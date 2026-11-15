@@ -720,13 +720,17 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the NINE refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`,
+# `stale`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
-# emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
+# emitted SIX since the fork/capability/skew/key gates were added — and it said SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
-# beside a list of seven). The list and the count are asserted against `cap_refusal_gate` by
-# `lane-outcome.test.sh`, so a gateway added without this line reddens a test instead of a reader.
+# beside a list of seven). ⛔ IT DRIFTED THE SAME WAY TWICE MORE, AND THE SECOND TIME WAS THIS CHANGE:
+# it read SEVEN beside eight names, then EIGHT beside eight names while `#3932` added a NINTH arm
+# (`stale`) to `cap_refusal_gate` — so the count is the part that rots, not the list. The list and the
+# count are asserted against `cap_refusal_gate` by `lane-outcome.test.sh` §4e, which is what turns the
+# next gateway added without this line into a red test instead of a misled reader.
 # `chain-merge.sh` folds an UNRECOGNISED third field to `load` — so a reader implemented from this
 # sentence alone would report a credential stand-down as a load wait, which is the #2991 mislabelling
 # this file is careful to avoid three lines above. The vocabulary lives in `cap_refusal_gate`; this
@@ -1047,8 +1051,8 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
 # AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83),
-# AGENT_MEM_REFUSED (81)
-# or AGENT_DISK_REFUSED (77);
+# AGENT_MEM_REFUSED (81), AGENT_DISK_REFUSED (77)
+# or AGENT_STALE_CODE_REFUSED (85);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
 # ── THE OUTCOME, RECORDED ONCE, IN THE SAME BREATH AS THE STATUS IT IS DERIVED FROM (#3331) ──────
@@ -1072,6 +1076,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
     "${AGENT_HARNESS_SKEW_REFUSED:-83}") lane_outcome refused "harness-skew" ;;
+    # ⛔ THE STALE-CHECKOUT REFUSAL GETS ITS OWN OUTCOME NAME TOO (this change's review, P1-2), for the
+    # reason above and one more: `refused capability-gate` is what an operator greps to decide whether to
+    # repair the box's pi/credential or move the item, and neither is right here.
+    "${AGENT_STALE_CODE_REFUSED:-85}")   lane_outcome refused "stale-code" ;;
     "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
     # ⛔ NO `pi-gate` ARM: THE CODE CANNOT REACH HERE (review, P2, measured). `run_agent` translates the
     # spawn point's `PI_GATE_REFUSED` (76) into `AGENT_LOAD_REFUSED` (75) before returning
@@ -1116,8 +1124,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`,
-  # `capability`, `skew` and `land` are the seven values the gate can refuse on, and each is chosen by the
+  # CAPACITY TRANSFER block above for the format and its two readers. There are NINE values the gate can
+  # refuse on — `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`, `stale`, and the `load` FOLD
+  # that absorbs anything unrecognised (see `cap_refusal_gate`; this line said "seven" and listed seven
+  # while the writer emitted nine — review P3, agent-infra#3932) — and each is chosen by the
   # code its own caller already distinguishes, so the record can never disagree with the exit status.
   # `mem` (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's
   # memory floor refused — which is why it takes the capacity-transfer branch below and not the `land`
@@ -1166,6 +1176,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
     elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then _cap_gate=mem
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
     elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
+    # ⛔ A STALE CHECKOUT IS THE OTHER REFUSAL WHOSE CODE MUST NOT BE 71 (this change's review, P1-2).
+    # The 71 arm below is the one that mints a capacity record, and its consumer in `orch-loop.sh`
+    # stands this box down SO A PEER CAN TAKE THE ITEM — correct for a capability refusal (a property
+    # of this box) and exactly wrong for a stale checkout, because the measured fleet state was EVERY
+    # cell 496-7093 commits behind (#3932): the item circulates between boxes that refuse identically
+    # and is never built. Its own code is what makes this file's words, and the controller's, publish
+    # the checkout remedy instead of "dispatch the issue to another box".
+    elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then _cap_gate=stale
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -1195,6 +1213,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # EVERY box. The record is still written (chain-merge.sh must stop waiting for a PR that
         # cannot appear), and the words say exactly what it buys, the same way `land` does.
         echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
+      elif [ "$_cap_gate" = "stale" ]; then
+        # ⛔ A SEVENTH VALUE, AND THE THIRD WHOSE RECORD IS NOT A CAPACITY CLAIM (this change's review,
+        # P1-2). The record is still written, for the `skew` reason: chain-merge.sh must stop waiting for
+        # a PR that cannot appear, and this box must not re-claim the item while its checkout is being
+        # advanced. What it must NOT do is tell the operator the item has moved to a peer — the peer
+        # behind the same wave of stale cells refuses identically, so the words say what the stand-down
+        # actually buys and where the remedy lives.
+        echo "[lane $N] stand-down recorded: gate=stale, until +${_cap_yield}s — this stops THIS box re-claiming #$N while its checkout is advanced; it does NOT free the item for a peer to clear, because the measured fleet state was every cell hundreds of commits behind (#3932), so a peer is likely stale too. The remedy is on the checkout the reading NAMED, by what it is — 'git -C <repo> pull --ff-only origin main' for a base checkout, 'git -C <repo> merge origin/main' for a PR-branch worktree (never a re-cut: that discards the PR) — and the repo and the distance are on the [capability-gate] REFUSED line in this log." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
       fi
@@ -1240,6 +1266,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # issue to another box", and both are wrong here: the extension set is fine and the peer refuses
     # identically. The fix is one verified redeploy on every box that runs lanes.
     echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991), OR the spawn gate could not resolve capacity.sh at all (the fork resolver's `nodeploy` arm, agent-infra#2293 follow-up). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair with a VERIFIED redeploy — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+    # ⛔ NAMED, AND NAMED AS A CHECKOUT PROBLEM RATHER THAN A CAPACITY ONE (this change's review, P1-2).
+    # Before this arm a stale-code refusal landed on the CAPABILITY text below — "repair this box's
+    # installed pi/extension set or its provider credential, or dispatch the issue to another box" —
+    # and all three remedies are wrong for it: the model call SUCCEEDED (that is how the reading was
+    # taken), and the fleet was measured stale on every cell, so the peer refuses identically. Two
+    # surfaces publishing contradictory instructions for one refusal is the harm this arm removes.
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THE READING CAME FROM (this change's review, P2-4): the probe
+    # measures `$PWD` on THIS path (`WIP_PATH` is unset in lane.sh), which is the lane's own WORKTREE — a
+    # base cut from origin/main. So the base remedy is right here, but it must be the BASE's advice and
+    # say so, because the same refusal text is published on the FIXER path where the measured artifact is
+    # a PR branch and re-cutting it would discard the PR (fix-one.sh's arm carries that shape).
+    echo "[lane $N] NOT started: STALE-CODE gate refused — this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (agent-infra#3932), so a lane cut from it produces a plausible log and a WRONG diff: it re-derives what main already fixed, or reverts it. Waiting will NOT clear it and load has nothing to do with it, and do NOT dispatch the issue to another box — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. The repo and the distance are on the [capability-gate] REFUSED line in this log, and it names the checkout that was measured: advance THAT one — for a BASE checkout (this lane's worktree, or the shared checkout) run 'git -C <repo> pull --ff-only origin main', or use the cell's own sync path; for a PR-BRANCH worktree (the fixer path) integrate origin/main INTO the branch with 'git -C <repo> merge origin/main' — and never re-cut a worktree that carries commits, because that discards the PR. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
     # this arm a capability refusal fell into the `else` below and the operator read "load gate refused
