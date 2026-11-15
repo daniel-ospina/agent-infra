@@ -657,6 +657,30 @@ ADMINOVR_RC=0; bash "$POLICY" --unit-veto "$TMP/adminovr.service" adminovr >/dev
 [ "$ADMINOVR_RC" -eq 1 ] \
   && ok "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE (skips the admin-merge evidence gate) IS vetoed" \
   || bad "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE=1 answered rc=$ADMINOVR_RC (want 1) — it skips the head-bound admin-merge evidence gate"
+# ⛔ THE KILL SWITCH'S BOTH SPELLINGS (fresh review of #4002 at `921aeed45`, P1 — a MEASURED fail-open:
+# both answered rc=0 CLEAN while the hatch was live, and `install-drainer-timer.sh` would have installed
+# it). `extensions/shared/kill-switch.ts` reads `env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE`,
+# decides on EXISTENCE (`any non-empty value`, not `"1"`), and `isEnforcementBypassed()` is what every
+# gate asks — so this declaration switches off the sequence/workflow enforcement of every lane the job
+# spawns. It carries none of the hatch vocabulary (SKIP|ALLOW|OVERRIDE|BYPASS), which is why the list
+# missed it; §5f below now admits it by vocabulary and would redden if either spelling left the list.
+# BOTH names are graded: the `ELDATO_` form is the `??`'s second arm, not a variant spelling, so a list
+# carrying one and not the other is a half-open gate.
+for _sm in AGENT_STATE_MACHINE ELDATO_STATE_MACHINE; do
+  printf '[Service]\nEnvironment=%s=1\nExecStart=/bin/true\n' "$_sm" >"$TMP/killswitch.service"
+  SM_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitch.service" killswitch >/dev/null 2>&1 || SM_RC=$?
+  [ "$SM_RC" -eq 1 ] \
+    && ok "(5d) edges: $_sm (the sequence-enforcer kill switch) IS vetoed" \
+    || bad "(5d) edges: Environment=$_sm=1 answered rc=$SM_RC (want 1) — it bypasses ALL enforcement for every lane the job spawns"
+done
+# …and the EXISTENCE-graded form: any non-empty value bypasses, so a value that is not `1` must be vetoed
+# too (the other hatches test `=== "1"`; this one does not, and grading it like the others would leave the
+# `=yes` spelling live).
+printf '[Service]\nEnvironment=AGENT_STATE_MACHINE=yes\nExecStart=/bin/true\n' >"$TMP/killswitchyes.service"
+SMy_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitchyes.service" killswitchyes >/dev/null 2>&1 || SMy_RC=$?
+[ "$SMy_RC" -eq 1 ] \
+  && ok "(5d) edges: …and its EXISTENCE-graded value (=yes) is vetoed too — the switch is set by presence, not by =1" \
+  || bad "(5d) edges: Environment=AGENT_STATE_MACHINE=yes answered rc=$SMy_RC (want 1) — the kill switch fires on ANY non-empty value"
 # …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
 bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
 [ "$ABSENT_RC" -eq 2 ] \
@@ -692,27 +716,48 @@ CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/t
 # `(AGENT|ELDATO)_(SKIP_REVIEW_GATE|SKIP_VGATE|ALLOW_MAIN_EDITS)` pattern cannot see a stem it was not told
 # about — that was round 3's finding against the first version of this arm):
 #   * every `_getEnv("STEM")` call site, expanded to BOTH prefixes;
-#   * plus every direct `process.env.(AGENT|ELDATO)_*` read whose name carries the hatch vocabulary
-#     (SKIP|ALLOW|OVERRIDE|BYPASS) — direct reads are unpaired, so they are matched on the vocabulary.
+#   * plus every direct `env.(AGENT|ELDATO)_*` / `process.env.(AGENT|ELDATO)_*` read whose name carries the
+#     hatch vocabulary (`SKIP|ALLOW|OVERRIDE|BYPASS|STATE_MACHINE`) — direct reads are unpaired, so they are
+#     matched on the vocabulary.
+# ⛔ THE THIRD READ FORM IS WHY THIS ARM WAS STILL BLIND (fresh review of #4002 at `921aeed45`, P1): a gate can
+# read a hatch through a PARAMETERISED env object — `env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE` in
+# `extensions/shared/kill-switch.ts`. Neither of the first two forms sees it, and the name carries none of the
+# hatch words either (`STATE_MACHINE` is the sequence enforcer's KILL SWITCH, decided on EXISTENCE). So the
+# vocabulary above gained `STATE_MACHINE` and the match is written against `\.(AGENT|ELDATO)_` — which covers
+# `env.X` and `process.env.X` alike — instead of only `process\.env\.`. Measured at the head that preceded
+# this fix: 7 names derived, 7 declared, EQUALITY PASS, and `--unit-veto` answering rc=0 for a unit carrying
+# `Environment=AGENT_STATE_MACHINE=1`. Both sides were missing the same two names — the equality was exact
+# over a set that was not the gates' set, which is what a drift arm must never be able to do.
 # The declared non-hatch stems are subtracted BY NAME with a reason, so a config variable cannot be mistaken
 # for a hatch and a new hatch cannot hide behind "it looked like config".
-# STATED LIMIT: a hatch whose stem carries none of the vocabulary words AND is read without `_getEnv` would
-# still be invisible here. That is the one shape this arm cannot see, and it is written down rather than
-# implied — the `_getEnv` convention is what the gates actually use, so the first half is the load-bearing one.
+# STATED LIMIT: a hatch whose stem carries none of the vocabulary words AND is read neither through `_getEnv`
+# nor as an `(AGENT|ELDATO)_*` name would still be invisible here — e.g. a name read as `process.env[key]`
+# from a computed string. That is the shape this arm cannot see, and it is written down rather than implied.
+# `AGENT_/ELDATO_SEQUENCE_MODE` carries none of the vocabulary and is NOT a hatch (its weakest licensed value,
+# `warn`, is already the default for every print session — see `extensions/shared/print-mode.ts`), so it is
+# correctly outside both sides rather than silently inside one.
 echo
 echo "== the list is what the gates honour (#4002) =="
-# ⛔ THE SCAN SET IS EVERY EXTENSION, NOT JUST THE SUBDIRECTORY INDEX FILES (fresh review of #4002, round 4):
-# `extensions/*/index.ts` is 18 files, and this repo carries top-level `extensions/*.ts` beside them — one of
-# which, `extensions/skill-enforcer.ts`, honours `_getEnv("ALLOW_MAIN_EDITS")`, a name in the list. A hatch
-# introduced only in a top-level extension was honoured by a real gate and INVISIBLE here, while the arm still
-# printed PASS. `.test.ts` is excluded on purpose: a test that mentions a variable is not a reader.
+# ⛔ THE SCAN SET IS EVERY PRODUCTION `.ts` UNDER `extensions/`, NOT JUST THE SUBDIRECTORY INDEX FILES
+# (fresh review of #4002, rounds 4 and 10). Round 4 widened `extensions/*/index.ts` (18 files) to also reach the
+# top-level `extensions/*.ts` (`extensions/skill-enforcer.ts` honours `_getEnv("ALLOW_MAIN_EDITS")`). That was
+# still WRONG in the same direction: a SHELL glob does not cross `/`, so `extensions/shared/*.ts` — where the
+# gates' shared helpers live, `kill-switch.ts` among them — was read by nothing, and the arm printed "derived …
+# from ALL 34 extension files" while 32 of the 66 production files were never opened. It is now
+# `extensions/*/*.ts` beside `extensions/*/index.ts` and `extensions/*.ts` (66 files today, no deeper nesting in
+# the tree), and the arm BELOW asserts the file that carries the third read form is actually in the set, so the
+# glob cannot silently go blind again. `.test.ts`/`.d.ts` are excluded on purpose: a test that mentions a
+# variable is not a reader, and a declaration file declares nothing.
 NON_HATCH_STEMS="SESSION_TEAM SKILLS_PREFIX"   # select a team / a skills path (`loop-enforcer`, `skill-enforcer`); neither disables a gate
 FILES=""
-for _f in "$REPO"/extensions/*/index.ts "$REPO"/extensions/*.ts; do
+for _f in "$REPO"/extensions/*/index.ts "$REPO"/extensions/*/*.ts "$REPO"/extensions/*.ts; do
   [ -f "$_f" ] || continue
-  case "$_f" in *.test.ts) continue ;; esac
+  case "$_f" in *.test.ts|*.d.ts) continue ;; esac
   FILES="$FILES $_f"
 done
+# ⛔ DE-DUPLICATED: the globs OVERLAP (`extensions/*/index.ts` is also `extensions/*/*.ts`), and a count that
+# double-counts files is a non-vacuity test that can pass on a set narrower than it reports.
+FILES="$(printf '%s\n' $FILES | sed '/^$/d' | LC_ALL=C sort -u)"
 DECLARED="$(sed -n 's/^GP_UNIT_BYPASS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
 STEMS="$(grep -ohE '_getEnv\("[A-Z_]+"\)' $FILES 2>/dev/null | sed -E 's/.*"([A-Z_]+)".*/\1/' | LC_ALL=C sort -u)"
 DUAL=""
@@ -721,9 +766,29 @@ for _s in $STEMS; do
   DUAL="$DUAL$(printf 'AGENT_%s\nELDATO_%s\n' "$_s" "$_s")
 "
 done
-DIRECT="$(grep -ohE 'process\.env\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS)[A-Z_]*' $FILES 2>/dev/null | sed 's/.*process\.env\.//' | LC_ALL=C sort -u)"
+DIRECT="$(grep -ohE '\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS|STATE_MACHINE)[A-Z_]*' $FILES 2>/dev/null | sed -E 's/^.*\.((AGENT|ELDATO)_)/\1/' | LC_ALL=C sort -u)"
 DERIVED="$(printf '%s%s\n' "$DUAL" "$DIRECT" | sed '/^$/d' | LC_ALL=C sort -u)"
 DERIVED_N="$(grep -c . <<<"$DERIVED")"
+# ⛔ NON-VACUITY, AND WHAT WOULD HAVE CAUGHT FINDING 1 (fresh review at `921aeed45`): the derivation must SEE
+# the third read form, and the scan set must CONTAIN the file it lives in. Both are asserted separately, because
+# the two ways this arm can go blind are independent — a glob that stops crossing into `extensions/shared/`, and
+# a vocabulary that does not admit `STATE_MACHINE` — and each has its own mutant (drop `*/*.ts` from the glob;
+# drop `|STATE_MACHINE` from the vocabulary). Without these, the round-10 failure mode recurs silently: BOTH
+# sides lose the same two names and the equality passes EXACTLY over a set that is not the gates' set.
+if printf '%s\n' $FILES | grep -q '/extensions/shared/kill-switch\.ts$'; then
+  ok "(5f) scan set: the file whose PARAMETERISED env read carries the kill switch (extensions/shared/kill-switch.ts) is IN the graded set — the glob reaches extensions/shared/"
+else
+  bad "(5f) scan set: extensions/shared/kill-switch.ts is NOT in the graded set — the glob reads $(printf '%s\n' $FILES | grep -c .) files but not the one the third read form lives in, so a hatch there is invisible while this arm prints PASS"
+fi
+# The third read form (`env.NAME`, not `process.env.NAME`) is the ONLY way these two arrive — no `_getEnv` stem
+# produces them — so their presence in DERIVED IS the proof that form is recognised.
+SM_MISSING=""
+for _sm in AGENT_STATE_MACHINE ELDATO_STATE_MACHINE; do
+  grep -qx -- "$_sm" <<<"$DERIVED" || SM_MISSING="$SM_MISSING $_sm"
+done
+[ -z "$SM_MISSING" ] \
+  && ok "(5f) drift: the derivation RECOGNISES the third read form — the kill switch (env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE) is derived from its call site, not declared by hand" \
+  || bad "(5f) drift: the derivation does not see$SM_MISSING — the parameterised env read (extensions/shared/kill-switch.ts) is invisible to it, so the equality can pass while the list omits a hatch the gates honour"
 [ -n "$STEMS" ] && [ "$DERIVED_N" -ge 2 ] \
   && ok "(5f) drift: derived the honoured hatch set from ALL $(printf '%s\n' $FILES | grep -c .) extension files ($DERIVED_N names across $(printf '%s\n' $STEMS | grep -c .) _getEnv stems) — the equality is not vacuous" \
   || bad "(5f) drift: derived only $DERIVED_N honoured name(s) from $(printf '%s\n' $FILES | grep -c .) files — the equality would pass on an empty set"

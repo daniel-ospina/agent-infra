@@ -99,10 +99,26 @@ GP_AMBIENT_CLEARED=0
 # admin-merge evidence gate (`the head-bound evidence gate was bypassed by AGENT_ADMIN_MERGE_OVERRIDE=1`).
 # A unit setting it hands every lane it spawns the un-certified landing route, which is precisely the #4002
 # shape. It belongs here for the same reason the other three do.
+# ⛔ FIVE HATCHES, not four (a measured fail-open found by the fresh review at `921aeed45`, and the reason
+# §5f's scan set and read vocabulary were widened with it): `STATE_MACHINE` is the SEQUENCE ENFORCER's
+# emergency valve — `extensions/shared/kill-switch.ts` `killSwitchEnvValue()` reads it as
+# `env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE`, `isKillSwitchSet()` decides on ITS **EXISTENCE**
+# (so any non-empty value works — not just `1`), and `isEnforcementBypassed()` is what every gate asks
+# (`"Kill switch active — all enforcement bypassed, EVERY session"`). So a unit declaring it hands the
+# phase/step/workflow enforcement of EVERY lane it spawns to nobody, for ever, and no spawned lane can
+# un-inherit it. It is the HUMAN's valve (`skills/enforcement/SKILL.md`: agents must NEVER engage it), the
+# one hatch that must never be baked into a scheduled job's declaration — the #4002 shape with a stronger
+# switch. Both spellings are listed: the alias is the `??`'s second arm, not a variant spelling.
+# ⚠️ `AGENT_/ELDATO_SEQUENCE_MODE` is deliberately NOT here and is not an omission: it is a MODE SELECTOR,
+# not a bypass — its weakest licensed value (`warn`) is already the default for every print session
+# (`extensions/shared/print-mode.ts`), so a declaration setting it inherits nothing a bare `pi -p` lacks.
 # ⛔ `gate-policy.test.sh` §5f derives the honoured set FROM the extensions — every `_getEnv("STEM")` call
-# site expanded to both prefixes, plus direct `process.env` hatch reads — and requires this list to equal
-# it, so a new hatch stem reddens the suite instead of being invisible. Extend THIS list, never a second copy.
-GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+# site expanded to both prefixes, plus every DIRECT `env.NAME` / `process.env.NAME` read whose name carries
+# the hatch vocabulary (`SKIP|ALLOW|OVERRIDE|BYPASS`) — and requires this list to equal it, so a new hatch
+# stem reddens the suite instead of being invisible. `STATE_MACHINE` carries none of those words, which is
+# exactly how it stayed invisible: it is admitted BY VOCABULARY (`STATE_MACHINE` is in the vocabulary list),
+# not by being spelled like the others. Extend THIS list, never a second copy.
+GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS AGENT_STATE_MACHINE ELDATO_STATE_MACHINE"
 
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
 #   0  clean (the declaration names none of the flags)
