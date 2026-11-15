@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
+import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
@@ -1223,8 +1223,16 @@ dexpect("#594-5d control — `checkout main && symbolic-ref HEAD` (a QUERY) keep
 dexpect("#594-R2a `git -c alias.p4='branch -fq victimP main' p4` EXPANDS (p4 is not a builtin)",
   `git -c alias.p4='branch -fq victimP main' p4`,
   { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimP", "main"] });
-dexpect("#594-R2a2 a bare non-builtin verb (`git p4`, `git gui`) is opaque, not trusted",
-  `git gui`, { branchState: true });
+// ⛔ P3 (round-11): THE PROBE NAME MUST NOT DEPEND ON THE HOST. This row used
+// `git gui`, which is alias-opaque only on a box whose `<git --exec-path>` has no
+// `git-gui` — so it FLIPPED on any box that ships it (this box ships
+// `git-submodule`/`git-subtree`; the reviewer's also had `git-p4`), turning a
+// correct fail-closed verdict into a red assertion. A per-process name cannot
+// collide with an installed extension, so the row pins the RULE — "a bare verb
+// nothing can resolve is not trusted" — rather than the install.
+const FX594_ABSENT = `fx594noext${process.pid}`;
+dexpect("#594-R2a2 a bare non-builtin verb nothing can resolve is opaque, not trusted",
+  `git ${FX594_ABSENT}`, { branchState: true });
 // (b) definitions accumulate in SEGMENT ORDER: a benign definition later in the
 // command must not reclassify an earlier destructive invocation.
 dexpect("#594-R2b destructive alias in segment 1, benign redefinition in segment 2 → segment 1 still classified",
@@ -1310,12 +1318,34 @@ dexpect("#594-R4e a non-builtin `main` command name EXPANDS its alias (`filter-b
 // builtin > external > alias: no alias can win its lookup. Treating it as
 // alias-OPAQUE therefore refused a legitimate command — `git subtree pull`, a
 // post-clone `git submodule update --init` — in EVERY checkout, for a shadowing
-// that cannot happen. The row now pins the correct direction, and `#594-R4e3` pins
-// the fail-closed half for a name nothing can resolve.
-dexpect("#594-R4e2 a resident non-builtin (`git subtree`) is NOT alias-opaque — no alias can shadow it (P1)",
-  `git subtree add -P x y`, { branchState: false });
+// that cannot happen. `#594-R4e3` pins the fail-closed half for a name nothing can
+// resolve.
+// ⛔ P3 (round-11): THIS ROW USED `git subtree`, WHICH MADE IT HOST-DEPENDENT — it
+// is resident on this box and on the reviewer's, but that is a property of the
+// INSTALL: on a box without `git-subtree` the verb is correctly opaque and the row
+// read as a regression, while `git gui` (the row above, `R2a2`) flipped the other
+// way on a box that ships `git-gui`. Which extensions a box has is not the rule, so
+// the condition is CREATED here instead of assumed — an executable `git-<verb>` on
+// the child's PATH is exactly what makes git skip the alias lookup. (The real-world
+// case — `git submodule update --init`, resident in `<git --exec-path>` — is driven
+// end-to-end at the handler layer by B10p1b in test-module-load.mjs, where the
+// extension is required to exist.)
+const FX594_RESIDENT = `fx594res${process.pid}`;
+const fx594ResDir = mkdtempSync(join(tmpdir(), "mwg594resident-"));
+const fx594ResPrevPath = process.env.PATH;
+try {
+  const fx594ResShim = join(fx594ResDir, `git-${FX594_RESIDENT}`);
+  writeFileSync(fx594ResShim, "#!/bin/sh\nexit 0\n");
+  chmodSync(fx594ResShim, 0o755);
+  process.env.PATH = `${fx594ResDir}:${fx594ResPrevPath}`;
+  dexpect(`#594-R4e2 a RESIDENT non-builtin (\`git ${FX594_RESIDENT}\`) is NOT alias-opaque — no alias can shadow it (P1)`,
+    `git ${FX594_RESIDENT} add -P x y`, { branchState: false });
+} finally {
+  process.env.PATH = fx594ResPrevPath;
+  try { rmSync(fx594ResDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
 dexpect("#594-R4e3 a non-resident non-builtin (no `git-<verb>` anywhere) IS opaque + branchState (fail closed)",
-  `git fx594noext add -P x y`, { branchState: true });
+  `git ${FX594_ABSENT} add -P x y`, { branchState: true });
 // The SAME two defects reachable through spellings the round-3 rows above do not walk: a
 // duplicated prefix handed through `env` (its assignments are argv, not the shell's), and the
 // SPACE form of `--config-env`. Both were measured FAIL-OPEN at `bd0ecbeca` (bState=false) and
