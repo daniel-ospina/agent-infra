@@ -5731,7 +5731,12 @@ assert_eq "$RECORD_RC" "0" "13n75 F4 OVER-BLOCK GUARD: 'found none' after the no
 # ADMITTED. The sed anchors are asserted to still match, so a refactor re-pins instead of silently
 # turning the pin into a no-op.
 N_LIVECNT_MUT="$T/mutant-livecnt-narrowed.sh"
-sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}\[\[:space:\].,:;_-\]\*(block(ing|ers?)|\\(?p\[01\]\\)?)" <<<"$line" && live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\\(?p[01]\\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
+# ⛔ RE-ANCHORED when the live_count line gained `_OC_SEP` and the enumeration shape (agent-infra#3902
+# review, P1). The anchor matches the separator-and-shape PREFIX and `.*live_count=1$` to the end of
+# the line, so a future separator/shape edit does NOT silently turn this pin into a no-op; only a
+# change that moves `live_count=1` onto another line does, and the `cmp -s` guard below turns THAT
+# into a red rather than a green pin.
+sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}${_OC_SEP}.*live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
 if cmp -s "$RECORD" "$N_LIVECNT_MUT"; then
     bad "13n76 MUTANT: the live_count sed anchor no longer matches — re-anchor the pin rather than dropping it"
 else
@@ -6318,6 +6323,136 @@ else
 $VACUITY_BLOCK"
     RECORD="$NC_SAVE"
     assert_eq "$RECORD_RC" "0" "13n128 MUTATION PIN: with the copula belt removed, 13n123's body is ADMITTED (rc 0) — the shape belt is load-bearing"
+fi
+
+# 13n129-13n139 — THE COUNT→SEVERITY BOND WAS SPELLED TWO WAYS, AND THE ENTRY GATE HAD THE NARROW
+# ONE (agent-infra#3902 review, P1 — MEASURED fail-open, four forms). `live_count` read the bond as
+# `[[:space:].,:;_-]*` while the arm's own ENTRY GATE, executed twelve lines earlier, read
+# `[[:space:]]*`. A declaration spelling the bond any other way was never recognised, the whole arm
+# was skipped at its gate, and a `clean` record was minted over a review declaring a live P1.
+# MEASURED on the shipped function at 043b1ab91 (arm extracted verbatim, bodies framed exactly as
+# `gh --jq @tsv` frames them): all four ADMITTED. The first is a REAL review comment
+# (agent-infra#4039, `6831139582`), not a constructed one.
+# ONE class now (`_OC_SEP`) is read by the gate, `live_count`, both declaration masks, the
+# severity-remainder belt and (b) `_OC_TOTAL` — two spellings of one rule is the defect, so a single
+# spelling is the fix, and 13n139's mutation pin is what makes that attribution explicit.
+_13n129=0
+for _13n129_body in \
+    '**Outcome: ISSUES 2** (1 × P1 correctness, 1 × P2 regression)' \
+    'Outcome: 2 findings (P1, P2)' \
+    'Outcome: 1, P1' \
+    'Outcome: 1xP1'; do
+    _13n129=$((_13n129 + 1)); _13n129_pr=$((427001 + _13n129))
+    rm -f "$(Q2 $_13n129_pr)"
+    EV_REF="comment:${_13n129_pr}01" run_record_ev "$_13n129_pr" STUB_EVIDENCE_BODY="$_13n129_body
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13n129 a declaration spelling the count→severity bond as '${_13n129_body}' is refused (rc 3)"
+done
+
+# 13n130 — the OTHER end of the same spelling. The severity-remainder belt is what reads a SURVIVING
+# count as a remainder; if it spells the bond more narrowly than the declaration does, `1 × P1` reads
+# as a declaration at the gate and as nothing here — the remainder disappears between the two copies.
+rm -f "$(Q2 427010)"
+EV_REF="comment:42701001" run_record_ev 427010 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed; 1 × P1 still open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n130 a surviving '1 × P1' is a remainder — the belt reads the same bond the gate does (rc 3)"
+
+# 13n131-13n133 — THE FALSE-REFUSAL CLASS ARM 1c INTRODUCED (agent-infra#3902 review, P2 — MEASURED).
+# `_OC_TOK` is `[[:alnum:]/._-]+`, so a token carrying a trailing comma does not fit and the run could
+# not step over one either; `_OC_TAIL` then failed and the line fell to the default-deny veto. On
+# `origin/main` (no arm 1c) each of these RECORDS, and the comma-free twin of each records HERE — which
+# is what proves the cause is punctuation, not content. `,` only: `;`/`:` are clause boundaries.
+rm -f "$(Q2 427011)"
+EV_REF="comment:42701101" run_record_ev 427011 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings, all fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n131 a comma before a total resolution does not refuse an honest closure (rc 0)"
+rm -f "$(Q2 427012)"
+EV_REF="comment:42701201" run_record_ev 427012 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings, both fixed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n132 …nor does a comma before a totality word (rc 0)"
+rm -f "$(Q2 427013)"
+EV_REF="comment:42701301" run_record_ev 427013 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings (P1), fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n133 …nor a comma after a severity parenthesis (rc 0)"
+
+# 13n134-13n135 — (b) MUST BE ABLE TO RESOLVE THE SPELLINGS THE GATE NOW RECOGNISES. Widening the
+# entry gate without widening the escape would convert an honest closure into a refusal, which is the
+# over-block direction the same review called out. Each of these RECORDS at 043b1ab91 only because the
+# arm was SKIPPED at the gate; now the gate reads them, so (b) has to answer them.
+rm -f "$(Q2 427014)"
+EV_REF="comment:42701401" run_record_ev 427014 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 1 × P1 fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n134 (b) resolves the '1 × P1' spelling the gate now recognises (rc 0)"
+rm -f "$(Q2 427015)"
+EV_REF="comment:42701501" run_record_ev 427015 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 findings (P1, P2) were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n135 (b) resolves the severity-enumeration shape the gate now recognises (rc 0)"
+
+# 13n136 — THE DECLARED RESIDUAL, PINNED SO IT CANNOT BE "FIXED" SILENTLY (agent-infra#3902 review,
+# P3 — MEASURED, and RECORDED rather than removed). `_OC_SELLED` is a blanket over any SPELLED count on
+# `_rest` while the DIGIT form is gated by a governor, so a spelled non-blocking count is refused
+# where its digit twin records. Deliberate: the blanket errs toward REFUSAL, and removing it would
+# trade a reworded re-run for a hole (a spelled count followed by a remainder verb in no belt at all,
+# `; one outside the retry path`, admits). This row and its sibling exist so the cost is a pinned
+# fact, not an accident — read the comment at `_OC_SELLED` before changing either verdict.
+rm -f "$(Q2 427016)"
+EV_REF="comment:42701601" run_record_ev 427016 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; one follow-up filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n136 DECLARED RESIDUAL: a SPELLED non-blocking count is refused (rc 3) — reword to a digit or drop the count"
+rm -f "$(Q2 427017)"
+EV_REF="comment:42701701" run_record_ev 427017 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 follow-up filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n136 …and its DIGIT twin records (rc 0) — the asymmetry 13n136's residual names"
+
+# 13n137-13n138 — THE OVER-BLOCK CONTROLS FOR THE SEVERITY-ENUMERATION SHAPE. That shape is a count,
+# a short word run and a parenthetical; the parenthetical must be NOTHING BUT severity tags AND must
+# carry a P0|P1, or the widening becomes a new false-refusal class. Both rows below are what a merely
+# `\(p[01]`-anchored alternative would wrongly refuse.
+rm -f "$(Q2 427018)"
+EV_REF="comment:42701801" run_record_ev 427018 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 tests added (P1 path covered).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n137 a parenthetical carrying PROSE is not a severity enumeration (rc 0)"
+rm -f "$(Q2 427019)"
+EV_REF="comment:42701901" run_record_ev 427019 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 nits (P2, P3) filed as follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n138 a P2|P3-only enumeration is a non-blocking follow-up, not a declaration (rc 0)"
+
+# 13n139 — MUTATION PIN for the whole class (agent-infra#3402 rule 3, in its exact form: an assertion
+# whose value cannot vary under any mutation of the diff is a finding). 13n129/13n130 could be red for
+# some other belt's reason, so the widening is REVERTED in a copy — `_OC_SEP` back to `[[:space:]]*`
+# and the enumeration shape disabled — and the same five bodies must then be ADMITTED.
+N_SEP_MUT="$T/mutant-sep-narrowed.sh"
+sed "s#^  local _OC_SEP=.*#  local _OC_SEP='[[:space:]]*'#; s#^  local _OC_PGROUP=.*#  local _OC_PGROUP='@@NEVERMATCH@@'#" "$RECORD" > "$N_SEP_MUT"
+if cmp -s "$RECORD" "$N_SEP_MUT"; then
+    bad "13n139 MUTANT: the _OC_SEP/_OC_PGROUP sed anchors no longer match — re-anchor the pin"
+else
+    bash -n "$N_SEP_MUT" && ok "13n139 MUTANT: the separator-narrowed mutant still parses" || bad "13n139 MUTANT: the mutant does not parse"
+    NS_SAVE="$RECORD"
+    RECORD="$N_SEP_MUT"
+    rm -f "$(Q2 427020)"
+    EV_REF="comment:42702001" run_record_ev 427020 STUB_EVIDENCE_BODY="**Outcome: ISSUES 2** (1 × P1 correctness, 1 × P2 regression)
+
+$VACUITY_BLOCK"
+    NS_A="$RECORD_RC"
+    rm -f "$(Q2 427021)"
+    EV_REF="comment:42702101" run_record_ev 427021 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed; 1 × P1 still open.**
+
+$VACUITY_BLOCK"
+    NS_B="$RECORD_RC"
+    RECORD="$NS_SAVE"
+    assert_eq "$NS_A" "0" "13n139 MUTATION PIN: with the separator narrowed, 13n129's real #4039 review is ADMITTED (rc 0) — one spelling is load-bearing"
+    assert_eq "$NS_B" "0" "13n139 MUTATION PIN: …and 13n130's '1 × P1' remainder is ADMITTED (rc 0) — the belt reads the same class"
 fi
 
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
@@ -7386,13 +7521,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4797 :6523 :8897 :9071, plus a comment mention at :4576; `14.1c-CITE` below
+#     CITE-CHECK: :4900 :6626 :9000 :9174, plus a comment mention at :4769; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4878) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4797) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4900) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8897). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9000). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7418,7 +7553,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8897` / `:9071` — CITE-CHECK: :8897 :9071 — re-derived by the
+#     this head the predicates are `:9000` / `:9174` — CITE-CHECK: :9000 :9174 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8327,7 +8462,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6523 :8897 :9071 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6626 :9000 :9174 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

@@ -1213,6 +1213,49 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # 2 P1 still open` and `… however 1 P1 is still open`. A severity tag is admitted in EVERY token
   # run that can sit between a count and its verb, and between a count and the noun `blocking`.
   local _OC_SEV='\(?p[0-3]\)?'
+  # ⛔ ONE SPELLING OF THE COUNT→SEVERITY BOND — IT WAS SPELLED TWO WAYS AND THE ENTRY GATE HAD THE
+  # NARROW ONE (agent-infra#3902 review, P1 — MEASURED fail-open, four forms). `live_count` read the
+  # separator between a count and its `P0|P1` tag as `[[:space:].,:;_-]*` while the arm's ENTRY GATE,
+  # twelve lines above it in execution order, read `[[:space:]]*`. So a declaration that spells the
+  # bond any other way was never even recognised, the whole arm was SKIPPED at its gate, and a
+  # `clean` record was minted over a review declaring a live P1. MEASURED on the shipped function at
+  # 043b1ab91, arm extracted verbatim and bodies framed exactly as `gh --jq @tsv` frames them:
+  #   `**Outcome: ISSUES 2** (1 × P1 correctness, 1 × P2 regression)`  -> ADMIT (a REAL #4039 review)
+  #   `Outcome: 2 findings (P1, P2)`                                  -> ADMIT
+  #   `Outcome: 1, P1`                                                -> ADMIT
+  #   `Outcome: 1xP1`                                                 -> ADMIT
+  # Two spellings of one rule IS the defect: whichever copy is narrower is the hole, and no test can
+  # see the difference because both copies live in the same function. There is now ONE class, and
+  # every site that reads the bond — the gate, `live_count`, the two declaration masks, the
+  # severity-remainder belt and (b) `_OC_TOTAL` — reads THIS one.
+  # The set is CLOSED and typographic, not a vocabulary: whitespace, the punctuation a writer puts
+  # between a digit and a tag (`. , : ; * _ ( ) = -`), and the two multiplication idioms (`x`, `×`),
+  # which is how `1 × P1` — the shape the fleet's own reviews emit — is spelled.
+  local _OC_SEP='[[:space:].,:;*_()=x×-]*'
+  # ⛔ A COUNT WHOSE SEVERITIES ARE ENUMERATED IN A PARENTHETICAL IS THE SAME DECLARATION
+  # (agent-infra#3902 review, P1 — MEASURED `Outcome: 2 findings (P1, P2)` -> ADMIT). Here the count
+  # and its severity are not adjacent at all: the count governs a findings noun and the severities
+  # are listed beside it. Reading it as a SEPARATOR would be wrong (the words in between are not
+  # punctuation), so it is a SHAPE: a count, at most three words, and then a parenthetical whose
+  # content is NOTHING BUT severity tags and separators and which contains at least one `P0|P1`.
+  # That last clause is what keeps it from being an over-block: `2 tests added (P1 path covered)` is
+  # NOT this shape (the parenthetical carries prose), while `2 findings (P1, P2)` is; and a list of
+  # only `P2|P3` (`2 nits (P2, P3)`) is a non-blocking follow-up, which is why a mere `\(` cannot
+  # stand in for it — the same P0|P1-only rule `_OC_SEVREMAINDER` already carries.
+  # ⛔ AND IT MUST BE A LIST, NOT ONE TAG (the same review's P3, found by running 13n86 — the
+  # pin for the `_bline` mask, which this alternative had silently made redundant). A single `(P1)`
+  # is ordinary prose in a sentence — `2 blocking (P1) findings and 3 non-blocking (P3) findings were
+  # fixed` — while an ENUMERATION is the shape that carries the declaration. Requiring a separator
+  # between two severities keeps the two apart and keeps 13n86's token budget honest.
+  # ⛔ THE ALTERNATION IS GROUPED, AND THAT IS NOT COSMETIC: `_OC_SEVLIST` is CONCATENATED into
+  # `_OC_PGROUP` and then into the entry gate and (b) `_OC_TOTAL`, which are both top-level `|`
+  # expressions. An ungrouped `A|B` here splits THOSE, and the `B` branch loses its preceding count —
+  # measured while writing this row: an ungrouped version admitted `Outcome: 2 findings (P1, P2)` (no
+  # resolution at all) because `_OC_TOTAL`'s third alternative degenerated to "a parenthetical naming
+  # a P1, followed by a resolution", with nothing declaring it. Grouping keeps each copy of the shape
+  # the shape it was written to be.
+  local _OC_SEVLIST="(\([^)]*p[01][^)]*[,;/+&][^)]*\)|\([^)]*[,;/+&][^)]*p[01][^)]*\))"
+  local _OC_PGROUP="[1-9][0-9]*([[:space:]]+[[:alpha:]]+){0,3}[[:space:]]+${_OC_SEVLIST}"
   # ⛔ A TOKEN MAY CARRY DIGITS, DOTS AND SLASHES, AND THE RUN IS SIX TOKENS WIDE
   # (agent-infra#3902 THIRD review, P2 — MEASURED false refusal). The class was `[[:alpha:]-]+` with
   # a THREE-token run, so the sentences a fixer actually writes when it says WHERE or WHICH cycle it
@@ -1226,7 +1269,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # re-run on every honest agent — and this class was avoidable by WIDTH, not by adding vocabulary.
   local _OC_TOK="(${_OC_SEV}|\\(?[[:alnum:]/._-]+\\)?)"
   # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
-  local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,6}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
+  # ⛔ THE TOKEN RUN ADMITS A COMMA BETWEEN ITS TOKENS (agent-infra#3902 review, P2 — MEASURED false
+  # refusal). `_OC_TOK` is `[[:alnum:]/._-]+`, so a token carrying a trailing comma did not fit and
+  # the run could not step over one either — the sentence then failed `_OC_TAIL` and fell through to
+  # the default-deny veto. On `origin/main` (which has no arm 1c) each of these RECORDS, so this was
+  # a false-refusal class arm 1c INTRODUCED, and the comma-free twin recording is the proof it is
+  # punctuation, not content: MEASURED at 043b1ab91:
+  #   `Outcome: CLEAN — 3 blocking findings, all fixed and re-verified.`   -> REFUSED (ADMIT without ,)
+  #   `Outcome: CLEAN — 3 blocking findings, both fixed.`                 -> REFUSED (ADMIT without ,)
+  #   `Outcome: CLEAN — 3 blocking findings (P1), fixed and re-verified.` -> REFUSED (ADMIT without ,)
+  # `,` only: `;` and `:` are CLAUSE boundaries, and this window must not cross one (the same
+  # `[^.;:]` discipline the token class and `_OC_PERSIST` already carry). The alternative is
+  # `[[:space:]]*,` and NOT `,` alone, so a comma can never be the first thing after the count's own
+  # noun — the run still starts on whitespace, which is what keeps a comma-separated LIST from being
+  # read as a resolution. Pinned by 13n131/13n132/13n133.
+  local _OC_TAIL="([[:space:]]*,[[:space:]]*${_OC_TOK}|[[:space:]]+${_OC_TOK}){0,6}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
   local _OC_CNT='([1-9][0-9]*|one|two|three|four|five|six|seven|eight|nine|ten)'
   # ⛔ `_OC_TOTAL` IS EVALUATED ON THE UNMASKED LINE, AND IT MUST STAY THAT WAY.
   # (agent-infra#3902 review, F6). A `BLKDECL`-as-total-subject alternative used to sit at the end of
@@ -1237,7 +1294,15 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # REMOVED rather than made live: matching this against `_rest` would WIDEN the escape (the
   # fail-open direction), while the first alternative already covers both the digit and the spelled
   # declaration, which is why the branch was never needed.
-  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
+  # ⛔ THE TWO SEVERITY ALTERNATIVES READ THE BOND WITH `_OC_SEP` TOO, AND A THIRD READS THE
+  # ENUMERATION SHAPE (agent-infra#3902 review, P1). The entry gate now RECOGNISES `1 × P1` and
+  # `2 findings (P1, P2)` as declarations, so (b) must be able to resolve the same spellings or the
+  # widening converts an honest closure into a refusal: `Outcome: CLEAN — 1 × P1 fixed and
+  # re-verified.` and `… 2 findings (P1, P2) were fixed and re-verified.` RECORD, pinned by
+  # 13n134/13n135. Every alternative here is an EXCEPTION on the default-deny path, so widening it
+  # can only turn a veto into an admit — and it is what keeps both ends of this function spelling
+  # one rule, which is the root the finding names.
+  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}${_OC_SEP}(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}${_OC_SEP}\(?p[01]\)?${_OC_TAIL}|(^|[^0-9])${_OC_PGROUP}${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
   # ⛔ A COLLECTIVE REMAINDER — `the rest`, `some`, `most`, `half` (agent-infra#3902 review, F3).
   # The header below CLAIMED these were counted; they were not, because they lived only in
   # `_OC_PERSIST`, which is `;`-SCOPED and so unreachable after the clause boundary. MEASURED at
@@ -1309,7 +1374,12 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # is the only shape it was ever written to except. `_OC_REFMASK` is the file's own rule (a negation
   # or exception is scoped to the match it excepts) applied to its own exception.
   local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+([[:space:]]+([[:alpha:]-]+[[:space:]]+){0,3}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified))/\1REFCNT\3/g'
-  local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
+  # ⛔ THE BOND IS READ WITH THE ONE SEPARATOR CLASS (`_OC_SEP`), not `[[:space:]]+`
+  # (agent-infra#3902 review, P1). This belt is what reads a SURVIVING count as a severity
+  # remainder, so if it spells the bond more narrowly than the declaration does, `1 × P1` reads as a
+  # declaration at the gate and as nothing at all here — the remainder disappears between the two
+  # spellings. 13n130 is the row: `2 blocking (P1) findings were fixed; 1 × P1 still open` must VETO.
+  local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}${_OC_SEP}${_OC_BSEV}"
   # ⛔ THIS LIST MUST CARRY EVERY NON-COLLECTIVE WORD `_OC_PERSIST` CARRIES, AND IT DID NOT
   # (agent-infra#3902 review, P1 — MEASURED fail-open, and a FALSE residual claim). `_OC_PERSIST` is
   # `;`-SCOPED (`_clause` = `${line%%;*}`), so after the declaration's own `;` — the shape an agent
@@ -1324,6 +1394,23 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # reads them. The `13n87` parity cell parses both lists and reds if they drift again, because the
   # defect was an OMISSION between two manually-maintained lists, not a missing insight.
   local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|yet|known|carried|waived|left|partial|skipped|re[-[:space:]]?open|re[-[:space:]]?opens|re[-[:space:]]?opened|rolled[[:space:]]+back|reverted|withdrawn|withheld|undone|dropped|discarded|scrapped|abandoned|revoked|put)"
+  # ⛔ A SPELLED COUNT IS REFUSED ANYWHERE ON THE LINE, AND THAT IS DECLARED, NOT ACCIDENTAL
+  # (agent-infra#3902 review, P3 — MEASURED, and RECORDED rather than removed). The DIGIT form below
+  # is gated by a governor (`_OC_COUNT` + `_OC_GOVERNS|_OC_RESOLVES|_OC_STILL|_OC_HANDOFF`), while
+  # `_OC_SELLED` is a blanket over any spelled count on `_rest`. So this pair is asymmetric:
+  #   `Outcome: CLEAN — 2 blocking findings were fixed; 1 follow-up filed.`    -> RECORDS  (right)
+  #   `Outcome: CLEAN — 2 blocking findings were fixed; one follow-up filed.`  -> REFUSED  (a reword)
+  # It is DELIBERATELY NOT SYMMETRISED, and the reason is the polarity rule this file states: the
+  # blanket errs toward REFUSAL, and removing it would trade a reworded re-run for a hole. A spelled
+  # count with no governor is caught today by the SHAPE belts anyway — `_OC_COPULA` and
+  # `_OC_ANYRESOLVE` are both built on `_OC_COUNT`, which already SPELLS `one..ten`, so
+  # `; one was waived` / `; one got merged` / `; one is still open` all reach a belt — and the only
+  # class the blanket alone covers is a spelled count followed by a remainder verb in NO belt at all
+  # (`; one outside the retry path`). That class is a genuine fail-open, so the blanket stays and the
+  # false refusal it costs is stated here instead of being paid for out of the fail-open side.
+  # DECLARED RESIDUAL: a spelled non-blocking count on the declaration line is refused; reword it to
+  # a digit or drop the count. 13n136 is the row that pins the declared behaviour so a later pass
+  # cannot "fix" the asymmetry without meeting this comment first.
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
   # ⛔ A TOTALITY CLAIM WITH AN EXCEPTION IS NOT A TOTALITY CLAIM (agent-infra#3902 review, P1 —
   # MEASURED fail-open). Escape (b) accepts `all blocking findings were fixed`; the SAME sentence with
@@ -1459,8 +1546,15 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # belts, and (b) — then applies to it identically, which is what keeps this a widening of the
     # ENTRY and not a second implementation. P2/P3 stay out: a P2/P3 count is a non-blocking
     # follow-up and must not refuse an honest clean line.
+    # ⛔ THE SEVERITY FORM READ THE BOND AS `[[:space:]]*` — ONE SEPARATOR — WHILE `live_count` TWELVE
+    # LINES BELOW ALREADY READ `[[:space:].,:;_-]*` (agent-infra#3902 review, P1 — MEASURED fail-open).
+    # Two spellings of one rule: the wider copy decided a count WAS live for `2, P1`, and the narrower
+    # one had already SKIPPED the line, so the escape below was never consulted. The separator is now
+    # the shared `_OC_SEP`, and the count→severity-bond-by-enumeration shape (`2 findings (P1, P2)`) is
+    # the third alternative. MEASURED at 043b1ab91: all four forms ADMITTED; all four are gated here
+    # now and pinned by 13n129.
     if ! grep -qiE 'block(ing|ers?)' <<<"$line" \
-       && ! grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]]*\(?p[01]\)?|(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)[[:space:]]*\(?p[01]\)?' <<<"$line"; then
+       && ! grep -qiE "(^|[^0-9])[1-9][0-9]*${_OC_SEP}\\(?p[01]\\)?|(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)${_OC_SEP}\\(?p[01]\\)?|(^|[^0-9])${_OC_PGROUP}" <<<"$line"; then
       continue
     fi
     # A LIVE POSITIVE COUNT — the number that qualifies a blocking NOUN or a P0/P1 severity, as
@@ -1480,7 +1574,11 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # plausibly puts between a count and its noun is admitted here too.
     # Widening this can only DISABLE an escape (it sets `live_count=1`, which turns (a) off), so it is
     # the fail-closed direction: no line that vetoed before is admitted now.
-    grep -qiE "(^|[^[:alnum:]])${_OC_CNT}[[:space:].,:;_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" && live_count=1
+    # ⛔ AND IT READS THE ENTRY GATE'S OWN TWO SHAPES (agent-infra#3902 review, P1). Reading a
+    # narrower count vocabulary than the gate that admitted the line is how the two spellings diverged
+    # in the first place: a line gated in on `2 findings (P1, P2)` would otherwise arrive here with
+    # `live_count=0`, leaving escape (a) armed against a declaration that enumerates a P1.
+    grep -qiE "(^|[^[:alnum:]])${_OC_CNT}${_OC_SEP}(block(ing|ers?)|\(?p[01]\)?)|(^|[^0-9])${_OC_PGROUP}" <<<"$line" && live_count=1
     # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
     if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
       continue
@@ -1500,7 +1598,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # addressed`, `were NEVER resolved`) all went rc 0. A gate that reads an unset variable is a
     # no-op gate; the suite caught it only because those four rows pin the belt from the other side.
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
-      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NEGDECL /g; s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)/\1 BLKDECL/; ${_OC_REFMASK}; s/\(p[0-3]\)/ PTAG /g")"
+      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}${_OC_SEP}(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NEGDECL /g; s/(^|[^[:alnum:]])${_OC_CNT}${_OC_SEP}(${_OC_SEV}[[:space:]]+)?block(ing|ers?)/\1 BLKDECL/; ${_OC_REFMASK}; s/\(p[0-3]\)/ PTAG /g")"
     # ⛔ A SEVERITY-ONLY DECLARATION MUST BE MASKED AS THE DECLARATION **ONCE**, AND ONLY WHEN THE
     # NOUN FORM DID NOT ALREADY MASK IT (agent-infra#3902 THIRD review, P1 — the entry gate above now
     # admits `<count> P0|P1`). Without this, `2 P1 were fixed and re-verified` kept its own count on
@@ -1513,7 +1611,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # count and every later count stays countable — which is the same "exactly one may stand" rule the
     # live-mention arm enforces from the other side.
     if ! grep -qE 'BLKDECL' <<<"$_rest"; then
-      _rest="$(printf '%s' "$_rest" | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]]+\(?p[01]\)?/\1 BLKDECL/")"
+      _rest="$(printf '%s' "$_rest" | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}${_OC_SEP}\(?p[01]\)?/\1 BLKDECL/")"
     fi
     # ⛔ THE NEGATION/IN-PROGRESS BELTS ARE READ LINE-WIDE (second review, F1). They were
     # `_clause`-scoped, so a remainder after the declaration's own `;` — the shape an agent actually
@@ -1804,7 +1902,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #     outcome and arm (2) is skipped; arm (1) still applies. Without an `Outcome:` field nothing
   #     changes — the loose arm runs exactly as before, so this cannot widen the fail-open.
   # ⛔ #3400 — A `not-clean` VERDICT SKIPS THE OUTCOME ARMS, AND ONLY THOSE.
-  # Arms (1)/(1b)/(2) below ask "does this artifact say the review did NOT conclude
+  # Arms (1)/(1b)/(1c)/(2) below ask "does this artifact say the review did NOT conclude
   # clean?" and refuse a CLEAN mint when it does. For a not-clean mint that is the
   # WRONG question: an artifact declaring the negative is exactly the evidence an
   # honest negative verdict has, and vetoing it would leave a lane able to record
@@ -1813,8 +1911,13 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # record — so nothing is weakened here: a clean mint still runs every arm below,
   # unchanged and unconditional. (This is also why the veto cannot be reached by a
   # caller who did not ask for it: polarity comes from the VERDICT, not a flag.)
+  # ⛔ AND THE LIST NAMES (1c): the comment and the diagnostic both spelled the skipped set
+  # `1/1b/2` and stopped there (agent-infra#3902 review, P3), so the arm that #2661 added — the one
+  # that reads the artifact's OWN `Outcome:` declaration — was invisible in the place a reader goes
+  # to ask which arms a negative mint skipped. The set is exactly the outcome arms and (1c) is one
+  # of them; a list that omits it reads as "(1c) still ran", which is the opposite of the truth.
   if [ "$polarity" = "not-clean" ]; then
-    printf '%s %s on %s#%s, created %s, postdates head %s (NEGATIVE-polarity evidence: the artifact is expected to declare the not-clean outcome, so arms 1/1b/2 do not apply)\n' \
+    printf '%s %s on %s#%s, created %s, postdates head %s (NEGATIVE-polarity evidence: the artifact is expected to declare the not-clean outcome, so arms 1/1b/1c/2 do not apply)\n' \
       "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
     return 0
   fi
