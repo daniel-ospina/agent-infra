@@ -453,6 +453,63 @@ async function partB() {
       process.env.PATH = prevPath;
       try { rmSync(extDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
+    // ── B10p2: round-11 P2 — THE SEARCH RUNS IN THE CHILD'S ENV, NOT THE GUARD'S
+    //    The exemption above is bought by an executable GIT must find, and git
+    //    searches the environment the command is EXECUTED with. The walker already
+    //    carries that env's `VAR=value` prefixes (`inv.envPrefixes`), so a prefix
+    //    that RESTRICTS `PATH` (or REPLACES `GIT_EXEC_PATH`) narrows what git can
+    //    resolve. Reading only the guard's own `process.env` bought the exemption
+    //    with a shim git would never find, and a persisted `alias.<verb>` then ran
+    //    unclassified: measured on the pre-fix head, `PATH=/usr/bin:/bin git
+    //    fx594ext` executed a persisted `alias.fx594ext='branch -fq victim594
+    //    main'` (branch created) while the classifier answered `branchState:false`.
+    const extEnvDir = mkdtempSync(join(tmpdir(), "mwg594childenv-"));
+    const prevEnvPath = process.env.PATH;
+    try {
+      const shim = join(extEnvDir, "git-fx594env");
+      writeFileSync(shim, "#!/bin/sh\nexit 0\n");
+      chmodSync(shim, 0o755);
+      process.env.PATH = extEnvDir + ":" + prevEnvPath;
+      const childSees = await callBash("git fx594env pull");
+      expectTrue("B10p2a: control — a `git-<cmd>` the CHILD can find stays ALLOWED (no over-block)",
+        childSees === undefined, `handler returned ${JSON.stringify(childSees)}`);
+      const childBlind = await callBash("PATH=/usr/bin:/bin git fx594env pull");
+      expectTrue("B10p2b: #594 a `PATH` prefix that HIDES the shim from the child leaves the verb opaque BLOCKED (the exemption needs an executable GIT can find)",
+        !!childBlind && childBlind.block === true, `handler returned ${JSON.stringify(childBlind)}`);
+      const childBlindEnv = await callBash("env PATH=/usr/bin:/bin git fx594env pull");
+      expectTrue("B10p2c: …the same through `env` (its assignments are argv, not the shell's)",
+        !!childBlindEnv && childBlindEnv.block === true, `handler returned ${JSON.stringify(childBlindEnv)}`);
+    } finally {
+      process.env.PATH = prevEnvPath;
+      try { rmSync(extEnvDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    // The exec-path half, on a FRESH module instance: git's `git_exec_path()`
+    // RETURNS `GIT_EXEC_PATH` when the child sets it (it does not append to it), so
+    // a shim reachable ONLY through the guard's own exec path must stop buying the
+    // exemption once the child replaces that variable. A fresh instance is needed
+    // because the list is probed once per module lifetime, by design.
+    const execShimDir = mkdtempSync(join(tmpdir(), "mwg594execpath-"));
+    const execEmptyDir = mkdtempSync(join(tmpdir(), "mwg594execnone-"));
+    const prevExecPath = process.env.GIT_EXEC_PATH;
+    try {
+      const execShim = join(execShimDir, "git-fx594exe");
+      writeFileSync(execShim, "#!/bin/sh\nexit 0\n");
+      chmodSync(execShim, 0o755);
+      process.env.GIT_EXEC_PATH = execShimDir;
+      const fresh = await import(`${pathToFileURL(join(HERE, "classify-git.mjs")).href}?childenv=${Date.now()}`);
+      expectTrue("B10p2d: control — a shim reachable only via the guard's own GIT_EXEC_PATH is exempt (no over-block)",
+        fresh.classifyGitCommandDetailed("git fx594exe pull").branchState === false,
+        `branchState=${fresh.classifyGitCommandDetailed("git fx594exe pull").branchState}`);
+      const replaced = fresh.classifyGitCommandDetailed(`GIT_EXEC_PATH=${execEmptyDir} git fx594exe pull`);
+      expectTrue("B10p2e: #594 a child `GIT_EXEC_PATH` REPLACES git's exec path — the shim is gone, so the verb is opaque (fail closed)",
+        replaced.branchState === true, `branchState=${replaced.branchState}`);
+    } finally {
+      if (prevExecPath === undefined) delete process.env.GIT_EXEC_PATH;
+      else process.env.GIT_EXEC_PATH = prevExecPath;
+      for (const d of [execShimDir, execEmptyDir]) {
+        try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
     // CONTROL: where an alias genuinely CAN win, the destructive shape is still
     // gated exactly as it was (the review's verified `branch(op=force)` case).
     const aliasWins = await callBash("git -c alias.x='branch -fq victim main' x");

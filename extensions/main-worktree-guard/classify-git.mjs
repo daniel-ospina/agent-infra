@@ -4444,18 +4444,44 @@ function _splitAliasValue(value) {
  * `X_OK`, not mere existence — a non-executable `git-foo` never wins a lookup, so
  * it must not buy an exemption.
  *
+ * ⛔ THE SEARCH RUNS IN THE CHILD, NOT IN THE GUARD (round-11 P2, measured
+ * FAIL-OPEN). git searches the environment the command is EXECUTED with, and the
+ * walker already carries the `VAR=value` prefixes bash puts in that child's env
+ * (`inv.envPrefixes`) — so a prefix that RESTRICTS `PATH` or REPLACES
+ * `GIT_EXEC_PATH` narrows what git can find. Resolving only against the guard's
+ * own `process.env` therefore bought an exemption with an executable git would
+ * NEVER find, and a persisted `alias.<verb>` (which the guard classifies as
+ * harmless) then ran unclassified. Measured on this box: a `git-fx594ext` shim on
+ * the GUARD's `PATH` plus a persisted destructive `alias.fx594ext` —
+ * `PATH=/usr/bin:/bin git fx594ext` made git run the ALIAS and create the branch,
+ * while the classifier answered `branchState:false` (ALLOW).
+ *
+ * Resolution order per variable is the same as `resolveEnv`'s, for the same
+ * reason: the invocation's LAST matching prefix, then `process.env`. Two
+ * deliberate differences, both in the FAIL-CLOSED direction:
+ *   · `inv.vars` is NOT consulted. The walker's `frame().vars` merges `A=1` and
+ *     `export A=1` with no export flag (see the `GIT_CONFIG_COUNT` round-8 note),
+ *     so a shell variable there may be invisible to git; trusting it would buy an
+ *     exemption git cannot see — the very fail-open this fixes. When it carries
+ *     the name with a value the child's env does not already hold, the search is
+ *     UNREADABLE and answers `false` (the verb stays opaque).
+ *   · a command-local `GIT_EXEC_PATH` REPLACES git's exec path rather than adding
+ *     to it (`git_exec_path()` returns the variable when it is set), so the
+ *     guard's own value must not survive it.
+ *
  * ⛔ FAIL-CLOSED ON AN UNREADABLE PATH — an error here returns `false`, which
  * leaves the verb `aliasOpaque` (the over-block), never a silent admission. The
  * inverse direction would be a bypass: a `PATH` the guard cannot read must not be
  * allowed to buy an alias exemption.
  * @param {string} verb the spelled subcommand word
+ * @param {object} [inv] the invocation whose CHILD env the search must mirror
  * @returns {boolean} true iff a `git-<verb>` executable is resolvable
  */
 const _gitExternalPathCache = new Map();
-// The exec-path list is probed ONCE per process: it needs a `git` call, and it
-// cannot change inside a session (a `GIT_EXEC_PATH` prefix on ONE command is the
-// command's own env, not the guard's — and not reading it is the fail-closed
-// direction, since the verb then stays opaque).
+// The exec-path list is probed ONCE per process: it needs a `git` call, and the
+// GUARD's own view of it cannot change inside a session. A command-local
+// `GIT_EXEC_PATH` prefix is NOT this list — it is read per invocation by
+// `_invEnvValue` in `_gitSearchDirs`, because it replaces what git searches.
 let _gitExecPathDirsCache;
 function _gitExecPathDirs() {
   if (_gitExecPathDirsCache !== undefined) return _gitExecPathDirsCache;
@@ -4473,12 +4499,63 @@ function _gitExecPathDirs() {
   _gitExecPathDirsCache = dirs.filter((d) => d.length > 0);
   return _gitExecPathDirsCache;
 }
-function _gitExternalOnPath(verb) {
+/**
+ * The `VAR=value` prefix the CHILD env receives for `name`, LAST match winning
+ * (bash applies the later assignment) — or `undefined` when no prefix sets it, in
+ * which case the child inherits `process.env`.
+ * @param {object} inv
+ * @param {string} name
+ * @returns {string|undefined}
+ */
+function _invEnvValue(inv, name) {
+  const prefixes = (inv && inv.envPrefixes) || [];
+  for (let i = prefixes.length - 1; i >= 0; i--) {
+    const p = String(prefixes[i] ?? "");
+    const e = p.indexOf("=");
+    if (e > 0 && p.slice(0, e) === name) return p.slice(e + 1);
+  }
+  return undefined;
+}
+/**
+ * The invocation's shell state may have set `name` in a way the child env does
+ * not show — `export A=1` and a plain `A=1` are one map to the walker. Unreadable,
+ * never "unset": the caller must stay fail-closed.
+ * @param {object} inv
+ * @param {string} name
+ * @returns {boolean}
+ */
+function _invEnvUnreadable(inv, name) {
+  if (!inv || !inv.vars || !Object.prototype.hasOwnProperty.call(inv.vars, name)) return false;
+  const v = inv.vars[name];
+  if (v === undefined || v === null) return false;
+  return String(v) !== String(process.env[name] ?? "");
+}
+/**
+ * The directories git would search for `git-<verb>` in THIS invocation's child
+ * env: its `GIT_EXEC_PATH` (replacing) then its `PATH`.
+ * @param {object} [inv]
+ * @returns {string[]|null} null when the child env cannot be read (fail closed)
+ */
+function _gitSearchDirs(inv) {
+  const prefixPath = _invEnvValue(inv, "PATH");
+  const prefixExec = _invEnvValue(inv, "GIT_EXEC_PATH");
+  if (prefixPath === undefined && _invEnvUnreadable(inv, "PATH")) return null;
+  if (prefixExec === undefined && _invEnvUnreadable(inv, "GIT_EXEC_PATH")) return null;
+  const execDirs = prefixExec !== undefined
+    ? String(prefixExec).split(":")
+    : _gitExecPathDirs();
+  const pathDirs = prefixPath !== undefined
+    ? String(prefixPath).split(":")
+    : String(process.env.PATH ?? "").split(":");
+  return [...execDirs, ...pathDirs];
+}
+function _gitExternalOnPath(verb, inv) {
   const name = String(verb ?? "");
   // git looks up `git-<word>` as a FILE NAME: a word carrying a separator, a
   // leading `-`, or shell syntax cannot name one, so it is never external.
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) return false;
-  const searchDirs = [..._gitExecPathDirs(), ...String(process.env.PATH ?? "").split(":")];
+  const searchDirs = _gitSearchDirs(inv);
+  if (searchDirs === null) return false; // unreadable child env → stay opaque
   const cacheKey = searchDirs.join(":") + "\u0000" + name;
   const cached = _gitExternalPathCache.get(cacheKey);
   if (cached !== undefined) return cached;
@@ -4561,7 +4638,7 @@ function _expandAliasInvocations(invocations) {
     // builtin is unaffected (git's precedence is builtin > alias), so it is
     // classified as before rather than over-blocked.
     const aliasMayApply = GIT_ALIAS_PRECEDES_BUILTIN.has(verb) ||
-      (!GIT_BUILTIN_COMMANDS.has(verb) && !_gitExternalOnPath(verb));
+      (!GIT_BUILTIN_COMMANDS.has(verb) && !_gitExternalOnPath(verb, inv));
     if (res.unreadableAliases && aliasMayApply) return { ...inv, aliasName: verb, aliasOpaque: true };
     // ⛔ THE LOOKUP IS CASE-INSENSITIVE, because git's alias lookup keys the
     // command name into the config key `alias.<cmd>`, whose name part is
@@ -4592,7 +4669,7 @@ function _expandAliasInvocations(invocations) {
     // persisted-alias residual below is unchanged: with no `git-<verb>` on the
     // exec path an unreadable name stays opaque and still fails closed.
     if (!GIT_BUILTIN_COMMANDS.has(verb)) {
-      if (_gitExternalOnPath(verb)) return inv;
+      if (_gitExternalOnPath(verb, inv)) return inv;
       return { ...inv, aliasName: verb, aliasOpaque: true };
     }
     return inv;
