@@ -283,6 +283,21 @@ PRD="$HERE/../pr-doctor.py"
 PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
 [ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
 ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (${SEAM:-?}s) — a python/branch literal pair that CANNOT drift" $rc
+# ⛔ AND THE REGISTRY'S COPY IS A THIRD ONE, PINNED BY NOTHING UNTIL NOW (agent-infra#4034 review, P2).
+# `lane_registry.py`'s `DEFAULT_BUDGET_S` is not a display constant: `_record_problem`/`start` derive
+# `lease_until = heartbeat_at + budget_s` from it and `lane_registry.py:437` ENFORCES that invariant on
+# every read, so a stale copy computes a FALSE `EXPIRED` for a live lane — and `docs/ops/lane-registry.md:193`
+# states what that costs (the lane is re-dispatched). Measured before this arm existed: `grep -rn
+# DEFAULT_BUDGET_S` returned only the definition and its two use sites, `scripts/test_lane_registry.py`
+# always passes an explicit `budget=`, and this suite pinned pr-doctor's copy and ai-drainer's but never
+# this one — the single listed file in the sweep whose literal could drift silently. Read from the entry
+# that OWNS it, and fail (not fall back) when it is unreadable: a default here would be the same defect
+# wearing a default's clothes.
+REG="$HERE/lane_registry.py"
+REG_DEF="$(sed -n 's/^DEFAULT_BUDGET_S = \([0-9][0-9]*\).*/\1/p' "$REG" | head -1)"
+case "${REG_DEF:-}" in ''|*[!0-9]*) REG_DEF="" ;; esac
+[ -n "${REG_DEF:-}" ] && [ "$REG_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) lane_registry's DEFAULT_BUDGET_S (${REG_DEF:-UNREADABLE — the arm cannot assert a lease it cannot derive}s) is the harness BACKSTOP (${SEAM:-?}s), not a stale copy that would read a live lane EXPIRED" $rc
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc

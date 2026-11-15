@@ -124,9 +124,13 @@ esac
 #   gate wait for the WHOLE merge term and losing the 1800 + 300 either side of it. At `_gw` = 3900 the
 #   merge term is 6000 s and the sum is 49290 s — OVER the 48000 s default below by 1290 s, exactly as
 #   it was OVER the old 18000 s default by 2490 s. ⚠️ THAT RESIDUAL IS PRE-EXISTING AND IS NOT CLOSED
-#   HERE: the shipped default gate wait (`_gw` = 900) gives 46290 s, which 48000 s covers with 810 s to
+#   HERE: the shipped default gate wait (`_gw` = 900) gives 46290 s, which 48000 s covers with 1710 s to
 #   spare, and an operator who RAISES the gate wait must raise this default with it (`CLAIM_ISSUE_TTL`
-#   is the override). At the defaults the margin is 810 s.
+#   is the override). At the defaults the margin is 1710 s. ⛔ THE NUMBER THAT STOOD HERE WAS 810, WHICH
+#   IS NOT THAT SUBTRACTION: 48000 − 46290 = 1710, and 810 is not a residual of any pair in the table
+#   above (the 49290 s over-read is 1290 OVER, not 810 under). Recount it off the four rows, never off
+#   this sentence — the block exists because the earlier sentence mis-summed, so a third mis-sum here is
+#   the exact failure mode it was written to end.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -168,6 +172,24 @@ esac
 # time (43200 since agent-infra#4034). The
 # assertions that pin the real behaviour are `branch-claim.test.sh` case 10.)*
 # ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
+#
+# ⛔ RESIDUAL, STATED: THIS TERM IS NOW SHORTER THAN ONE LANE (agent-infra#4034 review, P3). At the
+# shipped values `CLAIM_BRANCH_TTL` (14400 s = 4 h) sits BELOW a single lane's backstop
+# (`LANE_BACKSTOP_S` = 36000 s = 10 h), where before #4034 it sat ABOVE it (14400 vs 7200). The batch
+# term therefore no longer covers even ONE worst-case lane, let alone the batch it is taken for, and
+# nothing renews it: `claim_branch_acquire` mints once, `claim-reaper.sh` ABSTAINS on branch keys by
+# design (`*/branch-*` → ABSTAIN-BRANCH-KEY, because the holder pid is the acquiring CLI), and so
+# expiry is reached through `claim_prune` alone. The observable cost is not silent: the pre-push guard
+# refuses with `reason=claim-expired-unreclaimed … the stale claim must be reclaimed
+# (branch-claim.sh acquire <br>)` (:1123), so pushes stop until the holder re-acquires — a batch of
+# long lanes can outlive its own branch claim mid-flight, which is the mid-batch loss this key exists
+# to prevent, arriving through the TERM rather than through a peer.
+# ⛔ NOT CLOSED HERE, DELIBERATELY: the fix is a single knob (`CLAIM_BRANCH_TTL`), and which number a
+# batch wants is a property of the batch, not of this file — a default raised here would be a guess
+# that also raises the ceiling (they are the same value by construction, :154-157) for every batch that
+# does NOT need 10 h. So an operator running a batch of >4 h lanes sets `CLAIM_BRANCH_TTL` to cover the
+# batch's own term; `branch-claim.test.sh` case 10 pins that the knob raises the default and the
+# ceiling together, so the escape cannot split the term. Revisit if any batch is measured to hit it.
 CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
 case "${CLAIM_BRANCH_TTL:-}" in
   ''|*[!0123456789]*|0*) CLAIM_BRANCH_TTL=14400 ;;
@@ -1229,7 +1251,10 @@ _claim_commit_time() {
   #   committer a <a@b> <NOW> +0000 1 +0000   -> git %ct = NOW      (0 s old)
   #                                          -> _claim_commit_time = 1
   #
-  # and `claim_prune` then DELETED the claim as `1793991810s old, PAST the 18000s bound`. The `> ` anchor
+  # and `claim_prune` then DELETED the claim as `1793991810s old, PAST the 18000s bound`. (That is the
+  # line AS MEASURED, when the bound was 18000 s; the same message renders `PAST the 48000s bound` since
+  # agent-infra#4034 raised it — the quote is a record of the incident, and `test-claims.sh` A21 pins the
+  # CURRENT string, so a reader grepping for this one will not find it in the code and that is expected.) The `> ` anchor
   # means the accepted stamp is the one in the field git reads, and any OTHER `digits +-dddd` tail is
   # simply not a match — which lands on rc=1 (unmeasurable, KEPT and NAMED) instead of a forged age.
   # A76-A78 only exercised a token the `$` anchor REJECTS (`+0000 junk`), so they pinned the shape of the
@@ -1302,7 +1327,9 @@ _claim_commit_time() {
   # whatever else the line carries, so a newest header with ANY trailing token
   # (`committer a <a@b> 1 +0000 junk`) is filtered out by the `$` anchor and `tail` then returns an
   # EARLIER committer line — measured: a claim `git log --format=%ct` dates as 1 s old was reaped with
-  # `the claim commit is 1793991810s old, PAST the 18000s bound`, i.e. the exact forged-age steal the
+  # `the claim commit is 1793991810s old, PAST the 18000s bound` (AS MEASURED, when the bound was
+  # 18000 s; it renders `PAST the 48000s bound` since agent-infra#4034 — see the note at the sibling
+  # quote above), i.e. the exact forged-age steal the
   # two-header rule above exists to close, one token over. Selecting and parsing are two steps for that
   # reason: a NEWEST header this parser cannot read makes the age UNMEASURABLE (rc=1 below, so the
   # caller keeps and NAMES the claim), never a silent fallback to older text.

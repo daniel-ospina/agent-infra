@@ -136,6 +136,19 @@
 #                          raised that backstop 5x to 36000 s. The progress bound — not the wall — is
 #                          what ends a wedged lane, so this window follows the BACKSTOP and
 #                          lane-bound.test.sh pins the ordering)
+#                          ⛔ AND IT ERRS IN BOTH DIRECTIONS — THE OTHER ONE IS NOT FREE
+#                          (agent-infra#4034 review, P2). `live` is decided on the log's mtime ALONE
+#                          (no process, no progress gate — see cmd_count), and the numerator is what
+#                          `orch-loop.sh` refuses dispatch on (`LANES -ge MAX_LANES` → lanes_full).
+#                          So a window that is TOO LONG is not the safe side: a leaked or stuck tree
+#                          whose log stopped 2–10 h ago now reads LIVE where it read dead, `lanes=`
+#                          inflates toward the total, and the controller stops adding work for up to
+#                          the window — against the measured `lanes=14/76` (62 silent residents) that
+#                          shape collapses toward 76/76. Below the backstop is the OVER-ADMIT
+#                          direction (dispatch onto a full box, #2159); above it is the OVER-BLOCK one
+#                          (a full box reads full of ghosts). No number avoids both, because the proxy
+#                          is a file age: the escape is this seam, and `lane-reap.test.sh`'s
+#                          LIVE-WINDOW arm measures each direction on the same tree.
 #   LANE_REAP_LOG          durable pass log (default ~/.pi/agent/state/lane-reap.log)
 #   LANE_REAP_LOCK         single-run lock (default ~/.pi/agent/state/lane-reap.lock)
 #   LANE_REAP_TIMEOUT_BIN  timeout(1) (default: timeout; unresolvable ⇒ shell fallback, as on macOS)
@@ -174,6 +187,16 @@ CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 # the registry exists to surface. The env seam keeps its documented `LANE_REAP_` prefix.
 LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
 NO_LOG_H="${LANE_REAP_NO_LOG_H:-12}"
+# ⛔ THIS WINDOW TRADES TWO FAILURES AGAINST EACH OTHER, AND BOTH ARE REAL (#4034 review, P2).
+# TOO SHORT → a lane alive inside one long silent tool call counts DEAD to the MAX_LANES gate and the
+#   box over-admits (the #2159 OOM direction). That is why it must sit ABOVE the wall backstop, which
+#   is what forced 125 → 601 when agent-infra#4034 moved the backstop 7200 → 36000.
+# TOO LONG → the same proxy counts a leaked/stuck tree LIVE for up to the window (log mtime alone, no
+#   process or progress gate), which inflates the numerator `orch-loop.sh` gates dispatch on and makes
+#   a box full of ghosts read full for up to 10 h. The repo's own measured shape (14 live of 76
+#   resident, 62 silent) is what that direction costs, and it is NOT closed by choosing a number: the
+#   proxy is a file age. An operator on a box carrying silent residents lowers this seam deliberately.
+# `lane-reap.test.sh`'s LIVE-WINDOW arm measures BOTH directions on one tree, so neither is prose-only.
 LIVE_MIN="${LANE_REAP_LIVE_MIN:-601}"
 READ_TIMEOUT="${LANE_REAP_READ_TIMEOUT:-60}"
 # The budget for ONE pass, in seconds. A controller calls `count` every cycle, and the per-read
