@@ -79,15 +79,25 @@
 #                   spawn-gate.sh::run_agent, so the probe measures the model the lane will run.
 #   --repo <path>   the checkout to measure for the staleness reading (#3932). Same value as
 #                   `CELL_PREFLIGHT_REPO`, and it wins over it. NOT a way to switch the field off: a
-#                   named path that is not a checkout is reported (`repo=none … reason=not-a-checkout`),
-#                   never silently replaced by a guess. (`spawn-gate.sh`'s own spawn point names the
+#                   named path that is not IN a checkout is reported (`repo=none … reason=not-a-checkout`),
+#                   never silently replaced by a guess. A named path INSIDE a checkout (a subdirectory
+#                   rather than its root) resolves to that checkout's top level, because "which tree is
+#                   this work built on" is a property of the tree, not of the depth the caller happened
+#                   to be standing at. (`spawn-gate.sh`'s own spawn point names the
 #                   checkout through `CELL_PREFLIGHT_REPO` instead of this flag, on purpose: `$O` is
 #                   seeded file by file, so a caller passing a flag a deployed copy predates makes that
 #                   copy exit 2 `why=usage` — a version skew that would refuse every spawn.)
+#                   ⛔ AND NAMING IS A DEFEAT PATH, WHICH THIS LINE STATES RATHER THAN IMPLIES (this
+#                   change's review, P3-2). A caller that names a DIFFERENT, fresher checkout reads
+#                   `behind=0`, so `--repo`/`CELL_PREFLIGHT_REPO` can make the reading DISAPPEAR and not
+#                   merely "more specific". The invariant this file actually delivers is the narrow one:
+#                   the THRESHOLD and the BOUND have no flag, so a caller cannot widen the bar it is
+#                   judged against — it can only redirect WHAT is judged, which the reading line states
+#                   (`repo=`), so the redirection is disclosed on the artifact an operator reads.
 #
 # ENVIRONMENT (the staleness reading, #3932 — the THRESHOLD and the BOUND have no flag, because they
-# are policy, not a reading: a caller must not be able to turn its own readiness field off. Naming the
-# checkout is a different thing, and it has one):
+# are policy, not a reading: a caller must not be able to widen the bar it is judged against. Naming the
+# checkout is a different thing, and it has one — see the residual above):
 #   CELL_PREFLIGHT_REPO        the checkout to measure. Resolution order, first that EXISTS:
 #                              `--repo`, then `${CELL_PREFLIGHT_REPO}`, then `$PWD` (for a lane that is
 #                              the worktree it will build on), then `${CELL_HOME}/agent-infra`, then
@@ -100,7 +110,9 @@
 #                              other. `resolve_repo`'s own `tried=` note reports this same order.
 #                              Nothing found is `repo=none behind=unknown` — reported, never refused.
 #   CELL_PREFLIGHT_MAX_BEHIND  refuse when the checkout is MORE than this many commits behind
-#                              `origin/main`. Default 50.
+#                              `origin/main` AND it is a BASE (`role=base` on the reading line). A
+#                              checkout that already carries commits of its own (`role=branch`) is
+#                              REPORTED and never refused — see the ROLE paragraph below. Default 50.
 #   CELL_PREFLIGHT_FETCH_BOUND the fetch gets this many seconds before it is killed and the reading
 #                              becomes `behind=unknown`. Default 12.
 #
@@ -179,6 +191,29 @@ emit() {
 # sibling issues describe). A fetch that fails or times out yields `behind=unknown` and does NOT refuse —
 # an unanswerable network read is a WARN, the same doctrine as `no-answer`.
 #
+# ⛔ THE READING SAYS WHICH ROLE IT MEASURED, AND ONLY A BASE CAN REFUSE (this change's review, P1).
+# `behind=` counts commits main has that the checkout lacks, and that ONE number means two DIFFERENT
+# things depending on whether anything has been built on the tree already:
+#   role=base    HEAD is an ANCESTOR of `origin/main` — nothing has been built here yet, so the count is
+#                THE DISTANCE BETWEEN THE BASE AND MAIN, which is what `CELL_PREFLIGHT_MAX_BEHIND` is
+#                calibrated for (a two-day-old box is not an outage). A base beyond it produces a
+#                plausible log and a WRONG diff — it re-derives what main fixed, or reverts it — so it
+#                REFUSES (`why=stale-code`, 85).
+#   role=branch  HEAD carries commits of its own: a PR branch under repair, or a lane worktree a resume
+#                already put commits into. The same count is then mostly MAIN'S OWN COMMITS the branch
+#                has not merged yet — which for a fixer is the ASSIGNED WORK, not a defect. Refusing it
+#                is deterministic and non-transient, and the only work that would clear it is the work
+#                the refusal blocks BEFORE the process starts: a deadlock with no self-clearing path
+#                (`fix-one.sh` passes `WIP_PATH="$WT"`, a worktree checked out on the PR branch). So it
+#                is REPORTED (`stale_base=1` when over the threshold, plus a remedy on stderr) and never
+#                refused: the branch's dispatcher is already ordered to integrate `origin/main` — the
+#                generated brief says so in as many words — and #3932 ask 2 (a sanctioned fast-forward
+#                the gate itself may perform) is what would let this file do it instead.
+#   role=unknown an unreadable merge-base (a shallow clone, a `git` that cannot answer). Never refuses:
+#                an unmeasurable reading is a WARN, the same doctrine as `no-answer`.
+# ⛔ SO THE REFUSAL'S SUBJECT IS STATED, NOT ASSUMED: a caller reading `why=stale-code` knows a BASE was
+# measured, and a branch that is far behind is visible on an `ok` line without being a stall.
+#
 # ⛔ THE FETCH'S OWN EXIT STATUS IS THE ONLY THING THAT MAKES THAT SENTENCE TRUE (this change's review).
 # The first cut fetched in the background and then read `rev-list` UNCONDITIONALLY. But a failed fetch
 # does not delete `origin/main` — it leaves the last one it saw — so `rev-list` answers, and the gate
@@ -226,11 +261,20 @@ REPO_ARG=""
 #     resolved the LIVE `/tmp/cell-ai` instead — a red on the boxes this gate runs on, and a `git fetch`
 #     of a live checkout from inside a suite (this change's review, P2-3, measured).
 resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing was measured
-  local cand
+  local cand top
   REPO_FOUND=""
   for cand in "${REPO_ARG:-}" "${CELL_PREFLIGHT_REPO:-}"; do
     [ -n "$cand" ] || continue
     [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
+    # ⛔ A NAMED PATH INSIDE A CHECKOUT IS THAT CHECKOUT, NOT "NOT-A-CHECKOUT" (this change's review,
+    # P3-1). `spawn-gate.sh` names `$WIP_PATH`/`$PWD` unconditionally, so a spawn whose cwd is a
+    # SUBDIRECTORY of a checkout used to report `reason=not-a-checkout` → `behind=unknown` → admitted on
+    # a WARN: the gate went quiet for every caller that was not standing at the tree's root, which is
+    # the no-op-gate class. Walking UP answers the question the caller asked ("which tree is this work
+    # on"), and a path that is in NO checkout still takes the not-a-checkout arm below — the STOP stays,
+    # because looking somewhere other than where you were told is the defect one step later.
+    top="$( cd "$cand" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )"
+    [ -n "$top" ] && [ -e "$top/.git" ] && { REPO_FOUND="$top"; return 0; }
     REPO_NOTE="reason=not-a-checkout path=$cand"
     return 1
   done
@@ -245,8 +289,23 @@ resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing 
   return 1
 }
 
+# freshness_field <reading> <name> -> the token after `<name>=`, empty when the field is absent.
+# ⛔ THE FIELD IS TAKEN FROM ITS STRUCTURAL POSITION, AND THE SEARCH IS FOR THE FIRST OCCURRENCE: the
+# reading ends in fields this function does not own on every path, and `max_behind=` CONTAINS `behind=`. `behind=`
+# is therefore emitted before any longer field that ends in it, so `#*behind=` yields the distance.
+# A caller that matched the word anywhere would classify a numeric reading as unmeasurable (or the
+# reverse) whenever a trailing field happened to contain it — the fail-open this file already records
+# once for `why=`.
+freshness_field() {
+  local rest="${1#*$2=}"
+  case "$rest" in
+    "$1") printf '' ;;                 # absent: the prefix never matched, so the string is unchanged
+    *)     printf '%s' "${rest%%[[:space:]]*}" ;;
+  esac
+}
+
 code_freshness() {
-  local repo="" behind="" fp n fetch_rc
+  local repo="" behind="" role="" fp n fetch_rc att=1 errf
   REPO_NOTE=""
   resolve_repo || REPO_FOUND=""
   repo="$REPO_FOUND"
@@ -261,21 +320,54 @@ code_freshness() {
   # the exact false PASS this reading exists to remove, one line under the rule that a ref not refreshed
   # this run is not a measurement. Naming the destination makes the refresh structural instead of
   # dependent on a config the probe does not own.
-  ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null 2>&1 ) &
-  fp=$! n=0
-  while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
-  kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
-  # The watchdog's kill, a dead network and a missing remote ALL land here as non-zero, and all three
-  # mean the same thing: whatever `origin/main` now holds was not read from the remote this run.
-  wait "$fp" 2>/dev/null; fetch_rc=$?
+  errf="${TMPD:-${TMPDIR:-/tmp}}/fetch-stderr.$$"
+  while :; do
+    ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' ) >/dev/null 2>"$errf" &
+    fp=$! n=0
+    while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
+    kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
+    # The watchdog's kill, a dead network and a missing remote ALL land here as non-zero, and all three
+    # mean the same thing: whatever `origin/main` now holds was not read from the remote this run.
+    wait "$fp" 2>/dev/null; fetch_rc=$?
+    # ⛔ A LOSING FETCH IN A DISPATCH WAVE IS NOT A DEAD NETWORK (this change's review, P3-3, MEASURED).
+    # Every lane on a box fetches into the SAME clone once per spawn, so concurrent probes CAS-race on
+    # `refs/remotes/origin/main`; the losers exit 1 with `error: cannot lock ref 'refs/remotes/origin/main':
+    # is at X but expected Y` — measured here at 7 of 8 concurrent fetches failing in ONE wave. Publishing
+    # that as `behind=unknown` makes the gate go QUIET exactly while a wave is dispatching, which is the
+    # one moment it is load-bearing. The loser's reading is recoverable by RE-RUNNING (once the winner
+    # has landed the ref, the loser's update is a no-op and the fetch exits 0), so a fetch that failed ON
+    # THE CONCURRENCY CLASS is retried, twice at most. ⛔ THE MATCH IS ON THE ERROR TEXT AND NOT ON "any
+    # non-zero": a dead network or a blackholed remote must not buy itself two more bounds of wall clock
+    # on the spawn path.
+    if [ "$fetch_rc" -ne 0 ] && [ "$att" -lt 3 ] &&
+       grep -qE 'cannot lock ref|Unable to create .*[.]lock' "$errf" 2>/dev/null; then
+      att=$((att+1)); sleep 1; continue
+    fi
+    break
+  done
+  rm -f "$errf"
   if [ "${fetch_rc:-1}" -ne 0 ]; then
-    printf 'repo=%s behind=unknown reason=fetch-failed fetch_rc=%s' "$(basename "$repo")" "$fetch_rc"
+    printf 'repo=%s behind=unknown reason=fetch-failed fetch_rc=%s fetch_attempts=%s' \
+      "$(basename "$repo")" "$fetch_rc" "$att"
     return 0
   fi
   behind="$( cd "$repo" 2>/dev/null && git rev-list --count HEAD..origin/main 2>/dev/null )"
+  # ⛔ ROLE: IS ANYTHING BUILT ON THIS TREE, OR IS IT A BARE BASE? (`HEAD..origin/main` is the right
+  # number for a base and mostly main's own unmerged commits for a branch — the ROLE paragraph in the
+  # header is the contract.) `merge-base --is-ancestor` answers it in ONE read: 0 = HEAD is reachable
+  # from origin/main = nothing local = base; 1 = it carries commits of its own = branch; anything else
+  # is a tree that cannot answer (`role=unknown`), which refuses nothing.
+  ( cd "$repo" 2>/dev/null && git merge-base --is-ancestor HEAD origin/main ) >/dev/null 2>&1
+  case $? in
+    0) role=base ;;
+    1) role=branch ;;
+    *) role=unknown ;;
+  esac
   case "${behind:-}" in
-    ''|*[!0-9]*) printf 'repo=%s behind=unknown reason=rev-list-unreadable' "$(basename "$repo")" ;;
-    *)           printf 'repo=%s behind=%s' "$(basename "$repo")" "$behind" ;;
+    ''|*[!0-9]*) printf 'repo=%s behind=unknown reason=rev-list-unreadable role=%s fetch_attempts=%s' \
+                   "$(basename "$repo")" "$role" "$att" ;;
+    *)           printf 'repo=%s behind=%s role=%s fetch_attempts=%s' \
+                   "$(basename "$repo")" "$behind" "$role" "$att" ;;
   esac
 }
 
@@ -438,6 +530,9 @@ attempt() {
 # The refusal is taken from the LAST attempt only: a fast failure after a hang is not a confirmation.
 attempts_used=0
 last=""
+# Set when a BRANCH checkout is over the threshold: the reading rides the `ok` line as `stale_base=1`
+# instead of being refused (the ROLE paragraph in the header).
+STALE_BRANCH=""
 n=1
 while [ "$n" -le "$ATTEMPTS" ]; do
   attempt "$n"
@@ -447,11 +542,22 @@ while [ "$n" -le "$ATTEMPTS" ]; do
       # ⛔ THE BOX CAN ANSWER; IS ITS CODE CURRENT? A stale base is the failure this gate was blind to
       # (#3932): the model call succeeds and the lane then builds on a month-old checkout.
       FRESHNESS="$(code_freshness)"
-      FRESH_BEHIND="${FRESHNESS##*behind=}"
+      FRESH_BEHIND="$(freshness_field "$FRESHNESS" behind)"
+      FRESH_ROLE="$(freshness_field "$FRESHNESS" role)"
       case "$FRESH_BEHIND" in
         ''|*[!0-9]*) : ;;   # unmeasurable: reported below, never a refusal
         *)
-          if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ]; then
+          # ⛔ THE THRESHOLD APPLIES TO A BASE, WHICH IS WHAT IT WAS CALIBRATED FOR (this change's review,
+          # P1). A branch over the threshold is REPORTED (`stale_base=1`) and ADMITTED: its distance is
+          # mostly main's own unmerged commits, its dispatcher is already ordered to integrate them, and
+          # a refusal there is a permanent deadlock — the fixer that would advance the branch is the
+          # process being refused. See the ROLE paragraph in this file's header.
+          if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ] && [ "$FRESH_ROLE" != "base" ]; then
+            STALE_BRANCH=1
+            [ "$QUIET" = "1" ] || printf '%s\n' \
+              "[$PROG] the checkout on the reading line is a BRANCH (role=$FRESH_ROLE) more than ${MAX_BEHIND} commits behind origin/main, and that is REPORTED, never refused: on a branch the count is mostly main's own unmerged commits, and for a fixer integrating them IS the assigned work. ADMITTED — the generated brief already orders the integration ('merge origin/main' into the branch). No action is needed for readiness; a BASE checkout in this state would have been refused." >&2
+          fi
+          if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ] && [ "$FRESH_ROLE" = "base" ]; then
             # ⛔ EXIT 3, LIKE EVERY OTHER REFUSAL (this change's review). The first cut exited 1, and on
             # this file's own documented table `1` is not a verdict at all — the caller's "no verdict"
             # arm exists for exactly `rc=1` ("absent or could not start") and WARNS on it. It happened to
@@ -465,7 +571,7 @@ while [ "$n" -le "$ATTEMPTS" ]; do
           fi
           ;;
       esac
-      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE $FRESHNESS"
+      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE $FRESHNESS${STALE_BRANCH:+ stale_base=1}"
       exit 0
     fi
     # answered, then failed or hung

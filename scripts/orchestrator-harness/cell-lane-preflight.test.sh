@@ -102,6 +102,28 @@
 #                                            the boundary itself must not refuse. `-gt` → `-ge` left the
 #                                            whole suite green, so nothing pinned it (review of
 #                                            92ec5cd67, P2-1).
+# A28 a PR-BRANCH worktree over the          → `ok` + `role=branch` + `stale_base=1`, exit 0. The count
+#     threshold                              is the same number A17 REFUSES on, and the difference is
+#                                            what the tree IS: on a base it is the distance from main, on
+#                                            a branch it is mostly main's own unmerged commits — i.e. the
+#                                            fixer's ASSIGNED WORK. Refusing it there is a deadlock the
+#                                            refused process can never clear (review of 38f24c074, P1).
+# A29 a NAMED SUBDIRECTORY of a checkout    → measured, as `repo=<the checkout>`. `spawn-gate.sh`
+#                                            names `$PWD`/`$WIP_PATH` unconditionally, so pre-fix every
+#                                            spawn whose cwd was not the tree's root degraded to
+#                                            `reason=not-a-checkout` → `behind=unknown` → admitted on a
+#                                            WARN (review of 38f24c074, P3-1).
+# A30 a named path that is in NO checkout   → still `reason=not-a-checkout`: the walk-up in A29 must not
+#                                            invent a checkout for a directory that has none.
+# A31 a fetch that LOSES the ref lock race  → still MEASURED (`behind=3`), via ONE bounded retry. Every
+#                                            lane fetches into the same clone per spawn, so concurrent
+#                                            probes CAS-race on `refs/remotes/origin/main` — MEASURED at
+#                                            7 of 8 concurrent fetches failing in one wave. Publishing
+#                                            that as `behind=unknown` silences the gate exactly during a
+#                                            dispatch wave (review of 38f24c074, P3-3).
+# A32 a fetch that fails for a NETWORK      → NOT retried (`fetch_attempts=1`): the retry above is scoped
+#     reason, not a lock                     to the concurrency class, so a dead network does not buy
+#                                            itself two more bounds of wall clock on the spawn path.
 #
 # ⛔ EVERY PROBE INVOCATION IN THIS FILE CONTROLS ITS CWD. Read `from_neutral` before adding an arm:
 # an arm that runs the probe from the suite's own cwd measures whatever checkout the SUITE lives in
@@ -135,6 +157,16 @@
 #      A13 goes red too (`expected exit 0, got 3 … why=stale-code … behind=60`).
 # (M7) `-gt` → `-ge` on the threshold comparison: A27 goes red (`behind == max_behind` refuses).
 #      Measured: pre-A27 that edit left the suite 85/0 green.
+# (M8) drop the `role=` scoping and refuse on the number alone (`if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ]`,
+#      the pre-fix shape): A28 goes red with `expected exit 0, got 3 … why=stale-code`. That is the
+#      deadlock the fixer population lives with, made executable.
+# (M9) drop the `git rev-parse --show-toplevel` arm from `resolve_repo` (the pre-fix shape): A29 goes
+#      red (`expected … repo=repo, got: reason=not-a-checkout`) while A30 STAYS GREEN — which is the
+#      point of having both, since the two arms have opposite expectations for the same code.
+# (M10) delete the lock-class retry (`[ "$att" -lt 3 ] && grep -qE 'cannot lock ref…'`): A31 goes red
+#      (`expected 'behind=3', got: behind=unknown reason=fetch-failed`). Make it retry on ANY non-zero
+#      fetch instead: A32 goes red (`expected fetch_attempts=1`, got 2) — the two arms together pin both
+#      the retry AND its bound.
 # ⚠️ THE EARLIER HEADER ON THIS FILE NAMED A DIFFERENT MUTATION WITH COUNTS THAT BELONGED TO A THIRD
 # ONE (review of #2991, P2, reproduced by the reviewer). The old counts are deleted rather than
 # restated: a number that does not reproduce under the mutation it names is a claim about process
@@ -461,6 +493,11 @@ run_gate_cell "$WORK/a17" 20 CELL_PREFLIGHT_REPO="$WORK/a17/repo" CELL_PREFLIGHT
                 || bad "A17 expected exit 3, got $RC: $OUT"
 assert_has "A17 names the staleness" "why=stale-code" "$OUT"
 assert_has "A17 carries the distance it measured" "behind=3" "$OUT"
+# ⛔ AND SAYS WHAT IT MEASURED: a BASE. The refusal is scoped to bases (`role=branch` is reported, never
+# refused — see A28), so the line has to state the role the threshold was applied to, or an operator
+# reading `why=stale-code` cannot tell which population they are being told about (review of
+# 38f24c074, P1).
+assert_has "A17 ...and names the role it refused: a BASE, which is what the threshold is calibrated for" "role=base" "$OUT"
 assert_has "A17 carries the threshold it applied" "max_behind=2" "$OUT"
 assert_not_has "A17 is never reported ok (the defect this closes)" "LANE_CAPABILITY=ok" "$OUT"
 assert_has "A17 tells the operator the remedy" "Advance the checkout" "$OUT"
@@ -485,6 +522,10 @@ run_gate_cell "$WORK/a18" 20 CELL_PREFLIGHT_REPO="$WORK/a18/repo" CELL_PREFLIGHT
 assert_has "A18 says the reading is unknown" "behind=unknown" "$OUT"
 assert_not_has "A18 never publishes an unrefreshed ref as a measurement" "behind=0" "$OUT"
 assert_not_has "A18 does not refuse on a number it did not measure" "why=stale-code" "$OUT"
+# ⛔ AND IT MUST NOT BUY ITSELF A RETRY (A31/A32): the lock-race retry is scoped to the CONCURRENCY
+# class, so an unreachable remote reports ONE attempt. Retrying every failure would spend two more
+# `CELL_PREFLIGHT_FETCH_BOUND`s of the spawn path's wall clock on a box whose network is simply down.
+assert_has "A18 ...and spends exactly ONE fetch attempt on a failure that is not a lock race" "fetch_attempts=1" "$OUT"
 
 # A19 — nothing to measure is REPORTED, never refused (the CI/dev path every other arm here takes).
 make_stub "$WORK/a19" answer; make_keys "$WORK/a19"; mkdir -p "$WORK/a19/home"
@@ -634,6 +675,104 @@ run_gate_cell "$WORK/a27" 20 CELL_PREFLIGHT_REPO="$WORK/a27/repo" CELL_PREFLIGHT
                 || bad "A27 expected exit 0 at behind=3 max_behind=3, got $RC: $OUT"
 assert_has "A27 ...and reports the boundary it accepted" "behind=3" "$OUT"
 assert_not_has "A27 ...and never refuses at the boundary itself" "why=stale-code" "$OUT"
+
+# ── A28–A32: WHICH ROLE THE READING IS ABOUT, AND A FETCH THAT LOSES A RACE ──────────────────────
+# The three findings below are the review of `38f24c074`. They share one shape: the reading was
+# truthful, and the VERDICT drawn from it was wrong for the tree it was drawn about.
+
+# A28 — A BRANCH IS NOT A BASE. This is the SAME distance (`behind=3`) that A17 REFUSES on, and the
+# only difference is what the tree IS: on a base the count is the distance from main; on a branch it is
+# mostly main's own unmerged commits, and for a fixer integrating them IS the assigned work. Refusing it
+# is deterministic and non-transient, and the only work that would clear it is the work the refusal
+# blocks BEFORE the process starts — `fix-one.sh` passes `WIP_PATH="$WT"`, a worktree checked out on the
+# PR branch — so the fixer population deadlocks permanently (review of 38f24c074, P1).
+make_stub "$WORK/a28" answer; make_keys "$WORK/a28"
+mk_repo "$WORK/a28" 3 || bad "A28 fixture: could not build a git repo"
+g -C "$WORK/a28/repo" commit -q --allow-empty -m "the PR's own commit" || bad "A28 fixture: could not commit on the branch"
+run_gate_cell "$WORK/a28" 20 CELL_PREFLIGHT_REPO="$WORK/a28/repo" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A28 a PR-branch worktree over the threshold is ADMITTED (exit 0), not deadlocked" \
+                || bad "A28 expected exit 0, got $RC: $OUT"
+assert_has "A28 ...the reading still reports the distance" "behind=3" "$OUT"
+assert_has "A28 ...and names the role it measured, so the number is not read as a base's" "role=branch" "$OUT"
+assert_has "A28 ...and flags the stale base without refusing the work" "stale_base=1" "$OUT"
+assert_not_has "A28 ...never the permanent refusal a fixer cannot clear" "why=stale-code" "$OUT"
+# A28b — `stale_base` is the THRESHOLD's reading, not a constant: under a threshold the branch satisfies
+# it is absent. Without this, `stale_base=1` on every branch would pass A28 and mean nothing.
+run_gate_cell "$WORK/a28" 20 CELL_PREFLIGHT_REPO="$WORK/a28/repo" CELL_PREFLIGHT_MAX_BEHIND=5
+[ "$RC" -eq 0 ] && ok "A28b the same branch is READY under a threshold it satisfies (exit 0)" \
+                || bad "A28b expected exit 0 at max_behind=5, got $RC: $OUT"
+assert_not_has "A28b ...and carries no stale_base at all" "stale_base=1" "$OUT"
+
+# A29 — A NAMED SUBDIRECTORY IS THAT CHECKOUT. `spawn-gate.sh` names `$WIP_PATH`/`$PWD` unconditionally,
+# so pre-fix a spawn whose cwd was not the tree's ROOT reported `reason=not-a-checkout` and admitted on a
+# WARN — the gate silent for every caller that was not standing at the top level (review of 38f24c074,
+# P3-1). `git rev-parse --show-toplevel` answers the question the caller actually asked.
+make_stub "$WORK/a29" answer; make_keys "$WORK/a29"
+mk_repo "$WORK/a29" 0 || bad "A29 fixture: could not build a git repo"
+mkdir -p "$WORK/a29/repo/pkg/deep" || bad "A29 fixture: could not create the subdirectory"
+run_gate_cell "$WORK/a29" 20 CELL_PREFLIGHT_REPO="$WORK/a29/repo/pkg/deep" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A29 a named SUBDIRECTORY of a checkout is still measurable (exit 0)" \
+                || bad "A29 expected exit 0, got $RC: $OUT"
+assert_has "A29 ...resolved UP to the checkout the work is actually on" "repo=repo" "$OUT"
+assert_has "A29 ...and measured, instead of degrading to an admitted WARN" "behind=0" "$OUT"
+assert_not_has "A29 ...never reported as 'not a checkout' just because it is not the root" "reason=not-a-checkout" "$OUT"
+
+# A30 — AND THE WALK-UP MUST NOT INVENT A CHECKOUT. A30 has the OPPOSITE expectation to A29 for the same
+# code, which is what keeps A29 from being satisfied by "accept any path".
+make_stub "$WORK/a30" answer; make_keys "$WORK/a30"
+mkdir -p "$WORK/a30/loose" || bad "A30 fixture: could not create a non-checkout dir"
+run_gate_cell "$WORK/a30" 20 CELL_PREFLIGHT_REPO="$WORK/a30/loose" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A30 a named path in NO checkout is still admitted on an unknown reading (exit 0)" \
+                || bad "A30 expected exit 0, got $RC: $OUT"
+assert_has "A30 ...and is REPORTED as not-a-checkout, never guessed at" "reason=not-a-checkout" "$OUT"
+assert_has "A30 ...with the reading it could not make" "behind=unknown" "$OUT"
+
+# A31 — A FETCH THAT LOSES THE REF LOCK RACE IS MEASURABLE, NOT SILENT. Every lane on a box fetches into
+# the SAME clone once per spawn, so concurrent probes CAS-race on `refs/remotes/origin/main`; MEASURED at
+# 7 of 8 concurrent fetches failing in one wave with `error: cannot lock ref … is at X but expected Y`.
+# Publishing that as `behind=unknown` silences the gate exactly while a wave is dispatching (review of
+# 38f24c074, P3-3). The loser's read is recoverable by RE-RUNNING, so the failure is retried — twice at
+# most — and the line says how many attempts it took.
+REAL_GIT="$(command -v git)"
+mk_fetch_shim() { # mk_fetch_shim <dir> <lock-once|never-hosts> → a `git` that fails the FETCH it is told to
+  local d="$1" mode="$2"
+  mkdir -p "$d" || return 1
+  cat >"$d/git" <<SHIM
+#!/usr/bin/env bash
+case " \$* " in
+  *" fetch "*)
+    n=\$(cat "$d/fetches" 2>/dev/null || echo 0); n=\$((n+1)); echo "\$n" >"$d/fetches"
+    case "$mode" in
+      lock-once)   [ "\$n" -eq 1 ] && { echo "error: cannot lock ref 'refs/remotes/origin/main': is at 1111111 but expected 2222222" >&2; exit 1; } ;;
+      never-hosts) echo "fatal: unable to access 'https://example.invalid/x': Could not resolve host: example.invalid" >&2; exit 128 ;;
+    esac ;;
+esac
+exec "$REAL_GIT" "\$@"
+SHIM
+  chmod +x "$d/git"
+}
+make_stub "$WORK/a31" answer; make_keys "$WORK/a31"
+mk_repo "$WORK/a31" 3 || bad "A31 fixture: could not build a git repo"
+mk_fetch_shim "$WORK/a31/shim" lock-once || bad "A31 fixture: could not write the fetch shim"
+run_gate_cell "$WORK/a31" 20 CELL_PREFLIGHT_REPO="$WORK/a31/repo" CELL_PREFLIGHT_MAX_BEHIND=2 \
+              PATH="$WORK/a31/bin:$WORK/a31/shim:$PATH"
+[ "$RC" -eq 3 ] && ok "A31 a fetch that lost the ref lock race still reaches the same verdict (exit 3)" \
+                || bad "A31 expected exit 3 (stale base), got $RC: $OUT"
+assert_has "A31 ...because the distance was still MEASURED" "behind=3" "$OUT"
+assert_has "A31 ...and the line says it took two attempts" "fetch_attempts=2" "$OUT"
+assert_not_has "A31 ...never the 'unknown' that admits during a dispatch wave" "behind=unknown" "$OUT"
+
+# A32 — AND THE RETRY IS SCOPED. A dead network is NOT a lock race: it must not spend two more
+# `CELL_PREFLIGHT_FETCH_BOUND`s of the spawn path's wall clock, so it reports ONE attempt.
+make_stub "$WORK/a32" answer; make_keys "$WORK/a32"
+mk_repo "$WORK/a32" 3 || bad "A32 fixture: could not build a git repo"
+mk_fetch_shim "$WORK/a32/shim" never-hosts || bad "A32 fixture: could not write the fetch shim"
+run_gate_cell "$WORK/a32" 20 CELL_PREFLIGHT_REPO="$WORK/a32/repo" CELL_PREFLIGHT_MAX_BEHIND=2 \
+              PATH="$WORK/a32/bin:$WORK/a32/shim:$PATH"
+[ "$RC" -eq 0 ] && ok "A32 an unanswerable network read is still a WARN, not a refusal (exit 0)" \
+                || bad "A32 expected exit 0, got $RC: $OUT"
+assert_has "A32 ...reported as unmeasured" "behind=unknown" "$OUT"
+assert_has "A32 ...after exactly ONE attempt (the retry is scoped to the lock race)" "fetch_attempts=1" "$OUT"
 
 printf '\ncell-lane-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
