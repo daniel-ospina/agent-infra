@@ -146,7 +146,15 @@ elif [ "$rc" = "77" ]; then
 # branch >MAX_BEHIND behind is precisely the state that gets a fixer dispatched. So the sentence below
 # says merge, never re-cut. Tolerant default for the same $O-skew reason as the arms above.
 elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
-  echo "[adopt-fix $PR] fixer NOT started (STALE-CODE gate) — this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932), so work done from it produces a plausible log and a WRONG diff. The repo and the distance are on the [capability-gate] REFUSED line in $O/logs/fix-$PR.log. Waiting will NOT clear it and, in the measured fleet state (every cell hundreds of commits behind), a PEER will not either — so do NOT dispatch the PR elsewhere. On this path the measured artifact is the FIXER's worktree, which is the PR BRANCH: bring the branch up to date with 'git -C <that worktree> merge origin/main', resolve, push and re-run. Do NOT re-cut the worktree from origin/main — that discards the PR's own commits. Nothing was consumed." >> "$O/logs/adopt-$PR.log"
+  # ⛔ AND ONLY A BASE CAN REACH THIS (review of 38f24c074, P1 — fixed in `cell-lane-preflight.sh`). The
+  # probe now classifies the tree it measured and refuses ONLY `role=base`; a worktree that already
+  # carries commits of its own (`role=branch` — the NORMAL shape on this path, since `$WT` is checked out
+  # on the PR branch) is reported as `stale_base=1` and ADMITTED, because integrating `origin/main` is
+  # the work the fixer was dispatched to do and a refusal there could never clear itself. So a line here
+  # means the reading said `role=base`: nothing has been built in that worktree yet. The remedy is still
+  # never a re-cut — a re-cut discards anything the fixer left uncommitted, and nothing about this
+  # refusal requires it.
+  echo "[adopt-fix $PR] fixer NOT started (STALE-CODE gate) — this box completed the model call but the checkout it measured is a BASE more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932), so work done from it produces a plausible log and a WRONG diff. The repo, the distance AND the role are on the [capability-gate] REFUSED line in $O/logs/fix-$PR.log, and `role=base` there is why it refused at all: a worktree that already carries commits of its own (a PR branch — the normal shape on this path) is REPORTED as `stale_base=1` and ADMITTED instead, because merging main is the fixer's assigned work. Waiting will NOT clear it and, in the measured fleet state (every cell hundreds of commits behind), a PEER will not either — so do NOT dispatch the PR elsewhere. Bring that worktree up to date with 'git -C <that worktree> merge origin/main' (a fast-forward when it carries no commits of its own), push and re-run. Do NOT re-cut the worktree from origin/main — that discards any uncommitted work the fixer left behind. Nothing was consumed." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE HARNESS/MISMATCH REFUSAL (83) IS THE OTHER CODE THIS FILE DROPPED SILENTLY (#3932's review, P2
 # measured 83 to have the same pre-existing gap; closed here rather than filed, because it is one `elif`
 # in the shape of its neighbours and the operator's log is the artifact the gap costs). `fix-one.sh`
