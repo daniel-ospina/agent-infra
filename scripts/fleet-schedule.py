@@ -3625,6 +3625,24 @@ def cmd_stop():
     return 1
 
 
+def _delegated_clause(delegated):
+    """The scope clause appended to a macOS verdict when a DELEGATED scope was disclosed.
+
+    ⛔ ONE DEFINITION, EVERY ARM (#3826 review P3). The clause was inlined on the fully-clean arm
+    only, so the CAVEATS arm never named the delegated scope and a reader could not tell that four
+    declarations had gone ungraded. It is EMPTY when nothing is delegated, so every pre-existing
+    sentence stays byte-identical on the boxes that were already correct — no consumer and no test
+    pinned to the plain wording has to move.
+    """
+    if not delegated:
+        return ""
+    return (
+        " (install-launchd.sh --status; %d template(s) are DELEGATED and named above — their own "
+        "installers render, load and grade them, so this verdict does not cover their content)"
+        % len(delegated)
+    )
+
+
 def darwin_delegate(argv):
     installer = os.path.join(INFRA_ROOT, "scripts", "install-launchd.sh")
     if not os.path.isfile(installer):
@@ -3641,13 +3659,75 @@ def cmd_darwin(mode):
             text=True,
         )
         text = out.stdout + out.stderr
+        # ⛔ THE NEW WORDINGS COUNT TOO (#1867 review P3). `install-launchd.sh --status` reports an
+        # installed job with no template as `UNMANAGED` and an enumeration it could not perform as
+        # `UNKNOWN`; neither word was in this scan, so a run whose ONLY failures were those printed
+        # `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the exit status was
+        # right and the count beside it said nothing failed.
+        # ⛔ AND THE COUNT IS PER JOB, NOT PER WORDING (#1867 review P3, round 5). Matching the bare
+        # substring made the intro line match too, so three undeclared jobs and one both reported
+        # "1 launchd job(s) …". The delegate now prints the marker ON EACH JOB LINE and keeps the word
+        # out of its intro; this scan matches the marker, so `len(bad)` counts what it names.
+        # ⛔ AND `⛔ RETIRED-INSTALLED` (#1867 review, round 8). A retired label that is STILL on disk
+        # is the blind heartbeat's own case: `install-launchd.sh` exempts the RETIRED class from the
+        # UNMANAGED row (it is declared), and `retire_pass` — the only remover — runs on an INSTALL. So
+        # without this marker the delegate exited 1 with a row this scan did not count, and the verdict
+        # read `SCHEDULE NOT VERIFIED — 0 launchd job(s) …` over a box still ticking a job this
+        # repository has retired. The marker is on the JOB line, like UNMANAGED, so the count is a count
+        # of jobs.
+        # ⛔ AND `⛔ CMUX-GATED` (#3826 review P2). The delegate's `--status` now refuses a template that
+        # names a cmux-gated script with a row of its own and rc 1 — the blind job #1867 is about. Left
+        # out of this scan, such a box returned 1 while the verdict read `SCHEDULE NOT VERIFIED — 0
+        # launchd job(s) …`, the exact defect the round-5/round-8 notes above record for UNMANAGED and
+        # RETIRED-INSTALLED. The marker is on the JOB line, so the count stays a count of jobs.
+        JOB_MARKERS = (
+            "NOT INSTALLED",
+            "DRIFTED",
+            "not loaded",
+            "⛔ UNMANAGED",
+            "⛔ RETIRED-INSTALLED",
+            "⛔ UNKNOWN",
+            "⛔ CMUX-GATED",
+        )
+        # ⛔ A SET-LEVEL ROW IS NOT A JOB (#3826 review P3, round 18). Two of the delegate's failing
+        # rows describe the WHOLE SET rather than one unit — `⛔ UNKNOWN — the DECLARED SET … could not be
+        # evaluated` and `⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated`. Both carry the
+        # `⛔ UNKNOWN` marker, so this scan counted them as one launchd JOB each: MEASURED at this head
+        # with an unreadable TEMPLATES_DIR (delegate rc=2, zero jobs classified),
+        #   `SCHEDULE NOT VERIFIED — 1 launchd job(s) not installed/loaded/in sync/declared above`
+        # — a count of jobs over a run that classified none, the same lie rounds 5/8 fixed in the other
+        # direction. The set-level rows are distinguished by the marker's ` — ` suffix (an em dash after
+        # two spaces), which no per-job row uses: those are `⛔ UNKNOWN   <label>: …`.
+        # Excluding it is the honest answer, not a loosening: the delegate's non-zero exit is the second
+        # half of this gate, so a set-level UNKNOWN still FAILS the verdict — through the arm that says
+        # `the delegate exited N and named NO job`, which is exactly what happened.
+        SET_LEVEL_MARKERS = ("⛔ UNKNOWN —",)
+        set_level = [line for line in text.splitlines() if any(m in line for m in SET_LEVEL_MARKERS)]
         bad = [
             line
             for line in text.splitlines()
-            if "NOT INSTALLED" in line or "DRIFTED" in line or "not loaded" in line
+            if any(m in line for m in JOB_MARKERS) and not any(m in line for m in SET_LEVEL_MARKERS)
         ]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
+        # ⛔ AND A DISCLOSURE IS NOT AN "IN SYNC" (#1867 review, round 11). One row class is
+        # deliberately NOT a failure — `⚠️ INSTALLED-SKIPPED`: a job installed here whose template the
+        # installer would now SKIP (a placeholder stopped resolving, e.g. SWARM_ROOT unset). An install
+        # cannot clear it while the environment stays as it is, so making it a hard failure would
+        # re-create the permanent red round 10 removed. But the copy on disk is NOT what the template
+        # describes and will never be refreshed — so the verdict must not say the job set MATCHES.
+        # MEASURED pre-fix with a delegate emitting that row plus one `in sync` job: rc 0 and
+        # `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, a claim about content
+        # agreement that nothing in this scan had checked.
+        skipped = [line for line in text.splitlines() if "⚠️ INSTALLED-SKIPPED" in line]
+        # ⛔ THE DELEGATED DISCLOSURE IS COMPUTED HERE, NOT ONLY ON THE CLEAN ARM (#3826 review P3).
+        # It used to be derived after the caveats arm below, so the two disclosures were MUTUALLY
+        # EXCLUSIVE: whenever an INSTALLED-SKIPPED row existed — the ordinary state on a Mac with
+        # `SWARM_ROOT` unset, which this repo's own suite treats as legitimate — the caveats arm
+        # returned first and the verdict never mentioned that the four subdirectory templates had not
+        # been graded at all. That is the exact over-claim the delegated arm was added to remove, left
+        # standing one branch above it.
+        delegated = [line for line in text.splitlines() if ": DELEGATED —" in line]
         # ⛔ THE DELEGATE'S EXIT STATUS IS THE SECOND HALF OF THE GATE, not an implementation
         # detail: the substring scan catches only three wordings, so any OTHER failure of
         # install-launchd.sh --status (a missing template dir, an unset HOME, a syntax death)
@@ -3658,13 +3738,77 @@ def cmd_darwin(mode):
                 "launchd job set did not report a clean status" % out.returncode,
                 file=sys.stderr,
             )
-        if bad or out.returncode != 0:
+        if skipped and not bad and out.returncode == 0:
+            for line in skipped:
+                print("  CAVEAT %s" % line.strip(), file=sys.stderr)
             print(
-                "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync above"
-                % len(bad),
+                "SCHEDULE VERIFIED WITH CAVEATS — the jobs this verdict counts are in sync with "
+                "templates/launchd, but %d installed job(s) are SKIPPED by their template now "
+                "(the placeholder stopped resolving on this box): they are neither refreshed nor "
+                "removed, so the copies on disk are not what their templates describe. Restore the "
+                "environment and re-install to refresh them, or --uninstall to remove them.%s"
+                % (len(skipped), _delegated_clause(delegated)),
                 file=sys.stderr,
             )
+            return 0
+        if bad or out.returncode != 0:
+            # ⛔ ZERO JOBS IS NOT ZERO FAILURES (#3826 review P3). When the delegate DIES without
+            # emitting a marker row — a missing `TEMPLATES_DIR`, a syntax death, an unset HOME — this
+            # arm fires with `bad == []`, so the sentence read `SCHEDULE NOT VERIFIED — 0 launchd
+            # job(s) … above` BESIDE a real FAIL line. A count that says nothing failed next to a
+            # failure is how a real one gets read as a rounding artefact; the round-11 fix closed
+            # exactly this for the marker wordings and left it standing on the arm that was added for
+            # the delegate's own exit code. MEASURED with a delegate that prints `ERROR: template dir
+            # not found` and exits 1: `FAIL install-launchd.sh --status exited 1 …` then `SCHEDULE NOT
+            # VERIFIED — 0 launchd job(s) …`, rc 1. Reachable without a fixture: `install-launchd.sh`
+            # emits that message and `exit 1` for a missing template dir.
+            if bad:
+                print(
+                    "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "
+                    "above (UNMANAGED = installed with no template; RETIRED-INSTALLED = retired here but "
+                    "still installed, cleared by the next install; UNKNOWN = the installed set could "
+                    "not be enumerated)" % len(bad),
+                    file=sys.stderr,
+                )
+            elif set_level:
+                # ⛔ A SET-LEVEL FAILURE GETS ITS OWN SENTENCE, WITH NO JOB COUNT (#3826 review P3,
+                # round 18). The count above is a count of JOBS, and these rows do not name one —
+                # printing `1 launchd job(s)` over a run that classified ZERO jobs is the same lie
+                # rounds 5/8 fixed in the other direction. The sentence still cannot be read as
+                # "nothing failed" (which is what round 9's `0 launchd job(s)` complaint was about):
+                # it says the set itself is what failed.
+                print(
+                    "SCHEDULE NOT VERIFIED — the delegate reported a SET-LEVEL failure (%d row(s), "
+                    "above): it could not read or enumerate the declared set, so NO job was classified "
+                    "and nothing about the launchd job set was measured. Fix that first; no job count "
+                    "would mean anything here." % len(set_level),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "SCHEDULE NOT VERIFIED — the delegate exited %d and named NO job: it could not "
+                    "complete, so nothing about the launchd job set was measured (0 jobs above is an "
+                    "unanswered question, not a clean set)" % out.returncode,
+                    file=sys.stderr,
+                )
             return 1
+        # ⛔ THE VERDICT MUST NOT CLAIM A MATCH OVER FILES NOTHING GRADED (#3826 review P2).
+        # `install-launchd.sh --status` grades a FLAT `templates/launchd/*.plist` set and now DISCLOSES
+        # every template in a SUBDIRECTORY as `DELEGATED` (their own `install-*-timer.sh` renders,
+        # loads and grades them). Before that disclosure those rows did not exist at all, so this
+        # sentence — "launchd job set matches templates/launchd" — was printed over four of this
+        # repo's declarations that no pass had looked at. DELEGATED is a NAMED state, not a defect, so
+        # it is NOT a CAVEAT (a permanent amber on every Mac is the round-10 defect) — the sentence
+        # names the scope instead, and the plain wording is preserved verbatim when nothing is
+        # delegated so no consumer and no test has to move.
+        if delegated:
+            print(
+                "SCHEDULE VERIFIED — launchd job set matches templates/launchd "
+                "(install-launchd.sh --status; %d template(s) are DELEGATED and named above — their "
+                "own installers render, load and grade them, so this verdict does not cover their "
+                "content)" % len(delegated)
+            )
+            return 0
         print("SCHEDULE VERIFIED — launchd job set matches templates/launchd (install-launchd.sh --status)")
         return 0
     if mode == "--status":
