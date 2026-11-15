@@ -214,6 +214,141 @@ The three states a caller must read apart live in the *fields*, not the verdict:
 `capacity-placement(bound=…)`, `gate:merge-priority(<n> un-owned of <m> open PR(s))`,
 `fork_headroom`); `dispatched=0 nothing=placed_elsewhere:<n>` = the work went to a **peer box** (not a
 refusal and not idle — the placement seam did its job).
+
+⛔ **WHICH RUNG IDLED, AND WHY THAT RUNG WAS EMPTY (#3009 requirement 1).** `nothing=` carries
+`GATE_WHY` — the **first** capacity arm that fired — so on its own it cannot separate "a higher level of
+the five-level cascade holds the room" from "capacity refused before any rung was resolved". Five
+additive fields carry the cascade's own resolution. Four of them are pure *measurements* computed where
+their condition is decided and only *recorded* at the emit; the fifth (`level=`) is the rung's name:
+
+- `level=` — the rung the pass **resolved** (for an idle pass, the rung it idled on; when `slots=` is
+  non-zero, the rung that was **OPENED** — `level=ISSUES slots=2 slots_why=granted` means the ISSUES rung
+  was GRANTED two slots, NOT that anything spawned). ⛔ The grant is not a dispatch: the cascade block
+  freezes `slots=` and the gate vector that decides dispatch runs AFTER it, so read `dispatched=` and
+  `nothing=` for whether work went out — `level=ISSUES slots=10 slots_why=granted dispatched=0
+  nothing=gate:landing-floor(…)` is a real, IDLE pass. Read `level=` with `slots=`/`slots_why=`.
+  It is one of (`FIX_MAIN` | `MERGE` | `FIX_PR` | `REVIEW_PR` | `ISSUES`). Two
+  non-rung tokens, and they mean different things: `UNMEASURED` = the level walk **ran** and classified
+  nothing; `NOT-MEASURED` = the cascade block **ran** but left the rung unmeasured because `slots=0` made
+  the level walk moot (a full box reports *why it has no room*, not its level). ⛔ The "cascade block
+  never ran" case is **not** a token: the fork-held and disk-held records are written before the block
+  and carry **no `level=` field at all**, which is how a reader tells that case apart;
+- `slots=` — the slot count **that rung resolved**, captured in the cascade block where the cascade
+  decides it;
+- `slots_why=` — why a zero is a zero, in the order the allocator decides: `granted` (a non-zero
+  grant), `capacity` (the probe refused, so no rung resolved at all), `level` (a higher level holds the
+  room), `no_room`, `empty_backlog`, `listing_unreadable`, then the three zero-backlog tokens
+  `backlog_drained`, `backlog_partial`, `backlog_unreadable`. A final `unknown` exists in the code as an
+  **unreachable invariant guard**, not a vocabulary member: `cascade_issue_slots` returns at least 1 once
+  `can=1`, `room>0` and a readable listing make a grant possible, so every way to reach `slots=0` is
+  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown` —
+  a one-off measurement, not an artifact in this repo: `test-cascade.sh` pins the reachable arms, not the sweep).
+  It is kept rather than deleted so a broken invariant yields a NAME instead of an empty token —
+  ⛔ so if `slots_why=unknown` is ever observed, an invariant broke; a new cause has not appeared.
+  ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
+  #3909). The backlog count is `wc -l < candidates.txt` coerced to `0` when that file cannot be read, so
+  the **same zero** also arrives from a refresh whose pool listing failed — where an empty file is
+  byte-identical to a fleet with nothing to do. So the arm reads `state/queue-state` (the refresh's own
+  record: `EMPTY` / `READ(n)` / `PARTIAL(x)` / `UNREADABLE` — or an ABSENT or unparseable record, which
+  `queue_state_token` reports synthetically as `UNKNOWN`; `UNKNOWN` is never a value written to the file,
+  `queue_state_write` has exactly four spellings) and only a measured `EMPTY` may
+  be called empty. That ordering is
+  measured-before-blind on purpose: `empty_backlog` and `listing_unreadable` are each a **measurement**
+  and take precedence, while `backlog_unreadable` is an *absence* of attribution and ranks below them
+  (both can hold at once — the 2026-10-17 incident had both listings refused for 131 consecutive
+  passes). ⛔ The distinction is not cosmetic: `empty_backlog` is the diagnosis whose remedy is #3009
+  requirement 2 (widen the pool), so publishing it for a blind refresh aims that remedy at a pool that
+  was never read. ⛔ And "measured" means **measured recently**: the gate is the record's `EMPTY` **plus** a
+  current age (`QUEUE_STATE_MAX_AGE_MIN`, default 60), because a frozen reading is not this pass's
+  measurement — the refresh deliberately leaves the previous record standing when a pass aborts early, and
+  its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the
+  reading is demoted to the `blind` class, which costs the three zero-backlog attributions their name:
+  they fall to `backlog_unreadable` (unverifiable is stale, never fresh). ⛔ THAT DEMOTION APPLIES ONLY
+  WHERE THE ARM IS REACHED: the class decides *within* the zero-backlog arms, it does not override the
+  arms above them. A non-zero grant still reads `granted` (`CASCADE_RUNG_SLOTS > 0` is the first arm and
+  consults no class), and an unreadable PR listing still reads `listing_unreadable`, because that arm
+  precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
+  unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
+  included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3389` precedes
+  `:3390`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
+  rather than rounded up. Whether the pool was
+  read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
+  comparison**, not arithmetic: an epoch at or above 2^63 wraps negative inside `$(( ))`, which would
+  pass a "not in the future" test and then a negative age below the bound — reading a corrupt stamp as
+  FRESH forever. `[` errors on an out-of-range operand and an errored test is false, so the guard
+  falls to the `blind` class — hence `backlog_unreadable` in the backlog arms; the safe direction.
+  ⛔ **AND A DRAINED QUEUE IS NOT A BLIND ONE** (5th review cycle of #3909). The zero-backlog states
+  that are *not* a measured `EMPTY` are **three** facts, not one absence, because `READ(n)` is a
+  **successful** read and `PARTIAL(x)` a **named** partial read — both are measurements the record holds:
+  `backlog_drained` (`READ(n)` beside a zero backlog), `backlog_partial` (`PARTIAL(x)` — a subset, but
+  still a measurement), and `backlog_unreadable` (`UNREADABLE` / `UNKNOWN` / a stale stamp / an
+  ungradeable one — the only genuinely blind states). Collapsing a read pool into `backlog_unreadable`
+  would deny a measurement the record holds, which is the same "the record could not distinguish" class
+  in the opposite direction. The three are split **after** `listing_unreadable`, which is the PR
+  listing's own measured unreadability and can zero the grant on its own.
+  ⛔ **AND THEY NAME THE READING, NOT THE CAUSE** (corrected by the 6th and 7th review cycles of #3909).
+  `queue_state_write` runs when the *listing* completes, and `candidates.txt` is only replaced much
+  later, so `READ(n)` beside a zero queue file has THREE producers and only the first is a spent queue:
+  the ordinary reap-after-read; the pre-flight's `INCOMPLETE` abort (which runs *after* the write, so it
+  leaves a fresh record every cycle — the measured instance, `refresh-candidates.sh:778`, 2026-10-18:
+  `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`); and the plain mid-cycle window, because the
+  refresh is spawned in the background, so the record can be a fresh `READ(n)` while the queue still
+  holds the previous, drained one. ⛔ **The age bound covers NONE of the three** (it covers only the
+  pre-listing budget-gate box below, which is not one of them). It cannot rescue the
+  second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
+  `refresh-candidates.sh:6206`, and the post-listing budget reserve check, `:6175-6177`) re-writes a FRESH
+  stamp every cycle, so the bound never elapses. Nor the third, whose stamp is fresh by
+  construction. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
+  write and never re-writes `queue_state`, deliberately — `refresh-candidates.sh:4054-4059` — so that box
+  ages out and the classifier does answer `blind`, which is the bound working. An earlier revision
+  offered it as the limit and thereby contradicted itself.) Telling "spent" from "refused before
+  writing" therefore needs the pass's own completed outcome (`state/refresh-last`), which this field does
+  not consult — a declared limit, not an assumption, and it holds **within the bound** as well as under
+  it. So `backlog_drained` means "the record says the read succeeded and the queue holds nothing", and a
+  reader must not take it as proof the queue was consumed. ⛔ Relatedly, the display
+  token `queue=` and this decision input differ deliberately on TWO stamps: a FUTURE `at`
+  (`queue_state_token` clamps the AGE to 0, not the token — an `EMPTY` record prints `EMPTY(0s)`, a
+  `READ(7)` record prints `READ(7)(0s)`) and an ABSENT/unparseable `at` (the token prints the bare token
+  with NO age, e.g. `EMPTY`), while `queue_state_class` answers `blind` for both (unverifiable is not
+  fresh). ⛔ The bare-token case matters on its own: `queue=EMPTY` reads like a plain measurement.
+  Anything that gates asks the class;
+- `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room. ⛔ It is
+  computed in the **drain-escape block**, not the
+  cascade block — that separation is the whole point of it being its own token. ⛔ **A measured `0`
+  means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire on a
+  pass the cascade ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). ⛔ A zero
+  BACKLOG is **not** a second such state — that outcome is WITHHELD: it writes no escape RECORD
+  (`state/drain-escape`, *"No escape is taken and no record is written"*). ⛔ BUT IT STILL PUBLISHES A
+  MEASURED `escape=0` IN THE CYCLE RECORD: the token is reset to `0` at the top of the drain-escape block
+  on EVERY pass and the emit spells it `${CASCADE_ESCAPE_SLOTS-absent}`, so the withhold removes the
+  escape record, not the field (11th cycle P2; the suite arms this — "an EMPTY backlog publishes
+  escape=0"). Read `escape=0` there as "the backlog ceiling produced nothing".
+  Only `escape>0` proves a grant; `escape=0` proves only that the valve added nothing;
+- `can_spawn=` — the capacity probe's own answer.
+
+⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the
+rung's grant, `escape=` is what the valve spent. ⛔ The four **measurement** fields — `slots=`,
+`slots_why=`, `escape=`, `can_spawn=` — are emitted in the terse form `${VAR-absent}`.
+⛔ **WHAT THAT SPELLING DOES AND DOES NOT BUY** (corrected 2026-11-14, review P2 of #3909 — an earlier
+revision of this paragraph stated the reason wrongly). `${VAR-absent}` and `${VAR:-absent}` behave
+**identically** for a set `0`: the colon tests for unset-or-null, and `0` is neither, so *both* yield
+`0` (measured; GNU Bash §3.5.3 — *"Omitting the colon results in a test only for a parameter that is
+unset"*). The two differ only for a value that is set and **empty**: `-` keeps the empty string, `:-`
+replaces it with the word. The terse form is used so that a set-but-empty value stays visibly empty
+instead of masquerading as `absent`; it is **not** what protects a measured `0`, and an editor who
+switches the spelling will not thereby start losing zeros.
+⛔ **`absent` is the emitter's FALLBACK, not a value production produces** (corrected 2026-11-14, review
+P2 of #3909). The only emitter of those four keys is reached *after* the cascade block AND the
+**drain-escape** block have assigned all of them (the cascade assigns `level`/`slots`/`slots_why`/
+`can_spawn`; `escape=` is the drain-escape block's own token, see above), so `absent` never appears in a
+written record. The records that genuinely skip the block — the
+**fork-held** and **disk-held** emissions, written before it — carry **none** of the four tokens, exactly
+as they carry no `level=`; that is the signal a reader sees, and an earlier draft of this paragraph named
+the one they will never see instead. `level=` is the one token that cannot be `absent` because it is a
+name emitted as `${CASCADE_LEVEL_NAME:-NOT-MEASURED}`, whose fallback is `NOT-MEASURED`.
+
 ⛔ **`nothing=none` is the ALIVE marker, never the IDLE one** — the writer states the rule in its own
 comment: *"`nothing=none` is printed only when something WAS dispatched, so an idle cycle can never read
 as a working one."* An earlier draft of this document had that backwards (it read IDLE from
@@ -356,7 +491,13 @@ deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doct
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
 worktree holding uncommitted work, a refusing transport) stopped the order before delivery, so an
-operator must repair the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
+operator must repair the chain; ⛔ **the `verdict` field says WHICH**, because those remedies are not
+interchangeable: `UNDELIVERED` — the transport refused, and `chain=<resolved path>` on the same line
+names the one file to repair; `REFUSED` — a worktree, `next=fix-worktree`; `RUBRIC` — **nothing was
+placed and the chain was never invoked**, because this pass holds no rubric for the repo it grades
+(`next=supply-rubric`, the `OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` seams). Until `#4009` all three
+read `next=repair-chain` and named no chain at all — measured over **2920** passes while the chain
+answered `--status` in one call, i.e. the verdict sent operators to a healthy component; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
 **nothing was consumed**, and the sidecar also carries `verdict`, `refusal_bound`
 (`<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`) and
 `room` (the `capacity.sh probe` record measured at decision time); the reason is a PREFIX —

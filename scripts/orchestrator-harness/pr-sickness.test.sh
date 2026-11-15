@@ -32,6 +32,18 @@ eq()  { [ "$1" = "$2" ] && ok "$3" || bad "$3 (got '$1', want '$2')"; }
 has() { grep -qF -- "$2" <<<"$1" && ok "$3" || bad "$3 (missing '$2')"; }
 no()  { grep -qF -- "$2" <<<"$1" && bad "$3 (FOUND '$2')" || ok "$3"; }
 
+# mut <name> <exact-old> <exact-new> -> prints the mutant path. Declared beside the assertion helpers
+# because SEVERAL sections use it (the review-rejection arm needs its own mutants inline).
+mut() { # <name> <exact-old> <exact-new> -> prints the mutant path
+  python3 - "$MOD" "$TMP/mut-$1.sh" "$2" "$3" <<'PY'
+import sys
+src = open(sys.argv[1]).read(); old = sys.argv[3]; new = sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY
+  printf '%s' "$TMP/mut-$1.sh"
+}
+
 # ── the fake `gh`: one binary, both surfaces (api + run view) ────────────────────────────────────
 cat > "$TMP/bin/gh" <<'GH'
 #!/bin/bash
@@ -43,9 +55,35 @@ case "${1:-}" in
     # ignores the answer looks identical in the output. This file is the measurement.
     printf '%s\n' "$*" >> "$F/gh-calls" 2>/dev/null
     shift
+    # ── agent-infra#4011: the review-rejection arm ESCALATES on the PR. Both halves are answered here
+    # so the arm can be driven hermetically: the idempotence read (GET …/issues/<n>/comments) and the
+    # post (POST …/issues/<n>/comments). A POST is recorded to a file the suite counts.
+    method=GET
+    if [ "${1:-}" = "-X" ]; then method="${2:-GET}"; shift 2; fi
     [ "${1:-}" = "--paginate" ] && shift
     [ "${1:-}" = "--allow-escape-sequences" ] && shift
     ep="${1:-}"
+    if [ "$method" = "POST" ]; then
+      # `fail-post` makes the POST FAIL, which is how the suite proves the escalation's ORDER: a head
+      # must not be parked on a failed post, or `ps_gates` refuses it and the comment is lost for ever.
+      [ -f "$F/fail-post" ] && { echo "gh: HTTP 502 from the API" >&2; exit 1; }
+      case "$ep" in
+        *"/issues/"*)
+          body=""
+          while [ $# -gt 0 ]; do
+            case "$1" in -f) body="${2:-}"; shift 2 ;; *) shift ;; esac
+          done
+          printf '%s\n' "${body#body=}" >> "$F/comment-posts.log" 2>/dev/null
+          exit 0 ;;
+        *) exit 1 ;;
+      esac
+    fi
+    case "$ep" in
+      *"/issues/"*)
+        n="$(printf '%s' "$ep" | sed -n 's#.*/issues/\([0-9][0-9]*\)/.*#\1#p')"
+        cat "$F/comments-$n.json" 2>/dev/null || printf '[]\n'
+        exit 0 ;;
+    esac
     case "$ep" in
       *"/pulls?state=open"*)
         [ -f "$F/fail-listing" ] && { echo "gh: HTTP 502 from the API" >&2; exit 1; }
@@ -152,7 +190,9 @@ pulls_one() { printf '[{"number":%s,"head":{"sha":"%s","ref":"fix/sick-%s","repo
 # ⛔ NO GLOBBED DISCARD ANYWHERE IN THIS FILE: the checkout guard reads a script's discards
 # statically and fails the whole suite closed when one carries a wildcard (#709). Every reset
 # removes an EXPLICIT directory and recreates it.
-reset_all() { rm -rf "$STATE" "$FIX" "$FLAGS" "$TMP/spawns.log" 2>/dev/null; mkdir -p "$STATE" "$FIX" "$FLAGS"; }
+# ⛔ NO GLOBBED DISCARD HERE EITHER: `$TMP/records` joined the list with agent-infra#4011 (the review
+# record store is a fixture now) and it is named EXPLICITLY for the same reason as its neighbours.
+reset_all() { rm -rf "$STATE" "$FIX" "$FLAGS" "$TMP/records" "$TMP/spawns.log" 2>/dev/null; mkdir -p "$STATE" "$FIX" "$FLAGS"; }
 
 # one pass, in a subshell so module globals never leak between cases
 run_pass() { # [<module>] [extra args…]  — a first arg that is a FILE is the module, anything else is a flag
@@ -164,6 +204,7 @@ run_pass() { # [<module>] [extra args…]  — a first arg that is a FILE is the
   # no coverage at all.
   ( . "$mod"; . "$TMP/stubs.sh"
     PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" PS_OR="$OR" PS_REPO_PATH="$TMP/repo" \
+      PS_RECORD_DIR="$TMP/records" PS_MAX_REVIEW="${PS_MAX_REVIEW:-}" \
       ps_select --repo "$OR" --limit 8 "$@" ) 2>&1
 }
 spawns() { cat "$TMP/spawns.log" 2>/dev/null | grep -c . || true; }
@@ -576,16 +617,178 @@ eq "$(spawns)" "0" "and nothing is dispatched from an empty listing"
 
 reset_all
 
-echo "══ per-test non-vacuity: each behaviour has a targeted mutation that reddens it"
-mut() { # <name> <exact-old> <exact-new> -> prints the mutant path
-  python3 - "$MOD" "$TMP/mut-$1.sh" "$2" "$3" <<'PY'
-import sys
-src = open(sys.argv[1]).read(); old = sys.argv[3]; new = sys.argv[4]
-assert old in src, "mutation target not found: " + old
-open(sys.argv[2], "w").write(src.replace(old, new, 1))
-PY
-  printf '%s' "$TMP/mut-$1.sh"
+echo "══ (v) THE REVIEW-REJECTION SOURCE (#4011): a recorded not-clean verdict becomes a fix lane, by itself"
+# ⛔ WHAT THIS SECTION IS FOR. Measured 2026-11-10 on this repo's own PR #3698: a reviewer recorded
+# `not-clean` at the head, an agent NOTICED and dispatched a fixer by hand, the fix pushed, and another
+# review ran — two of four steps agent-driven. Nothing in the fleet consumed the verdict: auto-rail
+# classifies it `rejected` and skips, and the controller's fixer arm only reads `needsfix-<PR>-<head>`,
+# which only `merge-one.sh` writes. So every assertion below is on (a) the decision line, (b) the spawn
+# actually recorded, (c) the brief's content, and (d) the escalation actually posted.
+rec_write() { # <pr> <sha> <verdict> [<findings>]
+  mkdir -p "$TMP/records"
+  printf '{"pr":%s,"head_sha":"%s","mint":"fresh","evidence":"comment:4242","findings":%s,"verdict":"%s","repo":"%s","reviewed_at":"2026-11-10T00:00:00Z"}\n' \
+    "$1" "$2" "${4:-0}" "$3" "$OR" > "$TMP/records/example-repo-$1.json"
 }
+sha12r="$(printf '%s' "$sha_red" | cut -c1-12)"
+
+# (v1) THE TRIGGER. No check-surface fixture is written at all, so the surface read FAILS — the dispatch
+# must come from the verdict alone, which is what proves an agent is not needed in the loop.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 3
+out="$(run_pass)"
+has "$out" "REJECTED #77 findings=3 -> dispatch fix-77" "a recorded not-clean verdict produces a fix lane with no agent in the loop"
+eq "$(spawns)" "1" "exactly one fixer spawned"
+eq "$(cat "$TMP/spawns.log" 2>/dev/null)" "fix-77" "under the name every census/reaper already knows (fix-77)"
+b="$STATE/reviewbrief-77.md"
+[ -f "$b" ] && ok "the work item carries a review brief" || bad "no review brief at $b"
+has "$(cat "$b" 2>/dev/null)" "head12: $sha12r" "the brief is bound to the head it was generated at"
+has "$(cat "$b" 2>/dev/null)" "open findings: 3" "the brief carries the count the RECORDER recorded"
+has "$(cat "$b" 2>/dev/null)" "comment:4242" "…and names the reviewer's own artifact"
+has "$(cat "$b" 2>/dev/null)" "verdict: not-clean" "…and the verdict that caused the dispatch"
+eq "$(printf '%s\n' "$out" | grep -c '^REJECTED #77 findings=3 -> dispatch fix-77$')" "1" \
+  "the decision line is printed exactly ONCE (the surface path is not reached for a rejected head)"
+
+# (v2) A CLEAN VERDICT STARTS NOTHING — criterion 3, and the control that keeps the arm from reading any
+# non-negative verdict as "not clean enough".
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" clean 0
+out="$(run_pass)"
+eq "$(spawns)" "0" "a CLEAN verdict starts NO fix lane"
+no "$out" "REJECTED" "and the arm stays silent (a clean head is not this source's work)"
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" clean-micro 0
+out="$(run_pass)"
+eq "$(spawns)" "0" "…nor does clean-micro (the rail's own accepted family)"
+no "$out" "REJECTED" "…and again no REJECTED line"
+
+# (v3) A VERDICT IS ABOUT ONE REVISION. A record whose head is not the live head is STALE and must not
+# dispatch: the findings were addressed by whatever moved the head, and the new head gets its own review.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 9999aaaa not-clean 2
+out="$(run_pass)"
+eq "$(spawns)" "0" "a verdict recorded at an OLDER head is NOT acted on (a push re-arms the fix)"
+no "$out" "REJECTED" "…and the arm does not even talk about it (rc 2 falls through silently)"
+
+# (v4) CAP: N attempts at a head, then STOP **and** ESCALATE — on the PR, once.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+run_pass >/dev/null; run_pass >/dev/null
+eq "$(spawns)" "2" "two fixer attempts are spent at this head (PS_MAX_TRIES=2), then the cap binds"
+out="$(run_pass)"
+has "$out" "skip #77: review-fix budget exhausted (2/2 fixer attempts at head=$sha12r)" "the third pass hits the cap and NAMES it"
+eq "$(spawns)" "2" "and nothing is spawned past the cap"
+eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is PARKED (the harness's own 'needs a human' state)"
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "still unfixed after 2 fixer attempt(s)" "the park reason says what happened, in the operator's words"
+eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "exactly ONE escalation comment was posted on the PR"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" "…tagged by head, so a repeat pass cannot duplicate it"
+# ⛔ THE RE-ARM FACT MUST MATCH THE BOUND (fresh-context review, P2, verified against this repo's
+# `merge-one.sh` [rrceiling]: "A push does NOT re-arm this book (it is cumulative across heads)").
+# BOUND 1's budget is keyed on the TREE, so a push IS its remedy — pinned here as the positive half.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a **push re-arms it**" "BOUND 1's escalation names the push as the remedy (true: this budget is keyed on the tree)"
+# ⛔ THE MANUAL REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
+# the bound is `psick-<PR>-<sha12>`, so a remedy that removed only the park pair re-parks on the very
+# next pass. Both the parkreason and the PR comment must carry the counter path.
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "psick-77-$sha12r" "BOUND 1's parkreason names the counter that actually holds the bound"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "psick-77-$sha12r" "…and so does the PR comment, so following it actually clears the bound"
+out="$(run_pass)"
+has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
+eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
+
+# (v4b) A DRY RUN IS READ-ONLY AT THE BOUNDS TOO — it must not park a head and must not post a PR
+# comment (fresh-context review, P2, verified). `report` is documented as "read-only; never spawns", and
+# the bounds are evaluated BEFORE the dispatch's own dry-run guard, so this case is what proves the
+# preview cannot reach the two side effects the cap path owns.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+printf '2\n' > "$STATE/psick-77-$sha12r"              # the head is ALREADY at its repair cap
+out="$(PS_DRY_RUN=1 run_pass)"
+has "$out" "would-park-and-escalate at the cap (dry-run" "at the cap a dry run ANNOUNCES the park it would do"
+[ -s "$STATE/parked-77" ] && bad "a dry run must not park the head" || ok "the cap path writes NO park in a dry run"
+[ -s "$FIX/comment-posts.log" ] && bad "a dry run must not post an escalation comment" || ok "the cap path posts NO PR comment in a dry run"
+eq "$(spawns)" "0" "…and spawns nothing"
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
+printf '10\n' > "$STATE/reviewround-77"
+out="$(PS_DRY_RUN=1 run_pass)"
+has "$out" "would-park-and-escalate at the review-round ceiling" "at the ceiling a dry run ANNOUNCES the park it would do"
+[ -s "$STATE/parked-77" ] && bad "a dry run must not park the head at the ceiling" || ok "the ceiling path writes NO park in a dry run"
+[ -s "$FIX/comment-posts.log" ] && bad "a dry run must not post an escalation comment at the ceiling" || ok "the ceiling path posts NO PR comment in a dry run"
+
+# (v4c) THE ESCALATION IS POSTED **BEFORE** THE HEAD IS PARKED (fresh-context review, P2, verified).
+# `ps_gates` refuses a head parked at this sha, so parking first meant one failed POST lost the only
+# PR-visible artifact for ever. Proved by a POST that fails: the head must stay UNPARKED, and a later
+# pass (post restored) must then escalate AND park. The tag check is what makes the retry duplicate-free.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+printf '2\n' > "$STATE/psick-77-$sha12r"              # the head is ALREADY at its repair cap
+touch "$FIX/fail-post"
+out="$(run_pass)"
+has "$out" "the escalation could NOT be posted" "a failed POST is NAMED, not swallowed"
+# ⛔ AND THE CAUSE ITSELF REACHES THE LOG (fresh-context review, P3, verified): both call sites used to
+# pipe `ps_review_escalate` to `/dev/null`, and the reorder means no parkreason is written on this path,
+# so the cause existed NOWHERE — while the failure line told the operator to "see above" for a line that
+# was never printed. Asserting the CAUSE (not just the verdict) is what pins it.
+has "$out" "escalate: the comment could not be posted" "the failure's OWN cause reaches the log, not just a 'could not post' verdict"
+[ -s "$STATE/parked-77" ] && bad "a head must NOT be parked when the escalation could not be posted" \
+  || ok "the head stays UNPARKED, so the next pass can retry the escalation"
+rm -f "$FIX/fail-post"
+out="$(run_pass)"
+eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "the retry posts the escalation exactly once"
+eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "…and only THEN is the head parked"
+
+# (v5) THE CEILING IS THE RECORDED ONE (`state/reviewround-<PR>`, agent-infra#3441), not an invented
+# bound: at the ceiling a fixer would push a head whose review is refused by that same ceiling, so no
+# fixer is spent — and it says so.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
+printf '10\n' > "$STATE/reviewround-77"
+out="$(run_pass)"
+has "$out" "skip #77: review-round ceiling spent (rounds=10/10)" "a PR at MAX_REVIEW gets no fixer (the fix's review could not be bought)"
+eq "$(spawns)" "0" "and nothing is spawned"
+eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is parked, naming the ceiling"
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "review-round ceiling" "…in the reason a human reads"
+# ⛔ THE CEILING HALF, WHICH IS WHERE THE FIXED PARAGRAPH WAS FALSE. `state/reviewround-<PR>` is
+# CUMULATIVE ACROSS HEADS, so "a push re-arms it" told the operator to do the one thing that does not
+# work — and the parkreason is the only in-band remedy they see. Both directions pinned: the true
+# remedy present, the false one absent.
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "PUSH DOES NOT RE-ARM IT" "…and names the TRUE remedy for THIS bound (the book is cumulative across heads)"
+no  "$(cat "$STATE/parkreason-77" 2>/dev/null)" "re-arms it" "…not the false 'a push re-arms it' (verified against merge-one.sh's [rrceiling] park)"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a push does NOT re-arm this one" "the ceiling's PR comment says a push does NOT re-arm the review-round book"
+no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "re-arms both the per-head attempt budget and the review round" "…and the one fixed paragraph that claimed a push re-arms BOTH bounds is gone"
+# ⛔ THE "WHAT HAPPENED" SENTENCE MUST MATCH THIS BOUND TOO (fresh-context review, P2, verified). The
+# ceiling returns BEFORE the brief and before the spawn — this very case asserts `spawns=0` two lines
+# above — so a comment still saying "this queue dispatched a fixer lane automatically" contradicts the
+# run that posted it and reads a spent ROUND as a fixer that could not fix.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "No fixer was dispatched for this head" "the ceiling's comment says what actually happened (no fixer was spent)"
+no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "dispatched a fixer lane automatically" "…and does NOT claim a fixer ran (the constant paragraph that lied to the operator is gone)"
+# ⛔ MAX_REVIEW=0 IS REPORT-ONLY (the MAX_REVIEW_TRIES idiom), so the ceiling is DISABLED — a box
+# configured to buy no reviews must not refuse a repair on a budget it never configured.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
+printf '10\n' > "$STATE/reviewround-77"
+out="$(PS_MAX_REVIEW=0 run_pass)"
+has "$out" "REJECTED #77 findings=1 -> dispatch fix-77" "(control) MAX_REVIEW=0 is report-only: the ceiling does not refuse"
+eq "$(spawns)" "1" "…and the fixer is spent"
+
+# (v6) THE BRIEF CONTRACT IS CHECKED BEFORE THE SPAWN — criterion 4, both directions.
+# positive: the SHIPPED contract renders, exit 0 (NOT the gate's 80 = "refused").
+bgrc="$( . "$MOD"; brief_gate_probe >/dev/null 2>&1; echo $? )"
+eq "$bgrc" "0" "the shipped fixer contract renders on this box (brief-gate.sh --section fixer ⇒ exit 0, not 80)"
+m="$(mut noBrief 'bash "$c" --section fixer >/dev/null 2>&1 || return $?' 'return 80')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
+  out="$(run_pass "$m")"
+  has "$out" "skip #77: brief-gate.sh --section fixer REFUSED (exit 80)" "a box whose contract cannot render REFUSES, by name"
+  eq "$(spawns)" "0" "…and spends no lane on a fixer whose brief lost its mandate"
+else bad "could not build the (v6) mutant"; fi
+
+# (v7) THE ARM RUNS BEFORE THE CHECK SURFACE (a rejected head is work whatever CI says), exactly once.
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+out="$(run_pass)"
+has "$out" "REJECTED #77 findings=2 -> dispatch fix-77" "a red head that is ALSO rejected takes the review reason"
+no "$out" "RED #77" "…and is not dispatched a second time for the red"
+eq "$(spawns)" "1" "one spawn, one reason"
+
+# (v8) A RECORD THAT CANNOT BE READ IS NAMED, never silently treated as absent.
+reset_all; pulls_one 77 "$sha_red"; mkdir -p "$TMP/records"
+printf '{not json\n' > "$TMP/records/example-repo-77.json"
+out="$(run_pass)"
+has "$out" "the review record is present but UNREADABLE" "an unparseable record is reported, not read as 'no record'"
+eq "$(spawns)" "0" "and no fixer is spent on a verdict nobody can read"
+
+reset_all
+
+echo "══ per-test non-vacuity: each behaviour has a targeted mutation that reddens it"
 # (a) the RED arm turned into a skip ⇒ no work item, no brief
 m="$(mut noRed 'RED*) ;;' 'RED*) printf "skip #%s: green\n" "$pr"; return 1 ;;')" 2>/dev/null || m=""
 if [ -n "$m" ] && [ -f "$m" ]; then
@@ -602,6 +805,37 @@ if [ -n "$m" ] && [ -f "$m" ]; then
   [ "$(spawns)" -gt 1 ] && ok "(b) FAILS when the holder gate is removed (a second fixer is spawned)" \
     || bad "(b) still holds with the holder gate mutated — vacuous"
 else bad "could not build the (b) mutant"; fi
+# (v) THE REVIEW-REJECTION SOURCE'S FOUR DECISIONS, each mutated in turn (#4011). A suite that only
+# asserts the happy path would pass on a module whose arm dispatches EVERY verdict, ignores the head,
+# or never stops — the three ways this arm can be wrong.
+m="$(mut noRevArm 'rec="$(ps_record_for "$repo" "$pr")" || return 2' 'return 2')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 3
+  out="$(run_pass "$m")"
+  no "$out" "REJECTED #77" "(v1) FAILS when the review arm is removed (the verdict reaches nobody — the #4011 defect)"
+else bad "could not build the (v1) mutant"; fi
+m="$(mut anyVerdict '    *) return 2 ;;' '    *) : ;;')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" clean 0
+  out="$(run_pass "$m")"
+  [ "$(spawns)" -gt 0 ] && ok "(v2) FAILS when any verdict counts as negative (a CLEAN review would spend a fixer)" \
+    || bad "(v2) still holds with the verdict filter mutated — vacuous"
+else bad "could not build the (v2) mutant"; fi
+m="$(mut noHead '  [ "${rhead:-}" = "$sha" ] || return 2' '  :')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 9999aaaa not-clean 2
+  out="$(run_pass "$m")"
+  [ "$(spawns)" -gt 0 ] && ok "(v3) FAILS when the head binding is dropped (a STALE verdict dispatches a fixer at a new head)" \
+    || bad "(v3) still holds with the head binding mutated — vacuous"
+else bad "could not build the (v3) mutant"; fi
+m="$(mut capGt '[ "${1:-0}" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]' '[ "${1:-0}" -gt "$(ps_maxtries "$PS_MAX_TRIES")" ]')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+  run_pass "$m" >/dev/null; run_pass "$m" >/dev/null; run_pass "$m" >/dev/null
+  [ "$(spawns)" -gt 2 ] && ok "(v4) FAILS when the per-head cap is off-by-one (a fixer that cannot fix is re-spawned for ever)" \
+    || bad "(v4) still holds with the cap mutated — vacuous"
+else bad "could not build the (v4) mutant"; fi
+
 # ⛔ (e)'s MUTATION IS THE SECTION-(f) ARM ABOVE (f9b-f12), NOT A SEPARATE sed. Its target used to be
 # `if [ "$q" -gt "$c" ]` inside the queue predicate, which no longer exists in this module; the
 # mutation now RESTORES that old predicate (ceiling from the in-progress count, applied to repair) and

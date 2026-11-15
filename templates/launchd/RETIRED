@@ -29,9 +29,9 @@
 # rather than `NOT INSTALLED`, so `fleet-schedule.py --verify` (which delegates
 # to that verb) certifies the layer instead of reporting it broken — a retired
 # job is deliberately never installed, and an absence is not a failure. A copy
-# still installed after retirement is reported `DRIFTED`, so closing that false
-# FAIL does not launder a stale job into a clean status: re-run the installer
-# and it is unloaded + removed.
+# still installed after retirement is reported `⛔ RETIRED-INSTALLED` and the
+# verb exits 1, so closing that false FAIL does not launder a stale job into a
+# clean status: re-run the installer and it is unloaded + removed.
 #
 # Corruption-canary + provider-latency-tripwire REMAIN launchd jobs: the
 # canary watches ~/swarm (unprotected), the tripwire touches no protected
@@ -58,3 +58,23 @@ com.eldato.skill-lint-oracle
 # `retire_pass` in install-launchd.sh unloads + removes it), and running the installer is a separate,
 # deliberate step.
 com.eldato.orchestrator-watchdog
+
+# ── THE BLIND HEARTBEAT (#1867) — RETIRED, and this entry IS the remediation ──────────────────────
+# `com.tortoise.heartbeat-loop` is the launchd job that ran scripts/heartbeat-loop.sh on the Mac. NO
+# template in this directory ever named it (`pi-bootstrap/tests/test-setup-no-nesting.sh` records the
+# same fact, and `scripts/lane-status.py:42` names the label in a comment about its empty
+# environment), so it was installed by hand — which is exactly why the UNMANAGED instrument exists
+# and exactly why it could not be removed by any command in this repo: `--uninstall` iterates
+# TEMPLATES, and no template describes a hand-installed job.
+#
+# ⛔ WHY IT MUST GO RATHER THAN BE KEPT: the cmux socket is `cmuxOnly`, which gates on launch-chain
+# ATTRIBUTION, and a launchd job never has it. The job ticks, logs `Access denied - only processes
+# started inside cmux can connect`, and delivers NOTHING — measured 1,695 degraded reads, 210
+# refusals, 0 nudges, with a log that reads as activity. The launch path is
+# `scripts/heartbeat-launch.sh start` from a cmux-attributed shell (#1867), and
+# `templates/launchd/LAUNCHD-INCOMPATIBLE` now refuses to install any template that would name the
+# loop. This entry is the other half: it REMOVES the instance already on the box.
+#
+# Nothing is INSTALLED by adding this entry. `retire_pass` unloads + removes it on the next install
+# (and on `--uninstall`), so the box stops ticking a blind job without a human hand-deleting a plist.
+com.tortoise.heartbeat-loop

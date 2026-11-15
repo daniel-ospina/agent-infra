@@ -1052,6 +1052,40 @@ def contract_note(slug: str) -> str:
             "Tracked: agent-infra#2518" % (slug, _RUBRIC_REPO, slug))
 
 
+# ⛔ THE RUBRIC REFUSAL HAS A NAME, AND THE VERDICT LINE MUST BE ABLE TO SEE IT (#4009).
+# MEASURED 2026-11-07 -> 2026-11-12, Mac + cell: pass after pass printed
+# `dispatched 0 of 17 queued — VERDICT=UNDELIVERED next=repair-chain; repair the dispatch chain
+# named on the line above`. The dispatch chain was HEALTHY AND WAS NEVER INVOKED: `dispatch()`
+# returns at the rubric guard below, BEFORE `materialise_worktree()` and before
+# `$O/nonblocking-dispatch.sh` is exec'd at all. Two independent measurements say so:
+#   * `bash ~/orchestrator/nonblocking-dispatch.sh --status <name>` answers in one call, rc 0
+#     (the argv parses, the file is present, the liveness seam is alive);
+#   * `grep -c 'rubric: REFUSING TO DISPATCH' $STATE/pr-doctor.log` -> 2920 lines, and the 17
+#     per-order `not dispatched` lines above EVERY such verdict are that same note, truncated.
+# So `next=repair-chain` sent operators to repair a component that had not failed, and to a
+# component "the line above" does not name. The class is CONFIG -- a seam nobody supplied -- its
+# remedy is `contract_note()`'s own `Fix:` sentence, and it may not be reported as a TRANSPORT
+# failure. ⛔ IT STILL REFUSES: rc 3, never 0. #3105's ruling (a pass that delivers nothing may not
+# read as a quiet queue) is preserved; only the ATTRIBUTION changes.
+RUBRIC_REFUSAL = "rubric: REFUSING TO DISPATCH"
+
+
+def rubric_refusal_note(note: str) -> str:
+    """The ONE rendering of the rubric refusal: the marker, then `contract_note()`'s sentence."""
+    return "%s -- %s" % (RUBRIC_REFUSAL, note)
+
+
+def rubric_refused(detail: str) -> bool:
+    """True when `detail` is THIS file's rubric refusal (`contract_note()`, returned by `dispatch`).
+
+    ⛔ A MARKER, NOT A PROSE MATCH, and not a second call to `contract_note(REPO)`: the note is
+    produced in ONE place (`rubric_refusal_note`) and carried in the refusal's own detail, so the
+    class `main()` acts on is the class `dispatch()` decided -- the two cannot drift into
+    disagreeing about why an order was dropped.
+    """
+    return RUBRIC_REFUSAL in (detail or "")
+
+
 def rubric_report(note: str = "") -> str:
     """The one line a pass logs about the rubric it is judging by -- and whose it is.
 
@@ -1062,7 +1096,7 @@ def rubric_report(note: str = "") -> str:
     """
     note = note or contract_note(REPO)
     if note:
-        return "rubric: REFUSING TO DISPATCH -- %s" % note
+        return rubric_refusal_note(note)
     return ("rubric: required=%s surface=%s (from %s)"
             % (",".join(getattr(CLASSIFIER, "REQUIRED", ()) or ()) or "none",
                ",".join(getattr(CLASSIFIER, "SURFACE_PATHS", ()) or ()) or "none",
@@ -1270,6 +1304,9 @@ GATE_NEXT_TOKEN = {"load": "wait", "disk": "prune-disk",
 # The OTHER verdicts' next actions, short enough to survive the same cut. A verdict without one is a
 # diagnosis the reader has to re-derive (#2710).
 VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
+                      # ⛔ NOT `repair-chain` (#4009): nothing was exec'd at all, so the chain
+                      # cannot be the thing to repair. The remedy is the seam nobody supplied.
+                      "RUBRIC": "supply-rubric",
                       "REFUSING": "restore-read", "SLOTS-FULL": "none"}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -4296,7 +4333,10 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # same thing a real pass would do.
     note = rubric_note or contract_note(REPO)
     if note:
-        return False, note, False
+        # ⛔ THE MARKER TRAVELS WITH THE REFUSAL (#4009). `main()` classifies on it, so a pass whose
+        # every order died here reports the CONFIG refusal instead of `next=repair-chain` -- the
+        # chain below this line is never reached, which is exactly what the rubric refusal means.
+        return False, rubric_refusal_note(note), False
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
@@ -4994,6 +5034,30 @@ def run_all_repos(args, explicit) -> int:
     return record_exit(rc, "all-repos: %d of %d repo(s) non-clean -- %s"
                        % (len(dirty), len(results), summary),
                        repo=",".join(r["repo"] for r in ordered), repos=results, **_extra)
+
+
+def dispatch_chain_brief() -> str:
+    """The dispatch chain `next=repair-chain` points at, RESOLVED, with its state (#4009).
+
+    ⛔ "THE LINE ABOVE" NAMED NOTHING. MEASURED 2026-11-12: the verdict said *"repair the dispatch
+    chain named on the line above"*, and the line above it read `REFUSING: 13 order(s) no worker
+    accepted and nothing was dispatched -- not a clean pass` -- no chain, no path, no component. An
+    operator's only route was to re-derive `ORCH_DIR` and `NONBLOCKING_DISPATCH` by reading this
+    file. So the resolution is published on the line that carries the remedy.
+
+    ⛔ THE RESOLVED ABSOLUTE PATH, NOT `$O/nonblocking-dispatch.sh`, because the VALUE of `$O` is
+    the one thing that differs between the boxes this verdict is read on: the Mac's `ORCH_DIR` is
+    `~/orchestrator`, a cell's is the cell home's (`cell-install.sh`), and a verdict printing the
+    variable answers the question for NEITHER reader. `docs/ops/pr-repair-service.md` carries the
+    per-box table.
+
+    ⛔ `(MISSING)` IS THE ONE STATE WORTH THE FIELD, because it is the state an operator repairs by
+    DEPLOYING. Every other broken state (`stale`, predates the repair kind) is already reported
+    loudly by `dispatcher_kind_support()` at the refusal it causes, and a second reader here would
+    be a second verdict about the same file.
+    """
+    p = NONBLOCKING_DISPATCH
+    return p if os.path.exists(p) else "%s (MISSING)" % p
 
 
 def dispatcher_kind_support() -> str:
@@ -5827,10 +5891,22 @@ def run_pass(args, rubric_note: str = "") -> int:
                 log("REFUSING: %d PR(s) had an unusable changed-file list and nothing was"
                     " dispatched -- not a clean pass" % _held)
             elif undeliv:
+                # ⛔ "NO WORKER ACCEPTED" IS A TRANSPORT CLAIM, AND NO ORDER LEFT THE PROCESS (#4009).
+                # On a pass whose every refusal was the rubric guard, `dispatch()` returned before
+                # the chain was ever exec'd -- so this sentence asserted a transport failure over a
+                # component that was never addressed, one line above a verdict that repeated it. The
+                # class is named here so the two lines cannot tell different stories.
+                _rub = stalls.get("rubric") or 0
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 if carried and carried == undeliv:
                     log("REFUSING: %d PR(s) still undeliverable -- refused in an EARLIER pass and"
                         " waiting out its cooldown; nothing was dispatched -- not a clean pass"
                         % undeliv)
+                elif _rub and _rub == undeliv - carried:
+                    log("REFUSING: %d order(s) could not be placed because this pass holds a rubric"
+                        " that is not %s's -- nothing was dispatched and the dispatch chain was"
+                        " never invoked%s; not a clean pass"
+                        % (undeliv - carried, REPO or "<unresolved>", _carried))
                 else:
                     log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
                         " a clean pass" % (undeliv - carried))
@@ -5850,7 +5926,10 @@ def run_pass(args, rubric_note: str = "") -> int:
                 parts.append("no capacity budget (inflight=%d: alive=%d unproven=%d)"
                              % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
             for k, v in sorted(stalls.items()):
-                if v:
+                # ⛔ `rubric` IS NAMED WITH ITS CAUSE BELOW, NOT AS A BARE COUNTER (#4009). `rubric=13`
+                # beside `13 order(s) no worker accepted` said the same number twice and attributed
+                # it to the transport; one clause carrying the right cause is the whole point.
+                if v and k != "rubric":
                     parts.append("%s=%d" % (k, v))
         # These two are worth stating on a pass that DID dispatch: work was left behind, and why.
         if undeliv:
@@ -5865,12 +5944,20 @@ def run_pass(args, rubric_note: str = "") -> int:
             # the stall counters are already on this line (`live-unreadable=N`), and repeating them
             # here would say the same fact twice in one verdict.
             withheld = (stalls.get("live-unreadable") or 0) if dispatched else 0
-            placed_and_refused = undeliv - carried
+            # ⛔ AN ORDER REFUSED FOR THE RUBRIC NEVER REACHED THE TRANSPORT (#4009). Folded into
+            # `no worker accepted` it asserted a failure of a component that was never addressed,
+            # on the same line that now says the chain was never invoked. Split, so the count and
+            # the cause agree.
+            _rub = stalls.get("rubric") or 0
+            placed_and_refused = undeliv - carried - _rub
             if placed_and_refused:
                 parts.append("%d order(s) no worker accepted%s"
                              % (placed_and_refused,
                                 " (%d withheld: worker liveness unreadable)" % withheld
                                 if withheld else ""))
+            if _rub:
+                parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
+                             % _rub)
             if carried:
                 parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
                              " out a refusal cooldown" % carried)
@@ -5921,7 +6008,11 @@ def run_pass(args, rubric_note: str = "") -> int:
         # (`VERDICT=…`), not as prose a reader must interpret:
         #
         #   REFUSING     (2) I could not READ the world         -> restore the read, then re-run
-        #   UNDELIVERED  (3) the TRANSPORT would not take it     -> repair the chain; waiting is useless
+        #   UNDELIVERED  (3) the TRANSPORT would not take it     -> repair the chain (`chain=` names
+        #                    it); waiting is useless
+        #   RUBRIC       (3) I do not hold THIS repo's rubric, so NO order could be placed and the
+        #                    chain was NEVER INVOKED                  -> supply the seam; waiting is
+        #                    useless and repairing the chain cannot help (#4009)
         #   REFUSED      (3) the ORDER was refused on durable grounds (a worktree refusal that was
         #                    recorded for a cooldown)          -> fix the worktree; waiting is useless
         #   NO-CAPACITY  (6) THE BOX has no room                -> wait (load) / prune (disk) /
@@ -5950,6 +6041,13 @@ def run_pass(args, rubric_note: str = "") -> int:
         # counts, re-labelled as served. Counted on its OWN axis, because "a worker is running" and
         # "the worktree is dirty" are different answers to "why did nothing go out".
         refused_cool = stalls.get("refused-cooldown") or 0
+        # ⛔ THE THIRD DURABLE-REFUSAL AXIS, AND THE ONE THAT LIED FOR FIVE DAYS (#4009). A rubric
+        # refusal is the CONFIG class: `dispatch()` returns at its `contract_note()` guard before
+        # any worktree is materialised and before the dispatch chain is exec'd, so NOTHING about
+        # the transport failed. Counted on its own axis for the same reason `refused-cooldown` is:
+        # `undeliverable` decides the CODE (3, and it must stay 3 -- #3105), and only the token
+        # decides the REMEDY, which for this class is a seam nobody supplied.
+        rubric_n = stalls.get("rubric") or 0
         axes = {}
         for _n, _a, _ax in no_room:
             axes[_ax] = axes.get(_ax, 0) + 1
@@ -5960,6 +6058,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         verdict = "OK" if dispatched else "IDLE"
         if not dispatched and blind:
             code, verdict = EXIT_REFUSING, "REFUSING"
+        # ⛔ AND THE RUBRIC REFUSAL OUTRANKS BOTH DURABLE-REFUSAL TOKENS (#4009). Placed FIRST of
+        # the rc-3 arms because it is the most fundamental fact a pass can hold: if this file does
+        # not know the rubric, EVERY order is refused for that one reason, so neither
+        # `repair-chain` nor `fix-worktree` can be right about the pass. Falling through to
+        # UNDELIVERED was the measured defect -- 2920 passes telling an operator to repair a healthy
+        # chain -- and falling through to REFUSED would send them to a worktree that is not the
+        # blocker. The same equality guard the REFUSED arm uses applies verbatim: `rubric_n` (refused
+        # here for the rubric) + `carried` (refused earlier, still held) must be the WHOLE of
+        # `undeliv`, or a real transport drop would be hidden behind a single asserted cause.
+        elif not dispatched and rubric_n and undeliv == rubric_n + carried:
+            code, verdict = EXIT_UNDELIVERED, "RUBRIC"
         # ⛔ THE REFUSAL TOKEN WINS ONLY WHEN THE WHOLE UNDELIVERABLE SET IS REFUSALS (#2291 merged
         # with #2710's `carried`). Both changes route a durable refusal to rc 3 -- #2710 through
         # `undeliverable`/`carried`, #2291 through its own `refused-cooldown` axis -- so the code is
@@ -5989,16 +6098,31 @@ def run_pass(args, rubric_note: str = "") -> int:
                 bound, room_brief(room))
         elif verdict in VERDICT_NEXT_TOKEN:
             head += " next=%s" % VERDICT_NEXT_TOKEN[verdict]
+        # ⛔ NAME THE CHAIN THE REMEDY POINTS AT (#4009 acceptance 2). `next=repair-chain` is only
+        # actionable if the reader is not left to re-derive which file that is -- the measured
+        # verdict named a chain that "the line above" did not carry, on a box where the chain was
+        # healthy. The resolved path (and `(MISSING)` when deployment is what to repair) lands in
+        # the machine-field region, so it survives the 110-char cut the beat applies.
+        if verdict == "UNDELIVERED":
+            head += " chain=%s" % dispatch_chain_brief()
         if verdict == "NO-CAPACITY":
             head += "; " + " | ".join(sorted({GATE_NEXT_ACTION.get(ax, "wait") for ax in axes}))
         elif verdict == "UNDELIVERED":
-            head += ("; repair the dispatch chain named on the line above -- this does NOT clear"
-                     " by waiting")
+            head += ("; repair the dispatch chain NAMED BY `chain=` on this line -- this does NOT"
+                     " clear by waiting")
         elif verdict == "REFUSED":
             head += ("; fix the worktree named on the line above (uncommitted work, or commits"
                      " the PR head does not have) -- this does NOT clear by waiting")
         elif verdict == "REFUSING":
             head += "; restore the read (gh, the rate limit, TCC) and re-run"
+        elif verdict == "RUBRIC":
+            # ⛔ THE SENTENCE THAT HAD TO CHANGE (#4009). It used to say *repair the dispatch chain
+            # named on the line above*; the chain had not been invoked, the line above named no
+            # chain, and the real fix was in this pass's own `rubric:` line. Saying so is the whole
+            # change: an operator who repairs a healthy chain has cured nothing and lost a budget.
+            head += ("; the dispatch chain was NEVER INVOKED -- supply this repo's own rubric through"
+                     " the OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE seams named on this pass's `rubric:`"
+                     " line; repairing the chain cannot help and this does NOT clear by waiting")
         elif verdict == "SLOTS-FULL":
             head += "; capacity is present and the queue is being served"
         log("dispatched %d of %d queued — %s" % (dispatched, queued, head + "; " + why))
@@ -6164,10 +6288,25 @@ def run_pass(args, rubric_note: str = "") -> int:
             continue
         ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
-            # ⛔ THE BOX REFUSING AND THE TRANSPORT REFUSING ARE TWO FACTS (#2291). They arrived
-            # here as one `undeliverable += 1`, with one code, and therefore one remedy. The gate
-            # refusal is separated FIRST: it consumed nothing, it must not reach a cooldown, and its
-            # remedy is the axis it names (`GATE_NEXT_ACTION`) -- not "repair the dispatch chain".
+            # ⛔ THE RUBRIC IS A THIRD KIND OF REFUSAL AND IT IS NOT THE TRANSPORT (#4009). It is
+            # separated FIRST, before the gate axis and before the record arm, because it is
+            # neither: nothing was consumed (so no cooldown), no box bound was hit (so no NO-CAPACITY
+            # axis), and NOTHING WAS EXEC'D (so `repair-chain` is a false remedy). MEASURED: this
+            # class produced `VERDICT=UNDELIVERED next=repair-chain` on 2920 passes while the
+            # dispatcher answered `--status` in one call, i.e. the verdict named a healthy component.
+            #
+            # ⛔ ONE SHORT LINE PER ORDER, NOT THE NOTE. The full `contract_note()` is 600+ chars and
+            # is ALREADY on this pass's `rubric:` line (one per pass, `apply_repo()`), so repeating
+            # it per PR only produced 19 truncated copies of the same sentence -- which is what made
+            # the log read like 19 different transport failures.
+            if rubric_refused(detail):
+                stalled["rubric"] = stalled.get("rubric", 0) + 1
+                undeliverable += 1
+                log("#%s (%s): not dispatched -- this pass holds a rubric that is not %s's, so no "
+                    "order can be placed; nothing was consumed and the dispatch chain was never "
+                    "invoked (the whole note is on this pass's `rubric:` line)"
+                    % (key, action, REPO or "<unresolved>"))
+                continue
             axis = gate_refusal_axis(detail)
             if record and not args.dry_run:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in

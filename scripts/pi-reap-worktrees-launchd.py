@@ -33,6 +33,22 @@ OPTIONALS, so `--script x --repo y` would abort with "unrecognized arguments:
 
 `--dry-run` is deliberately NOT hard-coded here: the template owns the arming
 decision, so the flag lives in one place.
+
+`HARNESS_SCRIPT_PATH` — WHY THE CHILD NEEDS IT (agent-infra#3778, #4012). The
+script arrives on bash's STDIN, so inside the child `BASH_SOURCE[0]` is UNSET and
+`$0` is the literal `bash`. Every consumer that derives its own directory to find a
+sibling asset — the repo's one bounded-execution helper `lib/bounded.sh`, or a
+sibling `.py` — therefore resolved against `$PWD` and refused:
+
+    bash: line 43: BASH_SOURCE[0]: unbound variable
+    conflict-rebase-timer: /tmp/lib/bounded.sh is missing — refusing to schedule …
+
+`launchctl list` read `exit=2` every 30 minutes over a bot that had never run once,
+and the state dir held no beacon, no log and no `last-failure` — so nothing on the
+box could distinguish "never executed" from "executed and refused". The one process
+that KNOWS the absolute path is this launcher, so it exports it and no consumer has
+to guess. This is the class fix: every `--script` consumer inherits it, not just the
+one that was measured.
 """
 from __future__ import annotations
 
@@ -71,12 +87,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     script = os.path.expanduser(script)
+    # Absolute, and exported, because the child cannot recover it: with `bash -s`,
+    # `BASH_SOURCE[0]` is unset and `$0` is `bash` (agent-infra#3778). A consumer
+    # that resolves its own directory from this gets the FARM path when the job is
+    # farmed, which is the path whose sibling `lib/` actually exists.
+    env = dict(os.environ)
+    env["HARNESS_SCRIPT_PATH"] = os.path.abspath(script)
     try:
         with open(script, "rb") as fh:
             # `bash -s` consumes the script from stdin, so bash never has to
             # open the file itself — that read is the one TCC denies it.
             return subprocess.run(
-                ["/bin/bash", "-s", "--", *forward], stdin=fh).returncode
+                ["/bin/bash", "-s", "--", *forward], stdin=fh, env=env).returncode
     except OSError as exc:
         print(f"pi-reap-worktrees-launchd: cannot read {script}: {exc}",
               file=sys.stderr)

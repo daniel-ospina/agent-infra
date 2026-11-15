@@ -899,7 +899,107 @@ ck "10m: …and the token names the GONE dir, not the clean copy beside it" \
    "$(qF "harness=executes:$GONE" "$OUT" && echo 0 || echo 1)"
 
 echo
+echo "── §11 A POST-DEPLOY LOSS OF THE EXEC BIT IS DRIFT, NAMED — a blob has no mode (#4003) ──"
+# ⛔ THE CLASS THIS GRADES: a script that is PRESENT, BYTE-IDENTICAL and UNRUNNABLE. `git hash-object`
+# hashes CONTENT; the mode lives in the tree ENTRY, so a 0644 copy of a 0755 script hashes identically
+# and the byte half graded GREEN over a dispatcher the loop cannot exec — measured on this fleet:
+# `nonblocking-dispatch.sh`, 36,175 B, `-rw-r--r--`, the dispatch path dead while every instrument read
+# clean. The deploy half of #4003 stops the bit being CREATED wrong; this half is the only thing that can
+# see a bit lost AFTER a good deploy (a restore, a `cp` without `-p`, a tarball, an `rsync` without
+# `--perms`, a `core.fileMode=false` checkout).
+# ⛔ ITS OWN FIXTURE REPO. A 100755 entry added to `$REPO` would join `repo-sh` and change the population
+# every arm above counts (the surface fixtures copy only a.sh/b.sh), so this repo exists to keep that
+# population still.
+MREPO="$TMP/mode-repo"; MO="$TMP/mode-O"
+MSRC="$MREPO/scripts/orchestrator-harness"
+mkdir -p "$MSRC" "$MO"
+printf '#!/usr/bin/env bash\necho dispatch\n' > "$MSRC/nonblocking-dispatch.sh"   # tracked 100755
+printf '#!/usr/bin/env bash\necho plain\n'      > "$MSRC/plain.sh"               # tracked 100644
+chmod +x "$MSRC/nonblocking-dispatch.sh"
+git init -q -b main "$MREPO" >/dev/null 2>&1 || { echo "❌ git init failed for the mode fixture"; exit 2; }
+( cd "$MREPO" && $G add -A && $G commit -q -m mode ) >/dev/null 2>&1
+ck "§11 fixture: nonblocking-dispatch.sh is tracked 100755" \
+   "$([ "$(git -C "$MREPO" ls-tree HEAD -- scripts/orchestrator-harness/nonblocking-dispatch.sh | cut -d' ' -f1)" = 100755 ] && echo 0 || echo 1)"
+ck "§11 fixture: plain.sh is tracked 100644 (the negative — a 644 source is NEVER a mode finding)" \
+   "$([ "$(git -C "$MREPO" ls-tree HEAD -- scripts/orchestrator-harness/plain.sh | cut -d' ' -f1)" = 100644 ] && echo 0 || echo 1)"
+mdeploy() {   # byte-identical to the ref AND carrying the ref's mode: a deploy the box completed
+  rm -rf "$MO"; mkdir -p "$MO"
+  cp "$MSRC/nonblocking-dispatch.sh" "$MSRC/plain.sh" "$MO/" || return 1
+  chmod +x "$MO/nonblocking-dispatch.sh"
+  bash "$PROVW" write --o "$MO" --src "$MSRC" --ref main --repo "$MREPO" >/dev/null 2>&1
+}
+mrun() { OUT="$(bash "$DRIFT" --o "$MO" --repo "$MREPO" --ref main --rel scripts/orchestrator-harness --no-fetch 2>&1)"; RC=$?; }
+mdeploy || { echo "❌ could not deploy the mode fixture"; exit 2; }
+
+# ⛔ THE FALSE-RED CHECK, AND IT MUST BE THE FIRST ARM: a box whose BYTES AND MODES both match reports
+# GREEN. This is the arm that keeps the new one from being "a check that reddens a healthy fleet", and
+# without it a mode arm that fired on everything would pass §11b by accident.
+ck "§11 fixture: plain.sh IS deployed non-executable (so the green below is not vacuous)" \
+   "$([ ! -x "$MO/plain.sh" ] && echo 0 || echo 1)"
+mrun
+ck "§11a: bytes AND modes match ⇒ rc 0 — a healthy box stays GREEN" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "§11a: …the verdict is OK, and NO mode finding is fabricated" \
+   "$( { qF "OK: deployed" "$OUT" && ! qF "NOT EXECUTABLE" "$OUT"; } && echo 0 || echo 1)"
+
+# ⛔ THE DEFECT, PLANTED. `chmod -x` on the deployed copy only: the bytes stay the ref's exactly, which
+# is the whole point — nothing a blob SHA can see has changed.
+chmod -x "$MO/nonblocking-dispatch.sh"
+ck "§11 planted mode loss: the deployed bytes are still IDENTICAL to the ref's (cmp — the detection below cannot be coming from bytes)" \
+   "$(cmp -s "$MSRC/nonblocking-dispatch.sh" "$MO/nonblocking-dispatch.sh" && echo 0 || echo 1)"
+mrun
+ck "§11b: a source 100755 that \$O cannot exec is DRIFT — rc 1" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "§11b: …the report NAMES the unrunnable file, not a count" \
+   "$(qF 'nonblocking-dispatch.sh — the deployed copy is NOT EXECUTABLE' "$OUT" && echo 0 || echo 1)"
+ck "§11b: …and it names the deployed MODE it read, so the finding is evidence" \
+   "$(qF 'mode -rw-r--r--' "$OUT" && echo 0 || echo 1)"
+ck "§11b: …the token is harness=not-executable:<file> — its own state, not a byte claim" \
+   "$(qF 'harness=not-executable:nonblocking-dispatch.sh' "$OUT" && echo 0 || echo 1)"
+# ⛔ THE TWO FINDINGS MUST NOT COLLAPSE INTO ONE. `payload-differs` is defined as "the BYTES differ from
+# the checkout", which is FALSE here (they are identical), and its remedy ("redeploy to adopt") tells an
+# operator nothing about the missing bit. Both negative assertions below redden if this arm is folded
+# back into the byte half or its token.
+ck "§11b: …it is NOT reported as a byte difference (the bytes are the ref's — that claim would be false)" \
+   "$(qF 'DIFFERS from the repo at' "$OUT" && echo 1 || echo 0)"
+ck "§11b: …and the token is NOT payload-differs" \
+   "$(qF 'harness=payload-differs' "$OUT" && echo 1 || echo 0)"
+ck "§11b: …and the remedy is PASTABLE — it names the real path, not a placeholder" \
+   "$(qF "chmod +x '$MO/nonblocking-dispatch.sh'" "$OUT" && echo 0 || echo 1)"
+
+# ⛔ THE CONTROL PAIRED WITH §11b, one `chmod` apart on the SAME fixture: the check is not stuck red.
+chmod +x "$MO/nonblocking-dispatch.sh"
+mrun
+ck "§11c: restoring the bit returns the verdict to OK (the arm is not permanently red)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+
+# ⛔ THE BYTE HALF IS UNCHANGED. One byte in the 644 script — no mode involved anywhere — must still be
+# caught by the arm that caught it before this change.
+printf '#!/usr/bin/env bash\necho plaiN\n' > "$MO/plain.sh"
+mrun
+ck "§11d: a BYTE difference is still detected (rc 1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ EITHER BYTE-QUESTION ARM MAY ANSWER, AND BOTH ARE THE BYTES QUESTION: with a provenance record the
+# edit is `(a)` ("an UNCOMMITTED EDIT" — it knows which side moved); with only a stamp there is no
+# manifest, so `(b)` names it as `DIFFERS from the repo at`. What must NOT change is that a one-byte
+# defect is still caught and the file is still NAMED — the arm below pins the naming, and its sibling
+# pins that the mode arm did not answer a byte defect.
+ck "§11d: …and still reported by the BYTES question, naming the file (not by the mode arm)" \
+   "$(qF 'plain.sh' "$OUT" && { qF 'DIFFERS from the repo at' "$OUT" || qF 'plain.sh — UNCOMMITTED EDIT' "$OUT"; } && echo 0 || echo 1)"
+ck "§11d: …and NOT as harness=not-executable (that arm must not answer a byte defect)" \
+   "$(qF 'harness=not-executable' "$OUT" && echo 1 || echo 0)"
+mdeploy   # leave the fixture clean for any arm added later
+
+# ⛔ THE REVERSE POLARITY, ASSERTED RATHER THAN IMPLIED. An executable copy of a `100644` source is NOT a
+# finding: git stores only 644/755, so `+x` on a plain script breaks nothing, and a check that reddened
+# it would redden boxes for a reason no deploy can explain. Without this arm the one-way-ness is only
+# visible by reading the code.
+chmod +x "$MO/plain.sh"
+mrun
+ck "§11e: an EXECUTABLE copy of a 100644 source is NOT reported (the arm is one-way, not a mode diff)" \
+   "$([ "$RC" -eq 0 ] && ! qF 'NOT EXECUTABLE' "$OUT" && echo 0 || echo 1)"
+mdeploy
+
+echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
+
 # ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (#2838). This check used to
 # grep the runner's SOURCE for its own `run_shard` row — the text of a list that no longer exists:
 # #2838 deleted the enumerated block, because every suite ran twice beside the derived loop and the
