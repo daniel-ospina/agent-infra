@@ -248,7 +248,7 @@ either side's provider SOURCE reddens something. Its refusal also writes `state/
 |---|---|
 | swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo's `origin/main` has had **no commits since 2026-09-18** (checked against the remote, not a local checkout — a local one here was 283 commits behind) |
 | the `content-inspiration` job | its entry point was an uncommitted file; the `.mjs` pipeline survives on its branch |
-| `retired/` (10 files: six `.sh`, four `.py`) | earlier iterations, kept for the record only — and `retired/` is outside the depth-1 `*.sh` drift gate (§4.1) |
+| `retired/` (10 files: six `.sh`, four `.py`) | earlier iterations, kept for the record only — and `retired/` is outside the drift gate (it compares depth-1 files of a DECLARED kind, §4.1) |
 
 ### 0.6 Activation is part of the design, not an afterthought
 
@@ -1312,23 +1312,34 @@ byte difference, a lost executable bit, a mode that differs from the source, and
 end; `MODE-UNSET` records a path whose mode could not be read at all (no usable `stat`), which the
 VERIFIED line also says out loud. It is written only once a copy has
 been attempted, so it is never present in a runtime that was refused, and `check-deployed-drift.sh`
-ignores it (it hashes `*.sh`). If the ledger cannot be installed the bytes are still verified, but the
+ignores it (it compares the DECLARED shipped set — see §4.1; the ledger is not one of its kinds). If the ledger cannot be installed the bytes are still verified, but the
 verdict says the evidence file is missing rather than pointing at one that does not exist.
 
 **This proves the COPY. It does not prove the RELATION, or that nothing extra is running.** After a
-redeploy, `check-deployed-drift.sh` is the complement **for the top level of `$O`** — it hashes every
-`*.sh` the repo ships at the ref **directly under the harness dir**, requires every one to be present
-in `$O` with the same git blob, and requires `$O` to carry no `*.sh` the repo does not ship, so a script
-retired two releases ago does not keep running behind a verified deploy. Run both.
+redeploy, `check-deployed-drift.sh` is the complement **for the top level of `$O`** — it compares every
+file the repo ships at the ref **directly under the harness dir** whose kind is in the gate's DECLARED
+shipped set (`*.sh`, `*.py`, `*.mjs`, plus the extensionless `gh-app-token`), requires every one to be
+present in `$O` with the same git blob, and requires `$O` to carry no such file the repo does not ship,
+so a script retired two releases ago does not keep running behind a verified deploy. Run both.
 
-⛔ **AND KNOW ITS EDGE — this helper deploys more than that gate compares.** The gate's repo side is
-`ls-tree … | grep -E "^${REL}/[^/]+\.sh$"` (`check-deployed-drift.sh:333`), i.e. **depth-1 `*.sh`**, and
-its deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`). This helper copies a
-recursive `find`, so **the rule is: every file that is not a top-level `*.sh` is outside that
-comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/gh`, `$O/gh-limit/gh`,
-`$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
-`install.sh`'s `DRIFTED` list (`install.sh:855`) carries exactly two of them — `gh-rest/gh` and
-`gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
+⛔ **AND KNOW ITS EDGE — this helper deploys more than that gate compares.** The compared set is
+`HARNESS_EXTS` + `HARNESS_EXTENSIONLESS` in `check-deployed-drift.sh` — **one** declaration, read by
+every listing — i.e. **depth-1 files of a DECLARED kind, in BOTH directions**. This helper copies a
+recursive `find`, so **the rule is: a file is outside that comparison if it sits deeper than depth 1, or
+if its kind is in neither declaration.** Concretely, OUTSIDE: `$O/retired/` (six `.sh` and four `.py`),
+`$O/gh-rest/gh`, `$O/gh-limit/gh`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two
+docs. INSIDE — and this is what #4015 changed: `$O/gh-limit.py`, `$O/gh-cred.py`, `$O/objective.py`,
+`$O/gh-app-token` and every other depth-1 driver. An earlier revision of this paragraph offered
+`$O/gh-limit.py` as its example of an UNCOVERED file: that was true of the `*.sh`-only gate and is now
+exactly wrong, in the one example most likely to be copied.
+⛔ **The aggregate payload FOLD is a separate scope and stays `*.sh`-only** — said here because this is
+the one place a reader will conflate "compared" with "folded". `o_payload_hash` / `prov_payload_hash`
+is a digest CONTRACT shared by three writers, so a stamp cannot name a `.py` difference; the per-file
+comparison can, and it does.
+
+`install.sh`'s `DRIFTED` list (`install.sh:855`) carries `gh-rest/gh` and
+`gh-limit.py` — the first is outside the gate, the second is now inside it — and never `retired/*` or
+`gh-limit/gh`. `check-single-source.sh --o` **does** compare
 `gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
 `launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
 `*.sh` + `*.py` + `gh-rest/gh` + `gh-limit/gh` and nothing else (an earlier draft of this paragraph said
@@ -1336,14 +1347,26 @@ comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/
 `install.sh:133` reads that file when install.sh is run from `$O`). It also **skips a missing file**
 (`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
 `$O/gh-limit/gh` is compared by nothing on any path — and a missing shim is exactly what #2041
-measured. So "run both" closes the loop for top-level scripts and for a *differing* shim, and not for a
-*missing* one: more than the bare `cp *.sh` it replaces, less than *every file*.
+measured. So "run both" closes the loop for the DECLARED depth-1 set and for a *differing* shim, and not
+for a *missing* one, nor for an undeclared kind: more than the bare `cp *.sh` it replaces, less than
+*every file*.
 
-⚠️ Two earlier drafts of this paragraph were wrong and are recorded rather than quietly replaced: one
+⚠️ **A verdict change on a route this repo still documents.** §4 step 1's plain-directory route
+(`cp scripts/orchestrator-harness/*.sh ~/orchestrator/`) deploys `*.sh` only, and a box prepared that way
+now reports one MISSING row per `.py` driver (up to eleven) and exits 1 where it previously read
+`OK … harness=current`. The verdict is truthful — the box genuinely lacks the drivers, which is the
+whole point of #3016/#4015 — but it is a NEW red on a documented route, so it is stated here rather than
+discovered on a box. `scripts/harness-up` / this helper (recursive `find`) or `install.sh` clears it.
+Widening the `*.sh`-only seeders (`orchestrator-bringup.sh deploy_harness`, `cloud-cell-quiesce.sh`,
+`cloud-cell-supervisor.sh seed_and_stamp`, `deploy-crossbox.sh`) is the DEPLOYMENT half of #4015 and is
+deliberately not part of this change.
+
+⚠️ Three earlier drafts of this paragraph were wrong and are recorded rather than quietly replaced: one
 said the shim had "no comparator on any path" (false — `check-single-source.sh --o` compares it for
-*difference*), the other said **four** populations were uncovered (false — the set is defined by the rule
-above, not by a count). An unverified claim in a file about unverified claims is this issue, so both are
-stated here.
+*difference*), one said **four** populations were uncovered (false — the set is defined by the rule
+above, not by a count), and one named `$O/gh-limit.py` as an uncovered file (true only of the
+`*.sh`-only gate; #4015 put it inside — corrected above, not deleted). An unverified claim in a file
+about unverified claims is this issue, so all three are stated here.
 
 **AND THIS HELPER NOW RECORDS THE BOX'S OWN PROVENANCE (`agent-infra`, 2026-10-29).** At the end of a
 verified deploy it writes `$O/.harness-provenance` — the source commit, the ref, and a sha256 for
@@ -1489,7 +1512,10 @@ with the gap each still carries, in the coverage table earlier in this section).
 file the deploy wrote, so a box answers with no checkout, no network and no `jq`. The manifest is the
 **write set**, not the source tree: `start` installs only the depth-1 `*.sh`, so it records only those
 (it passes `--skip` for every file it does not write) — a `README.md` that a full deploy put in `$O` is
-therefore neither claimed by `start`'s record nor able to refuse a `start` that never touches it.
+therefore neither claimed by `start`'s record nor able to refuse a `start` that never touches it. ⚠️ And
+because the drift gate now compares `.py` too (§4.1), a `start`-prepared box's `.py` drivers are
+UNRECORDED **and** compared: they read as MISSING against the ref, which is the deployment half of
+#4015 still being open, not a defect of the record.
 
 ```bash
 # THE ONE-LINE ANSWER — works on a box with no checkout at all
@@ -1515,7 +1541,8 @@ path dead and the report green. The check therefore reads the mode from `$REF`'s
 and tests `[ -x ]` on `$O`, one-way: a source `100755` that `$O` cannot execute is a finding, an
 executable copy of a `100644` source is not (a check that reddens a healthy box is its own failure). That
 state gets its OWN token, `not-executable:<file>` — never `payload-differs`, whose meaning is "the bytes
-differ" and whose remedy names no mode. ⛔ **Scope:** the arm grades `$O`'s depth-1 `*.sh`; a `--surface`
+differ" and whose remedy names no mode. ⛔ **Scope:** the arm grades `$O`'s depth-1 files of the DECLARED
+kind (`*.sh`, `*.py`, `*.mjs`, `gh-app-token`); a `--surface`
 candidate dir other than `$O` is still compared by **bytes only** (the FARM population is not left
 ungraded — `check-farm-drift.sh` carries its own `NOT-EXECUTABLE` arm over `$DEST/scripts`).
 
@@ -1534,7 +1561,7 @@ bytes"). Every drift token below names a problem; `current` names the absence of
 | `harness=not-executable:<file>` | (b) — the **mode** half | the repo ships `<file>` **100755** at `$REF` and `$O`'s copy is **not executable**. Its bytes may be the ref's exactly — a mode is not in a blob, so no byte comparison can see this, and a bit lost **after** a good deploy (a restore, a `cp` without `-p`, a tarball, an `rsync` without `--perms`, a `core.fileMode=false` checkout) reads clean everywhere else. #4003's silent-disarm class: the loop execs a script the box cannot run | `chmod +x` the file(s) — the report prints the exact path — or redeploy, which writes the mode from git. ⛔ NOT `payload-differs`: nothing about the bytes is wrong, and that token's remedy names no mode |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
 | `harness=executes:<dir>` | **neither — it is a statement about the PROCESS** | a live controller is **executing** `<dir>/orch-loop.sh` and that directory **cannot be matched to this repo**: it **does not exist**, *or* it exists with **no readable `*.sh`** (the interpreter holds a deleted script open, so the process outlives the file) — the `DRIFT(exec)` line above the token says which of the two (`--surface` reads it from the process's own argv, `ps -eo pid=,command=` with `/proc/<pid>/cmdline` where the kernel keeps it, so it is what the box runs rather than what a record says). The pin record, the deploy record and the unit can all be correct — they describe copies at rest — while the tree that is running is one of those two states (#10114, #3194) | **restart the controller from the pinned tree** (`scripts/harness-up`); redeploying `$O` cannot clear it |
-| `harness=surface` | (b) on a copy — see the two shapes | a **copy at rest that this box carries** has drifted from `$REF`. The body NAMES the dir (`surface: <dir>`), and that dir may be `$O` or another one (`~/orchestrator`, a cell's copy, the running controller's). It appears in **two shapes**: `$O` has **no readable record** — then the token is `surface` for *any* surface drift, `$O`'s included, because `$O` is compared against `$REF` as a surface candidate even without a record (the body prints `identity: SKIPPED`; what that shape cannot answer is **record identity**, and an `$O` that drifted will be the dir named) — **or** `$O` answered all three questions and the drift is another dir | **reseed the dir the body names** (or move the box onto the pin: `scripts/harness-up`). Read the name: if it is `$O`, what a redeploy clears depends on WHICH comparison failed: a file that DIFFERS or is MISSING is overwritten/created, so a redeploy/`apply` clears it (and on the record-less shape it also makes the box identifiable) — but a file that **exists ONLY in that dir** (`DRIFT: <file> — exists ONLY in <dir>`) is NOT removed, because the deploy copies and does not prune (the "Precedence when more than one state is true" subsection below says so: "the deploy does not delete it"), so there the dir must be reseeded or the file removed by hand; if the named dir is another one, redeploying `$O` cannot clear it at all. ⛔ The comparison scope is **top-level `*.sh`** in the harness rel: a hand patch to a non-`.sh` file is invisible on the record-less shape and only the record form (`uncommitted-edit`) catches it |
+| `harness=surface` | (b) on a copy — see the two shapes | a **copy at rest that this box carries** has drifted from `$REF`. The body NAMES the dir (`surface: <dir>`), and that dir may be `$O` or another one (`~/orchestrator`, a cell's copy, the running controller's). It appears in **two shapes**: `$O` has **no readable record** — then the token is `surface` for *any* surface drift, `$O`'s included, because `$O` is compared against `$REF` as a surface candidate even without a record (the body prints `identity: SKIPPED`; what that shape cannot answer is **record identity**, and an `$O` that drifted will be the dir named) — **or** `$O` answered all three questions and the drift is another dir | **reseed the dir the body names** (or move the box onto the pin: `scripts/harness-up`). Read the name: if it is `$O`, what a redeploy clears depends on WHICH comparison failed: a file that DIFFERS or is MISSING is overwritten/created, so a redeploy/`apply` clears it (and on the record-less shape it also makes the box identifiable) — but a file that **exists ONLY in that dir** (`DRIFT: <file> — exists ONLY in <dir>`) is NOT removed, because the deploy copies and does not prune (the "Precedence when more than one state is true" subsection below says so: "the deploy does not delete it"), so there the dir must be reseeded or the file removed by hand; if the named dir is another one, redeploying `$O` cannot clear it at all. ⛔ The comparison scope is **depth-1 files of a declared kind** (`*.sh`, `*.py`, `*.mjs`, `gh-app-token`) in the harness rel: a hand patch to one of those reds the box on the record-less shape, while a hand patch to an UNDECLARED kind (`launchd.plist.template`, `port-provenance.txt`, the docs) is invisible there and only the record form (`uncommitted-edit`) catches it |
 
 ### Precedence when more than one state is true
 
@@ -1570,7 +1597,7 @@ What must never happen — and was exactly this P0 (#10114) — is a **concluded
 with no `$O` abstains, so the `O_ABSENT` arm can only be reached when the **surface pass** is what
 differed. On that shape `$O`'s bytes may still have been compared — `check-deployed-drift.sh` adds `$O`
 to the surface candidate list whenever `$O` IS a harness dir, so a `--surface` run against a
-record-less `$O` DOES compare it, and a hand patch to a top-level `*.sh` there reds the box (non-`.sh` files a deploy writes are NOT compared on that shape — only the record form catches those) — what that shape cannot answer is
+record-less `$O` DOES compare it, and a hand patch to a top-level file of a DECLARED kind there reds the box (a file of an UNDECLARED kind — `launchd.plist.template`, the docs — is NOT compared on that shape; only the record form catches those) — what that shape cannot answer is
 the **record identity** question (the body prints `identity: SKIPPED`); on the other shape `$O` **was**
 compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
 condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone still emits
@@ -5942,7 +5969,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, `status` FAILS a started cell whose roles never ran, a DEAD loop is never reported `WAITING` (`DEAD` in every row, non-zero), and an unverifiable loop record abstains as `UNKNOWN` with exit 3 (#2306). A CI shard |
 | `cloud-cell-doctor.hardening.test.sh` | #1989, the HARDENING half (a separate suite, not a fork of the one above): every read the doctor acts on must be classified, so an unreadable session list / client list / ancestry walk / pane read / log mtime / process table / open-PR read / review record is cannot-verify rather than an answer, while a benign non-answer (a fresh box with no server, a lane that ended between reads) is not; an action that did not take (a refused or unverifiable kill, cpu that went DOWN) is never a reap; the rail's rc classifier is a PREDICATE (`124..127`, any `128+N`); and a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says in the record that it was a rehearsal, on every role. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
-| `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped depth-1 file of the DECLARED kind (`*.sh`, `*.py`, `*.mjs`, `gh-app-token`) against its `$O` copy, in BOTH directions (missing and unshipped). Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤9 metered REST calls (the 9th is the per-candidate mergeability read, which the LIST endpoint does not compute), a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
 | `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, **`running: <sha12>|NONE|UNREADABLE|MIXED`** — the commit the RUNNING controller's own argv resolves to, which is what "activated" means (`harness-refresh.sh` calls the pin-ahead-of-process state `restart-pending`; the pin alone certified a box as `deployed AND activated` while it executed pre-fix code, #2680) — the repo it compares against is resolved `HARNESS_REPO`-first / the payload's own checkout / this script's own checkout / the conventional `$HOME/orchestrator` — and every candidate must CARRY the harness — `scripts/orchestrator-harness/box-status.sh` **tracked as a regular file at exactly that path by the candidate's own repo** (`git ls-files -s`: index mode `100644`/`100755` **and** the recorded path equal to the marker, so a prefix match is not the file), which skips a checkout that is merely *some* repo, one that only reaches the harness through the gitignored `scripts -> $AGENT_INFRA_PATH/scripts` pointer every tortoise/eldato checkout carries (#9475), one that tracks a SYMLINK (mode `120000`) or a GITLINK (`160000`) at the marker path and so ships no harness bytes, and one whose marker path is a DIRECTORY (the index records a nested file) — none of them can be read as the harness repo (#2679); a subdirectory candidate is ACCEPTED, the same as `harness_repo_of()` (a literal-path test refused what `harness-refresh.sh` and `check-deployed-drift.sh` accept), and a refused candidate is NAMED on `ref:` (`ref: UNRESOLVED (--repo: … has NO INDEX ENTRY for …)` / `(… not a TRACKED REGULAR FILE there (mode …))` / `(… records … instead …)`) instead of leaving the line out, because an absent line reads as "no opinion" when the answer is "compared against nothing" — and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table — and it reads the controller's argv as NUL-separated fields (`/proc/<pid>/cmdline`, `mapfile -d ''`), not a whitespace split, because a harness path may contain a space and a split one answered `running: UNREADABLE` for an ACTIVATED box; the `ps` fallback has no NUL-preserving form, so a space there yields UNREADABLE rather than a wrong tree, never a guess. `MIXED` is driven directly by two real trees in the suite, not only reached through a stub |
 | `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
