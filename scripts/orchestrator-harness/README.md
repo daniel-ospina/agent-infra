@@ -5021,6 +5021,17 @@ already holding):
   a reader that predates #2293 must treat `fork` the same way, and it will then publish the LOAD remedy
   for a box that cannot spawn the retry — which is exactly why the two codes were given distinct values
   (71 capability / 73 fork / 74 land / 75 load / 77 disk / 81 memory / 82 key / 83 skew / 85 stale-code) rather than shared.
+- **`stale-code` is refused on a BASE only, and the reading says which it measured** (#3932).
+  `cell-lane-preflight.sh` reports `role=base` when HEAD is an ancestor of `origin/main` (nothing is built
+  on that tree yet, so `HEAD..origin/main` IS the distance from the base the threshold is calibrated
+  for) and `role=branch` when the tree carries commits of its own. A BASE over
+  `CELL_PREFLIGHT_MAX_BEHIND` refuses **85**; a BRANCH over it is REPORTED (`stale_base=1`, plus a
+  `[capability-gate] NOTE` at the spawn seam) and **admitted**, because on a branch the count is mostly
+  main's own unmerged commits and merging them is the fixer's assigned work — refusing there is a
+  deadlock with no self-clearing path, since the only work that would advance the branch is the work
+  the refusal blocks before the process starts (`fix-one.sh` passes `WIP_PATH="$WT"`, a worktree on the
+  PR branch). `role=unknown` (an unreadable merge-base) never refuses. Do not "restore" the
+  unconditional refusal: it stops every fixer for a PR older than the repo's merge velocity.
 - **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
   never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
   for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
