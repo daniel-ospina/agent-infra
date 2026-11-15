@@ -3628,6 +3628,450 @@ def test_bash_shard_recap_identity_is_compared_not_dropped():
     assert blocked.blocked and blocked.blocked[0].nodeid == key
 
 
+# ── THE PER-RUN TEMP DIRECTORY (#1424) ──────────────────────────────────────
+#
+# The closed mask list already excluded the run's ADDRESSES, UUIDs, hex run ids,
+# tenants (``team_*``) and measured durations. It did NOT exclude the run's TEMP
+# DIRECTORY — so a failure whose assertion interpolates ``tmp_path`` (or pytest's
+# ``tt_*`` basetemp) carried a per-run path into its signature, and
+# ``_signatures_overlap``'s SUBSET rule could never hold for it. An id main itself
+# measures red is then BLOCKed on every PR as "a DIFFERENT failure":
+#
+#   BLOCK : tests/test_pack_state.py::TestBackfillScript::test_apply_writes_to_introspection_read_target
+#           signature differs from main's (1/1 (100%) vs 10/10 (100%))
+#           — same id, a DIFFERENT failure is not exempt
+#
+# Both sides are 100% red. They differ ONLY in the random directory name, which no
+# run can ever reproduce, so the match is unsatisfiable BY CONSTRUCTION rather than
+# by novelty. The fix masks the PER-RUN COMPONENT, never the whole path, because
+# over-masking is the fail-OPEN direction (see the normaliser list's own comment).
+
+#: The pair from #1424's body: ``tempfile``/``tmp_path`` shape, 100% red both sides.
+_REDIS_SOCKET_A = (
+    "Error 111 connecting to /tmp/tmpnnjrgwic/redis.socket. No such file or directory."
+)
+_REDIS_SOCKET_B = (
+    "Error 111 connecting to /tmp/tmpieuczgoo/redis.socket. No such file or directory."
+)
+
+#: The pair measured on tortoise #12342 (agent-infra #1424, comment 09:24Z): pytest's
+#: ``tt_*`` basetemp AND a ``mkdtemp(prefix=…)`` component, both random per run.
+_COLLISION_A = (
+    "local checkout: /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc/repo/.worktrees/asker-3061"
+)
+_COLLISION_B = (
+    "local checkout: /tmp/tt_asj7_8mx/collision-preflight-ps6x5yrr/repo/.worktrees/asker-3061"
+)
+
+
+def test_1424_a_per_run_temp_directory_is_one_signature():
+    """RED before the fix: each text normalises to itself, so the SUBSET rule fails."""
+    for left, right in [
+        (_REDIS_SOCKET_A, _REDIS_SOCKET_B),
+        (_COLLISION_A, _COLLISION_B),
+        # ``tempfile`` draws from ``[a-z0-9_]``, so ~14% of real runs carry an
+        # underscore in the random name. A class of ``[A-Za-z0-9]`` leaves those
+        # raw and the block returns intermittently (review round 2, finding 1).
+        (
+            "/tmp/tmpyhd2_vfw/redis.socket: No such file or directory.",
+            "/tmp/tmpkrc_c_8v/redis.socket: No such file or directory.",
+        ),
+        # An ALL-HEX draw must land on the same mask as an alphanumeric one: when
+        # the ``<HEX>`` rule ran first, one run normalised to ``pi-census-<HEX>``
+        # and the other to ``pi-census-<TMP>`` and the pair never converged.
+        (
+            "/tmp/tt_a1b2c3d4/pi-census-a1b2c3d4/repo/pi",
+            "/tmp/tt_q2w3e4r5/pi-census-q7w8e9r0/repo/pi",
+        ),
+        # NESTED roots (a ``tempfile`` dir under pytest's basetemp): masking the
+        # parent is what makes the child's anchor true, so the group needs a pass
+        # per level.
+        (
+            "/tmp/tt_a1b2c3d4/tmpXy12Zz9q/repo/x",
+            "/tmp/tt_q2w3e4r5/tmpAb34Cd56/repo/x",
+        ),
+    ]:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+
+        # The mask is APPLIED, not merely absent from both sides — equality alone
+        # would pass on an unfixed tree where both stayed raw.
+        assert "<TMP>" in a, a
+        assert "tt_" not in a and "tmpn" not in a, a
+        assert a == b, (
+            "a per-run temp directory must not be part of the signature — "
+            f"main's {left!r} and the PR's {right!r} are ONE failure"
+        )
+
+
+def test_1424_a_labelled_directory_under_a_temp_root_stays_SIGNAL():
+    """The random TAIL is masked; the test's own LABEL is not.
+
+    ``tempfile`` draws carry no hyphen, so a hyphenated component under a temp
+    root is a label unless its tail looks generated (carries a digit). Replacing
+    the whole component (review round 2, finding 2) collapsed these pairs — a
+    fail-OPEN exemption for a failure main never had.
+    """
+    for left, right in [
+        ("/tmp/tmpabc12345/run-integration failed", "/tmp/tmpabc12345/run-migrations failed"),
+        ("/tmp/tmpabc12345/expected-workflow failed", "/tmp/tmpabc12345/rejected-workflow failed"),
+    ]:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+        assert a != b, f"two different labels collapsed into one signature: {a!r}"
+
+    # …and the stable PREFIX survives when the tail IS generated, so two
+    # different mkdtemp prefixes stay distinguishable across runs.
+    one = ci_exemption.normalize_signature("/tmp/tmpabc12345/collision-preflight-iis0g3yc/repo")
+    two = ci_exemption.normalize_signature("/tmp/tmpabc12345/pi-census-zz9q8w7e/repo")
+    assert one == "/tmp/<TMP>/collision-preflight-<TMP>/repo", one
+    assert two == "/tmp/<TMP>/pi-census-<TMP>/repo", two
+
+
+def test_1424_each_floor_and_anchor_is_pinned():
+    """Every live conjunct of the temp rules reddens here when it is removed.
+
+    Review round 2 measured four conjuncts with NO discriminating test: the
+    ``tmp`` 8-character floor, the ``tt_`` temp-root anchor, the ``mkdtemp``
+    8-character floor and the delimiter lookahead. Each removal widened masking
+    without reddening anything, which is the fail-OPEN delta these pin.
+    """
+    n = ci_exemption.normalize_signature
+
+    # ``tmp`` floor: tempfile's draw is exactly 8, so a short ``tmp…`` token is a
+    # stable name (a directory, a prose word), not a generated one.
+    assert n("/tmp/tmpfiles/x broken") == "/tmp/tmpfiles/x broken"
+    assert n("/tmp/tmpabcd1d2e/x broken") == "/tmp/<TMP>/x broken"
+
+    # ``tt_`` temp-root ANCHOR: the same shape OUTSIDE a temp tree is a label.
+    # ⛔ These tokens are 8 characters, digit-bearing and NON-HEX on purpose: an
+    # 11-character label is excluded by the WIDTH arm, and an all-hex draw is
+    # already masked by the pre-existing ``<HEX>`` rule — either would leave the
+    # anchor unpinned (review round 7).
+    assert n("api_key=tt_valid_key_v2 rejected") == "api_key=tt_valid_key_v2 rejected"
+    assert n("api_key=tt_q9w8e7r6 rejected") == "api_key=tt_q9w8e7r6 rejected"
+    assert n("api_key=tt_z2x3c4v5 rejected") == "api_key=tt_z2x3c4v5 rejected"
+
+    # ``mkdtemp`` tail widths: 6 (Node's ``fs.mkdtempSync``) and 8 (Python's
+    # ``tempfile``) are generators; 9+ is not a draw at all. Both directions.
+    assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-<TMP> broken"
+    assert n("/tmp/tmpABCD1234/ab-zx81kq2p broken") == "/tmp/<TMP>/ab-<TMP> broken"
+    # …and the FLOOR at 6: a 5-character digit-bearing tail is not a draw, so
+    # lowering ``{6,8}`` must red here (round 7 measured it green before this).
+    assert n("/tmp/tt_a1b2c3d4/ab-c1234/x") == "/tmp/<TMP>/ab-c1234/x"
+    assert n("/tmp/tt_a1b2c3d4/ab-d5679/x") == "/tmp/<TMP>/ab-d5679/x"
+
+    # ``tmp`` EXACT width (round 3): ``_RandomNameSequence`` emits 8, so a longer
+    # run is a stable name — masking it collapsed ``/tmp/tmpcache2024`` with
+    # ``/tmp/tmpdata2024``. A 7-character name stays raw too.
+    assert n("/tmp/tmpcache2024/state.json") == "/tmp/tmpcache2024/state.json"
+    assert n("/tmp/tmpabc1d2e/x") == "/tmp/tmpabc1d2e/x"
+    assert n("/tmp/tmpabcd1d2e/x") == "/tmp/<TMP>/x"
+
+    # ``mkdtemp`` tail EXACT width, with a NON-HEX tail so the pre-existing
+    # ``<HEX>`` mask cannot be what leaves it raw.
+    assert n("/tmp/pi-census-zz9q8w7e6/x") == "/tmp/pi-census-zz9q8w7e6/x", (
+        "a 9-character tail is not a draw — masking it slides the prefix boundary"
+    )
+
+    # ``tt_`` 6-character floor.
+    assert n("/tmp/tt_ab1/x") == "/tmp/tt_ab1/x"
+
+    # The mkdtemp TEMP-ROOT ANCHOR (round 3, mutant M5): without it a deploy name
+    # outside a temp tree is masked and two environments converge.
+    assert (
+        n("deploy preview-deploy-zz88qq11 failed")
+        == "deploy preview-deploy-zz88qq11 failed"
+    )
+
+    # The fixed-point pass at THREE levels: each mask makes the next child's anchor
+    # true, and ``re.sub`` never re-scans a replacement.
+    assert (
+        n("/tmp/tt_a9b0c300/tt_a9b1c300/tt_a9b2c300/repo/x")
+        == "/tmp/<TMP>/<TMP>/<TMP>/repo/x"
+    )
+
+    # Delimiter lookahead: a FILENAME's stem is not a directory component. The
+    # tail here is 8 characters, so the floor cannot be what keeps it raw.
+    assert (
+        n("/tmp/tmpABCD1234/build-zx81kq2p.yaml missing")
+        == "/tmp/<TMP>/build-zx81kq2p.yaml missing"
+    )
+
+    # ``tmp`` temp-root anchor (round 2, finding 3): a stable directory that
+    # merely starts with ``tmp`` is untouched outside a temp tree, and — the
+    # amplification the reviewer measured — it cannot emit a ``<TMP>`` that then
+    # satisfies a sibling rule's ``(?<=<TMP>/)`` arm.
+    assert n("config /home/user/tmpmanager/x.yml") == "config /home/user/tmpmanager/x.yml"
+    assert n("/home/user/tmpmanagers/commit-workflow") == "/home/user/tmpmanagers/commit-workflow"
+
+
+def test_1424_the_temp_directory_case_is_EXEMPT_end_to_end():
+    """#1424's acceptance: the rail's own decision, not just the mask.
+
+    main measured this id red 10/10 with a signature carrying ITS run's temp dir;
+    the PR's run carries a different one. Same id, same assertion — the exemption
+    must be available, or no PR that touches this surface can land.
+    """
+    main_sig = ci_exemption.normalize_signature(f"AssertionError: {_REDIS_SOCKET_A}")
+    pr_sig = ci_exemption.normalize_signature(f"AssertionError: {_REDIS_SOCKET_B}")
+
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+
+    assert not decision.any_blocked, (
+        "same id + same assertion + main's own 10/10 measurement must EXEMPT; got "
+        f"{[b.reason for b in decision.blocked]}"
+    )
+    assert len(decision.exempt) == 1
+
+
+def test_1424_a_MEANINGFUL_path_still_BLOCKs():
+    """The other direction: the mask is the COMPONENT, not the whole path.
+
+    If it swallowed everything from ``/tmp/`` onward, two genuinely different
+    failures that happen to live under a temp root would compare equal and the
+    exemption would be handed to a failure main never had — the fail-OPEN
+    direction the SUBSET rule exists to close.
+    """
+    left = f"{_COLLISION_A}/packs/good-is-not-broken"
+    right = f"{_COLLISION_B}/packs/broken-is-not-good"
+    a = ci_exemption.normalize_signature(left)
+    b = ci_exemption.normalize_signature(right)
+
+    assert "good-is-not-broken" in a and "broken-is-not-good" in b
+    assert a != b, "a stable path component must stay SIGNAL"
+
+    decision = decide(
+        {ID: _f(1, 1, b)},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({a})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a different failure must never be exempted"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_1424_the_mask_does_not_swallow_a_short_or_generic_token():
+    """The mask list is closed: nothing is masked that the evidence does not demand."""
+    for text in (
+        "tmpdir",  # generic prose, not a generated id
+        "tt_id",
+        "assert 3 == 2",  # a COUNT is signal (the <HEX> rule's own guard)
+        "tortoise/packs/a.yml != tortoise/packs/b.yml",  # a repo-relative path is signal
+        "fix/12266-carve-out",  # a branch slug is not a mkdtemp component
+        "/tmp/fixtures/packs/good.yaml",  # a temp path with NO per-run component
+    ):
+        assert ci_exemption.normalize_signature(text) == text, text
+
+
+#: Pairs that LOOK like the volatile shapes and are NOT — each one is a real
+#: identifier from this fleet. A rule without the fingerprint masks every one of
+#: them, which is the fail-OPEN direction: main red in one repo directory would
+#: exempt a PR's NEW failure in another. Measured on this repo's own tree, a rule
+#: that is BOTH unanchored AND fingerprint-free masks 271 of 430 tracked
+#: directories (`docs/epics/917-lean-workflow`, `extensions/loop-enforcer`);
+#: unanchored ALONE masks 0 tracked DIRECTORIES today, because the
+#: digit/uppercase fingerprint is what excludes `commit-workflow`-style names.
+#: (Slug figures must be quoted with their population — round 6 measured 184 of
+#: 398 origin-tracking refs for the same shape, and the ref set drifts.) Review
+#: rounds 5 and 6 corrected this comment's earlier claims, which were no longer
+#: reproducible.
+_STABLE_LOOKALIKES = (
+    (
+        "pnpm pack: /repo/skills/commit-workflow/SKILL.md missing",
+        "pnpm pack: /repo/skills/debug-workflow/SKILL.md missing",
+    ),
+    (
+        "unregistered worktree /repo/.worktrees/fix/issue-3429-gh-credential",
+        "unregistered worktree /repo/.worktrees/fix/issue-9999-gh-credential",
+    ),
+    (
+        "changed files: modified\\extensions/loop-enforcer/termination.ts",
+        "changed files: modified\\extensions/secret-redactor/termination.ts",
+    ),
+    (
+        # ``tt_`` is ALSO the consumer repo's semantic API-key fixture family:
+        # masking it by shape alone conflates "valid key rejected" with
+        # "rate-limited", two different diagnoses under one id.
+        "AssertionError: status 401 for api_key=tt_valid_key expected 200",
+        "AssertionError: status 401 for api_key=tt_ratelimited expected 200",
+    ),
+)
+
+
+def test_1424_a_stable_lookalike_is_never_temp_masked():
+    """The masks are anchored to a TEMP PATH, not to a shape alone."""
+    for left, right in _STABLE_LOOKALIKES:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+        assert "<TMP>" not in a, f"a stable identifier was masked: {a!r}"
+        assert a != b, f"two genuinely different failures collapsed: {a!r}"
+
+    # …and the same pairs still BLOCK end-to-end, not merely in the string.
+    left, right = _STABLE_LOOKALIKES[0]
+    decision = decide(
+        {ID: _f(1, 1, ci_exemption.normalize_signature(right))},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({ci_exemption.normalize_signature(left)})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a different failure must never be exempted"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_1424_no_TRACKED_directory_of_this_repo_is_temp_masked():
+    """Breadth invariant, so the next shape rule cannot re-open the hole quietly.
+
+    Reads the INDEX, not the working tree: the name says *tracked*, and a dev or
+    fixer checkout legitimately carries transient untracked markers under a
+    gitignored ``tmp/`` (``.gitignore`` lists it), which would red this for a
+    reason that says nothing about the product (review round 3).
+    """
+    root = Path(__file__).resolve().parents[1]
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):  # not a git checkout → not ours to grade
+        pytest.skip("no git index here; the breadth invariant needs the index")
+    # EVERY ancestor, not only the immediate parent: an empty directory that holds
+    # no file directly is otherwise never graded, and 93 of this repo's 430 were
+    # invisible that way (review round 4) — a widened rule inside one would ship
+    # green.
+    dirs = {
+        par.as_posix()
+        for p in (q.decode() for q in out.split(b"\0") if q)
+        for par in Path(p).parents
+        if par.as_posix() != "."
+    }
+    assert len(dirs) > 50, f"the index scan found {len(dirs)} directories — it is not reading the tree"
+    masked = sorted(
+        d for d in dirs
+        if ci_exemption.normalize_signature(f"/repo/{d}") != f"/repo/{d}"
+    )
+    assert masked == [], f"stable repo paths must stay SIGNAL: {masked[:5]}"
+
+
+def test_1424_every_fleet_temp_generator_shape_is_covered():
+    """The masks follow the two generators the fleet actually runs (review round 4).
+
+    * pytest's DEFAULT basetemp ``pytest-of-<user>/pytest-<N>`` — ``<user>`` differs
+      between a hosted runner and a cell and ``N`` increments per session, so both
+      components are volatile. This repo sets no ``--basetemp``, so this is its own
+      ``tmp_path`` shape.
+    * Node's ``fs.mkdtempSync`` — width 6, MIXED case (libuv), which the
+      lowercase-only classes missed entirely even though 85 files here call it.
+    * ``mkstemp(prefix=…, suffix=…)`` — a ``.last`` / ``.tmp`` suffix is part of the
+      call, not of the draw, so the lookahead must still see it as a component.
+    * the ``tt_`` ceiling: an 8-character draw, so two differently-named stable
+      directories one character apart must never collapse.
+    """
+    n = ci_exemption.normalize_signature
+
+    assert (
+        n("/tmp/pytest-of-cmux/pytest-2727/test_x0/redis.socket")
+        == n("/tmp/pytest-of-cell/pytest-2729/test_x0/redis.socket")
+        == "/tmp/<TMP>/test_x0/redis.socket"
+    )
+    assert (
+        n("/tmp/auto-sync-pin-b7vSrb/x") == n("/tmp/auto-sync-pin-pVxkIu/x")
+        == "/tmp/auto-sync-pin-<TMP>/x"
+    )
+    assert (
+        n("/tmp/obj-cache-abcdef12.last") == n("/tmp/obj-cache-zzzz9999.last")
+        == "/tmp/obj-cache-<TMP>.last"
+    )
+    assert n("/tmp/tt_bigcache_2024/x") != n("/tmp/tt_bigcache_2025/x")
+    assert n("/tmp/tt_valid_key_1/x") != n("/tmp/tt_valid_key_2/x")
+    # …and the CEILING lookahead ``(?![0-9A-Za-z_])``, which only bites when the
+    # 9th character is part of the same word: without it these two collapse
+    # (round 7 measured the suite green with the lookahead deleted).
+    assert (
+        n("/tmp/tt_z2x3c4v5_shared/x") == "/tmp/tt_z2x3c4v5_shared/x"
+    ), "a 9th character means this is not an 8-character draw"
+    assert (
+        n("/tmp/tt_q9w8e7r6_shared/x") == "/tmp/tt_q9w8e7r6_shared/x"
+    )
+
+
+def test_1424_the_all_letter_draw_residual_is_DECLARED():
+    """The digit requirement's cost, pinned so it is declared rather than rediscovered.
+
+    ``tempfile`` draws from 37 characters, 27 of them non-digits, so an 8-character
+    draw is all letters ~8% of the time (``(27/37)**8``). Such a draw stays raw and
+    the id simply does not exempt — fail-CLOSED, and the price of never collapsing
+    two different labels. Dropping the requirement is NOT the fix: it masks
+    ``expected-workflow`` / ``build-workflow``-style 8-character FINAL segments.
+    """
+    a = ci_exemption.normalize_signature(
+        "/tmp/tt_a1b2c3d4/collision-preflight-abcdefgh/repo/x"
+    )
+    b = ci_exemption.normalize_signature(
+        "/tmp/tt_a1b2c3d4/collision-preflight-zzzzyyyy/repo/x"
+    )
+
+    assert a == "/tmp/<TMP>/collision-preflight-abcdefgh/repo/x", a
+    assert b == "/tmp/<TMP>/collision-preflight-zzzzyyyy/repo/x", b
+    assert a != b, "a declared residual must not silently become a mask"
+
+
+def test_1424_a_semantic_tt_label_stays_signal_even_under_a_temp_root():
+    """The digit requirement on the ``tt_`` tail is the arm the anchor cannot give.
+
+    ``tt_`` is BOTH a generated basetemp prefix and the consumer repo's API-key
+    fixture family. Anchoring to ``/tmp/`` separates the common case, but a
+    fixture labelled ``tt_expected`` can also be a directory NAME, so the tail
+    must look generated (it must carry a digit) before it is masked.
+
+    ⛔ The labels here are EIGHT characters ON PURPOSE. The first version of this
+    test used ``tt_valid_key`` (11) and ``tt_ratelimited`` (13) — both already
+    excluded by the width arm — so deleting the fingerprint kept the suite green
+    (review round 6 residual 1; the round-5 commit claimed this was fixed and it
+    was not, corrected here).
+    """
+    a = ci_exemption.normalize_signature("/tmp/tt_expected/repo/socket missing")
+    b = ci_exemption.normalize_signature("/tmp/tt_rejected/repo/socket missing")
+
+    assert "<TMP>" not in a, f"a semantic label must stay SIGNAL: {a!r}"
+    assert a != b, f"two 8-character labels collapsed: {a!r}"
+
+    # …the FINGERPRINT, at the width the mask actually operates on, is what
+    # separates an 8-character label from an 8-character draw.
+    assert (
+        ci_exemption.normalize_signature("/tmp/tt_a1b2c3d4/repo/socket")
+        == "/tmp/<TMP>/repo/socket"
+    )
+
+    # …and a long-form semantic fixture is excluded by the WIDTH arm, not this one.
+    assert (
+        ci_exemption.normalize_signature("/tmp/tt_valid_key/repo/x")
+        == "/tmp/tt_valid_key/repo/x"
+    )
+
+
+def test_1424_a_temp_mask_before_a_duration_does_not_read_as_a_bound_operator():
+    """``<TMP>`` must join ``_MASKED_TOKEN_RE``, or it becomes a phantom ``>`` bound.
+
+    The measurement rule reads the text to the LEFT of a duration and honours a
+    comparison operator there. Every mask token ends in ``>``, so an unmasked-in-
+    the-alternation token would make the mask's own closing delimiter look like a
+    bound and leave the following duration RAW — the #9331 block returning through
+    the new mask (the same defect cycles 6 and 9 closed for the other tokens).
+    """
+    a = ci_exemption.normalize_signature("wrote /tmp/tmpabcd1234 1.21s after start")
+    b = ci_exemption.normalize_signature("wrote /tmp/tmpzzzz9999 1.47s after start")
+
+    assert "<MEAS1:s>" in a, a
+    assert a == b, f"a duration after a <TMP> mask stayed volatile: {a!r} vs {b!r}"
+
+
 # ── THE ROW DOOR, DERIVED FROM THE PRODUCERS (#6798, raised in #2648 review) ─
 #
 # `_NON_NODEID_KEY_RE` is hand-enumerated, and that enumeration went stale TWICE in the
