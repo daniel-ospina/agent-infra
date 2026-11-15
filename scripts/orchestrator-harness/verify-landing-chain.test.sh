@@ -53,9 +53,12 @@ mk() { # mk <case-name> <pr>  → prints the snapshot root
 # (`<author_association>\x1f<body>\x1e`, `check-pipeline-compliance.sh`'s REVIEW_COMMENTS_JQ). A fixture
 # must speak the producer's grammar: the old `<<<COMMENT>>>` line frame carried no author at all, which
 # is why nothing downstream could apply the gate's admission rule for a whole review cycle.
+# ⛔ …INCLUDING the newline `jq -r` writes after every record. The reader must strip it, or a trusted
+# author reads as "\nOWNER" and is refused for a reason the report cannot show — so every comment fixture
+# below carries that byte, and the suite would catch the strip being dropped.
 comment() {
   local root="$1" pr="$2" assoc="$3" body="$4"
-  printf '%s\037%s\036' "$assoc" "$body" >> "$root/pr-$pr/comments.txt"
+  printf '%s\037%s\036\n' "$assoc" "$body" >> "$root/pr-$pr/comments.txt"
 }
 TEST_KEY="a-test-gate-key"
 sign_marker() { # sign_marker <marker text> [key] → prints "… sig=<hex>", exactly as the recorder does
@@ -691,6 +694,94 @@ verify "$R"; rc=$?
 ck "P2b: a queued attempt with NO started_at is still 'did not wait for'" "$(has "did not wait for"; echo $?)"
 ck "P2b: …so that landing is a FAIL (exit 1)" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# ROUND 8 — the fresh-context review at a0f941f22203, and the blocking finding the review before it
+# raised on the SAME head and nothing had remedied. One case per defect, each in the direction that
+# costs the most.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+# P2 — fix_round anchored on the FIRST `not-clean` and read the marker immediately after it, so a fix
+# round that needed TWO rounds and converged (`not-clean@H1 → not-clean@H2 → clean@H3`, standing verdict
+# clean at the PR tip) was reported `FAIL … the round did not converge` with exit 1, while the same
+# report printed `PASS review_record verdict=clean`. A false FAIL on capstone condition 4, for the
+# ordinary shape of a two-round PR. The anchor is the LAST refusal.
+R="$(mk fix-round-two-rounds 476)"
+H1="5555555555555555555555555555555555555555"; H2="6666666666666666666666666666666666666666"
+{
+  printf 'review recorded: reviews/476.json verdict=not-clean @ %s (o/r) findings=3\n' "$H1"
+  printf 'review recorded: reviews/476.json verdict=not-clean @ %s (o/r) findings=1\n' "$H2"
+  printf 'review recorded: reviews/476.json verdict=clean @ %s (o/r)\n' "$HEAD"
+} > "$R/pr-476/body.txt"
+printf '%s\n%s\n%s\n' "$H1" "$H2" "$HEAD" > "$R/pr-476/pr-commits.tsv"
+run "$R" 476 9001 "CI" 1; group "$R" 476 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 476
+verify "$R"; rc=$?
+ck "fix-round-two-rounds: a two-round fix that CONVERGED is a fix_round PASS" "$(has "PASS  fix_round"; echo $?)"
+ck "fix-round-two-rounds: …anchored on the LAST refusal" "$(has "not-clean@666666666666 was superseded by clean@111111111111"; echo $?)"
+ck "fix-round-two-rounds: …never described as a round that did not converge" "$(has "did not converge" && echo 1 || echo 0)"
+ck "fix-round-two-rounds: …so a converged two-round PR can close the capstone (exit 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+
+# P3 — a control byte in a snapshot-supplied field is escaped: `\` and `"` alone left every byte below
+# 0x20 raw, and `json.load` refuses the evidence file (`Invalid control character at char 122`).
+R="$(mk json-control-byte 477)"
+printf '%s\t%s\t%s\t%s\n' 477 MERGED "$(printf '2026-11-12T05:05:55Z\001bad')" "$MERGE" > "$R/pr-477/pr.meta"
+run "$R" 477 9001 "CI" 1; group "$R" 477 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R" --json
+ck "json-control-byte: a control byte in a detail is escaped as \\u00XX, not emitted raw" \
+  "$(hasj '\u0001bad'; echo $?)"
+ck "json-control-byte: …so the evidence file still parses" \
+  "$(printf '%s' "$OUTJ" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; echo $?)"
+
+# P3 — the two snapshot modes are mutually exclusive, and saying so is the contract: the write target
+# used to be silently ignored (never created, no word said), so an operator asking for an evidence
+# directory got a verification with no artifact and nothing to notice it by.
+OUTX="$(run_verify --from-snapshot "$T/clean" --write-snapshot "$T/neversnapshot" --repo "$REPO_FIXTURE" 2>&1)"; rcx=$?
+ck "snapshot-modes: --from-snapshot with --write-snapshot is a USAGE error (exit 3), never a silent no-op" \
+  "$([ "$rcx" -eq 3 ] && echo 0 || echo 1)"
+ck "snapshot-modes: …and the refusal says which two flags conflict" \
+  "$(grep -qF -- 'mutually exclusive' <<<"$OUTX"; echo $?)"
+ck "snapshot-modes: …and no snapshot directory was written" "$([ -e "$T/neversnapshot" ] && echo 1 || echo 0)"
+
+# BLOCKING, the false-PASS class — `review_record` admitted a COMMENT marker that the repo's own
+# required check refuses. Three arms, because the admission has three states: an untrusted AUTHOR, a
+# marker that cannot be SIGNED-VERIFIED where a key exists, and the signed, attested marker that IS
+# evidence (which must keep working — a gate nobody can satisfy gets bypassed).
+R="$(mk comment-untrusted-author 478)"
+: > "$R/pr-478/body.txt"
+comment "$R" 478 NONE "$(printf 'review recorded: reviews/478.json verdict=clean @ %s (o/r)\n' "$HEAD")"
+run "$R" 478 9001 "CI" 1; group "$R" 478 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "comment-untrusted-author: a marker from author_association=NONE is REFUSED, not admitted" \
+  "$(has "its author_association is NONE"; echo $?)"
+ck "comment-untrusted-author: …never PASS review_record" "$(has "PASS  review_record" && echo 1 || echo 0)"
+ck "comment-untrusted-author: …so the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+
+R="$(mk comment-unsigned-with-key 479)"
+: > "$R/pr-479/body.txt"
+comment "$R" 479 OWNER "$(printf 'review recorded: reviews/479.json verdict=clean @ %s (o/r)\n' "$HEAD")"
+run "$R" 479 9001 "CI" 1; group "$R" 479 10 9001 "unit-test" completed success "$MERGED_AT"
+VKEY="$TEST_KEY"; verify "$R"; rc=$?; VKEY=""
+ck "comment-unsigned-with-key: where a gate key resolves, an UNSIGNED marker comment is refused" \
+  "$(has "its sig= does not verify"; echo $?)"
+ck "comment-unsigned-with-key: …never PASS review_record" "$(has "PASS  review_record" && echo 1 || echo 0)"
+ck "comment-unsigned-with-key: …so the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+
+R="$(mk comment-signed 480)"
+: > "$R/pr-480/body.txt"
+MK="review recorded: reviews/480.json verdict=clean @ $HEAD (o/r)"
+# ⛔ TWO comments on purpose: a real review thread has more than one, and the SECOND record is the one
+# whose author field carries `jq -r`'s separator newline — the byte the reader must strip before it can
+# read "OWNER". With a single comment this fixture could not tell a reader that strips from one that
+# does not (measured: mutation M23 passed over it until this second comment existed).
+comment "$R" 480 NONE "lgtm — not an attestation"
+comment "$R" 480 OWNER "$(printf '%s\n' "$(sign_marker "$MK")")"
+run "$R" 480 9001 "CI" 1; group "$R" 480 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 480
+VKEY="$TEST_KEY"; verify "$R"; rc=$?; VKEY=""
+ck "comment-signed: an ATTESTED, signed marker comment IS evidence" "$(has "PASS  review_record"; echo $?)"
+ck "comment-signed: …and the detail names the arm that admitted it (auth=sig)" "$(has "auth=sig"; echo $?)"
+ck "comment-signed: …so a correctly reviewed landing is not failed (exit 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
 # mutation below breaks exactly the decision one case exists for; the case must then FLIP. This is the
@@ -959,6 +1050,71 @@ printf 'admin-merge: ✅ merged PR #471 at %s (state=MERGED confirmed via the AP
 verify_with "$MS" "$R"
 mutation_verdict M16 "landed by the per-PR chain, not by auto-rail" \
   "a chain landing's own log reads as an auto-rail landing — case route-chain-mergelog-alone is discriminating"
+
+# M17 — anchor the fix round on the FIRST refusal and treat the marker immediately after it as
+# terminal (round 8's P2, the false FAIL on a converged two-round fix — the pre-fix reader, verbatim).
+MS="$(mutant fix-round-first-anchor '          last = 0
+          for (i = 1; i <= NR; i++) if (v[i] == "not-clean") last = i
+          bad = s[last]
+          # later, not merely different: a clean marker AFTER the last refusal, at another head
+          for (i = last + 1; i <= NR; i++)' '          last = 0
+          for (i = 1; i <= NR; i++) if (v[i] == "not-clean" && last == 0) last = i
+          bad = s[last]
+          for (i = last + 1; i <= last + 1 && i <= NR; i++)')" \
+  || bad "M17 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/fix-round-two-rounds"
+mutation_verdict M17 "was superseded by clean@111111111111" \
+  "anchoring on the FIRST refusal fails a converged two-round fix — case fix-round-two-rounds is discriminating"
+
+# M18 — stop escaping control bytes (round 8's P3): the evidence file becomes invalid JSON.
+MS="$(mutant json-no-control-escape '        else if (c in CTL)    o = o "\\u00" CTL[c]' '        else if (0)           o = o "\\u00" CTL[c]')" \
+  || bad "M18 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/json-control-byte"
+mutation_verdict M18 '\u0001bad' \
+  "an unescaped control byte makes the --json evidence file unparseable — case json-control-byte is discriminating"
+
+# M19 — drop the mutually-exclusive snapshot guard (round 8's P3): --write-snapshot is a silent no-op.
+MS="$(mutant snapshot-modes 'if [ -n "$SNAPSHOT_IN" ] && [ -n "$SNAPSHOT_OUT" ]; then' 'if [ 0 -eq 1 ]; then')" \
+  || bad "M19 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="" bash "$MS" --from-snapshot "$T/clean" --write-snapshot "$T/neversnapshot-m" --repo "$REPO_FIXTURE" 2>&1)"; AOUT_RC=$?
+mutation_verdict M19 "mutually exclusive" \
+  "two mutually exclusive snapshot modes silently no-op — case snapshot-modes is discriminating"
+
+# M20 — drop the comment AUTHOR admission (round 8's BLOCKING finding): any account's marker is evidence.
+MS="$(mutant comment-no-author-admission '      if (chan == "COMMENT" && assoc != "OWNER" && assoc != "MEMBER" && assoc != "COLLABORATOR") {' '      if (0) {')" \
+  || bad "M20 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/comment-untrusted-author"
+mutation_verdict M20 "its author_association is NONE" \
+  "an unattested commenter's marker reads as this PR's review — case comment-untrusted-author is discriminating"
+
+# M21 — drop the comment SIGNATURE requirement where a key resolves (the other half of the same finding).
+MS="$(mutant comment-no-sig-required '              if [ -n "$GATE_KEY" ]; then' '              if [ 0 -ne 0 ]; then')" \
+  || bad "M21 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+VKEY="$TEST_KEY"; verify_with "$MS" "$T/comment-unsigned-with-key"; VKEY=""
+mutation_verdict M21 "its sig= does not verify" \
+  "with a key present an unsigned marker comment is admitted — case comment-unsigned-with-key is discriminating"
+
+# M22 — admit a box-local record FILE on trust (the same finding, second channel).
+MS="$(mutant record-file-on-trust '      rsha=""; rverdict=""' '      :')" \
+  || bad "M22 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/record-file-unsigned"
+mutation_verdict M22 "carries NO sig= field" \
+  "an unauthenticated record file reads as evidence — case record-file-unsigned is discriminating"
+
+# M23 — drop the leading-newline strip on the producer frame (`jq -r` writes one after every record):
+# a trusted author then reads as "\nOWNER" and the signed, attested marker is refused.
+MS="$(mutant frame-no-newline-strip '        sub(/^[\n\r]+/, "")' '        x = 0')" \
+  || bad "M23 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+VKEY="$TEST_KEY"; verify_with "$MS" "$T/comment-signed"; VKEY=""
+mutation_verdict M23 "auth=sig" \
+  "the producer frame's own trailing newline is not stripped, so a trusted author is refused — case comment-signed is discriminating"
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

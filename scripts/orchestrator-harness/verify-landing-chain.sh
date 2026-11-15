@@ -476,12 +476,18 @@ record_markers() { # record_markers <dir> <pr>
     # ── the COMMENT channel: the producer's frame, one `<author_association>\t<body>` per comment ──
     # A body is MULTI-LINE, so the frame is split here (`RS = \x1e`) into one line per body line, each
     # carrying its author; the ONE parser below then handles both channels.
+    # ⛔ `sub(/^[\n\r]+/)` IS LOAD-BEARING: `jq -r` writes a NEWLINE after each record, so every record
+    # but the first would begin with one and the AUTHOR field would read "\nOWNER" — refusing a marker
+    # from a trusted author for a reason invisible in the report (measured while building this read).
+    # A `\r` is stripped from each line for the same reason: GitHub bodies arrive CRLF on some clients
+    # and a trailing CR would stop the marker's own ` (<repo>)`/` sig=` anchors matching.
     [ -s "$dir/comments.txt" ] && awk -v RS='\036' '
       {
+        sub(/^[\n\r]+/, "")
         i = index($0, "\037")
         if (i == 0) { assoc = "-"; body = $0 } else { assoc = substr($0, 1, i - 1); body = substr($0, i + 1) }
         n = split(body, L, "\n")
-        for (k = 1; k <= n; k++) printf "COMMENT\t%s\t%s\n", assoc, L[k]
+        for (k = 1; k <= n; k++) { sub(/\r$/, "", L[k]); printf "COMMENT\t%s\t%s\n", assoc, L[k] }
       }' "$dir/comments.txt"
     # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history.
     # ⛔ `awk`, NOT `sed 's/^/COMMENT\t/'` (fresh-context review, round 7, P3). POSIX says an escaped
