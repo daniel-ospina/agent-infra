@@ -1239,6 +1239,16 @@ ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion
 _tn_code="$(sed 's/#.*//' "$HERE/../turn-end.py" 2>/dev/null)"
 if grep -qE "[\"']pi[\"']" <<<"$_tn_code"; then rc=1; else rc=0; fi
 ck "the excluded turn-end.py is a NON-launcher (no quoted 'pi' command token; the pi token pair lives in its docstrings), so its census exclusion hides no launch path" $rc
+# ⛔ AND THE EXCLUSION IS NARROWER THAN ITS NEIGHBOURS', SO THE ARM STATES WHAT IT DOES **NOT** PIN
+# (review of 38f24c074, P3-4). `key-gate.sh`'s pair of arms can assert BOTH "no quoted pi token" AND
+# "no spawn primitive"; `turn-end.py` carries `subprocess.run` for git/JSON CLIs, so **only the quoted
+# `pi` token is pinned** here and the neighbouring "carries no spawn primitive" property is NOT claimed.
+# Asserting the primitive is PRESENT makes that narrowness executable instead of implied — and it reds
+# if the file ever loses its subprocess usage, which is the moment to re-check whether this exclusion is
+# still needed at all rather than leaving a silently-weaker arm in the one census built to be the place
+# a second `pi` launcher cannot hide.
+if grep -qE 'subprocess[.](run|call|Popen|check_output)' <<<"$_tn_code"; then rc=0; else rc=1; fi
+ck "the excluded turn-end.py DOES carry a spawn primitive, so this arm pins the quoted-'pi' token ONLY (narrower than its neighbours — stated, not implied)" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -2564,11 +2574,6 @@ ck "...and says the refusal is NOT a box property, so a peer must not be handed 
 # the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
 # behind). The item then circulates between cells that refuse identically and is never built. The
 # refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
-# (g2b) A STALE CHECKOUT IS NOT A CAPACITY SHORTFALL (#3932). The reason had no arm, so it took the
-# generic *"the reading above names the refusal"* arm and the caller published the 71 text — "dispatch
-# the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
-# behind). The item then circulates between cells that refuse identically and is never built. The
-# refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
 # ⛔ AND THE REMEDY ALONE WAS NOT ENOUGH (this change's review, P1-2): the CODE was still 71, and every
 # reader maps 71 to a property of THIS box — `lane.sh` minted `state/capacity-refused-<N>` and the
 # controller stood down so a PEER could take the item, while this line said "do NOT assume a peer is
@@ -2607,6 +2612,27 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -eq 0 ] && ! grep -q 'UNMEASURABLE' "$LOG"; }; rc=$?
 ck "...while a MEASURED reading (behind=3) is admitted with no such WARN (control)" $rc
+# (g2d) A BRANCH OVER THE THRESHOLD IS ADMITTED, AND ADMITTED LOUDLY (review of 38f24c074, P1). The
+# probe REFUSES only a BASE: on a branch the distance is mostly main's own unmerged commits and the
+# fixer is the process that would integrate them, so refusing there is a deadlock the refused process
+# can never clear. This consumer's half of that contract is two properties, and BOTH are pinned here —
+# it must not turn `stale_base=1` into a refusal, and it must not swallow it silently either.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env repo=agent-infra behind=542 role=branch fetch_attempts=1 stale_base=1' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "a BRANCH over the threshold still ADMITS the spawn (rc=$CRC, agent ran) — a fixer is not deadlocked" $rc
+grep -q 'stale_base=1' "$LOG"; rc=$?
+ck "...and the admission is ANNOUNCED with the reading, so an evaluated-then-waived field is never silent" $rc
+grep -q 'deadlock the refused process can never clear' "$LOG"; rc=$?
+ck "...naming WHY it was waived, so the next reader does not 'fix' it back into a refusal" $rc
+# …and the CONTROL, which is the arm that keeps the one above honest: the SAME distance on a BASE is
+# still refused by 85, so `stale_base` cannot be read as 'branches are never refused, so never refuse'.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=stale-code host=x answered_ms=900 attempts=1 bound=45s repo=agent-infra behind=542 role=base fetch_attempts=1 max_behind=50' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 85 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "...while the same distance on a BASE still starts NO agent and exits 85 (control)" $rc
 # ⛔ ABSENCE OF THE FIELD IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS THE SILENT ONE (this change's
 # review, P2-2). A probe deployed before this field existed emits `ok … key=env` with no `behind=` at
 # all; it matched nothing, so the spawn was admitted with ZERO log lines while the property (g2c) is
