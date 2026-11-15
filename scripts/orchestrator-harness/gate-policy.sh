@@ -156,6 +156,20 @@ gate_policy_unit_veto() {
   local _ln _cmt _tail _bs _acc=""
   folded=""
   while IFS= read -r _ln || [ -n "$_ln" ]; do
+    # ⛔ A TRAILING `\r` IS AN EOL MARKER, NOT DECLARATION TEXT (fresh review of PR #4020, P2 — reproduced).
+    # `read_line` never puts a line terminator in the buffer: `categorize_eol` classifies `\r` as an EOL
+    # (`src/basic/fileio.c` — `EOL_THIRTEEN`), and the append is on the `eol == EOL_NONE` path only, so
+    # NEITHER `\r` NOR `\n` reaches `conf-parser.c`. A CRLF declaration is therefore byte-identical to its
+    # LF twin by the time the escape scan runs. `bash read` splits on `\n` alone and KEEPS the `\r`, so
+    # without this strip the trailing run of `…FOO=1 \` is `\`+`\r`: the parity scan below counts ZERO
+    # backslashes, the join never happens, and the hatch lands on a line that no longer starts with
+    # `Environment=` — CLEAN, while systemd sets it. That is the same "silently stopped matching" fail-open
+    # this whole function exists to close, so the strip belongs in the fold, before BOTH the comment test
+    # and the parity scan (the order systemd uses).
+    # STATED LIMIT: a file written with CR-ONLY endings is ONE physical line to `read`, so it is not split
+    # here; no path in this tree writes one (every template is LF and every installer heredoc is LF), and
+    # the CRLF case is the one an editor or a `core.autocrlf` checkout actually produces.
+    _ln="${_ln%$'\r'}"
     # The comment test skips LEADING blanks (systemd does), and the line is then dropped whole.
     _cmt="$_ln"
     while :; do case "$_cmt" in [[:space:]]*) _cmt="${_cmt#?}" ;; *) break ;; esac; done

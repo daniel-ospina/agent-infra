@@ -311,6 +311,34 @@ assert_eq "$RC" 0 "T12 control: the shipped templates still install (the veto is
 assert_contains "$(cat "$FX/units/eldato-conflict-rebase.service" 2>/dev/null)" 'ExecStart=' \
    "T12 control: …and the clean unit still carries its ExecStart"
 
+# ── T13: A JUDGE THAT CANNOT ANSWER IS NOT A GATE-BYPASS FINDING ─────────────────────────────────────
+# (fresh review of PR #4020, P3.) `vet_unit` used to collapse EVERY non-zero rc into "carries a GATE-BYPASS
+# environment entry (named above)". rc 2 means the judge could not grade, and rc 64 means the resolved
+# `gate-policy.sh` predates `--unit-veto` (a stale `~/agent-infra` supplying TEMPLATES_DIR) — in both the
+# operator was told to hunt a hatch no line named. The refusal must stay (fail-closed) and must name the
+# REAL cause, which is what the missing-judge arm (§5c2) already demands for an absent judge.
+echo "== T13: a stale/unusable JUDGE is refused by its own diagnosis, not as a bypass it never found ──"
+printf '#!/usr/bin/env bash\nexit 64\n' >"$FX/stale-judge.sh"
+chmod +x "$FX/stale-judge.sh"
+TPL_DIR="$REPO/templates/systemd"; EXTRA_ENV=("GP_GUARD=$FX/stale-judge.sh"); RUN --dry-run
+STALE_OUT="$OUT"; STALE_RC="$RC"
+assert_eq "$STALE_RC" 1 "T13 a judge that does not know --unit-veto still REFUSES the install (fail-closed)"
+assert_contains "$STALE_OUT" 'rc=64' "T13 …and it reports the rc it actually got"
+assert_contains "$STALE_OUT" 'never vetted' "T13 …and says the artifact was never vetted, not that a hatch was found"
+assert_absent "$STALE_OUT" 'GATE-BYPASS' "T13 …and it does NOT claim a GATE-BYPASS entry no line named"
+# …and rc 2 (ungradable) is the third diagnosis: refused, named as ungradable, never as a bypass.
+printf '#!/usr/bin/env bash\nexit 2\n' >"$FX/ungradable-judge.sh"
+chmod +x "$FX/ungradable-judge.sh"
+EXTRA_ENV=("GP_GUARD=$FX/ungradable-judge.sh"); RUN --dry-run
+UNGR_OUT="$OUT"; UNGR_RC="$RC"
+assert_eq "$UNGR_RC" 1 "T13 an ungradable declaration is still refused (an ungradable unit is not a clean one)"
+assert_contains "$UNGR_OUT" 'could not GRADE' "T13 …and the refusal names the grading failure as the cause"
+assert_absent "$UNGR_OUT" 'GATE-BYPASS' "T13 …and it does not accuse the unit of a bypass"
+# CONTROL: the real judge still accepts the shipped templates — so T13's arms red on the DIAGNOSIS and not
+# because the resolver quietly stopped finding a judge at all.
+EXTRA_ENV=("GP_GUARD=$REPO/scripts/orchestrator-harness/gate-policy.sh"); RUN --dry-run
+assert_eq "$RC" 0 "T13 control: with the real judge and shipped templates the same invocation is clean"
+
 echo
 echo "install-conflict-rebase-timer.test.sh — passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

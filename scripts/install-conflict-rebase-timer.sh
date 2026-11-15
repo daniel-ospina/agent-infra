@@ -316,12 +316,26 @@ resolve_launcher() {
 # refuses for a missing `ExecStart=` and a non-parsing plist. `return 2` from the judge (ungradable) and
 # `return 1` (vetoed) are both refusals here — there is no "installed but warned" state, because by then
 # the flag is live in a running job.
+# ⛔ EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS (fresh review of PR #4020,
+# P3). Collapsing them into "carries a GATE-BYPASS environment entry (named above)" is a FALSE ACCUSATION
+# when the judge could not grade at all: rc 2 means unreadable/ungradable (nothing was named above), and
+# rc 64 means the `gate-policy.sh` this installer resolved predates `--unit-veto` — e.g. a stale
+# `~/agent-infra` supplying `TEMPLATES_DIR`. The operator is then told to hunt a hatch that no line names,
+# which is the wrong-diagnosis failure the `(5c2)` missing-judge arm exists to prevent for an ABSENT judge;
+# a STALE one is the same event with a different rc. The verdict stays fail-closed either way.
 vet_unit() {
-    local f="$1" label="$2"
+    local f="$1" label="$2" rc=0
     { [ -n "$GP_GUARD" ] && [ -f "$GP_GUARD" ]; } \
         || { err "REFUSING: gate-policy.sh not found (looked beside $TEMPLATES_DIR, in $INFRA_ROOT and in \${AGENT_INFRA_PATH}) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted. Point GP_GUARD at a gate-policy.sh copy."; return 1; }
-    bash "$GP_GUARD" --unit-veto "$f" "$label" && return 0
-    err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduler that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
+    bash "$GP_GUARD" --unit-veto "$f" "$label" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 1 ]; then
+        err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduler that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
+    elif [ "$rc" -eq 2 ]; then
+        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — unreadable, or a declaration it cannot fold; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+    else
+        err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — that copy does not know the flag (#4002), so the rendered $label was never vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
+    fi
     return 1
 }
 

@@ -556,17 +556,63 @@ BLK_RC=0; bash "$POLICY" --unit-veto "$TMP/blank-inside.service" blank-inside >/
 # systemd's `escaped` flag is the PARITY of the trailing run (`conf-parser.c:389-399`), so `\\` ends the
 # line: this unit sets PATH with a literal backslash and mentions the hatch in a comment, and systemd reads
 # it as clean. The awk fold joined it anyway and VETOED it, i.e. the operator could not install a correct
-# unit. The twin below is the same fixture with ONE trailing backslash (a real continuation), so the pair
-# pins parity rather than "the fold stopped folding".
+# unit.
+# ⛔ THIS PAIR PINS THE COMMENT RULE, NOT PARITY (fresh review of PR #4020, P2 — measured: BOTH arms stay
+# GREEN under a parity regression). In both fixtures the only hatch-shaped text is inside a COMMENT, and the
+# comment rule (:158-161) drops `#`/`;` lines regardless of parity before the trailing-run scan, so the
+# hatch never reaches the extraction whatever the parity branch does. They do discriminate — against the
+# comment rule — which is how round 8 measured them reddening under the pre-fix fold (that fold treated a
+# comment as content). What they cannot see is `gate-policy.sh:164-166`, the branch that decides CLEAN vs
+# VETO for every declaration whose environment ends in a backslash run. The PARITY DISCRIMINATOR pair below
+# is the arm for that, and it is the one that reddens when the parity test degrades to `>= 1`.
 printf '[Service]\nEnvironment=PATH=/opt/bin\\\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped.service"
 bash "$POLICY" --unit-veto "$TMP/escaped.service" escaped >/dev/null 2>&1 \
-  && ok "(5d) edges: a line ending in an ESCAPED backslash does not continue (systemd's parity rule), so its following comment is not part of the declaration" \
+  && ok "(5d) edges: a line ending in an ESCAPED backslash does not continue, so its following COMMENT is not part of the declaration" \
   || bad "(5d) edges: an escaped trailing backslash was joined with the next line — a clean unit is refused on the install path"
 printf '[Service]\nEnvironment=PATH=/opt/bin\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped-twin.service"
 ESC_TWIN_RC=0; bash "$POLICY" --unit-veto "$TMP/escaped-twin.service" escaped-twin >/dev/null 2>&1 || ESC_TWIN_RC=$?
 [ "$ESC_TWIN_RC" -eq 0 ] \
   && ok "(5d) edges: …and the ONE-backslash twin of that fixture is also clean (the comment is dropped, so no hatch reaches the declaration)" \
-  || bad "(5d) edges: the one-backslash twin answered rc=$ESC_TWIN_RC (want 0) — the parity arm is not measuring parity"
+  || bad "(5d) edges: the one-backslash twin answered rc=$ESC_TWIN_RC (want 0) — the comment rule no longer drops a commented mention"
+# ⛔ THE PARITY DISCRIMINATOR (fresh review of PR #4020, P2 — the pair above carried NO parity signal, and
+# this one is MEASURED to carry it). The hatch sits on a line of its OWN, not in a comment, so the ONLY
+# thing that can put it inside an `Environment=` directive is the join:
+#   correct (`\\` escaped -> the line ends):  the bare `AGENT_SKIP_REVIEW_GATE=1` line is an unknown key in
+#                                              [Service], it sets NOTHING  => CLEAN (rc 0)
+#   parity degraded (`>= 1` -> any trailing run joins): it becomes
+#                                              `Environment=PATH=/opt/bin\ AGENT_SKIP_REVIEW_GATE=1` => VETO (rc 1)
+# Measured both ways against a copy of the judge: rc 1 -> 0 under none, 0 -> 1 under the parity mutant.
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\\\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/parity-disc.service"
+PD_RC=0; bash "$POLICY" --unit-veto "$TMP/parity-disc.service" parity-disc >/dev/null 2>&1 || PD_RC=$?
+[ "$PD_RC" -eq 0 ] \
+  && ok "(5d) edges: an ESCAPED trailing backslash ends the line, so the hatch on the NEXT line is not part of the declaration — CLEAN (this is the arm the parity branch can redden)" \
+  || bad "(5d) edges: the escaped-backslash declaration was vetoed (rc=$PD_RC, want 0) — the fold joined a line systemd keeps whole, so the parity test is not reading parity"
+# …and its ONE-backslash twin is a REAL continuation, so the joined directive DOES name the hatch: this is
+# the control that the pair measures parity and not "the fold stopped folding" (that mutant leaves the arm
+# above green and reddens this one).
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/parity-disc-twin.service"
+PDT_RC=0; bash "$POLICY" --unit-veto "$TMP/parity-disc-twin.service" parity-disc-twin >/dev/null 2>&1 || PDT_RC=$?
+[ "$PDT_RC" -eq 1 ] \
+  && ok "(5d) edges: …and its ONE-backslash twin IS a continuation, so the joined declaration names the hatch and is vetoed" \
+  || bad "(5d) edges: the one-backslash parity twin answered rc=$PDT_RC (want 1) — the fold is gone and a hatch on a continued line reads CLEAN"
+# ⛔ A CRLF DECLARATION IS BYTE-IDENTICAL TO ITS LF TWIN TO systemd (fresh review of PR #4020, P2 —
+# reproduced: rc 0 at the reviewed head, 1 for the LF twin). `read_line` never appends the terminator
+# (`src/basic/fileio.c`: `categorize_eol` marks `\r` as an EOL; the append is on the `eol == EOL_NONE` path
+# only), so the escape scan sees the trailing `\` and joins. `bash read` splits on `\n` alone and keeps the
+# `\r`, so without the strip in the fold this unit read CLEAN while systemd set the hatch — the exact
+# fail-open class #4002 exists to close, and nothing else in the suite covers a CRLF fixture.
+printf '[Service]\r\nEnvironment=FOO=1 \\\r\n   AGENT_SKIP_REVIEW_GATE=1\r\n' >"$TMP/crlf.service"
+CRLF_RC=0; bash "$POLICY" --unit-veto "$TMP/crlf.service" crlf >/dev/null 2>&1 || CRLF_RC=$?
+[ "$CRLF_RC" -eq 1 ] \
+  && ok "(5d) edges: a CRLF declaration's backslash-continued Environment= IS joined (systemd drops the CR), so the hatch is vetoed" \
+  || bad "(5d) edges: the CRLF twin of the continued declaration answered rc=$CRLF_RC (want 1) — the fold kept the CR, so the parity scan saw no trailing backslash and the hatch read CLEAN"
+# …and the CR strip must not create an over-block of its own: the CRLF spelling of the ESCAPED fixture is
+# still clean, so a CRLF template cannot be refused for being CRLF.
+printf '[Service]\r\nEnvironment=PATH=/opt/bin\\\\\r\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\r\nExecStart=/bin/true\r\n' >"$TMP/crlf-clean.service"
+CRLFC_RC=0; bash "$POLICY" --unit-veto "$TMP/crlf-clean.service" crlf-clean >/dev/null 2>&1 || CRLFC_RC=$?
+[ "$CRLFC_RC" -eq 0 ] \
+  && ok "(5d) edges: …and a CRLF spelling of the ESCAPED fixture is still CLEAN (stripping the CR does not veto a CRLF template)" \
+  || bad "(5d) edges: the clean CRLF fixture answered rc=$CRLFC_RC (want 0) — the CR strip turned a CRLF unit into a false positive"
 # …and the LAUNCHD half of the grader must be able to REDDEN (fresh review of #4002, P2). 5a passes if the
 # `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
 # "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the
