@@ -49,9 +49,9 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | Surface | Change | Test layer |
 |---|---|---|
 | `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only where the lane's own run can never attach (`STRUCTURAL` + no `push`/`workflow_dispatch`) | `tests/issue-2465-inert-wait/run.sh` A(a)–(a8), (b)–(d), (g), plus mutations (f)/(h) and the helper mutants (a5)/(a6)/(a7); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
-| `admin-merge.sh` `lane_own_run_can_attach` (new helper) | trigger classifier — can this lane's OWN name appear on a run for a PR head? gates the `unreadable` widening; the member SHAPE is validated too, so an unclassifiable list is `unread` (fail closed) rather than a silent widen | unit: arms (a2)/(a3)/(a3b)/(a3c)/(a4)/(a7)/(a8) with mutants (a5)/(a6)/(a7) (`tests/issue-2465-inert-wait/run.sh`) — (a3b) is the multi-trigger list naming ONLY the attachable member, (a3c) the JOINED value whose push mechanism is qualified by its own `branches`/`paths` filter, (a7) proves both are load-bearing, and (a8) pins the shape gate |
+| `admin-merge.sh` `lane_own_run_can_attach` (new helper) | trigger classifier — can this lane's OWN name appear on a run for a PR head? gates the `unreadable` widening; the member SHAPE is validated too, so an unclassifiable list is non-`measured` (fail closed) rather than a silent widen, and the MESSAGE names which ground it is on (`unread` vs read-but-`unclassifiable`) | unit: arms (a2)/(a3)/(a3b)/(a3c)/(a4)/(a7)/(a8) with mutants (a5)/(a6)/(a7) (`tests/issue-2465-inert-wait/run.sh`) — (a3b) is the multi-trigger list naming ONLY the attachable member, (a3c) the JOINED value whose push mechanism is qualified by its own `branches`/`paths` filter, (a7) proves both are load-bearing, and (a8) pins the shape gate and the read-vs-unclassifiable wording |
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
-| `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in | unit: arm (a) is the attributable row, plus the single-definition guard and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
+| `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in; its RECORD states the shipped two-condition gate, not the rejected class-wide widen | unit: arm (a) is the attributable row, plus the single-definition guard, the record↔predicate pin (a0) with mutant (a9), and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | `wait_enabled` gains the `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` conjunct (it may disable the wait only with a zero window, and only together with the zero window — never by touching the bounds), and the `*)` refusal is re-cut so its two states do not share a verdict. The POLL/BUDGET contract (`#2862`: spent on the attempt), the stall/ceiling bounds and §4.5 are **unchanged**. | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) for the unchanged contract; `tests/admin-merge/run.sh` §79 (g1)-(g4) for the seam; `tests/issue-2465-inert-wait/run.sh` B1-B7 and the state-keyed text arm |
 | `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B7, `tests/admin-merge/run.sh` §79 (g1)-(g4) |
 | `tests/*/run.sh` discovery | new suite auto-wired by the glob (`scripts/run-bash-shards.sh:203`) | shard runner |
@@ -87,7 +87,11 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    ⛔ NOT "unreadable widens for the whole STRUCTURAL class" — that was the merged first
    landing (`e4716a058`), and it failed open on one transient read for exactly the
    `push`/`workflow_dispatch` members above (review P1).
-   Test: A(a) red before the change (against `origin/main`'s rail) and green after; A(b) the
+   Test: A(a) red before the change (against `origin/main`'s rail) and green after; **A(a0)**
+   pins this helper's own RECORD to the shipped two-condition gate — the docstring must name
+   `lane_own_run_can_attach` and carry neither class-wide claim, and mutant (a9) reduces the gate to
+   the class LABEL to prove that pin is load-bearing (round 5, P2: prose a next lane restores must
+   not be able to re-open the fail-open with every behavioural arm green); A(b) the
    measured-`none` half; A(c)/A(c2) `paths-excluded` still probes; A(c3) non-structural
    `unreadable` still fails closed; **A(g) STRUCTURAL + `has-run` → NO widening**, with mutant
    (f) rebuilding the reversal to prove (g) is load-bearing. The integration proof of the #1614
@@ -175,6 +179,31 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   the recovery clause quotes the seconds it spent blind. Arms: `(C)` drives the extracted
   `block_on_first_checks` for BOTH producers, the recovery case, and the two controls;
   attribution is measured — against the round-4 rail exactly those four rows are RED.
+- R11 the RECORD states a policy the code does not ship (review round 5, P2) —
+  `lane_no_pr_trigger`'s docstring still described the REJECTED one-condition widen (the whole
+  STRUCTURAL class widens on `unreadable`, with the class-wide "this PR cannot start a run"
+  rationale) while §0b's shipped gate is `lane_structural && ! lane_own_run_can_attach`. The code
+  was right, so no behavioural arm could see the drift — and it drifts in the direction that fails
+  open: a next lane restoring "the record" re-opens #2465's fail-open with every arm green. →
+  arm **(a0)** pins the prose to the predicate (the docstring must NAME `lane_own_run_can_attach`
+  and must carry neither class-wide claim), and mutation **(a9)** reduces the gate to the class
+  LABEL in a mutant, which reds (a0) and widens (a2)'s `push` lane — so the pin is proven
+  load-bearing rather than decorative.
+- R12 the message calls a list it READ "unreadable" (review round 5, P3) — the shape gate returned
+  on the SAME `unread` default as an absent clause, so §0b said "could not be READ" about a clause
+  the code had read and refused to classify. Under-claiming is the safe direction, but claim
+  accuracy is that block's own rule → `LANE_RUN_ATTACH_SOURCE` carries a third value
+  (`unclassifiable`), the clause names the ground it is on, and (a4)/(a8) assert BOTH directions
+  (each arm must NOT print the other's wording).
+
+**Accepted residual (recorded, not fixed — review round 5, P3):** the shape gate accepts
+`[a-z0-9_,]` while the producer's `_KEY_RE` (`scripts/ci-workflow-pr-evaluable.sh:111`) also admits
+`-`, `.` and uppercase. A declared key inside that difference keeps the lane on the FAIL-CLOSED arm,
+so such a lane can never widen and keeps the #2465 inert wait. It is recorded rather than widened
+because **accepting those characters LOOSENS**: a value that passes the gate but names no trigger
+this helper knows answers "cannot attach", which WIDENS. Every documented `on:` event name is
+lowercase snake_case (GitHub's own events reference), so the gap is empty against real event names;
+if it ever is not, the cost is friction on one lane, with `--any-workflow` as the documented escape.
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5

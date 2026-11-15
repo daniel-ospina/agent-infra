@@ -29,14 +29,16 @@
 # extracted from the REAL `atomic-land.sh`. Both are awk extractions over the shipped
 # files (never copies — a copy would drift), each asserted non-empty and asserted to
 # contain the fix, so a refactor that moves the seam fails loudly instead of testing
-# nothing. FIVE mutation arms: (f) re-introduces the #1614 reversal in a mutant and
+# nothing. SIX mutation arms: (f) re-introduces the #1614 reversal in a mutant and
 # shows the dead-end-gate arm goes RED there, and (h) re-spells the classifier's
 # reason prefix and shows arm (a) — the only arm the classification can change — goes
 # RED there. (h) exists because a copy of that CLASSIFIER used to be emitted inside
-# the extracted lib's body and silently shadow the extract (review P1). The other three are
-# the helper mutants: (a5) makes 'push' unattachable, (a6) flips the absent-clause default,
-# and (a7) makes the helper name an UNATTACHABLE trigger — each counted, so a silent no-op
-# proves nothing.
+# the extracted lib's body and silently shadow the extract (review P1). Three are the
+# helper mutants: (a5) makes 'push' unattachable, (a6) flips the absent-clause default,
+# and (a7) makes the helper name an UNATTACHABLE trigger. The sixth, (a9), reduces the
+# §0b gate to the class LABEL — the one-condition policy the docstring used to record —
+# and is what makes the docstring/predicate pin (a0) provably load-bearing. Each is
+# counted, so a silent no-op proves nothing.
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
 # (arm (e) there is the integration proof of the #1614 gate, arm (f) the integration
@@ -74,6 +76,13 @@ extract_block() { # $1 = source path
 }
 extract_helper() { # $1 = source path  $2 = helper name
   awk -v head="$2() {" 'index($0,head)==1{o=1} o{print} o&&/^}$/{exit}' "$1"
+}
+extract_docstring() { # $1 = source path  $2 = function name — the `#` block ABOVE it
+  awk -v fn="$2() {" '
+    $0 == fn { print block; exit }
+    /^#/ { block = block $0 "\n"; next }
+    { block = "" }
+  ' "$1"
 }
 
 build_lib() { # $1 = source path, $2 = output file
@@ -148,6 +157,54 @@ drive() {
   R_LANE="$(sed -n 's/^LANE=//p' <<<"$R_ERR")"
   R_LOG="$(sed -n 's/^APLOG=//p' <<<"$R_ERR")"
 }
+
+# ── (a0) THE RECORD AND THE PREDICATE MUST AGREE (round 5, P2) ──────────────
+# `lane_no_pr_trigger`'s docstring stated the REJECTED one-condition policy — the whole
+# STRUCTURAL class widens on `unreadable`, with the class-wide "this PR cannot start a
+# run" rationale — while the shipped gate is `lane_structural && !
+# lane_own_run_can_attach`. The CODE was right; the RECORD was not, in the direction
+# that fails open: a next lane restoring "the record" re-opens #2465's fail-open with
+# every behavioural arm still green, because no arm reads the prose. So the prose is
+# pinned here, to the predicate, and mutation (a9) is what proves the pin bites.
+echo "(a0) the docstring states the SHIPPED two-condition predicate, not the rejected class-wide one"
+DOC="$(extract_docstring "$SRC" lane_no_pr_trigger)"
+ck "(a0) extracted a non-empty docstring for lane_no_pr_trigger (not pinning an empty seam)" \
+   "$([ -n "$DOC" ] && echo 0 || echo 1)"
+ck "(a0) the gate in the extracted §0b is the TWO-condition predicate (lane_structural && ! lane_own_run_can_attach)" \
+   "$(grep -qF 'lane_structural" -eq 1 ] && ! lane_own_run_can_attach' "$LIB" && echo 0 || echo 1)"
+ck "(a0) ⛔ the docstring does NOT state the REJECTED class-wide widen (review P2)" \
+   "$(grep -q 'the STRUCTURAL class widens on it' <<<"$DOC" && echo 1 || echo 0)"
+ck "(a0) ⛔ …nor the class-wide claim a push-triggered member falsifies ('no run can be STARTED by this PR')" \
+   "$(grep -q 'can be STARTED by this PR' <<<"$DOC" && echo 1 || echo 0)"
+ck "(a0) …and it NAMES the second condition, so the record cannot describe a one-condition policy again" \
+   "$(grep -q 'lane_own_run_can_attach' <<<"$DOC" && echo 0 || echo 1)"
+
+# ── (a9) MUTATION PROOF — reducing the gate to the class LABEL turns (a0)/(a2) RED ──
+# The mutation is exactly the rejected policy in code: `lane_structural` alone widens.
+# It must be visible to (a0) (whose predicate pin reads those very bytes) AND to (a2)
+# (whose push lane then widens on one failed read — the fail-open review P1 rejected).
+echo "(a9) MUTATION: the §0b gate reduced to the class LABEL → (a0)'s predicate pin and (a2) go RED"
+PMUT="$TMP/predicate-mutant.sh"
+awk '
+  index($0, "if [ \"$lane_structural\" -eq 1 ] && ! lane_own_run_can_attach") > 0 {
+    print "            if [ \"$lane_structural\" -eq 1 ]; then"; n++; next
+  }
+  { print }
+  END { exit (n == 1 ? 0 : 1) }
+' "$SRC" > "$PMUT"
+ck "(a9) the mutation applied EXACTLY once to the widening gate (a silent no-op mutation would prove nothing)" "$?"
+ck "(a9) the mutant parses (bash -n)" "$(bash -n "$PMUT" 2>/dev/null && echo 0 || echo 1)"
+PMUTLIB="$TMP/predicate-mutant-lib.sh"
+ck "(a9) the mutant still builds a lib carrying the gate (not testing an empty seam)" \
+   "$(build_lib "$PMUT" "$PMUTLIB" && grep -q 'lane_structural' "$PMUTLIB" && echo 0 || echo 1)"
+ck "(a9) against the mutant, (a0)'s predicate pin is RED — the gate no longer consults lane_own_run_can_attach" \
+   "$(grep -qF 'lane_structural" -eq 1 ] && ! lane_own_run_can_attach' "$PMUTLIB" && echo 1 || echo 0)"
+PM_ERR="$(AP_VERDICT=inapplicable \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push)' \
+  AP_PROBE_STATE=unreadable bash < "$PMUTLIB" 2>&1 >/dev/null)"
+PM_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$PM_ERR")"
+ck "(a9) …and (a2)'s push case WIDENS there (ANY_WORKFLOW='$PM_ANY' — the fail-open the old docstring described)" \
+   "$([ "$PM_ANY" = 1 ] && echo 0 || echo 1)"
 
 # ── (a) STRUCTURAL class + an UNREADABLE probe — #2465's MEASURED case ──────
 echo "(a) STRUCTURAL (no PR trigger) + the run probe READ FAILED — #2465's actual 3900s burn"
@@ -259,6 +316,12 @@ ck "(a4) an unknown trigger shape KEEPS the filter (fail closed) — a producer-
 # not take" rule forbids. The message must say the list was unread instead.
 ck "(a4) the message says the trigger list could not be READ — it does not claim a declared trigger" \
    "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+# ⛔ THE OTHER GROUND (round 5, P3). An ABSENT clause was never read; the shape gate in
+# arm (a8) read one and could not classify it. Reporting both as "could not be READ"
+# under-claims in the safe direction, but this file's rule is claim ACCURACY — and if
+# both arms print the same words, no assertion can tell which ground fired.
+ck "(a4) ⛔ it does NOT claim the list was READ (this ground is the ABSENT clause — a8 owns the read-but-unclassifiable one)" \
+   "$(grep -q 'WAS READ from the applicability reason' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a4) ⛔ it does NOT print \"it declares '\" (a declared trigger it never read)" \
    "$(grep -q "it declares '" <<<"$R_ERR" && echo 1 || echo 0)"
 # ⛔ AND THE TAIL MAY NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3, P2).
@@ -358,8 +421,13 @@ do
   drive inapplicable "$bad_clause" unreadable
   ck "(a8) NO widening on an unclassifiable list [${bad_clause##*(declared triggers: }]" \
      "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
-  ck "(a8) …and the message says the list could not be READ, not a trigger it never parsed" \
-     "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+  # ⛔ "READ BUT UNCLASSIFIABLE", NOT "UNREAD" (round 5, P3). The clause WAS read here —
+  # the shape gate refused to name a member — so "could not be READ" was the wrong claim,
+  # even though it under-claimed in the safe direction.
+  ck "(a8) …and the message says the list WAS READ but no member is classifiable" \
+     "$(grep -q 'WAS READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+  ck "(a8) ⛔ …and it does NOT claim the list could not be READ (the code read it) (round 5 P3)" \
+     "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 1 || echo 0)"
 done
 ck "(a8) CONTROL: a WELL-FORMED inert list ('workflow_call') still WIDENS — the shape gate tightens the unreadable shape only, not the #2465 narrowing" \
    "$(drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call)' unreadable >/dev/null 2>&1; [ "$R_ANY" = 1 ] && echo 0 || echo 1)"

@@ -6704,7 +6704,14 @@ lane_applicable() {
 
 # lane_no_pr_trigger <reason> — TRUE (0) only when the MEASURED applicability
 # reason is the STRUCTURAL class: the lane's own `on:` block declares neither
-# `pull_request` nor `pull_request_target`, so no push to a PR head can START it (#2465).
+# `pull_request` nor `pull_request_target`, whatever else it declares (#2465).
+#
+# ⛔ THE CLASS ALONE ANSWERS NOTHING ABOUT WHETHER A RUN CAN ATTACH. A `push` /
+# `workflow_dispatch` member of this class DOES get a run of ITSELF attached to a PR
+# head (a push whose tip is that head, a `gh workflow run --ref`, a rerun of a
+# CANCELLED run), so "declares no PR trigger" must never be read as "this PR cannot
+# start a run of it". That question belongs to `lane_own_run_can_attach`, and the
+# whole-class reading of it is what failed open in the merged landing `e4716a058`.
 #
 # ⛔ THIS CLASS DOES *NOT* SKIP THE RUN PROBE — DO NOT REINTRODUCE THAT (#1614).
 # A first cut of #2465 did: it treated "structural" as "the probe cannot decide
@@ -6715,14 +6722,30 @@ lane_applicable() {
 # filter and its name in the certificate. Widening there is how "every trigger-split
 # repo silently becomes `--any-workflow`".
 #
-# WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable`:
-#   * the STRUCTURAL class widens on it. No run of this lane can be STARTED by this
-#     PR, so the filtered wait is INERT — it can only ever clear on a run that cannot
-#     appear — and #2465's measured 3900 s burn was caused by exactly ONE failed
-#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a
-#     run". Waiting longer cannot outlast a failed read.
-#   * every other class keeps the filter on it (fail closed): there a run CAN appear,
-#     so an unread answer is not an exemption.
+# WHAT THE CLASS DOES IS GATE ONE POLICY ON ONE PROBE ANSWER, `unreadable` — and the
+# gate is TWO measured conditions, not the class label (review P2: this record used to
+# state the rejected one-condition policy, so a next lane restoring "the record" would
+# have re-opened the fail-open):
+#
+#     lane_structural && ! lane_own_run_can_attach
+#
+#   * BOTH hold — STRUCTURAL, and its `on:` names neither `push` nor `workflow_dispatch`
+#     (an absent or unclassifiable trigger list included: the fail-closed default). No
+#     run of this lane can attach to the head, so the filtered wait is INERT — it can
+#     only ever clear on a run that cannot appear — and #2465's measured 3900 s burn was
+#     caused by exactly ONE failed `gh run list` (§0b runs the probe once), not by a
+#     probe that answered "has a run". Waiting longer cannot outlast a failed read.
+#     Widen.
+#   * Otherwise the filter is KEPT (fail closed). That covers every other class, AND a
+#     STRUCTURAL lane that CAN attach a run of itself to the head: there a run CAN
+#     appear, so an unread answer is not an exemption.
+#
+# ⛔ NOT a class-wide widen. The whole-structural-class reading was the merged landing
+# (`e4716a058`), it reversed the fail-closed answer for this class's `push` /
+# `workflow_dispatch` members on ONE transient read, and it is what review P1 rejected.
+# `tests/issue-2465-inert-wait/run.sh` pins the two-condition predicate itself
+# (mutation (a9)) as well as this record's wording (arm (a0)), so the two cannot drift
+# apart again.
 # The merge decision is NOT loosened either way: §4.5 grades the evaluated tree across
 # EVERY workflow and app, exactly as it does for `--any-workflow` and for the
 # FIRST-CHECKS wait's own #2862 re-derive, whose fixture pins that the dropped filter
@@ -6764,11 +6787,15 @@ lane_no_pr_trigger() {
 # ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
 # attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
 # reason, the other could not read the list at all and defaulted fail-closed. So the
-# helper also records WHICH: LANE_RUN_ATTACH_SOURCE is `measured` only when the clause
-# was present, and LANE_RUN_ATTACH_TRIGGERS names what it found (empty on the default).
-# Without that, §0b's message told an absent-clause lane that it "declares a trigger"
-# — a declaration the code never read, which is the one thing this file forbids in a
-# message (`nothing below may claim a MEASUREMENT the code did not take`).
+# helper also records WHICH ground it is on — LANE_RUN_ATTACH_SOURCE is
+# `measured` only when a clause was present AND every member had a classifiable
+# shape, `unread` when there was no clause to read, and `unclassifiable` when the
+# clause WAS read but no member is a shape this helper can name (round 5, P3: §0b's
+# message must not call a list it read "unreadable") — and LANE_RUN_ATTACH_TRIGGERS
+# names what it found (empty on every default). Without that, §0b's message told an
+# absent-clause lane that it "declares a trigger" — a declaration the code never read,
+# which is the one thing this file forbids in a message (`nothing below may claim a
+# MEASUREMENT the code did not take`).
 #
 # The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
 # present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
@@ -6785,11 +6812,27 @@ lane_own_run_can_attach() {
   esac
   # ⛔ THE SHAPE GATE (round 3, P2). Normalise ONLY the documented delimiter, then
   # refuse to classify anything that is not a plain `on:` key. `return 0` here is the
-  # fail-CLOSED answer (keep the filter) and leaves LANE_RUN_ATTACH_SOURCE at `unread`,
-  # so §0b's message says the list was unread instead of naming a trigger it invented.
+  # fail-CLOSED answer (keep the filter) and leaves LANE_RUN_ATTACH_SOURCE non-measured,
+  # so §0b's message says the list was not classified instead of naming a trigger it
+  # invented.
+  #
+  # ⛔ THE CHARSET IS DELIBERATELY NARROWER THAN THE PRODUCER'S KEY VALIDATOR, and that
+  # is an ACCEPTED RESIDUAL, not an oversight (round 5, P3). The producer's `_KEY_RE`
+  # (scripts/ci-workflow-pr-evaluable.sh:111) also admits `-`, `.` and uppercase;
+  # accepting them here would be the LOOSENING direction, because a value that passes
+  # the gate but names no trigger this helper knows answers "cannot attach" — which
+  # WIDENS. Every documented `on:` event name is lowercase snake_case (GitHub's own
+  # events reference: `branch_protection_rule`, `check_run`, `deployment_status`, …), so
+  # the difference is empty in practice, and a value inside it keeps this fail-closed
+  # arm: the lane cannot widen on a list this code cannot name (#2465's inert wait).
   norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   case "$norm" in
-    ''|*[!a-z0-9_,]*) return 0 ;;
+    ''|*[!a-z0-9_,]*)
+      # PRESENT but unclassifiable: the clause WAS read, so the message must say that
+      # rather than "could not be READ" (round 5, P3 — claim accuracy, and it is the
+      # difference between "we learned nothing" and "we learned something we cannot use").
+      LANE_RUN_ATTACH_SOURCE="unclassifiable"
+      return 0 ;;
   esac
   LANE_RUN_ATTACH_SOURCE="measured"
   list=",$norm,"
@@ -10355,15 +10398,24 @@ main() {
               lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs$lane_attach_how"
               lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
             else
-              # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code could not
-              # READ the trigger list, so the only honest statement is that the answer is
-              # unread and the filter is kept fail-closed.
+              # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code did
+              # not CLASSIFY a trigger, so the only honest statement is that no attachable
+              # trigger was established and the filter is kept fail-closed.
               # ⛔ "NO SUCH PR EVENT", NOT "NO PR EVENT" (round 4, P2): this class is
               # `triggers & {pull_request, pull_request_target} == {}` (see
               # scripts/ci-workflow-pr-evaluable.sh:106,829-836), and a `pull_request_review`-
               # only lane belongs to it while a PR event (a submitted review) genuinely
               # STARTS it. The narrower, MEASURED claim is the one that belongs here.
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              # ⛔ AND "UNREAD" IS NOT "UNCLASSIFIABLE" (round 5, P3). On the shape gate
+              # the list WAS read and no member had a classifiable shape; on the absent
+              # clause there was nothing to read. Reporting both as "could not be READ"
+              # under-claimed in the safe direction, but claim accuracy is this block's
+              # own rule, so the ground is carried in LANE_RUN_ATTACH_SOURCE and named.
+              local lane_list_ground="could not be READ from the applicability reason"
+              if [ "$LANE_RUN_ATTACH_SOURCE" = unclassifiable ]; then
+                lane_list_ground="WAS READ from the applicability reason, but no member of it is a plain lowercase 'on:' key this code can classify"
+              fi
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list $lane_list_ground — so the filter is kept because an unclassified answer is not an exemption, not because a run was measured absent"
               # ⛔ AND THE TAIL MUST NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3,
               # P2). "This class CAN still start a run while the wait runs" is the fact this arm
               # has just said it could not establish, and it repeats the "not an exemption"
