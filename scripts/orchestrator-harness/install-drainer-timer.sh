@@ -198,7 +198,36 @@ say_status() {
                      | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
         want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
         if [ -z "$installed" ]; then
-            printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so ai-drainer.sh falls back to its compiled default)\n'
+            # ⛔ "NO PIN" IS NOT "CLEAN" (agent-infra#4034 review, P3). With no pin the unit dispatches at
+            # the default COMPILED INTO THE SCRIPT ITS OWN `ExecStart=` NAMES — so a box whose `$O` tree
+            # predates the seam keeps the OLD cap while the checkout, the docs and the suite all say the
+            # new one. That is the same state this exit code exists to make automatable, arriving through
+            # the other door, so grade it the same way: read the script the unit would ACTUALLY run (never
+            # the copy this checkout happens to hold), and decide on ITS literal. An ExecStart that is not
+            # an ai-drainer.sh at all is named as UNKNOWN rather than being called clean — it is not
+            # evidence of a stale cap, and it is not evidence of a fresh one either.
+            local exe have
+            exe="$(sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc" 2>/dev/null | tail -1 | tr -d '\r')"
+            have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
+                      "${exe:-/nonexistent}" 2>/dev/null | head -1)"
+            case "${have:-}" in ''|*[!0-9]*) have="" ;; esac
+            if [ -z "${exe:-}" ] || [ ! -f "${exe:-/nonexistent}" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
+                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+            elif [ -z "$have" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s declares no readable default, so the cap this\n' "$exe"
+                printf '      box dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+            elif [ "$have" != "$want" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "$have"
+                printf '      %s)\n' "$exe"
+                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "$have" "$want"
+                printf '      the box keeps the old cap until this unit is re-rendered: re-run this installer\n'
+                printf '      (no arguments) on this cell.\n'
+                return 3
+            else
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$have" "$exe"
+                printf '      agrees with the %s s this checkout would render)\n' "$want"
+            fi
         else
             printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
         fi

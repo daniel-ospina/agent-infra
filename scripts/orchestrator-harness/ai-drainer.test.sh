@@ -1991,11 +1991,23 @@ SC_EOF
   # review, P2 — verified). It used to render a retired 3000 s literal, which shadowed
   # ai-drainer.sh's own `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` on every installed box: drainer lanes
   # stayed capped at 50 min (300 s above the 2700 s progress allowance) and raising the seam changed
-  # nothing there — the censoring surviving on the box whose job is to drain the backlog. Rendered with
-  # LANE_TIMEOUT scrubbed so this measures the SEAM, not whatever the harness env happens to carry.
+  # nothing there — the censoring surviving on the box whose job is to drain the backlog. Rendered with the
+  # harness's two lane-bound variables scrubbed so this measures the SEAM, not whatever the ambient env
+  # happens to carry.
+  #
+  # ⛔ BOTH, NOT JUST `LANE_TIMEOUT` (agent-infra#4034 review, P2 — reproduced). The installer resolves its
+  # default as `${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}` and then `DRAINER_LANE_TIMEOUT="${LANE_BACKSTOP_S:-}"`
+  # (install-drainer-timer.sh:136,160,199), so `LANE_BACKSTOP_S` is a SECOND ambient way into the rendered
+  # pin and into `--status`'s `want`. Scrubbing only `LANE_TIMEOUT` therefore left every arm below reading
+  # the CALLER's environment: measured on a box whose controller exports `LANE_BACKSTOP_S=7200`,
+  # `bash ai-drainer.test.sh` reported **194 passed, 3 failed** with nothing set on the command line — the
+  # "installed pin == seam" arm and BOTH `--status` arms (the clean one reds, and the deliberate 7200 pin
+  # compares equal so it reads CLEAN). That inverts the suite on exactly the stale-pin cell this change
+  # exists to make visible, and a fixer would then "fix" the test instead of reading the pin. Set
+  # `LANE_TIMEOUT=7200 LANE_BACKSTOP_S=7200 bash …` and this must stay green: the arms measure the SEAM.
   T4="$ROOT/inst4"; mkdir -p "$T4"
   SEAM_T="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/spawn-gate.sh" | head -1)"
-  ( unset LANE_TIMEOUT; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+  ( unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
       DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" >/dev/null 2>&1 )
   check "installer: the installed unit pins LANE_TIMEOUT to the SEAM (${SEAM_T:-?}s), not a retired 3000s literal" \
     'v="$(sed -n "s/^Environment=LANE_TIMEOUT=//p" "$T4/units/eldato-ai-drainer.service" 2>/dev/null)"; [ -n "$SEAM_T" ] && [ "$v" = "$SEAM_T" ]' \
@@ -2006,8 +2018,8 @@ SC_EOF
   # such a box read healthy. These three arms grade the reading: matching pin → clean, stale pin → warned
   # AND non-zero (a warning only an eye can read is the invisibility this fixes), no pin on disk → named
   # as "no pin" rather than silently compared against an empty string.
-  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
-        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status prints the INSTALLED LANE_TIMEOUT pin beside what it would render, and is clean when they agree" \
     '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
@@ -2016,16 +2028,40 @@ SC_EOF
   # line surgery. This is a unit installed BEFORE the seam moved, which is the exact artifact in the wild.
   grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
   printf 'Environment=LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
-  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
-        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status WARNS and exits 3 on a STALE pin (a pre-change unit still dispatching at 7200)" \
     '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
   printf 'ExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
-  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
-        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status names an ABSENT pin as absent (never compares '' and calls it clean)" \
     '[ "$rc" -eq 0 ] && grep -q "carries no pin" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # ⛔ "NO PIN" IS NOT "CLEAN" BY DEFAULT (agent-infra#4034 review, P3). A unit with no pin dispatches at
+  # the default COMPILED INTO THE ai-drainer.sh ITS OWN `ExecStart=` NAMES — so on a box whose `$O` tree
+  # predates this seam the box keeps the OLD cap while the checkout, the docs and the suite all say the
+  # new one, which is the very state exit 3 exists to make automatable. Read the script the unit would
+  # actually run (never the copy this checkout happens to have), and grade it: matching → clean, stale →
+  # warned AND non-zero, unreadable → named as UNKNOWN rather than silently compared against ''. The
+  # `/bin/true` arm directly above is the unreadable case and stays rc 0 for that reason.
+  cp "$HERE/ai-drainer.sh" "$T4/drainer-fresh.sh"
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >>"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status grades an ABSENT pin against the unit's OWN ExecStart script, and is clean when they agree" \
+    '[ "$rc" -eq 0 ] && grep -q "carries no pin" <<<"$out" && grep -q "agrees" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # A one-line stand-in for the `$O` copy a pre-#4034 box still has: the reader below parses exactly this
+  # line, so the fixture carries the shape and not a paraphrase of it.
+  printf 'LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"\n' >"$T4/drainer-stale.sh"
+  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status WARNS and exits 3 when a NO-PIN unit's ExecStart script still carries the OLD compiled default" \
+    '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out" && grep -q "carries no pin" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
   cp "$T4/svc.bak" "$T4/units/eldato-ai-drainer.service"
 else
