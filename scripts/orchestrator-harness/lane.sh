@@ -1243,10 +1243,15 @@ elif [ "$rc" = "0" ]; then
           # what the `*)` arm is: the count is `unpushed` and the push never landed anywhere.
           case "${LANE_END_PUSH:-}" in
             FAILED)
+              # ⛔ AND `FAILED` + NO ORIGIN IS THE ONE SHAPE THAT *DID* MEASURE THE ABSENCE, so it keeps
+              # the original sentence: `spawn-gate.sh` assigns `FAILED` with an empty `LANE_END_ORIGIN`
+              # only in the arm where "the REMOTE ANSWERED and does NOT hold refs/heads/<branch>". The
+              # over-claim lives in the OTHER `FAILED` arm — origin holds a DIFFERENT sha there — and that
+              # is the split below.
               if [ -n "${LANE_END_ORIGIN:-}" ]; then
-                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) that the push target does NOT carry under this branch name (state=$LANE_DELIVERY). ${LANE_END_PUSH_URL:-origin} holds refs/heads/${LANE_END_BRANCH:-$BR} at ${LANE_END_ORIGIN}, a DIFFERENT head, and this run's commits are NOT on that ref — whether they are on some OTHER ref is NOT measured here, so do NOT read this as 'nothing left the box'. Land or push them explicitly (or hand the branch to the merge chain) rather than re-dispatching: the commits exist here and a relaunch abandons them. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) that ${LANE_END_PUSH_URL:-origin} does NOT carry at THIS head (state=$LANE_DELIVERY). That repository holds refs/heads/${LANE_END_BRANCH:-$BR} at ${LANE_END_ORIGIN} — a DIFFERENT sha, and this run's commits are not on that ref; whether they are on some OTHER ref is NOT measured here, so do NOT read this as 'nothing left the box'. Land or push them explicitly (or hand the branch to the merge chain) rather than re-dispatching: the commits exist here and a relaunch abandons them. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
               else
-                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) the exit path's push could not deliver (state=$LANE_DELIVERY, push=FAILED); the remote's content was not established for this ref. Push them explicitly (or hand the branch to the merge chain) rather than re-dispatching. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+                echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — the push target ANSWERED and does not hold this branch, so the commit(s) exist only on this disk. No pushed head carries them, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
               fi ;;
             UNAVAILABLE|detached|refused-*)
               echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) on this disk (state=$LANE_DELIVERY, push=${LANE_END_PUSH}) — the exit path could NOT establish what the push target holds, so this line asserts NOTHING about origin either way. Push them explicitly and verify with a remote read; do not read this as delivered and do not read it as lost. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
