@@ -87,7 +87,6 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // classifies it separately (branch-state mutation, ownership-gated).
   { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*[ \t](?:["']?--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|["']?-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*[ \t](?:["']?--forc(?:e)?(?![A-Za-z0-9])|["']?-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
-  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
   { name: "checkout-discard-all", re: /\bgit\s+(checkout|switch)\s+-{0,2}\s*\.(\s|$|[;&|])/ },
   // Bare-ref or -b branch switch: `git checkout main`, `git checkout -b feat/x`,
@@ -97,6 +96,23 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "checkout-branch", re: /\bgit\s+(checkout|switch)\s+(-b\s+)?(?!--)(?!-\w)(\S+)/ },
   { name: "restore", re: /\bgit\s+restore\b/ },
   { name: "stash-pop", re: /\bgit\s+stash\s+(pop|apply|drop|clear)\b/ },
+  // #506 — the ARRAY IS A PRIORITY LIST, and `push-delete` used to sit ABOVE
+  // force-checkout / checkout-discard-all / checkout-branch / restore /
+  // stash-pop. Because `classifyGitCommand` returns the FIRST match on the WHOLE
+  // command string, a compound whose lead verb is one of those five classified
+  // `block:push-delete` — a LESS severe verdict than the verb it contains — and
+  // the full path's #73 arm then returned allow whenever the delete target was
+  // checked out nowhere, so the lead verb RAN in the hub main checkout
+  // (`git stash pop && git push origin --delete stale` — probe-verified). The
+  // verbs above (reset/clean/merge/rebase/pull/branch-force-delete/force-push)
+  // never had this shape: they out-rank push-delete and reached the full path as
+  // themselves, where the DETAILED classifier's unconditional override (#506's
+  // main defect) laundered them instead.
+  // A remote-branch delete is the LEAST destructive entry in this family, so it
+  // belongs LAST: a compound now names its most severe verb, exactly as the
+  // guard's contract says. Pure delete pushes are unaffected (nothing else
+  // matches), and `force-push` still out-ranks it (`git push -f … --delete`).
+  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
 ];
 
 /**
@@ -2763,7 +2779,20 @@ function _wtOpenerSegment(line) {
     // that demoted the real shell heredoc to data and blanked its body
     // (reviewer round-5 P1).
     if (ch === "<" && s[i + 1] === "<" && opened === -1) { opened = segs.length; cur += "<<"; i++; continue; }
-    if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
+    // ⛔ `&` IS A LIST OPERATOR ONLY WHEN IT IS NOT PART OF A REDIRECTION.
+    // `2>&1`, `>&2`, `<&0` carry the `&` INSIDE the fd-DUP operator, and
+    // `&>word` / `&>>word` are the both-streams redirects — neither ends a
+    // simple command. Splitting on them cut the opener segment's head down to
+    // the fd DIGIT (`"1 bash << EOF"`), so `_wtHeadInterpreter` answered null,
+    // `_wtHeredocKind` fell to `null` (DATA) and the body was never walked:
+    // measured `[]` for `2>&1 bash <<EOF` + a hub-mutating body while `main`
+    // resolved that body and BLOCKED it — a fail-OPEN and a regression
+    // (#523 round-7 F1). A `&` that is NOT adjacent to `<`/`>` is still the
+    // list operator it always was (`cmd &`, `cmd && cmd`).
+    if (ch === "&" && !(s[i - 1] === ">" || s[i - 1] === "<" || s[i + 1] === ">")) {
+      segs.push(cur); cur = ""; continue;
+    }
+    if (ch === ";" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
       segs.push(cur); cur = ""; continue;
     }
     cur += ch;
@@ -2827,6 +2856,28 @@ function _wtLinePipesToInterpreter(line) {
  *  payloads — so `)` is left as it was and the whole class is tracked on #2161
  *  rather than half-closed here.
  */
+/** Re-emit a heredoc delimiter WORD for the downstream tokenizer, as ONE token.
+ *
+ *  bash's quote removal collapses `'E F'`, `E\ F` and `"E F"` to the single
+ *  word `E F`, and the body is delimited on a line that IS that word. Emitting
+ *  the removed word unquoted let `_tokenize` split it on the space, so the
+ *  redirect branch consumed `<<` + the first fragment and the remaining
+ *  fragment became a POSITIONAL — the body was then mis-classified as DATA and
+ *  never walked (#523 round-6 F2, measured).
+ *
+ *  A plain word is returned VERBATIM so every existing consumer's emitted text
+ *  is unchanged; anything containing a space or a shell metacharacter is
+ *  double-quoted (`_tokenize` removes the quotes and unescapes `\\`/`"` inside
+ *  them, yielding the one word bash computed).
+ * @param {string} word
+ * @returns {string}
+ */
+function _emitDelimiterWord(word) {
+  const w = String(word ?? "");
+  if (/^[A-Za-z0-9_./:=+-]+$/.test(w)) return w;
+  return `"${w.replace(/[\\"]/g, "\\$&")}"`;
+}
+
 function _wtScanLine(line, carry) {
   let i = 0;
   let out = "";
@@ -2834,7 +2885,13 @@ function _wtScanLine(line, carry) {
   let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let delim = null;
-  let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
+  let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`), or
+                          // "\\" when it was backslash-escaped (`<<\EOF`) — both suppress
+                          // outer-shell expansion of the body
+  // `<<-EOF` (dash form) strips leading TABS from every body line INCLUDING the
+  // terminator line before bash compares it; the plain form strips nothing
+  // (#523 round-3 F2). Consumers that match the terminator need this flag.
+  let delimDash = false;
   let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
@@ -2862,22 +2919,56 @@ function _wtScanLine(line, carry) {
     }
     if (ch === "<" && line[i + 1] === "<") {
       let j = i + 2;
-      if (line[j] === "-") j++;
+      const dash = line[j] === "-";
+      if (dash) j++;
       while (line[j] === " " || line[j] === "\t") j++;
       let q = null;
       if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
       let d = "";
+      let dEscaped = false;
       // An UNQUOTED delimiter is a shell word: it stops at whitespace / shell
       // metacharacters, NOT at the first non-word char. Stopping early (`<<E-O-F`
       // → delimiter `E`) left the terminator unmatched, so the body swallowed
       // every following line — including a later discard (reviewer round-6 P1).
-      while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
+      // ⛔ A BACKSLASH ESCAPES the next character and is then REMOVED by quote
+      // removal, exactly as bash does it: `bash <<\EOF` is the heredoc delimiter
+      // `EOF`. Ending the word at `\` produced `delim: null`, so no body was
+      // opened and the RAW body text fell into the command-line scan — the
+      // pre-#523 accident, i.e. the exact defect #523 closes, one character away
+      // (measured: `bash <<\EOF` + a body of `echo hi` then `/tmp/x.sh` resolved
+      // `echo` and never read the file; real bash executes it. #523 round-5 F2a).
+      // A backslash-quoted word also stops the outer shell EXPANDING the body,
+      // so it is reported the way a quoted delimiter is (`delimQuoted`), which is
+      // what the M5 substitution projection keys on.
+      while (j < line.length) {
+        const c = line[j];
+        if (q) { if (c === q) break; d += c; j++; continue; }
+        if (c === "\\") {
+          const nxt = line[j + 1] ?? "";
+          if (!nxt) break; // a trailing backslash continues onto the next line
+          d += nxt; dEscaped = true; j += 2; continue;
+        }
+        if (/[\s;&|<>(){}'"]/.test(c)) break;
+        d += c; j++;
+      }
       if (q && line[j] === q) j++;
-      if (d && delim === null) { delim = d; delimQuoted = q; }
+      if (d && delim === null) { delim = d; delimQuoted = q ?? (dEscaped ? "\\" : null); delimDash = dash; }
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
-      out += d ? `<< ${d}` : "<<";
+      //
+      // ⛔ THE DELIMITER IS ONE SHELL WORD. It is a word whose quotes and
+      // backslashes are removed by QUOTE REMOVAL, and the spaces it contained
+      // stay inside it — `<<'E F'` and `<<E\ F` both delimit on the line `E F`.
+      // Re-emitting the quote-removed word UNQUOTED produced `<< E F`, i.e. TWO
+      // tokens, so `_scriptInvocationAt`'s redirect branch consumed `<<` + `E`
+      // and left `F` as a POSITIONAL — `stdinProgram` came out false, the body
+      // was never walked, and the only path resolved was the phantom `F` (a
+      // non-file, so the content gate no-opped): measured `[]` for a body that
+      // real bash executes, while `main` resolved the body's file and BLOCKED it
+      // (#523 round-6 F2). `_emitDelimiterWord` keeps a plain word byte-identical
+      // to the old emission and quotes only the forms that used to split.
+      out += d ? `<< ${_emitDelimiterWord(d)}` : "<<";
       i = j;
       continue;
     }
@@ -2908,7 +2999,7 @@ function _wtScanLine(line, carry) {
   // apostrophe. The mirror direction is a false BLOCK: a commented-out
   // `git checkout -- x` on the line after a code line was harvested as live.
   if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; }
-  return { text: out, delim, delimQuoted };
+  return { text: out, delim, delimQuoted, delimDash };
 }
 
 /**
@@ -3932,11 +4023,38 @@ export function _branchInvMutatesBranchState(args) {
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
- *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
+ *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete, hasPush,
+ *     promotedFrom,
  *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
+ * - promotedFrom: the pattern NAME whose verdict the always-run skimmed pass
+ *   REPLACED with a higher-priority one (null when no promotion happened).
+ *   #506 round 11 (P0) — it is a FACT the consumer must not lose:
+ *   `git stash drop && git -C . push -f origin main` holds `stash-pop` in the raw
+ *   pass and promotes to `force-push` from the skimmed pass, and `force-push` is
+ *   a kind the ownership allowance ADMITS while `stash-pop` is one it never did.
+ *   So a promotion can move a compound onto a MORE admitted verdict, and the
+ *   replaced verb is still an EFFECT of the command. Reported, never acted on,
+ *   here: index.ts owns the admission map and decides what to do with it.
+ *   ⚠️ It is the raw pass's winner under the CURRENT (post-#506) array order, NOT
+ *   under the pre-#506 order — round 12 corrected that claim after measuring it.
+ *   This PR moved `push-delete` from index 8 to 13, so when a delete spelling is
+ *   present the raw winner here is `push-delete` while the pre-#506 winner was one
+ *   of its less-severe neighbours; a 4608-compound sweep found 48 such rows. So
+ *   the consumer's restore is DENY-WINS restitution, never a reproduction of the
+ *   old verdict: where base would have run the #73 delete check on a
+ *   `block:push-delete` verdict, this field alone would skip it — which is why
+ *   index.ts runs that check BEFORE it acts on this field.
+ * - hasPush: true iff the command contains a PUSH INVOCATION (any verdict).
+ *   #506 — index.ts's delete-target arm must run the #73 sibling check on a
+ *   compound the verdict did not name a push for, but a `block:commit` verdict
+ *   PROVES there is no push invocation at all, so the only "evidence" there is
+ *   the string extractor matching a commit MESSAGE
+ *   (`git commit -m "… git push origin -d main"`). Even the documented
+ *   echo/comment over-match class needs a real push somewhere; this flag is
+ *   what lets the consumer tell the two apart without re-deriving the walk.
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
@@ -3964,6 +4082,8 @@ export function classifyGitCommandDetailed(command) {
     verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
+    hasPush: false,
+    promotedFrom: null,
     renameFrom: null, renameTo: null, syncSource: null,
   };
   // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
@@ -4016,8 +4136,9 @@ export function classifyGitCommandDetailed(command) {
   }
 
   // ── verb-anchored legacy destructive patterns ──
-  // Run on the RAW command (compound chains: `git pull && git merge`), and if
-  // that misses, on EVERY invocation's SKIMMED reconstruction (`git -C x
+  // Run on the RAW command (compound chains: `git pull && git merge`), and —
+  // ALWAYS, never only when the raw pass misses (#506 review round 8, P1) — on
+  // EVERY invocation's SKIMMED reconstruction (`git -C x
   // checkout main` ≡ `git checkout main` — the -C/-c/GIT_DIR prefixes defeat
   // the raw regexes' `git\s+branch` adjacency, which is exactly why they were
   // verified bypasses). #587 (review fold-in): the re-test covers every
@@ -4026,18 +4147,65 @@ export function classifyGitCommandDetailed(command) {
   // escaped both passes. index.ts resolves the effective repo from the STATE
   // invocation, so worktree/foreign-targeted deletes stay exempt downstream.
   const raw = String(command ?? "").trim();
-  for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-    if (re.test(raw)) { out.verdict = `block:${name}`; break; }
+  // The INDEX of the winning pattern in the priority list (-1 = nothing matched
+  // yet). Both passes share it, so a later pass can only ever move the verdict
+  // to a STRICTLY HIGHER-priority verb — never weaken it.
+  // ⛔ "HIGHER PRIORITY" IS NOT "MORE RESTRICTIVE", AND THAT DISTINCTION IS A
+  // SECURITY PROPERTY (see `promotedFrom` in the shape doc above, #506 round 11
+  // P0). The consumer's ownership allowance admits a FIXED SET of kinds
+  // (pull/merge/rebase/push/force-push/push-delete/branch-force-delete) and
+  // never admits reset/clean/force-checkout/checkout-discard-all/
+  // checkout-branch/restore/stash-pop. Promotion therefore moves a compound
+  // ACROSS that line in the unsafe direction: the raw pass sees `stash-pop`,
+  // the skimmed pass promotes to `force-push`, and the allowance — which the
+  // pre-#506 verdict would never have reached — then admits the whole command.
+  // So a raise records what it replaced.
+  let patternIdx = -1;
+  for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+    if (DESTRUCTIVE_GIT_PATTERNS[i].re.test(raw)) {
+      out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+      patternIdx = i;
+      break;
+    }
   }
-  if (out.verdict === "allow") {
-    for (const inv of invocations) {
-      const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
-      if (skimmed === "git") continue;
-      let hit = false;
-      for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-        if (re.test(skimmed)) { out.verdict = `block:${name}`; hit = true; break; }
+  // ⛔ THE SKIMMED PASS RUNS **ALWAYS** — it is not conditional on the raw pass
+  // having found nothing (#506 review round 8, P1; measured end-to-end). It
+  // exists because the `-C`/`-c`/`GIT_DIR` prefixes defeat the raw regexes'
+  // `git <verb>` adjacency, so a raw hit is evidence about the raw TEXT, not
+  // about the verbs the command contains. Gating it on `verdict === "allow"`
+  // left the prefix class open one spelling over: for
+  // `git -C . reset --hard && git push origin --delete stale` the raw pass
+  // matches ONLY `push-delete` (the reset is prefix-defeated), the skimmed pass
+  // never ran, and the compound reached index.ts as `block:push-delete` — whose
+  // #73 arm returns its allow-when-no-sibling-checkout verdict — so the hard
+  // reset RAN in the shared hub main checkout. That is exactly the laundering
+  // #506 exists to close, through the one spelling the raw pass cannot see.
+  // The two passes are therefore combined by PRIORITY (`DESTRUCTIVE_GIT_PATTERNS`
+  // is a priority list, #506): whichever pass names the more severe verb wins,
+  // and the skimmed pass cannot lower a raw verdict. The delete FACTS
+  // (`isPushDelete`/`pushTargets`) are unaffected — they are computed from the
+  // push invocation below, not from the verdict.
+  for (const inv of invocations) {
+    if (patternIdx === 0) break; // already the highest-priority pattern
+    const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
+    if (skimmed === "git") continue;
+    for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+      if (!DESTRUCTIVE_GIT_PATTERNS[i].re.test(skimmed)) continue;
+      if (patternIdx === -1 || i < patternIdx) {
+        // #506 round 11 (P0): a raise that REPLACES an already-held verdict is a
+        // PROMOTION, and the replaced name is retained. The FIRST replaced value
+        // is what the pre-#506 classifier produced WHENEVER THE RAW PASS MATCHED
+        // NOTHING (there, base's verdict WAS the first skimmed hit); when the raw
+        // pass did match it is the raw winner under the CURRENT order. Those two
+        // coincide only when no delete spelling is present, because this PR moved
+        // `push-delete` to the end — see the warning in the shape doc above.
+        if (patternIdx !== -1 && out.promotedFrom === null) {
+          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;
+        }
+        out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+        patternIdx = i;
       }
-      if (hit) break;
+      break; // the first matching pattern for THIS invocation is its own verdict
     }
   }
 
@@ -4089,6 +4257,7 @@ export function classifyGitCommandDetailed(command) {
     const legacyVerdict = out.verdict;
     const args = pushInv.args;
     const joined = `git push ${args.join(" ")}`;
+    out.hasPush = true; // #506: "a real push invocation exists" — see the doc block
     // #443 clean-hub parity (mirrors the #439 disordered-hub closure): delete
     // detection was exact-only (`--delete` / `:branch`), so the documented
     // `-d` short form, merged no-arg short clusters containing `d` (`-dq`), and
@@ -4105,9 +4274,28 @@ export function classifyGitCommandDetailed(command) {
     const optSlots = _markOptionValueSlots(args);
     const deleteIdx = args.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
     const hasColonTargets = args.some((a, i) => !optSlots[i] && /^:/.test(a));
+    // #506 — a delete spelling must NEVER override an UNRELATED legacy
+    // destructive verdict. The legacy verdict is assigned from the WHOLE
+    // command string (`git reset --hard && git push origin --delete b` ⇒
+    // block:reset), i.e. it names the most severe effect of the compound. The
+    // override handed such a compound to index.ts's #73 coordinated arm as
+    // `block:push-delete`; when the delete target is not checked out anywhere
+    // that arm returns its allow-when-no-sibling-checkout verdict and the
+    // LEGACY_BLOCK arm is never reached — so the hard reset RAN in the shared
+    // hub main checkout (the laundering this issue records; it predates #443,
+    // which only extended it to the `-d`/`--del` spellings). Keep the legacy
+    // verdict, and keep the delete FACTS (`isPushDelete` + `pushTargets`) so
+    // index.ts can still run the #73 sibling check on the delete targets
+    // independently of the verdict — the delete is a real effect of the
+    // compound even when it is not the verdict's verb.
+    // The push family is unchanged: `block:push-delete` and
+    // `block:force-push` verdicts resolve to block:push-delete exactly as
+    // before (both are push verdicts, and the coordinated arm owns both).
+    const legacyIsOtherDestructive = legacyVerdict.startsWith("block:") &&
+      legacyVerdict !== "block:push-delete" && legacyVerdict !== "block:force-push";
     if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
       out.isPushDelete = true;
-      out.verdict = "block:push-delete";
+      if (!legacyIsOtherDestructive) out.verdict = "block:push-delete";
       // git treats the FIRST positional as the repository and every further
       // positional as a delete refspec when a delete form is present
       // (`git push --delete origin a b` deletes a AND b — probe-verified;
@@ -4135,8 +4323,15 @@ export function classifyGitCommandDetailed(command) {
       // echo/comment over-match (a text that merely MENTIONS a complete
       // `git push … --delete <target>` also populates targets; sibling-
       // conditional safe-direction, consistent with the frozen --delete
-      // echo precedent). Parenthesized later segments (`(git push … -d c)`) are
-      // a tracked residual (token-level paren suffix).
+      // echo precedent). Parenthesized later segments (`(git push … --delete c)`)
+      // WERE the tracked residual — the token-level paren suffix leaked into the
+      // target as `c)` — and are now attributed by the shared extractor
+      // `_pushSegmentTokens`, so this fold-in covers them (pinned by test.mjs's
+      // "parenthesized later-segment --delete → real target only"). The
+      // `-d`/`--del` spelling is NOT served here: the FROZEN legacy regex knows
+      // only `--delete`/`:ref`, so such a compound keeps the `block:push`
+      // verdict and is served by `wholeCommandDeleteTargets`, not by this gated
+      // fold-in.
       if (deleteIdx === -1 && !hasColonTargets) {
         out.pushTargets = extractPushDeleteBranch(String(command)) ?? [];
       }
@@ -4163,7 +4358,8 @@ export function classifyGitCommandDetailed(command) {
         else out.verdict = "block:push"; // legacy --force\b false-matched lease/includes
       }
     }
-    // legacyVerdict was some other destructive (reset etc.) → keep it
+    // legacyVerdict was some other destructive (reset etc.) → keep it —
+    // with or without a delete spelling in the compound (#506).
   }
 
   // ── commit matcher (excludes commit-graph/commit-tree) — only when no
@@ -4759,6 +4955,18 @@ function _isPushDeleteFlagToken(a) {
 //   ~        tilde expansion at word start.
 //   \       escape — the word is not the text.
 //
+// ⛔ WHITESPACE IS DELIBERATELY *NOT* IN THIS CLASS, AND THE REASON IS A MEASURED FALSE BLOCK
+// (round-10 review, P0 F1, and the fix that replaced the first attempt). The obvious rule — "a ref
+// cannot contain whitespace, so refuse a target that does" — is TRUE and still wrong as a REFUSAL
+// RULE here, because the very same shape arrives as an ORDINARY OVER-CAPTURE: the delete arm's
+// target list includes the classifier's positionals, so a legitimate
+// `git push origin -o merge_request.title="Release 2.0" -d feat/x` carries the option VALUE as a
+// candidate target. Measured at that head: `-o "a b" -d held` and `-o "a\nb" -d held` began refusing
+// by #653 ("cannot tell WHICH branch") where the delete target was a plain literal and #73 should
+// have decided it — a false block on a real push-option form. The whitespace hazard itself is fixed
+// at its SOURCE (`_dropUnmatchedQuote`), so a target can no longer acquire a glued space in the first
+// place. This entry stays out with that reason recorded, so a later reader does not "restore" it.
+//
 // Deliberately NOT included: `,` (legal in a ref name; brace expansion is caught
 // by its own braces) and `^`/`:` (illegal in a ref name and not a shell
 // expansion — git rejects such a refspec, so it cannot delete a held branch).
@@ -4792,8 +5000,1082 @@ export function unresolvableDeleteTargets(targets) {
   return [...new Set(targets.filter((t) => !isResolvableDeleteTarget(t)))];
 }
 
+/**
+ * Collapse BACKTICK command substitutions in a segment body to an opaque word.
+ *
+ * An unquoted backtick is a substitution delimiter, but `_tokenize` keeps it inside the word, so
+ * the extractor used to report the phantom target `b`+backtick (`echo `git push origin -d b``). That
+ * phantom names no ref, so the #73 lookup found nothing. ⛔ IT WAS NEVER AN ALLOW ON THE REBASED BASE —
+ * `DELETE_TARGET_UNRESOLVABLE_RE` includes the backtick, so #653 already refused it (on the fragment),
+ * and an earlier revision of this comment claimed otherwise. What this change buys is the REAL target
+ * `b` instead of a fragment: the #73 lookup now runs on a name that exists (#504 round-8 review, P3).
+ *
+ * ⛔ AN OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). A first attempt truncated at
+ * the first unquoted backtick, which is only right for a CLOSER. `git push `date` origin -d
+ * held/branch` has its OPENER inside the segment; truncating there discarded `-d held/branch` and
+ * returned null where origin/main returned the target — the same fail-open the fix exists to close.
+ * Bash's model is a SPAN: the delimited text is one word of the enclosing simple command, and the
+ * words after it belong to that command. So unquoted backticks are PAIRED left-to-right inside the
+ * segment body and each pair collapses to one opaque placeholder word (which keeps every following
+ * word, including the delete flag and its target); only an UNPAIRED one — the closer of a
+ * substitution opened before `git push`, or an opener whose closer lies beyond this segment — ends
+ * the body. QUOTED backticks are data and are never paired.
+ * @param {string} body
+ * @returns {string}
+ */
+function _foldBacktickSubstitutions(body) {
+  const marks = [];
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      // A backslash escapes the next char only inside double quotes (POSIX); inside single quotes it
+      // is literal, so skipping there would mis-read a later closing quote.
+      if (ch === "\\" && quote === '"') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "`") marks.push(i);
+  }
+  if (marks.length === 0) return body;
+  let out = "";
+  let prev = 0;
+  for (let k = 0; k < marks.length; k += 2) {
+    const open = marks[k];
+    const close = marks[k + 1];
+    if (close === undefined) {
+      // ⛔ AN UNPAIRED BACKTICK IS A TRUNCATED SPAN, NOT SILENCE (round-7 review, P0). This dropped
+      // everything from the opener onward, so a substitution whose body contains `;`/`&`/`|` — which
+      // `segRe`'s `([^;&|\n]*)` capture cuts BEFORE the closer — lost the delete flag AND its target with no
+      // refusable token left behind: `git push origin -d `echo a && echo b`` extracted `null` and the #73
+      // arm was never consulted. `origin/main` REFUSED that shape (its tokenizer left the fragment
+      // `` `echo ``), so dropping it was a regression, the same one finding 1 measured for the paren
+      // twin.
+      // The tail is UNKNOWABLE either way, so the whole span becomes ONE placeholder word.
+      // ⛔ THE SEPARATOR IS LOAD-BEARING: without it the placeholder GLUES onto the preceding word
+      // (`… -d b` + `\u0000SUBST` is the single token `b\u0000SUBST`), which would corrupt a real
+      // target. With it, `echo `git push origin -d b` x` reports `["b","$(…)"]` — refused for the
+      // unknowable word, with the real target still attributed — which is the same verdict
+      // `origin/main` reaches on its own `` b` `` fragment.
+      // A backtick with NOTHING after it in this segment is the #504 CLOSER (`echo `git push origin -d
+      // held/branch``), whose closer belongs to an outer command; it still ENDS the body, unchanged.
+      const tail = body.slice(prev, open);
+      return body.slice(open + 1).trim() === "" ? out + tail : `${out}${tail} ${_SUBST_PLACEHOLDER}`;
+    }
+    out += body.slice(prev, open) + _SUBST_PLACEHOLDER;
+    prev = close + 1;
+  }
+  return out + body.slice(prev);
+}
+
+/** Does the RAW segment text still carry a delete spelling anywhere?
+ *
+ * ⛔ USED ONLY TO DECIDE THAT A TRUNCATION WAS AMBIGUOUS, never to attribute a target — so a coarse
+ * whitespace split is the right instrument here: the question is "does the visible text name a
+ * delete at all", not "what is its argv word". Deliberately QUOTE-INSENSITIVE and over-inclusive,
+ * because every extra hit only turns a silent allow into #653's refusal (the fail-closed direction);
+ * a miss would turn the same allow into a delete of a sibling's branch.
+ * @param {string} body
+ * @returns {boolean}
+ */
+/** Does a COMMAND SUBSTITUTION's own text carry a delete spelling?
+ *
+ * ⛔ THE WHOLE-SEGMENT TEST IS TOO BROAD, AND IT WAS A MEASURED FALSE BLOCK (round-15 review, P1).
+ * The end-of-walk arm needs to know whether the delete spelling it cannot attribute came OUT OF the
+ * substituted text — because that is the only place an opaque placeholder can hide a flag. Asking the
+ * whole segment instead fires on ordinary push-option TEXT plus an unrelated substitution:
+ *
+ *   git push origin -o "x -d y" -o $(cat f) HEAD:feat
+ *     bash argv → [push][origin][-o][x -d y][-o][feat/from-file][HEAD:feat]   (NO delete)
+ *     origin/main → allow        this head, whole-segment test → REFUSE ("$(…)")   ← FALSE BLOCK
+ *
+ * (2,005 rows of one class in the review's sweep.) Scanning only a span's BODY keeps every real case —
+ * `$(echo -d<LF>)`, `$(echo --delete<LF>)`, `` `echo -d` `` all carry the spelling INSIDE the span —
+ * while text outside a span stops counting.
+ *
+ * ⛔ WHAT IT ACTUALLY SCANS, EXACTLY (round-18 review, P3 — the paragraph above used to claim
+ * `${ … }`/`$( … )`/backtick BODIES and the `${…}` half was never true; the loop opens a body only on
+ * `$(` and on a backtick):
+ *   SCANNED     `$( … )` (paren-matched) and `` `…` `` bodies, including inside `"…"`;
+ *   NOT SCANNED `${ … }` parameter-expansion bodies, and `$'…'` ANSI-C literals (which
+ *               `_foldAnsiCStrings` folds to a placeholder, so their TEXT is gone by the time this runs).
+ * MEASURED consequence of the `$'…'` gap — `git push origin $'-d' held/branch`, whose bash argv is
+ * `push origin -d held/branch`, i.e. a REAL delete of `held/branch`, returns `null`:
+ *   `extractPushDeleteBranch("git push origin $'-d' held/branch")` → null on `origin/main`, on the
+ *   pre-#3962 head and at this head. It is PRE-EXISTING and identical on all three (the detailed verdict
+ *   on that text is `block:push`, which is a PUSH gate, not a delete gate: the null is what stops #653
+ *   from ever seeing `held/branch`), so this is a hole to record, never a regression this change made.
+ * ⛔ AND A BLIND FIX IS A FALSE-BLOCK GENERATOR, which is why the gap is recorded instead of closed:
+ * the same scan would fire on `git push origin -o $'-d' HEAD:feat`, where the ANSI-C literal is an
+ * option VALUE (a plain push — `-o` takes `-d` as its argument), and this function has no token context
+ * to tell the two apart. Closing it needs the ANSI-C body scanned only when the literal is a WORD the
+ * shell will re-parse, i.e. the same slot-awareness `_markOptionValueSlots` provides one level up — a
+ * change to the caller's contract, not to this scanner. Until then the doc above states the truth.
+ *
+ * Quoting is tracked so a backtick inside `"…"` is not read as a span opener, and the mask control
+ * sentinels are normalised to spaces (a command-list newline is glued inside the word otherwise).
+ * @param {string} body
+ * @returns {boolean}
+ */
+function _spanCarriesDeleteSpelling(body) {
+  const s = String(body ?? "");
+  const hit = (inner) => inner.replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean)
+    .some((w) => {
+      const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+      return _isPushDeleteFlagToken(bare) || (bare.startsWith(":") && bare.length > 1);
+    });
+  let i = 0, quote = null;
+  while (i < s.length) {
+    const ch = s[i];
+    // ⛔ SINGLE QUOTES SUPPRESS EVERYTHING; DOUBLE QUOTES DO NOT SUPPRESS A SUBSTITUTION (round-17
+    // review, P1). This used to skip the whole of `"…"`, so the body of a QUOTED `$( … )`/backtick was
+    // never scanned and the arm could not fire for the residual-1 family — which is why the fix above
+    // has to land together with this: a detector that cannot see the spelling and a walk that produces
+    // no placeholder fail in the SAME direction (allow).  Outside double quotes the escape and quote
+    // arms are unchanged.
+    if (quote === "'") { i++; continue; }
+    if (quote === '"') {
+      // A backslash escapes the next char only inside double quotes (POSIX) — so `\`` is a LITERAL
+      // backtick and must not open a span.
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === '"') { quote = null; i++; continue; }
+    } else {
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+    }
+    let start = -1, closer = ")";
+    if (ch === "$" && s[i + 1] === "(") start = i + 2;
+    else if (ch === "`") { start = i + 1; closer = "`"; }
+    if (start >= 0) {
+      let end = -1;
+      if (closer === "`") end = s.indexOf("`", start);
+      else {
+        let depth = 1;
+        for (let j = start; j < s.length; j++) {
+          if (s[j] === "(") depth++;
+          else if (s[j] === ")" && --depth === 0) { end = j; break; }
+        }
+      }
+      if (hit(s.slice(start, end === -1 ? s.length : end))) return true;
+      i = end === -1 ? s.length : end + 1;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
+function _rawCarriesDeleteSpelling(body) {
+  // ⛔ THE MASK SENTINELS ARE WORD BREAKS HERE (round-14 review). `_maskQuotedNewlines` replaces a
+  // command-list newline with `_NL_SPAN` (\u0004) so the CAPTURE survives, which means the raw text
+  // this function sees still has that character GLUED inside a word: `$(echo -d<U+0004>)` splits to
+  // `-d\u0004)` — not a flag token — and the detector reported "no delete spelling" for a push whose
+  // substitution expands to exactly `-d`. Every control sentinel the masks emit is a separator at the
+  // shell level, so they are normalised to spaces before the split.
+  const words = String(body ?? "").replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean);
+  for (const w of words) {
+    const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+    if (_isPushDeleteFlagToken(bare)) return true;
+    if (bare.startsWith(":") && bare.length > 1) return true; // `:ref` — an empty-source delete
+  }
+  return false;
+}
+
+/** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
+ *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
+ *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
+ *  substitution's WORD is. In a DELETE-TARGET slot `_cleanDeleteTarget` maps it to the UNRESOLVABLE
+ *  MARKER `$(…)`, which #653 REFUSES — never to `""`.
+ *  ⛔ IT USED TO SAY `""` HERE, AND THAT SENTENCE DESCRIBED THE FAIL-OPEN (#504 × #653). Dropping the
+ *  placeholder was the honest reading of "this is not a ref name" *before* #653 existed; after #653 a
+ *  target that never REACHES the refusing block is never refused either, so
+ *  `git push origin -d $(echo held/branch)` extracted `null` → the #73 arm was never consulted → the
+ *  delete of a sibling-held branch was ALLOWED. Do not "restore" the `""` mapping on the strength of
+ *  that old sentence: the arm of `_cleanDeleteTarget` that implements it says why it is wrong. */
+const _SUBST_PLACEHOLDER = "\u0000SUBST";
+
+/** Sentinel for a NEWLINE that is DATA, not a list separator (`_maskQuotedNewlines`).
+ *
+ * ⛔ A NEWLINE ENDS A COMMAND ONLY WHEN IT IS UNQUOTED AND OUTSIDE ANY SPAN (round-8 review, P0). The
+ * capture below stops at `\n`, which is right for the round-7 shape (`git push x⏎( git push origin -d
+ * b )`) — but bash does NOT end a command at a newline inside `"…"`, `'…'`, `$( … )`, backticks or
+ * `${ … }`; there it is ordinary DATA. Cutting the capture there loses the `-d` and its real target:
+ *
+ *   git push origin -o "a<LF>b" -d held/branch          origin/main → LOOKUP [b, held/branch]
+ *   git push origin -o $(echo a<LF>) -d held/branch      this branch → ALLOW (null)
+ *
+ * `-o merge_request.description="line1<LF>line2"`-style push options are ordinary usage, and the
+ * module's OWN parser agrees: `classifyGitCommandDetailed(...).verbArgs` returns
+ * `["origin","-o","a\nb","-d","held/branch"]` on BOTH trees — only this capture disagreed. So the
+ * newline is masked to one character before the scan and unmasked on the targets, which keeps every
+ * index relation (including `_maskDataParens`'s 1:1 sentinels) intact.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`) or `_QP_L`/`_QP_R` (`\u0001`/`\u0002`). */
+const _NL_DATA = "\u0003";
+
+/** Sentinel for a NEWLINE that is a COMMAND SEPARATOR even though it sits inside a SPAN.
+ *
+ * ⛔ "INSIDE A SPAN" IS NOT "DATA" (round-13 review, P1 — measured as a FAIL-OPEN against
+ * `origin/main`). `_maskQuotedNewlines` masks a newline to keep the segment CAPTURE from cutting at
+ * it, which is right for every span. But a newline inside `$( … )`, `<( … )`, backticks or the body of
+ * a `-c` operand is ALSO a list separator for the shell that parses that span — bash runs the commands
+ * on both sides. Masking it to `_NL_DATA` (a DATA character, which must stay inside its word for
+ * `-o "a<LF>b"`) GLUED it onto the next word, so the target the delete would really use stopped
+ * being a ref name:
+ *
+ *   bash -c "git push origin -d held/branch<LF>echo done"
+ *     origin/main → ["held/branch","echo","done"] → refs/heads/held/branch → BLOCK
+ *     before this → ["held/branch\necho","done"]   → no such ref → #73 finds nothing → ALLOW
+ *
+ * `isResolvableDeleteTarget` accepts the glued token (a newline is not in the unresolvable class), so
+ * #653 does not fire either — the delete of a sibling-held branch proceeds in a linked-worktree
+ * session, where M2 is exempt. The two origins therefore need two sentinels: this one is a WORD
+ * SEPARATOR and `_pushSegmentTokens` splits on it after the capture has been taken.
+ * ⛔ It cannot collide with `\u0000`/`\u0001`/`\u0002`/`\u0003`. */
+const _NL_SPAN = "\u0004";
+
+/** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks, `${ … }`
+ * or an ANSI-C `$'…'` literal — and only those. A `\`-escaped newline is a LINE CONTINUATION and is
+ * already gone before this runs. Unbalanced state is handled the way bash's own parse would leave it:
+ * everything after an unterminated quote/span stays inside it, so no later newline is a separator.
+ *
+ * ⛔ THREE WAYS THIS MASK USED TO HIDE A REAL SEPARATOR, EACH A FAIL-OPEN (round-9 review, P0 ×3),
+ * PLUS TWO MORE FOUND BY THE ROUND-10 REVIEW (P0 ×2 — the list was called complete and was not).
+ * Masking a newline that bash treats as a SEPARATOR merges two commands into one body; the second
+ * command's `(`/`$(` is then read as a span OPENER, its `-d` and target are skipped as span content,
+ * `extractPushDeleteBranch` returns null — and a delete of a sibling-held branch is ALLOWED. Measured
+ * against `origin/main` over a 644-row shape corpus: 12 rows where main BLOCKS and this mask ALLOWED.
+ *
+ *   (a) `$'…'` — bash has a dedicated ANSI-C quoting context in which `\` escapes (so `\'` does NOT
+ *       close it). Reading the `'` as a plain single quote closed the literal at the escape and
+ *       re-opened one that never closed, so every later newline was masked:
+ *         git push origin -o $'don\'t'⏎( git push origin -d held/branch )   → ALLOWED, main BLOCKS
+ *       Fixed by folding the literal BEFORE the scan (`_foldAnsiCStrings`), which is already the rule
+ *       `_pushSegmentTokens` applies per segment; here it must happen on the WHOLE command, because
+ *       this pass runs before segmentation.
+ *   (b) `# …` — a `#` that BEGINS A WORD starts a comment (bash: that word and the rest of the line are
+ *       ignored, and the newline that ends it IS a separator). There was no comment tracking, so an
+ *       APOSTROPHE inside a comment opened a quote that never closed:
+ *         git push origin HEAD:feat # don't⏎git push origin -d held/branch   → ALLOWED, main BLOCKS
+ *   (c) `}` closed a `$(`-opened span — one shared `span` counter for two different span kinds. The
+ *       `}` of `${R:-(}` therefore left `span === 1`, masking the newline after it:
+ *         git push origin -o ${R:-(}⏎( git push origin -d held/branch )      → ALLOWED, main BLOCKS
+ *       Fixed by a STACK: `}` only closes a `${`, `)` only closes a `$(`, and inside `${ … }` a bare
+ *       `(` is DATA, not a nesting level (bash: `${R:-(}` is the complete expansion yielding `(`).
+ *   (d) A PROCESS-SUBSTITUTION OPENER WAS NOT A SPAN (round-10 review, P0 F3). `<(`/`>(` pushed no
+ *       level, so a newline inside the substitution body was masked as a SEPARATOR and the capture cut:
+ *         git push origin -o <(cat ff⏎) -d held/branch    → ALLOWED (null), main BLOCKS
+ *   (e) A `$( … )` INSIDE `"…"` WAS INVISIBLE TO THE STACK (round-10 review, P0 F4). The quote arm ran
+ *       before the span arms, so the substitution's own `"` closed the ENCLOSING quote and its data
+ *       newline separated the command:
+ *         git push origin -o "$(echo "a⏎b")" -d held/branch   → ALLOWED (null), main BLOCKS
+ *       `_maskDataParens` already modelled this (`substQuotes`); the two passes now share one model.
+ * @param {string} text
+ * @returns {string}
+ */
+function _maskQuotedNewlines(text) {
+  const s = _foldAnsiCStrings(String(text ?? ""));
+  const out = [];
+  let quote = null;  // ' or "
+  // ⛔ ONE STACK ENTRY PER SPAN, EACH CARRYING THE QUOTING CONTEXT TO RESTORE (round-10 review, P0
+  // F4). A flat `spans` of kind strings could not express "this `$( … )` was opened INSIDE a double
+  // quote, so bash returns to that quote at its `)`" — and the monolithic quote branch ran FIRST, so
+  // the `$(` never became a span at all and the span's inner `"` CLOSED THE ENCLOSING QUOTE:
+  //
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    base → ["a","b\")","hk7/branch"] → BLOCK
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    here → null                       → ALLOW
+  //
+  // `_maskDataParens` already models exactly this (`substQuotes`); the two passes disagreed on bash's
+  // quoting model and this one lost. Keeping the model in ONE place (this stack) is the fix.
+  const spans = [];  // { kind: "(" | "{", restore: "'" | '"' | null }
+  const openSpan = (kind, restore) => spans.push({ kind, restore, prog: quoteIsProgram });
+  let btick = false;
+  // ⛔ A QUOTE THAT IS A `-c` PROGRAM OPERAND IS A PROGRAM AT THE INNER LEVEL (round-13 review, P1).
+  // `bash -c "git push origin -d held/branch<LF>echo done"` keeps the newline INSIDE a double quote at
+  // THIS level, but the inner shell receives the de-quoted text and parses the newline as a list
+  // separator — bash really runs both commands. Masking it as DATA glued `echo` onto the ref
+  // (`held/branch\necho`), which names no ref, so #73 found nothing and ALLOWED a sibling-held delete.
+  // So a newline inside such a quote is `_NL_SPAN` (a word separator), not `_NL_DATA` (data).
+  let quoteIsProgram = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const inCmdSpan = () => btick || spans.some((sp) => sp.kind === "(");
+    const push = (v) => {
+      if (v !== "\n") { out.push(v); return; }
+      if (quote !== null) { out.push(quoteIsProgram ? _NL_SPAN : _NL_DATA); return; }
+      if (inCmdSpan()) { out.push(_NL_SPAN); return; }        // `$(`/`<(`/backtick: a real separator
+      if (spans.length > 0) { out.push(_NL_DATA); return; }   // only `${ … }`: DATA, and must stay masked
+      out.push(v);                                            // a real list separator (capture already cut)
+    };
+    const top = spans[spans.length - 1];
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+      // A `$(` INSIDE DOUBLE QUOTES OPENS A SPAN IN A FRESH QUOTING CONTEXT (defect (d), F4). Bash
+      // parses the substitution body as its own command list and returns to this quote at the
+      // matching `)`. A `${` inside quotes needs no level: the enclosing quote already masks its
+      // newlines, so treating it as data here is correct and unchanged.
+      if (quote === '"' && ch === "$" && s[i + 1] === "(") {
+        openSpan("(", quote); quote = null; out.push("$("); i++; continue;
+      }
+      if (ch === quote) quote = null;
+      push(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+    // A `#` BEGINNING A WORD starts a comment. The terminating newline is NOT part of it — it ends the
+    // comment and is a real separator, which is the whole point of masking only genuine data newlines.
+    if (ch === "#" && (i === 0 || /[\s;&|(]/.test(s[i - 1]))) {
+      const nl = s.indexOf("\n", i);
+      const end = nl === -1 ? s.length : nl;
+      out.push(s.slice(i, end));
+      i = end - 1;
+      continue;
+    }
+    // ⛔ THE PROGRAM DECISION IS TAKEN AT THE LITERAL'S `$`, NOT AT ITS QUOTE (round-18 review, P1 — a
+    // measured FAIL-OPEN on the GUARDED ref). `_foldAnsiCStrings` (:5206) asks the question at the `$`
+    // and KEEPS a program operand VERBATIM; this arm then re-derived it one character later, at the
+    // `'`, where the slice ends with `$` — a word no `-c`/`eval` pattern can match — so it answered
+    // FALSE for EVERY ANSI-C program operand and re-classified the program's OWN newline as `_NL_DATA`
+    // (a word-continuation char) instead of `_NL_SPAN` (a separator). The two passes must not disagree
+    // about the same literal, so this asks at the position the fold asked at:
+    //
+    //   git push origin -d held/branch  ← from `sh -c $'git push origin -d held/branch<LF>echo done'`
+    //   before → ["held/branch\necho","done"] (target names no ref → #73 misses → ALLOW)
+    //   after  → ["held/branch","echo","done"] — same list as `origin/main` → #73 CONSULTED
+    //
+    // `$"…"` (translated string, which the fold does not special-case) is the same word, so it takes
+    // the same position. Nothing else changes: a plain `'…'`/`"…"` still asks at its own index.
+    if (ch === "'" || ch === '"') {
+      const progAt = s[i - 1] === "$" ? i - 1 : i;
+      quote = ch; quoteIsProgram = _ansiCIsProgramOperand(s.slice(0, progAt)); out.push(ch); continue;
+    }
+    if (ch === "`") { btick = !btick; out.push(ch); continue; }
+    if (ch === "$" && s[i + 1] === "(") { openSpan("(", null); out.push("$("); i++; continue; }
+    if (ch === "$" && s[i + 1] === "{") { openSpan("{", null); out.push("${"); i++; continue; }
+    // ⛔ A BARE `(` NESTS ONLY INSIDE `$( … )`. Inside `${ … }` it is literal text, so pushing a level
+    // there would make the expansion's own `}` fail to close and mask the next newline (defect (c)).
+    // ⛔ A PROCESS-SUBSTITUTION OPENER IS A SPAN (round-10 review, P0 F3). `<( list )` / `>( list )` is
+    // ONE WORD of the enclosing simple command (GNU Bash manual, Process Substitution), so a newline
+    // inside it is DATA — but the `(` was pushed only when the stack top was already `$(`, so the
+    // span was invisible and its inner newline CUT THE CAPTURE, losing the delete flag and target:
+    //
+    //   git push origin HEAD:wtfeat && git push origin -o <(cat ff<LF>) -d hk7/branch
+    //   base → ["ff",")","hk7/branch"] (BLOCK)      here → null (ALLOW)
+    //
+    // The whole `<`/`>`+`(` form is the word, so the level is pushed for both spellings; `$((` also
+    // nests through this arm (the `$(` level is already on the stack).
+    if (ch === "(" && (top?.kind === "(" || s[i - 1] === "<" || s[i - 1] === ">")) { openSpan("(", null); out.push(ch); continue; }
+    if (ch === ")" && top?.kind === "(") {
+      const done = spans.pop();
+      if (done.restore) { quote = done.restore; quoteIsProgram = !!done.prog; } // back to the quote (and its kind) the span was opened in (F4)
+      out.push(ch);
+      continue;
+    }
+    if (ch === "}" && top?.kind === "{") { spans.pop(); out.push(ch); continue; }
+    push(ch);
+  }
+  return out.join("");
+}
+
+/** Fold a bash ANSI-C string (`$'…'`) to ONE placeholder word.
+ *
+ * ⛔ `_tokenize` HAS NO ANSI-C QUOTING (round-8 review, P0), and this extractor's dependence on it is
+ * what makes its gap a #73 hole rather than a cosmetic one: `$'…'` is a QUOTED string to bash (nothing
+ * inside expands except its own escapes), but `_tokenize` opens a plain `'…'` at the `$`, where `\` is
+ * literal — so the `\'` inside `$'don\'t'` CLOSES the quote and the following `'` opens one that runs
+ * to the end of the segment, swallowing the delete:
+ *
+ *   git push -o $'don\'t' origin -d held/branch     origin/main → LOOKUP [held/branch]
+ *   git push -o $'don\'t' origin -d held/branch     this branch → ALLOW (null)
+ *
+ * `-o merge_request.title=$'don\'t merge'` reaches it. Folding the whole literal to the span placeholder
+ * keeps the POSITIONAL count faithful (it is one argv word) and makes a delete target in that slot
+ * unresolvable instead of silently swallowed — the same treatment every other expansion gets.
+ * @param {string} body
+ * @returns {string}
+ */
+function _foldAnsiCStrings(body) {
+  const s = String(body ?? "");
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out += ch + s[i + 1]; i++; continue; }
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "$" && s[i + 1] === "'") {
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") { if (s[j] === "\\") j++; j++; }
+      // ⛔ AN ANSI-C LITERAL IS A WORD — UNLESS A SHELL IS ASKED TO RUN IT AS A PROGRAM (round-12
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Folding it to the opaque
+      // placeholder is right for a bare word: bash's manual §3.1.2.4 says `$'string'` expands to a
+      // single-quoted WORD, so `$'git push origin -d b'` on its own is an ARGUMENT, never a command.
+      // It is WRONG the moment the word is the operand of `sh -c` / `bash -c` / `bash -lc` / `eval`,
+      // because THAT shell decodes it and runs the text as a program — the same nested-interpreter
+      // handoff this module already models for `sh -c '…'` (`_dropUnmatchedQuote`) and for a heredoc's
+      // body. Folding there discarded the whole push, so the extractor returned `null`:
+      //
+      //   sh -c $'git push origin -d held/branch'      origin/main → ["held/branch"] → #73 CONSULTED
+      //   sh -c $'git push origin --delete held/branch'  before this → null → the DEGRADED ARM
+      //                                                 (index.ts:6094 `rawDeleteNames`) → [] → ALLOW
+      //
+      // (measured on the real handler path: for the `--delete` spelling both trees reach
+      // `block:push-delete`, so the only difference is the emptied target list — and that arm is the
+      // one that runs when the classifier fails to load, which is its entire purpose. 240 rows of an
+      // ANSI-C family sweep lost on 28 that bash really executes.)
+      // The test is the PRECEDING WORD, not a broader promise: `-c`, any short cluster ending in `c`
+      // (`-lc`, `-ic`), or `eval`. Everything else keeps the fold.
+      if (_ansiCIsProgramOperand(s.slice(0, i))) { out += s.slice(i, j < s.length ? j + 1 : s.length); i = j < s.length ? j : s.length; continue; }
+      out += _SUBST_PLACEHOLDER; // one word; `$'…'` contents are not the argv text
+      i = j < s.length ? j : s.length;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    out += ch;
+  }
+  return out;
+}
+
+/** Is the `$'…'` literal starting at `before.length` the PROGRAM operand of a shell?
+ *
+ * Looks at the text immediately preceding the literal: `eval`, an option word `-c`, or a short-option
+ * cluster ENDING in `c` (`-lc`, `-ic`) means the next word is a script the interpreter will run. A
+ * redirect or list separator between them (`sh -c >/dev/null $'…'`) does not change that, because the
+ * shell takes the first non-redirect word as its operand — so those tokens are skipped going back.
+ * Deliberately coarse: a FALSE hit only makes the text SCANNED (`sh -c $'…'` is then read the way
+ * `sh -c '…'` already is), and an over-read in a gate is the cheap direction.
+ * @param {string} before — the segment text preceding the literal
+ * @returns {boolean}
+ */
+function _ansiCIsProgramOperand(before) {
+  const words = String(before ?? "").trimEnd().split(/\s+/).filter(Boolean);
+  for (let k = words.length - 1; k >= 0 && k >= words.length - 3; k--) {
+    const w = words[k].replace(/^["']+|["']+$/g, "");
+    if (!w) continue;
+    if (w === "eval") return true;
+    if (/^-[A-Za-z]*c$/.test(w)) return true;
+    if (/^[0-9]?[<>]|^&>/.test(w)) continue; // a redirect (with or without its fd) — skip it and keep looking
+    return false; // the first REAL word back is not a program-taking form
+  }
+  return false;
+}
+
+/** Sentinels for a parenthesis that is DATA — QUOTED, ESCAPED, or inside a `${ … }` parameter
+ * expansion (`_maskDataParens`).
+ *
+ * ⛔ QUOTED PARENS ARE DATA, NOT OPERATORS (fresh-context review round 4, P2). `_tokenize` is
+ * quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives at
+ * `_pushSegmentTokens` as the token `)` — indistinguishable from the shell operator. That token then
+ * hit the span-closer leg with `depth === 0` and ENDED the segment, discarding the delete flag:
+ * `git push origin -o ")" -d held/branch` returned `[]` where `origin/main` returned
+ * `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+ * ALLOWED — the fourth mirror-shape of the rounds 1-3 class (redirect-as-boundary,
+ * opener-as-terminator, span-word-as-filename, now quote-erasure). `\)` erases the same way.
+ *
+ * The mask is 1:1 in LENGTH, and that is load-bearing (fresh-context review round 5, P3: an earlier
+ * revision of this comment CLAIMED it while the sentinels were `"\u0001QPL"`/`"\u0001QPR"` — 1 → 4
+ * bytes, so the stated invariant was false and a reader trusting it would reason about index
+ * arithmetic that did not exist). `_foldBacktickSubstitutions` slices the body BY INDEX, so keeping
+ * every mask exactly one character means its indices are valid on the MASKED string and map 1:1 back
+ * onto the original. The sentinels are single control characters that cannot occur in a shell word
+ * and cannot collide with `_SUBST_PLACEHOLDER`'s `\u0000` prefix. Every token is unmasked before it
+ * is returned, so a genuinely quoted ref name that contains a paren is unaffected.
+ */
+const _QP_L = "\u0001";
+const _QP_R = "\u0002";
+
+/** Marks a COMMAND SUBSTITUTION that opens inside `"…"` (`$(` or a backtick), so the segment walk can
+ * fold the one word it contributes into `_SUBST_PLACEHOLDER`.
+ *
+ * ⛔ WITHOUT IT A QUOTED SUBSTITUTION IS INVISIBLE TO THE WALK (round-17 review, P1 — a measured
+ * FAIL-OPEN on the GUARDED ref). `_maskDataParens` masks a quoted span's parens, which is right for the
+ * parenthesis rules, but the resulting token was then ordinary TEXT to `_pushSegmentTokens`: no
+ * placeholder, so its "a delete spelling arrived inside a collapsed span" arm could not fire and the
+ * word was handed on as a plain refspec. gnu.org, *Command Substitution*: "If the substitution appears
+ * within double quotes, word splitting and pathname expansion are not performed on the results" — so
+ * the span is exactly ONE argv word, which is precisely what the placeholder means.
+ * One mark for both spellings because the walk's treatment is identical; it is masked to a space by
+ * `_spanCarriesDeleteSpelling`/`_rawCarriesDeleteSpelling` (they normalise `[\u0000-\u0008]`), so it
+ * cannot glue a spelling onto a neighbouring word there either.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`), `_QP_L`/`_QP_R` (`\u0001`/`\u0002`),
+ * `_NL_DATA` (`\u0003`) or `_NL_SPAN` (`\u0004`). */
+const _QS_MARK = "\u0005";
+
+/** Suffix appended to `_SUBST_PLACEHOLDER` for a span that was QUOTED, i.e. one the shell will NOT
+ * word-split.
+ *
+ * ⛔ THE VALUE-SLOT RULE TURNS ON THIS DISTINCTION (round-17 review, P1 — measured as a FAIL-OPEN on the
+ * GUARDED ref, and it is the SECOND time this surface mistook "one word" for "the whole expansion").
+ * `-o`/`--push-option` consumes exactly ONE argv word, so a QUOTED span in that slot is provably the
+ * value and cannot become a flag (gnu.org, *Command Substitution*: no word splitting inside `"…"`):
+ *
+ *   git push origin -o "$(echo "x -d held/branch")"   bash argv → push origin -o 'x -d held/branch'
+ *     (ONE word — the value). Ref only survives; nothing is deleted.
+ *
+ * An UNQUOTED span DOES split, so only its FIRST word is the value and every later word is ordinary
+ * argv — a delete flag among them is a real flag:
+ *
+ *   git push origin -o $(echo "x -d held/branch")
+ *     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` DELETES the ref)
+ *     origin/main and `51401fc9b` both REFUSED it (each on an unresolvable `held/branch\")` fragment); a
+ *     blanket value-slot exemption returned `null`.
+ *     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling (and its
+ *     `--push-option` twin), NOT for the backtick twin `` -o `echo "x" -d` held/branch ``, where
+ *     `origin/main` returns `null` — i.e. it ALLOWED that one, so closing it is NEW coverage rather than
+ *     restored coverage. The blanket exemption arrived in `51401fc9b`.
+ *
+ * Which word of an expansion carries the spelling is UNKNOWABLE statically, so an unquoted span in a
+ * value slot is treated as able to spill and the arm FIRES (#653's policy: refuse what cannot be
+ * resolved). The cost is a documented over-block on `-o $(echo -d)` — a push-option whose expansion is
+ * exactly `-d` is not a workflow — and the alternative is a deleted sibling branch.
+ * It is a SUFFIX rather than a second placeholder so every containment test (`_cleanDeleteTarget`, the
+ * marker dedupe, `_isPushDeleteFlagToken`) keeps matching `_SUBST_PLACEHOLDER` unchanged. */
+const _QUOTED_SPAN_SUFFIX = "\u0006";
+
+/** Replace `(`/`)` that are DATA with sentinels, mirroring `_tokenize`'s own rules EXACTLY: a
+ * backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
+ * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
+ * sentinel character (see `_QP_L`).
+ *
+ * Five ways a paren is DATA: (a) quoted, (b) escaped, (c) inside a `${ … }` PARAMETER EXPANSION, and
+ * (d)+(e) inside a `$( … )` / backtick span, which `_pushSegmentTokens`'s span rules already treat as
+ * one word. (c) must be masked here because those span rules cannot see it: the `)` of `${R:-)}` is
+ * not a closer of anything.
+ *
+ * ⛔ A `${ … }` WORD'S PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 6, P2). Only
+ * quoted/escaped parens were masked, so the `)` of `-o ${R:-)}` tokenized as the operator `)` and
+ * ENDED the segment before the delete flag — `git push origin -o ${R:-)} -d held/branch` returned
+ * `[]` where origin/main returned `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted
+ * and the #73 hazard was ALLOWED (reproduced end-to-end: the remote deletes the branch). The span's
+ * `}` is found by bash's own rule — the first `}` that is not escaped, not inside a quoted string, and
+ * not inside a NESTED expansion (GNU Bash manual, Shell Parameter Expansion; probes: `${R:-)}` →
+ * `)`, `${R:-'}'}` → `}`, `${A:-${B:-)}}` → `)`). An UNCLOSED `${` is a bash syntax error
+ * ("unexpected EOF while looking for matching `}`"), so no runnable command reaches the tail of this
+ * function with a stale `expDepth`.
+ * @param {string} body
+ * @returns {string}
+ */
+function _maskDataParens(body) {
+  const swap = (c) => (c === "(" ? _QP_L : c === ")" ? _QP_R : c);
+  let out = "";
+  let quote = null;
+  let quoteExpDepth = 0; // `expDepth` in force when the CURRENT quote OPENED
+  let expDepth = 0; // `${ … }` spans OPEN in this segment: their parens are DATA
+  // ⛔ A `$( … )` INSIDE `"…"` OPENS A NEW QUOTING CONTEXT (round-9 review, P0). Bash re-enters the
+  // substitution's own quoting context and returns to the enclosing one at the matching `)`, so a `"`
+  // INSIDE the span must not close the ENCLOSING quote. A single flat `quote` let it, and the span's
+  // inner `)` then arrived UNMASKED — where `_pushSegmentTokens` reads a `)` with `depth === 0` as the
+  // #504 segment boundary and BREAKS, discarding the `-d` and its target:
+  //   git push origin -o "title=$(echo "fix) bug")" -d held/branch  → ALLOWED here, BLOCKED on origin/main
+  // (measured 4/4 shapes; the `-o "plain"` control BLOCKS on both, so the fixture is valid).
+  //
+  // ⛔ ONE STACK, NOT A COUNTER (round-11 review, P0). A flat `expDepth` + a parallel `substQuotes`
+  // modelled neither of bash's two rules for a `}` that is DATA, and 48 of 64 measured shapes came
+  // back `null` where `origin/main` reported the real target (so `_coordinatedDeleteBlock` was never
+  // consulted and the delete of a sibling-held branch was ALLOWED):
+  //
+  //   (i) a `}` INSIDE A QUOTE THAT OPENED INSIDE THE EXPANSION is data — the counter dropped the
+  //       level anyway, because the quoted arm fired on ANY `}`:
+  //         git push origin -o ${A:-"}"x)} -d held/branch      base ["held/branch"] BLOCK / here ALLOW
+  //       `quoteExpDepth` records `expDepth` at the moment the quote opened, so a quoted `}` closes a
+  //       level only when it is the expansion's OWN `"${A:-x}"` case (`expDepth > quoteExpDepth`).
+  //   (ii) a `}` INSIDE A `$( … )` NESTED IN THE EXPANSION is data — but the `$(` got no level at all
+  //       (`expDepth === 0` gate), so the argument's `}` closed the expansion:
+  //         git push origin -o ${A:-$(printf "}")} -d held/branch  base ["held/branch"] BLOCK / here ALLOW
+  //       A `$(` now pushes a level at ANY depth, so `}` only closes the TOP span and a `(`-kind top
+  //       makes it data. `expDepth` still masks every paren inside `${ … }`; a closer that returns into
+  //       a quote OR into an expansion is masked (fail-safe direction: a masked paren can never become
+  //       the #504 operator token).
+  const spans = []; // { kind: "(" | "{", restore: quote-at-open | null, inExp: boolean }
+  const top = () => spans[spans.length - 1];
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === quote) { quote = null; out += ch; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < body.length) {
+        out += ch + swap(body[i + 1]); i++; continue;
+      }
+      // A `${` inside DOUBLE quotes still opens an expansion (bash expands it there); inside SINGLE
+      // quotes it is literal text, so the single-quote path below never touches `expDepth`.
+      if (quote === '"' && ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+      if (quote === '"' && ch === "}" && top()?.kind === "{" && expDepth > quoteExpDepth) { spans.pop(); expDepth--; out += ch; continue; }
+      // A `$(` inside DOUBLE quotes starts a substitution: enter it in a NEUTRAL quoting context and
+      // remember the quote we must return to. The `(` stays masked, so a quoted span contributes no
+      // operator token.
+      // ⛔ IT IS MARKED `_QS` AS WELL, BECAUSE A QUOTED SPAN IS OTHERWISE INVISIBLE TO THE WALK (round-17
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Masking alone left the token as the
+      // literal text `$(echo -d)`: not the placeholder, so `_pushSegmentTokens`' "a spelling arrived
+      // inside a collapsed span" arm could not fire, and the word fell through to
+      // `_cleanDeleteTarget` as an ordinary refspec. The shape below is a REAL delete of a ref a
+      // sibling worktree holds (bash argv, stub-`git` probe: `push origin -o x -d y -d held/branch`):
+      //
+      //   git push origin -o "x -d y" "$(echo -d)" held/branch
+      //     origin/main → REFUSE (on the accidental fragment `$(echo`)   before this → ALLOW (null)
+      //
+      // gnu.org, *Command Substitution*: "If the substitution appears within double quotes, word
+      // splitting and pathname expansion are not performed on the results" — a quoted `$( … )` is
+      // therefore exactly ONE argv word, which is what `_SUBST_PLACEHOLDER` models. The bare twin
+      // (`"$(echo -d)"` → `$(echo -d)`) already reached the arm; quoting changed nothing but visibility.
+      if (quote === '"' && ch === "$" && body[i + 1] === "(") {
+        spans.push({ kind: "(", restore: quote, inExp: false }); quote = null; out += ch + _QS_MARK; i++; continue;
+      }
+      // ⛔ A BACKTICK INSIDE `"…"` IS A SUBSTITUTION TOO (same round-17 finding, same class). Bash
+      // expands it and no word splitting applies, so the word is one opaque argv word; the old path
+      // left it literal, so `` git push origin -o "x -d y" "`echo -d`" held/branch `` was ALLOWED on
+      // BOTH trees (a pre-existing gap, measured) and neither the arm nor #653 could see it.
+      // ⛔ IT EMITS ONE CHARACTER, SO IT MUST NOT `i++` (round-17 review P0, and this was MINE). The
+      // `$(` branch above consumes TWO source characters (`$` and `(`) and emits two, so its `i++` is
+      // correct; copying that idiom here advanced 2 while emitting 1 and ATE THE NEXT CHARACTER —
+      // which for a quoted backtick span is the span's own first letter, followed by the rest of the
+      // segment once the closing quote was eaten too:
+      //
+      //   git push origin -o -d "`echo -d`" -d held/branch
+      //     masked →  origin -o -d "<QS>cho -d<QS> -d held/branch   ('e' and the closing `"` gone)
+      //     → one quoted word swallows `-d held/branch` → extractor null → #73 never consulted → ALLOW
+      //   bash argv → push origin -o -d -d held/branch  (the `-o` value is the FIRST `-d`, the second
+      //     is a real delete flag) → REAL delete of the sibling-held ref
+      //
+      // One character in, one sentinel out, so no index adjustment is needed — the enclosing `for`
+      // already advances past it. `\`` keeps its literal meaning (the escape arm above runs first).
+      if (quote === '"' && ch === "`") { out += _QS_MARK; continue; }
+      out += swap(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < body.length) {
+      out += ch + swap(body[i + 1]); i++; continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; quoteExpDepth = expDepth; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+    if (ch === "}" && top()?.kind === "{") { spans.pop(); expDepth--; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "(") {
+      // Inside an expansion the substitution is DATA (every paren there is masked, as before); it still
+      // needs a LEVEL so its own `}` cannot close the expansion (defect (ii)).
+      const inExp = expDepth > 0;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? ch + swap("(") : ch + "("; i++; continue;
+    }
+    if (ch === "(" && top()?.kind === "(") {
+      const inExp = !!top().inExp;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? swap(ch) : ch; continue;
+    }
+    if (ch === ")" && top()?.kind === "(") {
+      const done = spans.pop();
+      // At the OUTERMOST `)` the substitution returns to the context that opened it. A `)` that
+      // closes a level opened inside `"…"` is itself DATA there, so it is masked. SO IS one that
+      // closes a level opened inside `${ … }` (defect (ii)): an unmasked `)` there reaches
+      // `_pushSegmentTokens` as the #504 operator token.
+      // ⚠️ STATED RESIDUAL (round-9 review): the QUOTE half of this mask is NOT independently
+      // observable — the closer always lands INSIDE the restored quote for `_tokenize` too, so
+      // unmasking it changes 0 rows of the differential and reddens no test. It is kept because
+      // MASKING IS THE FAIL-SAFE DIRECTION for a gate: a masked paren can never become an operator
+      // token, whereas an unmasked one can become the #504 `break` — and this function exists to stop
+      // exactly that. Do not "simplify" it away on the strength of it having no test; the asymmetry
+      // is the reason. (The EXPANSION half is observable and pinned by the round-11 rows.)
+      const maskCloser = done.inExp || done.restore;
+      if (done.restore) quote = done.restore;
+      out += maskCloser ? swap(ch) : ch;
+      continue;
+    }
+    out += expDepth > 0 ? swap(ch) : ch; // inside `${ … }` BOTH parens are data
+  }
+  return out;
+}
+
+/** Restore the parens `_maskDataParens` replaced.
+ *
+ * ⛔ BOTH sentinels are checked. A token can legitimately contain ONLY `_QP_R` — `-o ")"` masks to that
+ * single character — so sniffing for `_QP_L` alone (the first revision did) left such a token
+ * UNMASKED, feeding `\u0002` onward as if it were a ref.
+ * @param {string} tok
+ * @returns {string}
+ */
+function _unmaskDataParens(tok) {
+  if (typeof tok !== "string") return tok;
+  return tok.replace(/[\u0001\u0002]/g, (c) => (c === _QP_L ? "(" : ")"));
+}
+
+/** Drop the ONE quote character in this segment body that has no partner.
+ *
+ * ⛔ AN UNBALANCED QUOTE IN A SEGMENT IS A CLOSER (or an opener) OF THE *OUTER* COMMAND, AND
+ * `_tokenize` SWALLOWS WHITESPACE INTO THE WORD WHILE IT IS OPEN (round-10 review, P0 F1). The
+ * capture is bounded by `;`/`&`/`|`/newlines, not by quoting, so a compound that hands the push to a
+ * shell — `sh -c 'git push origin -d held'`, `eval "…"`, `bash -c "…"` — leaves the segment body as
+ * ` origin -d held' `: the `'` that CLOSES the outer word is inside the capture, nothing in the body
+ * opened it, and `_tokenize`'s quote branch then appends `'`, ` ` and every later character to the
+ * target. `_cleanDeleteTarget` strips only ADJACENT quotes, so the target stayed `held ` — and a
+ * trailing space is not in `DELETE_TARGET_UNRESOLVABLE_RE`, so #653 did not refuse it and
+ * `_coordinatedDeleteBlock` looked up `refs/heads/held ` (an exact-key miss) and ALLOWED the delete
+ * of a branch a sibling worktree holds. MEASURED: `origin/main` returned ["held"] (BLOCK), this
+ * branch returned ["held "] (ALLOW), end-to-end through the shipped handler.
+ *
+ * Deleting the unmatched quote character restores the word exactly as bash sees it (`sh -c` strips
+ * the quotes before the inner shell ever parses the body), and it leaves every BALANCED quote
+ * untouched — a genuinely quoted ref name (`-d 'feat/x)'`) keeps its whitespace-free content.
+ * Refusing the glued form in `_cleanDeleteTarget` was tried FIRST and reverted: the same over-capture
+ * also carries push-option VALUES (`-o "Release 2.0"`), so the refusal rule turned an ordinary
+ * `-o … -d <literal>` into a false block (see `DELETE_TARGET_UNRESOLVABLE_RE`).
+ * @param {string} s
+ * @returns {string}
+ */
+function _dropUnmatchedQuote(s) {
+  let quote = null;
+  let open = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i++; continue; }   // POSIX: `\` escapes only in `"…"`
+      if (ch === quote) { quote = null; open = -1; }
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; open = i; continue; }
+  }
+  if (quote === null || open < 0) return s;
+  return s.slice(0, open) + s.slice(open + 1);
+}
+
+/**
+ * Tokenize ONE `git push` segment body, stopping where BASH ENDS THE COMMAND.
+ *
+ * #504 residual (parenthesized later segment). The segment body used to be `split(/\s+/)`, which
+ * keeps a shell operator ATTACHED to the last word — a subshell/substitution closer. `… && (git push
+ * origin -d old-feat)` therefore produced the whole-command target token `old-feat)`, and
+ * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a genuinely QUOTED name. The
+ * phantom `old-feat)` names no ref, so `_coordinatedDeleteBlock` looked up `refs/heads/old-feat)`,
+ * found nothing checked out, and ALLOWED the delete of a branch a sibling still holds — the exact
+ * #73 hazard, reachable from a worktree session where M2 is exempt.
+ *
+ * `_tokenize` is the module's quote-aware shell splitter, so QUOTED text stays in the word
+ * (`-d 'feat/x)'` is the real ref `feat/x)`). FOUR rules bound the segment, and each was measured
+ * against a fail-open this helper shipped or inherited:
+ *
+ *   1. NO LIST SEPARATOR CAN REACH THIS HELPER (round-6 review, P3: an earlier revision described a
+ *      `_SHELL_OPS` separator break HERE as live; it was dead). `segRe`'s capture is `([^;&|\n]*)`, so
+ *      `;`, `&` and `|` — and therefore `&&`, `||`, `&>` — are never in the body, and neither is a
+ *      NEWLINE; `_tokenize` is called WITHOUT `newlineIsSeparator`, so it never synthesises a `;`
+ *      either. ⛔ THE NEWLINE HALF IS ROUND-7 REVIEW, P0, AND IT IS A CAPTURE CHANGE, NOT A BREAK
+ *      INSIDE THIS HELPER: the capture used to span a newline, so two commands arrived as one body and
+ *      the second command's `(` became a span OPENER under rule 3 — `git push origin HEAD:feat\n( git
+ *      push origin -d held/branch )` extracted `[]` and the #73 arm was never consulted, where
+ *      `origin/main` blocked it. A `;`-break here was tried FIRST and was wrong twice over: it cannot
+ *      see the second `git push` at all (the `g` scan had already consumed it into the first match), and
+ *      it would have needed a rule for a separator the capture no longer admits. The only `_SHELL_OPS`
+ *      members that can arrive, `(`/`)`, are intercepted by rule 3. There is deliberately no
+ *      separator branch below to go dead.
+ *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
+ *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
+ *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
+ *      gave the target. The token is SKIPPED with its filename operand instead.
+ *   3. A parenthesised span is a WORD, not a boundary, when it OPENS inside the segment (`$(
+ *      cat .remote)`, `-o $(date)`): its contents are skipped and scanning CONTINUES, so the flag
+ *      and target after it survive (round-2 review P2 — truncating at the opener returned null
+ *      where origin/main returned the target). A `)` with no matching opener in the segment closes
+ *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
+ *      #504 itself. A span that never CLOSES is still reported as ONE unknowable word (round-7 review,
+ *      P0) — dropping it was the same regression as the newline gap, on the other side of the capture:
+ *      `segRe` cuts a substitution body at its own `;`/`&`/`|`, so `-d $(cat f | head -1)` lost the
+ *      target entirely.
+ *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin), which
+ *      reports a truncated backtick span the same way.
+ *   4. Only an UNQUOTED, UNEXPANDED paren is an operator (round-4 review P2; round-6 P2).
+ *      `_tokenize` strips quotes, so a word that is exactly `")"` reached rules 1-3 as the token `)`
+ *      and ended the segment — and so did the `)` of a `${ … }` word, whose closer is a BRACE, not a
+ *      paren. `_maskDataParens` neutralises quoted, escaped AND parameter-expansion parens before
+ *      tokenizing and every token is unmasked on the way out, so paren DATA can never drive the span
+ *      rules.
+ *   5. ONLY A BALANCED QUOTE IS A QUOTE (round-10 review, P0 F1). The capture is bounded by LIST
+ *      SEPARATORS, not by quoting, so a quote that OPENS before `git push` (or one whose partner lies
+ *      beyond the capture) arrives here alone — and `_tokenize` then swallows the whitespace that
+ *      follows it into the word, producing the phantom `held ` that misses the #73 lookup. The
+ *      unmatched quote character is dropped before tokenizing (`_dropUnmatchedQuote`), which is what
+ *      bash's own `sh -c`/`eval` handling does to it; a BALANCED quoted word still keeps its content
+ *      (`-d 'feat/x)'` is the real ref `feat/x)`).
+ * @param {string} body raw text after the `git push` word
+ * @returns {string[]}
+ */
+function _pushSegmentTokens(body) {
+  // ANSI-C strings are folded FIRST (see `_foldAnsiCStrings`) — `_tokenize` has no `$'…'` quoting, and
+  // leaving it to guess is what let a `\'` inside one swallow the rest of the segment. The unmatched
+  // quote is dropped NEXT, so every later pass works on quote-balanced text (rule 5).
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_dropUnmatchedQuote(_foldAnsiCStrings(body)))))
+    // ⛔ A SPAN'S NEWLINE SEPARATES WORDS (round-13 review, P1). `_NL_SPAN` marks a newline that is a
+    // list separator for the shell parsing that span, so it must end the word it was masked into —
+    // otherwise `held/branch` + `echo` arrive as the single token `held/branch\necho`, which names no
+    // ref, so #73 looks it up, finds nothing and ALLOWS. Splitting here (after `segRe` took the
+    // capture, so the segment itself is still whole) restores the real target while the command on
+    // the other side of the newline stays in the same body — which is what `origin/main` reports too.
+    // `_NL_DATA` is NOT split: a newline inside `"…"`/`'…'` is data and belongs inside its word.
+    .flatMap((t) => (t.includes(_NL_SPAN) ? t.split(_NL_SPAN).filter(Boolean) : [t]));
+  const tokens = [];
+  let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === "(") {
+      // The `$` of a `$( … )` is a separate token from `_tokenize`; it is part of the span, not an
+      // argv word, so do not let it sit in the token list as a positional.
+      if (tokens[tokens.length - 1] === "$") tokens.pop();
+      depth++;
+      continue;
+    }
+    if (t === ")") {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0) tokens.push(_SUBST_PLACEHOLDER); // the span is one positional word
+        continue;
+      }
+      // ⛔ A CLOSER THAT LEAVES A DELETE BEHIND IT IS AMBIGUOUS, NOT A SAFE BOUNDARY (round-11 review,
+      // P2 — measured as a FAIL-OPEN against `origin/main`). Truncating here is right when the `)`
+      // really does close a subshell opened before `git push`. It is WRONG when the `)` only LOOKS
+      // like a closer because a nested interpreter re-parses the text at a different escaping level —
+      // `bash -c "… \"…\" …"` de-escapes one level before the inner shell parses it, so a paren that
+      // `_maskDataParens` sees as an OPERATOR (the `\"` before it is an escaped quote at THIS level)
+      // is DATA at the level that actually runs the push. Depth then underflows at the span's real
+      // closer, and everything from `-d` onward is discarded:
+      //
+      //   bash -c "git push origin -o \"$(echo \"a)b\")\" -d held/branch"
+      //     origin/main → wholeCommandDeleteTargets = ["…","held/branch"] → #73 CONSULTED → BLOCK
+      //     before this  → []                                              → #73 never consulted → ALLOW
+      //
+      // (measured: `verdict` is `block:push` on BOTH trees, so the whole gap is the empty target list —
+      // and a linked-worktree session is M2-EXEMPT, which is what makes it reachable. 64 rows of a
+      // 6,528-row differential were this one class; every one had the real `held/branch` on the base.)
+      // ⛔ The rule is deliberately NOT "un-escape the nested level and re-parse": that is a second
+      // parser with its own escaping bugs, and this module has one already. The delete is VISIBLE in
+      // the text and UNATTRIBUTABLE by the walk, which is exactly the case #653's policy calls for —
+      // report it as unresolvable so the block REFUSES and NAMES it, rather than dropping it.
+      // Scoped to a walk that attributed NO delete of its own, so a segment that already has its flag
+      // and target keeps them (the truncation is then harmless); the raw check is over-inclusive on
+      // purpose (see `_rawCarriesDeleteSpelling`) because over-blocking is the cheap direction here.
+      if (!tokens.some((x) => _isPushDeleteFlagToken(x)) && _rawCarriesDeleteSpelling(body)) {
+        // ⛔ CONTINUE, not refuse: the delete is still ahead of us in the SAME segment, so the walk can
+        // still attribute its REAL target (`held/branch`) and let #73 decide on it with its own reason.
+        // Refusing here would block the same command for a worse reason ("cannot tell WHICH branch")
+        // about a target that is in fact a plain literal. `origin/main` blocks this shape by
+        // over-capture; this blocks it by READING it, which is the outcome the PR exists to produce.
+        continue;
+      }
+      break; // closes a subshell opened before `git push` — the #504 boundary
+    }
+    if (_isRedirectOperator(t)) {
+      // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2). `<( list )` /
+      // `>( list )` is a single WORD passed as an argument (bash manual §5.1), but `_tokenize` drops
+      // the adjacency and emits `<` + `(` as two tokens — so consuming the next token as the
+      // redirect's filename ate the span OPENER, depth stayed 0, and the span's `)` then terminated
+      // the segment: `git push origin <(cat f) -d held/branch` returned null where origin/main
+      // returned the target. Leave `(` alone and let the span rule above handle it.
+      // The redirect's FILENAME is not an argv word, so it is skipped with its operator. ⛔ NO
+      // `_redirectTakesOperand` CONJUNCT HERE (round-8 review, P3) — it was a predicate whose FALSE arm
+      // could never fire on this body, so it is deleted rather than left as a branch no input reaches.
+      // The argument is structural, not a count of shapes: `_isRedirectOperator` accepts exactly two
+      // classes this branch cannot see, (a) the `&`-bearing forms (`&>`, `&>>`, `>&`, `2>&1`, `>&2`,
+      // `2>&-`, `<&1`, `>&-`) — every one contains `&`, which the segment capture excludes — and (b) the
+      // `>|` noclobber form, which contains `|`, also excluded. What survives both filters is
+      // `[N]{>,>>,<,<<}`: `_tokenize` splits the operator from its operand (`2>/dev/null` arrives as `2>`
+      // + `/dev/null`), so no attached-operand spelling reaches here either. Every surviving token is one
+      // `_redirectTakesOperand` ACCEPTS. Verified empirically on the survivor set: restoring the conjunct
+      // leaves test-653-delete-target (77 rows, every redirect shape in it) unchanged.
+      if (toks[i + 1] !== "(") i++;
+      continue;
+    }
+    if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
+    // ⛔ A `$( … )` / backtick that OPENED INSIDE `"…"` IS STILL ONE OPAQUE WORD (round-17 review, P1).
+    // `_maskDataParens` marks it (`_QS_MARK`) instead of letting it fall through as literal text; the
+    // shell neither splits nor globs a quoted substitution's result, so the word's content is unknowable
+    // here and belongs in the placeholder — the same treatment the BARE twin already got. The `_QUOTED`
+    // suffix records the ONE thing that distinguishes it from a bare span: it will not word-split, which
+    // is what makes its value-slot exemption sound (see `_QUOTED_SPAN_SUFFIX`).
+    if (t.includes(_QS_MARK)) {
+      // ⛔ A MIXED TOKEN IS NOT ONE WORD (round-17 review cycle 3, P1 — measured as a FAIL-OPEN with real
+      // git). `_foldBacktickSubstitutions` splices an UNQUOTED backtick span INLINE, with no separator
+      // (by design — see its own note), so when such a span is ADJACENT to a quoted one the two collapses
+      // land in ONE token. Treating "contains a quoted span" as "is a quoted span" then discarded the
+      // half that DOES split, and the value-slot exemption fired on a word bash splits into three:
+      //
+      //   git push origin -o `echo "x -d held"`"$(echo )"
+      //     bash argv → push origin -o x -d held      (the unquoted half spills → REAL delete)
+      //     a contains-test → exempt → null → #73 never consulted → ALLOWED
+      //     origin/main → REFUSE (on the `"$(echo` fragment)   the exemption-deleted mutant → REFUSE
+      //
+      // A token carrying BOTH markers has an UNQUOTED part, so it can split and cannot be "provably the
+      // value": it takes the BARE placeholder, which the exemption rejects. Fails closed in one place.
+      const mixed = t.includes(_SUBST_PLACEHOLDER);
+      // ⛔ THE LITERAL TEXT BEFORE THE SPAN IS KEPT (round-17 review cycle 4, P2 — a false block):
+      // dropping it turned the INLINE option form into a bare span, so `-o"$(echo -d)"` — where the
+      // `-o` and its value are ONE argv word (`-o-d`), so the value cannot be a flag — lost the `-o`
+      // and was refused. The trailing `$` belongs to the `$(` opener (the mask emits `$` + `_QS_MARK`)
+      // and is not part of the word bash sees.
+      const raw = t.slice(0, t.indexOf(_QS_MARK));
+      const head = raw.endsWith("$") ? raw.slice(0, -1) : raw;
+      // What comes AFTER the span is still dropped, and that direction is SAFE rather than sloppy: the
+      // token keeps `_SUBST_PLACEHOLDER`, so any word with a suffix stays UNRESOLVABLE (`_cleanDeleteTarget`
+      // marks it, #653 refuses it) and a suffix can never turn an unknowable word into a resolvable ref
+      // name. Measured: `git push origin -d held/branch"$(cat x)"` → `["$(…)"]` (REFUSED) on this head and
+      // on the pre-fix head, vs `main`'s `["held/branch\"$(cat"]` fragment — over-refusal, not a fail-open.
+      tokens.push(mixed ? (head + _SUBST_PLACEHOLDER) : (head + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX));
+      continue;
+    }
+    tokens.push(_unmaskDataParens(t));
+  }
+  // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
+  // substitution whose body contains `;`/`&`/`|` — cut by `segRe` BEFORE the closer — left no word
+  // behind that `_cleanDeleteTarget` could mark: `git push origin -d $(cat f | head -1)` extracted
+  // `null` and the #73 arm was never consulted, where `origin/main` REFUSED it. The span is ONE
+  // unknowable word either way, so it becomes the same placeholder a CLOSED span gets; words collected
+  // BEFORE it are kept (the flag/target survive).
+  // ⛔ This is also why the placeholder must survive into a TARGET slot: `_cleanDeleteTarget` turns it
+  // into the unresolvable marker #653 refuses; dropping it there instead is the fail-open that
+  // function documents.
+  if (depth > 0) tokens.push(_SUBST_PLACEHOLDER);
+  // ⛔ A DELETE SPELLING THAT ARRIVED INSIDE A COLLAPSED SPAN IS UNATTRIBUTABLE, NOT ABSENT
+  // (round-14 review, P1 — measured as a FAIL-OPEN against `origin/main`). The span fold above turns a
+  // substitution's words into ONE opaque placeholder, so a delete FLAG that came out of the
+  // substitution disappears from the token list entirely and the segment looks like a plain push:
+  //
+  //   bash -c "git push origin $(echo --delete<LF>) held/branch"
+  //     bash really runs → <push><origin><--delete><held/branch>
+  //     origin/main      → pushTargets ["$(echo",")","held/branch"] → the delete arm REFUSES
+  //     before this      → []                                      → #73 never consulted → ALLOW
+  //
+  // (`origin/main` reached it by accident — its whitespace split happened to surface the flag fragment.
+  // The same accident is what this PR replaces everywhere else, so the coverage has to be restored by a
+  // RULE rather than by re-introducing the accident.) This is exactly the case the closer arm above and
+  // `_cleanDeleteTarget` already document: the delete is VISIBLE in the text and UNATTRIBUTABLE by the
+  // walk, which is what #653's policy is for — report the marker so the block REFUSES and NAMES it.
+  // ⛔ SCOPED TWICE, because an unscoped version is a false-block generator: it fires only when the
+  // walk collapsed a span AND found no delete flag of its own AND the raw text carries a delete
+  // spelling. A plain `git push origin HEAD:feat` has no placeholder; `git push origin -o $(date) -d
+  // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
+  // be in the same segment, which is the ambiguous shape this is meant to catch.
+  const _valueSlot = _markOptionValueSlots(tokens);
+  const _isSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER);
+  const _isQuotedSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+  // ⛔ THE INLINE OPTION SPELLINGS ARE THE SAME WORDS AS THE SEPARATED ONES (round-17 review cycle 4, P2 —
+  // a FALSE BLOCK this PR introduced, measured against `origin/main`). `_markOptionValueSlots` models the
+  // SEPARATED slot only (`-o` then a value token), so `-o"$(echo -d)"` and `--push-option="$(echo -d)"`
+  // got no slot and the exemption could not fire — while bash sees ONE word (`-o-d`,
+  // `--push-option=-d`), i.e. `-o`'s INLINE value, which cannot be a flag:
+  //
+  //   git push origin -o"$(echo -d)" main   → argv push origin -o-d main → nothing deleted
+  //   origin/main → allow    this head (before) → REFUSE "$(…)"
+  //
+  // Narrow ON PURPOSE: only the exact `-o<VALUE>` / `--push-option=<VALUE>` forms whose value is the whole
+  // quoted span are exempted. A MERGED cluster that also carries a delete flag (`-do"$(…)"` is `-d` plus
+  // `-o` with an inline value, so `-d` IS a flag) matches neither test and keeps failing CLOSED, which is
+  // the safe direction for a form this parser does not model.
+  const _isInlineOptValue = (t) => t === "-o" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX
+    || t === "--push-option=" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX;
+  // ⛔ ONLY A **QUOTED** SPAN CAN BE EXEMPTED FROM A VALUE SLOT (round-17 review, P1 — measured as a
+  // FAIL-OPEN on the GUARDED ref). `-o`/`--push-option` consumes ONE argv word: a quoted span is exactly
+  // one word, so it is provably the value and cannot be a flag — but an UNQUOTED span is word-split, so
+  // only its first word is the value and the REST IS ARGV, where a delete flag is a real flag:
+  //
+  //   git push origin -o $(echo "x -d held/branch")
+  //     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` deletes the ref)
+  //     a blanket exemption → null → #73 never consulted → ALLOWED;  origin/main and aa5104539 REFUSED.
+  //
+  // Which expanded word carries the spelling is unknowable statically, so the unquoted case is treated as
+  // ABLE TO SPILL and the arm fires (#653's policy). That is a deliberate, documented over-block on
+  // `-o $(echo -d)` — whose expansion is exactly `-d`, i.e. not a push option anyone writes — and the
+  // alternative is a deleted sibling branch. The quoted spelling (`-o "$(echo -d)"`, `-o"$(echo -d)"`)
+  // stays exempt, which is the case the exemption was FOR.
+  const _opaqueInFlagSlot = tokens.some((t, i) =>
+    _isSpanTok(t) && !((_valueSlot[i] && _isQuotedSpanTok(t)) || _isInlineOptValue(t)));
+  // ⛔ "THIS SEGMENT ALREADY HAS ITS OWN DELETE FLAG" MUST BE VALUE-SLOT AWARE (round-17 review, NOTE
+  // promoted — a PRE-EXISTING fail-open on the guarded ref, measured with real git on all three trees).
+  // `-o`/`--push-option` consumes its argument, so an `-o -d` supplies no flag — but the raw token list
+  // is indistinguishable from a real one, and the scan in `extractPushDeleteBranch` correctly SKIPS the
+  // value. Both halves then declined, and nothing was attributed at all:
+  //
+  //   git push origin -o -d $(echo -d) held/branch
+  //     bash argv → push origin -o -d -d held/branch   (the second `-d` IS a delete flag) → real git
+  //     DELETES the sibling-held ref;  origin/main, the previous head and this head all returned null.
+  //
+  // Reading the flag through `_markOptionValueSlots` (the same definition used everywhere else) makes
+  // the arm fire for the span that really carries the flag, and leaves a plain `-o -d $(date) HEAD:feat`
+  // alone — its span body carries no spelling, so `_spanCarriesDeleteSpelling` is false.
+  const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));
+  if (!_ownFlag &&
+      _opaqueInFlagSlot &&
+      // ⛔ A **QUOTED** SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a
+      // FALSE BLOCK this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly
+      // ONE argument, and a QUOTED substitution is exactly one word (gnu.org: no word splitting inside
+      // `"…"`), so that word is provably the value (probe-verified against real git 2.43:
+      // `git push -o -d origin` is a plain push):
+      //
+      //   git push origin -o "$(echo -d)" HEAD:feat
+      //     bash argv → push origin -o -d HEAD:feat   (no delete)   origin/main → allow
+      //     a bare "span outside a value slot" test → REFUSE "$(…)" → a false block on a real push-option
+      //
+      // ⛔ THE EXEMPTION IS **QUOTED-ONLY**, AND THE FIRST VERSION OF THIS COMMENT GOT THAT WRONG (round-17
+      // review, P1, MEASURED — it is why `_QUOTED_SPAN_SUFFIX` exists). It claimed "a multi-word expansion
+      // (`-o $(echo "-d held/branch")`) → `-o -d held/branch`, where `-d` is the VALUE", which is false for
+      // every word AFTER the first: `-o` consumes one word, an UNQUOTED span word-SPLITS, and the rest is
+      // ordinary argv — so a flag there is a REAL flag:
+      //
+      //   git push origin -o $(echo "x -d held/branch")
+      //     bash argv → push origin -o x -d held/branch  (`-o` value is `x`; `-d held/branch` DELETES)
+      //     a blanket exemption → null → #73 never consulted → ALLOWED, where `origin/main` and
+      //     `aa5104539` both REFUSED it.
+      //     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling and its
+      //     `--push-option` twin, NOT for the backtick twin `` -o `echo "x" -d` held/branch `` — there
+      //     `origin/main` returns `null` (it ALLOWED it), so closing that one is NEW coverage rather than
+      //     restored coverage. The blanket exemption arrived in `51401fc9b`.
+      // The quoted/unquoted split is exactly the shell's own: a quoted span cannot spill, an unquoted one
+      // can, and which word carries the spelling is unknowable — so the unquoted case fails CLOSED.
+      // `_markOptionValueSlots` is the module's existing definition of the slot (the same one the target
+      // scan in `extractPushDeleteBranch` uses), so the two cannot drift.
+      _spanCarriesDeleteSpelling(body)) {
+    // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
+    // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete
+    // spelling and the shell may well expand the span into that same flag (bash: `$(echo -d)` IS
+    // `-d`), and where it does not, the marker is unresolvable and #653 refuses it with a message
+    // NAMING the word. `origin/main` reached the same refusal from a fragment of the span; reporting
+    // `$(…)` says the true thing instead — WHICH word it could not resolve.
+    tokens.push("-d", _SUBST_PLACEHOLDER);
+  }
+  return tokens;
+}
+
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
+  // ⛔ A COLLAPSED SUBSTITUTION IN A TARGET SLOT IS *UNRESOLVABLE*, NOT EMPTY (#504 × #653). This
+  // returned `""` when the placeholder was introduced, back when a target the guard could not
+  // resolve simply fell out of the list — and dropping it then was the honest reading of "this is
+  // not a ref name". #653 has since made that reading a FAIL-OPEN: `_coordinatedDeleteBlock` refuses
+  // an unresolvable target, so a target that never REACHES it is never refused either, and
+  // `git push origin -d $(echo held/branch)` came back `null` → the arm was never consulted → the
+  // delete of a sibling-held branch was ALLOWED. MEASURED on the rebase base: `origin/main` refused
+  // this shape (on a fragment), so dropping it here would have been a REGRESSION against main, not a
+  // residual. The placeholder therefore becomes a marker that is (a) non-empty, so it reaches the
+  // block, and (b) shell-shaped, so `DELETE_TARGET_UNRESOLVABLE_RE` refuses it and the refusal NAMES
+  // it. The exact span text is deliberately NOT reconstructed: it feeds a REFUSAL, never a lookup,
+  // and `_foldBacktickSubstitutions` has already replaced a backtick span's text with the sentinel,
+  // so a reconstruction would be faithful for `$( … )` and impossible for `` `…` `` — one marker for
+  // both keeps the rule (and the message) the same shape. Two distinct substitutions in one delete
+  // therefore collapse to ONE marker under the caller's dedupe; that loses which spans they were and
+  // changes no verdict: every one of them is still refused.
+  //
+  // ⛔ CONTAINMENT, NOT EQUALITY (round-10 review, P0 F2). The exact-match arm read `x ===` and so
+  // missed every GLUED phantom: `_foldAnsiCStrings` and `_foldBacktickSubstitutions`' PAIRED arm both
+  // splice the placeholder IN PLACE, with no separator, so a substitution CONCATENATED with the ref
+  // produced one token that matched NEITHER this arm NOR `DELETE_TARGET_UNRESOLVABLE_RE` (a NUL is in
+  // no class), and it was then treated as a literal ref name:
+  //
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      base → ["hk7/branch$'"] → REFUSE
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      here → ["hk7/branch\u0000SUBST"] → ALLOW
+  //   git push origin HEAD:wtfeat ; git push origin -d `date`hk7/branch    here → ["\u0000SUBSThk7/branch"] → ALLOW
+  //
+  // (bash concatenates, so `$''hk7/branch` IS the argv word `hk7/branch`, and the delete really runs.
+  // The paired-backtick arm has the same glue on the CLOSING side; its UNPAIRED arm adds a separator
+  // on purpose, which is why only this containment rule covers both directions.) A NUL cannot occur
+  // in a shell word at all, so containment is fail-closed with no over-block: a token carrying the
+  // placeholder is not literal text and its ref name is unknowable.
+  if (x.includes(_SUBST_PLACEHOLDER)) return "$(…)";
   return x
     .replace(/^["']|["']$/g, "")   // strip surrounding quotes
     .replace(/^:+/, "")             // leading empty-source colon(s)
@@ -4824,18 +6106,76 @@ function _cleanDeleteTarget(x) {
  *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
  *   result does NOT prove git will delete it (review P3-1).
  */
+// ⛔ NO HAND-MAINTAINED OPTION LIST LIVES HERE ANY MORE (review round 17, P0).
+// Round 16 taught this extractor an adjacency prefix by hand — `-C`/`-c`,
+// `--git-dir`, `--work-tree` — and the very next review found `git --no-pager
+// push …` still invisible, because git's GLOBAL-OPTION SET is larger than any
+// list a lane maintains by hand (`--no-pager`, `-p`, `--paginate`,
+// `--namespace`, `--cd`, `--config`, `--config-env`, `GIT_*=` …). Every miss is
+// the same fail-open: this function is the ONLY implementation behind
+// `wholeCommandDeleteTargets`, so an unseen target makes the push-family
+// allowance read `foreignDelete=false` and ADMIT a compound that deletes a
+// sibling worktree's branch; and in DEGRADED mode it is the only surface at all.
+// So the prefix regex is DELETED. The extractor now reads the PARSER's own
+// invocations (`allGitInvocations`, the same walk `classifyGitCommandDetailed`
+// uses), which is the surface that already understands every global option and
+// every quoting form — one implementation, no second list to drift.
+// The TEXT surface is kept beside it, deliberately: a command that merely
+// MENTIONS a push (`echo git push origin -d b`, a commit message) must keep
+// over-matching, because that is the documented fail-closed over-capture
+// (`hasPush`/`promotedFrom` are what keep it off the full path — see index.ts).
+// ⚠️ STATED LIMITS — MEASURED, and narrower than round 16's, but they exist and
+// are declared rather than assumed covered. The PARSED surface reaches
+// `sudo`/`env FOO=1`/`command`/`time`/`xargs`/`$( … )`/`bash -c '…'`/`sh -c '…'`/
+// subshells/brace groups, and the TEXT surface covers an unprefixed mention
+// anywhere. Still invisible, all three BASE-IDENTICAL (not regressions):
+//   · an `eval "…"` payload whose push also carries a global option
+//     (`eval "git push origin -d a"` IS caught by the text surface);
+//   · a BACKTICK substitution (`` `git --no-pager push origin --delete a` ``) —
+//     the walk has no backtick form, and the text surface needs literal
+//     adjacency, so `$( … )` is covered and `` `…` `` is not;
+//   · an alias the guard does not expand.
+// Closing any of them means teaching a LIST again (the drift this round removed)
+// or extending the shell walk — declared here so the next lane reads a limit
+// instead of rediscovering a fail-open.
 export function extractPushDeleteBranch(command) {
-  const c = String(command ?? "").trim();
-  if (!/\bgit\s+push\b/.test(c)) return null;
-  // Compound commands carry several `git push` segments (`a && git push … ;
-  // git push …`) — detect deletes per segment, stopping at shell operators
-  // (the original regex's [^;&|]* contract).
+  // ⛔ A BACKSLASH-NEWLINE IS A LINE CONTINUATION AND MUST BE RESOLVED **BEFORE** THE SEGMENT SCAN
+  // (main, round-7 review, P0). `segRe` stops the capture at a newline, which is right for two separate
+  // COMMANDS — but a continuation is ONE command, and bash joins the lines before it parses words, so
+  // `git push origin \\<newline> -d held/branch` would have been cut at the newline, losing the delete
+  // entirely (extractor `["origin","\"]` → no flag → ALLOW). Replacing the pair with the EMPTY string is
+  // what the shell does (nothing is inserted; the surrounding spaces do the word separation). This is
+  // kept from `main` verbatim: it is a SHELL-fidelity fix and it applies to both surfaces below.
+  // ⛔ TWO TEXTS, AND EACH SURFACE GETS THE ONE IT NEEDS (merge resolution of #3962 × main's masking):
+  // `raw` is what the SHELL sees and it is what the PARSER must read; `c` is `raw` with newlines-in-quotes
+  // masked for the SEGMENT CAPTURE only. Handing the masked `c` to the parser fed it the `_NL_DATA` /
+  // `_NL_SPAN` sentinels as literal characters, so a parsed delete target could carry a `\u0004` that no
+  // real ref name can contain (MEASURED: `git push origin -d a\`echo<NL>held/branch\`` → `["a\u0004`",
+  // "held/branch"]`). The sentinel is an internal encoding, never input to a parser.
+  const raw = String(command ?? "").trim().replace(/\\\r?\n/g, "");
+  const c = _maskQuotedNewlines(raw);
+  // ⛔ NO TEXT PRE-FILTER (review round 18, P0). A `!/\bpush\b/.test(c)` gate
+  // stood here as a cost shortcut, and it VETOED THE SURFACE THAT HAD THE ANSWER:
+  // `git pu""sh origin --delete held` and `git pu\sh …` are resolved by the
+  // parser as a real `push` with target `held`, while the literal token `push`
+  // never appears in the text — so the extractor returned null over a command the
+  // classifier had already attributed, and in DEGRADED mode (where this function
+  // is the only surface) that admitted a sibling-held delete. A cheap gate that
+  // can exclude a row the parser classifies is the same strict-subset defect this
+  // round exists to remove, so the gate is GONE; the shell walk is the filter.
+  // ⚠️ THE SAME GATE IS WHY `main`'s own `!/\bgit\s+push\b/` RETURN BELOW CANNOT BE RESTORED: it was
+  // the veto, not a cheap-and-harmless shortcut, and surface B's literal regex cannot match a
+  // quoted-splice spelling either — surface A is the ONLY surface that resolves it.
+  // Cost, measured on node 24: `ls -la` 0.0003 ms, `git status` 0.0001 ms,
+  // `git push origin -d a` 0.008 ms, a 25 kB compound 2.9 ms — and the arms that
+  // call this are reached only for commands a verdict already flagged.
+  if (c === "") return null;
   const branches = [];
-  const segRe = /\bgit\s+push\b([^;&|]*)/g;
-  let sm;
-  while ((sm = segRe.exec(c)) !== null) {
-    const tokens = sm[1].trim().split(/\s+/).filter(Boolean);
-    if (tokens.length === 0) continue;
+
+  /** Attribute every delete refspec these PUSH ARGUMENT TOKENS carry.
+   *  One implementation, driven by BOTH surfaces below. */
+  const collectFromArgTokens = (tokens) => {
+    if (tokens.length === 0) return;
     // Arg-taking options consume a value (`-o draft`, `--push-option draft`,
     // merged `-do draft` = -d -o draft; inline `-doDraft`/`--push-option=x`
     // carry their value in-token). A consumed value is NOT a flag and NOT a
@@ -4894,12 +6234,48 @@ export function extractPushDeleteBranch(command) {
         branches.push(_cleanDeleteTarget(tq));
       }
     }
+  };
+
+  // ── SURFACE A — the PARSED invocations (round 17): every git invocation the
+  // shell walk produced, with git's global options already consumed by the
+  // parser. This is what makes `git --no-pager push`, `git -C dir push`,
+  // `git -c k=v push`, `git --namespace=ns push` and their quoted values
+  // attribut­able without a second option list.
+  let invs = [];
+  try { invs = allGitInvocations(raw) ?? []; } catch { invs = []; }
+  for (const inv of invs) {
+    if (inv?.verb === "push" && Array.isArray(inv.args)) collectFromArgTokens(inv.args);
   }
+
+  // ── SURFACE B — the TEXT segments. Contract unchanged: a delete spelling that merely MENTIONS a push
+  // still over-matches (fail-closed), and surface A is what resolves the prefixed/global-option
+  // spellings.
+  // ⛔ THE CAPTURE ENDS AT A NEWLINE (`[^;&|\n]*`), NOT AT A LATER SPLIT (main, agent-infra#1158): a
+  // newline is a list separator in bash exactly like `;`. A body that kept it
+  // (`git push origin HEAD:feat\n( git push origin -d held/branch )`) made the SECOND command's `(` look
+  // like a span OPENER under the span rules, so the `-d` and its target were skipped as span content, the
+  // extractor returned `[]`, and the #73 arm was never consulted. Ending the capture makes the `g` scan
+  // find the second `git push` as its OWN segment, which is the attribution the shell actually has.
+  // ⛔ THE TOKENS COME FROM `_pushSegmentTokens`, NOT `split(/\s+/)` (main, #504 residual): it is
+  // quote-aware, folds `$'…'`/backtick spans to the `$(…)` placeholder, keeps a `$( … )` span as ONE
+  // positional word, honours ANSI-C quoting, bounds the segment at the first shell BOUNDARY token and
+  // splits `_NL_SPAN` (a newline that is a separator) while preserving `_NL_DATA` (a newline that is
+  // data). A naive whitespace split loses every one of those, so it must not come back here.
+  const segRe = /\bgit\s+push\b([^;&|\n]*)/g;
+  let sm;
+  while ((sm = segRe.exec(c)) !== null) {
+    collectFromArgTokens(_pushSegmentTokens(sm[1]));
+  }
+
   const out = branches.filter(Boolean);
   // Dedupe: `-d :old/x` is counted by the flag path AND the colon path for
   // the SAME refspec (git deletes it once). Distinct targets stay distinct.
   const uniq = [...new Set(out)];
-  return uniq.length > 0 ? uniq : null;
+  // Unmask the newlines that were DATA: they are part of the ref TEXT the shell would pass, so a target
+  // carrying one is reported as written. It stays unresolvable to #653 only when it ALSO carries an
+  // expansion — a newline is legal inside a ref name, so this is not a silent widening either way.
+  const restored = uniq.map((t) => t.split(_NL_DATA).join("\n"));
+  return restored.length > 0 ? restored : null;
 }
 
 /**
@@ -8746,7 +10122,51 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   let envSawAssign = false;        // cycle-34 P2-2: env option parsing ENDS at the first name=value operand
   let spawnerOperandNext = false;  // a spawner flag that takes an operand
   const SPAWNER_WORDS = new Set(["sudo", "env", "xargs", "nohup", "command", "time", "nice", "doas", "stdbuf", "timeout", "builtin", "exec", "setsid"]); // exec = spawner prefix (r37 P3); setsid cycle-32 P1-1
-  let dirStack = [];            // pushd/popd directory stack (cycle-23 F2)
+  let dirStack = [];            // pushd/popd directory stack (cycle-23 F2) — REVERSED:
+                               // its END is the entry just below the top (the one
+                               // `pending`/a bare popd consumes). bash's own model
+                               // is [cwd, …pushed] with index 0 = the CURRENT dir
+                               // (`dirs` prints it left to right), and its indexed
+                               // forms (`pushd +N`/`-N`, `popd +N`/`-N`) index INTO
+                               // that list. vstack/setVStack are the ONLY conversion
+                               // points so a rotation can never disagree about
+                               // orientation (#3955).
+  const vstack = (top) => [top, ...dirStack.slice().reverse()];
+  const setVStack = (S) => { dirStack = S.slice(1).reverse(); return S[0]; };
+  // ⛔ A STACK ENTRY IS NOT A PROMISE THAT ITS DIRECTORY EXISTS, so every stack
+  // form that ends in a `cd` must model WHICH HALF of the operation survives when
+  // that `cd` fails. This is not theory: `pushd -n` inserts its operand STRING
+  // verbatim (bash: `add_dirstack_element(savestring(list->word->word))`), so an
+  // absent path can sit in `DIRSTACK` and the very next form that consumes it
+  // cd's to nothing. MEASURED, bash 3.2.57 on this host, stack `[b, +1, docs, a]`
+  // (cwd `b`, `+1` inserted by `pushd -n -- +1`):
+  //   `popd`       rc 1  "popd: +1: No such file or directory"  NOTHING removed, cwd b
+  //   `popd +0`    rc 1  same error                              NOTHING removed, cwd b
+  //   `popd -3`    rc 1  same error                              NOTHING removed, cwd b
+  //   `popd +1`    rc 0  the entry is removed, no cd            `[b, docs, a]`, cwd b
+  //   `popd -n +1` rc 0  the entry is removed, no cd            `[b, docs, a]`, cwd b
+  //   `pushd`      rc 1  the SWAP stays, its cd fails            `[b, b, docs, a]`, cwd b
+  //   `pushd +1`   rc 1  the ROTATION stays, its cd fails        `[b, docs, a, b]`, cwd b
+  // The rule that reproduces all seven: the STACK mutation an arm performs is
+  // unconditional and only its `cd` is conditional on the target existing —
+  // EXCEPT the two forms whose removal IS the entry being cd'd to (a bare
+  // `popd`, and `popd ±N` naming element 0), where a failed cd removes NOTHING.
+  // Getting this wrong in either direction is a grading bug, not cosmetics: a
+  // cwd bash never entered grades a directory the write never touches (a FALSE
+  // REFUSAL) and desynchronises every later stack form (a fail-OPEN).
+  // ⛔ A RAW STACK ENTRY (`pushd -n <relative>`, see the insert site) is resolved AT
+  // THE CONSUMING cd, from the cwd holding THEN — that is what bash does: it stores
+  // the operand STRING. Resolving eagerly published a path bash never wrote
+  // (measured: `pushd sub; pushd -n ../docs; cd ..; popd` — bash's popd fails from
+  // `hub` and stays there, the eager model landed in `docs`).
+  const RAWSTACK = "\u0000raw:";
+  const cdTo = (x) => {
+    if (typeof x === "string" && x.startsWith(RAWSTACK)) {
+      const at = resolve(f().cwd, x.slice(RAWSTACK.length));
+      return existsSync(at) ? at : null;
+    }
+    return x !== undefined && x !== null && existsSync(x) ? x : null;
+  };
   let dirStackSnapshots = [];  // FULL copy per ( - restored at ) (cycle-24 P1 r29 D1-D3:
                                // a subshell gets a COPY — ( popd ) must not eat an inherited entry)
   const SPAWNER_FLAG_OPERANDS = {
@@ -8844,6 +10264,520 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     return { w, k };
   };
   const readShellArg = readWord;   // alias (same shell-argument semantics)
+  // ── EVERY remaining operand word of this simple command, for the dir-stack
+  // verbs ONLY (#3955 review rounds 3-4). bash's `pushd`/`popd` scan the WHOLE
+  // argv, so a single-word read models the first operand and silently DROPS the
+  // rest — measured fail-OPENs, e.g. `popd +0 -n` (bash: NOCD, cwd unchanged;
+  // one-word model: cd's to the new top) and `popd +0 extra` (bash: rc 2,
+  // nothing changes).
+  // ⛔ TWO separate rules keep this honest, and both are MEASURED:
+  //  • a REDIRECT (with or without an FD prefix — `2>/dev/null`, `>f`, `2>&1`) is
+  //    not an operand, and bash still reads the operands AFTER it
+  //    (`popd 2>/dev/null +1` removes element 1). So the scan SKIPS it and keeps
+  //    going — but it does NOT consume it: `k` is handed back pointing at the
+  //    redirect, so the MAIN walker still attributes a write target like
+  //    `pushd ../docs > tracked.md` (skipping it here would drop that write);
+  //  • a `#` AT WORD START IS A COMMENT and ends the scan — consuming it made a
+  //    command AFTER it (`; echo x > tracked.md`, which bash never runs) look
+  //    like a live write (a measured false refusal).
+  const readOperandWords = (k) => {
+    const out = [];
+    const tildes = [];                        // per operand: is the SOURCE word a BARE `~`?
+    const quoted = [];                        // per operand: was the SOURCE word QUOTED/ESCAPED? (popd's `$VAR` reality)
+    // ⛔ bash expands the tilde PREFIX — everything up to the first UNQUOTED `/` — and
+    // only when nothing in that prefix is quoted. So `~"/docs"` and `~\//docs` are
+    // LITERAL `~` words (pushd errors, nothing moves), while `~/"/docs"` and
+    // `"~"/docs` are decided by the first character alone. `readWord` returns the
+    // DE-QUOTED text, so the RAW source is the only place this survives.
+    const bareTildeAt = (p0) => {
+      if (s[p0] !== "~") return false;
+      for (let j = p0 + 1; j < n; j++) {
+        const c = s[j];
+        if (c === "\\" || c === "'" || c === '"') return false;   // quoting inside the prefix
+        if (c === "/") return true;                              // first unquoted slash ends the prefix
+        if (/[\s;&|()<>`$]/.test(c)) return true;                // the word ended before any slash
+      }
+      return true;
+    };
+    let resumeAt = null;                     // where the MAIN walker must resume (a redirect)
+    const skipRedirect = (at) => {           // at = index of the `>`/`<` operator
+      let r = at;
+      while (r < n && "<>&|".includes(s[r])) r++;
+      if (s.slice(at, r).includes("<<")) return { stop: true, at };   // heredoc BODY is data — stop
+      const opnd = readWord(skipWsNl(r));
+      return { stop: false, at: opnd.k > r ? opnd.k : r + 1 };
+    };
+    for (;;) {
+      const p = skipWsNl(k);
+      if (s[p] === "#") return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : p };
+      if (s[p] === ">" || s[p] === "<") {
+        if (resumeAt === null) resumeAt = p;
+        const r = skipRedirect(p);
+        if (r.stop) return { args: out, tildes, quoted, k: resumeAt };
+        k = r.at;
+        continue;
+      }
+      const w = readWord(p);
+      // ⛔ AN EXPLICITLY EMPTY WORD IS STILL AN OPERAND (#3955 review round 9).
+      // `readWord` returns `""` both for "no word here" AND for a QUOTED EMPTY
+      // string, and treating the second as the first DROPPED the operand — which
+      // turned `pushd ""` into a BARE `pushd` (the one form that swaps the top
+      // two) while bash runs `pushd .`. MEASURED (bash 5.2.21), stack `[H, H/a]`
+      // cwd `H`: `pushd ""` ⇒ rc 0, dirs `H H H/a`, cwd `H` (a duplicate of the
+      // cwd inserted below the top, NO cd) — while a bare `pushd` really swaps to
+      // `H/a`. So the drop was a REGRESSION: `cd a; pushd ..; pushd ""` grades the
+      // TRACKED `H/tracked.md` write as `a/tracked.md` → ALLOW, where `origin/main`
+      // BLOCKed. The raw source character is the only place this survives
+      // (`readWord` has already stripped the quotes).
+      // ⛔ THE QUOTED-EMPTY SPELLING IS FOUR FORMS, not two (#3955 review round 10):
+      // `""`, `''`, `$''` (ANSI-C) and `$""` (locale) all reach pushd as an empty
+      // operand KEPT by the shell — MEASURED (bash 5.2.21): `pushd $''` and
+      // `pushd $""` both give dirs `H H H/a` with the cwd unmoved, exactly like
+      // `pushd ""`, and `pushd $'' ../b` is `too many arguments`. Testing only the
+      // bare quote characters dropped the `$`-prefixed pair, so those collapsed
+      // onto the bare-`pushd` SWAP — the same regression, one spelling over
+      // (measured: `cd a; pushd ..; pushd $''` graded `a/tracked.md` → ALLOW).
+      // An UNQUOTED `$VAR` that expands empty is a DIFFERENT, correct thing: the
+      // shell REMOVES that word, which is why the bare-form path must keep it.
+      const emptyQuoted = s[p] === '"' || s[p] === "'" ||
+        (s[p] === "$" && (s[p + 1] === '"' || s[p + 1] === "'"));
+      if (!w.w) {
+        if (emptyQuoted && w.k > p) {
+          out.push(""); tildes.push(false); quoted.push(true); k = w.k;
+          if (out.length >= 64) return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : k };
+          continue;
+        }
+        return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : p };
+      }
+      // ⛔ AN FD PREFIX IS AN **UNQUOTED** DIGIT RUN (#3955 review round 10). bash
+      // demotes `N>` to an io-number only when the digits reach it UNQUOTED; a
+      // quoted or escaped `2` is an ordinary operand. Testing the DE-QUOTED word
+      // (`w.w`) conflated the two, so `pushd '2'>/dev/null` / `pushd \\2>/dev/null`
+      // lost their operand entirely — zero operands is the bare `pushd` SWAP, and
+      // MEASURED (bash 5.2.21) that is a regression: `pushd '2'` really fails
+      // (a directory named `2` does not exist), the cwd stays put and the write
+      // hits the TRACKED hub root, while the collapsed model resolved `a/` → ALLOW.
+      const rawDigits = /^[0-9]+$/.test(s.slice(p, w.k).replace(/\\\r?\n/g, ""));
+      if (rawDigits && /^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
+        if (resumeAt === null) resumeAt = p;
+        const r = skipRedirect(w.k);
+        if (r.stop) return { args: out, tildes, quoted, k: resumeAt };
+        k = r.at;
+        continue;
+      }
+      out.push(w.w);
+      // ⛔ A QUOTED OR ESCAPED `~` IS NOT A TILDE WORD: bash expands `~` LEXICALLY,
+      // before quoting is stripped, so `pushd "~"` / `pushd '~'` / `pushd \~`
+      // hand pushd a LITERAL `~` that does not exist — rc 1, NOTHING changes.
+      // `readWord` returns the DE-QUOTED text, so the raw start character is the
+      // only place that distinction survives.
+      tildes.push(bareTildeAt(p));
+      // ⛔ WAS THIS OPERAND **QUOTED** AT THE SOURCE? The `popd` arm needs it: an
+      // UNQUOTED `$VAR` that expands empty has its word REMOVED by the shell (so bash
+      // runs a BARE `popd`), while a QUOTED `"$VAR"` that expands empty KEEPS an empty
+      // word (so bash runs `popd ""` ⇒ `-0`). `readWord` has already stripped the
+      // quoting, so the RAW span is the only place this survives — MEASURED (bash
+      // 5.2.21), stack `[docs, a]` cwd `docs`: `popd $E` ⇒ dirs `[docs, a]` cwd `docs`
+      // (a bare popd), `popd "$E"` ⇒ dirs `[a, docs]` cwd `a` (`-0`, NO cd). Opposite
+      // cwds from one de-quoted word (#3955 review round 11).
+      quoted.push(/["'\\]/.test(s.slice(p, w.k)));
+      k = w.k;
+      if (out.length >= 64) return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : k };   // bounded
+    }
+  };
+  // ── THE DIR-STACK VERBS' ARGV MODEL (#3955 review round 3), MEASURED on
+  // bash 5.2.21, stack `[b, docs, a]` (cwd `b`) unless a row says otherwise.
+  // The single-operand arms in the walker body stay as they were (they are
+  // verified); these two helpers take over ONLY when the verb carries TWO OR
+  // MORE operand words — the shape that used to be read as "the first word, and
+  // nothing else":
+  //   `-n` is an OPTION anywhere before `--` (getopt), and repeats harmlessly;
+  //   `--` ends option parsing. After it the first word is a LITERAL directory
+  //        operand — `pushd -n -- +1` INSERTS the string "+1" and `pushd -- +1`
+  //        tries to cd to a directory by that name — while for `popd`
+  //        EVERYTHING after `--` is IGNORED (`popd -- +1` and `popd -- -n` are
+  //        exactly a bare `popd`);
+  //   among numeric operands the LAST one wins — `pushd +1 +2` ⇒ +2,
+  //        `pushd +2 +1` ⇒ +1, `pushd -n +1 +2` ⇒ rotate by 2 and replace the
+  //        rotated-in entry with the cwd, `popd +0 +1` ⇒ element 1 removed,
+  //        `popd +0 -1` on a 2-entry stack ⇒ element 0 removed AND a cd;
+  //   for `pushd` the FIRST operand picks the MODE (numeric ⇒ rotation, else a
+  //        directory) — so `pushd -n extra +1` INSERTS `extra` and ignores `+1`,
+  //        while `pushd -n +1 ../c` rotates by 1 — and with `-n` the trailing
+  //        words are IGNORED (`pushd -n ../c extra` inserts ../c); WITHOUT `-n`
+  //        a trailing word is bash's "too many arguments" (rc 1, NOTHING
+  //        changes: `pushd ../c extra`, `pushd -- ../c extra`);
+  //   for `popd` ANY other word is "invalid argument" (rc 2) with the stack AND
+  //        the cwd untouched — `popd +1 extra`, `popd extra +1`, `popd -n extra`
+  //        — so it must never be read as the bare form.
+  // ⛔ DECLARED RESIDUALS (not modelled here). The first two are PRE-EXISTING
+  // for every verb in this walker; the others say so where they differ:
+  //  • EXIT STATUS — when a dir-stack verb ERRORS, bash marks the command failed,
+  //    so it skips a following `&&` list AND it SKIPS a following `||` list when
+  //    the verb SUCCEEDED (both directions are unmodelled). This walker runs
+  //    whichever RHS follows, because `&&`/`||` are handled as plain segment
+  //    separators. Measured: `cd a; pushd -- && pushd -n .. ; popd; …` (bash
+  //    keeps `a`, the model reaches the hub root) and `cd a; pushd ../docs ||
+  //    popd; …` (bash stays in docs, the model pops to `a`). Inert while
+  //    `pushd -n <dir>` was a no-op; visible now that the form really inserts.
+  //    Fixing it means TRACKING the previous command's status across the whole
+  //    walk and gating ONLY the `&&` / `||` RHS on it. ⛔ NOT `;` — a `;` list is
+  //    UNCONDITIONAL in bash (`false; echo x > f` still writes), so gating it
+  //    would drop a write bash performs, the opposite failure. A different
+  //    change than #3955.
+  //  • `pushd -n $VAR +N`: same cwd, two stacks — see the note at the dir arm.
+  const popdArgv = (args, fr, quoted) => {
+    let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
+    let emptySel = false;                         // an explicitly EMPTY operand
+    let unprovableQuoted = false;                  // …and it was QUOTED at the source (see the fork)
+    for (let ai = 0; ai < args.length; ai++) {
+      const w = args[ai];
+      if (sawDD) continue;                        // everything after `--` is ignored
+      if (w === "--") { sawDD = true; continue; }
+      if (w === "-n") { nFlag = true; continue; }
+      // ⛔ `popd ""` IS AN INDEX OPERAND, not an absent one and not "invalid"
+      // (#3955 review round 9). MEASURED (bash 5.2.21), stack `[a, docs, a]` cwd
+      // `a`: `popd ""` ⇒ rc 0, dirs `[a, docs]` — the LAST element removed and NO
+      // cd, i.e. exactly `popd -0`; likewise `popd -n ""`, `popd "" ""`, and
+      // `popd -- ""` after the marker is a plain bare popd. Reading it as the
+      // bare form instead cd'd to element 1 (`popd ""` on `[H, H/a]` really keeps
+      // the cwd at `H` and overwrites the TRACKED `H/tracked.md`).
+      // COMPOSITION RESIDUAL (declared, measured): an empty operand TOGETHER with
+      // a numeric one keeps the cwd unchanged in every measured row (`+0 ""`,
+      // `+1 ""`, `+2 ""`, `-0 ""`, `-1 ""`, `"" +0`, `"" +1`, `"" +2`,
+      // `"" -1` — all nine leave the cwd at `a`), but WHICH entry is removed is
+      // NOT a single rule (`+1 ""`/`+2 ""`/`-1 ""` remove element 1, the others
+      // remove the last). The empty operand therefore WINS as `-0` (correct cwd on
+      // all nine rows, correct element on six); the three divergent spellings can
+      // desynchronise the stack for a LATER form and are not modelled.
+      if (w === "") { emptySel = true; continue; }
+      const m = /^([+-])([0-9]+)$/.exec(w);
+      if (m) { sel = m; continue; }               // LAST numeric wins
+      if (/^[$`]/.test(w)) {
+        unprovable = true;
+        if (quoted && quoted[ai] === true) unprovableQuoted = true;
+        continue;
+      }
+      invalid = true;
+    }
+    // ⛔ `sel` IS REGEXP-MATCH-SHAPED — `sel[1]` is the SIGN and `sel[2]` the
+    // DIGITS (it is the `exec` result below). Writing `["-", "0"]` put the sign at
+    // index 0 and left `sel[2]` undefined, so `idx0` was **NaN**: `popd ""` then
+    // removed NOTHING (`S.slice(0,NaN)` is the whole array) while still scoring the
+    // cwd right, which is why the cwd-only rows could not see it (#3955 review
+    // round 10). MEASURED consequence on `[b, docs, a]`: `popd ""` must drop the
+    // last entry, so the NEXT `popd -1` lands in docs — with NaN it landed in b.
+    if (emptySel) sel = ["-0", "-", "0"];        // `popd ""` ⇒ `-0`: drop the LAST entry, no cd
+    if (invalid) return;                          // bash rc 2 — nothing changes
+    const S = vstack(fr.cwd);
+    const keep = fr.cwd;
+    if (sel) {
+      const idx0 = sel[1] === "+" ? Number(sel[2]) : S.length - 1 - Number(sel[2]);
+      if (nFlag) {
+        // `-n` never cds, so an absent entry is REMOVABLE and no cd can fail.
+        // `+0` names element 0 (the current directory), so bash drops element 1
+        // instead (measured: `popd -n +0` ⇒ [b, a]).
+        const idx = idx0 === 0 ? 1 : idx0;
+        if (idx >= 0 && idx < S.length && S.length > 1) {
+          setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
+        }
+        return;
+      }
+      if (idx0 < 0 || idx0 >= S.length) return;   // out of range → bash error, no change
+      const rest = S.slice(0, idx0).concat(S.slice(idx0 + 1));
+      // ⛔ ELEMENT 0 IS THE CURRENT DIRECTORY, so removing it forces a cd to the
+      // new top; when THAT cd fails bash removes nothing (measured: `popd +0`
+      // and `popd -3` over `[b, +1, docs, a]` are rc 1 with `dirs` unchanged).
+      if (idx0 === 0 && cdTo(rest[0]) === null) return;
+      // ⛔ `rest[0]` may be a RAW entry (`pushd -n <relative>`): resolve it HERE, or the
+      // sentinel becomes the cwd and every later resolution is garbage.
+      const landing = cdTo(setVStack(rest));
+      fr.pending = landing === null ? keep : landing;   // idx0 > 0 never cds — stay put
+      if (unprovable && landing !== keep) {
+        fr.forkCwd = fr.forkCwd || landing;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== landing).slice(0, 64);
+      }
+      return;
+    }
+    // ⛔ THE QUOTING IS WHAT DECIDES WHICH REALITY THE EMPTY CASE IS (#3955 review
+    // round 11) — there is no single "no move" answer:
+    //   QUOTED   `popd "$VAR"` / `popd -n "$VAR"` — the empty word is KEPT, so bash
+    //            runs `popd ""` = `-0`: drop the LAST entry, NO cd. A non-empty value
+    //            is `invalid argument` (nothing changes).
+    //   UNQUOTED `popd $VAR` / `popd -n $VAR` — the empty word is REMOVED, so bash
+    //            runs a BARE `popd` (or bare `popd -n`): element 0/1 really moves and
+    //            a bare `popd` really cds. A non-empty value is `invalid argument`.
+    // MEASURED (bash 5.2.21), stack `[a, docs, a]` cwd `a`, `E` unset:
+    //   `popd "$E"`  ⇒ dirs `[a, docs]` cwd `a`   (`-0`)
+    //   `popd $E`    ⇒ dirs `[docs, a]` cwd `docs` (bare popd — the cwd MOVES)
+    //   `popd -n "$E"`⇒ dirs `[a, docs]`        `popd -n $E` ⇒ dirs `[a, a]`
+    // Getting the unquoted branch wrong (round 10 left the stack untouched for BOTH)
+    // is a measured fail-OPEN: `cd a; pushd ../docs; pushd ../b; popd $NOPE; popd`
+    // really ends in `a` and the untouched-stack model resolved `docs`.
+    // ⛔ REMAINING RESIDUAL (declared): the empty/non-empty split WITHIN one spelling is
+    // still a STACK divergence (the fork carries CWDs, not STACKs — `forkStackAlts`),
+    // so a LATER stack verb can still diverge on the non-empty value.
+    if (unprovable && !sel) {
+      if (unprovableQuoted) {                     // KEPT empty word ⇒ `-0` (drop LAST, no cd)
+        if (S.length > 1) setVStack(S.slice(0, S.length - 1));
+        fr.pending = keep;
+        return;
+      }
+      if (nFlag) {                                // REMOVED empty word ⇒ a BARE `popd -n`: drop element 1
+        if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+        fr.pending = keep;
+        return;
+      }
+      const du = dirStack.pop();                  // REMOVED empty word ⇒ a BARE `popd`: mutate AND cd
+      if (du !== undefined && cdTo(du) === null) {
+        dirStack.push(du);
+        fr.pending = null;
+        return;
+      }
+      const popUnprov = du !== undefined ? cdTo(du) : null;
+      fr.pending = popUnprov;
+      if (popUnprov !== null && popUnprov !== keep) {
+        fr.forkCwd = fr.forkCwd || popUnprov;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== popUnprov).slice(0, 64);
+      }
+      return;
+    }
+    if (nFlag) {                                  // bare `popd -n` — drop element 1, keep the cwd
+      if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+      return;
+    }
+    // bare `popd` (with `--`, or with an operand this walker cannot expand)
+    // ⛔ AN UNPROVABLE OPERAND (`popd "$VAR"` / `popd $VAR`) — the three realities,
+    // and why the cwd is now the UNCHANGED one (#3955 review round 10). `readWord`
+    // cannot tell `"$VAR"` from `$VAR`, and the spellings differ:
+    //   • `popd "$VAR"` with an EMPTY expansion is `popd ""` ⇒ `-0`: drop the last
+    //     entry, NO cd — cwd unchanged.
+    //   • EITHER spelling with a NON-EMPTY value is bash's `invalid argument`
+    //     (rc 2) — stack and cwd untouched.
+    //   • `popd $VAR` UNQUOTED with an empty expansion has the word REMOVED, so bash
+    //     runs a BARE `popd` and cds to element 1 — the ONLY reality that moves.
+    // Two of the three keep the cwd, so the cwd is unambiguous and belongs in
+    // `pending`; the bare-popd landing is the fork ALT so the write set is still a
+    // superset. Applying the bare mutation as the PRIMARY (what this arm used to
+    // do) made the STACK diverge on the two realities that never move it — MEASURED
+    // (bash 5.2.21, `E` unset), a regression vs `origin/main`:
+    //   `cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd "$E"; popd; …`
+    //   bash ⇒ the next popd cds to `a` (the retained `../a` entry) and the write
+    //   hits `a/tracked.md`; the bare-primary model consumed `../a` HERE and left
+    //   the next popd resolving {`H/b`, `H/docs`} ⇒ the tracked `a/tracked.md`
+    //   overwrite was ALLOWed. ⛔ THAT ROW IS THE **QUOTED** SPELLING: round 10 read it
+    //   as "leaving the stack alone reproduces bash exactly", which MEASUREMENT
+    //   FALSIFIED for the unquoted spelling — see the quoting fork below.
+    const d = dirStack.pop();
+    if (d !== undefined && cdTo(d) === null) {
+      dirStack.push(d);                           // retained, not consumed (round-2 rule)
+      fr.pending = null;
+      return;
+    }
+    const popTo = d !== undefined ? cdTo(d) : null;   // a RAW entry resolves here, not at insert
+    fr.pending = popTo;
+  };
+  // Returns null when the whole form is modelled here, or `{ dirWord }` when the
+  // form reduces to a PLAIN directory operand (`pushd -- <dir>`) that the shared
+  // cd path in the walker body must run — one cd implementation, not two.
+  const pushdArgv = (args, fr, cwd, tildes) => {
+    let nFlag = false, sawDD = false, mode = null, nums = null, dirWord = null, extra = 0;
+    let dirTilde = false;                            // dirWord was a BARE (unquoted) `~`
+    // ⛔ `-n` IS POSITION-SENSITIVE (#3955 review round 4, measured on bash
+    // 5.2.21): option scanning stops at the first NON-NUMERIC argument, so
+    //   `pushd +1 -n`      HONOURS it (rc 0, rotation without cd)
+    //   `pushd +1 -n +2`   HONOURS it (last numeric wins, no cd)
+    //   `pushd +1 extra -n` does NOT — the rotation happens WITH its cd
+    //   `pushd ../c -n`    is `too many arguments` (rc 1, NOTHING changes: the
+    //                      dir operand closed the scan, so `-n` is a 2nd arg)
+    //   `pushd -n ../c -n` INSERTS (harmless once `-n` is already in effect)
+    // Numeric operands do NOT close the scan; any other word does.
+    let optClosed = false;
+    for (let ai = 0; ai < args.length; ai++) {
+      const w = args[ai];
+      const isTilde = tildes ? tildes[ai] === true : false;
+      if (sawDD) {                                   // after `--` every word is a LITERAL operand
+        if (mode === null) { mode = "dir"; dirWord = w; dirTilde = isTilde; } else extra++;
+        continue;
+      }
+      if (w === "--") { sawDD = true; optClosed = true; continue; }
+      const m = /^([+-])([0-9]+)$/.exec(w);
+      if (m) {
+        if (mode === null) { mode = "numeric"; nums = [m]; }
+        else if (mode === "numeric") nums.push(m);   // LAST wins, but every one is range-checked
+        else { if (mode === "dir" && nFlag) continue; extra++; }
+        continue;
+      }
+      if (w === "-n") {
+        if ((mode === null || mode === "numeric") && !optClosed) { nFlag = true; continue; }
+        if (mode === "dir" && nFlag) continue;       // harmless — `-n` is already in effect
+        extra++;                                     // a second argument in dir mode → "too many arguments"
+        continue;
+      }
+      if (mode === null) {
+        if (w.startsWith("-")) { mode = "flag"; optClosed = true; continue; }   // `-x` / `-` (OLDPWD, #2177's residual)
+        mode = "dir"; dirWord = w; dirTilde = isTilde;
+        continue;
+      }
+      if (mode === "dir") { if (nFlag) continue; extra++; continue; }
+      optClosed = true; extra++;                     // non-numeric in numeric mode: ignored, scan closed
+    }
+    const runNumeric = (numsArr) => {
+      const S = vstack(fr.cwd);
+      // ⛔ EVERY NUMERIC OPERAND IS RANGE-CHECKED, and the LAST one is the one
+      // APPLIED — measured: `pushd +1 +1` on a 3-entry stack rotates ONCE (not
+      // twice), `pushd +0 +2` rotates by 2, and `pushd +2 +9` / `pushd +9 +2`
+      // both error (naming the out-of-range operand) with the stack and cwd
+      // untouched — even on a 2-entry stack where the LAST operand (`+1`) was
+      // in range: `pushd +2 +1` errors on `+2`. An identity index (`+0` in the
+      // cd arm, `+0`/`-0` landing on element 0 under `-n`) is rc 0 and changes
+      // NOTHING, never an error (measured).
+      // ⛔ THE BOUND IS ON THE SOURCE NUMBER `N`, NOT on the transformed index —
+      // and it is the SAME for both signs and both modes: bash errors iff
+      // `N >= len` (measured on 5.2.21, 3-entry stack `[b, docs, a]`:
+      //   `pushd -3` / `pushd -n -3`  rc 1 "-3: index out of range", nothing changes
+      //   `pushd -2` / `pushd -n -2`  rc 0, IDENTITY (dirs unchanged)
+      //   `pushd +3` / `pushd -n +3`  rc 1 ; `pushd +2` rotates
+      // ). Bounding the transformed index was wrong in BOTH directions: `-N`
+      // maps to `len-1-N` under `-n` (a too-deep `-3` slipped through and a
+      // LATER in-range operand was still applied) and to `N+1` in the cd arm
+      // (`-2` on a 3-entry stack is a LEGAL identity, yet was rejected —
+      // dropping the form AND the later operand).
+      const rotOf = (m) => (m[1] === "+" ? Number(m[2]) : S.length - 1 - Number(m[2]));
+      const cdOf = (m) => (m[1] === "+" ? Number(m[2]) : Number(m[2]) + 1);
+      for (const m of numsArr) if (Number(m[2]) >= S.length) return null;   // out of range → bash error, nothing changes
+      const last = numsArr[numsArr.length - 1];
+      if (nFlag) {
+        // No cd ever happens. bash REPLACES the rotated-in entry with the
+        // current dir; that entry is element 0 of the stack, which `vstack`
+        // always derives from `fr.cwd`, so only the tail is stored.
+        const rk = rotOf(last);                                  // left by N · left by len-1-N
+        if (rk > 0 && rk < S.length) setVStack(S.slice(rk).concat(S.slice(0, rk)));
+        return null;
+      }
+      const k = cdOf(last);                                      // left by N · right by N+1
+      if (k > 0 && k < S.length) {                               // k===0 → identity
+        // ⛔ THE ROTATION SURVIVES A FAILED `cd` (measured: `pushd +1` over
+        // `[b, +1, docs, a]` leaves `[b, docs, a, b]` at cwd `b`), so `cdTo`
+        // gates ONLY the pending cd — never the rotation itself.
+        fr.pending = cdTo(setVStack(last[1] === "+"
+          ? S.slice(k).concat(S.slice(0, k))                        // rotate left
+          : S.slice(S.length - k).concat(S.slice(0, S.length - k)))); // rotate right
+      }
+      return null;
+    };
+    if (mode === "numeric") return runNumeric(nums);
+    if (mode === "flag") { fr.pending = null; return null; }      // conservative no-op
+    if (mode === null) {
+      if (nFlag) return null;                                    // `pushd -n --` — nothing changes
+      // bare `pushd` / `pushd --`: swap the top two entries and cd to the new
+      // top; a 1-deep stack is "no other directory" (rc 1) and moves nothing.
+      const S = vstack(fr.cwd);
+      fr.pending = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
+      return null;
+    }
+    // mode === "dir"
+    // ⛔ AN EMPTY OPERAND IS `pushd .` (#3955 review round 9): bash's `cd ""` is a
+    // successful no-op, so `pushd ""` / `pushd ''` / `pushd -- ""` insert a
+    // DUPLICATE of the cwd below the top without moving — MEASURED (bash 5.2.21),
+    // stack `[H, H/a]` cwd `H`: dirs becomes `H H H/a`, cwd stays `H`, whereas a
+    // BARE `pushd` swaps to `H/a`. It is returned as the plain directory operand
+    // `""` and the SHARED cd path does the work: `resolve(cwd, "")` IS the cwd, so
+    // the stack gets the duplicate and the landing is the cwd — one cd
+    // implementation, exactly as `pushd .` behaves.
+    // ⛔ DECLARED RESIDUAL — `pushd $VAR +N`. bash's answer depends on the VALUE:
+    // an unquoted empty expansion is REMOVED, so bash runs `pushd +N` (a rotation
+    // WITH its cd); a non-empty one is a second argument ("too many arguments",
+    // rc 1, NOTHING changes). The two realities differ in the DIR STACK, not only
+    // in the cwd, and `forkAlts` carries cwds — a cwd-only fork here is WORSE than
+    // no fork: it rotates the single stack and publishes a cwd the stack no longer
+    // supports, so the NEXT stack verb lands where neither reality does (measured,
+    // 3-entry stack, `NOPE=../b` real: `pushd $NOPE +1; popd` ⇒ bash `docs`,
+    // cwd-fork model `a`/`b`, ALLOWing the tracked `docs/tracked.md`). So this
+    // models the LITERAL reading (a second argument) and declares the other half,
+    // which is what `origin/main` did — non-regressive. Carrying stacks in the
+    // fork (`forkStackAlts`) is the honest fix; it is its own change.
+    if (extra > 0 && !nFlag) return null;  // "too many arguments" — nothing changes
+    if (nFlag) {
+      // -n <dir>: insert below the top, no cd. ⛔ `-n` NEVER stat()s the operand —
+      // bash inserts the operand STRING verbatim and the validation happens at the
+      // LATER `popd`, which errors and leaves the cwd alone. `~` is expanded here
+      // because bash expands it BEFORE `pushd` sees it (measured on a 2-deep
+      // stack: `pushd -n ~; popd` lands in $HOME, not on the previous top —
+      // leaving `~` uninserted skewed the stack by one).
+      const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
+      const tilde = dirWord && dirTilde && home
+        ? (dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")))   // `~//x` too
+        : undefined;
+      // ⛔ `dirWord !== null`, NOT `dirWord &&` — an EMPTY operand still INSERTS
+      // (#3955 review round 9). MEASURED (bash 5.2.21), stack `[docs, a]` cwd
+      // `docs`: `pushd -n ""` ⇒ rc 0, dirs `docs '' a` — bash splices the operand
+      // STRING (empty) in at index 1, and because `cd ""` is a successful NO-OP
+      // the later `popd` consumes that entry and leaves the cwd where it was. The
+      // empty string is a RELATIVE operand, so it takes the RAWSTACK path and
+      // resolves at the consuming cd to whatever the cwd then is — which is what
+      // bash does.
+      const ins = dirWord !== null && dirWord !== "-" && !/^[$`]/.test(dirWord)
+        ? (tilde !== undefined ? tilde
+          : (isAbsolute(dirWord) ? dirWord : RAWSTACK + dirWord))   // RELATIVE ⇒ raw, resolved at the cd
+        : null;
+      if (ins) { const S = vstack(fr.cwd); S.splice(1, 0, ins); setVStack(S); }
+      return null;
+    }
+    // `~` / `~/…` is NOT unprovable: bash expands it to `$HOME` before `pushd`
+    // runs, and an UNQUOTED tilde is never removed (unlike `$VAR`), so it ALWAYS
+    // cds. Leaving it a no-op was a measured fail-open — on a 2-deep stack
+    //   `cd a; pushd ../docs; pushd ~; popd; …`  bash cds to $HOME and the popd
+    // lands back in `docs`, which the no-op model read as `a`. `~user` stays
+    // undecidable (declared residual, same as `cd ~user`).
+    if (dirTilde && dirWord && (dirWord === "~" || dirWord.startsWith("~/"))) {
+      const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
+      if (home) return { dirWord: dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")) };   // `~` → HOME, `~/x` → HOME/x. ⛔ STRIP the separators, do not slice a fixed count: `slice(1)` keeps the `/` and `resolve()` then DISCARDS HOME (the ROOT path), and `slice(2)` still does it for `~//x`.
+      return null;                                                        // declared residual: no HOME
+    }
+    // ⛔ AN UNQUOTED `$VAR`/BACKTICK OPERAND IS *REMOVED* WHEN EMPTY, so bash runs
+    // a BARE `pushd` (swap the top two, cd to the new top) — a bare `pushd` on a
+    // 1-deep stack is "no other directory" (rc 1, nothing changes). BOTH of the
+    // cwds that depend on the EXPANSION-BEING-EMPTY fact are emitted, exactly as
+    // the `popd` arm above does it: the swap landing as the primary cwd and the
+    // unchanged cwd as the alt. The old no-cd/no-push model was a measured
+    // fail-open on any stack deeper than one —
+    //   `cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md`
+    //   bash cwd=docs (wrote docs/tracked.md), the no-op model read a/tracked.md.
+    // ⛔ DECLARED RESIDUAL, and NOT the superset this comment used to claim: when
+    // the expansion is a REAL DIRECTORY, bash cds to it, and that landing is NOT
+    // emitted (the two alts above are the empty-expansion reality and the
+    // unchanged one). MEASURED (bash 5.2.21): `cd docs; E=..; pushd $E` ⇒ cwd `H`,
+    // so `… pushd $E; echo x > tracked.md` overwrites the TRACKED `H/tracked.md`
+    // while this arm resolves `docs/tracked.md` → ALLOW. That is NOT introduced
+    // here: the PLAIN `cd $VAR` arm has the identical hole on this head and on
+    // `origin/main` (measured: `cd docs; E=..; cd $E; echo x > tracked.md` also
+    // resolves `docs/tracked.md`), so closing it needs a walker-wide "unknown cwd"
+    // reality — its own change, filed separately. `popd $VAR` and the
+    // bare-`pushd`-on-empty-expansion arm ARE supersets (their one landing is the
+    // unchanged cwd, which is emitted).
+    if (dirWord && /^[$`]/.test(dirWord)) {
+      const S = vstack(fr.cwd);
+      const keep = fr.cwd;
+      const swap = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
+      fr.pending = swap;                          // reality 1: the empty expansion ⇒ bare `pushd`
+      if (swap !== null && swap !== keep) {       // reality 2 (alt): the expansion is a real directory
+        fr.forkCwd = fr.forkCwd || swap;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== swap).slice(0, 64);
+      }
+      return null;
+    }
+    // ⛔ DECLARED RESIDUAL: `pushd -n $VAR +N` (and `pushd -n $VAR` generally).
+    // bash REMOVES the empty word, so the numeric operand then applies (`pushd -n
+    // $NOPE +1` rotates); this model drops the form entirely. Both realities share
+    // ONE cwd (`-n` never cds), so they differ only in the DIR STACK — and the
+    // fork machinery carries cwd realities, not stack realities, so this cannot
+    // be forked honestly. Measured, 3-entry stack `[b, docs, a]`:
+    //   `pushd -n $NOPE +1; popd` ⇒ bash pops to `a`, this model pops to `docs`.
+    // Exotic (a `-n` insert of an UNQUOTED variable AND a numeric operand); it is
+    // not a regression against `origin/main`, which no-opped every `-n` form.
+    return { dirWord };                                          // `pushd -- <dir>` — the shared cd path
+  };
   // #625: in-place OVERWRITE verb targets — a write with no primitive token.
   // Command-position only (the caller dispatches on the simple-command word,
   // mirroring the `tee` branch): `git mv a b` / `echo cp a b` are ARG
@@ -9980,13 +11914,61 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     if (w0.w === "cd" || w0.w === "pushd") {
       const nxt = skipWsNl(i);
-      const tgt = readWord(nxt);
+      let tgt = readWord(nxt);
       i = tgt.k;
       const isPushd = w0.w === "pushd";
-      // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
-      if (isPushd && (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { f().pending = null; continue; }
+      // ⛔ THE WHOLE ARGV, ALWAYS — and ONE model (#3955 review rounds 3-4).
+      // bash scans every operand word of these verbs; a single-word read dropped
+      // the rest (`pushd -n +1 +2` rotated by 1 where bash rotates by 2), and a
+      // SPLIT (new scanner for >=2 words, old arms below for 0-1) left the old
+      // arms with no FD notion at all — `pushd 2>/dev/null` read the redirect's
+      // `2` as an operand on that arm only. Routing ALWAYS is what makes the
+      // model single: the old single-operand arms are GONE rather than kept as a
+      // second, disagreeing definition.
+      if (isPushd) {
+        const argv = readOperandWords(nxt);
+        i = argv.k;
+        const onlyDir = pushdArgv(argv.args, f(), cwd, argv.tildes);
+        if (!onlyDir) continue;
+        tgt = { w: onlyDir.dirWord, k: i };   // a plain directory operand — the shared cd path below
+      }
+      // ── The dir stack's INDEXED forms (#3955's "flag/+N" half). Real bash
+      // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
+      // directory:
+      //   pushd +N  rotate LEFT by N, so element N becomes the top, then cd
+      //   pushd -N  rotate RIGHT by N+1, then cd        (`-0` ⇒ right by 1)
+      //   pushd -- <dir>  the marker, NOT the operand — bash cds (measured)
+      //   popd  +N  REMOVE element N without cd         (N=0 ⇒ cd to the new top)
+      //   popd  -N  REMOVE element len-1-N without cd
+      //   popd  --  exactly a bare popd
+      //   popd  -n  remove the element a bare popd would have cd'd to; keep cwd
+      //   pushd -n <dir>  INSERT <dir> at index 1; keep cwd
+      // ⛔ `-n` is an OPTION, not an alternative form — `pushd [-n] [+N | -N |
+      // dir]` / `popd [-n] [+N | -N]` (GNU bash manual §6.8.1) — so `-n` COMBINES
+      // with the numeric operand, and the operand picks WHICH entry moves.
+      // Measured on the same bash, stack [b, docs, a] (cwd b): `popd -n +2` and
+      // `popd -n -0` ⇒ [b, docs]; `popd -n +0` ⇒ [b, a] (== bare `popd -n`);
+      // `popd -n +9`/`-n foo` ⇒ error, nothing changes; `pushd -n +1` ⇒
+      // [b, a, b] — the stack rotates exactly as `pushd +1` would and the
+      // rotated-in entry is REPLACED by the cwd (no cd ever happens).
+      // An out-of-range index is a bash ERROR: stack and cwd both untouched.
+      // Treating them ALL as "no cd AND no stack change" (the previous model)
+      // drifted the walker's cwd off bash's in BOTH directions — measured
+      // fail-OPENs (`cd a; pushd ../docs; pushd ../a; pushd +1; echo x >
+      // tracked.md` really overwrites the TRACKED `docs/tracked.md`, while the
+      // walker resolved `a/tracked.md` → ALLOW; likewise `pushd -1`, `popd +0`
+      // and `pushd -n ../docs; popd`) and measured false positives (`popd --`).
+      // ⛔ READING `-n` ALONE IS THE SAME CLASS: `popd -n +2` dropped element 1
+      // whatever the operand said, so the next bare `popd` landed one entry too
+      // deep and the gate ALLOWed the tracked write real bash performs — a
+      // fail-OPEN of the #437/#3955 shape, and the arm `origin/main` graded
+      // right only by accident (it no-opped the whole form) (#3955 review 1).
       let next = null;
-      if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
+      // ⛔ `!== ""` is deliberately ALLOWED THROUGH: an explicitly empty operand
+      // is `cd ""` (a successful no-op for `cd`, and `pushd .` for `pushd`) — the
+      // shared path below resolves it to the cwd, so a `pushd ""` still records
+      // the duplicate entry its bare-`pushd` sibling must not lose (#3955 round 9).
+      if (tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
         const cand = resolve(cwd, tgt.w);
         if (existsSync(cand)) next = cand;                  // failed cd — unchanged
       }
@@ -10020,11 +12002,18 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       continue;
     }
     if (w0.w === "popd") {
-      const tgt = readWord(skipWsNl(i));
-      i = tgt.k;
-      if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
-      const d = dirStack.pop();
-      f().pending = d !== undefined && existsSync(d) ? d : null; // empty stack → bash no-op
+      // ⛔ THE WHOLE ARGV, ALWAYS — one model (see `popdArgv`; same reason as the
+      // pushd arm: a split between a new multi-word scanner and the old
+      // single-word arms let the two disagree, and the old arms had no FD notion —
+      // `popd 2>/dev/null` read the redirect's `2` as an operand, so bash's bare
+      // `popd` was modelled as a bash ERROR and the walker stayed one entry off).
+      // The multi-word fail-OPENs of the single-word read are measured: `popd +0
+      // -n`, `popd +0 extra` and `popd -n +1 extra` left the walker in `a` while
+      // bash never leaves `docs`, so a tracked `docs/tracked.md` overwrite was
+      // ALLOWed.
+      const argv = readOperandWords(i);
+      i = argv.k;
+      popdArgv(argv.args, f(), argv.quoted);
       continue;
     }
     if (w0.w === "python" || w0.w.startsWith("python")) {
@@ -10622,11 +12611,141 @@ const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash", "
  * not execute a script FILE (inline `-c` strings are the caller's command
  * itself and are gated by the normal classifier). Only LEADING positions count
  * (env-prefix / cd / separators allowed) so `git add ./foo` never false-matches.
+ *
+ * #523: a heredoc BODY is not part of the command line, so its tokens are never
+ * script operands — see `extractScriptPaths`, which resolves the scripts a
+ * heredoc-fed interpreter's PROGRAM executes.
  * @param {string} command
  * @returns {string|null}
  */
 export function extractScriptPath(command) {
-  const tokens = _tokenize(command);
+  const paths = extractScriptPaths(command);
+  return paths.length > 0 ? paths[0] : null;
+}
+
+/** A command-position token that ENDS a simple command — the resume point for
+ *  the heredoc-program walk. `;`/`&&`/`||`/`(`/`)` are also walked over by
+ *  `_scriptInvocationAt`'s own leading scan; `|`/`&` are not, which is why the
+ *  walk skips them itself. */
+function _isScriptCommandBoundary(t) {
+  return t === ";" || t === "&&" || t === "||" || t === "|" || t === "&" || t === "(" || t === ")";
+}
+
+/** Does this redirect operator CONSUME the next token as its operand?
+ *  `>`, `>>`, `2>`, `<`, `&>`, `&>>`, `>&` do (`> out`, `< in`, `&> log`).
+ *  An fd-DUP / fd-CLOSE form (`2>&1`, `1>&2`, `2>&-`, `<&0`) names an fd that
+ *  is already open and takes NO operand. The distinction decides how far the
+ *  program walk steps over a leading redirect (#523 round-6 F1). */
+function _redirectTakesOperand(t) {
+  if (!_isRedirectOperator(t)) return false;
+  if (/^[0-9]*[<>]&(?:[0-9]+-?|-)$/.test(t)) return false; // fd-dup / fd-close
+  return true;
+}
+
+/**
+ * `_scriptInvocationAt` for a simple command that may begin with REDIRECTS.
+ *
+ * The command word of a simple command is its first NON-REDIRECT token, and a
+ * redirect may stand IN FRONT of it (`2>/dev/null ./x.sh`, `&> log sh <<X`,
+ * `<evil.sh bash`) — tree-sitter-bash models `redirect` nodes before
+ * `command_name`, and mvdan.cc/sh attaches a redirect to the `CallExpr` ahead of
+ * its `Args`. `_scriptInvocationAt`'s own leading scan steps over fd-DUP/close
+ * forms only, so it stopped at a redirect WITH an operand, resolved nothing, and
+ * `next` jumped to the FOLLOWING command boundary — the rest of the simple
+ * command was then never visited (#523 round-6 F1 inside a body, round-7 F1 on an
+ * opener line).
+ *
+ * Also reports `stdinFile`: the fd-0 FILE a leading `<`/`0<` named. That operand
+ * IS the program when the invocation has no script positional (`<evil.sh bash` —
+ * bash reads evil.sh as its program), so it must be gated even though it is not
+ * the token the command word resolves to (#523 round-7 F2a).
+ * @param {string[]} tokens
+ * @param {number} i0
+ * @returns {{path: string|null, next: number|undefined, interpreted: boolean, stdinProgram: boolean, stdinFile: string|null}}
+ */
+function _leadingScriptInvocationAt(tokens, i0) {
+  let i = i0;
+  let stdinFile = null;
+  while (i < tokens.length && _isRedirectOperator(tokens[i])) {
+    const op = tokens[i];
+    // `<<<` (a here-string) is tokenized as the operator PAIR `<<` + `<` and
+    // takes ONE operand — the here-string word. Consuming it as operator +
+    // operand landed the "command word" on that word, so the real command was
+    // never resolved (`<<< data /tmp/x.sh` in a body executes x.sh; measured
+    // `[]`, #523 round-7 F2b). The word is DATA written on the line, never a
+    // program file.
+    if (op === "<<" && tokens[i + 1] === "<") { i += 3; continue; }
+    if (!_redirectTakesOperand(op)) { i += 1; continue; } // fd-dup / fd-close: no operand
+    if (op === "<" || op === "0<") stdinFile = tokens[i + 1] ?? null;
+    i += 2;
+  }
+  if (i >= tokens.length) return { path: null, next: tokens.length, interpreted: false, stdinProgram: false, stdinFile: null };
+  const inv = _scriptInvocationAt(tokens, i);
+  return { ...inv, stdinFile: inv.stdinProgram ? stdinFile : null };
+}
+
+/** The `stdinProgram` verdict for a text segment that may begin with redirects. */
+function _stdinProgramOf(text) {
+  return _leadingScriptInvocationAt(_tokenize(String(text ?? "")), 0).stdinProgram === true;
+}
+
+/** Index a program walk resumes from after the simple command starting at
+ *  `from`: the next boundary token, or tokens.length when the command runs to
+ *  the end. */
+function _nextScriptCommandAt(tokens, from) {
+  for (let k = from; k < tokens.length; k++) {
+    if (_isScriptCommandBoundary(tokens[k])) return k;
+  }
+  return tokens.length;
+}
+
+/** Shell KEYWORDS that occupy a command position without being the command
+ *  (`if true; then <cmd>`, `for f in a; do <cmd>`, `case x in a) <cmd>;; esac`).
+ *  Only the heredoc-PROGRAM walk skips them: it is looking for the programs a
+ *  body runs, so a frame word must not hide the command inside the frame. The
+ *  deliberately EXCLUDED words are the ones that are also ordinary commands
+ *  (`test`, `true`, `set`, `cd`, `eval`, `time`, `:` …) — skipping those would
+ *  move the scan onto their first ARGUMENT and read it as a script path. */
+const _PROGRAM_FRAME_WORDS = new Set([
+  "if", "then", "elif", "else", "fi", "while", "until", "do", "done",
+  "for", "in", "case", "esac", "!", "{", "}",
+]);
+
+/**
+ * Resolve the script FILE the simple command at `tokens[i0]` executes.
+ *
+ * Returns `{ path, next, stdinProgram, interpreted }`: `path` is the script
+ * operand (or null), `next` is the index a PROGRAM walk resumes from (the next
+ * command boundary), `stdinProgram` says whether the interpreter's program
+ * comes from STDIN at all — i.e. no script operand, no `-c`/`--command` inline
+ * string, no process-substitution operand, and no fd-0 FILE redirect left
+ * standing (#523 round-2) — and `interpreted` says HOW `path` runs. Only `path`
+ * is read by `extractScriptPath`, so the command-line semantics are exactly what
+ * they were; the other three exist for the heredoc-body walk, which must see
+ * every command in a program, must know whether a body is that program, and
+ * must know per PATH whether the shell READS the file (#523 review round-4 —
+ * see `extractHeredocProgramScriptInvocations`).
+ * @param {string[]} tokens
+ * @param {number} i0
+ * @returns {{path: string|null, next: number, stdinProgram: boolean, interpreted: boolean}}
+ */
+function _scriptInvocationAt(tokens, i0) {
+  // `interpreted` (#523 round-4) distinguishes the two ways a resolved path runs,
+  // because only one of them reads the file's BYTES:
+  //   TRUE  — an INTERPRETER reads it as text: a shell script operand
+  //           (`bash x.sh`), a stdin file (`bash < x.sh`), `.`/`source x.sh`.
+  //           The content walk must run whatever the first bytes are.
+  //   FALSE — the file is executed DIRECTLY (execve): the kernel runs an ELF /
+  //           Mach-O and never asks an interpreter to read it, so the #1485
+  //           opaque-binary stand-down applies. A bare `/abs/x.sh` or `./x.sh`
+  //           token is this form.
+  // Only meaningful when `path` is non-null; every null return reports false.
+  const done = (path, from, interpreted = true) => ({
+    path,
+    next: _nextScriptCommandAt(tokens, from),
+    stdinProgram: false,
+    interpreted: path ? interpreted !== false : false,
+  });
   // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
   // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
   // basename retired the M4 script-content closure for colliding names —
@@ -10634,7 +12753,7 @@ export function extractScriptPath(command) {
   // `./time`, so the script was never read.
   const isSpawnerTok = (x) => SPAWNER_WORDS.has(x) || (String(x).startsWith("/") && SPAWNER_WORDS.has(basename(String(x))));
   const isShellTok = (x) => SHELL_INTERPRETERS.has(x) || (String(x).startsWith("/") && SHELL_INTERPRETERS.has(basename(String(x))));
-  let i = 0;
+  let i = i0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
@@ -10668,9 +12787,12 @@ export function extractScriptPath(command) {
     if (t === "&&" || t === ";" || t === "||") { i++; continue; } // separators
     if (t === "(" || t === ")") { i++; continue; }                 // #347: subshell wrappers
     if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t) || t === "<&" || /^[<>]&/.test(t)) { i++; continue; } // round-17: fd-dup/close prefixes
+    // A non-script command word ENDS the leading scan: the token itself is
+    // resolved below (it may be the interpreter), and a program walk resumes at
+    // the separator that ends this simple command.
     break;
   }
-  if (i >= tokens.length) return null;
+  if (i >= tokens.length) return { path: null, next: tokens.length, stdinProgram: false, interpreted: false };
   const t = tokens[i];
   if (isShellTok(t)) { // abs path: `/bin/sh evil.sh`
     // (#444) The script operand is the FIRST non-flag, non-redirect positional
@@ -10714,14 +12836,33 @@ export function extractScriptPath(command) {
       if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; } // fd-dup/close — no operand
       if (n === "<(" || n.startsWith("<(")) { sawProcessSub = true; j++; continue; } // process substitution FD
       if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
-        if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
-          stdinOperand = tokens[j + 1]; // the stdin file — the program only with -s, or without a script positional
+        // `<<` (§523): the next token is a HEREDOC DELIMITER, not a file — the
+        // program it feeds is the BODY, which is not on this command line at
+        // all (`_heredocSplitForScripts` removes it before tokenizing). Reading
+        // the delimiter as a stdin file made `bash <<EOF` resolve `EOF` (a
+        // phantom path), and made the body's first token look like the script.
+        if (n === "<" || n === "0<") {
+          stdinOperand = tokens[j + 1]; // the stdin FILE — the program with -s, or with no script positional
+        } else if (/^(?:[0-9]+)?<<-?$/.test(n)) {
+          // (#523 round-2 P1) LAST fd-0 REDIRECT WINS. bash processes
+          // redirections LEFT TO RIGHT, so a heredoc opener AFTER an `<` file
+          // redirect REPLACES it as fd 0 — `bash < /dev/null <<EOF` feeds the
+          // BODY (the file is never read), so the earlier `<` operand is NOT a
+          // script and the body IS the program. Keeping the stale operand made
+          // `program` false, the body went unwalked, and the only path gated
+          // was `/dev/null` (a char device `_gateScriptPathContent` skips) —
+          // measured ALLOWED on the head for `bash < /dev/null <<EOF` +
+          // `/tmp/evil.sh` while `main` BLOCKED it: a regression, and exactly
+          // the defect #523 exists to close. The mirror shape is unaffected:
+          // in `bash <<EOF < /dev/null` the FILE is the later redirect and the
+          // `<` branch above has already overwritten the operand.
+          stdinOperand = null;
         }
         j += 2;
         continue;
       }
-      if (_isShellBoundary(n)) break;
-      if (sawDoubleDash) return n; // after `--` ANY operand is the script (dash-leading too)
+      if (_isShellBoundary(n)) break; // fall through: a stdin operand seen so far IS the program (B34/B36)
+      if (sawDoubleDash) return done(n, j); // after `--` ANY operand is the script (dash-leading too)
       if (n === "--") { sawDoubleDash = true; j++; continue; }
       if (n === "-c" || n === "--command" || n.startsWith("--command=")) {
         sawInline = true;
@@ -10750,21 +12891,303 @@ export function extractScriptPath(command) {
       // A non-flag, non-redirect operand:
       if (sawInline) { j++; continue; } // -c: $0/$1 args — never a script file
       if (sawDashS) { j++; continue; }  // -s: $0/$1 — the program is stdin (redirect seen above)
-      return n;                         // THE script — later tokens are its args ($1…)
+      return done(n, j);                // THE script — later tokens are its args ($1…)
     }
-    if (sawInline) return null; // `-c 'inline'` — gated by the normal classifier
-    if (sawProcessSub) return null; // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
+    if (sawInline) return done(null, i); // `-c 'inline'` — gated by the normal classifier
+    if (sawProcessSub) return done(null, i); // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
     // No script positional: a stdin redirect's operand IS the program —
     // `bash < evil.sh`, and with -s the ONLY program source (`bash -s < f
-    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case).
-    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null;
+    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case). A HEREDOC's operand
+    // (its delimiter) is deliberately not a candidate — the program is the
+    // body, resolved by `extractHeredocProgramScriptPaths` (#523).
+    //
+    // `stdinProgram` is TRUE only when NOTHING else claims the program: a
+    // leftover fd-0 file operand means the file is the program (a heredoc that
+    // came earlier was then superseded), and `-c`/`<(` were returned above.
+    // This flag is what the #523 body predicate reads — `operand === null`
+    // alone was too coarse in both directions: it walked a `-c` program's STDIN
+    // DATA (over-block, round-2 P2) and, with the stale `<` operand above, it
+    // refused to walk the body a heredoc really feeds (fail-open, round-2 P1).
+    const stdinPath = stdinOperand && !String(stdinOperand).startsWith("-") ? stdinOperand : null;
+    // A stdin FILE operand is READ by the interpreter, so it is `interpreted`.
+    return {
+      path: stdinPath,
+      next: _nextScriptCommandAt(tokens, i),
+      stdinProgram: stdinOperand === null,
+      interpreted: stdinPath ? true : false,
+    };
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];
-    return next && !next.startsWith("-") ? next : null;
+    return done(next && !next.startsWith("-") ? next : null, i);
   }
-  if (/^\.{0,2}\//.test(t)) return t; // ./x.sh or /abs/x.sh direct execution
-  return null;
+  if (/^\.{0,2}\//.test(t)) return done(t, i, false); // ./x.sh or /abs/x.sh — DIRECT execution (execve, no reader)
+  return done(null, i);
+}
+
+/**
+ * Is the heredoc body on this opener line the PROGRAM its consumer runs (#523)?
+ *
+ * TRUE only when a SHELL interpreter consumes the body as its stdin PROGRAM:
+ * no script operand, no `-c`/`--command` inline string, no `<(` operand, and
+ * the deciding fd-0 redirect is the heredoc itself (see the last-redirect-wins
+ * note in `_scriptInvocationAt`). Both directions are measured shapes:
+ *
+ *  - `bash < /dev/null <<EOF` → TRUE. bash's redirections are processed left to
+ *    right, so the heredoc replaces the earlier `<` as fd 0; the file is never
+ *    read and the body executes. (Pre-fix: the stale `<` operand made this
+ *    FALSE, the body was not walked, and the defect #523 closes stayed open —
+ *    a regression against `main`, which resolved the body token by accident.)
+ *  - `bash -c 'echo hi' <<EOF` → FALSE. The body is the `-c` string's stdin
+ *    DATA; nothing in it executes, so walking it could only over-block.
+ *  - `bash <<EOF | bash helper.sh` → TRUE. The SEGMENT THAT OWNS THE `<<` is a
+ *    stdin-program shell, so it executes the body; the pipe to its right
+ *    consumes that shell's STDOUT and never sees the heredoc. (Pre-fix: any
+ *    pipe interpreter's verdict was returned unconditionally, so this shape
+ *    resolved NOTHING while real bash ran the body — a fail-OPEN, and a
+ *    regression inside this change.)
+ *  - `cat <<'X' | bash` → TRUE, via the segment after the pipe: the OPENER is
+ *    not an interpreter, so the CONSUMER is the interpreter there, and a piped
+ *    `-c` (`| bash -c 'cat'`) is DATA again.
+ *  - `cat <<EOF | python3` → FALSE: a code interpreter consumes the body as
+ *    CODE (the #627 surface, same as the head form `python3 <<PY`), never as a
+ *    shell program.
+ * @param {string} code the opener line, comment-stripped
+ * @param {string|null} kind `_wtHeredocKind(code)` — nothing is a program unless this is `"shell"`
+ * @returns {boolean}
+ */
+function _heredocBodyIsProgram(code, kind) {
+  if (kind !== "shell") return false;
+  // ⛔ THE SEGMENT THAT OWNS THE `<<` DECIDES FIRST. When it is itself a shell
+  // interpreter it reads the body as its stdin program (or as DATA, when it has
+  // a script operand or a `-c` string), and everything to the right of a pipe
+  // gets that shell's STDOUT — never the heredoc. Asking the pipe consumer
+  // instead made `bash <<EOF | bash helper.sh`, `| bash -c 'true'` and
+  // `| python3 -c …` fail OPEN: real bash executes the body, the walk resolved
+  // `[]`, and `_backdoorBlock` saw no path to gate (#523 round-3 F1, measured).
+  // `_wtOpenerSegment` is the same opener the kind decision uses, so the two
+  // cannot disagree about WHICH segment consumes the body.
+  const opener = _wtOpenerSegment(code);
+  const openerInterp = _wtHeadInterpreter(opener);
+  if (openerInterp !== null) {
+    if (_WT_SHELL_WORDS.test(basename(String(openerInterp)))) {
+      return _stdinProgramOf(opener);
+    }
+    // ⛔ A NON-SHELL INTERPRETER OPENER CONSUMES THE BODY ITSELF — the pipe
+    // carries that interpreter's STDOUT to whatever is on the right, and the
+    // right-hand command never sees the heredoc. `python3 <<PY | bash` is a
+    // PYTHON program whose output is piped into bash: the body is python SOURCE
+    // and nothing in it executes as shell. Falling through to the pipe loop made
+    // the shell on the right walk the python body as a PROGRAM, so a path in a
+    // `print("./gen.sh")` string was resolved and content-gated as a DIRECT
+    // execution — an OVER-BLOCK and a REGRESSION against `main`, which resolves
+    // nothing here (measured: `["./gen.sh"]` on the head, `null` on `main`;
+    // #523 round-5 F1). A parser answers this from the grammar — a heredoc
+    // belongs to the simple command it is attached to (tree-sitter-bash's
+    // `heredoc_redirect`, mvdan.cc/sh's redirect node) — which is the rule this
+    // branch now follows.
+    return false;
+  }
+  // Otherwise the opener is not an interpreter at all (`cat`, `tee`, `grep …`)
+  // and the body is piped INTO a consumer: the pipeline's first
+  // stdin-consuming interpreter decides. The split mirrors
+  // `_wtLinePipesToInterpreter` (same naive-but-conservative splitting, so the
+  // two never disagree about WHETHER an interpreter consumes the body).
+  const segs = String(code).split("|");
+  for (let k = 1; k < segs.length; k++) {
+    const interp = _wtHeadInterpreter(segs[k]);
+    if (interp === null) continue;
+    if (!_WT_SHELL_WORDS.test(basename(String(interp)))) return false; // CODE consumer → #627 surface
+    return _stdinProgramOf(segs[k]);
+  }
+  return _stdinProgramOf(code);
+}
+
+/**
+ * Split a command at its heredoc regions for the script-path walk (#523).
+ *
+ * `header` is the command with every heredoc BODY blanked — line-for-line, so
+ * line numbers and offsets are unchanged — and `bodies` carries each body's
+ * text, its consumer kind (`_wtHeredocKind`: `"shell"` = a shell EXECUTES the
+ * body, `"code"` = a non-shell interpreter does, `null` = a positively
+ * identified DATA consumer) and `program`: true when the body IS the program
+ * the interpreter runs, i.e. the opener line hands it no script operand.
+ *
+ * Why the header matters: a heredoc body is NOT part of the command line. The
+ * old walk tokenized the raw text, so the tokens after `<<DELIM` were scanned
+ * as if they were command-line words — `bash <<EOF` with a body whose first
+ * line is `echo hi` resolved `echo` (a non-file), the content gate no-opped,
+ * and every file the body actually executed went unread (#523, measured:
+ * `bash <<EOF` + `/tmp/evil.sh` ALLOWED while `bash /tmp/evil.sh` BLOCKED).
+ * @param {string} command
+ * @returns {{header: string, bodies: Array<{kind: string|null, text: string, program: boolean}>}}
+ */
+function _heredocSplitForScripts(command) {
+  const text = String(command ?? "");
+  // Cheap superset bail: no `<<` anywhere means no heredoc (and `<<<` here-strings
+  // are not heredocs to `_wtScanLine`, which emits them as `<<` + `<`).
+  if (!text.includes("<<")) return { header: text, bodies: [] };
+  const header = [];
+  const bodies = [];
+  const carry = { quote: null, arith: 0 };
+  let pending = null;
+  for (const line of text.split("\n")) {
+    if (pending) {
+      // ⛔ MATCH THE TERMINATOR THE WAY BASH DOES — the line must BE the
+      // delimiter, with no leading or trailing blanks; `<<-` strips leading
+      // TABS (and only tabs) first. `trim()` also accepted `   EOF` / `EOF   `,
+      // which bash keeps as BODY lines: the split ended the body early and
+      // routed the rest of the program into `header`, where the command-line
+      // scan resolves ONE path — so a space-padded `EOF` shielded an arbitrary
+      // body (measured: `bash <<EOF` + `   EOF` + `true` + `/tmp/evil.sh` +
+      // `EOF` → `["true"]`, ALLOWED, while real bash runs the marker; #523
+      // round-3 F2). The trim() precedent is the M5 DISCARD walk's, where
+      // ending a body early exposes MORE text; here the seam has the opposite
+      // polarity, so the borrowed rationale does not carry.
+      const term = pending.dash ? line.replace(/^\t+/, "") : line;
+      if (term === pending.delim) {
+        bodies.push({ kind: pending.kind, text: pending.buf.join("\n"), program: pending.program });
+        header.push("");
+        pending = null;
+        continue;
+      }
+      pending.buf.push(line);
+      header.push("");
+      continue;
+    }
+    const { text: code, delim, delimDash } = _wtScanLine(line, carry);
+    header.push(code);
+    if (delim !== null) {
+      const kind = _wtHeredocKind(code);
+      // `bash <<EOF script.sh` — the operand IS the script and the body is its
+      // stdin DATA (probe-verified against real bash). Only a body a shell
+      // interpreter reads as its stdin PROGRAM is walked: `_heredocBodyIsProgram`
+      // owns the whole predicate (no script operand, no `-c` inline string, no
+      // process substitution, last-fd-0-redirect-wins), because each of those
+      // parts was a separate measured hole (#523 round-2 P1/P2).
+      pending = { delim, dash: delimDash, kind, program: _heredocBodyIsProgram(code, kind), buf: [] };
+    }
+  }
+  // Unterminated heredoc: bash feeds the rest of the text to the interpreter as
+  // the body, so the trailing lines are program text, not command-line tokens.
+  if (pending) bodies.push({ kind: pending.kind, text: pending.buf.join("\n"), program: pending.program });
+  return { header: header.join("\n"), bodies };
+}
+
+/**
+ * Every script FILE a heredoc-fed SHELL interpreter's program executes (#523),
+ * with PER-PATH PROVENANCE about how that invocation runs the file.
+ *
+ * The body is a PROGRAM, not a command line, so every command position in it is
+ * walked (line breaks and `;`/`&&`/`||`/`|` are command boundaries there, and
+ * control-flow frame words are skipped). Nested heredocs inside a body are
+ * followed to a depth bound, and a body that is not a shell program (python
+ * `<<PY` is the #627 code surface; `cat`'s heredoc is data) contributes
+ * nothing.
+ *
+ * `interpreted` is per INVOCATION, not per command (#523 review round-4): a
+ * bare body line (`/usr/bin/git status`, `./x.sh`) is executed DIRECTLY — the
+ * kernel runs it and no interpreter ever reads the bytes — while `bash x.sh`,
+ * `bash < x.sh` and `. x.sh` on a body line hand the file to a READER. The
+ * handler needs that distinction: forcing `viaInterpreter` for EVERY body path
+ * re-created the #1485 false block on every opaque binary a body executes (a
+ * Go binary's bytes contain git-shaped prose; measured BLOCK for the body form
+ * of a command `main` ALLOWS directly).
+ * @param {string} bodyText
+ * @param {number} depth
+ * @returns {{path: string, interpreted: boolean}[]}
+ */
+function _programScriptInvocations(bodyText, depth = 0) {
+  const out = [];
+  const { header, bodies } = _heredocSplitForScripts(bodyText);
+  const tokens = _tokenize(header, { newlineIsSeparator: true });
+  let i = 0;
+  while (i < tokens.length) {
+    while (i < tokens.length && (_isScriptCommandBoundary(tokens[i]) || _PROGRAM_FRAME_WORDS.has(tokens[i]))) i++;
+    if (i >= tokens.length) break;
+    // ⛔ THE COMMAND WORD IS THE FIRST NON-REDIRECT TOKEN of the simple command.
+    // A redirect may stand BEFORE it (`2>/dev/null ./x.sh`, `<evil.sh bash`) and
+    // bash still executes/reads what it names. `_leadingScriptInvocationAt` steps
+    // over the operator AND its operand (and over a here-string's single word),
+    // so the remaining tokens of the line are not silently skipped; the fd-0 FILE
+    // a leading `<`/`0<` named is reported back as `stdinFile` because `<evil.sh
+    // bash` makes evil.sh BASH'S PROGRAM — measured `[]` for that body line while
+    // real bash executes the file (#523 round-6 F1, round-7 F2a).
+    const inv = _leadingScriptInvocationAt(tokens, i);
+    if (inv.stdinFile) out.push({ path: inv.stdinFile, interpreted: true });
+    if (inv.path) out.push({ path: inv.path, interpreted: inv.interpreted === true });
+    i = inv.next > i ? inv.next : i + 1; // never spin on a zero-width advance
+  }
+  if (depth < 2) {
+    for (const b of bodies) {
+      if (b.program) out.push(..._programScriptInvocations(b.text, depth + 1));
+    }
+  }
+  return out;
+}
+
+/**
+ * Collapse repeated invocations of the SAME path to one entry, keeping order and
+ * OR-ing `interpreted` — the conservative direction: if ANY invocation of a path
+ * hands it to a reader, one invocation's bytes are READ, so the path must be
+ * content-gated.
+ * @param {{path: string, interpreted: boolean}[]} list
+ * @returns {{path: string, interpreted: boolean}[]}
+ */
+function _dedupeScriptInvocations(list) {
+  const byPath = new Map();
+  for (const inv of list) byPath.set(inv.path, (byPath.get(inv.path) ?? false) || inv.interpreted === true);
+  return [...byPath].map(([path, interpreted]) => ({ path, interpreted }));
+}
+
+/**
+ * The script FILES a heredoc body executes, each with its per-invocation
+ * provenance, for the consumers that gate EVERY one of them rather than the
+ * first (#523). `extractScriptPaths` already includes these paths; this export
+ * exists so a caller can tell a body-resolved path apart from a command-line
+ * one AND know whether that body invocation READS the file (see
+ * `_programScriptInvocations`).
+ * @param {string} command
+ * @returns {{path: string, interpreted: boolean}[]}
+ */
+export function extractHeredocProgramScriptInvocations(command) {
+  const out = [];
+  const { bodies } = _heredocSplitForScripts(command);
+  for (const b of bodies) {
+    if (b.program) out.push(..._programScriptInvocations(b.text));
+  }
+  return _dedupeScriptInvocations(out);
+}
+
+/**
+ * The script FILES a heredoc body executes (#523) — bare paths, for callers
+ * that need membership only. `extractHeredocProgramScriptInvocations` is the
+ * form that also reports how each path runs.
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function extractHeredocProgramScriptPaths(command) {
+  return extractHeredocProgramScriptInvocations(command).map((inv) => inv.path);
+}
+
+/**
+ * Every script FILE this command executes, in resolution order: the command
+ * line's leading script invocation first (at most one — the
+ * one-script-per-command-line class is #3538, and is deliberately NOT this
+ * surface), then every script execution in each heredoc body a shell
+ * interpreter reads as its PROGRAM.
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function extractScriptPaths(command) {
+  const { header, bodies } = _heredocSplitForScripts(command);
+  const out = [];
+  const lead = _scriptInvocationAt(_tokenize(header), 0).path;
+  if (lead) out.push(lead);
+  for (const b of bodies) {
+    if (b.program) out.push(..._programScriptInvocations(b.text).map((inv) => inv.path));
+  }
+  return [...new Set(out)];
 }
 
 /**

@@ -15,7 +15,54 @@ export PI_FLEET_PATH_PINNED=1
 # `objective.py`'s refresh, the heaviest gh reader in the tree — kept calling gh unserialised and
 # un-backed-off, while the cells (whose supervisor exports `O`) had the layer. Same default as
 # `orch-loop.sh` and `deploy-mac-orchestrator.sh`.
-export PATH="/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims:$PATH"
+# ⛔ DERIVED FROM `$HOME`, NOT FROM A USERNAME (#1867). This line used to name one user's home
+# LITERALLY (`/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims`). On that one laptop it
+# was correct; on every other box — a second Mac, a Linux cell — it prepended two paths that do not
+# exist and pushed the load-bearing `gh` shim dir NOT onto PATH at all, so `gh` silently fell back to
+# whatever the launch environment happened to carry. A pin is a repair; a repair spelled with one
+# user's name is a divergence that only shows up on the machine nobody tested.
+# The ORDER is unchanged (bin, then cmux, then the agent dirs, then whatever was already on PATH)
+# and an entry is added only when it EXISTS, so the same line means the same thing on macOS and
+# Linux.
+# ⛔ THE PIN IS APPLIED IN ONE PLACE, FURTHER DOWN (#1867 review P1 residual). It used to be TWO
+# blocks — a two-entry prepend here and the rest below — and both prepended each entry inside their
+# own loop, which installs a list REVERSED (the last entry wins the front). Measured on a brew Mac:
+# `/opt/homebrew/bin` ended up ahead of `$HOME/.pi/agent/shims`, so every child's bare `gh` resolved
+# to the raw binary and the #984 admin-merge guard plus the #1910 fleet pacing gate were silently
+# inert for the loop's whole life (the trap `MEMORY.md:59` records verbatim). One list, built in
+# order and prepended ONCE, reproduces the precedence `main`'s single literal had.
+# It also waits for HOME to be validated and pinned below, which is the HOME its entries derive from.
+# `HOME` IS REQUIRED, NEVER FORCE-SET (#1867). The one-user pin that used to live here
+# (`if [ -d /Users/danielospina ]; then export HOME=…`) re-homed the process to a path derived from
+# the CALLER's HOME above, so the loop wrote its state under one home and changed into another —
+# the file's own note records that disagreement. Worse, on a box that did not have that directory
+# it silently did nothing, and `cd "$HOME" || exit 0` below then exited 0 having logged NOTHING.
+# A loop that cannot say which home it runs in must refuse loudly: every path it publishes is
+# derived from this root.
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+    # ⛔ STDERR ONLY, AND THAT IS THE HONEST FORM (#1867 review). The "durable log" half that used
+    # to sit here was DEAD: `STATE`/`LOG` are assigned further down this file and no caller exports
+    # them, so `${STATE:-}` was always empty at this point — and if a caller ever DID export STATE,
+    # the `>> "$LOG"` under `set -u` would abort with rc=1 instead of the promised 2. The refusal
+    # itself is the part that works, and it is pinned (rc=2 + "REFUSING"), so it stays exactly that.
+    echo "heartbeat-loop: REFUSING to start: HOME=${HOME:-<unset>} is unset or not a directory" >&2
+    exit 2
+fi
+# ⛔ "IS A DIRECTORY" IS NOT "CAN BE ENTERED" (#3826 review P3). `[ -d "$HOME" ]` needs only SEARCH on
+# the PARENT, so a mode-000 home passes this guard and the `cd "$HOME"` far below then hit
+# `|| exit 0` — the loop exiting SUCCESS having written no pidfile and no log, which is precisely the
+# "green having logged nothing" shape this guard's own header says it removed. MEASURED with a mode-000
+# home owned by another user (the `su` / systemd `User=` leftover shape):
+#   heartbeat-loop.sh: line 527: cd: /tmp/htest4/home: Permission denied   →  RC=0
+# ⛔ AND IT IS PROBED HERE, BEFORE THE SELF-DETACH, ON PURPOSE. Probed only at the `cd`, the refusal
+# lands in the DETACHED CHILD while the CALLER's `bash heartbeat-loop.sh` returns 0 — the same lie one
+# process further out. A subshell probe needs no cwd change, so nothing that runs between here and the
+# real `cd` (`_beat_pin_repo_evidence`, which reads the caller's tree) is moved.
+( cd "$HOME" ) 2>/dev/null || {
+    echo "heartbeat-loop: REFUSING to start: cannot enter HOME=$HOME" >&2
+    exit 2
+}
+export HOME
 # RAISE THE CLI DEADLINE. Measured 2026-10-01: `cmux workspace list` takes 0.2-2s on a
 # quiet box but 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow
 # answer is indistinguishable from a hang (`Error: Command timed out`). That made the
@@ -45,14 +92,24 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # Nothing about it needs to be inside cmux interactively — it only has to have
 # been started there, once.
 #
-# LIFECYCLE
-#   start:  bash ~/.pi/agent/scripts/heartbeat-loop.sh        (idempotent)
-#   stop:   touch ~/.pi/agent/state/HEARTBEAT-OFF             (loop exits)
-#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF            (exits at the top of the next pass)
-#   resume: rm -f ~/.pi/agent/state/HEARTBEAT-OFF && bash ~/.pi/agent/scripts/heartbeat-loop.sh
-#           (a start WITHOUT the rm prints "heartbeat loop started" and then exits on its own
-#            kill file in that same pass — the resume is the rm AND the start)
-#   status: cat ~/.pi/agent/state/heartbeat-loop.pid && kill -0 $(cat ...)
+# LIFECYCLE — the VERSIONED ENTRY POINT IS THE LAUNCHER, not this file (scripts/heartbeat-launch.sh):
+#   start:  bash scripts/heartbeat-launch.sh start             (idempotent; verifies the pid it reports)
+#   stop:   bash scripts/heartbeat-launch.sh stop              (writes ~/.pi/agent/state/HEARTBEAT-OFF)
+#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF             (exits at the top of the next pass)
+#   resume: bash scripts/heartbeat-launch.sh start             (refuses while the kill file is present and
+#                                                              names the `rm -f` that clears it, so the
+#                                                              resume is one command and not a remembered
+#                                                              pair)
+#   status: bash scripts/heartbeat-launch.sh status            (pid + last pass + fleet-read mtimes)
+#   check:  bash scripts/heartbeat-launch.sh check             (0 OK · 1 DRIFT · 2 UNKNOWN — behaviour)
+# ⛔ THIS BLOCK USED TO DOCUMENT `bash ~/.pi/agent/scripts/heartbeat-loop.sh` AND NOTHING ELSE (#3826
+# review P3): that path is the FARMED copy, and this file is deliberately NOT farmed — `pi-bootstrap/
+# setup.sh` holds it back pending #1553 (`lane_root_srcs`) — so on a fresh farm the only documented
+# start command named a file that does not exist on the box. Two entry points is the divergence #1867
+# exists to remove; the path below still works and is a legacy fallback, not the documented one.
+#   legacy: bash scripts/heartbeat-loop.sh                     (self-detaches; proves liveness only — see
+#                                                              the detach block at the bottom for the
+#                                                              residual it declares)
 #
 # ⛔ REBOOT: the loop does not survive one, and it CANNOT be restarted by launchd
 # (that is the whole point above). Re-run the start command after a reboot, or set
@@ -308,37 +365,157 @@ if [ -z "${LOOP_DETACHED:-}" ]; then
     fi
   fi
   LOOP_DETACHED=1 nohup /bin/bash "$0" >/dev/null 2>&1 &
-  sleep 1
-  echo "heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))"
-  exit 0
+  # ⛔ THE LAUNCH IS PROVED BY THE ARTEFACT THE LOOP LEAVES, NEVER BY THIS SHELL'S EXIT CODE (#3826
+  # review P3, round 17). This arm slept one second, printed
+  # `heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))` and exited **0** — so on a
+  # first run, where `$STATE` does not exist yet, the child's own `echo $$ > "$PIDFILE"` failed
+  # silently, the pidfile was never written, and the operator was told `heartbeat loop started (pid ?)`
+  # with a green status: the launched-once heartbeat dead and reported as running. It is the same
+  # false PASS `heartbeat-launch.sh start` was written to remove, one file over. The poll below is
+  # bounded (5s) and fails LOUDLY instead.
+  # ⛔ DECLARED RESIDUAL: this proves LIVENESS, not IDENTITY. A stale pidfile naming a LIVE stranger
+  # would satisfy `kill -0` — which is why this path is no longer the documented entry point:
+  # `heartbeat-launch.sh start` answers that with `pid_is_loop` (a recycled pid is named as such and
+  # the stale record is removed before the fork). Not duplicated here; declared instead of implied.
+  _detach_waited=0
+  _detach_pid=""
+  while [ "$_detach_waited" -lt 10 ]; do
+      sleep 0.5
+      # `-f` BEFORE the redirect: a bare `< "$PIDFILE"` on a missing file makes bash print its own
+      # "No such file or directory" on stderr every iteration — a first run, which is exactly the
+      # case this poll exists for, would have sprayed the operator's terminal with 10 of them.
+      if [ -f "$PIDFILE" ]; then
+          _detach_pid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)" || true
+      fi
+      if [ -n "$_detach_pid" ] && kill -0 "$_detach_pid" 2>/dev/null; then
+          echo "heartbeat loop started (pid $_detach_pid)"
+          exit 0
+      fi
+      _detach_waited=$((_detach_waited + 1))
+  done
+  echo "REFUSING: the loop left no live pidfile at $PIDFILE after 5s — it is NOT running (see $LOG)" >&2
+  exit 1
 fi
 
 # launchd is not involved, but a detached process still inherits the environment it
-# was started with, which may be a cmux pane's interactive shell. Pin the two
-# variables everything downstream actually needs rather than trusting that.
-# ⛔ A PIN IS A REPAIR, NOT AN OVERRIDE (#1933). It is applied only when the directory it names
-# EXISTS. Unconditionally, it also silently turned the whole loop into a no-op on any box that is
-# not this laptop: `cd "$HOME" || exit 0` below went to a path that does not exist and exited 0
-# having written NOTHING to the log -- the exact silent-green shape this file documents twice
-# above. MEASURED (`HOME=$tmp LOOP_DETACHED=1 bash scripts/heartbeat-loop.sh` on a box without
-# /Users/danielospina): rc=0, heartbeat log absent. And `STATE`/`SCRIPTS` are derived from the
-# CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
-# one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
-# that does not gets its own HOME -- consistent with the state and scripts paths.
-if [ -d /Users/danielospina ]; then export HOME="/Users/danielospina"; fi
-# ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
-# default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
+# was started with, which may be a cmux pane's interactive shell. Derive what everything
+# downstream needs from the CALLER's environment rather than trusting it.
+# ⛔ HOME IS REQUIRED AND ALREADY SETTLED ABOVE (#1867). The one-user `if [ -d /Users/danielospina ]
+# then export HOME=…` pin that lived here is gone: it named one person's home in a script that ships
+# to every machine, and it re-pinned HOME AFTER `STATE`/`SCRIPTS` had been derived from the caller's
+# HOME — state under one home, cwd under another. The requirement is now checked once, near the top,
+# and refuses loudly instead of driving `cd "$HOME" || exit 0` into a silent green.
+# ⛔ `O` IS DERIVED FROM THAT SAME HOME, never from an ambient re-read. A `:-` default is evaluated
+# once; computing it from a different `$HOME` than the one above (a `sudo`/`su` shell, an agent
 # session) exports a path that does not exist on this box, and every tool silently falls back to its
 # pinned real gh — an inert layer with nothing on any stream (#1988, review round 9). Keep this line
-# BELOW the HOME pin (the re-exec block above it must not freeze an ambient-HOME value). Same value
-# the nine resolvers look for: `$O/gh-rest/gh`, then `$O/gh-limit/gh`.
+# BELOW the HOME requirement. Same value the nine resolvers look for: `$O/gh-rest/gh`, then
+# `$O/gh-limit/gh`.
 export O="${O:-$HOME/orchestrator}"
-# `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra
-# gh-shim). It was MISSING from the first version of this PATH, and the very first
-# tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently
-# dead while the heartbeat reported a green. Add a PATH entry only when it is
-# needed, but never omit this one silently.
-export PATH="/Users/danielospina/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/danielospina/.pi/agent/bin:/Users/danielospina/.pi/agent/shims:/Users/danielospina/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra gh-shim). It
+# was MISSING from the first version of this PATH, and the very first tick logged "NOTE ask-owner
+# scan produced nothing usable" — the gate was silently dead while the heartbeat reported a green.
+# Add a PATH entry only when it is needed, but never omit this one silently.
+#
+# ⛔ NO LITERAL USER HOME (#1867). Every home-relative entry is derived from `$HOME` and added
+# only when it exists; the absolutist list this replaced (`/Users/danielospina/bin:…`) was correct
+# on exactly one machine and produced a PATH full of non-directories everywhere else. The system
+# dirs stay LAST IN THE LIST, so they keep the tail rank the same list gave them on `main`.
+# ⛔ THE LIST IS BUILT IN ORDER AND PREPENDED ONCE (#1867 review P1 residual). Prepending each entry
+# inside the loop installs the list REVERSED — the last entry wins the front — which put
+# `/opt/homebrew/bin` ahead of `$HOME/.pi/agent/shims`
+# (`scripts/orchestrator-harness/capacity-transfer.test.sh:48`: on a
+# brew Mac `gh` IS `/opt/homebrew/bin/gh`) and disarmed the `gh` shim's #984 admin-merge guard and
+# #1910 pacing gate for every child of this loop, while the pin LOOKED installed. Appending the
+# entries in list order to an accumulator and prepending that ONE string keeps the first-listed dir
+# furthest front, shims ahead of homebrew/system, and the system dirs appended below as the tail —
+# the precedence `main`'s single literal had.
+#
+# ⛔ AND "ALREADY ON PATH" IS NOT "ALREADY IN FRONT" (#1867 review P2, round 6). The pin skipped any
+# entry already present (`case ":$PATH:" in *":$_path_dir:"*) continue`), which preserves that
+# entry's INHERITED rank — so a caller whose PATH already carried `/opt/homebrew/bin` BEFORE
+# `$HOME/.pi/agent/shims` (a brew Mac's interactive shell, or any caller that exported COLUMNS/PATH
+# from a login profile) got exactly the precedence this block exists to prevent: both dirs skipped,
+# only the three absent ones prepended, and a child's bare `gh` still resolved to the raw binary.
+# The block's own comment says the shim dir "must never be omitted"; the skip arm omitted it. A pinned
+# dir is now ALWAYS prepended, and its inherited occurrences are STRIPPED from the tail, so rank is
+# forced rather than assumed. Empty PATH components (which mean the cwd) are dropped by the final
+# assembly below, which runs on every input — not by a prune nested inside a per-entry loop that only
+# runs when some pinned directory exists — because they are the one entry a caller never sees, and `.`
+# on a PATH is a hazard, not a setting.
+_pin_prefix=""
+_pin_rest="$PATH"
+_oldifs="$IFS"
+for _path_dir in \
+    "$HOME/bin" \
+    "/Applications/cmux.app/Contents/Resources/bin" \
+    "$HOME/.pi/agent/bin" \
+    "$HOME/.pi/agent/shims" \
+    "$HOME/.local/bin" \
+    "/opt/homebrew/bin"; do
+    [ -d "$_path_dir" ] || continue
+    _pin_prefix="$_pin_prefix$_path_dir:"
+    _pruned=""
+    IFS=':'
+    # Globbing OFF around the split: a PATH component containing `*` or `?` must be copied, not expanded
+    # against the cwd — the same reason `pid_is_loop` does it in `heartbeat-launch.sh`.
+    set -f
+    for _pin_dir in $_pin_rest; do
+        [ -n "$_pin_dir" ] || continue
+        [ "$_pin_dir" = "$_path_dir" ] && continue
+        _pruned="${_pruned:+$_pruned:}$_pin_dir"
+    done
+    set +f
+    IFS="$_oldifs"
+    _pin_rest="$_pruned"
+done
+unset _path_dir _pin_dir _pruned
+# ⛔ ONE ASSEMBLY, ONE PRUNE, ALWAYS (#1867 review P3, round 8). The empty-component pruning used to
+# live ONLY inside the per-entry loop above, so it ran only when at least one pinned directory existed
+# — and the tail append then welded the pieces together unconditionally. With no pinned dir present and
+# an empty PATH the result was `:/usr/local/bin:…`, a LEADING empty component: the cwd ranked AHEAD of
+# every system dir, which is the exact hazard the pass above exists to remove and one of the two inputs
+# this block's own comment named. The round-7 fix covered the empty TAIL (no trailing `:`) and missed
+# the empty BASE, and neither covered an INTERIOR `::` inherited from a caller. MEASURED on the round-7
+# line with an empty PATH and none of the six pinned dirs: the child saw
+# `PATH=:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+# The join is now component-wise and unconditional, so no input shape can emit a leading, trailing or
+# interior empty component — and the system tail cannot be appended twice. The pieces are handed to ONE
+# split (`_pin_prefix`'s own trailing `:` is just a delimiter here, so an empty value neither welds a
+# `::` nor needs a separate "is the tail empty" arm), which is why the 2-arm `if` it replaces is gone.
+_pin_path=""
+_oldifs="$IFS"
+IFS=':'
+# Globbing OFF around the split: a PATH component containing `*` or `?` must be copied, not expanded
+# against the cwd — the same reason `pid_is_loop` does it in `heartbeat-launch.sh`.
+set -f
+for _pin_dir in $_pin_prefix $_pin_rest /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    # ⛔ `''`, `.` AND `..` ARE THE SAME HAZARD, SPELLED THREE WAYS (#1867 review, round 12). This prune
+    # dropped only the EMPTY component, so a caller's literal `.` came through verbatim (measured:
+    # `PATH='/opt/homebrew/bin:/usr/bin:.:/bin'` → `…:/opt/homebrew/bin:/usr/bin:.:/bin:/usr/local/bin:…`).
+    # That is NEW with this change and not a pre-existing hole: on main this block REPLACED PATH with one
+    # literal and never inherited a caller's entries, so no `.` could survive it. Now the loop lives for
+    # days, detaches, and its children `cd` into worktrees and run bare commands — so a `.` on PATH is
+    # the block's own stated concern ("`.` on a PATH is a hazard, not a setting") executing whatever the
+    # child's cwd happens to hold. `.` and `..` are the non-empty spellings of the cwd entry; they are
+    # dropped with the empty one, and the system tail keeps the resulting PATH usable.
+    case "$_pin_dir" in ''|.|..) continue ;; esac
+    _pin_path="${_pin_path:+$_pin_path:}$_pin_dir"
+done
+set +f
+IFS="$_oldifs"
+# ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
+# this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —
+# so every child's bare `gh` resolved to the raw binary and NOT to `~/.pi/agent/shims/gh`. That shim
+# is load-bearing, not a convenience wrapper: its header calls it "the argv-level admin-merge guard
+# (#984)" and "THE FLEET COURTESY GATE (#1910)", and `:3-10` of THIS file records the measured
+# consequence of losing it ("every telemetry read returned empty and the fleet read '0 open PRs /
+# VERDICT=STALLED' while 100 PRs were open"). The assembly above keeps them LAST — pinned prefix,
+# then the inherited PATH, then the system tail — which reproduces the pre-change precedence
+# (shims before homebrew/system) on both platforms.
+PATH="$_pin_path"
+export PATH
+unset _pin_prefix _pin_rest _pin_path _pin_dir _oldifs
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
 
 # ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).
@@ -398,7 +575,14 @@ _beat_pin_repo_evidence() {
   fi
 }
 _beat_pin_repo_evidence
-cd "$HOME" || exit 0
+# ⛔ `cd "$HOME" || exit 0` WAS THE SAME FAILURE THE GUARD AT THE TOP CLOSES, ON THE OTHER HALF (#3826
+# review P3). The guard refuses an UNSET or non-directory HOME; a HOME that EXISTS but cannot be
+# ENTERED passes `[ -d "$HOME" ]` (stat needs only search on the parent) and then hit `exit 0` — the
+# loop exiting SUCCESS having logged NOTHING, no pidfile, no state dir. Measured with a mode-000 HOME
+# owned by another user (the `su` / systemd `User=` leftover shape):
+#   heartbeat-loop.sh: line 527: cd: /tmp/htest4/home: Permission denied   →  RC=0
+# A caller reading that rc is told the beat is running. One refusal, one code: 2, at both halves.
+cd "$HOME" || { echo "heartbeat-loop: REFUSING: cannot enter HOME=$HOME" >&2; exit 2; }
 
 echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT

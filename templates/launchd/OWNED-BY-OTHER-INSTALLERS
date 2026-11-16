@@ -1,0 +1,59 @@
+# templates/launchd/OWNED-BY-OTHER-INSTALLERS — launchd labels THIS REPO installs (or adopts) from a
+# surface other than `scripts/install-launchd.sh`'s template set (#1867 review P1).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `install-launchd.sh --status` reports any installed `com.eldato.*` / `com.tortoise.*` plist with no
+# template as UNMANAGED and exits non-zero. That instrument is right, but its declared set is ONE
+# directory, and this repo installs launchd jobs from other surfaces: the harness controller
+# `com.eldato.orchestrator-loop`, rendered by `scripts/orchestrator-harness/install.sh` from
+# `scripts/orchestrator-harness/launchd.plist.template` and cycled through `launchd-cycle.sh` — it is
+# deliberately NOT in this directory, because that installer owns its own lifecycle.
+#
+# Flagging it made `--status` exit 1 forever on the reference Mac layout, and the caller that gates on
+# it hard-FAILs: `scripts/fleet-schedule.py` → `FAIL … SCHEDULE NOT VERIFIED` →
+# `activate-harness.sh` → `fleet-schedule … FAILING`. A drift instrument whose healthy state is red
+# is one an operator learns to ignore — or silences by deleting a plist the controller needs.
+#
+# WHAT BELONGS HERE
+# -----------------
+# A label that (a) matches the UNMANAGED scope, (b) is installed — or is adopted and supervised — by
+# another surface of THIS repo, named in the entry's own comment with its file, and (c) therefore has
+# no template here. A job that should be GONE belongs in `RETIRED` instead (that is a removal). A job
+# nobody declares is exactly what UNMANAGED is for — do not add it here to quiet the alarm.
+#
+# ⛔ WHY THE REMEDY MAKES THIS LIST LOAD-BEARING, NOT COSMETIC: `--status` prints, for every label it
+# reports, `launchctl bootout … && rm -f …`. A missing entry therefore does not merely print a false
+# alarm — it hands the operator the command that DELETES a live job belonging to the box's own
+# controller. Both entries below were found that way (#1867 review P1, rounds 4-5).
+#
+# ⛔ DRIFT-GATED IN BOTH DIRECTIONS: `scripts/install-launchd.test.sh` §18 asserts (1) every entry
+# below still has a DECLARING SURFACE in this repo — matched against `LABEL="…"`, `BASE_LABEL="…"`,
+# `LABEL="${LABEL:-com.…}"`, a python `label = "com.…"` assignment, an inline
+# `<string>com.…</string>` plist label, or a literal `Library/LaunchAgents/com.….plist` path, so an
+# entry cannot go stale — and (2) the REVERSE: every `com.eldato.*` / `com.tortoise.*` label any
+# installer in this repo (shell OR python — see `merge-reminder.py` below) writes into `LaunchAgents`
+# is a template, RETIRED, or listed here, so a MISSING entry fails the suite instead of becoming a
+# delete advice. A gate that can only drift one way cannot notice the direction that does harm.
+#
+#   com.eldato.orchestrator-loop   ← scripts/orchestrator-harness/install.sh (BASE_LABEL + LABEL)
+#                                   also scripts/orchestrator-bringup.sh (LABEL)
+#   com.eldato.lane-arm            ← scripts/install-lane-arm-timer.sh (inline plist label;
+#                                   the label is NOT a `LABEL="com.…"` assignment there — its
+#                                   `LABEL=eldato-lane-arm` is the systemd unit name — which is why
+#                                   the drift gate reads the inline plist spelling too)
+#   com.eldato.orchestrator-stack  ← ADOPTED, not installed: it is the supervision job a box already
+#                                   carries (`scripts/orchestrator-bringup.sh`, "here the loaded job is
+#                                   com.eldato.orchestrator-stack -> /bin/bash $O/supervisor.sh, while
+#                                   install.sh renders com.eldato.orchestrator-loop") and the DEFAULT
+#                                   target of `scripts/orchestrator-harness/watchdog-loop.sh`
+#                                   (`LABEL="${LABEL:-com.eldato.orchestrator-stack}"`). No installer
+#                                   in this repo writes its plist — which is precisely why flagging it
+#                                   aimed a `bootout && rm -f` at the box's live controller.
+#   com.tortoise.merge-reminder    ← scripts/orchestrator-harness/merge-reminder.py (`--install` on
+#                                   darwin writes ~/Library/LaunchAgents/<label>.plist; the label is a
+#                                   PYTHON assignment, which is why the drift gate walks *.py too)
+com.eldato.orchestrator-loop
+com.eldato.lane-arm
+com.eldato.orchestrator-stack
+com.tortoise.merge-reminder

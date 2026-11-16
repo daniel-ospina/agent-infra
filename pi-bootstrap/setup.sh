@@ -763,7 +763,7 @@ fi
 # unit whose every tick exits 127 while `list-timers` reads green. Before this line NEITHER was on a
 # cell, which is why a capability that had shipped, been tested and carried a header was scheduled on
 # zero boxes — the installer could not even find the thing it was meant to install.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh disk-reaper-deployed-check.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh disk-reaper-deployed-check.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py lane-route.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -1029,7 +1029,20 @@ fi
 # (`pr-sickness.sh`, `lane-merge.sh`, via `scripts/orchestrator-harness/pr-state.sh`) live in `$O`,
 # which is NOT a checkout of this repo: without the farm the seam resolves nothing there and every
 # actor prints `router unavailable` — the wiring would exist and never run.
-fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py)
+# triage.py + triage_arms.py (#4046): the lane TRIAGE ROUTER and its three arms. Farmed for exactly
+# the reason pr_state.py is: their consumer `scripts/turn-end.py` is farmed FLAT to `$DEST/scripts`,
+# which is not a checkout — so without this entry its `$SCRIPTS/fleet/triage.py` import fails and the
+# one guard that stops "continue" reaching a lane that asked its question in its PANE silently
+# degrades to the pre-#4046 behaviour (it says so in the log rather than going quiet, but a declared
+# gap is still a gap). `triage_arms.py` rides along because `triage.py` is the decision and the arms
+# are the only consumer of `PROOFS`/`REMEDIES`: separating them would leave the farm holding a router
+# whose route table no shipped file implements.
+# ⛔ ONE LINE, AND THE CLOSING PAREN MUST END IT (#1899). `pi-bootstrap/tests/test-setup-no-nesting.sh`
+# derives this array with `sed -n 's/^fleet_tools=(\(.*\))$/\1/p'`, so a WRAPPED array reads as EMPTY and
+# the farm's whole disposition check reports "could not read the fleet_tools array" — measured on the
+# first version of this very entry, which wrapped after `pr_state.py \`. The comment at the top of this
+# block says the same thing; this is the second time it has bitten, which is why it is repeated here.
+fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py triage.py triage_arms.py)
 mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
@@ -1051,7 +1064,7 @@ for base in "${fleet_tools[@]}"; do
     farm_missing+="scripts/fleet/$base (install failed)"$'\n'
   fi
 done
-echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state + triage/triage-arms, #1178/#1777/#2866/#4046)"
 
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a
