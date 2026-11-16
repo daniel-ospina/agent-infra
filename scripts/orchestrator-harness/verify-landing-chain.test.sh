@@ -1086,8 +1086,11 @@ else
 fi
 ck "whole-artifact rule: the anchored grammar comes from \`marker_whole_re\` and is applied to every line" \
   "$(grep -qF 'if (line !~ whole)' "$SCRIPT" && echo 0 || echo 1)"
+# ⛔ CAPTURE, THEN TEST IN THE SHELL — never `grep … | grep -q` (#841/#864): under pipefail the quiet
+# grep exits at the first match, the writer takes SIGPIPE, and the pipeline reports 141 instead of 0.
+_MRE_LINE="$(grep -F 'marker_whole_re()' -A2 "$SCRIPT")"
 ck "whole-artifact rule: …and that grammar is anchored at BOTH ends (a prefix match would re-open the same hole)" \
-  "$(grep -F 'marker_whole_re()' -A2 "$SCRIPT" | grep -qF 'verdict=(clean|clean-micro|clean-low|not-clean) @ [0-9a-f]+' && echo 0 || echo 1)"
+  "$(case "$_MRE_LINE" in *'verdict=(clean|clean-micro|clean-low|not-clean) @ [0-9a-f]+'*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
