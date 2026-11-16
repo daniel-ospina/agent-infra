@@ -303,8 +303,18 @@ R="$(mk route-override-named-not-taken 423)"
 run "$R" 423 9001 "CI" 1; group "$R" 423 10 9001 "unit-test" completed success "$MERGED_AT"
 printf 'admin-merge: ⛔ BLOCK — a red is visible on this tree. Landing a red tree on purpose is\n   AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge attempted.\n' > "$R/pr-423/rail.out"
 verify "$R"; rc=$?
+# ⛔ THE NEEDLE WAS DEAD (fresh-context review, round 9 — P3, MEASURED). It was
+# "an admin-merge override is recorded", a sentence this script CANNOT print: the FAIL this case guards
+# against says "… together with an admin-merge override spelling in the same attempt …" (round 7
+# re-worded it from "same artifact" and the needle was never updated) and the PASS says "… and no
+# override is recorded on it …", which contains neither phrase. `has` is a fixed-string grep, so the
+# assertion evaluated to `echo 0` on EVERY run of this branch — a green line that asserts nothing, on the
+# predicate that decides capstone condition 6, inside the case written for the round-7 false-accusation
+# fix (that case would have printed the FAIL sentence and still passed). The bypass sentence below is
+# the one the round-6 AND round-7 wordings both carry, so a regression that accuses this refusal of
+# bypassing the rail now trips it.
 ck "route-override-named-not-taken: a refusal that NAMES the override is not an override landing" \
-  "$(has "an admin-merge override is recorded" && echo 1 || echo 0)"
+  "$(has "together with an admin-merge override spelling" && echo 1 || echo 0)"
 ck "route-override-named-not-taken: …and it is an INCONCLUSIVE route, never a PASS" \
   "$(hasj '"check":"rail_landed","verdict":"INCONCLUSIVE"' && has "records NO landing of #423" && echo 0 || echo 1)"
 ck "route-override-named-not-taken: …so the run does not close the capstone (exit 2, not 0)" \
@@ -782,6 +792,81 @@ ck "comment-signed: an ATTESTED, signed marker comment IS evidence" "$(has "PASS
 ck "comment-signed: …and the detail names the arm that admitted it (auth=sig)" "$(has "auth=sig"; echo $?)"
 ck "comment-signed: …so a correctly reviewed landing is not failed (exit 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ROUND 9 — the fresh-context review at fbe6f636a5. Two P2s IN THE PREDICATE (both false-PASS/false-FAIL
+# by execution on fixtures of this suite's own shape), one P3 in a case of this file, and one P3 in the
+# record-file fallback. Every case below FAILS on the pre-fix script — the mutations M24/M25/M26 prove it.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+# P2 — the marker sha was parsed with a GREEDY `^.* @ `, and the marker's TRAILER IS FREE TEXT:
+# `record-review.sh` splices the recorder's FINDINGS_NOTE verbatim after the sha (only a quote, a
+# backslash and control bytes are rejected), and that trailer exists ONLY on `not-clean` markers — so the
+# markers the greedy parse ate were exactly the refusals whose loss flips the verdict. A note reading
+# `refused @ round 1` left "round 1" as the sha, the 40-hex guard failed, and `next` dropped the marker
+# SILENTLY: with the refusal at the same head as an earlier clean, the whole run said ALL-MET, exit 0.
+R="$(mk marker-note-at 481)"
+{
+  printf 'review recorded: reviews/481.json verdict=clean @ %s (o/r)\n' "$HEAD"
+  printf 'review recorded: reviews/481.json verdict=not-clean @ %s (o/r) findings=refused @ round 1\n' "$HEAD"
+} > "$R/pr-481/body.txt"
+run "$R" 481 9001 "CI" 1; group "$R" 481 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 481
+verify "$R"; rc=$?
+ck "marker-note-at: a refusal whose findings note carries ' @ ' is READ, not silently dropped" \
+  "$(has "the standing record at head ${HEAD:0:12} is NOT-CLEAN"; echo $?)"
+ck "marker-note-at: …so the clean at the same head never reads as the standing record" \
+  "$(has "PASS  review_record" && echo 1 || echo 0)"
+ck "marker-note-at: …and the run exits 1, never 0 (the false PASS this pin exists for)" \
+  "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+
+# P2 — the standing record was decided by CHANNEL, NOT BY RECENCY. The producer posts the evidence COMMENT
+# first and the body best-effort (`record-review.sh:8420` `post_review_evidence_comment … || true`, then
+# `post_marker`), so a body PATCH that failed — the exit-5 path the pending/flush machinery exists for —
+# leaves the body STALE while the comment carries the newest record. Body `not-clean@H1` + comment
+# `clean@H2` (H2 the tip) was reported NOT-CLEAN plus a "did not converge" fix_round, exit 1: the
+# false-FAIL class the header says teaches readers to ignore the instrument.
+R="$(mk record-newest-by-recency 482)"
+H1C="3333333333333333333333333333333333333333"
+printf '%s\n%s\n' "$H1C" "$HEAD" > "$R/pr-482/pr-commits.tsv"
+printf 'review recorded: reviews/482.json verdict=not-clean @ %s (o/r) findings=1\n' "$H1C" > "$R/pr-482/body.txt"
+comment "$R" 482 OWNER "$(printf 'review recorded: reviews/482.json verdict=clean @ %s (o/r)\n' "$HEAD")"
+run "$R" 482 9001 "CI" 1; group "$R" 482 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 482
+verify "$R"; rc=$?
+ck "record-newest-by-recency: the NEWEST admitted record is the comment's clean at the tip" \
+  "$(has "PASS  review_record" && has "head=${HEAD:0:12} source=marker-comment" && echo 0 || echo 1)"
+ck "record-newest-by-recency: …so the stale body refusal was superseded, not the standing verdict" \
+  "$(has "not-clean@${H1C:0:12} was superseded by clean@${HEAD:0:12}"; echo $?)"
+ck "record-newest-by-recency: …and a correctly reviewed landing exits 0" \
+  "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+
+# …and the TIEBREAK at an EQUAL head is UNCHANGED: the body is written LAST, so where both channels carry a
+# marker at the same head the body is still the recorder's current word. (A regression pin rather than a
+# mutation-covered case: the recency fix must not invert the rule it qualified.)
+R="$(mk record-order-tiebreak 483)"
+printf 'review recorded: reviews/483.json verdict=not-clean @ %s (o/r) findings=1\n' "$HEAD" > "$R/pr-483/body.txt"
+comment "$R" 483 OWNER "$(printf 'review recorded: reviews/483.json verdict=clean @ %s (o/r)\n' "$HEAD")"
+run "$R" 483 9001 "CI" 1; group "$R" 483 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "record-order-tiebreak: at an EQUAL head the body is still the standing record (NOT-CLEAN)" \
+  "$(has "the standing record at head ${HEAD:0:12} is NOT-CLEAN"; echo $?)"
+ck "record-order-tiebreak: …so the run exits 1" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+
+# P3 — the box-local record file's `pr` field was used ONLY inside the signed text and never compared with
+# the PR being verified, so a record legitimately signed for another PR in the same repo verified here
+# whenever the head matched — and ONE HEAD CAN CARRY A STACK OF PRs. The gate binds the file to the PR by
+# signing the CALLER's own PR number (`review_record_eval`), which is the check this reader was missing.
+R="$(mk record-file-other-pr 484)"
+: > "$R/pr-484/body.txt"
+printf '{"pr":599,"head_sha":"%s","sig":"%s","verdict":"clean","repo":"o/r"}\n' \
+  "$HEAD" "$(record_sig 599 "$HEAD" clean o/r)" > "$R/pr-484/record.json"
+run "$R" 484 9001 "CI" 1; group "$R" 484 10 9001 "unit-test" completed success "$MERGED_AT"
+VKEY="$TEST_KEY"; verify "$R"; rc=$?; VKEY=""
+ck "record-file-other-pr: a record signed for ANOTHER PR is refused, naming the mismatch" \
+  "$(has "minted for PR #599, not PR #484"; echo $?)"
+ck "record-file-other-pr: …never PASS review_record" "$(has "PASS  review_record" && echo 1 || echo 0)"
+ck "record-file-other-pr: …and the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
 # mutation below breaks exactly the decision one case exists for; the case must then FLIP. This is the
@@ -810,27 +895,67 @@ open(path, "w").write(s.replace(old, new))
 PYEOF
   printf '%s\n' "$d/verify-landing-chain.sh"
 }
-verify_with() { # verify_with <script> <root> → sets AOUT (report) and AOUT_RC (the mutant's exit)
-  AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" 2>&1)"
+verify_with() { # verify_with <script> <root> [--json] → sets AOUT (report) and AOUT_RC (the mutant's exit)
+  # ⛔ THE REFERENCE RUN IS TAKEN HERE, ON THE SAME FIXTURE AND THE SAME MODE (round 9 F1). `mutation_verdict`
+  # needs the CORRECT script's output to check its own premise against, and it must be the same invocation
+  # or the premise is about a different code path — which is exactly how M18 came to be measured on a run
+  # where the mutated code never executed.
+  local jarg=""
+  case "${3:-}" in --json) jarg="--json" ;; esac
+  if [ -n "$jarg" ]; then
+    _ref_run --from-snapshot "$2" --repo "$REPO_FIXTURE" --json
+    AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" --json 2>&1)"
+  else
+    _ref_run --from-snapshot "$2" --repo "$REPO_FIXTURE"
+    AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" 2>&1)"
+  fi
   AOUT_RC=$?
+}
+# ⛔ THE REFERENCE IS THE CORRECT SCRIPT, ONCE PER (fixture, mode, key) — NOT per mutation: the same
+# fixture is measured by several mutations and a fresh run each time would add minutes to the shard.
+REFOUT=""; REF_SEEN=""
+_ref_run() { # _ref_run <args to the CORRECT script…> → sets REFOUT, REFRC, REF_SEEN (cached)
+  local key f
+  key="$(printf '%s|%s' "$VKEY" "$*" | cksum | awk '{print $1}')"
+  f="$MUT/_ref/$key"
+  if [ ! -f "$f.out" ]; then
+    mkdir -p "$MUT/_ref"
+    HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$SCRIPT" "$@" > "$f.out" 2>&1
+    printf '%s\n' "$?" > "$f.rc"
+  fi
+  REFOUT="$(cat "$f.out")"; REFRC="$(cat "$f.rc")"; REF_SEEN=1
 }
 # A mutant that did not produce a REPORT proves nothing. 0/1/2 are the verdict ladder; 3 is usage and
 # anything else is a crash. Both are reported as an invalid mutation, never as discrimination.
+# ⛔ `--json` PRINTS NO `PR #` HEADER (round 9 F1): the JSON emitter opens with `{"prs":[`, so the report
+# header test accepts either rendering. Without this a JSON-driven mutation could never run — which is one
+# reason M18 was driven through the TEXT renderer, where its mutation site does not execute at all.
 mutant_ran() {
   case "${AOUT_RC:-3}" in
-    0|1|2) grep -q '^PR #' <<<"$AOUT" ;;
+    0|1|2) grep -q -e '^PR #' -e '^{"prs":' <<<"$AOUT" ;;
     *) return 1 ;;
   esac
 }
 
 # ⛔ ONE SHAPE FOR EVERY MUTATION, AND IT CANNOT PASS BY ABSENCE. `mutation_verdict` refuses a mutant
-# that did not run (rc outside the 0/1/2 verdict ladder, or no `PR #` header in its output) as an
+# that did not run (rc outside the 0/1/2 verdict ladder, or no report header in its output) as an
 # INVALID mutation — that is exactly how round 1's six mutations came to prove nothing, so the guard
 # is not optional here.
+# ⛔ …AND IT CHECKS ITS OWN PREMISE (fresh-context review, round 9 — F1, reproduced by execution). It used
+# to grep the needle ONLY in the mutant's output, so a needle the CORRECT run never prints was absent in
+# BOTH runs and the `else` arm reported "discriminating" for a fact nobody measured. That is an
+# EQUIVALENT MUTANT — identical output on the inputs exercised, so it can never be killed (Stryker
+# Mutator, "Equivalent mutants") — and it is how M14 (round 7) and M18 (round 8) both shipped green while
+# proving nothing. The needle is now REQUIRED in the correct script's output on the same fixture and mode
+# first (`REFOUT`, taken by `verify_with`/`_ref_run`); absent there, the mutation is INVALID.
 # The needle is a string the CORRECT script prints in this scenario; the mutant must lose it.
 mutation_verdict() { # mutation_verdict <label> <needle-the-correct-script-prints> <what-broke>
   if ! mutant_ran; then
     bad "$1: INVALID MUTATION — the mutant did not produce a report (rc=${AOUT_RC:-?}), so nothing is proven"
+    return
+  fi
+  if [ -z "$REF_SEEN" ] || ! grep -qF -- "$2" <<<"$REFOUT"; then
+    bad "$1: INVALID MUTATION — the CORRECT script does not print '$2' on this fixture and mode, so its absence from the mutant is an EQUIVALENT MUTANT, not discrimination"
     return
   fi
   if grep -qF -- "$2" <<<"$AOUT"; then
@@ -839,6 +964,17 @@ mutation_verdict() { # mutation_verdict <label> <needle-the-correct-script-print
     ok "$1: $3"
   fi
 }
+
+# ⛔ THE PREMISE CHECK IS ITSELF CHECKED (round 9 F1). A needle the CORRECT run never prints must be
+# reported INVALID, never as discrimination — otherwise the new guard is the same green-by-absence shape it
+# exists to remove. Run in a SUBSHELL so its own ok()/bad() cannot move this suite's counters (a subshell
+# increments its own copies); only the TEXT it emitted is asserted here.
+verify_with "$SCRIPT" "$T/clean"
+_SELF="$(mutation_verdict M0 "a sentence this fixture never prints — the equivalent-mutant alibi" "must never be reported as discrimination" 2>&1)"
+ck "mutation_verdict refuses a needle the CORRECT run never prints (round 9 F1: the equivalent-mutant alibi)" \
+  "$(grep -qF 'INVALID MUTATION — the CORRECT script does not print' <<<"$_SELF"; echo $?)"
+ck "…and it does NOT report that mutation as discriminating" \
+  "$(grep -qF 'must never be reported as discrimination' <<<"$_SELF" && echo 1 || echo 0)"
 
 # M1 — group by JOB NAME alone (drop the workflow). Case 8 must stop seeing the red.
 MS="$(mutant name-only 'g = w "/" name' 'g = name')" || bad "M1 mutation could not be applied"
@@ -1068,17 +1204,55 @@ mutation_verdict M17 "was superseded by clean@111111111111" \
   "anchoring on the FIRST refusal fails a converged two-round fix — case fix-round-two-rounds is discriminating"
 
 # M18 — stop escaping control bytes (round 8's P3): the evidence file becomes invalid JSON.
+# ⛔ DRIVEN THROUGH `--json` (fresh-context review, round 9 — F1, reproduced by execution). The mutation
+# site is `jstr`, which exists ONLY in the `--json` emitter (`:1168`), and this block used to call
+# `verify_with` with NO `--json`: the mutant differed from the correct script only in code that never ran,
+# its TEXT report was BYTE-IDENTICAL to the correct one, the needle was absent from BOTH, and M18 printed
+# "case json-control-byte is discriminating" — a fact nobody measured. That is an EQUIVALENT MUTANT
+# (Stryker: identical output on the inputs exercised, so it can never be killed), the class round 7's
+# finding 2 removed from M14, and `mutation_verdict` now refuses it outright as an INVALID mutation.
 MS="$(mutant json-no-control-escape '        else if (c in CTL)    o = o "\\u00" CTL[c]' '        else if (0)           o = o "\\u00" CTL[c]')" \
   || bad "M18 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
-verify_with "$MS" "$T/json-control-byte"
+verify_with "$MS" "$T/json-control-byte" --json
 mutation_verdict M18 '\u0001bad' \
   "an unescaped control byte makes the --json evidence file unparseable — case json-control-byte is discriminating"
+
+# M24 — decide the standing record by CHANNEL again (round 9's P2): the stale body refusal wins.
+# The mutation drops the commit-position term, leaving only the channel tiebreak — the pre-fix reader.
+MS="$(mutant record-by-channel '      i = ($4 in idx) ? idx[$4] : 0' '      i = 0')" \
+  || bad "M24 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/record-newest-by-recency"
+mutation_verdict M24 "verdict=clean head=111111111111 source=marker-comment" \
+  "channel priority reads a STALE body refusal as the standing record — case record-newest-by-recency is discriminating"
+
+# M25 — parse the sha with the GREEDY `^.* @ ` again (round 9's P2): a refusal whose note carries ` @ `
+# is dropped silently, and a clean at the same head reads as the standing verdict.
+MS="$(mutant marker-sha-greedy '      s = rest; sub(/^[^ \t]+ @ /, "", s)' '      s = rest; sub(/^.* @ /, "", s)')" \
+  || bad "M25 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/marker-note-at"
+mutation_verdict M25 "the standing record at head 111111111111 is NOT-CLEAN" \
+  "a findings note containing ' @ ' drops the refusal and the clean reads as the record — case marker-note-at is discriminating"
+
+# M26 — admit the box-local record file without comparing its `pr` field again (round 9's P3): a record
+# signed for another PR at the same head reads as this PR's review.
+MS="$(mutant record-file-any-pr '    elif [ "$recpr" != "$pr" ]; then' '    elif [ 0 -ne 0 ]; then')" \
+  || bad "M26 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+VKEY="$TEST_KEY"; verify_with "$MS" "$T/record-file-other-pr"; VKEY=""
+mutation_verdict M26 "was minted for PR #599, not PR #484" \
+  "a record signed for another PR at the same head reads as this PR's review — case record-file-other-pr is discriminating"
 
 # M19 — drop the mutually-exclusive snapshot guard (round 8's P3): --write-snapshot is a silent no-op.
 MS="$(mutant snapshot-modes 'if [ -n "$SNAPSHOT_IN" ] && [ -n "$SNAPSHOT_OUT" ]; then' 'if [ 0 -eq 1 ]; then')" \
   || bad "M19 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
+# this mutation runs a NON-`verify_with` command shape, so its reference (the CORRECT script, same flags,
+# round 9 F1) is taken explicitly; the write target differs so the reference cannot create the directory
+# the case asserts was never written.
+_ref_run --from-snapshot "$T/clean" --write-snapshot "$T/neversnapshot-ref" --repo "$REPO_FIXTURE"
 AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="" bash "$MS" --from-snapshot "$T/clean" --write-snapshot "$T/neversnapshot-m" --repo "$REPO_FIXTURE" 2>&1)"; AOUT_RC=$?
 mutation_verdict M19 "mutually exclusive" \
   "two mutually exclusive snapshot modes silently no-op — case snapshot-modes is discriminating"
