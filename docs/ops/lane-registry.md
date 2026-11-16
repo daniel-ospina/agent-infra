@@ -356,9 +356,15 @@ Or from a session, without a shell: `lane.list` / `lane.show`.
 
 1. **`merge-one.sh` carries its own `run_agent()`** (this is not new — `spawn-gate.sh`'s header already
    names it for the disk gate). Reviewer and merge lanes reached that way do **not** write a record.
-2. **`check-deployed-drift.sh` hashes only `*.sh`** (#3016), so a stale `lane_registry.py` in `$O` is not
-   caught by that gate. The mitigation shipped here is the `registry_sha256` fingerprint on every payload;
-   adding python to the drift gate is #3016's work, not this slice's.
+2. **The aggregate payload FOLD is `*.sh`-only** (#3016 / #4015). `o_payload_hash` is a digest contract
+   shared with two other writers (`install.sh::prov_payload_hash`, `cloud-cell-supervisor.sh::o_payload_hash`),
+   so a *stamp* cannot name a `.py` or `.mjs` difference. ⚠️ The per-file comparisons no longer share that
+   blind spot: since #4015 `check-deployed-drift.sh` compares every depth-1 file of its DECLARED shipped
+   set (`*.sh`, `*.py`, `*.mjs`, and the extensionless `gh-app-token`) against the ref in BOTH directions,
+   so a stale `$O/lane_registry.py` now reads `DRIFT(checkout): lane_registry.py — the deployed copy
+   DIFFERS` and exits 1. The mitigation shipped here is the `registry_sha256` fingerprint on every payload;
+   the residual that REMAINS is narrower than the old wording — a `.py` edit is invisible only to a
+   *stamp-only* box's aggregate digest, and the byte arm catches it there.
 3. **Clock skew** — see §3.4.
 3b. **A corrupt record has no shipped remedy.** A record that fails `_record_problem` (a bad `lease_until`,
    a `DONE` with no artifacts, a ref/payload id mismatch) fails the **whole** read by design — skipping it
