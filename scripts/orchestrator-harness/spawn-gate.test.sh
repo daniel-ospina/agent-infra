@@ -2501,6 +2501,17 @@ grep -q 'LANE_CAPABILITY=refused why=exit-hang' "$LOG"; rc=$?
 ck "...and the lane log carries the READING it refused on (answered_ms … alive_at …)" $rc
 grep -q 'capability-gate. REFUSED' "$LOG"; rc=$?
 ck "...and NAMES the gate, so a refused spawn is not read as a cap kill or a load refusal" $rc
+# ⛔ (a2) A REFUSAL WRITES NO AGENT-START MARKER (agent-infra#4047 review, P1). `pr-doctor.py`'s
+# `_agent_started` takes `[agent] provider=… model=…` as proof that a launch happened — the ONLY evidence
+# it has, because the pid `--status` reports is the dispatcher, alive through preflight before any gate
+# decides. The marker used to be written ABOVE this gate, so on the one gate that is slow by design (one
+# bounded probe, 5-25 s measured) the refusal always landed outside `CONFIRM_WINDOW_S` (1.0 s) with the
+# marker already in the log: every capability refusal was confirmed `launched, agent started` and
+# RECORDED — a class cooldown and a budget slot spent on an agent that never ran, and the pass printed
+# `dispatched N of M` over it. The marker now sits immediately before the `pi` spawn, so this arm is the
+# falsifier for that ordering: it is RED on the pre-change tree, where the marker is already there.
+grep -q '\[agent\] provider=' "$LOG"; rc=$?
+ck "…and a REFUSED spawn writes NO '[agent] provider=' line (else a slow refusal is read as a launch)" $((1 - rc))
 # (b) no-answer → WARN and PROCEED (a transient must never arm a refusal)
 # ⛔ THE SHAPE MATTERS HERE, not just the word: `why=no-answer` means the process RETURNED, which is
 # the only shape a transient takes, so this fixture carries `returned_ms=` and `rc=`. The earlier
@@ -2512,6 +2523,10 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-answer host=x retur
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
 ck "an unanswered probe WARNS and still dispatches (rc=$CRC, never 71, agent ran) — a transient cannot arm a refusal" $rc
+# …and the other half of (a2): a spawn that DOES reach the launch writes the marker, so the check above
+# cannot be satisfied by never writing it at all.
+grep -q '\[agent\] provider=deepseek model=deepseek-flash label=capability test' "$LOG"; rc=$?
+ck "…while a spawn that reaches the launch DOES write it (the marker still answers 'which model ran?')" $rc
 grep -q 'capability-gate. WARN' "$LOG"; rc=$?
 ck "...and the WARN names the reading, so a stall that follows has a starting point" $rc
 # (c) the declared escape
