@@ -943,16 +943,47 @@ check_terminal "9h" failed "agent-exit-1" 1
 # arm's `done` line carried a delivery token at all, so `has "$(lastline)" unpushed-1` fails there.
 # The pre-existing arms stay green because `check_terminal` matches the reason by SUBSTRING and every
 # new token keeps `agent-exit-0` as its prefix — that compatibility is a designed property, not luck.
+#
+# ⛔ AND THE `delivered`/`nochange` SPLIT IS RUN-SCOPED (review of #4047, P1 — MEASURED with the arm
+# below). "origin/<br> exists and HEAD is not ahead of it" was satisfiable by a lane that did NOTHING,
+# whenever an EARLIER run had already pushed that branch name: remote-tracking refs are shared across
+# the clone's worktrees and `lane.sh` never fetches. The read therefore also compares HEAD against the
+# head the run STARTED from, and the two arms below are the two halves of that polarity — 10a moves the
+# head and 10a3 does not.
 
-# 10a DELIVERED — origin carries the lane's own head and the tree is clean: the ONE state that is
-# unchanged. If this arm ever drifts to a suffix, delivered lanes have been silently reclassified.
+# 10a DELIVERED — THIS RUN moved the head to what origin now carries, and the tree is clean: the ONE
+# state that is unchanged. If this arm ever drifts to a suffix, delivered lanes have been silently
+# reclassified.
+# ⛔ THE STUB COMMITS *AND* MOVES `refs/remotes/origin/<br>`, WHICH IS WHAT A REAL PUSH DOES. The first
+# cut fabricated the remote ref BEFORE the run and asserted `delivered` — i.e. the arm enshrined the
+# false PASS the P1 finding names ("a lane that did nothing, on a branch an earlier run had pushed").
+# A stub that only prints is a lane that delivered nothing, and it must not read `delivered`.
 mk_arm deliv_ok; WT="$ARMWT"
+pi() {
+  printf 'work\n' > "$PWD/delivered.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  # …and the push that carries it (a local remote-tracking update: the fixture never reaches a network)
+  git -C "$PWD" update-ref "refs/remotes/origin/$(git -C "$PWD" rev-parse --abbrev-ref HEAD)" \
+    "$(git -C "$PWD" rev-parse HEAD)"
+  printf 'ran\n'; return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10a" done "agent-exit-0" 0
+has "$(lastline)" "reason=agent-exit-0 " "10a2 …and a DELIVERED lane carries NO suffix — the one case that must read exactly as it did before this change"
+
+# 10a3 THE #4016 SHAPE ONE LEVEL DOWN (review of #4047, P1 — THE ARM THAT PINS THE RUN-SCOPED READ):
+# the branch name is ALREADY on origin at the head this run starts from (an earlier run pushed it), and
+# THIS run's agent does nothing. `ahead` is 0 and the ref verifies, so the pre-change read minted
+# `delivered` — a false PASS for a lane that contributed nothing. It must read `nochange`.
+mk_arm deliv_prior_push; WT="$ARMWT"
 pi() { printf 'ran\n'; return 0; }
 export -f pi
 "$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
 drive "$WT" "$KEYVAR=sk_fixture"
-check_terminal "10a" done "agent-exit-0" 0
-has "$(lastline)" "reason=agent-exit-0 " "10a2 …and a DELIVERED lane carries NO suffix — the one case that must read exactly as it did before this change"
+check_terminal "10a3" done "agent-exit-0-nochange" 0
+hasnt "$(lastline)" "reason=agent-exit-0 " "10a3b …and it does NOT read as the unchanged `delivered` token an earlier run's push used to buy"
 
 # 10b UNPUSHED — the #4009/#4012 shape: real commits that origin does not carry.
 # ⛔ THE STUB USES `git`, NOT `$REAL_GIT`, AND THAT IS THE FIX TO THIS ARM'S FIRST CUT (measured
@@ -961,6 +992,14 @@ has "$(lastline)" "reason=agent-exit-0 " "10a2 …and a DELIVERED lane carries N
 # empty, the command degenerated to `-C <path> add …` with no command word, `pi` returned non-zero,
 # and the lane took the `rc=1` path the delivery read never sees. An exported function inherits an
 # exported ENVIRONMENT, never the caller's unexported locals.
+# ⛔ AND THE WIP-RESCUE IS DISABLED FOR THIS ARM (review of #4047, P2 — MEASURED): this is the only
+# stub that COMMITS, so it is the first to reach `run_agent`'s exit rescue → `lane_end_push`, which runs
+# `ls-remote --symref` and then `git push origin HEAD:refs/heads/…` against the fixture's origin — and
+# the fixture's origin is the REAL `https://github.com/daniel-ospina/agent-infra.git`. With a credential
+# helper that push SUCCEEDS: it moves `refs/remotes/origin/$BR`, the read then answers `delivered`, the
+# arm goes RED, and a stray branch lands in the production repo; unauthenticated it is still two network
+# calls per run. `WIP_RESCUE_DISABLE=1` is the shipped operator hatch (`spawn-gate.sh`), not a bypass:
+# it is exactly "do not push from this run", which is the state this arm needs to model.
 mk_arm deliv_unpushed; WT="$ARMWT"
 pi() {
   printf 'work\n' > "$PWD/pushed-later.txt"
@@ -970,19 +1009,42 @@ pi() {
 }
 export -f pi
 "$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
-drive "$WT" "$KEYVAR=sk_fixture"
+drive "$WT" "$KEYVAR=sk_fixture" WIP_RESCUE_DISABLE=1
 check_terminal "10b" done "agent-exit-0-undelivered:unpushed-1" 0
-has "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+has "$(cat "$(LOG)" 2>/dev/null)" "commit(s) that origin does NOT carry" \
     "10b2 …and the log says it in words, not only in a grep key — an operator reads the log, not the census"
 
 # 10c UNCOMMITTED — the #4011 shape: files written, never committed. Distinct from 10b on purpose:
 # a commit needs a push, staged work needs a commit, and one remedy cannot serve both.
+# ⛔ AND THE MESSAGE MUST NOT DENY A DELIVERY THAT EXISTS (review of #4047, P2). This state is reachable
+# ONLY when origin already carries HEAD, so "NOTHING LEFT THE BOX … no pushed head carries it" was false
+# about the branch, the PR and the pushed commits — and its printed remedy (re-dispatch) is the
+# redundant relaunch the issue measures. The assertion below pins the words that replaced it.
 mk_arm deliv_dirty; WT="$ARMWT"
 pi() { printf 'staged\n' > "$PWD/staged.txt"; printf 'ran\n'; return 0; }
 export -f pi
 "$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
 drive "$WT" "$KEYVAR=sk_fixture"
 check_terminal "10c" done "agent-exit-0-undelivered:uncommitted-1" 0
+has "$(cat "$(LOG)" 2>/dev/null)" "Origin already carries this run's head" \
+    "10c2 …and the log does NOT claim the branch never left the box — it says the tree has the uncommitted part"
+
+# 10c3 A READ THAT FAILS IS NOT A CLEAN TREE (review of #4047, P2 — the fail-open this pins). `dirty`
+# used to be `git status --porcelain 2>/dev/null | wc -l`: `wc` SUCCEEDS on empty input, so a status
+# read that FAILED (an `index.lock` held by another git process — a real state in a shared worktree)
+# answered `0` = clean, and with `ahead` defaulting to 0 the same way, a lane whose state could not be
+# read was minted `delivered`. A held `index.lock` reproduces that failure honestly, on the shipped
+# script, without stubbing git.
+mk_arm deliv_read_fail; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+"$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
+LOCK="$("$REAL_GIT" -C "$ARMWT" rev-parse --absolute-git-dir)/index.lock"
+: > "$LOCK"
+drive "$WT" "$KEYVAR=sk_fixture" WIP_RESCUE_DISABLE=1
+rm -f "$LOCK"
+check_terminal "10c3" done "agent-exit-0-delivery-unknown" 0
+hasnt "$(lastline)" "reason=agent-exit-0 " "10c3b …and it does NOT fall back to `delivered` when the tree could not be read"
 
 # 10d NOCHANGE — the #4016 shape: no commit beyond main, clean tree. Named rather than folded into
 # `undelivered`, because a lane dispatched to CHECK something legitimately ends here while one
