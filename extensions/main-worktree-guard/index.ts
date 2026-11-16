@@ -2016,16 +2016,39 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * CREATES the file, erasing the deletion, and `git status` reads clean. The
  * landing site is `<wt>/deleted.txt`; the spelling is `/tmp/sink`.
  *
- * So resolve the chain BY HAND (`lstat` + `readlink`, bounded) until a
- * non-symlink or a non-existent path is reached. That answer is then treated
- * exactly like any other target: the ancestor walk below finds the nearest
- * existing directory and probes THAT checkout, so a dangling sink into `/tmp`
- * stays admitted and one into a checkout is blocked by its effect. Nothing new
- * fails closed — the class is closed by resolving it, not by refusing it.
+ * ⛔ THE KERNEL RESOLVES THE WHOLE CHAIN whenever the destination EXISTS, and
+ * that answer must be kept — `statSync(t)`/`realpathSync(t)` do it correctly in
+ * one step and are tried FIRST by the caller. This helper exists ONLY for the
+ * case the kernel refuses (a dangling destination somewhere in the chain).
+ *
+ * ⛔ AND A RELATIVE TARGET IS JOINED TO THE LINK'S **REAL** PARENT, never the
+ * lexical one (review cycle 2, REPRODUCED — this is the shape that turned a
+ * correct BLOCK into an ALLOW). When the link is reached through a symlinked
+ * directory, `dirname(cur)` names a directory that is not the link's parent at
+ * all, so `../x` joined there resolves to a path that is neither the spelling
+ * nor the destination — and the ancestor walk then probes a checkout the write
+ * never touches. With `<tmp>/ld -> <wt>/sub` and `<wt>/sub/sink -> ../sub/wip.txt`:
+ *
+ *     git show HEAD:sub/wip.txt > <tmp>/ld/sink
+ *
+ * truncated `wt/sub/wip.txt`'s UNCOMMITTED work while the arm probed `<tmp>/sub`.
+ * `realpathSync(dirname(cur))` is the kernel's own answer for the parent (it
+ * exists — `lstat` just read the link), so the join matches what the shell does.
+ *
+ * That answer is then treated like any other target: the ancestor walk below
+ * finds the nearest existing directory and probes THAT checkout, so a dangling
+ * sink into `/tmp` stays admitted and one into a checkout is blocked by its
+ * effect. Nothing new fails closed — the class is closed by resolving it, not by
+ * refusing it.
+ *
+ * A chain longer than the bound returns null (unresolvable): the kernel's own
+ * MAXSYMLINKS is 40, so the shell refuses such a command with ELOOP and nothing
+ * is written — but "harmless by coincidence" is not a reason to return a path
+ * this function could not actually resolve.
  * @param {string} p
- * @returns {string} the path the write would actually create/modify
+ * @returns {string|null} the path the write would actually create/modify, or null
  */
-function _resolveThroughDanglingLinks(p: string): string {
+function _resolveThroughDanglingLinks(p: string): string | null {
   let cur = p;
   for (let i = 0; i < 40; i++) {
     let st;
@@ -2033,9 +2056,13 @@ function _resolveThroughDanglingLinks(p: string): string {
     if (!st.isSymbolicLink()) return cur;
     let target: string;
     try { target = readlinkSync(cur); } catch { return cur; }
-    cur = isAbsolute(target) ? target : resolve(dirname(cur), target);
+    if (isAbsolute(target)) { cur = target; continue; }
+    // REAL parent, not the lexical one — see the ⛔ above.
+    let parent = dirname(cur);
+    try { parent = realpathSync(parent); } catch { /* keep the lexical parent (best effort) */ }
+    cur = resolve(parent, target);
   }
-  return cur; // a link cycle: the caller's ancestor probe is still the conservative answer
+  return null; // chain longer than the kernel would follow — unresolvable, fail closed
 }
 
 function _catFileRevertStateBlock(
@@ -2086,6 +2113,9 @@ function _catFileRevertStateBlock(
   // above, so its ancestor walk lands on `writeCwd` and it is still probed there.
   const candidates = new Set<string>();
   let hardlinked: string | null = null;
+  // A link chain longer than the kernel would follow: the landing site could not
+  // be determined at all, which is the same answer the hardlink arm gives.
+  let unresolvable: string | null = null;
   for (const t of targets) {
     // ── LINK RESOLUTION (#3620 review, MEASURED fail-open without it) ────
     // The write lands where the BYTES land. A sink that is a SYMLINK into a
@@ -2095,20 +2125,34 @@ function _catFileRevertStateBlock(
     // clean. origin/main blocked that only INCIDENTALLY (the dirty checkout was
     // the session cwd, which used to be an unconditional candidate); resolving
     // the link blocks it on the effect, which is what this arm claims to gate.
-    // Resolve FIRST (by hand, so a DANGLING link is followed too — `statSync` and
-    // `realpathSync` both throw there and the write then lands on the link's own
-    // parent instead of its destination), then decide the landing directory.
-    let landing = _resolveThroughDanglingLinks(t);
+    // ── LANDING SITE, in the kernel's own words first ──────────────────
+    // `statSync`/`realpathSync` follow the ENTIRE chain, correctly, for an
+    // existing destination — including a relative target reached through a
+    // symlinked parent. That answer is authoritative and is tried FIRST; the
+    // hand resolution below exists only for the case the kernel REFUSES (a
+    // dangling destination), which is the one it cannot answer.
+    let landing: string | null = t;
     try {
-      const lst = statSync(landing);
+      const lst = statSync(t);
       // A HARDLINK shares the inode with a file that may be tracked content in a
       // checkout this walk never enumerates, and NO path-based probe can see
       // that: `realpath` answers with the link's own name. Rather than guess,
       // fail closed — the arm's own doctrine is that one wrong ALLOW here is
       // unrecoverable, one wrong BLOCK costs a retry.
-      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = landing; continue; }
-      landing = realpathSync(landing);
-    } catch { /* landing does not exist yet — the ancestor walk below resolves it */ }
+      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = t; continue; }
+      landing = realpathSync(t);
+    } catch {
+      // Dangling somewhere in the chain — resolve the rest by hand (REAL parents,
+      // see `_resolveThroughDanglingLinks`), then apply the same two rules to the
+      // answer, so a dangling sink into a dirty checkout is blocked on its effect.
+      landing = _resolveThroughDanglingLinks(t);
+      if (landing === null) { unresolvable = t; continue; }
+      try {
+        const lst = statSync(landing);
+        if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = landing; continue; }
+        landing = realpathSync(landing);
+      } catch { /* nothing at the landing path yet — the ancestor walk below decides */ }
+    }
     let dir = dirname(landing);
     // Bounded: a target under a not-yet-existing directory has no checkout of
     // its own, so the walk finds the nearest one that exists.
@@ -2130,6 +2174,13 @@ function _catFileRevertStateBlock(
       { form: d.form, scope: "paths", pathspecs: [hardlinked] },
       writeCwd,
       "the redirect target is a hardlink (link count > 1), so the checkout it would destroy cannot be determined",
+    );
+  }
+  if (unresolvable !== null) {
+    return _worktreeDiscardBlockReason(
+      { form: d.form, scope: "paths", pathspecs: [unresolvable] },
+      writeCwd,
+      "the redirect target is a symlink chain too long to resolve, so the checkout it would destroy cannot be determined",
     );
   }
 
@@ -6168,7 +6219,11 @@ export default function (pi: ExtensionAPI) {
         // the write/edit route, whose #618 gate the marker return precedes — the
         // marker is an audited solo-session recovery hatch, not a license to
         // write other hubs).
-        const markerOn = readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+        // #3620: the marker state is READ ONCE per tool call (`_currentHatchActive`,
+        // resolved at the top of this handler from the same ctx id and the same
+        // predicate). Re-reading here would let a marker touched in between be
+        // acted on with one answer and explained with another.
+        const markerOn = _currentHatchActive;
         const bashWrite = _hubBashTrackedWrite(localCommand, st.disorder, markerOn);
         if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
@@ -6393,7 +6448,9 @@ export default function (pi: ExtensionAPI) {
 
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
-    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
+    // Same single read as above (#3620) — the hatch verdict and the diagnosis it
+    // is explained by must come from ONE observation of the marker.
+    if (_currentHatchActive) {
       return undefined;
     }
     if (isBash) {

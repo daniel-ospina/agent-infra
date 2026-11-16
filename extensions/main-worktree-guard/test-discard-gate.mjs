@@ -2804,6 +2804,81 @@ async function partD() {
       rmSync(join(wt, "gone.txt"), { force: true });
     }
 
+    // ── D12/D13 (#3620 review cycle 2, P1 MEASURED regression): a RELATIVE link
+    // target reached through a SYMLINKED DIRECTORY. The hand resolution joined a
+    // relative target to `dirname(cur)` — the LEXICAL parent — so with
+    // `<tmp>/ld -> <wt>/sub` and `<wt>/sub/sink -> ../sub/wip2.txt` it computed
+    // `<tmp>/sub/wip2.txt` and probed THAT, while the kernel wrote
+    // `<wt>/sub/wip2.txt`. Measured at the cycle-2 head: ALLOWED, and the worktree's
+    // tracked uncommitted work was truncated by a shape the PREVIOUS head blocked.
+    // Two rules fix it, and these rows hold them: the kernel resolves an EXISTING
+    // destination (it is tried first), and a relative target is joined to the
+    // link's REAL parent (`realpathSync(dirname(cur))`), never the lexical one.
+    mkdirSync(join(wt, "sub"), { recursive: true });
+    writeFileSync(join(wt, "sub", "wip2.txt"), "committed-v1\n");
+    gg("add sub/wip2.txt", wt);
+    gg("commit -qm sub-wip", wt);
+    writeFileSync(join(wt, "sub", "wip2.txt"), "UNCOMMITTED WORK IN THE WT\n");
+    const ld = join(tmpd, "3620-linkdir");
+    rmSync(join(wt, "sub", "sink"), { force: true });
+    rmSync(ld, { recursive: true, force: true });
+    symlinkSync(join(wt, "sub"), ld);
+    // The link lives in the REAL dir and climbs back into it, so the lexical join
+    // lands on a path that need not exist — and if it does, it is the DECOY's.
+    symlinkSync("../sub/wip2.txt", join(wt, "sub", "sink"));
+    try {
+      const viaLinkDir = await bash(`git show HEAD:sub/wip2.txt > ${ld}/sink`, wt);
+      expectTrue("D12 a RELATIVE link target via a SYMLINKED PARENT into tracked-dirty work is BLOCKED",
+        blocked(viaLinkDir), `was allowed: ${JSON.stringify(reason(viaLinkDir)).slice(0, 200)}`);
+      expectTrue("D12b …and the block names the checkout the bytes actually land in",
+        /Checkout: .*\/wt\b/.test(reason(viaLinkDir)), `reason=${JSON.stringify(reason(viaLinkDir)).slice(0, 240)}`);
+      // DECOY control: a DIRTY checkout planted exactly where the lexical join
+      // would look. The verdict must still be about the REAL checkout, or the
+      // landing site is a reconstruction rather than the kernel's answer.
+      const decoy = join(tmpd, "3620-decoy-sub");
+      rmSync(decoy, { recursive: true, force: true });
+      execSync(`git init -q -b main "${decoy}"`, { cwd: tmpd, stdio: "ignore" });
+      execSync("git config user.email t@t && git config user.name t", { cwd: decoy, stdio: "ignore" });
+      writeFileSync(join(decoy, "wip2.txt"), "v1\n");
+      execSync("git add -A && git commit -qm init", { cwd: decoy, stdio: "ignore" });
+      writeFileSync(join(decoy, "wip2.txt"), "DECOY DIRT\n");
+      const decoySink = join(tmpd, "3620-decoy-link");
+      rmSync(decoySink, { recursive: true, force: true });
+      symlinkSync(decoy, decoySink);
+      const withDecoy = await bash(`git show HEAD:sub/wip2.txt > ${decoySink}/wip2.txt`, wt);
+      expectTrue("D12c with a DIRTY DECOY at the lexically-reconstructed path, the block still names the REAL checkout",
+        blocked(withDecoy) && !/3620-decoy-sub/.test(reason(withDecoy)),
+        `reason=${JSON.stringify(reason(withDecoy)).slice(0, 240)}`);
+    } finally {
+      rmSync(join(wt, "sub", "sink"), { force: true });
+      rmSync(ld, { recursive: true, force: true });
+    }
+    // D13 — the DANGLING half of the same construct, with the deletion as the ONLY
+    // dirt: the kernel refuses here, so the hand resolution is what runs, and if it
+    // reconstructs the lexical parent it finds no checkout and ALLOWS. (With the
+    // dirty file still modified, this row would pass for the wrong reason.)
+    gg("checkout -q -- sub/wip2.txt", wt);
+    writeFileSync(join(wt, "sub", "gone2.txt"), "tracked-then-deleted\n");
+    gg("add sub/gone2.txt", wt);
+    gg("commit -qm sub-gone", wt);
+    rmSync(join(wt, "sub", "gone2.txt"), { force: true });
+    rmSync(ld, { recursive: true, force: true });
+    symlinkSync(join(wt, "sub"), ld);
+    symlinkSync("../sub/gone2.txt", join(wt, "sub", "sink2"));
+    try {
+      const viaLinkDirDangling = await bash(`git show HEAD:sub/gone2.txt > ${ld}/sink2`, wt);
+      expectTrue("D13 a RELATIVE DANGLING target via a SYMLINKED PARENT is BLOCKED (it re-creates the deleted tracked file)",
+        blocked(viaLinkDirDangling), `was allowed: ${JSON.stringify(reason(viaLinkDirDangling)).slice(0, 200)}`);
+      expectTrue("D13b …and it names the worktree whose pending deletion it would erase",
+        /Checkout: .*\/wt\b/.test(reason(viaLinkDirDangling)),
+        `reason=${JSON.stringify(reason(viaLinkDirDangling)).slice(0, 240)}`);
+    } finally {
+      rmSync(join(wt, "sub", "sink2"), { force: true });
+      rmSync(ld, { recursive: true, force: true });
+      gg("reset -q --hard HEAD~2", wt);
+      rmSync(join(wt, "sub"), { recursive: true, force: true });
+    }
+
     // ── D8: M4's disorder early-return must not shadow M5 ──
     // The issue names this as a second reachability gap in the same region, to
     // be assessed with the fix rather than separately. Measured before the fix
