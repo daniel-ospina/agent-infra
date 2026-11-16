@@ -1030,8 +1030,12 @@ mdeploy
 echo
 echo "── §12 THE DECLARED EXTENSION SET: a .py driver is COMPARED, not invisible (agent-infra#4015/#3016) ──"
 # ⛔ THE DEFECT THIS GRADES, MEASURED: the byte arm listed the repo with
-# `grep -E "^${REL}/[^/]+\.sh$"`, so `gh-limit.py`, `gh-cred.py`, `objective.py` and every other python
-# driver in the harness dir were never in the compared set — in EITHER direction. A box running a stale
+# `grep -E "^${REL}/[^/]+\.sh$"`, so `gh-limit.py`, `gh-cred.py` and every other python driver in the
+# harness dir were never in the compared set — in EITHER direction. (It listed `$O` with `ls -1 *.sh`,
+# so a hand-placed `$O/objective.py` — shipped by the repo as a SIBLING of the harness dir — read clean
+# too; today it is named, but by the present-but-not-shipped arm, which is a different claim from being
+# compared: see check-deployed-drift.sh's "WHAT DEPTH 1 + THE DECLARED SET DOES NOT COMPARE" block.)
+# A box running a stale
 # `$O/gh-limit.py` printed `OK: deployed … matches` and exited 0 while `install.sh` names that exact file
 # as the one whose absence silently unserialised every harness `gh` call (#2041). So the arm below
 # plants a ONE-BYTE change in the `.py` driver, leaves every `.sh` untouched, and requires RED.

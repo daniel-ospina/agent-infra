@@ -724,7 +724,7 @@ never handed to the chain is unreviewed code by default.
 
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
+(`install.sh:800`) and `$O/gh-limit.py` (`:817`); everything else is the operator's `cp`, §4 step 1.
 Its `DRIFTED` warning iterates an explicit `for f in …` list of forty-two `*.sh` plus five `*.py`
 (`check-class.py`, `gh-limit.py`, `lane_registry.py`, `merge-reminder.py`, `nochk-resolve.py`) and
 `gh-rest/gh` — **forty-eight** entries at `install.sh:1725` (a stale "twenty-four entries, `install.sh:855`"
@@ -1270,7 +1270,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 
 | Path | What it still does |
 |---|---|
-| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:539`) and `$O/gh-limit.py` (`install.sh:556`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:822`, `:1003`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
+| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:800`) and `$O/gh-limit.py` (`install.sh:817`) — the four files it seeds in total are named in §4.1's "only this helper clears it" paragraph — no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:1749`, `:1981`; an earlier revision cited `:822`/`:1003`, which are unrelated statements). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
 | `deploy-mac-orchestrator.sh` phase A (`:292-296`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
@@ -1353,12 +1353,13 @@ comparison can, and it does.
 `gh-rest/gh`. It carries `gh-rest/gh`
 and `gh-limit.py` — the first is outside the gate, the second is now inside it — and never `retired/*` or
 `gh-limit/gh`. `check-single-source.sh --o` **does** compare
-`gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
-`launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
+`gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:341` builds `DEPLOY_SET`,
+`:386-387` compares it) — ⚠️ but NOT
+`launchd.plist.template`, `port-provenance.txt` or `retired/*`: the `for f in` at `:341` is
 `*.sh` + `*.py` + `gh-rest/gh` + `gh-limit/gh` and nothing else (an earlier draft of this paragraph said
 "the template" and was wrong — a tampered `$O/launchd.plist.template` is MISSED, which matters because
-`install.sh:133` reads that file when install.sh is run from `$O`). It also **skips a missing file**
-(`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
+`install.sh:188` reads that file when install.sh is run from `$O`). It also **skips a missing file**
+(`:387` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
 `$O/gh-limit/gh` is compared by nothing on any path — and a missing shim is exactly what #2041
 measured. So "run both" closes the loop for the DECLARED depth-1 set and for a *differing* shim, and not
 for a *missing* one, nor for an undeclared kind: more than the bare `cp *.sh` it replaces, less than
