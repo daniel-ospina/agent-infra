@@ -504,6 +504,14 @@ record_markers() { # record_markers <dir> <pr>
     BEGIN { fold = tolower(want) }
     {
       chan = $1
+      # ⛔ A CHANNEL WORD OUTSIDE THE FRAME SET IS A CORRUPT FRAME, NOT EVIDENCE (fresh-context review,
+      # round 9). The frame is OURS — `COMMENT|BODY TAB assoc TAB marker` — so anything else means a field
+      # leaked its boundary (a newline inside an author, the shape M23 pins) and the remainder of the line
+      # arrived as a channel nobody wrote. Since round 9 the channel is no longer a filter applied once in
+      # `last_marker`, so without this an invented channel would reach the ADMISSION instead: a verifying
+      # `sig=` admits a marker whose channel is not `COMMENT`-or-`BODY` (a comment is admitted on its
+      # signature), which is how the M23 pin first stopped discriminating.
+      if (chan != "COMMENT" && chan != "BODY") next
       # the channel and the author come from the FRAME; everything after them is the marker as it was
       # written (tabs included), because a signature covers the bytes the recorder signed
       line = $0
@@ -518,8 +526,19 @@ record_markers() { # record_markers <dir> <pr>
       sub(/^review recorded: reviews\/[^ ]* verdict=/, "", rest)
       v = rest; sub(/ .*$/, "", v)
       if (v != "clean" && v != "clean-micro" && v != "clean-low" && v != "not-clean") next
-      if (rest !~ / @ [0-9a-f]+( |$)/) next
-      s = rest; sub(/^.* @ /, "", s); sub(/ .*$/, "", s)
+      # ⛔ THE FIRST ` @ `, NOT THE LAST (fresh-context review, round 9 — P2, MEASURED). The greedy
+      # `^.* @ ` walked to the LAST ` @ ` in the line, and that line TRAILER IS FREE TEXT:
+      # record-review.sh splices the recorder FINDINGS_NOTE verbatim after the sha
+      # (`… @ <40hex> (o/r) findings=<note>`, :8172, which rejects only a quote, a backslash and control
+      # bytes). A note reading `refused @ round 1` therefore left `round 1` as the sha, the 40-hex guard
+      # failed, and `next` dropped the marker SILENTLY — and the note trailer exists ONLY on not-clean
+      # markers, so the markers this ate were exactly the refusals whose loss flips the verdict: with the
+      # refusal at the same head as an earlier clean the report read `VERDICT: ALL-MET`, exit 0, over a
+      # standing refusal (the F2n/M10 false-PASS class, reopened through the trailer). Anchored on the
+      # marker own `<verdict> @ <sha>` frame — `rest` starts at the verdict word — so trailer text cannot
+      # reach the sha field at all.
+      if (rest !~ /^[^ \t]+ @ [0-9a-f]+( |$)/) next
+      s = rest; sub(/^[^ \t]+ @ /, "", s); sub(/ .*$/, "", s)
       if (length(s) != 40 || tolower(s) !~ /^[0-9a-f]+$/) next
       repo = ""
       # the FIRST parenthesised slug-shaped group is the marker repo; text after it (findings=, sig=)
@@ -576,25 +595,47 @@ admitted_marks() { # <dir> <pr> → "MARK <chan> <verdict> <sha> <auth>" · "SKI
   done
 }
 
-# this repo, one channel: "verdict TAB sha TAB auth", oldest first
-markers_from() {
-  admitted_marks "$1" "$2" | awk -F'\t' -v ch="$3" \
-    '$1 == "MARK" && (ch == "*" || $2 == ch) { print $3 "\t" $4 "\t" $5 }'
+# ⛔ THE CHANNELS ARE ORDERED BY RECENCY, NOT BY CHANNEL PRIORITY (fresh-context review, round 9 —
+# P2, MEASURED). Channel priority said "any body marker beats every comment marker", but the PRODUCER
+# posts the comment FIRST and the body second, and the body write is BEST-EFFORT
+# (`record-review.sh:8420` `post_review_evidence_comment … || true`, then `post_marker`): a body PATCH
+# that failed — the exit-5 path the pending/flush machinery exists for — leaves a STALE body marker while
+# the comment carries the newest record, and a later body edit can drop the newest marker outright. On a
+# landing whose body said `not-clean@H1` and whose comment said `clean@H2` (H2 the PR tip) the reader
+# reported `FAIL review_record "the standing record at head … is NOT-CLEAN"` plus a `did not converge`
+# fix_round, exit 1 — the false-FAIL class the header says teaches readers to ignore the instrument.
+# RECENCY IS THE MARKER'S POSITION IN THE PR'S OWN (linear) COMMIT LIST, which a lost body write cannot
+# rewrite; the channel is the TIEBREAK at an equal head, where the recorder's "the body is the current
+# word" rule still holds (the body is written last). A head that is not in the commit list is read as
+# the OLDEST — `review_bound` already FAILs a marker at a revision the PR never carried.
+# Output: "verdict TAB sha TAB chan TAB auth", oldest first. `sort` is used rather than an awk
+# selection sort so the ordering rule is one portable expression.
+markers_ordered() { # markers_ordered <dir> <pr> [BODY|COMMENT|*]
+  admitted_marks "$1" "$2" | awk -F'\t' -v ch="${3:-*}" -v commits="$1/pr-commits.tsv" '
+    BEGIN { n = 0; while ((getline l < commits) > 0) { n++; idx[l] = n } }
+    $1 != "MARK" { next }
+    ch != "*" && $2 != ch { next }
+    {
+      i = ($4 in idx) ? idx[$4] : 0
+      cr = ($2 == "BODY") ? 2 : 1      # the comment is written FIRST, the body last
+      seq++
+      printf "%08d\t%02d\t%08d\t%s\t%s\t%s\t%s\n", i, cr, seq, $3, $4, $2, $5
+    }' | LC_ALL=C sort | cut -f4-
 }
 
-# the recorder's CURRENT word is the body; a comment-only marker is a declared weaker source
+# this repo, one channel: "verdict TAB sha TAB auth", oldest first
+markers_from() {
+  markers_ordered "$1" "$2" "${3:-*}" | cut -f1,2,4
+}
+
+# the recorder's CURRENT word is the NEWEST admitted marker, on whichever channel carried it
 last_marker() { # → "verdict TAB sha TAB source TAB auth"; empty when nothing admitted
-  local dir="$1" pr="$2" v
-  v="$(admitted_marks "$dir" "$pr" \
-    | awk -F'\t' '$1 == "MARK" && $2 == "BODY" { v = $3; s = $4; a = $5 } END { if (v != "") printf "%s\t%s\tbody\t%s\n", v, s, a }')"
-  if [ -n "$v" ]; then
-    printf '%s\n' "$v"
-    return 0
-  fi
-  v="$(admitted_marks "$dir" "$pr" \
-    | awk -F'\t' '$1 == "MARK" && $2 == "COMMENT" { v = $3; s = $4; a = $5 } END { if (v != "") printf "%s\t%s\tcomment\t%s\n", v, s, a }')"
-  [ -n "$v" ] || return 1
-  printf '%s\n' "$v"
+  local m
+  m="$(markers_ordered "$1" "$2" '*' | tail -1)"
+  [ -n "$m" ] || return 1
+  printf '%s\t%s\t%s\t%s\n' "$(printf '%s' "$m" | cut -f1)" "$(printf '%s' "$m" | cut -f2)" \
+    "$(printf '%s' "$m" | cut -f3 | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" \
+    "$(printf '%s' "$m" | cut -f4)"
 }
 
 skipped_markers() { # → "channel:sha:repo" for the markers refused as foreign, or empty
@@ -914,6 +955,15 @@ analyse() { # analyse <dir> <pr>
       rrefused="the box-local record file at head ${rsha:0:12} carries a sig= that cannot be VERIFIED — no AI_REVIEW_GATE_KEY in the environment or at ~/.pi/agent/.ai-review-gate-key on this box"
     elif [ -z "$recpr" ]; then
       rrefused="the box-local record file carries no pr field, so it attests no revision"
+    elif [ "$recpr" != "$pr" ]; then
+      # ⛔ THE FILE MUST ATTEST *THIS* PR (fresh-context review, round 9 — P3, MEASURED). The `pr` field
+      # was used ONLY inside the signed text, never compared with the PR being verified, so a record
+      # legitimately signed for another PR in the same repo verified here whenever the head matched — and
+      # one head can carry several PRs (a stack). The gate binds the file to the PR this way: its
+      # `review_record_eval` signs with the CALLER's PR number and requires the stored `repo` to equal the
+      # target repo. (`repo` needs no separate check: it is inside the same signed text, so a record
+      # minted for another repo cannot verify under this one's `$REPO`.)
+      rrefused="the box-local record file was minted for PR #${recpr}, not PR #${pr} — a signed record for another PR is not this PR's review (the gate signs the caller's own PR number)"
     else
       recsig_text="$(printf 'review-record:v1:%s:%s:%s:%s' "$recpr" "$rsha" "$rverdict" "$REPO")"
       [ "$(printf '%s' "$recsig_text" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null \
