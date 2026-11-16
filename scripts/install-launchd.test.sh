@@ -751,8 +751,19 @@ set +e
 STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
 STATUS_RC=$?
 set -e
-assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
-    "--status reports a surviving installed copy of a retired label as DRIFT, not as a clean status"
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — an installed copy ALSO survives" \
+    "--status reports a surviving installed copy of a retired label, not a clean status"
+assert_eq "$STATUS_RC" "1" \
+    "...and the exit code carries it (the row below is the one that counts it)"
+# ⛔ ONE JOB, ONE MARKER (round 12). This row must NOT carry a marker word of its own: the set-level
+# `⛔ RETIRED-INSTALLED` pass owns both the marker and the exit code for this state, and a second
+# matched line made `fleet-schedule.py --verify` print "2 launchd job(s)" over ONE job (measured).
+assert_not_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
+    "...and it does not print a second job MARKER for the same job (the count is a count of jobs)"
+assert_contains "$STATUS_OUT" "⛔ RETIRED-INSTALLED   com.eldato.hub-state-check" \
+    "...the marker for that state is the set-level RETIRED-INSTALLED row"
+assert_eq "$(printf '%s\n' "$STATUS_OUT" | grep -c 'hub-state-check.*DRIFTED')" "0" \
+    "...and no line about it mentions DRIFTED, so the marker scan counts this job once"
 rm -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 rm -f "$TEMPLATES/com.eldato.hub-state-check.plist"
 
@@ -928,6 +939,25 @@ else
     ok "the TCC-protected unit is absent afterwards"
 fi
 assert_eq "$(grep -c 'bootstrap.*com\.eldato\.objective-reminder' "$LOG" || true)" "$BOOTSTRAP_OBJ_BEFORE" "no bootstrap for the skipped TCC-protected unit"
+# ⛔ AND `--status` MUST ANSWER THE SAME QUESTION THE SAME WAY (#3826 review P2, round 2). The
+# installer SKIPs a TCC-protected unit and returns 0 having DISARMED it; `status_job` had no matching
+# arm, so the same template fell through to `NOT INSTALLED` + rc 1 — a PERMANENT red no command can
+# clear, because re-running the installer just SKIPs it again, and `fleet-schedule.py --verify` turns
+# that rc into `SCHEDULE NOT VERIFIED`. MEASURED pre-fix on this exact fixture: install `SKIP … rc 0`,
+# then `--status` `NOT INSTALLED (template v…)` rc 1. Asserted in both directions, because a "fix"
+# that simply made every absent template rc 0 would pass the code arm and lie here.
+set +e
+OUT="$(run_installer "$HOME1" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_contains "$OUT" "com.eldato.objective-reminder: NOT APPLICABLE" \
+    "the TCC-protected unit is NOT APPLICABLE to --status too — the install path's third skip arm is mirrored"
+# ⛔ THE ASSERTION IS ON *THIS* JOB'S ROW, NOT ON THE EXIT CODE. This fixture home has other declared
+# templates absent, so `--status` rc belongs to them and says nothing about this unit — asserting rc 0
+# here would be measuring the tripwire §7 broke. The discriminating property is that THIS label is
+# never `NOT INSTALLED`, which is what raised the permanent red.
+assert_not_contains "$OUT" "com.eldato.objective-reminder: NOT INSTALLED" \
+    "…and it is never reported NOT INSTALLED (the permanent-red arm the TCC skip would otherwise hit)"
 # Restore the template + fixture so later sections install cleanly.
 # ⛔ NO VERSION-BUMP SED HERE (#3413 review P3). An earlier draft rewrote `agent-infra-plist-version`
 # to force a reinstall and rewrote it back; the `rm -f` above already forces that, and the pairs
@@ -2415,10 +2445,10 @@ set +e
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
 set -e
-assert_eq "$RC" "0" "--status exits 0"
+assert_eq "$RC" "1" "--status exits NON-ZERO when a DECLARED job is DRIFTED (a caveat with exit 0 is green)"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
-assert_contains "$OUT" "Retired (moved to session-checks, #432)" "status lists retired jobs"
+assert_contains "$OUT" "Retired in this repo (no template; the next install unloads + removes each)" "status lists retired jobs"
 
 echo "── 10. --uninstall ───────────────────────────────────────────────"
 set +e
@@ -2811,6 +2841,983 @@ assert_contains "$(run_arm --status 2>&1)" "orphan-reaper: DISARMED" "§16 --sta
 # rendered copy) keeps it true on any box, armed or not.
 assert_contains "$(cat "$TEMPLATES/com.eldato.pi-reap-orphans.plist")" "{{REAP_ORPHAN_MODE}}" \
     "§16 the template carries the {{REAP_ORPHAN_MODE}} placeholder, not a literal — arming stays reachable"
+
+
+# ── §17: the cmux LAUNCH-PATH gate (#1867) ─────────────────────────────────────────────────────────
+# The heartbeat was installed as a launchd job for its whole life and never delivered a message: the
+# cmux socket (`socketControlMode = cmuxOnly`) refuses a launchd-spawned caller, so the job ran, logged
+# `Access denied - only processes started inside cmux can connect` on every tick, and delivered 0
+# nudges over 1,695 degraded reads. A gate that can never open is not a gate — and the installer used to
+# install one while reporting success, because it had NO knowledge of the socket at all.
+#
+# These assertions fail on pre-change code by construction: before the gate there was nothing to refuse
+# with, so every row below was a green `installed + loaded`.
+echo ""
+echo "── 17. cmux-gated scripts refuse to install under launchd (#1867) ──"
+
+[ -f "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" ] \
+    && ok "§17 the repo SHIPS the gate manifest (templates/launchd/LAUNCHD-INCOMPATIBLE)" \
+    || bad "§17 the repo SHIPS the gate manifest (templates/launchd/LAUNCHD-INCOMPATIBLE)"
+assert_contains "$(cat "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" 2>/dev/null || echo MISSING)" "scripts/heartbeat-loop.sh" \
+    "§17 ... and it declares scripts/heartbeat-loop.sh, the script the blind job ran"
+
+# A template that names the cmux-gated script is REFUSED, hard, and nothing is installed from it.
+# Case A uses the CHECKOUT path (`<repo>/scripts/heartbeat-loop.sh`), which exists in this tree.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" --loop 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 a template running a cmux-gated script REFUSES the install (exit 1)"
+assert_contains "$OUT" "cmux-GATED script cannot run under launchd" "§17 ... and says the job would be BLIND, not merely broken"
+assert_contains "$OUT" "socketControlMode" "§17 ... and names the socket gate that makes it so"
+assert_contains "$OUT" "heartbeat-launch.sh start" "§17 ... and names the documented launch path instead"
+[ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ] \
+    && bad "§17 ... and installed NOTHING" \
+    || ok "§17 ... and installed NOTHING"
+
+# ⛔ SUFFIX MATCH, NOT PREFIX (#1867): the gate is a property of the SCRIPT, so the FARMED copy a real
+# plist names must refuse too — and so must a copy in any worktree. A prefix-only rule would pass the
+# repo path and quietly bless the deployed one, which is the path that actually runs.
+# Case B therefore names the identical script under $HOME/.pi/agent/scripts — the farmed deployment
+# path, which shares NO prefix with the checkout.
+mkstub "$PROBE_HOME/.pi/agent/scripts/heartbeat-loop.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/heartbeat-loop.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 the FARMED copy of the gated script refuses too (suffix match, not prefix)"
+assert_contains "$OUT" "cmux-GATED" "§17 ... with the same named refusal"
+
+# DIRECT control: a DIFFERENT script in the same directory installs, so the refusal above is about the
+# manifest entry and not about the directory or the interpreter.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§17 control: a NEIGHBOURING non-gated script in the same dir still installs"
+
+# ⛔ AN EMPTY OR MISSING MANIFEST IS A NO-OP GATE, so the run is refused rather than proceeding
+# ungated — the "installs blindness while reporting success" shape, one layer up.
+GATE_DIR="$T/gate-templates"; rm -rf "$GATE_DIR"; mkdir -p "$GATE_DIR"
+printf '# no entries at all\n' > "$GATE_DIR/LAUNCHD-INCOMPATIBLE"
+set +e
+OUT="$( export HOME="$PROBE_HOME"
+         export PATH="$T/bin:$PATH"
+         export FAKE_LAUNCHCTL_LOG="$LOG"
+         export TEMPLATES_DIR="$GATE_DIR"
+         export AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents"
+         export ELDATO_ALLOW_TEST_HOME=1
+         unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+         bash "$INSTALLER" 2>&1 )"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 an EMPTY manifest refuses the install (an empty gate is the same no-op as none)"
+assert_contains "$OUT" "lists no scripts" "§17 ... and says the gate is empty rather than passing everything"
+
+# ⛔ FINDING 2 (P3): `verify_targets` answers 1 for a cmux refusal, so `install_job` fell through to the
+# FARM-GAP terminal message — "fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh)" —
+# printed directly beneath the correct diagnosis. That remedy provably cannot clear a cmux-gated
+# template, so an operator follows it and the FAIL survives every re-run. On `origin/main` that sentence
+# was only ever emitted for genuinely missing targets, so the misdiagnosis is new to this change.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" --loop 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17c the cmux refusal still exits 1 (the fix is the MESSAGE, not the verdict)"
+assert_contains "$OUT" "REFUSING com.eldato.tccprobe: this template names a cmux-gated script" "§17c ... and the terminal reason names the cmux cause"
+assert_not_contains "$OUT" "fix the farm/checkout first" "§17c ... and NEVER tells the operator to run sync.sh — a remedy that cannot clear it"
+assert_not_contains "$OUT" "missing or unreachable from launchd" "§17c ... and does not call a cmux-gated target a farm gap"
+
+# ── 17b. THE TWO VERBS MUST AGREE ABOUT ONE FILE ──────────────────────────────────────────────────
+# ⛔ FINDING 1 (P2) — A FAIL-OPEN ON #1867'S OWN DEFECT. `verify_targets` answers 1 for BOTH "a target is
+# missing" and "a target is cmux-gated", and `status_job`'s probe acted on 2 ONLY, so the gated template
+# fell through to the CONTENT comparison. With the plist installed byte-identically — the state the blind
+# box was actually in, per #1867's own body — `--status` printed `installed=loaded version=… (in sync)`
+# and exited 0, certifying the blind job as healthy, while `install-launchd.sh` refused the SAME file
+# loudly. MEASURED pre-fix: rc 0, row `in sync`.
+cmux_status_probe() { # <home> <gated-script-path> → installer --status stdout+stderr; rc is the installer's
+    cmux_status_probe_env "$1" "$2" ""
+}
+
+# ⛔ THE SAME FIXTURE WITH A TMPDIR OVERRIDE (§17c). Set separately rather than as a default so the
+# §17b call site is untouched: these two rows must differ in exactly ONE variable (the temp dir), or a
+# green cannot be attributed to the property under test.
+cmux_status_probe_env() { # <home> <gated-script-path> <TMPDIR or "">
+    local home="$1" gated="$2" tmpdir_override="$3"
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR" "$home/Library/LaunchAgents"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$gated</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
+PLIST
+    # BYTE-IDENTICAL install. ⛔ THE TRAILING NEWLINE IS THE WHOLE POINT: `status_job` compares with
+    # `cmp -s "$installed" <(printf '%s' "$rendered")`, and `printf '%s'` emits NO trailing newline —
+    # so an installed copy written by `cp` from a heredoc differs by one byte, reads DRIFTED, and the
+    # row certifies nothing. MEASURED while first writing this fixture: the pre-fix code answered rc 1
+    # `(DRIFTED (template changed — re-run installer))` and the exit-code row below passed vacuously.
+    # `$(cat …)` strips trailing newlines, which is exactly the shape the installer writes.
+    printf '%s' "$(cat "$PROBE_DIR/com.eldato.tccprobe.plist")" > "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      [ -n "$tmpdir_override" ] && export TMPDIR="$tmpdir_override"
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+
+# `cmux_status_probe_nowrite <home> <gated> <nonexistent-tmpdir>` — §17c's entry point, named for what
+# it proves: a temp dir that does not exist, so `mktemp` cannot succeed.
+cmux_status_probe_nowrite() {
+    cmux_status_probe_env "$1" "$2" "$3"
+}
+set +e
+OUT="$(cmux_status_probe "$PROBE_HOME" "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh")"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17b --status REFUSES a cmux-gated template (exit 1) — pre-fix it exited 0"
+assert_contains "$OUT" "⛔ CMUX-GATED   com.eldato.tccprobe" "§17b ... with a row of its own, not a content verdict"
+assert_contains "$OUT" "socketControlMode" "§17b ... naming the socket gate that makes the job blind"
+assert_not_contains "$OUT" "in sync" "§17b ... and NEVER 'in sync' — the row that certified the blind job as healthy"
+assert_not_contains "$OUT" "installed=loaded" "§17b ... and no installed=loaded content verdict at all"
+# DIRECT control: the same fixture with a NEIGHBOURING non-gated script must still grade on CONTENT —
+# otherwise the new arm could be buying its green by refusing every template.
+mkstub "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+set +e
+OUT="$(cmux_status_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh")"; RC=$?
+set -e
+assert_contains "$OUT" "com.eldato.tccprobe" "§17b control: a NON-gated template in the same fixture is still reported"
+assert_not_contains "$OUT" "⛔ CMUX-GATED" "§17b control: ... and is NOT refused as cmux-gated (the arm is about the script, not the directory)"
+
+# ── 17c. A BROKEN TMPDIR IS "COULD NOT GRADE", NEVER "in sync" (#3826 review P1, round 17) ──────
+# ⛔ THIS IS THE ROW THAT WOULD HAVE CAUGHT THE ROUND-16 REGRESSION, and §17b is the row that DID.
+# Round 16 removed the cmux probe's temp file to stop an unwritable TMPDIR from hiding a gated job, and
+# handed `plist_cmux_gated_target` a PROCESS SUBSTITUTION — a pipe, which `plistlib` cannot read
+# (`UnsupportedOperation: File or stream is not seekable`), so the reader exited 3, the probe answered
+# "no gated target", and the row fell through to the CONTENT comparison. MEASURED at `8aade2a1c`: a
+# byte-identical install of this same gated fixture read `installed=loaded version=v0.0.1 (in sync)`,
+# rc 0 — the certify-the-blind-job fail-open, re-opened by its own fix.
+# The probe now uses ONE real temp file for BOTH arms, so an unwritable TMPDIR is answered as
+# `2 UNKNOWN` — which is the property round 16 was actually after: a broken TMPDIR can never produce
+# `in sync`. Red under the mutant that lets a temp-file failure fall through to the content verdict.
+PROBE_NOWRITE="$T/no-such-tmpdir"
+rm -rf "$PROBE_NOWRITE"
+set +e
+OUT="$(cmux_status_probe_nowrite "$PROBE_HOME" "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" "$PROBE_NOWRITE")"; RC=$?
+set -e
+assert_eq "$RC" "2" "§17c an unwritable TMPDIR answers 2 UNKNOWN for a cmux-gated template (not 0, not 1)"
+assert_contains "$OUT" "⛔ UNKNOWN   com.eldato.tccprobe" "§17c ... with an UNKNOWN row of its own, naming the unit it could not grade"
+assert_contains "$OUT" "cannot create a temp file" "§17c ... and the reason, so the operator fixes TMPDIR and not the plist"
+assert_not_contains "$OUT" "in sync" "§17c ... and NEVER 'in sync': a unit that cannot be graded is not certified"
+assert_not_contains "$OUT" "installed=loaded" "§17c ... and no installed=loaded content verdict at all"
+
+# ── 17d. A GATE THAT CANNOT BE EVALUATED IS NOT A CLEAN UNIT (#3826 review P1, round 18) ──────────
+# ⛔ THE `--status` BLOCK ENDS BEFORE `cmux_gate_required` IS CALLED. `is_cmux_gated` answers "not
+# gated" when `templates/launchd/LAUNCHD-INCOMPATIBLE` is missing or holds no entry, and on the INSTALL
+# path that is safe because the gate refusal runs first — but `--status` inherited the answer without
+# the gate, so the two verbs disagreed about one file again. MEASURED at `f17785035` on a scratch
+# INFRA_ROOT carrying a GATED template and no manifest (and again with a comments-only one), installed
+# byte-identically:
+#   --status → `com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)`   STATUS_RC=0
+#   install  → `ERROR: the cmux launch-path gate cannot be evaluated`               INSTALL_RC=1
+# The gate is now its OWN answer (rc 4 from `plist_cmux_gated_target` → an UNKNOWN row), so a gate that
+# cannot open is never read as a clean unit. The third arm is the control the first two need: with the
+# real manifest present this same fixture still reds ⛔ CMUX-GATED, so the arm refuses the unanswerable
+# case rather than every case.
+GATE_ROOT="$T/gate-root"; rm -rf "$GATE_ROOT"
+mkdir -p "$GATE_ROOT/scripts" "$GATE_ROOT/templates/launchd"
+cp "$INSTALLER" "$GATE_ROOT/scripts/install-launchd.sh"
+GATE_HOME="$T/gate-home"; rm -rf "$GATE_HOME"; mkdir -p "$GATE_HOME/Library/LaunchAgents" "$GATE_HOME/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$GATE_HOME/.pi/agent/scripts/probe-ok.sh"; chmod +x "$GATE_HOME/.pi/agent/scripts/probe-ok.sh"
+cat > "$GATE_ROOT/templates/launchd/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key><array><string>/bin/bash</string><string>$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh</string></array>
+</dict>
+</plist>
+PLIST
+# The two manifests the set-level guard requires, so THIS row is the gate's arm and not §18f's.
+printf 'com.eldato.orchestrator-loop\n' > "$GATE_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS"
+printf 'com.eldato.old\n' > "$GATE_ROOT/templates/launchd/RETIRED"
+printf '%s' "$(cat "$GATE_ROOT/templates/launchd/com.eldato.tccprobe.plist")" > "$GATE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+gate_status() {
+    ( export HOME="$GATE_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TEMPLATES_DIR AGENTS_DIR TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$GATE_ROOT/scripts/install-launchd.sh" --status 2>&1 )
+}
+for _gate_label in 'absent' 'empty'; do
+    if [ "$_gate_label" = 'absent' ]; then
+        rm -f "$GATE_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    else
+        printf '# nothing here is cmux-gated\n' > "$GATE_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    fi
+    set +e
+    OUT="$(gate_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "2" "§17d a $_gate_label LAUNCHD-INCOMPATIBLE answers 2 UNKNOWN for a gated template"
+    assert_contains "$OUT" "cmux launch-path GATE could not be evaluated" "§17d ... naming the gate that could not be opened ($_gate_label)"
+    assert_not_contains "$OUT" "in sync" "§17d ... and NEVER 'in sync' over a job nobody could classify ($_gate_label)"
+done
+cp "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" "$GATE_ROOT/templates/launchd/"
+set +e
+OUT="$(gate_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17d control: the real manifest present → the SAME fixture is refused as CMUX-GATED (rc 1)"
+assert_contains "$OUT" "⛔ CMUX-GATED   com.eldato.tccprobe" "§17d ... so the new arm refuses the unanswerable case, not every case"
+
+
+# ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
+# The blind heartbeat was installed, loaded and ticking with no template describing it, so neither the
+# status pass (which iterates TEMPLATES) nor any content comparison could see it. That is the hole this
+# closes: --status names it AND the exit code carries it, because a status command that prints a caveat
+# and exits 0 is read by every caller as green.
+echo ""
+echo "── 18. --status reports an installed plist with no template as UNMANAGED ──"
+
+STRAY_HOME="$T/stray-home"; mkfakehome "$STRAY_HOME"
+# ⛔ THE FIXTURE IS PROVISIONED FIRST, IN THE *SAME* ENVIRONMENT `run_stray_status` USES (#1867
+# review, round 9). Round 9 made a per-job failure verdict carry the exit code, and `NOT INSTALLED` on
+# an INSTALLABLE template is one — so a bare `mkfakehome` with nothing installed read rc 1 for every
+# row in this section, poisoning fourteen `want: 0` assertions whose SUBJECT ("is this label wrongly
+# called UNMANAGED?") was fine. The honest repair is not to re-polarise those rows: it is to give the
+# fixture the state they assume, a box whose declared set IS installed. The environment is deliberately
+# IDENTICAL to `run_stray_status`'s (TORTOISE_REPO/SWARM_ROOT/PYTHON_BIN unset), so "installs there"
+# and "is applicable here" answer the same way and a template cannot be installed and then reported
+# NOT APPLICABLE — the predicates are the installer's own, in both directions.
+# ⛔ DEFINED BEFORE ITS FIRST CALL, NOT AFTER IT: bash resolves a function at CALL time, and the first
+# cut of this block sat 35 lines below its use — `run_stray_installer: command not found`, rc 127, the
+# fixture stayed bare and the same 14 rows failed for a reason that looked exactly like the bug being
+# fixed. A fixture that cannot run is not a fixture.
+run_stray_installer() {
+    ( export HOME="$STRAY_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$STRAY_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+set +e
+STRAY_INSTALL_OUT="$(run_stray_installer)"
+STRAY_INSTALL_RC=$?
+set -e
+assert_eq "$STRAY_INSTALL_RC" "0" "§18 fixture: the declared set installs cleanly (so 'clean' is reachable here)"
+# seed_stray_plist <label> — an installed plist on the box naming <label>. Only the FILENAME matters
+# to `unmanaged_plists` (it classifies by basename); the body is a minimal valid plist so nothing
+# downstream mistakes it for a truncated file.
+seed_stray_plist() {
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0"><dict>' \
+        "<key>Label</key><string>$1</string>" \
+        '<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/stray.sh</string></array>' \
+        '</dict></plist>' > "$STRAY_HOME/Library/LaunchAgents/$1.plist"
+}
+run_stray_status() { # [agents-dir] — defaults to the fake home's LaunchAgents
+    ( export HOME="$STRAY_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      # `STRAY_TEMPLATES` is the seam for the DECLARED-set arms (§18d): the same fake home and the same
+      # installed set, judged against a different declaration tree.
+      export TEMPLATES_DIR="${STRAY_TEMPLATES:-$TEMPLATES}"
+      export AGENTS_DIR="${1:-$STRAY_HOME/Library/LaunchAgents}"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: --status on a box with NOTHING unmanaged exits 0"
+assert_not_contains "$OUT" "UNMANAGED" "§18 ... and does not cry UNMANAGED over an empty LaunchAgents dir"
+
+# The blind heartbeat's exact shape: a plist on the box that no template describes.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.heartbeat.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.heartbeat</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18 --status exits NON-ZERO when an installed job has no template (a caveat with exit 0 is green)"
+assert_contains "$OUT" "UNMANAGED" "§18 ... and names the condition"
+assert_contains "$OUT" "com.eldato.heartbeat" "§18 ... and names the label, so it is actionable"
+assert_contains "$OUT" "no template change and no content comparison can" "§18 ... and says WHY no existing instrument could see it"
+
+# A RETIRED label is deliberately template-less — it is DECLARED and removed by retire_pass. It must
+# NOT be reported as unmanaged, or every box that installed the pre-retirement jobs would cry wolf.
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.heartbeat.plist"
+# (The RETIRED manifest is NOT copied into LaunchAgents: nothing reads it from there. It was, and that
+# line read as the setup for the arm below while `retired_labels` actually reads the TEMPLATES copy
+# seeded by the fixture's `cp -R` — a misleading fixture, deleted rather than left to mislead.)
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hub-state-check.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.hub-state-check</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/old.sh</string></array>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_not_contains "$OUT" "UNMANAGED" "§18 a RETIRED label is NOT unmanaged (it is declared, and retire_pass removes it)"
+# ⛔ BUT "NOT UNMANAGED" IS NOT "CLEAN" (#1867 review, round 8). `retire_pass` — the only remover —
+# runs on an INSTALL, never on `--status`. Exempting RETIRED from the ROW was right; exempting it from
+# the EXIT CODE meant this verb exited 0 over a job the manifest says must go, and
+# `scripts/fleet-schedule.py --verify` then printed `SCHEDULE VERIFIED` over it. The row class is its
+# own (`⛔ RETIRED-INSTALLED`), the exit is 1, and the remedy is an INSTALL — not `rm -f`, because the
+# label IS declared and `retire_pass` does the bootout AND the removal.
+assert_eq "$RC" "1" "§18 a RETIRED label that is STILL INSTALLED exits 1, not 0 (retire_pass has not run)"
+assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... with its OWN row class, distinct from UNMANAGED"
+assert_contains "$OUT" "com.eldato.hub-state-check" "§18 ... naming the label"
+assert_contains "$OUT" "bash scripts/install-launchd.sh" "§18 ... and the remedy that actually removes it (retire_pass)"
+# ⛔ AND THE PRINTED REMEDY MUST BE A VERB THAT EXISTS (#1867 review, round 10). This row used to read
+# `assert_contains "$OUT" "install-launchd.sh --install"` — it pinned a string that CANNOT RUN: the
+# installer has no `--install` arm, so the printed command fell to `*)` and exited 2. MEASURED following
+# it verbatim: rc 2 `unknown argument: --install`, plist still on disk, RETIRED-INSTALLED still printed;
+# the SAME command with no argument: `RETIRED (unloaded + removed)`, row gone. An assertion that greps a
+# remedy never notices whether the remedy works, so the string is now asserted NEGATIVELY as well.
+assert_not_contains "$OUT" "install-launchd.sh --install" "§18 ... and NOT a verb this file does not have (--install exits 2)"
+assert_not_contains "$OUT" 'bootout gui/' "§18 ... never the hand-deletion remedy: the label is DECLARED, not a stray"
+# ⛔ AND THE FIXTURE MUST BE TORN DOWN (#1867 review, round 8). The old row exited 0 whatever the plist
+# said, so leaving it on disk was invisible; now that it is a FAILING state, a seed without a teardown
+# would leave `--status` returning 1 for every later row in this section — eleven `want: 0` rows red with
+# a message that names the label UNDER TEST instead of the leaked one. MEASURED with the teardown
+# missing: 11 ❌, all `got: 1, want: 0`, the first being the very next control row.
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: removing the retired plist clears the RETIRED-INSTALLED row (the seed is torn down)"
+assert_not_contains "$OUT" "RETIRED-INSTALLED" "§18 ... so no later row in this section inherits the leak"
+
+# ⛔ THE BLIND JOB'S OWN LABEL IS NOW DECLARED (#1867 review P1), and that entry IS the remediation.
+# `com.tortoise.heartbeat-loop` is the hand-installed launchd job that ran scripts/heartbeat-loop.sh
+# (no template in this repo ever named it — pi-bootstrap/tests/test-setup-no-nesting.sh records the
+# same fact). Before this entry the diagnosis shipped and the removal did not: `--uninstall`
+# iterates TEMPLATES, so no command in this repo could remove it, and `--status` stayed red until a
+# human hand-deleted the plist. Adding it to RETIRED makes `retire_pass` unload + remove it on the
+# next install (and on --uninstall), so the box goes green in the same change that diagnoses it.
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED" 2>/dev/null || echo MISSING)" "com.tortoise.heartbeat-loop" \
+    "§18 RETIRED declares the blind heartbeat's label (com.tortoise.heartbeat-loop)"
+cat > "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.tortoise.heartbeat-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_not_contains "$OUT" "UNMANAGED" "§18 the blind job is NOT unmanaged once RETIRED declares it (retire_pass removes it)"
+# ⛔ THE FALSE PASS THIS CHANGE EXISTED TO PREVENT WAS STILL HERE (#1867 review, round 8), one layer
+# down: this verb certified the box that was still ticking the blind job. MEASURED on round 7's code
+# with a fixture holding ONLY this plist: rc=0, zero rows, plist still on disk — while the normalising
+# caller (`fleet-schedule.py --verify`) printed `SCHEDULE VERIFIED`. It must fail until an install
+# removes the job.
+assert_eq "$RC" "1" "§18 the blind job still installed is a FAILING state, not a green one"
+assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... reported as RETIRED-INSTALLED, one line per job"
+assert_contains "$OUT" "com.tortoise.heartbeat-loop" "§18 ... naming the blind heartbeat's own label"
+assert_contains "$OUT" "bash scripts/install-launchd.sh" "§18 ... and pointing at the install that runs retire_pass"
+# ⛔ THE REMEDY IS NOW EXERCISED, NOT JUST GREPPED (#1867 review, round 10). The no-argument install is
+# what the row tells the operator to run; here it is actually run, and the row must clear. Round 9's
+# version of this block removed the plist by hand, so the command the operator was told to use was
+# never executed by any assertion.
+set +e
+RETIRE_REMEDY_OUT="$(run_stray_installer)"
+RETIRE_REMEDY_RC=$?
+set -e
+assert_eq "$RETIRE_REMEDY_RC" "0" "§18 the printed remedy (the bare installer) exits 0"
+assert_contains "$RETIRE_REMEDY_OUT" "com.tortoise.heartbeat-loop: RETIRED (unloaded + removed)" \
+    "§18 ... and it UNLOADS + REMOVES the retired label itself (retire_pass ran)"
+[ ! -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" ] \
+    && ok "§18 ... and the plist is gone from disk, not merely reported" \
+    || bad "§18 ... the printed remedy left the retired plist installed"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+# The CONTROL: with the retired plist gone the box is green again, so the row above is not a stuck red
+# and an operator can verify the removal with the same verb they diagnosed with.
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: once the retired job is removed, --status is 0 again (transient by construction)"
+assert_not_contains "$OUT" "RETIRED-INSTALLED" "§18 ... and no longer reports a retired-installed row"
+
+# ── 18e. THE RETIRED MANIFEST RESOLVES LIKE THE OTHER TWO (#1867 review, round 12) ────────────────
+# `retired_labels` read `$TEMPLATES_DIR/RETIRED` and NOTHING else, so an env-overridden or sparse
+# TEMPLATES_DIR that carried templates but no RETIRED made `is_retired` answer `no` for every label.
+# The row a retired job then produced was `⛔ UNMANAGED` plus `launchctl bootout … && rm -f …` — the
+# deletion advice aimed at a live job, which is verbatim the harm
+# `templates/launchd/OWNED-BY-OTHER-INSTALLERS:28-31` exists to prevent ("A missing entry therefore
+# does not merely print a false alarm — it hands the operator the command that DELETES a live job").
+# `cmux_manifest` and `foreign_manifest` already fall back to the checkout's own copy for exactly this
+# reason; RETIRED is the third manifest in that directory and resolves the same way now.
+# MEASURED pre-fix on this fixture minus RETIRED: `⛔ UNMANAGED   com.tortoise.heartbeat-loop` and the
+# bootout command, over the one job this change exists to REMOVE rather than hand-delete.
+NO_RETIRED_TEMPLATES="$T/no-retired-templates"; mkdir -p "$NO_RETIRED_TEMPLATES"
+cp "$TEMPLATES"/*.plist "$NO_RETIRED_TEMPLATES"/ 2>/dev/null || true
+if [ -f "$NO_RETIRED_TEMPLATES/RETIRED" ]; then
+    bad "§18e fixture: RETIRED was copied in — this arm would be vacuous"
+else
+    ok "§18e fixture: the declared set is present and the RETIRED manifest is NOT ($(ls "$NO_RETIRED_TEMPLATES"/*.plist 2>/dev/null | wc -l | tr -d ' ') template(s))"
+fi
+cat > "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.tortoise.heartbeat-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+STRAY_TEMPLATES="$NO_RETIRED_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "1" "§18e a retired job is STILL a failing state when TEMPLATES_DIR carries no RETIRED"
+assert_contains "$OUT" "⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop" \
+    "§18e ... resolved through the checkout's own copy, so it is still a known retired label"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.tortoise.heartbeat-loop" \
+    "§18e ... and is NOT reclassified as a stray"
+assert_not_contains "$OUT" 'heartbeat-loop.plist" && rm -f' \
+    "§18e ... so no delete command is aimed at a job this repo has declared retired"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+
+# ⛔ A JOB ANOTHER INSTALLER OF THIS REPO OWNS IS NOT UNMANAGED (#1867 review P1). The harness
+# controller `com.eldato.orchestrator-loop` is rendered by scripts/orchestrator-harness/install.sh
+# from its OWN template — deliberately not in this directory, because that installer owns its
+# lifecycle. Flagging it made `--status` exit 1 FOREVER on the reference Mac layout, and the caller
+# that gates on it hard-FAILs: scripts/fleet-schedule.py → `FAIL … SCHEDULE NOT VERIFIED` →
+# activate-harness.sh → `fleet-schedule … FAILING`. A drift instrument whose healthy state is red is
+# one an operator learns to ignore, or silences by deleting a plist the controller needs.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.orchestrator-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/launchd-controller.sh</string></array>
+<key>StartInterval</key><integer>300</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 a job the HARNESS installer owns is NOT unmanaged (no permanent red on the reference Mac)"
+assert_not_contains "$OUT" "com.eldato.orchestrator-loop" "§18 ... and is not even named as unmanaged"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+
+# ⛔ TWO MORE LABELS THIS REPO INSTALLS OR ADOPTS, each found the same way (#1867 review P1, round 4).
+# The exemption list had exactly one entry, so `--status` on a box carrying either of these went RED and
+# — worse than a false alarm — printed `launchctl bootout … && rm -f …` as the remedy for a live job:
+#   · com.eldato.lane-arm          — scripts/install-lane-arm-timer.sh writes it into LaunchAgents on
+#                                    macOS; docs/ops/harness-activation.md row 12 lists it as installed
+#                                    on "both" platforms, and pi-bootstrap/setup.sh farms the installer.
+#   · com.eldato.orchestrator-stack — the supervision job a box already carries, ADOPTED by
+#                                    scripts/orchestrator-bringup.sh and the DEFAULT target of
+#                                    scripts/orchestrator-harness/watchdog-loop.sh:129. No installer
+#                                    here writes its plist, which is exactly why UNMANAGED was literally
+#                                    true for it — and why the printed delete advice was indefensible.
+# Red under the mutant that drops either entry: rc=1, the label named, the bootout line printed.
+for _owned in com.eldato.lane-arm com.eldato.orchestrator-stack; do
+    seed_stray_plist "$_owned"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 '$_owned' is declared elsewhere in this repo — NOT unmanaged, no permanent red"
+    assert_not_contains "$OUT" "$_owned" "§18 ... and no bootout+rm advice is aimed at '$_owned'"
+    rm -f "$STRAY_HOME/Library/LaunchAgents/$_owned.plist"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 control: removing '$_owned' leaves the box clean (the row above was not a stuck red)"
+done
+
+# ── 18f. AN EMPTY EXEMPTION MANIFEST IS A REFUSAL, NOT A BLANKET RE-CLASSIFICATION (#3826 P2) ─────
+# ⛔ THE GUARD TESTED THE MANIFEST'S *PATH*, NOT ITS ENTRIES. `retired_manifest`/`foreign_manifest`
+# answer a path when the file is `-r`/`-f`, so a manifest that EXISTS and is EMPTY — a truncated file,
+# a mangled merge, a copy whose entries were lost — passed the guard, `is_foreign` then answered "no"
+# for every label, and the loop handed the operator `launchctl bootout … && rm -f …` for a live job
+# another installer of THIS repo owns. That is verbatim the harm
+# `templates/launchd/OWNED-BY-OTHER-INSTALLERS:28-31` exists to prevent, and the identical sentence
+# `cmux_gate_required` already refuses on the install path ("an EMPTY gate is the same no-op as a
+# missing one"). MEASURED at `8aade2a1c` with the label below seeded and OWNED-BY-OTHER-INSTALLERS
+# truncated to 0 bytes: `⛔ UNMANAGED com.eldato.orchestrator-loop` plus the bootout+rm remedy, rc 1;
+# with the entries restored, 0 UNMANAGED rows. Red under the mutant that restores the path-only guard.
+EMPTY_OWNED_TEMPLATES="$T/empty-owned-templates"; mkdir -p "$EMPTY_OWNED_TEMPLATES"
+cp "$TEMPLATES"/*.plist "$EMPTY_OWNED_TEMPLATES"/ 2>/dev/null || true
+cp "$TEMPLATES/RETIRED" "$EMPTY_OWNED_TEMPLATES"/ 2>/dev/null || true
+: > "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS"
+if [ -f "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" ] && [ ! -s "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" ]; then
+    ok "§18f fixture: the declared set is present and OWNED-BY-OTHER-INSTALLERS exists but holds no entry"
+else
+    bad "§18f fixture: the emptiness this arm tests was not produced"
+fi
+seed_stray_plist com.eldato.orchestrator-loop
+STRAY_TEMPLATES="$EMPTY_OWNED_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "2" "§18f an EMPTY exemption manifest answers 2 UNKNOWN, not a per-job verdict"
+assert_contains "$OUT" "⛔ UNKNOWN" "§18f ... with a row that says the set could not be read"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.eldato.orchestrator-loop" \
+    "§18f ... and never re-classifies a job another installer of this repo owns as a stray"
+assert_not_contains "$OUT" 'launchctl bootout gui/' \
+    "§18f ... so NO delete command is aimed at a live job on the strength of a list it never read"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18f control: with a readable manifest and nothing unmanaged, the box is clean again"
+
+# ── 18g. AN EMPTY `RETIRED` LIST IS A TERMINAL STATE, NOT A RED (#3826 review P2, round 18) ────────
+# ⛔ THE INVERSE OF §18f, AND IT BIT. `RETIRED` is a RECORD OF REMOVALS, so "holds no entry" is its
+# legitimate terminal state — the moment every retired job is gone. Round 17 refused on emptiness for
+# BOTH lists, which on a clean box produced: `in sync` for the job, THEN
+# `⛔ UNKNOWN — the DECLARED SET … could NOT be read` and rc **2** — a PERMANENT red with a false
+# diagnosis (the set WAS read) and a remedy (`re-run with a readable TEMPLATES_DIR`) that cannot clear
+# it. MEASURED at `f17785035`. `OWNED-BY-OTHER-INSTALLERS` keeps the refusal (§18f) because an empty one
+# re-classifies live jobs into delete advice; emptiness is only dangerous where entries are owed.
+RETIRED_EMPTY_ROOT="$T/retired-empty"; rm -rf "$RETIRED_EMPTY_ROOT"
+mkdir -p "$RETIRED_EMPTY_ROOT/templates" "$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents" "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh"
+chmod +x "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh"
+cat > "$RETIRED_EMPTY_ROOT/templates/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key><array><string>/bin/bash</string><string>$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh</string></array>
+</dict>
+</plist>
+PLIST
+printf '%s' "$(cat "$RETIRED_EMPTY_ROOT/templates/com.eldato.tccprobe.plist")" > "$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+printf 'com.eldato.orchestrator-loop\n' > "$RETIRED_EMPTY_ROOT/templates/OWNED-BY-OTHER-INSTALLERS"
+cp "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" "$RETIRED_EMPTY_ROOT/templates/"
+# A comments-only RETIRED: the shape a repo has the day after its last retirement is cleared.
+printf '# nothing is retired right now\n' > "$RETIRED_EMPTY_ROOT/templates/RETIRED"
+retired_empty_status() {
+    ( export HOME="$RETIRED_EMPTY_ROOT/home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$RETIRED_EMPTY_ROOT/templates"
+      export AGENTS_DIR="$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+if [ -f "$RETIRED_EMPTY_ROOT/templates/RETIRED" ] \
+   && [ "$(grep -cvE '^[[:space:]]*(#|$)' "$RETIRED_EMPTY_ROOT/templates/RETIRED")" = "0" ]; then
+    ok "§18g fixture: RETIRED exists and holds no entry (comments only) — the shape the arm must not refuse"
+else
+    bad "§18g fixture: RETIRED still holds an entry, so this arm would be vacuous"
+fi
+set +e
+OUT="$(retired_empty_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18g an EMPTY RETIRED on a clean in-sync box is NOT a permanent red (rc 0)"
+assert_contains "$OUT" "com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)" "§18g ... the job is still graded on content"
+assert_not_contains "$OUT" "⛔ UNKNOWN" "§18g ... and no UNKNOWN row claims a set that WAS read could not be read"
+
+# ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list, IN BOTH DIRECTIONS, and
+# against EVERY SPELLING an installer in this repo uses (#1867 review P1/P2, round 4).
+#
+# The round-3 gate asked only the STALE question — "does this exempted label still get declared?" —
+# with a regex that saw only `LABEL="com.…"` assignment lines. Both halves were wrong, and both let
+# real jobs through:
+#   · DIRECTION: an exemption list that can only drift stale cannot notice a MISSING exemption. That
+#     is the P1 this section exists for — a label the repo installs, never exempted, reported as
+#     UNMANAGED with `launchctl bootout … && rm -f …` printed as the remedy for it.
+#   · SPELLING: `install-lane-arm-timer.sh` never writes `LABEL="com.eldato.lane-arm"` — its
+#     `LABEL=eldato-lane-arm` is the SYSTEMD unit name, and the launchd label exists only as an
+#     inline plist body (`<key>Label</key><string>com.eldato.lane-arm</string>`) plus a literal
+#     `Library/LaunchAgents/com.eldato.lane-arm.plist` path. `watchdog-loop.sh` writes its label only
+#     as a `${LABEL:-com.eldato.orchestrator-stack}` default. A `LABEL=`-only grep sees NEITHER, so a
+#     reverse gate built on it would have missed the very label that motivated this.
+#
+# `installed_labels_in_repo` therefore derives the population the other way — every
+# com.eldato.*/com.tortoise.* label an installer here writes into LaunchAgents, in any of the four
+# spellings — and the rows below assert each one is a template (flat OR one dir down), RETIRED, or
+# listed in OWNED-BY-OTHER-INSTALLERS. That is the direction that reds when an entry goes missing.
+# STATED LIMIT: the greps read LITERAL labels; a label assembled at runtime from something other
+# than `UNIT_NAME` (which is resolved below) is not enumerated. Every label this repo installs today
+# is reached by one of the arms below — the population rows pin that `com.eldato.lane-arm` (an inline
+# plist body) and `com.eldato.orchestrator-stack` (a `${LABEL:-…}` default) are BOTH in it, so a gate
+# that stopped seeing either cannot pass silently.
+#
+# ⛔ INSTALLERS ARE NOT ALL SHELL (#1867 review P2, round 5). The first version of this population
+# walked `install-*.sh` and four `orchestrator-harness/*.sh` only, so `scripts/orchestrator-harness/
+# merge-reminder.py` — which writes `~/Library/LaunchAgents/com.tortoise.merge-reminder.plist` on
+# darwin — was invisible to the gate that exists to catch exactly it: the label was undeclared,
+# `--status` reported it UNMANAGED, and the remedy printed for it was `launchctl bootout … && rm -f`
+# on a live job of this repo's own. `*.py` modules are a declaring surface for the same reason an
+# installer script is, and the assignment spelling (`LABEL = "com.…"`, `label = "com.…"`) is one of
+# the arms below.
+installed_labels_in_repo() {
+    local f unit
+    for f in "$SCRIPT_DIR"/install-*.sh "$SCRIPT_DIR"/orchestrator-bringup.sh \
+             "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/orchestrator-harness/*.sh \
+             "$SCRIPT_DIR"/orchestrator-harness/*.py; do
+        [ -f "$f" ] || continue
+        # ⛔ NOT A SUITE. `scripts/install-*.sh` matches this very file's siblings' fixtures —
+        # `install-launchd.test.sh` seeds `com.eldato.tccprobe` / `com.eldato.hand-installed` plists as
+        # FIXTURES, and a suite is not a declaring surface: including it made the reverse gate demand
+        # an exemption for a label that exists only inside a test's scratch home. The same exclusion
+        # applies to the python suites, which build fake `~/Library/LaunchAgents` trees.
+        case "$f" in *.test.sh|*.test.py|*/test_*.py) continue ;; esac
+        # (1) A `label`-shaped name assigned a literal label — shell `LABEL="com.…"`,
+        # `BASE_LABEL="com.…"`, and python `label = "com.…"` / `GATE_JOB_LABEL = "com.…"`. The
+        # `${LABEL:-…}` default form is arm (5).
+        grep -hoE '[A-Za-z_]*(LABEL|label)[A-Za-z_]*[[:space:]]*[:=][[:space:]]*"com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
+            | grep -oE 'com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' || true
+        # (2) an inline plist body — the spelling lane-arm uses and nothing else does.
+        grep -hoE '<key>Label</key><string>com\.(eldato|tortoise)\.[A-Za-z0-9._-]+</string>' "$f" \
+            | sed -E 's:.*<string>(.*)</string>:\1:' || true
+        # (3) a literal installed-plist path (`"Library" / "LaunchAgents" / f"{label}.plist"` does NOT
+        # name a label, which is why the python installer is reached by arm (1) instead).
+        grep -hoE 'Library/LaunchAgents/com\.(eldato|tortoise)\.[A-Za-z0-9._-]+\.plist' "$f" \
+            | sed -E 's:.*LaunchAgents/::; s:\.plist$::' || true
+        # (4) LABEL="com.eldato.${UNIT_NAME#eldato-}" — resolved against THIS file's own UNIT_NAME=.
+        # Four installers spell it this way; none of them would be enumerated without this arm, and
+        # all four are template-backed, so leaving them out would have made the reverse gate quietly
+        # narrower than its claim.
+        if grep -qF 'com.eldato.${UNIT_NAME#eldato-}' "$f"; then
+            unit="$(grep -m1 -oE '^UNIT_NAME="eldato-[A-Za-z0-9._-]+"' "$f" | sed -E 's/.*"eldato-//; s/"$//' || true)"
+            [ -n "$unit" ] && printf 'com.eldato.%s\n' "$unit"
+        fi
+        # (5) LABEL="${LABEL:-com.….}" — the default IS the declaration (`watchdog-loop.sh`).
+        grep -hoE '\$\{(BASE_)?LABEL:-com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
+            | grep -oE 'com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' || true
+    done | LC_ALL=C sort -u
+}
+
+TEMPLATE_LABELS="$( { for _tpl in "$REPO_TEMPLATES"/*.plist "$REPO_TEMPLATES"/*/*.plist; do
+                        [ -f "$_tpl" ] || continue
+                        basename "$_tpl" .plist
+                    done; } | LC_ALL=C sort -u)"
+RETIRED_LABELS="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/RETIRED" 2>/dev/null | LC_ALL=C sort -u || true)"
+FOREIGN_ENTRIES="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null | LC_ALL=C sort -u || true)"
+if [ -n "$FOREIGN_ENTRIES" ]; then
+    ok "§18 OWNED-BY-OTHER-INSTALLERS has entries for the drift gate to check (not a vacuous loop)"
+else
+    bad "§18 OWNED-BY-OTHER-INSTALLERS is empty — the drift rows below would prove nothing"
+fi
+
+# (A) NO ENTRY IS STALE — every exemption still has a declaring surface, in ANY spelling.
+# ⛔ HERE-STRINGS, NEVER `printf … | grep -q` (#841/#864): a piped `grep -q` can exit at its first match
+# while the producer is still writing, the producer dies of SIGPIPE, and under `pipefail` the pipeline's
+# status inverts — the verdict reads false while the pattern WAS found.
+DECLARED_IN_REPO="$(installed_labels_in_repo || true)"
+if grep -qxF -- 'com.eldato.lane-arm' <<<"$DECLARED_IN_REPO"; then
+    ok "§18 the population is read from the installers, and it includes the inline-plist label (com.eldato.lane-arm)"
+else
+    bad "§18 installed_labels_in_repo MISSED com.eldato.lane-arm — the reverse gate below would be looking at a narrower population than it claims"
+fi
+# ⛔ AND THE PYTHON-ASSIGNMENT SPELLING IS IN IT TOO (#1867 review P2, round 5).
+# `scripts/orchestrator-harness/merge-reminder.py --install` writes a LaunchAgent on darwin, so the
+# label it writes is installed by this repo; the first version of this population walked only
+# `install-*.sh` and four `*.sh` under orchestrator-harness, so that label was INVISIBLE — it went
+# undeclared, `--status` called it UNMANAGED, and the remedy printed for a live job of this repo's own
+# was `launchctl bootout … && rm -f`. Pinning it here means a future narrowing of the file walk reds
+# this row instead of silently re-opening the hole.
+if grep -qxF -- 'com.tortoise.merge-reminder' <<<"$DECLARED_IN_REPO"; then
+    ok "§18 …and the label a PYTHON installer writes (com.tortoise.merge-reminder), so *.py is walked too"
+else
+    bad "§18 installed_labels_in_repo MISSED com.tortoise.merge-reminder — the file walk does not include *_*.py installers, so a python-installed label is undeclared and gets a bootout+rm remedy"
+fi
+while IFS= read -r _foreign; do
+    [ -n "$_foreign" ] || continue
+    if grep -qxF -- "$_foreign" <<<"$DECLARED_IN_REPO"; then
+        ok "§18 the exemption '$_foreign' still has a declaring surface in this repo (not stale)"
+    else
+        bad "§18 the exemption '$_foreign' has NO declaring installer/spelling in this repo — re-anchor OWNED-BY-OTHER-INSTALLERS"
+    fi
+done <<<"$FOREIGN_ENTRIES"
+
+# (B) NO INSTALLED LABEL IS UNDECLARED — the direction that actually does harm, because the remedy
+# `--status` prints for an undeclared label is a deletion.
+INSTALLED_IN_REPO="$(installed_labels_in_repo || true)"
+if [ -n "$INSTALLED_IN_REPO" ]; then
+    ok "§18 the reverse-direction gate has a population to check (not a vacuous loop)"
+else
+    bad "§18 installed_labels_in_repo found NO labels at all — the reverse gate below proves nothing"
+fi
+while IFS= read -r _installed; do
+    [ -n "$_installed" ] || continue
+    if grep -qxF -- "$_installed" <<<"$TEMPLATE_LABELS" \
+       || grep -qxF -- "$_installed" <<<"$RETIRED_LABELS" \
+       || grep -qxF -- "$_installed" <<<"$FOREIGN_ENTRIES"; then
+        ok "§18 '$_installed' is installed by this repo AND declared (template / RETIRED / OWNED-BY-OTHER-INSTALLERS)"
+    else
+        bad "§18 '$_installed' is installed into ~/Library/LaunchAgents by an installer in this repo but declared NOWHERE — --status would report it UNMANAGED and print a bootout+rm remedy for a live job"
+    fi
+done <<<"$INSTALLED_IN_REPO"
+
+
+# ⛔ AND A TEMPLATE ONE DIRECTORY DOWN IS STILL DECLARED (#1867 review P1). This repo ships four
+# launchd templates in SUB-directories — conflict-rebase/, harness-apply/, reaper/, runner-autoscale/
+# — each installed into ~/Library/LaunchAgents by its own installer. Counting only the FLAT
+# `*.plist` templates made every one of them UNMANAGED on the reference Mac, where `--status` exited 1
+# and printed the `launchctl bootout && rm -f` remedy for three owner-armed jobs (and
+# fleet-schedule.py turns that rc into `SCHEDULE NOT VERIFIED` → `fleet-schedule … FAILING`).
+SUBDIR_TEMPLATES=0
+for _tpl in "$REPO_TEMPLATES"/*/*.plist; do
+    [ -f "$_tpl" ] || continue
+    SUBDIR_TEMPLATES=$((SUBDIR_TEMPLATES + 1))
+    _lbl="$(basename "$_tpl" .plist)"
+    seed_stray_plist "$_lbl"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 a template in a SUB-directory ($_lbl) is DECLARED — not unmanaged"
+    # ⛔ DECLARED IS NOT THE SAME AS VISIBLE (#3826 review P2). Before this arm, a declared template in
+    # a sub-directory produced NO ROW AT ALL: `declared_labels` is a walk (so `is_declared` exempted
+    # it from the UNMANAGED alarm) while the per-job pass is a FLAT glob — so `--status` exited 0 over
+    # a job nothing had inspected, and `fleet-schedule.py --verify` certified the job set as matching
+    # templates/launchd. It is now disclosed as DELEGATED (the installer that owns it renders and
+    # grades it), which keeps the section's real property — no `bootout` advice for a live job — while
+    # making "declared" observable in both directions.
+    assert_contains "$OUT" "$_lbl: DELEGATED" "§18 ... and IS disclosed as DELEGATED — a declared template --status never looks at is the blind-install false PASS"
+    assert_not_contains "$OUT" "⛔ UNMANAGED   $_lbl" "§18 ... but never as a stray, so no bootout advice for the repo's own job"
+    rm -f "$STRAY_HOME/Library/LaunchAgents/$_lbl.plist"
+done
+if [ "$SUBDIR_TEMPLATES" -gt 0 ]; then
+    ok "§18 the sub-directory rows above are not vacuous ($SUBDIR_TEMPLATES template(s) one dir down)"
+else
+    bad "§18 NO sub-directory template exists in $REPO_TEMPLATES — the recursion rows proved nothing"
+fi
+
+# ⛔ AND THE SET IS A REAL WALK, NOT "FLAT OR EXACTLY ONE DIR DOWN" (#1867 review P2, round 7). The
+# heading, `is_declared`'s comment and docs/ops/heartbeat-launch-path.md all said ANY depth / "resolved
+# recursively", while the code was two fixed globs. A template at
+# `templates/launchd/<group>/<sub>/x.plist` was therefore reported UNMANAGED — with
+# `launchctl bootout … && rm -f …` printed as the remedy — the same harm the P1 above was raised for,
+# closed for one level while the comment claimed all of them. This row is the claim's own test: a
+# template THREE levels down must be DECLARED, and a future narrowing of the walk reds it.
+mkdir -p "$TEMPLATES/group/sub"
+printf '%s\n' \
+    '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<plist version="1.0"><dict>' \
+    '<key>Label</key><string>com.eldato.nested</string>' \
+    '<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/nested.sh</string></array>' \
+    '</dict></plist>' > "$TEMPLATES/group/sub/com.eldato.nested.plist"
+seed_stray_plist com.eldato.nested
+# ⛔ THE set +e/set -e WINDOW IS NOT DECORATION (#1867 review, round 8). Every neighbouring block in
+# this section has it and this one did not, so under the suite's `set -euo pipefail` a NON-ZERO status
+# aborted the run at the assignment: the §18b failure MESSAGE never printed and the ten assertions
+# after it (both UNKNOWN rows, the unreadable-dir row, the nobody-declares-it control) never ran.
+# MEASURED with `declared_labels` narrowed back to the two fixed globs in a /tmp copy: 505 ✅ / 0 ❌ /
+# rc=1, stopping dead at "the sub-directory rows above are not vacuous" — a red CI job whose
+# diagnosis is missing and a fifth of the section silently skipped. A row that cannot report is not a
+# row.
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18b a template THREE levels down is DECLARED — the declared set is a walk, not two globs"
+assert_contains "$OUT" "com.eldato.nested: DELEGATED" "§18b ... and the walk is OBSERVABLE: a declared-but-not-owned template is disclosed, never invisible (#3826 review P2)"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.eldato.nested" "§18b ... so no bootout+rm advice is aimed at a job this repo ships"
+rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"
+rmdir "$TEMPLATES/group/sub" "$TEMPLATES/group" 2>/dev/null || true
+
+# ⛔ AND THE OWN-SET TEST IS ON THE RESOLVED DIRECTORY, NOT THE SPELLING (#3826 review P2). The walk
+# classified "mine vs another installer's" by comparing `dirname "$template"` — which NEVER carries a
+# trailing slash — against `$TEMPLATES_DIR` as a STRING. A spelling that differs by one slash (exactly
+# what shell tab-completion inserts) therefore made EVERY flat template read as delegated. MEASURED
+# pre-fix with `TEMPLATES_DIR="$TEMPLATES/"`: 23 `DELEGATED —` rows instead of 4, each graded job
+# appearing TWICE with contradictory verdicts (`NOT INSTALLED (template v0.2.0)` beside `DELEGATED — …
+# installed and graded by another installer`), asserting a false ownership and a false state for a job
+# that was absent — while `fleet-schedule.py --verify` counted the 23 disclosures over the 19 jobs it
+# had just graded.
+set +e
+OUT="$( export STRAY_TEMPLATES="$TEMPLATES/"; run_stray_status )"; RC=$?
+set -e
+FLAT_LABELS=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    [ -f "$_tpl" ] || continue
+    FLAT_LABELS=$((FLAT_LABELS + 1))
+    _lbl="$(basename "$_tpl" .plist)"
+    assert_not_contains "$OUT" "$_lbl: DELEGATED" "§18e a trailing slash on TEMPLATES_DIR does not re-declare THIS installer's own flat template ($_lbl) as delegated"
+done
+if [ "$FLAT_LABELS" -gt 0 ]; then
+    ok "§18e the trailing-slash rows above are not vacuous ($FLAT_LABELS flat template(s))"
+else
+    bad "§18e NO flat template exists in $TEMPLATES — the trailing-slash rows proved nothing"
+fi
+
+# ── 18c. THE PER-JOB VERDICTS NOW CARRY THE EXIT CODE (#1867 review, round 9) ────────────────────
+# Two arms, because the fix has two halves that fail in opposite directions:
+#   · an INSTALLABLE template that is ABSENT must be a FAILURE (`NOT INSTALLED`, rc 1). Pre-fix it
+#     printed the row and returned 0, so `--status` certified a box missing a job its own repo ships —
+#     MEASURED on the round-8 code: row printed, rc 0.
+#   · a template the installer would SKIP for an unset placeholder must NOT be (that would be a
+#     permanent red on a legitimate box — a Mac with no tortoise checkout is the common case, and the
+#     `OWNED-BY-OTHER-INSTALLERS` exemption exists precisely because such reds get "fixed" by deleting
+#     live plists). It prints `NOT APPLICABLE` and leaves the code alone.
+# The control runs the OTHER way too: the corrected fixture (declared set installed) is rc 0 above, so
+# a change that made every row fail would not pass as "the guard works".
+INSTALLABLE=com.eldato.objective-reminder
+[ -f "$STRAY_HOME/Library/LaunchAgents/$INSTALLABLE.plist" ] \
+    && ok "§18c fixture: $INSTALLABLE is installed, so its removal is what the arm below measures" \
+    || bad "§18c fixture: $INSTALLABLE was NOT installed — the NOT-INSTALLED arm would be vacuous"
+rm -f "$STRAY_HOME/Library/LaunchAgents/$INSTALLABLE.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18c an INSTALLABLE declared template that is ABSENT is a FAILURE code, not a caveat"
+assert_contains "$OUT" "$INSTALLABLE: NOT INSTALLED" "§18c ... and the row says NOT INSTALLED"
+set +e
+run_stray_installer >/dev/null 2>&1
+set -e
+# ⚠️ NOT APPLICABLE — measured on the SAME invocation, so the two arms cannot disagree about env.
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18c control: re-installing restores a clean box (the failure above was the absence, not the verb)"
+assert_contains "$OUT" "com.tortoise.pr-doctor: NOT APPLICABLE" "§18c a template the installer SKIPs is NOT APPLICABLE (not a failure)"
+assert_not_contains "$OUT" "com.tortoise.pr-doctor: NOT INSTALLED" "§18c ...and is never reported as an absent job"
+
+# ── 18c2. INSTALLED **AND** SKIPPABLE: A PERMANENT RED NO INSTALL CAN CLEAR (#1867 review, round 10)
+# Round 9 put the skip predicate INSIDE the `[ ! -f "$installed" ]` branch, so it only fired for an
+# ABSENT plist. A job installed while its placeholder resolved, on a box that has since stopped
+# qualifying, fell through to the `cmp` and was reported `DRIFTED … re-run installer` — a remedy that
+# provably cannot clear it, because the installer SKIPs that very template. MEASURED on round 9:
+# install with SWARM_ROOT set → `in sync` rc 0; unset SWARM_ROOT → `(DRIFTED …)` rc 1; run the printed
+# remedy → `SKIP … unresolved placeholder(s) {{SWARM_ROOT}}`, plist still installed, still `DRIFTED`
+# rc 1. The shipped arm hoists the predicate above the installed-check and names the state.
+SWARM_INSTALL_HOME="$T/swarm-install-home"; mkfakehome "$SWARM_INSTALL_HOME"
+run_swarm_install() { # $1 = SWARM_ROOT value
+    ( export HOME="$SWARM_INSTALL_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$SWARM_INSTALL_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      export SWARM_ROOT="$1"
+      unset TORTOISE_REPO PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+run_swarm_status_no_swarm() {
+    ( export HOME="$SWARM_INSTALL_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$SWARM_INSTALL_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO PYTHON_BIN SWARM_ROOT
+      bash "$INSTALLER" --status 2>&1 )
+}
+set +e
+SWARM_INSTALL_RC_IGNORED=0
+run_swarm_install "$SWARM_INSTALL_HOME/swarm" >/dev/null 2>&1 || SWARM_INSTALL_RC_IGNORED=$?
+set -e
+assert_eq "$SWARM_INSTALL_RC_IGNORED" "0" "§18c2 fixture: the declared set installs with SWARM_ROOT resolved"
+[ -f "$SWARM_INSTALL_HOME/Library/LaunchAgents/com.eldato.corruption-canary.plist" ] \
+    && ok "§18c2 fixture: the canary installed while SWARM_ROOT resolved (so the arm below is not vacuous)" \
+    || bad "§18c2 fixture: the canary did NOT install — the installed-and-skippable row would be vacuous"
+set +e
+OUT="$(run_swarm_status_no_swarm)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18c2 an INSTALLED job that stops qualifying is NOT a permanent red (rc 0)"
+assert_contains "$OUT" "com.eldato.corruption-canary: INSTALLED, but SKIPPED now" \
+    "§18c2 ... it is named as installed-and-skipped, not silently clean"
+# ⛔ AND IT CARRIES A MARKER, NOT JUST PROSE (#1867 review, round 11). The only consumer that gates on
+# this verb — `fleet-schedule.py --verify` — counts MARKERS, so a row of plain words reached it as no
+# row at all and its verdict said the job set MATCHES while this copy is provably stale.
+assert_contains "$OUT" "⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary" \
+    "§18c2 ... with the ⚠️ INSTALLED-SKIPPED marker the verdict consumer counts"
+assert_not_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (DRIFTED" \
+    "§18c2 ... and NOT as DRIFTED with a 're-run installer' remedy that cannot clear it"
+rm -f "$SWARM_INSTALL_HOME/Library/LaunchAgents/com.eldato.corruption-canary.plist"
+
+# ── 18d. THE DECLARED SET MUST BE READABLE OR THE ANSWER IS UNKNOWN (#1867 review, round 9) ──────
+# With an EMPTY declared set, "is this label declared?" is `no` for every label — so every installed
+# job reads UNMANAGED and the rows carry `launchctl bootout … && rm -f …` aimed at this repo's own
+# armed jobs. MEASURED pre-fix with `TEMPLATES_DIR` empty (and again chmod 000):
+# `⛔ UNMANAGED   com.eldato.objective-reminder` plus that delete command, rc 1 — the delete advice
+# being the harm, not the rc. The `AGENTS_DIR` arm already refuses this way; this is the other side.
+EMPTY_TEMPLATES="$T/empty-templates"; mkdir -p "$EMPTY_TEMPLATES"
+STRAY_TEMPLATES="$EMPTY_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "2" "§18d an EMPTY declared set is UNKNOWN (2), never 'everything is a stray'"
+assert_contains "$OUT" "DECLARED SET" "§18d ... naming the uncountable set, not the installed one"
+assert_not_contains "$OUT" "UNMANAGED" "§18d ... and printing NO stray rows (a row would carry delete advice)"
+assert_not_contains "$OUT" 'bootout gui/' "§18d ... and therefore no bootout+rm command for a live job"
+
+# ⛔ AND "I COULD NOT LOOK" IS NOT "NOTHING TO REPORT" (#1867 review P2). An AGENTS_DIR that exists
+# but cannot be enumerated used to produce no rows, and no rows read as a CLEAN box: `--status`
+# exited 0 from an instrument that looked at nothing. It must answer UNKNOWN (2) instead — the same
+# fail-closed polarity `check`/`cmux_gate_required` already have (0 OK · 1 DRIFT · 2 UNKNOWN).
+NOT_A_DIR="$T/agents-not-a-dir"; : > "$NOT_A_DIR"
+set +e
+OUT="$(run_stray_status "$NOT_A_DIR")"; RC=$?
+set -e
+assert_eq "$RC" "2" "§18 an AGENTS_DIR that exists but cannot be enumerated is UNKNOWN (2), not a clean 0"
+assert_contains "$OUT" "UNKNOWN" "§18 ... and says so loudly rather than printing nothing"
+assert_contains "$OUT" "could NOT be enumerated" "§18 ... naming the failed enumeration as the reason"
+
+if [ "$(id -u)" != "0" ]; then
+    UNREADABLE_DIR="$T/agents-unreadable"; mkdir -p "$UNREADABLE_DIR"; : > "$UNREADABLE_DIR/com.eldato.secret.plist"
+    chmod 000 "$UNREADABLE_DIR"
+    set +e
+    OUT="$(run_stray_status "$UNREADABLE_DIR")"; RC=$?
+    set -e
+    chmod 755 "$UNREADABLE_DIR"
+    assert_eq "$RC" "2" "§18 an UNREADABLE LaunchAgents dir is UNKNOWN (2), not a clean 0"
+    assert_contains "$OUT" "could NOT be enumerated" "§18 ... naming the failed enumeration"
+else
+    echo "  · §18 unreadable-dir row SKIPPED: running as root, which reads a 000 dir (the"
+    echo "    not-a-directory row above is the deterministic one and carries the same arm)"
+fi
+
+# The alarm still fires for a job NOBODY declares — the exclusion list must not have blunted it.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hand-installed.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.hand-installed</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/mystery.sh</string></array>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18 control: a job NOBODY declares is still UNMANAGED (the exemptions did not blunt the alarm)"
+assert_contains "$OUT" "com.eldato.hand-installed" "§18 ... and is named"
+assert_contains "$OUT" "launchctl bootout" "§18 ... with the exact command that removes it (the missing remediation)"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.hand-installed.plist"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 
 
 echo "  PASS=$PASS FAIL=$FAIL"

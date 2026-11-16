@@ -4323,8 +4323,15 @@ export function classifyGitCommandDetailed(command) {
       // echo/comment over-match (a text that merely MENTIONS a complete
       // `git push … --delete <target>` also populates targets; sibling-
       // conditional safe-direction, consistent with the frozen --delete
-      // echo precedent). Parenthesized later segments (`(git push … -d c)`) are
-      // a tracked residual (token-level paren suffix).
+      // echo precedent). Parenthesized later segments (`(git push … --delete c)`)
+      // WERE the tracked residual — the token-level paren suffix leaked into the
+      // target as `c)` — and are now attributed by the shared extractor
+      // `_pushSegmentTokens`, so this fold-in covers them (pinned by test.mjs's
+      // "parenthesized later-segment --delete → real target only"). The
+      // `-d`/`--del` spelling is NOT served here: the FROZEN legacy regex knows
+      // only `--delete`/`:ref`, so such a compound keeps the `block:push`
+      // verdict and is served by `wholeCommandDeleteTargets`, not by this gated
+      // fold-in.
       if (deleteIdx === -1 && !hasColonTargets) {
         out.pushTargets = extractPushDeleteBranch(String(command)) ?? [];
       }
@@ -4948,6 +4955,18 @@ function _isPushDeleteFlagToken(a) {
 //   ~        tilde expansion at word start.
 //   \       escape — the word is not the text.
 //
+// ⛔ WHITESPACE IS DELIBERATELY *NOT* IN THIS CLASS, AND THE REASON IS A MEASURED FALSE BLOCK
+// (round-10 review, P0 F1, and the fix that replaced the first attempt). The obvious rule — "a ref
+// cannot contain whitespace, so refuse a target that does" — is TRUE and still wrong as a REFUSAL
+// RULE here, because the very same shape arrives as an ORDINARY OVER-CAPTURE: the delete arm's
+// target list includes the classifier's positionals, so a legitimate
+// `git push origin -o merge_request.title="Release 2.0" -d feat/x` carries the option VALUE as a
+// candidate target. Measured at that head: `-o "a b" -d held` and `-o "a\nb" -d held` began refusing
+// by #653 ("cannot tell WHICH branch") where the delete target was a plain literal and #73 should
+// have decided it — a false block on a real push-option form. The whitespace hazard itself is fixed
+// at its SOURCE (`_dropUnmatchedQuote`), so a target can no longer acquire a glued space in the first
+// place. This entry stays out with that reason recorded, so a later reader does not "restore" it.
+//
 // Deliberately NOT included: `,` (legal in a ref name; brace expansion is caught
 // by its own braces) and `^`/`:` (illegal in a ref name and not a shell
 // expansion — git rejects such a refspec, so it cannot delete a held branch).
@@ -4981,8 +5000,1082 @@ export function unresolvableDeleteTargets(targets) {
   return [...new Set(targets.filter((t) => !isResolvableDeleteTarget(t)))];
 }
 
+/**
+ * Collapse BACKTICK command substitutions in a segment body to an opaque word.
+ *
+ * An unquoted backtick is a substitution delimiter, but `_tokenize` keeps it inside the word, so
+ * the extractor used to report the phantom target `b`+backtick (`echo `git push origin -d b``). That
+ * phantom names no ref, so the #73 lookup found nothing. ⛔ IT WAS NEVER AN ALLOW ON THE REBASED BASE —
+ * `DELETE_TARGET_UNRESOLVABLE_RE` includes the backtick, so #653 already refused it (on the fragment),
+ * and an earlier revision of this comment claimed otherwise. What this change buys is the REAL target
+ * `b` instead of a fragment: the #73 lookup now runs on a name that exists (#504 round-8 review, P3).
+ *
+ * ⛔ AN OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). A first attempt truncated at
+ * the first unquoted backtick, which is only right for a CLOSER. `git push `date` origin -d
+ * held/branch` has its OPENER inside the segment; truncating there discarded `-d held/branch` and
+ * returned null where origin/main returned the target — the same fail-open the fix exists to close.
+ * Bash's model is a SPAN: the delimited text is one word of the enclosing simple command, and the
+ * words after it belong to that command. So unquoted backticks are PAIRED left-to-right inside the
+ * segment body and each pair collapses to one opaque placeholder word (which keeps every following
+ * word, including the delete flag and its target); only an UNPAIRED one — the closer of a
+ * substitution opened before `git push`, or an opener whose closer lies beyond this segment — ends
+ * the body. QUOTED backticks are data and are never paired.
+ * @param {string} body
+ * @returns {string}
+ */
+function _foldBacktickSubstitutions(body) {
+  const marks = [];
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      // A backslash escapes the next char only inside double quotes (POSIX); inside single quotes it
+      // is literal, so skipping there would mis-read a later closing quote.
+      if (ch === "\\" && quote === '"') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "`") marks.push(i);
+  }
+  if (marks.length === 0) return body;
+  let out = "";
+  let prev = 0;
+  for (let k = 0; k < marks.length; k += 2) {
+    const open = marks[k];
+    const close = marks[k + 1];
+    if (close === undefined) {
+      // ⛔ AN UNPAIRED BACKTICK IS A TRUNCATED SPAN, NOT SILENCE (round-7 review, P0). This dropped
+      // everything from the opener onward, so a substitution whose body contains `;`/`&`/`|` — which
+      // `segRe`'s `([^;&|\n]*)` capture cuts BEFORE the closer — lost the delete flag AND its target with no
+      // refusable token left behind: `git push origin -d `echo a && echo b`` extracted `null` and the #73
+      // arm was never consulted. `origin/main` REFUSED that shape (its tokenizer left the fragment
+      // `` `echo ``), so dropping it was a regression, the same one finding 1 measured for the paren
+      // twin.
+      // The tail is UNKNOWABLE either way, so the whole span becomes ONE placeholder word.
+      // ⛔ THE SEPARATOR IS LOAD-BEARING: without it the placeholder GLUES onto the preceding word
+      // (`… -d b` + `\u0000SUBST` is the single token `b\u0000SUBST`), which would corrupt a real
+      // target. With it, `echo `git push origin -d b` x` reports `["b","$(…)"]` — refused for the
+      // unknowable word, with the real target still attributed — which is the same verdict
+      // `origin/main` reaches on its own `` b` `` fragment.
+      // A backtick with NOTHING after it in this segment is the #504 CLOSER (`echo `git push origin -d
+      // held/branch``), whose closer belongs to an outer command; it still ENDS the body, unchanged.
+      const tail = body.slice(prev, open);
+      return body.slice(open + 1).trim() === "" ? out + tail : `${out}${tail} ${_SUBST_PLACEHOLDER}`;
+    }
+    out += body.slice(prev, open) + _SUBST_PLACEHOLDER;
+    prev = close + 1;
+  }
+  return out + body.slice(prev);
+}
+
+/** Does the RAW segment text still carry a delete spelling anywhere?
+ *
+ * ⛔ USED ONLY TO DECIDE THAT A TRUNCATION WAS AMBIGUOUS, never to attribute a target — so a coarse
+ * whitespace split is the right instrument here: the question is "does the visible text name a
+ * delete at all", not "what is its argv word". Deliberately QUOTE-INSENSITIVE and over-inclusive,
+ * because every extra hit only turns a silent allow into #653's refusal (the fail-closed direction);
+ * a miss would turn the same allow into a delete of a sibling's branch.
+ * @param {string} body
+ * @returns {boolean}
+ */
+/** Does a COMMAND SUBSTITUTION's own text carry a delete spelling?
+ *
+ * ⛔ THE WHOLE-SEGMENT TEST IS TOO BROAD, AND IT WAS A MEASURED FALSE BLOCK (round-15 review, P1).
+ * The end-of-walk arm needs to know whether the delete spelling it cannot attribute came OUT OF the
+ * substituted text — because that is the only place an opaque placeholder can hide a flag. Asking the
+ * whole segment instead fires on ordinary push-option TEXT plus an unrelated substitution:
+ *
+ *   git push origin -o "x -d y" -o $(cat f) HEAD:feat
+ *     bash argv → [push][origin][-o][x -d y][-o][feat/from-file][HEAD:feat]   (NO delete)
+ *     origin/main → allow        this head, whole-segment test → REFUSE ("$(…)")   ← FALSE BLOCK
+ *
+ * (2,005 rows of one class in the review's sweep.) Scanning only a span's BODY keeps every real case —
+ * `$(echo -d<LF>)`, `$(echo --delete<LF>)`, `` `echo -d` `` all carry the spelling INSIDE the span —
+ * while text outside a span stops counting.
+ *
+ * ⛔ WHAT IT ACTUALLY SCANS, EXACTLY (round-18 review, P3 — the paragraph above used to claim
+ * `${ … }`/`$( … )`/backtick BODIES and the `${…}` half was never true; the loop opens a body only on
+ * `$(` and on a backtick):
+ *   SCANNED     `$( … )` (paren-matched) and `` `…` `` bodies, including inside `"…"`;
+ *   NOT SCANNED `${ … }` parameter-expansion bodies, and `$'…'` ANSI-C literals (which
+ *               `_foldAnsiCStrings` folds to a placeholder, so their TEXT is gone by the time this runs).
+ * MEASURED consequence of the `$'…'` gap — `git push origin $'-d' held/branch`, whose bash argv is
+ * `push origin -d held/branch`, i.e. a REAL delete of `held/branch`, returns `null`:
+ *   `extractPushDeleteBranch("git push origin $'-d' held/branch")` → null on `origin/main`, on the
+ *   pre-#3962 head and at this head. It is PRE-EXISTING and identical on all three (the detailed verdict
+ *   on that text is `block:push`, which is a PUSH gate, not a delete gate: the null is what stops #653
+ *   from ever seeing `held/branch`), so this is a hole to record, never a regression this change made.
+ * ⛔ AND A BLIND FIX IS A FALSE-BLOCK GENERATOR, which is why the gap is recorded instead of closed:
+ * the same scan would fire on `git push origin -o $'-d' HEAD:feat`, where the ANSI-C literal is an
+ * option VALUE (a plain push — `-o` takes `-d` as its argument), and this function has no token context
+ * to tell the two apart. Closing it needs the ANSI-C body scanned only when the literal is a WORD the
+ * shell will re-parse, i.e. the same slot-awareness `_markOptionValueSlots` provides one level up — a
+ * change to the caller's contract, not to this scanner. Until then the doc above states the truth.
+ *
+ * Quoting is tracked so a backtick inside `"…"` is not read as a span opener, and the mask control
+ * sentinels are normalised to spaces (a command-list newline is glued inside the word otherwise).
+ * @param {string} body
+ * @returns {boolean}
+ */
+function _spanCarriesDeleteSpelling(body) {
+  const s = String(body ?? "");
+  const hit = (inner) => inner.replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean)
+    .some((w) => {
+      const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+      return _isPushDeleteFlagToken(bare) || (bare.startsWith(":") && bare.length > 1);
+    });
+  let i = 0, quote = null;
+  while (i < s.length) {
+    const ch = s[i];
+    // ⛔ SINGLE QUOTES SUPPRESS EVERYTHING; DOUBLE QUOTES DO NOT SUPPRESS A SUBSTITUTION (round-17
+    // review, P1). This used to skip the whole of `"…"`, so the body of a QUOTED `$( … )`/backtick was
+    // never scanned and the arm could not fire for the residual-1 family — which is why the fix above
+    // has to land together with this: a detector that cannot see the spelling and a walk that produces
+    // no placeholder fail in the SAME direction (allow).  Outside double quotes the escape and quote
+    // arms are unchanged.
+    if (quote === "'") { i++; continue; }
+    if (quote === '"') {
+      // A backslash escapes the next char only inside double quotes (POSIX) — so `\`` is a LITERAL
+      // backtick and must not open a span.
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === '"') { quote = null; i++; continue; }
+    } else {
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+    }
+    let start = -1, closer = ")";
+    if (ch === "$" && s[i + 1] === "(") start = i + 2;
+    else if (ch === "`") { start = i + 1; closer = "`"; }
+    if (start >= 0) {
+      let end = -1;
+      if (closer === "`") end = s.indexOf("`", start);
+      else {
+        let depth = 1;
+        for (let j = start; j < s.length; j++) {
+          if (s[j] === "(") depth++;
+          else if (s[j] === ")" && --depth === 0) { end = j; break; }
+        }
+      }
+      if (hit(s.slice(start, end === -1 ? s.length : end))) return true;
+      i = end === -1 ? s.length : end + 1;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
+function _rawCarriesDeleteSpelling(body) {
+  // ⛔ THE MASK SENTINELS ARE WORD BREAKS HERE (round-14 review). `_maskQuotedNewlines` replaces a
+  // command-list newline with `_NL_SPAN` (\u0004) so the CAPTURE survives, which means the raw text
+  // this function sees still has that character GLUED inside a word: `$(echo -d<U+0004>)` splits to
+  // `-d\u0004)` — not a flag token — and the detector reported "no delete spelling" for a push whose
+  // substitution expands to exactly `-d`. Every control sentinel the masks emit is a separator at the
+  // shell level, so they are normalised to spaces before the split.
+  const words = String(body ?? "").replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean);
+  for (const w of words) {
+    const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+    if (_isPushDeleteFlagToken(bare)) return true;
+    if (bare.startsWith(":") && bare.length > 1) return true; // `:ref` — an empty-source delete
+  }
+  return false;
+}
+
+/** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
+ *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
+ *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
+ *  substitution's WORD is. In a DELETE-TARGET slot `_cleanDeleteTarget` maps it to the UNRESOLVABLE
+ *  MARKER `$(…)`, which #653 REFUSES — never to `""`.
+ *  ⛔ IT USED TO SAY `""` HERE, AND THAT SENTENCE DESCRIBED THE FAIL-OPEN (#504 × #653). Dropping the
+ *  placeholder was the honest reading of "this is not a ref name" *before* #653 existed; after #653 a
+ *  target that never REACHES the refusing block is never refused either, so
+ *  `git push origin -d $(echo held/branch)` extracted `null` → the #73 arm was never consulted → the
+ *  delete of a sibling-held branch was ALLOWED. Do not "restore" the `""` mapping on the strength of
+ *  that old sentence: the arm of `_cleanDeleteTarget` that implements it says why it is wrong. */
+const _SUBST_PLACEHOLDER = "\u0000SUBST";
+
+/** Sentinel for a NEWLINE that is DATA, not a list separator (`_maskQuotedNewlines`).
+ *
+ * ⛔ A NEWLINE ENDS A COMMAND ONLY WHEN IT IS UNQUOTED AND OUTSIDE ANY SPAN (round-8 review, P0). The
+ * capture below stops at `\n`, which is right for the round-7 shape (`git push x⏎( git push origin -d
+ * b )`) — but bash does NOT end a command at a newline inside `"…"`, `'…'`, `$( … )`, backticks or
+ * `${ … }`; there it is ordinary DATA. Cutting the capture there loses the `-d` and its real target:
+ *
+ *   git push origin -o "a<LF>b" -d held/branch          origin/main → LOOKUP [b, held/branch]
+ *   git push origin -o $(echo a<LF>) -d held/branch      this branch → ALLOW (null)
+ *
+ * `-o merge_request.description="line1<LF>line2"`-style push options are ordinary usage, and the
+ * module's OWN parser agrees: `classifyGitCommandDetailed(...).verbArgs` returns
+ * `["origin","-o","a\nb","-d","held/branch"]` on BOTH trees — only this capture disagreed. So the
+ * newline is masked to one character before the scan and unmasked on the targets, which keeps every
+ * index relation (including `_maskDataParens`'s 1:1 sentinels) intact.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`) or `_QP_L`/`_QP_R` (`\u0001`/`\u0002`). */
+const _NL_DATA = "\u0003";
+
+/** Sentinel for a NEWLINE that is a COMMAND SEPARATOR even though it sits inside a SPAN.
+ *
+ * ⛔ "INSIDE A SPAN" IS NOT "DATA" (round-13 review, P1 — measured as a FAIL-OPEN against
+ * `origin/main`). `_maskQuotedNewlines` masks a newline to keep the segment CAPTURE from cutting at
+ * it, which is right for every span. But a newline inside `$( … )`, `<( … )`, backticks or the body of
+ * a `-c` operand is ALSO a list separator for the shell that parses that span — bash runs the commands
+ * on both sides. Masking it to `_NL_DATA` (a DATA character, which must stay inside its word for
+ * `-o "a<LF>b"`) GLUED it onto the next word, so the target the delete would really use stopped
+ * being a ref name:
+ *
+ *   bash -c "git push origin -d held/branch<LF>echo done"
+ *     origin/main → ["held/branch","echo","done"] → refs/heads/held/branch → BLOCK
+ *     before this → ["held/branch\necho","done"]   → no such ref → #73 finds nothing → ALLOW
+ *
+ * `isResolvableDeleteTarget` accepts the glued token (a newline is not in the unresolvable class), so
+ * #653 does not fire either — the delete of a sibling-held branch proceeds in a linked-worktree
+ * session, where M2 is exempt. The two origins therefore need two sentinels: this one is a WORD
+ * SEPARATOR and `_pushSegmentTokens` splits on it after the capture has been taken.
+ * ⛔ It cannot collide with `\u0000`/`\u0001`/`\u0002`/`\u0003`. */
+const _NL_SPAN = "\u0004";
+
+/** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks, `${ … }`
+ * or an ANSI-C `$'…'` literal — and only those. A `\`-escaped newline is a LINE CONTINUATION and is
+ * already gone before this runs. Unbalanced state is handled the way bash's own parse would leave it:
+ * everything after an unterminated quote/span stays inside it, so no later newline is a separator.
+ *
+ * ⛔ THREE WAYS THIS MASK USED TO HIDE A REAL SEPARATOR, EACH A FAIL-OPEN (round-9 review, P0 ×3),
+ * PLUS TWO MORE FOUND BY THE ROUND-10 REVIEW (P0 ×2 — the list was called complete and was not).
+ * Masking a newline that bash treats as a SEPARATOR merges two commands into one body; the second
+ * command's `(`/`$(` is then read as a span OPENER, its `-d` and target are skipped as span content,
+ * `extractPushDeleteBranch` returns null — and a delete of a sibling-held branch is ALLOWED. Measured
+ * against `origin/main` over a 644-row shape corpus: 12 rows where main BLOCKS and this mask ALLOWED.
+ *
+ *   (a) `$'…'` — bash has a dedicated ANSI-C quoting context in which `\` escapes (so `\'` does NOT
+ *       close it). Reading the `'` as a plain single quote closed the literal at the escape and
+ *       re-opened one that never closed, so every later newline was masked:
+ *         git push origin -o $'don\'t'⏎( git push origin -d held/branch )   → ALLOWED, main BLOCKS
+ *       Fixed by folding the literal BEFORE the scan (`_foldAnsiCStrings`), which is already the rule
+ *       `_pushSegmentTokens` applies per segment; here it must happen on the WHOLE command, because
+ *       this pass runs before segmentation.
+ *   (b) `# …` — a `#` that BEGINS A WORD starts a comment (bash: that word and the rest of the line are
+ *       ignored, and the newline that ends it IS a separator). There was no comment tracking, so an
+ *       APOSTROPHE inside a comment opened a quote that never closed:
+ *         git push origin HEAD:feat # don't⏎git push origin -d held/branch   → ALLOWED, main BLOCKS
+ *   (c) `}` closed a `$(`-opened span — one shared `span` counter for two different span kinds. The
+ *       `}` of `${R:-(}` therefore left `span === 1`, masking the newline after it:
+ *         git push origin -o ${R:-(}⏎( git push origin -d held/branch )      → ALLOWED, main BLOCKS
+ *       Fixed by a STACK: `}` only closes a `${`, `)` only closes a `$(`, and inside `${ … }` a bare
+ *       `(` is DATA, not a nesting level (bash: `${R:-(}` is the complete expansion yielding `(`).
+ *   (d) A PROCESS-SUBSTITUTION OPENER WAS NOT A SPAN (round-10 review, P0 F3). `<(`/`>(` pushed no
+ *       level, so a newline inside the substitution body was masked as a SEPARATOR and the capture cut:
+ *         git push origin -o <(cat ff⏎) -d held/branch    → ALLOWED (null), main BLOCKS
+ *   (e) A `$( … )` INSIDE `"…"` WAS INVISIBLE TO THE STACK (round-10 review, P0 F4). The quote arm ran
+ *       before the span arms, so the substitution's own `"` closed the ENCLOSING quote and its data
+ *       newline separated the command:
+ *         git push origin -o "$(echo "a⏎b")" -d held/branch   → ALLOWED (null), main BLOCKS
+ *       `_maskDataParens` already modelled this (`substQuotes`); the two passes now share one model.
+ * @param {string} text
+ * @returns {string}
+ */
+function _maskQuotedNewlines(text) {
+  const s = _foldAnsiCStrings(String(text ?? ""));
+  const out = [];
+  let quote = null;  // ' or "
+  // ⛔ ONE STACK ENTRY PER SPAN, EACH CARRYING THE QUOTING CONTEXT TO RESTORE (round-10 review, P0
+  // F4). A flat `spans` of kind strings could not express "this `$( … )` was opened INSIDE a double
+  // quote, so bash returns to that quote at its `)`" — and the monolithic quote branch ran FIRST, so
+  // the `$(` never became a span at all and the span's inner `"` CLOSED THE ENCLOSING QUOTE:
+  //
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    base → ["a","b\")","hk7/branch"] → BLOCK
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    here → null                       → ALLOW
+  //
+  // `_maskDataParens` already models exactly this (`substQuotes`); the two passes disagreed on bash's
+  // quoting model and this one lost. Keeping the model in ONE place (this stack) is the fix.
+  const spans = [];  // { kind: "(" | "{", restore: "'" | '"' | null }
+  const openSpan = (kind, restore) => spans.push({ kind, restore, prog: quoteIsProgram });
+  let btick = false;
+  // ⛔ A QUOTE THAT IS A `-c` PROGRAM OPERAND IS A PROGRAM AT THE INNER LEVEL (round-13 review, P1).
+  // `bash -c "git push origin -d held/branch<LF>echo done"` keeps the newline INSIDE a double quote at
+  // THIS level, but the inner shell receives the de-quoted text and parses the newline as a list
+  // separator — bash really runs both commands. Masking it as DATA glued `echo` onto the ref
+  // (`held/branch\necho`), which names no ref, so #73 found nothing and ALLOWED a sibling-held delete.
+  // So a newline inside such a quote is `_NL_SPAN` (a word separator), not `_NL_DATA` (data).
+  let quoteIsProgram = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const inCmdSpan = () => btick || spans.some((sp) => sp.kind === "(");
+    const push = (v) => {
+      if (v !== "\n") { out.push(v); return; }
+      if (quote !== null) { out.push(quoteIsProgram ? _NL_SPAN : _NL_DATA); return; }
+      if (inCmdSpan()) { out.push(_NL_SPAN); return; }        // `$(`/`<(`/backtick: a real separator
+      if (spans.length > 0) { out.push(_NL_DATA); return; }   // only `${ … }`: DATA, and must stay masked
+      out.push(v);                                            // a real list separator (capture already cut)
+    };
+    const top = spans[spans.length - 1];
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+      // A `$(` INSIDE DOUBLE QUOTES OPENS A SPAN IN A FRESH QUOTING CONTEXT (defect (d), F4). Bash
+      // parses the substitution body as its own command list and returns to this quote at the
+      // matching `)`. A `${` inside quotes needs no level: the enclosing quote already masks its
+      // newlines, so treating it as data here is correct and unchanged.
+      if (quote === '"' && ch === "$" && s[i + 1] === "(") {
+        openSpan("(", quote); quote = null; out.push("$("); i++; continue;
+      }
+      if (ch === quote) quote = null;
+      push(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+    // A `#` BEGINNING A WORD starts a comment. The terminating newline is NOT part of it — it ends the
+    // comment and is a real separator, which is the whole point of masking only genuine data newlines.
+    if (ch === "#" && (i === 0 || /[\s;&|(]/.test(s[i - 1]))) {
+      const nl = s.indexOf("\n", i);
+      const end = nl === -1 ? s.length : nl;
+      out.push(s.slice(i, end));
+      i = end - 1;
+      continue;
+    }
+    // ⛔ THE PROGRAM DECISION IS TAKEN AT THE LITERAL'S `$`, NOT AT ITS QUOTE (round-18 review, P1 — a
+    // measured FAIL-OPEN on the GUARDED ref). `_foldAnsiCStrings` (:5206) asks the question at the `$`
+    // and KEEPS a program operand VERBATIM; this arm then re-derived it one character later, at the
+    // `'`, where the slice ends with `$` — a word no `-c`/`eval` pattern can match — so it answered
+    // FALSE for EVERY ANSI-C program operand and re-classified the program's OWN newline as `_NL_DATA`
+    // (a word-continuation char) instead of `_NL_SPAN` (a separator). The two passes must not disagree
+    // about the same literal, so this asks at the position the fold asked at:
+    //
+    //   git push origin -d held/branch  ← from `sh -c $'git push origin -d held/branch<LF>echo done'`
+    //   before → ["held/branch\necho","done"] (target names no ref → #73 misses → ALLOW)
+    //   after  → ["held/branch","echo","done"] — same list as `origin/main` → #73 CONSULTED
+    //
+    // `$"…"` (translated string, which the fold does not special-case) is the same word, so it takes
+    // the same position. Nothing else changes: a plain `'…'`/`"…"` still asks at its own index.
+    if (ch === "'" || ch === '"') {
+      const progAt = s[i - 1] === "$" ? i - 1 : i;
+      quote = ch; quoteIsProgram = _ansiCIsProgramOperand(s.slice(0, progAt)); out.push(ch); continue;
+    }
+    if (ch === "`") { btick = !btick; out.push(ch); continue; }
+    if (ch === "$" && s[i + 1] === "(") { openSpan("(", null); out.push("$("); i++; continue; }
+    if (ch === "$" && s[i + 1] === "{") { openSpan("{", null); out.push("${"); i++; continue; }
+    // ⛔ A BARE `(` NESTS ONLY INSIDE `$( … )`. Inside `${ … }` it is literal text, so pushing a level
+    // there would make the expansion's own `}` fail to close and mask the next newline (defect (c)).
+    // ⛔ A PROCESS-SUBSTITUTION OPENER IS A SPAN (round-10 review, P0 F3). `<( list )` / `>( list )` is
+    // ONE WORD of the enclosing simple command (GNU Bash manual, Process Substitution), so a newline
+    // inside it is DATA — but the `(` was pushed only when the stack top was already `$(`, so the
+    // span was invisible and its inner newline CUT THE CAPTURE, losing the delete flag and target:
+    //
+    //   git push origin HEAD:wtfeat && git push origin -o <(cat ff<LF>) -d hk7/branch
+    //   base → ["ff",")","hk7/branch"] (BLOCK)      here → null (ALLOW)
+    //
+    // The whole `<`/`>`+`(` form is the word, so the level is pushed for both spellings; `$((` also
+    // nests through this arm (the `$(` level is already on the stack).
+    if (ch === "(" && (top?.kind === "(" || s[i - 1] === "<" || s[i - 1] === ">")) { openSpan("(", null); out.push(ch); continue; }
+    if (ch === ")" && top?.kind === "(") {
+      const done = spans.pop();
+      if (done.restore) { quote = done.restore; quoteIsProgram = !!done.prog; } // back to the quote (and its kind) the span was opened in (F4)
+      out.push(ch);
+      continue;
+    }
+    if (ch === "}" && top?.kind === "{") { spans.pop(); out.push(ch); continue; }
+    push(ch);
+  }
+  return out.join("");
+}
+
+/** Fold a bash ANSI-C string (`$'…'`) to ONE placeholder word.
+ *
+ * ⛔ `_tokenize` HAS NO ANSI-C QUOTING (round-8 review, P0), and this extractor's dependence on it is
+ * what makes its gap a #73 hole rather than a cosmetic one: `$'…'` is a QUOTED string to bash (nothing
+ * inside expands except its own escapes), but `_tokenize` opens a plain `'…'` at the `$`, where `\` is
+ * literal — so the `\'` inside `$'don\'t'` CLOSES the quote and the following `'` opens one that runs
+ * to the end of the segment, swallowing the delete:
+ *
+ *   git push -o $'don\'t' origin -d held/branch     origin/main → LOOKUP [held/branch]
+ *   git push -o $'don\'t' origin -d held/branch     this branch → ALLOW (null)
+ *
+ * `-o merge_request.title=$'don\'t merge'` reaches it. Folding the whole literal to the span placeholder
+ * keeps the POSITIONAL count faithful (it is one argv word) and makes a delete target in that slot
+ * unresolvable instead of silently swallowed — the same treatment every other expansion gets.
+ * @param {string} body
+ * @returns {string}
+ */
+function _foldAnsiCStrings(body) {
+  const s = String(body ?? "");
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out += ch + s[i + 1]; i++; continue; }
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "$" && s[i + 1] === "'") {
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") { if (s[j] === "\\") j++; j++; }
+      // ⛔ AN ANSI-C LITERAL IS A WORD — UNLESS A SHELL IS ASKED TO RUN IT AS A PROGRAM (round-12
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Folding it to the opaque
+      // placeholder is right for a bare word: bash's manual §3.1.2.4 says `$'string'` expands to a
+      // single-quoted WORD, so `$'git push origin -d b'` on its own is an ARGUMENT, never a command.
+      // It is WRONG the moment the word is the operand of `sh -c` / `bash -c` / `bash -lc` / `eval`,
+      // because THAT shell decodes it and runs the text as a program — the same nested-interpreter
+      // handoff this module already models for `sh -c '…'` (`_dropUnmatchedQuote`) and for a heredoc's
+      // body. Folding there discarded the whole push, so the extractor returned `null`:
+      //
+      //   sh -c $'git push origin -d held/branch'      origin/main → ["held/branch"] → #73 CONSULTED
+      //   sh -c $'git push origin --delete held/branch'  before this → null → the DEGRADED ARM
+      //                                                 (index.ts:6094 `rawDeleteNames`) → [] → ALLOW
+      //
+      // (measured on the real handler path: for the `--delete` spelling both trees reach
+      // `block:push-delete`, so the only difference is the emptied target list — and that arm is the
+      // one that runs when the classifier fails to load, which is its entire purpose. 240 rows of an
+      // ANSI-C family sweep lost on 28 that bash really executes.)
+      // The test is the PRECEDING WORD, not a broader promise: `-c`, any short cluster ending in `c`
+      // (`-lc`, `-ic`), or `eval`. Everything else keeps the fold.
+      if (_ansiCIsProgramOperand(s.slice(0, i))) { out += s.slice(i, j < s.length ? j + 1 : s.length); i = j < s.length ? j : s.length; continue; }
+      out += _SUBST_PLACEHOLDER; // one word; `$'…'` contents are not the argv text
+      i = j < s.length ? j : s.length;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    out += ch;
+  }
+  return out;
+}
+
+/** Is the `$'…'` literal starting at `before.length` the PROGRAM operand of a shell?
+ *
+ * Looks at the text immediately preceding the literal: `eval`, an option word `-c`, or a short-option
+ * cluster ENDING in `c` (`-lc`, `-ic`) means the next word is a script the interpreter will run. A
+ * redirect or list separator between them (`sh -c >/dev/null $'…'`) does not change that, because the
+ * shell takes the first non-redirect word as its operand — so those tokens are skipped going back.
+ * Deliberately coarse: a FALSE hit only makes the text SCANNED (`sh -c $'…'` is then read the way
+ * `sh -c '…'` already is), and an over-read in a gate is the cheap direction.
+ * @param {string} before — the segment text preceding the literal
+ * @returns {boolean}
+ */
+function _ansiCIsProgramOperand(before) {
+  const words = String(before ?? "").trimEnd().split(/\s+/).filter(Boolean);
+  for (let k = words.length - 1; k >= 0 && k >= words.length - 3; k--) {
+    const w = words[k].replace(/^["']+|["']+$/g, "");
+    if (!w) continue;
+    if (w === "eval") return true;
+    if (/^-[A-Za-z]*c$/.test(w)) return true;
+    if (/^[0-9]?[<>]|^&>/.test(w)) continue; // a redirect (with or without its fd) — skip it and keep looking
+    return false; // the first REAL word back is not a program-taking form
+  }
+  return false;
+}
+
+/** Sentinels for a parenthesis that is DATA — QUOTED, ESCAPED, or inside a `${ … }` parameter
+ * expansion (`_maskDataParens`).
+ *
+ * ⛔ QUOTED PARENS ARE DATA, NOT OPERATORS (fresh-context review round 4, P2). `_tokenize` is
+ * quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives at
+ * `_pushSegmentTokens` as the token `)` — indistinguishable from the shell operator. That token then
+ * hit the span-closer leg with `depth === 0` and ENDED the segment, discarding the delete flag:
+ * `git push origin -o ")" -d held/branch` returned `[]` where `origin/main` returned
+ * `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+ * ALLOWED — the fourth mirror-shape of the rounds 1-3 class (redirect-as-boundary,
+ * opener-as-terminator, span-word-as-filename, now quote-erasure). `\)` erases the same way.
+ *
+ * The mask is 1:1 in LENGTH, and that is load-bearing (fresh-context review round 5, P3: an earlier
+ * revision of this comment CLAIMED it while the sentinels were `"\u0001QPL"`/`"\u0001QPR"` — 1 → 4
+ * bytes, so the stated invariant was false and a reader trusting it would reason about index
+ * arithmetic that did not exist). `_foldBacktickSubstitutions` slices the body BY INDEX, so keeping
+ * every mask exactly one character means its indices are valid on the MASKED string and map 1:1 back
+ * onto the original. The sentinels are single control characters that cannot occur in a shell word
+ * and cannot collide with `_SUBST_PLACEHOLDER`'s `\u0000` prefix. Every token is unmasked before it
+ * is returned, so a genuinely quoted ref name that contains a paren is unaffected.
+ */
+const _QP_L = "\u0001";
+const _QP_R = "\u0002";
+
+/** Marks a COMMAND SUBSTITUTION that opens inside `"…"` (`$(` or a backtick), so the segment walk can
+ * fold the one word it contributes into `_SUBST_PLACEHOLDER`.
+ *
+ * ⛔ WITHOUT IT A QUOTED SUBSTITUTION IS INVISIBLE TO THE WALK (round-17 review, P1 — a measured
+ * FAIL-OPEN on the GUARDED ref). `_maskDataParens` masks a quoted span's parens, which is right for the
+ * parenthesis rules, but the resulting token was then ordinary TEXT to `_pushSegmentTokens`: no
+ * placeholder, so its "a delete spelling arrived inside a collapsed span" arm could not fire and the
+ * word was handed on as a plain refspec. gnu.org, *Command Substitution*: "If the substitution appears
+ * within double quotes, word splitting and pathname expansion are not performed on the results" — so
+ * the span is exactly ONE argv word, which is precisely what the placeholder means.
+ * One mark for both spellings because the walk's treatment is identical; it is masked to a space by
+ * `_spanCarriesDeleteSpelling`/`_rawCarriesDeleteSpelling` (they normalise `[\u0000-\u0008]`), so it
+ * cannot glue a spelling onto a neighbouring word there either.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`), `_QP_L`/`_QP_R` (`\u0001`/`\u0002`),
+ * `_NL_DATA` (`\u0003`) or `_NL_SPAN` (`\u0004`). */
+const _QS_MARK = "\u0005";
+
+/** Suffix appended to `_SUBST_PLACEHOLDER` for a span that was QUOTED, i.e. one the shell will NOT
+ * word-split.
+ *
+ * ⛔ THE VALUE-SLOT RULE TURNS ON THIS DISTINCTION (round-17 review, P1 — measured as a FAIL-OPEN on the
+ * GUARDED ref, and it is the SECOND time this surface mistook "one word" for "the whole expansion").
+ * `-o`/`--push-option` consumes exactly ONE argv word, so a QUOTED span in that slot is provably the
+ * value and cannot become a flag (gnu.org, *Command Substitution*: no word splitting inside `"…"`):
+ *
+ *   git push origin -o "$(echo "x -d held/branch")"   bash argv → push origin -o 'x -d held/branch'
+ *     (ONE word — the value). Ref only survives; nothing is deleted.
+ *
+ * An UNQUOTED span DOES split, so only its FIRST word is the value and every later word is ordinary
+ * argv — a delete flag among them is a real flag:
+ *
+ *   git push origin -o $(echo "x -d held/branch")
+ *     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` DELETES the ref)
+ *     origin/main and `51401fc9b` both REFUSED it (each on an unresolvable `held/branch\")` fragment); a
+ *     blanket value-slot exemption returned `null`.
+ *     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling (and its
+ *     `--push-option` twin), NOT for the backtick twin `` -o `echo "x" -d` held/branch ``, where
+ *     `origin/main` returns `null` — i.e. it ALLOWED that one, so closing it is NEW coverage rather than
+ *     restored coverage. The blanket exemption arrived in `51401fc9b`.
+ *
+ * Which word of an expansion carries the spelling is UNKNOWABLE statically, so an unquoted span in a
+ * value slot is treated as able to spill and the arm FIRES (#653's policy: refuse what cannot be
+ * resolved). The cost is a documented over-block on `-o $(echo -d)` — a push-option whose expansion is
+ * exactly `-d` is not a workflow — and the alternative is a deleted sibling branch.
+ * It is a SUFFIX rather than a second placeholder so every containment test (`_cleanDeleteTarget`, the
+ * marker dedupe, `_isPushDeleteFlagToken`) keeps matching `_SUBST_PLACEHOLDER` unchanged. */
+const _QUOTED_SPAN_SUFFIX = "\u0006";
+
+/** Replace `(`/`)` that are DATA with sentinels, mirroring `_tokenize`'s own rules EXACTLY: a
+ * backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
+ * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
+ * sentinel character (see `_QP_L`).
+ *
+ * Five ways a paren is DATA: (a) quoted, (b) escaped, (c) inside a `${ … }` PARAMETER EXPANSION, and
+ * (d)+(e) inside a `$( … )` / backtick span, which `_pushSegmentTokens`'s span rules already treat as
+ * one word. (c) must be masked here because those span rules cannot see it: the `)` of `${R:-)}` is
+ * not a closer of anything.
+ *
+ * ⛔ A `${ … }` WORD'S PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 6, P2). Only
+ * quoted/escaped parens were masked, so the `)` of `-o ${R:-)}` tokenized as the operator `)` and
+ * ENDED the segment before the delete flag — `git push origin -o ${R:-)} -d held/branch` returned
+ * `[]` where origin/main returned `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted
+ * and the #73 hazard was ALLOWED (reproduced end-to-end: the remote deletes the branch). The span's
+ * `}` is found by bash's own rule — the first `}` that is not escaped, not inside a quoted string, and
+ * not inside a NESTED expansion (GNU Bash manual, Shell Parameter Expansion; probes: `${R:-)}` →
+ * `)`, `${R:-'}'}` → `}`, `${A:-${B:-)}}` → `)`). An UNCLOSED `${` is a bash syntax error
+ * ("unexpected EOF while looking for matching `}`"), so no runnable command reaches the tail of this
+ * function with a stale `expDepth`.
+ * @param {string} body
+ * @returns {string}
+ */
+function _maskDataParens(body) {
+  const swap = (c) => (c === "(" ? _QP_L : c === ")" ? _QP_R : c);
+  let out = "";
+  let quote = null;
+  let quoteExpDepth = 0; // `expDepth` in force when the CURRENT quote OPENED
+  let expDepth = 0; // `${ … }` spans OPEN in this segment: their parens are DATA
+  // ⛔ A `$( … )` INSIDE `"…"` OPENS A NEW QUOTING CONTEXT (round-9 review, P0). Bash re-enters the
+  // substitution's own quoting context and returns to the enclosing one at the matching `)`, so a `"`
+  // INSIDE the span must not close the ENCLOSING quote. A single flat `quote` let it, and the span's
+  // inner `)` then arrived UNMASKED — where `_pushSegmentTokens` reads a `)` with `depth === 0` as the
+  // #504 segment boundary and BREAKS, discarding the `-d` and its target:
+  //   git push origin -o "title=$(echo "fix) bug")" -d held/branch  → ALLOWED here, BLOCKED on origin/main
+  // (measured 4/4 shapes; the `-o "plain"` control BLOCKS on both, so the fixture is valid).
+  //
+  // ⛔ ONE STACK, NOT A COUNTER (round-11 review, P0). A flat `expDepth` + a parallel `substQuotes`
+  // modelled neither of bash's two rules for a `}` that is DATA, and 48 of 64 measured shapes came
+  // back `null` where `origin/main` reported the real target (so `_coordinatedDeleteBlock` was never
+  // consulted and the delete of a sibling-held branch was ALLOWED):
+  //
+  //   (i) a `}` INSIDE A QUOTE THAT OPENED INSIDE THE EXPANSION is data — the counter dropped the
+  //       level anyway, because the quoted arm fired on ANY `}`:
+  //         git push origin -o ${A:-"}"x)} -d held/branch      base ["held/branch"] BLOCK / here ALLOW
+  //       `quoteExpDepth` records `expDepth` at the moment the quote opened, so a quoted `}` closes a
+  //       level only when it is the expansion's OWN `"${A:-x}"` case (`expDepth > quoteExpDepth`).
+  //   (ii) a `}` INSIDE A `$( … )` NESTED IN THE EXPANSION is data — but the `$(` got no level at all
+  //       (`expDepth === 0` gate), so the argument's `}` closed the expansion:
+  //         git push origin -o ${A:-$(printf "}")} -d held/branch  base ["held/branch"] BLOCK / here ALLOW
+  //       A `$(` now pushes a level at ANY depth, so `}` only closes the TOP span and a `(`-kind top
+  //       makes it data. `expDepth` still masks every paren inside `${ … }`; a closer that returns into
+  //       a quote OR into an expansion is masked (fail-safe direction: a masked paren can never become
+  //       the #504 operator token).
+  const spans = []; // { kind: "(" | "{", restore: quote-at-open | null, inExp: boolean }
+  const top = () => spans[spans.length - 1];
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === quote) { quote = null; out += ch; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < body.length) {
+        out += ch + swap(body[i + 1]); i++; continue;
+      }
+      // A `${` inside DOUBLE quotes still opens an expansion (bash expands it there); inside SINGLE
+      // quotes it is literal text, so the single-quote path below never touches `expDepth`.
+      if (quote === '"' && ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+      if (quote === '"' && ch === "}" && top()?.kind === "{" && expDepth > quoteExpDepth) { spans.pop(); expDepth--; out += ch; continue; }
+      // A `$(` inside DOUBLE quotes starts a substitution: enter it in a NEUTRAL quoting context and
+      // remember the quote we must return to. The `(` stays masked, so a quoted span contributes no
+      // operator token.
+      // ⛔ IT IS MARKED `_QS` AS WELL, BECAUSE A QUOTED SPAN IS OTHERWISE INVISIBLE TO THE WALK (round-17
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Masking alone left the token as the
+      // literal text `$(echo -d)`: not the placeholder, so `_pushSegmentTokens`' "a spelling arrived
+      // inside a collapsed span" arm could not fire, and the word fell through to
+      // `_cleanDeleteTarget` as an ordinary refspec. The shape below is a REAL delete of a ref a
+      // sibling worktree holds (bash argv, stub-`git` probe: `push origin -o x -d y -d held/branch`):
+      //
+      //   git push origin -o "x -d y" "$(echo -d)" held/branch
+      //     origin/main → REFUSE (on the accidental fragment `$(echo`)   before this → ALLOW (null)
+      //
+      // gnu.org, *Command Substitution*: "If the substitution appears within double quotes, word
+      // splitting and pathname expansion are not performed on the results" — a quoted `$( … )` is
+      // therefore exactly ONE argv word, which is what `_SUBST_PLACEHOLDER` models. The bare twin
+      // (`"$(echo -d)"` → `$(echo -d)`) already reached the arm; quoting changed nothing but visibility.
+      if (quote === '"' && ch === "$" && body[i + 1] === "(") {
+        spans.push({ kind: "(", restore: quote, inExp: false }); quote = null; out += ch + _QS_MARK; i++; continue;
+      }
+      // ⛔ A BACKTICK INSIDE `"…"` IS A SUBSTITUTION TOO (same round-17 finding, same class). Bash
+      // expands it and no word splitting applies, so the word is one opaque argv word; the old path
+      // left it literal, so `` git push origin -o "x -d y" "`echo -d`" held/branch `` was ALLOWED on
+      // BOTH trees (a pre-existing gap, measured) and neither the arm nor #653 could see it.
+      // ⛔ IT EMITS ONE CHARACTER, SO IT MUST NOT `i++` (round-17 review P0, and this was MINE). The
+      // `$(` branch above consumes TWO source characters (`$` and `(`) and emits two, so its `i++` is
+      // correct; copying that idiom here advanced 2 while emitting 1 and ATE THE NEXT CHARACTER —
+      // which for a quoted backtick span is the span's own first letter, followed by the rest of the
+      // segment once the closing quote was eaten too:
+      //
+      //   git push origin -o -d "`echo -d`" -d held/branch
+      //     masked →  origin -o -d "<QS>cho -d<QS> -d held/branch   ('e' and the closing `"` gone)
+      //     → one quoted word swallows `-d held/branch` → extractor null → #73 never consulted → ALLOW
+      //   bash argv → push origin -o -d -d held/branch  (the `-o` value is the FIRST `-d`, the second
+      //     is a real delete flag) → REAL delete of the sibling-held ref
+      //
+      // One character in, one sentinel out, so no index adjustment is needed — the enclosing `for`
+      // already advances past it. `\`` keeps its literal meaning (the escape arm above runs first).
+      if (quote === '"' && ch === "`") { out += _QS_MARK; continue; }
+      out += swap(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < body.length) {
+      out += ch + swap(body[i + 1]); i++; continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; quoteExpDepth = expDepth; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+    if (ch === "}" && top()?.kind === "{") { spans.pop(); expDepth--; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "(") {
+      // Inside an expansion the substitution is DATA (every paren there is masked, as before); it still
+      // needs a LEVEL so its own `}` cannot close the expansion (defect (ii)).
+      const inExp = expDepth > 0;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? ch + swap("(") : ch + "("; i++; continue;
+    }
+    if (ch === "(" && top()?.kind === "(") {
+      const inExp = !!top().inExp;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? swap(ch) : ch; continue;
+    }
+    if (ch === ")" && top()?.kind === "(") {
+      const done = spans.pop();
+      // At the OUTERMOST `)` the substitution returns to the context that opened it. A `)` that
+      // closes a level opened inside `"…"` is itself DATA there, so it is masked. SO IS one that
+      // closes a level opened inside `${ … }` (defect (ii)): an unmasked `)` there reaches
+      // `_pushSegmentTokens` as the #504 operator token.
+      // ⚠️ STATED RESIDUAL (round-9 review): the QUOTE half of this mask is NOT independently
+      // observable — the closer always lands INSIDE the restored quote for `_tokenize` too, so
+      // unmasking it changes 0 rows of the differential and reddens no test. It is kept because
+      // MASKING IS THE FAIL-SAFE DIRECTION for a gate: a masked paren can never become an operator
+      // token, whereas an unmasked one can become the #504 `break` — and this function exists to stop
+      // exactly that. Do not "simplify" it away on the strength of it having no test; the asymmetry
+      // is the reason. (The EXPANSION half is observable and pinned by the round-11 rows.)
+      const maskCloser = done.inExp || done.restore;
+      if (done.restore) quote = done.restore;
+      out += maskCloser ? swap(ch) : ch;
+      continue;
+    }
+    out += expDepth > 0 ? swap(ch) : ch; // inside `${ … }` BOTH parens are data
+  }
+  return out;
+}
+
+/** Restore the parens `_maskDataParens` replaced.
+ *
+ * ⛔ BOTH sentinels are checked. A token can legitimately contain ONLY `_QP_R` — `-o ")"` masks to that
+ * single character — so sniffing for `_QP_L` alone (the first revision did) left such a token
+ * UNMASKED, feeding `\u0002` onward as if it were a ref.
+ * @param {string} tok
+ * @returns {string}
+ */
+function _unmaskDataParens(tok) {
+  if (typeof tok !== "string") return tok;
+  return tok.replace(/[\u0001\u0002]/g, (c) => (c === _QP_L ? "(" : ")"));
+}
+
+/** Drop the ONE quote character in this segment body that has no partner.
+ *
+ * ⛔ AN UNBALANCED QUOTE IN A SEGMENT IS A CLOSER (or an opener) OF THE *OUTER* COMMAND, AND
+ * `_tokenize` SWALLOWS WHITESPACE INTO THE WORD WHILE IT IS OPEN (round-10 review, P0 F1). The
+ * capture is bounded by `;`/`&`/`|`/newlines, not by quoting, so a compound that hands the push to a
+ * shell — `sh -c 'git push origin -d held'`, `eval "…"`, `bash -c "…"` — leaves the segment body as
+ * ` origin -d held' `: the `'` that CLOSES the outer word is inside the capture, nothing in the body
+ * opened it, and `_tokenize`'s quote branch then appends `'`, ` ` and every later character to the
+ * target. `_cleanDeleteTarget` strips only ADJACENT quotes, so the target stayed `held ` — and a
+ * trailing space is not in `DELETE_TARGET_UNRESOLVABLE_RE`, so #653 did not refuse it and
+ * `_coordinatedDeleteBlock` looked up `refs/heads/held ` (an exact-key miss) and ALLOWED the delete
+ * of a branch a sibling worktree holds. MEASURED: `origin/main` returned ["held"] (BLOCK), this
+ * branch returned ["held "] (ALLOW), end-to-end through the shipped handler.
+ *
+ * Deleting the unmatched quote character restores the word exactly as bash sees it (`sh -c` strips
+ * the quotes before the inner shell ever parses the body), and it leaves every BALANCED quote
+ * untouched — a genuinely quoted ref name (`-d 'feat/x)'`) keeps its whitespace-free content.
+ * Refusing the glued form in `_cleanDeleteTarget` was tried FIRST and reverted: the same over-capture
+ * also carries push-option VALUES (`-o "Release 2.0"`), so the refusal rule turned an ordinary
+ * `-o … -d <literal>` into a false block (see `DELETE_TARGET_UNRESOLVABLE_RE`).
+ * @param {string} s
+ * @returns {string}
+ */
+function _dropUnmatchedQuote(s) {
+  let quote = null;
+  let open = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i++; continue; }   // POSIX: `\` escapes only in `"…"`
+      if (ch === quote) { quote = null; open = -1; }
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; open = i; continue; }
+  }
+  if (quote === null || open < 0) return s;
+  return s.slice(0, open) + s.slice(open + 1);
+}
+
+/**
+ * Tokenize ONE `git push` segment body, stopping where BASH ENDS THE COMMAND.
+ *
+ * #504 residual (parenthesized later segment). The segment body used to be `split(/\s+/)`, which
+ * keeps a shell operator ATTACHED to the last word — a subshell/substitution closer. `… && (git push
+ * origin -d old-feat)` therefore produced the whole-command target token `old-feat)`, and
+ * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a genuinely QUOTED name. The
+ * phantom `old-feat)` names no ref, so `_coordinatedDeleteBlock` looked up `refs/heads/old-feat)`,
+ * found nothing checked out, and ALLOWED the delete of a branch a sibling still holds — the exact
+ * #73 hazard, reachable from a worktree session where M2 is exempt.
+ *
+ * `_tokenize` is the module's quote-aware shell splitter, so QUOTED text stays in the word
+ * (`-d 'feat/x)'` is the real ref `feat/x)`). FOUR rules bound the segment, and each was measured
+ * against a fail-open this helper shipped or inherited:
+ *
+ *   1. NO LIST SEPARATOR CAN REACH THIS HELPER (round-6 review, P3: an earlier revision described a
+ *      `_SHELL_OPS` separator break HERE as live; it was dead). `segRe`'s capture is `([^;&|\n]*)`, so
+ *      `;`, `&` and `|` — and therefore `&&`, `||`, `&>` — are never in the body, and neither is a
+ *      NEWLINE; `_tokenize` is called WITHOUT `newlineIsSeparator`, so it never synthesises a `;`
+ *      either. ⛔ THE NEWLINE HALF IS ROUND-7 REVIEW, P0, AND IT IS A CAPTURE CHANGE, NOT A BREAK
+ *      INSIDE THIS HELPER: the capture used to span a newline, so two commands arrived as one body and
+ *      the second command's `(` became a span OPENER under rule 3 — `git push origin HEAD:feat\n( git
+ *      push origin -d held/branch )` extracted `[]` and the #73 arm was never consulted, where
+ *      `origin/main` blocked it. A `;`-break here was tried FIRST and was wrong twice over: it cannot
+ *      see the second `git push` at all (the `g` scan had already consumed it into the first match), and
+ *      it would have needed a rule for a separator the capture no longer admits. The only `_SHELL_OPS`
+ *      members that can arrive, `(`/`)`, are intercepted by rule 3. There is deliberately no
+ *      separator branch below to go dead.
+ *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
+ *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
+ *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
+ *      gave the target. The token is SKIPPED with its filename operand instead.
+ *   3. A parenthesised span is a WORD, not a boundary, when it OPENS inside the segment (`$(
+ *      cat .remote)`, `-o $(date)`): its contents are skipped and scanning CONTINUES, so the flag
+ *      and target after it survive (round-2 review P2 — truncating at the opener returned null
+ *      where origin/main returned the target). A `)` with no matching opener in the segment closes
+ *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
+ *      #504 itself. A span that never CLOSES is still reported as ONE unknowable word (round-7 review,
+ *      P0) — dropping it was the same regression as the newline gap, on the other side of the capture:
+ *      `segRe` cuts a substitution body at its own `;`/`&`/`|`, so `-d $(cat f | head -1)` lost the
+ *      target entirely.
+ *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin), which
+ *      reports a truncated backtick span the same way.
+ *   4. Only an UNQUOTED, UNEXPANDED paren is an operator (round-4 review P2; round-6 P2).
+ *      `_tokenize` strips quotes, so a word that is exactly `")"` reached rules 1-3 as the token `)`
+ *      and ended the segment — and so did the `)` of a `${ … }` word, whose closer is a BRACE, not a
+ *      paren. `_maskDataParens` neutralises quoted, escaped AND parameter-expansion parens before
+ *      tokenizing and every token is unmasked on the way out, so paren DATA can never drive the span
+ *      rules.
+ *   5. ONLY A BALANCED QUOTE IS A QUOTE (round-10 review, P0 F1). The capture is bounded by LIST
+ *      SEPARATORS, not by quoting, so a quote that OPENS before `git push` (or one whose partner lies
+ *      beyond the capture) arrives here alone — and `_tokenize` then swallows the whitespace that
+ *      follows it into the word, producing the phantom `held ` that misses the #73 lookup. The
+ *      unmatched quote character is dropped before tokenizing (`_dropUnmatchedQuote`), which is what
+ *      bash's own `sh -c`/`eval` handling does to it; a BALANCED quoted word still keeps its content
+ *      (`-d 'feat/x)'` is the real ref `feat/x)`).
+ * @param {string} body raw text after the `git push` word
+ * @returns {string[]}
+ */
+function _pushSegmentTokens(body) {
+  // ANSI-C strings are folded FIRST (see `_foldAnsiCStrings`) — `_tokenize` has no `$'…'` quoting, and
+  // leaving it to guess is what let a `\'` inside one swallow the rest of the segment. The unmatched
+  // quote is dropped NEXT, so every later pass works on quote-balanced text (rule 5).
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_dropUnmatchedQuote(_foldAnsiCStrings(body)))))
+    // ⛔ A SPAN'S NEWLINE SEPARATES WORDS (round-13 review, P1). `_NL_SPAN` marks a newline that is a
+    // list separator for the shell parsing that span, so it must end the word it was masked into —
+    // otherwise `held/branch` + `echo` arrive as the single token `held/branch\necho`, which names no
+    // ref, so #73 looks it up, finds nothing and ALLOWS. Splitting here (after `segRe` took the
+    // capture, so the segment itself is still whole) restores the real target while the command on
+    // the other side of the newline stays in the same body — which is what `origin/main` reports too.
+    // `_NL_DATA` is NOT split: a newline inside `"…"`/`'…'` is data and belongs inside its word.
+    .flatMap((t) => (t.includes(_NL_SPAN) ? t.split(_NL_SPAN).filter(Boolean) : [t]));
+  const tokens = [];
+  let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === "(") {
+      // The `$` of a `$( … )` is a separate token from `_tokenize`; it is part of the span, not an
+      // argv word, so do not let it sit in the token list as a positional.
+      if (tokens[tokens.length - 1] === "$") tokens.pop();
+      depth++;
+      continue;
+    }
+    if (t === ")") {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0) tokens.push(_SUBST_PLACEHOLDER); // the span is one positional word
+        continue;
+      }
+      // ⛔ A CLOSER THAT LEAVES A DELETE BEHIND IT IS AMBIGUOUS, NOT A SAFE BOUNDARY (round-11 review,
+      // P2 — measured as a FAIL-OPEN against `origin/main`). Truncating here is right when the `)`
+      // really does close a subshell opened before `git push`. It is WRONG when the `)` only LOOKS
+      // like a closer because a nested interpreter re-parses the text at a different escaping level —
+      // `bash -c "… \"…\" …"` de-escapes one level before the inner shell parses it, so a paren that
+      // `_maskDataParens` sees as an OPERATOR (the `\"` before it is an escaped quote at THIS level)
+      // is DATA at the level that actually runs the push. Depth then underflows at the span's real
+      // closer, and everything from `-d` onward is discarded:
+      //
+      //   bash -c "git push origin -o \"$(echo \"a)b\")\" -d held/branch"
+      //     origin/main → wholeCommandDeleteTargets = ["…","held/branch"] → #73 CONSULTED → BLOCK
+      //     before this  → []                                              → #73 never consulted → ALLOW
+      //
+      // (measured: `verdict` is `block:push` on BOTH trees, so the whole gap is the empty target list —
+      // and a linked-worktree session is M2-EXEMPT, which is what makes it reachable. 64 rows of a
+      // 6,528-row differential were this one class; every one had the real `held/branch` on the base.)
+      // ⛔ The rule is deliberately NOT "un-escape the nested level and re-parse": that is a second
+      // parser with its own escaping bugs, and this module has one already. The delete is VISIBLE in
+      // the text and UNATTRIBUTABLE by the walk, which is exactly the case #653's policy calls for —
+      // report it as unresolvable so the block REFUSES and NAMES it, rather than dropping it.
+      // Scoped to a walk that attributed NO delete of its own, so a segment that already has its flag
+      // and target keeps them (the truncation is then harmless); the raw check is over-inclusive on
+      // purpose (see `_rawCarriesDeleteSpelling`) because over-blocking is the cheap direction here.
+      if (!tokens.some((x) => _isPushDeleteFlagToken(x)) && _rawCarriesDeleteSpelling(body)) {
+        // ⛔ CONTINUE, not refuse: the delete is still ahead of us in the SAME segment, so the walk can
+        // still attribute its REAL target (`held/branch`) and let #73 decide on it with its own reason.
+        // Refusing here would block the same command for a worse reason ("cannot tell WHICH branch")
+        // about a target that is in fact a plain literal. `origin/main` blocks this shape by
+        // over-capture; this blocks it by READING it, which is the outcome the PR exists to produce.
+        continue;
+      }
+      break; // closes a subshell opened before `git push` — the #504 boundary
+    }
+    if (_isRedirectOperator(t)) {
+      // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2). `<( list )` /
+      // `>( list )` is a single WORD passed as an argument (bash manual §5.1), but `_tokenize` drops
+      // the adjacency and emits `<` + `(` as two tokens — so consuming the next token as the
+      // redirect's filename ate the span OPENER, depth stayed 0, and the span's `)` then terminated
+      // the segment: `git push origin <(cat f) -d held/branch` returned null where origin/main
+      // returned the target. Leave `(` alone and let the span rule above handle it.
+      // The redirect's FILENAME is not an argv word, so it is skipped with its operator. ⛔ NO
+      // `_redirectTakesOperand` CONJUNCT HERE (round-8 review, P3) — it was a predicate whose FALSE arm
+      // could never fire on this body, so it is deleted rather than left as a branch no input reaches.
+      // The argument is structural, not a count of shapes: `_isRedirectOperator` accepts exactly two
+      // classes this branch cannot see, (a) the `&`-bearing forms (`&>`, `&>>`, `>&`, `2>&1`, `>&2`,
+      // `2>&-`, `<&1`, `>&-`) — every one contains `&`, which the segment capture excludes — and (b) the
+      // `>|` noclobber form, which contains `|`, also excluded. What survives both filters is
+      // `[N]{>,>>,<,<<}`: `_tokenize` splits the operator from its operand (`2>/dev/null` arrives as `2>`
+      // + `/dev/null`), so no attached-operand spelling reaches here either. Every surviving token is one
+      // `_redirectTakesOperand` ACCEPTS. Verified empirically on the survivor set: restoring the conjunct
+      // leaves test-653-delete-target (77 rows, every redirect shape in it) unchanged.
+      if (toks[i + 1] !== "(") i++;
+      continue;
+    }
+    if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
+    // ⛔ A `$( … )` / backtick that OPENED INSIDE `"…"` IS STILL ONE OPAQUE WORD (round-17 review, P1).
+    // `_maskDataParens` marks it (`_QS_MARK`) instead of letting it fall through as literal text; the
+    // shell neither splits nor globs a quoted substitution's result, so the word's content is unknowable
+    // here and belongs in the placeholder — the same treatment the BARE twin already got. The `_QUOTED`
+    // suffix records the ONE thing that distinguishes it from a bare span: it will not word-split, which
+    // is what makes its value-slot exemption sound (see `_QUOTED_SPAN_SUFFIX`).
+    if (t.includes(_QS_MARK)) {
+      // ⛔ A MIXED TOKEN IS NOT ONE WORD (round-17 review cycle 3, P1 — measured as a FAIL-OPEN with real
+      // git). `_foldBacktickSubstitutions` splices an UNQUOTED backtick span INLINE, with no separator
+      // (by design — see its own note), so when such a span is ADJACENT to a quoted one the two collapses
+      // land in ONE token. Treating "contains a quoted span" as "is a quoted span" then discarded the
+      // half that DOES split, and the value-slot exemption fired on a word bash splits into three:
+      //
+      //   git push origin -o `echo "x -d held"`"$(echo )"
+      //     bash argv → push origin -o x -d held      (the unquoted half spills → REAL delete)
+      //     a contains-test → exempt → null → #73 never consulted → ALLOWED
+      //     origin/main → REFUSE (on the `"$(echo` fragment)   the exemption-deleted mutant → REFUSE
+      //
+      // A token carrying BOTH markers has an UNQUOTED part, so it can split and cannot be "provably the
+      // value": it takes the BARE placeholder, which the exemption rejects. Fails closed in one place.
+      const mixed = t.includes(_SUBST_PLACEHOLDER);
+      // ⛔ THE LITERAL TEXT BEFORE THE SPAN IS KEPT (round-17 review cycle 4, P2 — a false block):
+      // dropping it turned the INLINE option form into a bare span, so `-o"$(echo -d)"` — where the
+      // `-o` and its value are ONE argv word (`-o-d`), so the value cannot be a flag — lost the `-o`
+      // and was refused. The trailing `$` belongs to the `$(` opener (the mask emits `$` + `_QS_MARK`)
+      // and is not part of the word bash sees.
+      const raw = t.slice(0, t.indexOf(_QS_MARK));
+      const head = raw.endsWith("$") ? raw.slice(0, -1) : raw;
+      // What comes AFTER the span is still dropped, and that direction is SAFE rather than sloppy: the
+      // token keeps `_SUBST_PLACEHOLDER`, so any word with a suffix stays UNRESOLVABLE (`_cleanDeleteTarget`
+      // marks it, #653 refuses it) and a suffix can never turn an unknowable word into a resolvable ref
+      // name. Measured: `git push origin -d held/branch"$(cat x)"` → `["$(…)"]` (REFUSED) on this head and
+      // on the pre-fix head, vs `main`'s `["held/branch\"$(cat"]` fragment — over-refusal, not a fail-open.
+      tokens.push(mixed ? (head + _SUBST_PLACEHOLDER) : (head + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX));
+      continue;
+    }
+    tokens.push(_unmaskDataParens(t));
+  }
+  // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
+  // substitution whose body contains `;`/`&`/`|` — cut by `segRe` BEFORE the closer — left no word
+  // behind that `_cleanDeleteTarget` could mark: `git push origin -d $(cat f | head -1)` extracted
+  // `null` and the #73 arm was never consulted, where `origin/main` REFUSED it. The span is ONE
+  // unknowable word either way, so it becomes the same placeholder a CLOSED span gets; words collected
+  // BEFORE it are kept (the flag/target survive).
+  // ⛔ This is also why the placeholder must survive into a TARGET slot: `_cleanDeleteTarget` turns it
+  // into the unresolvable marker #653 refuses; dropping it there instead is the fail-open that
+  // function documents.
+  if (depth > 0) tokens.push(_SUBST_PLACEHOLDER);
+  // ⛔ A DELETE SPELLING THAT ARRIVED INSIDE A COLLAPSED SPAN IS UNATTRIBUTABLE, NOT ABSENT
+  // (round-14 review, P1 — measured as a FAIL-OPEN against `origin/main`). The span fold above turns a
+  // substitution's words into ONE opaque placeholder, so a delete FLAG that came out of the
+  // substitution disappears from the token list entirely and the segment looks like a plain push:
+  //
+  //   bash -c "git push origin $(echo --delete<LF>) held/branch"
+  //     bash really runs → <push><origin><--delete><held/branch>
+  //     origin/main      → pushTargets ["$(echo",")","held/branch"] → the delete arm REFUSES
+  //     before this      → []                                      → #73 never consulted → ALLOW
+  //
+  // (`origin/main` reached it by accident — its whitespace split happened to surface the flag fragment.
+  // The same accident is what this PR replaces everywhere else, so the coverage has to be restored by a
+  // RULE rather than by re-introducing the accident.) This is exactly the case the closer arm above and
+  // `_cleanDeleteTarget` already document: the delete is VISIBLE in the text and UNATTRIBUTABLE by the
+  // walk, which is what #653's policy is for — report the marker so the block REFUSES and NAMES it.
+  // ⛔ SCOPED TWICE, because an unscoped version is a false-block generator: it fires only when the
+  // walk collapsed a span AND found no delete flag of its own AND the raw text carries a delete
+  // spelling. A plain `git push origin HEAD:feat` has no placeholder; `git push origin -o $(date) -d
+  // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
+  // be in the same segment, which is the ambiguous shape this is meant to catch.
+  const _valueSlot = _markOptionValueSlots(tokens);
+  const _isSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER);
+  const _isQuotedSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+  // ⛔ THE INLINE OPTION SPELLINGS ARE THE SAME WORDS AS THE SEPARATED ONES (round-17 review cycle 4, P2 —
+  // a FALSE BLOCK this PR introduced, measured against `origin/main`). `_markOptionValueSlots` models the
+  // SEPARATED slot only (`-o` then a value token), so `-o"$(echo -d)"` and `--push-option="$(echo -d)"`
+  // got no slot and the exemption could not fire — while bash sees ONE word (`-o-d`,
+  // `--push-option=-d`), i.e. `-o`'s INLINE value, which cannot be a flag:
+  //
+  //   git push origin -o"$(echo -d)" main   → argv push origin -o-d main → nothing deleted
+  //   origin/main → allow    this head (before) → REFUSE "$(…)"
+  //
+  // Narrow ON PURPOSE: only the exact `-o<VALUE>` / `--push-option=<VALUE>` forms whose value is the whole
+  // quoted span are exempted. A MERGED cluster that also carries a delete flag (`-do"$(…)"` is `-d` plus
+  // `-o` with an inline value, so `-d` IS a flag) matches neither test and keeps failing CLOSED, which is
+  // the safe direction for a form this parser does not model.
+  const _isInlineOptValue = (t) => t === "-o" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX
+    || t === "--push-option=" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX;
+  // ⛔ ONLY A **QUOTED** SPAN CAN BE EXEMPTED FROM A VALUE SLOT (round-17 review, P1 — measured as a
+  // FAIL-OPEN on the GUARDED ref). `-o`/`--push-option` consumes ONE argv word: a quoted span is exactly
+  // one word, so it is provably the value and cannot be a flag — but an UNQUOTED span is word-split, so
+  // only its first word is the value and the REST IS ARGV, where a delete flag is a real flag:
+  //
+  //   git push origin -o $(echo "x -d held/branch")
+  //     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` deletes the ref)
+  //     a blanket exemption → null → #73 never consulted → ALLOWED;  origin/main and aa5104539 REFUSED.
+  //
+  // Which expanded word carries the spelling is unknowable statically, so the unquoted case is treated as
+  // ABLE TO SPILL and the arm fires (#653's policy). That is a deliberate, documented over-block on
+  // `-o $(echo -d)` — whose expansion is exactly `-d`, i.e. not a push option anyone writes — and the
+  // alternative is a deleted sibling branch. The quoted spelling (`-o "$(echo -d)"`, `-o"$(echo -d)"`)
+  // stays exempt, which is the case the exemption was FOR.
+  const _opaqueInFlagSlot = tokens.some((t, i) =>
+    _isSpanTok(t) && !((_valueSlot[i] && _isQuotedSpanTok(t)) || _isInlineOptValue(t)));
+  // ⛔ "THIS SEGMENT ALREADY HAS ITS OWN DELETE FLAG" MUST BE VALUE-SLOT AWARE (round-17 review, NOTE
+  // promoted — a PRE-EXISTING fail-open on the guarded ref, measured with real git on all three trees).
+  // `-o`/`--push-option` consumes its argument, so an `-o -d` supplies no flag — but the raw token list
+  // is indistinguishable from a real one, and the scan in `extractPushDeleteBranch` correctly SKIPS the
+  // value. Both halves then declined, and nothing was attributed at all:
+  //
+  //   git push origin -o -d $(echo -d) held/branch
+  //     bash argv → push origin -o -d -d held/branch   (the second `-d` IS a delete flag) → real git
+  //     DELETES the sibling-held ref;  origin/main, the previous head and this head all returned null.
+  //
+  // Reading the flag through `_markOptionValueSlots` (the same definition used everywhere else) makes
+  // the arm fire for the span that really carries the flag, and leaves a plain `-o -d $(date) HEAD:feat`
+  // alone — its span body carries no spelling, so `_spanCarriesDeleteSpelling` is false.
+  const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));
+  if (!_ownFlag &&
+      _opaqueInFlagSlot &&
+      // ⛔ A **QUOTED** SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a
+      // FALSE BLOCK this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly
+      // ONE argument, and a QUOTED substitution is exactly one word (gnu.org: no word splitting inside
+      // `"…"`), so that word is provably the value (probe-verified against real git 2.43:
+      // `git push -o -d origin` is a plain push):
+      //
+      //   git push origin -o "$(echo -d)" HEAD:feat
+      //     bash argv → push origin -o -d HEAD:feat   (no delete)   origin/main → allow
+      //     a bare "span outside a value slot" test → REFUSE "$(…)" → a false block on a real push-option
+      //
+      // ⛔ THE EXEMPTION IS **QUOTED-ONLY**, AND THE FIRST VERSION OF THIS COMMENT GOT THAT WRONG (round-17
+      // review, P1, MEASURED — it is why `_QUOTED_SPAN_SUFFIX` exists). It claimed "a multi-word expansion
+      // (`-o $(echo "-d held/branch")`) → `-o -d held/branch`, where `-d` is the VALUE", which is false for
+      // every word AFTER the first: `-o` consumes one word, an UNQUOTED span word-SPLITS, and the rest is
+      // ordinary argv — so a flag there is a REAL flag:
+      //
+      //   git push origin -o $(echo "x -d held/branch")
+      //     bash argv → push origin -o x -d held/branch  (`-o` value is `x`; `-d held/branch` DELETES)
+      //     a blanket exemption → null → #73 never consulted → ALLOWED, where `origin/main` and
+      //     `aa5104539` both REFUSED it.
+      //     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling and its
+      //     `--push-option` twin, NOT for the backtick twin `` -o `echo "x" -d` held/branch `` — there
+      //     `origin/main` returns `null` (it ALLOWED it), so closing that one is NEW coverage rather than
+      //     restored coverage. The blanket exemption arrived in `51401fc9b`.
+      // The quoted/unquoted split is exactly the shell's own: a quoted span cannot spill, an unquoted one
+      // can, and which word carries the spelling is unknowable — so the unquoted case fails CLOSED.
+      // `_markOptionValueSlots` is the module's existing definition of the slot (the same one the target
+      // scan in `extractPushDeleteBranch` uses), so the two cannot drift.
+      _spanCarriesDeleteSpelling(body)) {
+    // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
+    // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete
+    // spelling and the shell may well expand the span into that same flag (bash: `$(echo -d)` IS
+    // `-d`), and where it does not, the marker is unresolvable and #653 refuses it with a message
+    // NAMING the word. `origin/main` reached the same refusal from a fragment of the span; reporting
+    // `$(…)` says the true thing instead — WHICH word it could not resolve.
+    tokens.push("-d", _SUBST_PLACEHOLDER);
+  }
+  return tokens;
+}
+
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
+  // ⛔ A COLLAPSED SUBSTITUTION IN A TARGET SLOT IS *UNRESOLVABLE*, NOT EMPTY (#504 × #653). This
+  // returned `""` when the placeholder was introduced, back when a target the guard could not
+  // resolve simply fell out of the list — and dropping it then was the honest reading of "this is
+  // not a ref name". #653 has since made that reading a FAIL-OPEN: `_coordinatedDeleteBlock` refuses
+  // an unresolvable target, so a target that never REACHES it is never refused either, and
+  // `git push origin -d $(echo held/branch)` came back `null` → the arm was never consulted → the
+  // delete of a sibling-held branch was ALLOWED. MEASURED on the rebase base: `origin/main` refused
+  // this shape (on a fragment), so dropping it here would have been a REGRESSION against main, not a
+  // residual. The placeholder therefore becomes a marker that is (a) non-empty, so it reaches the
+  // block, and (b) shell-shaped, so `DELETE_TARGET_UNRESOLVABLE_RE` refuses it and the refusal NAMES
+  // it. The exact span text is deliberately NOT reconstructed: it feeds a REFUSAL, never a lookup,
+  // and `_foldBacktickSubstitutions` has already replaced a backtick span's text with the sentinel,
+  // so a reconstruction would be faithful for `$( … )` and impossible for `` `…` `` — one marker for
+  // both keeps the rule (and the message) the same shape. Two distinct substitutions in one delete
+  // therefore collapse to ONE marker under the caller's dedupe; that loses which spans they were and
+  // changes no verdict: every one of them is still refused.
+  //
+  // ⛔ CONTAINMENT, NOT EQUALITY (round-10 review, P0 F2). The exact-match arm read `x ===` and so
+  // missed every GLUED phantom: `_foldAnsiCStrings` and `_foldBacktickSubstitutions`' PAIRED arm both
+  // splice the placeholder IN PLACE, with no separator, so a substitution CONCATENATED with the ref
+  // produced one token that matched NEITHER this arm NOR `DELETE_TARGET_UNRESOLVABLE_RE` (a NUL is in
+  // no class), and it was then treated as a literal ref name:
+  //
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      base → ["hk7/branch$'"] → REFUSE
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      here → ["hk7/branch\u0000SUBST"] → ALLOW
+  //   git push origin HEAD:wtfeat ; git push origin -d `date`hk7/branch    here → ["\u0000SUBSThk7/branch"] → ALLOW
+  //
+  // (bash concatenates, so `$''hk7/branch` IS the argv word `hk7/branch`, and the delete really runs.
+  // The paired-backtick arm has the same glue on the CLOSING side; its UNPAIRED arm adds a separator
+  // on purpose, which is why only this containment rule covers both directions.) A NUL cannot occur
+  // in a shell word at all, so containment is fail-closed with no over-block: a token carrying the
+  // placeholder is not literal text and its ref name is unknowable.
+  if (x.includes(_SUBST_PLACEHOLDER)) return "$(…)";
   return x
     .replace(/^["']|["']$/g, "")   // strip surrounding quotes
     .replace(/^:+/, "")             // leading empty-source colon(s)
@@ -5046,7 +6139,21 @@ function _cleanDeleteTarget(x) {
 // or extending the shell walk — declared here so the next lane reads a limit
 // instead of rediscovering a fail-open.
 export function extractPushDeleteBranch(command) {
-  const c = String(command ?? "").trim();
+  // ⛔ A BACKSLASH-NEWLINE IS A LINE CONTINUATION AND MUST BE RESOLVED **BEFORE** THE SEGMENT SCAN
+  // (main, round-7 review, P0). `segRe` stops the capture at a newline, which is right for two separate
+  // COMMANDS — but a continuation is ONE command, and bash joins the lines before it parses words, so
+  // `git push origin \\<newline> -d held/branch` would have been cut at the newline, losing the delete
+  // entirely (extractor `["origin","\"]` → no flag → ALLOW). Replacing the pair with the EMPTY string is
+  // what the shell does (nothing is inserted; the surrounding spaces do the word separation). This is
+  // kept from `main` verbatim: it is a SHELL-fidelity fix and it applies to both surfaces below.
+  // ⛔ TWO TEXTS, AND EACH SURFACE GETS THE ONE IT NEEDS (merge resolution of #3962 × main's masking):
+  // `raw` is what the SHELL sees and it is what the PARSER must read; `c` is `raw` with newlines-in-quotes
+  // masked for the SEGMENT CAPTURE only. Handing the masked `c` to the parser fed it the `_NL_DATA` /
+  // `_NL_SPAN` sentinels as literal characters, so a parsed delete target could carry a `\u0004` that no
+  // real ref name can contain (MEASURED: `git push origin -d a\`echo<NL>held/branch\`` → `["a\u0004`",
+  // "held/branch"]`). The sentinel is an internal encoding, never input to a parser.
+  const raw = String(command ?? "").trim().replace(/\\\r?\n/g, "");
+  const c = _maskQuotedNewlines(raw);
   // ⛔ NO TEXT PRE-FILTER (review round 18, P0). A `!/\bpush\b/.test(c)` gate
   // stood here as a cost shortcut, and it VETOED THE SURFACE THAT HAD THE ANSWER:
   // `git pu""sh origin --delete held` and `git pu\sh …` are resolved by the
@@ -5056,6 +6163,9 @@ export function extractPushDeleteBranch(command) {
   // is the only surface) that admitted a sibling-held delete. A cheap gate that
   // can exclude a row the parser classifies is the same strict-subset defect this
   // round exists to remove, so the gate is GONE; the shell walk is the filter.
+  // ⚠️ THE SAME GATE IS WHY `main`'s own `!/\bgit\s+push\b/` RETURN BELOW CANNOT BE RESTORED: it was
+  // the veto, not a cheap-and-harmless shortcut, and surface B's literal regex cannot match a
+  // quoted-splice spelling either — surface A is the ONLY surface that resolves it.
   // Cost, measured on node 24: `ls -la` 0.0003 ms, `git status` 0.0001 ms,
   // `git push origin -d a` 0.008 ms, a 25 kB compound 2.9 ms — and the arms that
   // call this are reached only for commands a verdict already flagged.
@@ -5132,26 +6242,40 @@ export function extractPushDeleteBranch(command) {
   // `git -c k=v push`, `git --namespace=ns push` and their quoted values
   // attribut­able without a second option list.
   let invs = [];
-  try { invs = allGitInvocations(c) ?? []; } catch { invs = []; }
+  try { invs = allGitInvocations(raw) ?? []; } catch { invs = []; }
   for (const inv of invs) {
     if (inv?.verb === "push" && Array.isArray(inv.args)) collectFromArgTokens(inv.args);
   }
 
-  // ── SURFACE B — the TEXT segments, unchanged in contract: a delete spelling
-  // that merely MENTIONS a push still over-matches (fail-closed), and the
-  // literal adjacency is all this surface needs — the prefixed real commands are
-  // surface A's business now.
-  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  // ── SURFACE B — the TEXT segments. Contract unchanged: a delete spelling that merely MENTIONS a push
+  // still over-matches (fail-closed), and surface A is what resolves the prefixed/global-option
+  // spellings.
+  // ⛔ THE CAPTURE ENDS AT A NEWLINE (`[^;&|\n]*`), NOT AT A LATER SPLIT (main, agent-infra#1158): a
+  // newline is a list separator in bash exactly like `;`. A body that kept it
+  // (`git push origin HEAD:feat\n( git push origin -d held/branch )`) made the SECOND command's `(` look
+  // like a span OPENER under the span rules, so the `-d` and its target were skipped as span content, the
+  // extractor returned `[]`, and the #73 arm was never consulted. Ending the capture makes the `g` scan
+  // find the second `git push` as its OWN segment, which is the attribution the shell actually has.
+  // ⛔ THE TOKENS COME FROM `_pushSegmentTokens`, NOT `split(/\s+/)` (main, #504 residual): it is
+  // quote-aware, folds `$'…'`/backtick spans to the `$(…)` placeholder, keeps a `$( … )` span as ONE
+  // positional word, honours ANSI-C quoting, bounds the segment at the first shell BOUNDARY token and
+  // splits `_NL_SPAN` (a newline that is a separator) while preserving `_NL_DATA` (a newline that is
+  // data). A naive whitespace split loses every one of those, so it must not come back here.
+  const segRe = /\bgit\s+push\b([^;&|\n]*)/g;
   let sm;
   while ((sm = segRe.exec(c)) !== null) {
-    collectFromArgTokens(sm[1].trim().split(/\s+/).filter(Boolean));
+    collectFromArgTokens(_pushSegmentTokens(sm[1]));
   }
 
   const out = branches.filter(Boolean);
   // Dedupe: `-d :old/x` is counted by the flag path AND the colon path for
   // the SAME refspec (git deletes it once). Distinct targets stay distinct.
   const uniq = [...new Set(out)];
-  return uniq.length > 0 ? uniq : null;
+  // Unmask the newlines that were DATA: they are part of the ref TEXT the shell would pass, so a target
+  // carrying one is reported as written. It stays unresolvable to #653 only when it ALSO carries an
+  // expansion — a newline is legal inside a ref name, so this is not a silent widening either way.
+  const restored = uniq.map((t) => t.split(_NL_DATA).join("\n"));
+  return restored.length > 0 ? restored : null;
 }
 
 /**
