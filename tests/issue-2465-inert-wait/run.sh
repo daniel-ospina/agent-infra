@@ -505,7 +505,12 @@ do
   # ⛔ "READ BUT UNCLASSIFIABLE", NOT "UNREAD" (round 5, P3). The clause WAS read here —
   # the shape gate refused to name a member — so "could not be READ" was the wrong claim,
   # even though it under-claimed in the safe direction.
-  ck "(a8) …and the message says the list WAS READ but no member is classifiable" \
+  # ⛔ "NOT ENTIRELY CLASSIFIABLE", NOT "no member is classifiable" (round 10, P3). The
+  # shape gate is all-or-nothing, so both shapes below ARE `unclassifiable` — but
+  # `push workflow_dispatch` and `push-to-fork` each carry a member this code classifies
+  # perfectly, so "no member is classifiable" is false about a member that exists. The
+  # label names the wording the message actually prints (a12)/(a14) pin the same rule.
+  ck "(a8) …and the message says the list WAS READ but is not ENTIRELY classifiable" \
      "$(grep -q 'WAS READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
   ck "(a8) ⛔ …and it does NOT claim the list could not be READ (the code read it) (round 5 P3)" \
      "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 1 || echo 0)"
