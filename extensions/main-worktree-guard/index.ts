@@ -571,6 +571,22 @@ function _getEnv(name: string): string | undefined {
 function _isAllowMainEdits(): boolean {
   return _getEnv("ALLOW_MAIN_EDITS") === "1";
 }
+// #1239 — THE SENTENCE EVERY "override with the env" REFUSAL MUST CARRY.
+//
+// `AGENT_ALLOW_MAIN_EDITS=1` is read from the PROCESS env at session start. A
+// blocked agent cannot set it: an `AGENT_ALLOW_MAIN_EDITS=1 <cmd>` prefix sets it
+// in the CHILD shell the guard never inspects, and an `export` in a running
+// session cannot reach the already-running process. Measured: the report that
+// produced #3620 tried both spellings, both were inert, and the refusal had
+// presented them as THE remedy — so the honest response (stop) was a dead end.
+//
+// The env hatch stays (it is a real route for a session the DISPATCHER hatched),
+// but every message that offers it now says which route it is. The reachable
+// one — the TTL marker — is named by the recovery texts above.
+const _ENV_HATCH_CAVEAT = [
+  "   \u26a0\ufe0f That env is read at session START: an inline `AGENT_ALLOW_MAIN_EDITS=1",
+  "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
+];
 // ── Escape marker (#207) helpers ────────────────────────────────────────────
 // Marker path is derived per call (lazy like gateEventsFile()) — never a
 // module-level constant, so a $HOME change (tests, alternate agent dirs) works.
@@ -777,6 +793,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
         "   let the delete through unchecked (#653).",
         "   → Re-run with the LITERAL ref: `git push origin --delete feat/my-branch`.",
         "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+        ..._ENV_HATCH_CAVEAT,
       ].join("\n"),
     };
   }
@@ -805,6 +822,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
       "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
       "   → Switch those worktrees/main to another branch first, then retry.",
       "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n"),
   };
 }
@@ -1098,6 +1116,7 @@ function _hubTargetWriteBlockReason(rel: string, top: string, wipHint: string): 
     `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
     `     override (deliberate solo sessions only).`,
+    ..._ENV_HATCH_CAVEAT,
   ].join("\n");
 }
 
@@ -1871,6 +1890,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n");
   }
   if (hit.kind === "script-depth") {
@@ -1885,6 +1905,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n");
   }
   const gitMeta = hit.rel === ".git" || hit.rel.startsWith(".git/");
@@ -1914,6 +1935,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
     `     override (deliberate solo sessions only).`,
+    ..._ENV_HATCH_CAVEAT,
   ].join("\n");
 }
 
@@ -5440,6 +5462,7 @@ const WHY = [
   "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
   "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
   "     deliberate solo sessions.",
+  ..._ENV_HATCH_CAVEAT,
 ].join("\n");
 
 // ── #265 per-session baseline state ────────────────────────────────────────
@@ -7496,6 +7519,7 @@ export default function (pi: ExtensionAPI) {
           "   other's uncommitted changes. Each agent needs its own branch.",
           "   → Create a worktree: invoke the using-git-worktrees skill.",
           "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override (solo sessions only).",
+          ..._ENV_HATCH_CAVEAT,
         ].join("\n"),
       };
     }
@@ -7551,6 +7575,7 @@ export default function (pi: ExtensionAPI) {
             `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
             `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
             `     override (deliberate solo sessions only).`,
+            ..._ENV_HATCH_CAVEAT,
           ].join("\n"),
         };
       }

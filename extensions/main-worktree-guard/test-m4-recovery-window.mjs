@@ -667,6 +667,29 @@ async function partB() {
     check("B8d marker ACTIVE ⇒ no INERT paragraph (the diagnosis is conditional)",
       /INERT/.test(activeWholeTree?.reason ?? ""), false);
     setMarker(false);
+
+    // ── B9 (#1239): no refusal may offer the env hatch as an AVAILABLE remedy ──
+    //
+    // `AGENT_ALLOW_MAIN_EDITS=1` is read from the process env at session start.
+    // An already-blocked agent cannot set it — an inline `VAR=1 cmd` prefix sets
+    // it in a child shell the guard never inspects, and an `export` cannot reach
+    // the running process — so a refusal that prints it as THE remedy is a dead
+    // end. A SOURCE SCAN rather than nine fixtures: the property is "every site
+    // that prints the line also prints what it cannot do", and a behavioural
+    // test would need nine different gate geometries (push-delete, cross-checkout
+    // write, compound, worktree, …). Fails loudly with line numbers if a new
+    // site appears without the caveat.
+    const srcLines = readFileSync(join(HERE, "index.ts"), "utf8").split("\n");
+    const offenders = [];
+    srcLines.forEach((ln, i) => {
+      if (!/Or set AGENT_ALLOW_MAIN_EDITS/.test(ln)) return;
+      if (!/_ENV_HATCH_CAVEAT/.test(srcLines.slice(i, i + 4).join("\n"))) offenders.push(i + 1);
+    });
+    check("B9 (#1239): every `Or set AGENT_ALLOW_MAIN_EDITS` refusal also carries the session-start caveat",
+      offenders, []);
+    const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
+    checkD("B9b the caveat names session START and says an inline/export CANNOT set it",
+      /session START/.test(caveat?.[1] ?? "") && /CANNOT/.test(caveat?.[1] ?? ""), caveat?.[1]);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {
