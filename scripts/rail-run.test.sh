@@ -214,8 +214,41 @@ assert_rc 1 "$N" "DUPLICATE: exactly ONE rail invocation ever reached the rail"
 # ── B2: two CONCURRENT starts still produce ONE rail (the claim is atomic) ───
 # Without an atomic claim this is check-then-act: both probe, both see nothing, both launch, and the
 # PR gets TWO merge attempts. Sequential arms cannot see that, so this one races the two starts.
-( RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c1.out" 2>&1; echo $? > "$T/c1.rc" ) &
-( RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c2.out" 2>&1; echo $? > "$T/c2.rc" ) &
+#
+# ⛔ THE WINNER'S RUN HAS TO STILL BE IN FLIGHT WHEN THE LOSER LOOKS — otherwise this arm is asserting
+# an INTERLEAVING it does not control, not the property it names. The fake rail is INSTANT, so a start
+# whose run has already written its `rc` is LEGITIMATELY no longer in flight (`prev_in_flight` returns 1
+# on an exit status, and this file's own DUPLICATE arm says so). A loser that is merely SCHEDULED late
+# then reads a FINISHED run — a new start over a finished run is legal, it is not a race — launches its
+# own rail, and reddens "exactly ONCE" on a CORRECT implementation. Measured at ea0b056bb (CI run
+# 43195539277, bash-shard 4): `want rc=1, got rc=2` and `got rc=0 and rc=0`, twice in one run and only
+# on the runner (this box is fast enough to keep the pair inside the launcher's few-instruction window).
+# FAKE_RAIL_SLEEP keeps the winner's RECORDER positively alive for the whole window, so `prev_in_flight`
+# answers on the recorder pid rather than on an exit status, and the only reachable shapes are the two
+# legal ones below.
+#
+# The GO file is a start BARRIER: both launchers are RELEASED together instead of being separated by
+# this shell's own fork/exec cost. That is what keeps the arm able to catch a claim-less
+# (check-then-act) rewrite — both probes must be able to see NO run, or the mutant escapes by reading
+# the winner's `latest` and being refused for the right answer.
+# ⛔ THE GO FILE MUST NOT EXIST WHEN THE WAITERS FORK. An earlier revision CREATED it here
+# (`: > "$T/race-go"`), which PRE-RELEASED both subshells on their first test — the barrier was
+# inert, the release was still fork-ordered, and no edit could ever redden it (review P2-1 at
+# a35ad9570f). The write belongs on the RELEASE line below and nowhere else.
+rm -f "$T/race-go"
+( while [ ! -f "$T/race-go" ]; do sleep 0.01; done
+  FAKE_RAIL_SLEEP=6 RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c1.out" 2>&1; echo $? > "$T/c1.rc" ) &
+( while [ ! -f "$T/race-go" ]; do sleep 0.01; done
+  FAKE_RAIL_SLEEP=6 RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c2.out" 2>&1; echo $? > "$T/c2.rc" ) &
+sleep 0.2
+# ⛔ THE BARRIER IS ASSERTED, NOT ASSUMED: while it is still CLOSED, no launcher may have reached the
+# rail. On the pre-released form the two starts ran at fork time and this row counted invocations
+# already, so the arm now discriminates the construct it is built on.
+BARR="$(rail_invocations 301)"
+if [ "$BARR" = 0 ]; then
+  ok "CONCURRENT: the start barrier HELD — neither launcher reached the rail before release"
+else bad "CONCURRENT: the start barrier did NOT hold — $BARR rail invocation(s) before release"; fi
+: > "$T/race-go"
 wait
 CONC="$(rail_invocations 301)"
 assert_rc 1 "$CONC" "CONCURRENT: two racing starts reach the rail exactly ONCE"
@@ -796,7 +829,10 @@ assert_rc 25 "$RC" "LIVE-HOST: a host mismatch on a possibly-live run still abst
 assert_state "$TXT" unknown "LIVE-HOST: it claims neither a death nor a landing"
 assert_contains "$TXT" "refusal is BOUNDED" "LIVE-HOST: the note says the start refusal is BOUNDED, not indefinite"
 assert_contains "$TXT" "RAIL_RUN_RECORD_MAX" "LIVE-HOST: and names the bound that ends it"
-assert_not_contains "$TXT" "positively gone" "LIVE-HOST: so it does not demand a proof `prev_in_flight` never requires"
+# ⛔ SINGLE-QUOTED ON PURPOSE: in a DOUBLE-quoted string the backticks are COMMAND SUBSTITUTION, so
+# this label rendered as "proof  never requires" and printed `prev_in_flight: command not found` into
+# the shard's log (CI run 43195539277). The label is prose; it must never be run.
+assert_not_contains "$TXT" "positively gone" 'LIVE-HOST: so it does not demand a proof `prev_in_flight` never requires'
 assert_not_contains "$TXT" "and start a new run" "LIVE-HOST: and so it does not tell the reader to start one NOW"
 
 # ── AG1g: the POSITIVELY-GONE path had NO arm, and it is the common terminal one ──────────────

@@ -38,8 +38,11 @@
              two lanes never work the same PRs.
 
          ⛔ 1200s = 20 min, and a tick is a TOP-UP: count the live lanes, dispatch
-         `target − alive`, exit. A lane's own cap is 3000s, so a lane routinely outlives the
-         tick that started it — the next tick counts it and fills the remainder, so the box
+         `target − alive`, exit. A lane routinely outlives the tick that started it — a lane's own
+         cap is `ai-drainer.sh`'s compiled `LANE_TIMEOUT` default (`${LANE_BACKSTOP_S:-36000}` since
+         agent-infra#4034; 7200 before it, and this line said "3000s" for a while after that was
+         already false: the plist pins NO `LANE_TIMEOUT`, so a Mac box dispatches at whatever that
+         script says, never at a number here) — so the next tick counts it and fills the remainder, so the box
          converges on its measured capacity instead of on one lane per poll. A tick that
          lands while ANOTHER tick holds the drainer lock skips by design. A 20-minute poll is
          what the inventory row's freshness bound is derived from rather than guessed.

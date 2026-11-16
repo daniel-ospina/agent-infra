@@ -2422,6 +2422,141 @@ bare stdin/pipe/heredoc payloads, file/shebang payloads, dynamic string
 construction, and pathological obfuscation (the open-ended family shared with
 the shell residual tier).
 
+**#523 — a heredoc-fed interpreter's BODY is a program, not command-line text.**
+A heredoc is not part of the command line: bash feeds the body to the
+interpreter as its stdin, so a body line executes while its tokens were never
+operands. The walk used to tokenize the raw text, so the FIRST body token was
+read as the script — `bash <<EOF` + a body of `echo hi` then `/tmp/evil.sh`
+resolved `echo` (a non-file), the content walk no-opped, and the
+hub-mutating file the body actually executed was never read. Measured on this
+build's parent: six body shapes ALLOWED (`bash <<EOF`, `sh <<'X'`, `cat <<EOF |
+bash`, `<<-`, a nested `bash <file>` in the body, and a second dirty file after
+a clean one) while the control `bash <file>` was BLOCKED. `extractScriptPaths`
+now splits the command at its heredoc regions (`_heredocSplitForScripts`, on the
+same quote/arith-aware `_wtScanLine` the M5 walk uses): the HEADER keeps its
+command line for the existing leading-position scan, and each SHELL-programmed
+body is walked as a PROGRAM — every command position, `;`/`&&`/`||`/`|`/newline
+as boundaries, control-flow frame words skipped — so every file it executes is
+resolved, and `_backdoorBlock` gates each one (`_gateScriptPathContent`).
+Both directions are pinned: a body is a PROGRAM only when the interpreter is
+handed no script operand (`bash <<EOF script.sh` → the operand is the script and
+the body is its stdin DATA), and a DATA body (`cat <<EOF`) or a CODE body
+(`python3 <<PY`, the #627 surface) is not walked. A heredoc belongs to the simple
+command it is attached to — the grammar every real shell parser models
+(`tree-sitter-bash`'s `heredoc_redirect`, `mvdan.cc/sh`'s redirect node) — so a
+CODE opener keeps its body even when its STDOUT is piped into a shell:
+`python3 <<PY | bash` is a PYTHON program whose output is piped, the body is
+python SOURCE, and walking it resolved a path out of a `print("./gen.sh")`
+string as a DIRECT execution — measured BLOCK on the head where `main` ALLOWS
+(the #627 surface; pinned by `test.mjs` B52q, `test-script-backdoor` B7u). An
+UNTERMINATED/absent heredoc IS walked: bash feeds the rest of the text to the
+interpreter as the body, so the trailing lines are program text and
+`bash <<EOF` with no terminator resolves the file its tail runs (pinned by
+`test.mjs` B52r). A body-executed path carries its OWN provenance about how that
+invocation runs it (`extractHeredocProgramScriptInvocations` →
+`interpreted`), and only an invocation that HANDS THE FILE TO A READER forces
+the via-interpreter verdict: `bash x.sh`, `bash < x.sh` and `.`/`source x.sh`
+inside a body are read as text, so #1485's opaque-binary stand-down must not
+apply to them. A BARE body line is the other direction — it is a DIRECT
+execution (`execve`; the kernel runs the ELF/Mach-O and bash's ENOEXEC→shell
+fallback never happens for a valid binary), so forcing the interpreter verdict
+for the whole body was an OVER-BLOCK and a regression against `main`: measured
+BLOCK for a body line `/usr/bin/git status` that `main` ALLOWS (a Go binary's
+bytes contain git-shaped prose — the exact #1485 defect, re-created on this
+surface). Both directions are pinned (`test.mjs` B52p, `test-script-backdoor`
+B7r/B7s/B7t). A body-executed path's ARGV is passed as UNKNOWN (`null`) rather
+than derived from the command line, because the raw tokens after a body line
+are the heredoc DELIMITER and the rest of the program: measured fail-OPEN with
+them, since
+`bash <<EOF` + `"/tmp/x.sh"` reported `$1 = "EOF"` and pruned a
+`case "$1" in "") git reset --hard` branch as unreachable while the body really
+calls the script with NO args and runs it. Unknown argv makes the reachability
+filter bail and the whole script gate.
+Which fd 0 wins is `bash`'s rule, not a guess: redirections are processed LEFT to
+RIGHT, so the LAST one on the line decides. `bash < /dev/null <<EOF` feeds the
+BODY (the file is never read — the body is the program, and the superseded `<`
+operand is not a script), while `bash <<EOF < /dev/null` feeds the FILE (the body
+is data). Both directions are pinned. A `-c`/`--command` inline string is not a
+program source for the body either: `bash -c '…' <<EOF` gives the body to the
+`-c` string as stdin DATA, so walking it could only over-block — the predicate
+follows where the program COMES FROM (no script operand, no inline string, no
+process substitution, last fd-0 redirect is the heredoc). The segment that OWNS
+the `<<` decides that first: `bash <<EOF | bash helper.sh` runs the body as the
+LEFT shell's program (the pipe consumes that shell's stdout and never sees the
+heredoc) → program, while `cat <<'X' | bash` hands the body to the pipe consumer
+→ program via `bash`, and a piped `| bash -c '…'` → data. And the body ends
+where bash ends it: on a line that IS the delimiter, with no leading or trailing
+blanks (`<<-` strips leading TABS, and only tabs) — a space-padded `   EOF` is a
+body line, not a terminator. The DELIMITER WORD is read the way bash reads it
+too: quote removal applies, so a backslash-escaped word is the word
+(`bash <<\EOF` is the delimiter `EOF`), and — like a quoted delimiter — it stops
+the outer shell expanding the body. Ending the word at the backslash opened NO
+body, dropped the raw body text into the command-line scan and resolved a benign
+first token (`echo`) while real bash executes the body's file — a live #523
+fail-open one character away (pinned by `test.mjs` B52r, `test-script-backdoor`
+B7v). The delimiter is also ONE shell word: quote removal strips its quotes and
+backslash and leaves its SPACES inside the word, so `<<'E F'` and `<<E\ F` both
+delimit on the line `E F` — re-emitting the removed word unquoted split it in two,
+the body was classified DATA and never walked (B52t, B7x). Inside a body, a
+REDIRECT may stand in front of the command word (`2>/dev/null ./x.sh`,
+`<evil.sh bash`): the walk steps over the operator AND its operand, because the
+command word is the first NON-REDIRECT token — without that the operator was taken
+as the command word, nothing resolved, and the rest of the line was skipped
+(B52s, B7w) — and when the redirect it stepped over is a fd-0 FILE and the shell
+has no script operand, that FILE is the program, read by the interpreter (B52v).
+A here-string is `<<< word` — ONE operand, and the word is data (B52v). The same
+rule governs the HEADER line's PRE-COMMAND position: `&` is a list operator only
+when it is not part of a redirection, so `2>&1 bash <<EOF` / `&>log bash <<EOF` /
+`2>/dev/null bash <<EOF` do not lose the heredoc's consumer (B52u, B7y), and a
+CODE opener keeps its body SOURCE through that prefix too (B7z). ⛔ The
+POST-command fd-DUP spelling (`bash >&2 <<EOF`) is NOT closed — `&` itself is
+handled, but the bare `>&` is not matched by `_scriptInvocationAt`'s one-token
+fd-DUP branch, so the digit `2` is read as a script positional and the body is
+classified DATA (see the residual list below and **#4069**).
+**Declared residuals of this arm** (declared in #523's scope, or measured and filed
+with its own issue — each entry names which; ⛔ NOT all of them fail toward gating,
+the measured fail-AWAY ones are listed as such rather than as a comfort): the command LINE itself still contributes ONE script (the
+one-script-per-command-line class is #3538, unchanged here); two heredocs on ONE
+header line are handled one at a time (the
+`_wtScanLine` one-heredoc-per-line contract), so `bash <<A; bash <<B` runs B's
+body while this walk resolves no path for it — **fail-AWAY, measured**; the
+nested-body walk is depth-bounded at two levels (`_programScriptInvocations`), so a
+four-level heredoc nest runs and resolves nothing — **fail-AWAY, measured**; and
+a body that WRITES a script and then executes it is not statically followable
+(the same class as Residual 1/3 in the discard section). ⛔ The COMMAND LINE's
+leading-position scan is still untouched, so `2>/dev/null bash /tmp/evil.sh` on the
+command line resolves nothing — the pre-existing **#3970** root (two resolvers
+disagreeing about a leading redirection), deliberately frozen byte-identical to
+`main` because the 0-changed-resolutions census depends on it (measured: 8,129
+commands from this repo's own `extensions/` + `scripts/` trees give an identical
+`classifyGitCommandDetailed` and an identical lead path). ⛔ An earlier version of
+this paragraph claimed that same gap also covered a HEADER-line redirection before
+a heredoc (`2>&1 bash <<EOF`) and called it **fail-AWAY**; BOTH parts were wrong —
+the mechanism was `_wtOpenerSegment` splitting on the `&` (a different seam), and
+the polarity was a fail-OPEN **regression**: `main` resolved that body's file and
+BLOCKED it while this arm allowed it. The header line is now handled and the claim
+is gone rather than re-worded.
+
+⛔ **Declared residual — the redirect OPERATOR SET is incomplete (#4069),
+pre-existing, measured fail-AWAY on BOTH builds.** Three spellings are split into
+tokens that mean something else, so the body a shell really executes is
+classified DATA and the gate reads nothing:
+
+| shape | this arm | `origin/main` | real bash |
+|---|---|---|---|
+| `bash >&2 <<EOF` + a mutating body (`>&1`, `>& 2`, `<<-`, `<<'EOF'` too) | `["2"]` — a non-file | `["2"]` | body RUNS |
+| `bash >\|/dev/null <<EOF` / `>\|/dev/null bash <<EOF` | `/dev/null` / `[]` | same | body RUNS |
+| `bash <>/dev/null <<EOF` / `< >/dev/null bash <<EOF` | `/dev/null` / `[]` | same | body RUNS |
+
+All three are IDENTICAL at `main`, so none is a regression from this change, and
+none can be closed here: the `>&digit` arm is `_scriptInvocationAt`'s **leading
+scan**, whose command-line behaviour is frozen byte-identical to `main` by #523's
+recorded design (the same decision that files #3970) — changing it is a reopen,
+not a fix — and the `>|` / `<>` arms are `_tokenize`'s **shared operator set**,
+which every classifier consumer reads (this change's safety proof is the
+8,819-command census above, which would have to be re-established). Filed with
+the measurements as **#4069**, not chased here.
+
 ## What it does NOT fix
 
 **Hung processes.** A hung process cannot issue any tool call, so it can never

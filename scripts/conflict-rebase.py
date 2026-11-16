@@ -110,6 +110,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -140,6 +141,182 @@ BACKOFF_REFUSE_BASE = 24 * 3600
 BACKOFF_REFUSE_CAP = 14 * 24 * 3600
 BACKOFF_OK = 6 * 3600
 
+# ⛔ THE REPLAY NEEDS A COMMITTER, AND HAD NONE (agent-infra#4012).
+# A rebase REWRITES commits, so git must author a new committer on every one of them.
+# It resolves one from the repo config, then `~/.gitconfig`, then the system config —
+# and the scratch repo (`$STATE/scratch.git`, `git init --bare`) is not a clone of this
+# checkout, so THIS REPO'S LOCAL IDENTITY DOES NOT REACH IT. Measured on a cell
+# 2026-11-12 whose only identity lived in `<checkout>/.git/config` while `~/.gitconfig`
+# carried none:
+#
+#     $ git -C scratch.git/… rebase --onto origin/main <mb>
+#     Rebasing (1/27)Committer identity unknown / fatal: unable to auto-detect email address
+#
+# i.e. the replay died on commit ONE, with an EMPTY unmerged set, and was therefore
+# classified `rebase-failed` — the one outcome that publishes nothing (no label, no
+# comment, no diagnosis), takes a short backoff, and re-occupies a cap slot every pass
+# forever. Net effect: the bot had never rebased a single PR on any box, and every
+# CONFLICTING PR looked like a content conflict. A launchd/systemd pass inherits no
+# login shell, so relying on the ambient identity was never going to hold either.
+#
+# The identity is explicit, therefore, and it is the FLEET's own bot identity (the same
+# one `lane.sh` commits with) — a replay is genuinely committed by the bot, and the
+# ORIGINAL AUTHOR of each commit is preserved by `git rebase` regardless. `-c` on the
+# command keeps it out of any file: it applies to exactly the replay it is given.
+BOT_IDENT = ("pi orchestrator", "orchestrator@premiselabs.co")
+IDENT_ARGS = ["-c", f"user.name={BOT_IDENT[0]}", "-c", f"user.email={BOT_IDENT[1]}"]
+
+# ⛔ A GENERATED FILE IS NOT A CONTENT CONFLICT — IT IS A FUNCTION OF THE TREE (#4012).
+# The refusal this bot was built on (agent-infra#2698: "a content conflict is a content
+# decision") is TRUE for authored files and FALSE for these: their content is *derived*,
+# so there is no intent to weigh — the correct resolution is whatever the generator emits
+# for the tree being replayed, and it is VERIFIABLE by re-running the repo's own check.
+# Hand-merging one is exactly the failure the owner measured: a `sanctioned-scripts.pin.json`
+# conflict "with a hash matching neither side", where neither side could be right because
+# the right value did not exist until somebody ran the generator.
+#
+# Measured 2026-11-12 on the live queue: of FIVE `CONFLICTING` PRs, TWO were pure generated
+# files (#3964 `scripts/workflow-lock.d/…/jobs.verify.sha256`, #3698
+# `sanctioned-scripts.pin.json`) and zero were the "already-landed hunk" class — so the
+# generated class is the population, and a hunk-resolution arm would have had no case.
+#
+# Every command below is the repo's OWN documented generator, not a convention invented
+# here: `check-workflow-lock.mjs` exports `UPDATE_COMMAND` naming its `--update-lock`, and
+# the pin's own `_why` names `test-sanctioned-identity.mjs --cut` as the one way to re-cut
+# it. Each entry carries a VERIFY command because "the generator ran" is not "the result is
+# right": a generator that silently no-ops leaves a tree that still reds, and staging that
+# would be a false PASS on the PR. Both run in the rebase worktree, so the digest is
+# emitted for the commit being replayed, which is the only tree it can be right about.
+GENERATED_FILES = (
+    {
+        # A PREFIX (trailing slash): the lock is one file PER REGION, so a conflict names
+        # one of ~100 region files and can never be matched by an exact path.
+        "match": "scripts/workflow-lock.d/",
+        "cmd": "node scripts/check-workflow-lock.mjs --update-lock",
+        "verify": "node scripts/check-workflow-lock.mjs",
+        "why": "a region digest of the workflow it describes (the check's own UPDATE_COMMAND)",
+    },
+)
+
+# ⛔ MEASURED AND DELIBERATELY EXCLUDED: `extensions/main-worktree-guard/sanctioned-scripts.pin.json`.
+# It is a generated file by every definition above, and #4012 names it as the conflict that
+# "matched neither side". But its own `--cut` CANNOT regenerate a CONFLICTED pin, because it
+# PARSES the pin it is about to rewrite:
+#
+#     $ node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut
+#     ❌ cut: Expected double-quoted property name in JSON at position 1151 (line 8 column 1)
+#
+# (measured on #3698's replay, 2026-11-12 — the conflict markers themselves are the unparseable
+# bytes). Declaring it here would therefore refuse every time while publishing NOTHING (a
+# generator failure is not a `content-conflict`, so it takes no label and writes no comment):
+# a refusal nobody sees, on a PR that needed a human. The correct repair is in the GENERATOR —
+# a `--cut` that does not depend on the file it rewrites — and that is guarded code (it is the
+# pin that makes a sanctioned script's byte-identity unforgeable), so it is not changed here.
+
+# Bound so a generator that keeps re-conflicting cannot hold a cap slot forever. Each round
+# resolves one stopped commit, so this is generous for a real replay and finite for a loop.
+MAX_REGENERATE_ROUNDS = 25
+
+# ⛔ THE REPLAY'S GUARDS ARE ONE LIST, BECAUSE THERE ARE NOW TWO INVOCATIONS (#4012 review, P1).
+# `git rebase` is started once and then RESUMED (`--continue` / `--skip`) after each regeneration,
+# and each resume is a NEW PROCESS: `-c` is a per-process override, so a resume that did not
+# repeat them would read AMBIENT config for the rest of the replay. That is the exact thing the
+# module header forbids ("relying on the ambient config being off is not a guarantee, it is a
+# hope"): an ambient `rerere.enabled`/`rerere.autoUpdate` pair lets a RECORDED resolution be
+# applied during a later pick, the pick completes with no conflict stop, and a resume that
+# returned 0 would let the bot push a tree carrying a content decision a robot made.
+# `rebase.autoSquash=false` was set on the first call for the same reason and was being dropped
+# by the resume too (an ambient `true` lets a later fixup be squashed by the continued replay).
+# ⛔ `--no-rerere-autoupdate` is NOT in this list: git 2.43 REJECTS it on `--continue` (measured —
+# `usage: git rebase …` and no rebase state is touched), so it can only ride the first invocation.
+# The config arm is the one that must hold everywhere, and `rerere.enabled=false` makes rerere
+# inert on its own — the flag was always the belt to that braces.
+REPLAY_GUARDS = ["-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
+                 "-c", "rebase.autoSquash=false"]
+
+
+_GENERATED_CACHE: tuple[dict, ...] | None = None
+
+
+def _generated() -> tuple[dict, ...]:
+    """The built-in registry plus any `CONFLICT_REBASE_GENERATED` file (APPENDED only).
+
+    The seam exists so this file's resolution arm can be driven hermetically by its own
+    suite (a fixture generator that writes a fixture file) and so another repo can declare
+    its own generators without forking. It is APPEND-ONLY on purpose: it cannot REMOVE a
+    built-in entry, so a stray env var can never DISABLE the protections above. ⛔ BUT
+    APPEND-ONLY IS NOT THE SAFETY PROPERTY — a seam entry can still ADD an arbitrary path with
+    an arbitrary `cmd`/`verify`, i.e. it can declare an authored file derived (measured
+    correction, #4012 review P2). What makes a regeneration safe is (i) the result must pass
+    that entry's own check IN THE REBASE WORKTREE before it is staged, and (ii) ONE authored
+    path refuses the whole commit. The seam is therefore treated as operator-controlled input,
+    exactly like the unit's `CONFLICT_REBASE_STATE`/`CHECKOUT` exports, and not as a fence.
+    A seam file that cannot be read is `Unreadable` — never silently ignored, because "the
+    registry I declared did not load" reads exactly like "this file is not generated", and
+    that difference is a pushed tree versus a refusal.
+    """
+    global _GENERATED_CACHE
+    if _GENERATED_CACHE is None:
+        entries = [dict(e) for e in GENERATED_FILES]
+        seam = os.environ.get("CONFLICT_REBASE_GENERATED") or ""
+        if seam:
+            try:
+                data = json.loads(Path(seam).read_text())
+                if not isinstance(data, list):
+                    raise ValueError("expected a JSON array")
+                for e in data:
+                    missing = [k for k in ("match", "cmd", "verify") if not str((e or {}).get(k) or "").strip()]
+                    if missing:
+                        raise ValueError(f"an entry is missing {missing}")
+                    entries.append({"match": str(e["match"]), "cmd": str(e["cmd"]),
+                                    "verify": str(e["verify"]), "why": str(e.get("why") or "declared seam")})
+            except (OSError, ValueError, AttributeError, TypeError) as e:
+                _GENERATED_CACHE = None
+                raise Unreadable(f"CONFLICT_REBASE_GENERATED unreadable ({seam}): {e}") from e
+        _GENERATED_CACHE = tuple(entries)
+    return _GENERATED_CACHE
+
+
+def generated_entry(path: str) -> dict | None:
+    """The declared generator for `path`, or None when `path` is AUTHORED.
+
+    A conflict file that is not declared here is never resolved by this bot — silence is
+    the safe answer, and the refusal path (label + comment naming the paths) is unchanged.
+    """
+    for e in _generated():
+        m = e["match"]
+        if m.endswith("/"):
+            if path.startswith(m):
+                return e
+        elif path == m:
+            return e
+    return None
+
+
+def _run_generated(wt: Path, entry: dict, which: str) -> subprocess.CompletedProcess:
+    """Run the entry's `cmd` (regen) or `verify`, in the rebase worktree. Never raises.
+
+    ⛔ `shlex.split` IS INSIDE THE GUARD, AND THE DOCSTRING WAS LYING UNTIL IT WAS (#4012 review,
+    cycle 3 P2). It raises `ValueError` on an unbalanced quote or escape, and the first version had
+    it OUTSIDE the `try`, which guarded `OSError` only. A seam entry that is valid JSON with an
+    unparseable `cmd` (the shape a hand-written JSON string produces by accident — and the seam
+    exists precisely so operators write these) then escaped as a `ValueError` through
+    `_run_generated` → the `Refused`-only `try` at the call site → `rebase_pr`, which translates
+    `RuntimeError` only → `main`, which catches `(Refused, Unreadable)`. Result: the pass died with
+    a traceback and exit 1, the `--report` was never written, and every remaining candidate was
+    abandoned — a crash on the path whose whole purpose is to make failures OBSERVABLE.
+    A malformed entry is now an rc like any other failed generator: it is classified
+    `generated-regenerate-failed`, published on the PR, and the pass continues.
+    """
+    raw = str(entry[which])
+    try:
+        argv = shlex.split(raw)
+        if not argv:
+            raise ValueError("the command is empty")
+        return run(argv, cwd=str(wt))
+    except (OSError, ValueError) as e:
+        return subprocess.CompletedProcess([raw], 127, "", f"cannot run {raw!r}: {e}")
+
 
 class Unreadable(Exception):
     """A surface could not be read. NEVER the same as an empty surface."""
@@ -155,8 +332,10 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def git(repo: Path | str, *args: str, check: bool = True, stdin: str | None = None) -> str:
-    p = run(["git", "-C", str(repo), *args], input=stdin)
+def git(repo: Path | str, *args: str, check: bool = True, stdin: str | None = None,
+        ident: bool = False) -> str:
+    """`git -C <repo> <args>`. `ident=True` adds the bot committer (see BOT_IDENT)."""
+    p = run(["git", *(IDENT_ARGS if ident else []), "-C", str(repo), *args], input=stdin)
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip()[:400]}")
     return p.stdout
@@ -698,6 +877,27 @@ def scratch_repo(repo: str) -> Path:
     return path
 
 
+def replay_fault(blob: str) -> str:
+    """The line that actually explains a failed replay (agent-infra#4012).
+
+    ⛔ NAME THE FAULT, NOT THE PROGRESS COUNTER. `git rebase` writes "Rebasing (1/27)"
+    to stdout WITHOUT a trailing newline and only then fails, so the first line of
+    `stdout + stderr` is the counter with the diagnosis GLUED to it:
+
+        Rebasing (1/27)fatal: unable to auto-detect email address (got 'x@y.(none)')
+
+    Taking "the first non-empty line" therefore reported `the replay failed without a
+    conflict: Rebasing (1/27)` for every PR the bot touched — a diagnosis that named no
+    cause, on the defect that made the bot inert — and the real `fatal:` was never shown.
+    Prefer a `fatal:`/`error:` occurrence wherever it sits in the blob; fall back to the
+    first non-empty line only when git printed neither.
+    """
+    m = re.search(r"(fatal|error):\s*([^\n]*)", blob)
+    if m:
+        return f"{m.group(1)}: {m.group(2).strip()}"[:300]
+    return next((ln.strip() for ln in blob.splitlines() if ln.strip()), "no output")[:300]
+
+
 def rebase_pr(scratch: Path, pr: dict, args) -> dict:
     """Do the whole safe thing for ONE PR. Raises Refused with a kind + detail.
 
@@ -750,12 +950,17 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
     # 3. the rebase, in a throwaway worktree of the scratch repo.
     wt = Path(tempfile.mkdtemp(prefix="cr-wt-"))
     shutil.rmtree(wt)
+    regenerated: list[tuple[str, str]] = []
     try:
         git(scratch, "worktree", "add", "--detach", str(wt), head)
-        rb = run(["git", "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
-                  "-c", "rebase.autoSquash=false", "-C", str(wt),
+        rb = run(["git", *IDENT_ARGS, *REPLAY_GUARDS, "-C", str(wt),
                   "rebase", "--no-rerere-autoupdate", "--onto", "refs/remotes/origin/main", mb])
-        if rb.returncode != 0:
+        # ⛔ THE REPLAY IS A LOOP, NOT ONE SHOT (#4012). A conflict on a GENERATED file is
+        # resolved by REGENERATING it from the tree being replayed and continuing; the next
+        # commit can stop again. Every OTHER conflict aborts and refuses, unchanged — so
+        # this loop can only ever skip *derived* content, never authored content.
+        rounds = 0
+        while rb.returncode != 0:
             # ⛔ A FAILED REPLAY IS NOT AUTOMATICALLY A CONTENT CONFLICT. Reporting
             # every non-zero exit as one labels someone's PR `needs-human-conflict`,
             # tells them to resolve a conflict that may not exist, and hides the real
@@ -770,17 +975,57 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
             if ev.returncode != 0:
                 raise Unreadable(f"could not read the unmerged index: {ev.stderr.strip()[:300]}")
             unmerged = sorted({ln.split("\t")[-1] for ln in ev.stdout.splitlines() if ln.strip()})
-            run(["git", "-C", str(wt), "rebase", "--abort"])
             blob = rb.stdout + rb.stderr
             if not unmerged:
-                first = next((ln for ln in blob.splitlines() if ln.strip()), "no output")
-                raise Refused("rebase-failed", f"the replay failed without a conflict: {first[:300]}")
+                run(["git", "-C", str(wt), "rebase", "--abort"])
+                raise Refused("rebase-failed", f"the replay failed without a conflict: {replay_fault(blob)}")
             # The conflicting commit is the one the rebase stopped on; name it.
             m = re.search(r"could not apply ([0-9a-f]{7,40})", blob)
             stuck = m.group(1) if m else ""
-            paths = unmerged[:5]
-            raise Refused("content-conflict",
-                          f"rebase stopped on {stuck or 'a commit'}; conflicting paths: {', '.join(paths) or 'unreported'}")
+            # ⛔ ONE AUTHORED PATH REFUSES THE WHOLE COMMIT. Regenerating the derived half
+            # while a human is needed for the other half would publish a tree nobody asked
+            # for, and the refusal is what tells them which paths actually need them.
+            entries = [(p, generated_entry(p)) for p in unmerged]
+            authored = [p for p, e in entries if e is None]
+            if authored or rounds >= MAX_REGENERATE_ROUNDS:
+                run(["git", "-C", str(wt), "rebase", "--abort"])
+                if authored:
+                    raise Refused(
+                        "content-conflict",
+                        f"rebase stopped on {stuck or 'a commit'}; conflicting paths: "
+                        f"{', '.join(authored[:5]) or 'unreported'}")
+                raise Refused(
+                    "content-conflict",
+                    f"rebase stopped on {stuck or 'a commit'} and regeneration did not settle it in "
+                    f"{MAX_REGENERATE_ROUNDS} round(s); conflicting paths: "
+                    f"{', '.join(p for p, _ in entries[:5])}")
+            rounds += 1
+            try:
+                for path, entry in entries:
+                    gen = _run_generated(wt, entry, "cmd")
+                    if gen.returncode != 0:
+                        raise Refused(
+                            "generated-regenerate-failed",
+                            f"{path} is generated (`{entry['cmd']}`) but regenerating it failed "
+                            f"(rc {gen.returncode}): {replay_fault(gen.stderr or gen.stdout)}")
+                    ver = _run_generated(wt, entry, "verify")
+                    if ver.returncode != 0:
+                        raise Refused(
+                            "generated-regenerate-failed",
+                            f"{path} was regenerated but its own check still fails "
+                            f"(`{entry['verify']}`, rc {ver.returncode}): "
+                            f"{replay_fault(ver.stderr or ver.stdout)}")
+                    git(wt, "add", "--", path)
+                    regenerated.append((path, entry["cmd"]))
+                    log(f"REGENERATED {path}")
+            except Refused:
+                run(["git", "-C", str(wt), "rebase", "--abort"])
+                raise
+            # An empty result is the legitimate shrink: the replayed tree already carries it.
+            staged = run(["git", "-C", str(wt), "diff", "--cached", "--quiet", "HEAD"]).returncode != 0
+            rb = run(["git", *IDENT_ARGS, *REPLAY_GUARDS, "-C", str(wt), "rebase",
+                      "--continue" if staged else "--skip"],
+                     env={**os.environ, "GIT_EDITOR": "true"})
         new_head = git(wt, "rev-parse", "HEAD").strip()
 
         # 4. content preservation: NOTHING INVENTED, nothing silently lost.
@@ -804,7 +1049,8 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
         if new_count == 0:
             raise Refused("nothing-left", "every commit became empty against main — nothing to re-land")
         return {"branch": branch, "old_head": head, "new_head": new_head, "base": base,
-                "kept": kept, "dropped": dropped, "replayed": new_count, "wt": wt}
+                "kept": kept, "dropped": dropped, "replayed": new_count, "wt": wt,
+                "regenerated": regenerated}
     finally:
         run(["git", "-C", str(scratch), "worktree", "remove", "--force", str(wt)])
         shutil.rmtree(wt, ignore_errors=True)
@@ -986,7 +1232,12 @@ def main(argv: list[str]) -> int:
                             "kind": r.kind, "detail": r.detail})
             if args.dry_run:
                 continue
-            if r.kind == "content-conflict":
+            # ⛔ EVERY REFUSAL THAT NEEDS A HUMAN MUST BE PUBLISHED — a generator that could not
+            # produce a value is the SAME demand on a human as a content conflict, and leaving it
+            # out took no label and wrote no comment: a refusal nobody sees, on a PR that needed
+            # someone. (Measured while wiring the pin entry: `--cut` cannot regenerate a CONFLICTED
+            # pin, so that entry was withdrawn — see GENERATED_FILES — but the class stays covered.)
+            if r.kind in ("content-conflict", "generated-regenerate-failed"):
                 try:
                     add_label(n, args.repo, LABEL)
                 except Unreadable as e:
@@ -1159,6 +1410,20 @@ def _success_body(n: int, res: dict, before: tuple[str, str], after: tuple[str, 
         + (f"; {res['dropped']} commit(s) dropped because their patch is already in `main`" if res["dropped"] else ""),
         f"- GitHub now reports `mergeable={mergeable}`",
         f"- diff_sha256 before `{before[1][:16] or before[0]}` → after `{after[1][:16] or after[0]}`",
+    ]
+    regenerated = res.get("regenerated") or []
+    if regenerated:
+        # ⛔ NAME EVERY REGENERATION AND ITS GENERATOR. "Resolved automatically" over a
+        # derived file is a claim a reader cannot check; `path ← command` is one they can
+        # run themselves, and each of these was re-verified by that file's OWN check inside
+        # the rebase worktree before anything was pushed.
+        lines += [""]
+        lines.append(f"**{len(regenerated)} generated file(s) REGENERATED, not hand-merged** "
+                     "(a derived file has no intent to weigh — and neither side of the conflict "
+                     "could have been right, because the right value did not exist until its "
+                     "generator ran on this tree):")
+        lines += [f"- `{p}` ← `{cmd}` (verified by that file's own check)" for p, cmd in regenerated]
+    lines += [
         "",
         f"**Review record**: {rec}.",
     ]
@@ -1204,22 +1469,41 @@ def _success_body(n: int, res: dict, before: tuple[str, str], after: tuple[str, 
         ]
     if dropped_labels:
         lines.append(f"Removed review-asserting label(s): {', '.join('`%s`' % x for x in dropped_labels)}.")
-    lines += ["", "CI re-runs on the new head automatically. No conflict was resolved by this bot."]
+    lines += ["", "CI re-runs on the new head automatically. "
+              + ("No AUTHORED file was resolved by this bot — only the regenerated file(s) "
+                 "above, each with its generator named." if regenerated
+                 else "No conflict was resolved by this bot.")]
     return "\n".join(lines) + "\n"
 
 
 def _refusal_body(n: int, pr: dict, r: Refused) -> str:
+    # ⛔ THE HEADLINE MUST MATCH THE KIND. A generator failure is not "two intents disagree" —
+    # telling a reader to resolve a conflict that is really a broken regeneration sends them to
+    # the wrong place, and the detail line is the only thing that names the real fault.
+    generated = r.kind == "generated-regenerate-failed"
+    head = (
+        f"The rebase of `{pr['headRefName']}` onto `main` stopped on a **generated file that could "
+        f"not be regenerated**, so this bot stops." if generated else
+        f"The rebase of `{pr['headRefName']}` onto `main` hits a **content conflict**, so this bot stops."
+    )
+    tail = (
+        "A generated file has no intent to weigh — its content is a function of the tree — so this "
+        "bot regenerates it with its declared generator and verifies the result. That failed here, "
+        "which means the generator or its check needs attention; the bot will not push a derived "
+        "value it could not verify." if generated else
+        "A conflict means two intents disagree. Picking a side mechanically is how a tree lands that "
+        "compiles and is wrong, so the resolution is a human decision."
+    )
     return "\n".join([
         "## 🤖 conflict-rebase — REFUSED (`needs-human-conflict`)",
         "",
-        f"The rebase of `{pr['headRefName']}` onto `main` hits a **content conflict**, so this bot stops.",
+        head,
         "",
         f"- {r.detail}",
         f"- head left untouched at `{pr['headRefOid'][:12]}` — nothing was pushed.",
         "",
-        "A conflict means two intents disagree. Picking a side mechanically is how a tree lands that "
-        "compiles and is wrong, so the resolution is a human decision. Please resolve it, push, and "
-        f"remove the `{LABEL}` label (this bot will not touch the PR again while it is set).",
+        f"{tail} Please resolve it, push, and remove the `{LABEL}` label (this bot will not touch "
+        "the PR again while it is set).",
         "",
     ]) + "\n"
 

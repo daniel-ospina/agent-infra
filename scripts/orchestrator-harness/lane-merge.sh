@@ -247,12 +247,15 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # whole clock. A re-run is still permitted and still cheap (one PR read) — the bound is a runaway guard,
 # never a reason to call a head green.
 #
-# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: keeping the
-# shipped 7 supervision chunks costs `IMPL_RESERVE_S + 7*POLL_S = 900 + 840 = 1740 s`, so the largest wait
-# this clock can carry is `7200 - 1740 = 5460 s`. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s)
-# are FAR above that ceiling (as is the run-duration p95 5612 s), so NO value of `WAIT_S` that fits this
-# lane's clock can cover the tail — the 29 runs that exceeded 7200 s on the lane-visible clock could not
-# have been waited out by ANY setting of this constant, and raising `WAIT_S` past 5460 s would only eat the
+# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: the design
+# allowance derived below costs `IMPL_RESERVE_S + MAX_WATCH x POLL_S` — at the shipped defaults
+# `900 + 247 x 120 = 30540 s` on the 36000 s clock agent-infra#4034 set — so the largest check wait this
+# clock can carry is `36000 - 30540 = 5460 s`. ⛔ THAT CEILING IS UNCHANGED BY THE 5x, and the reason is
+# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock buys supervision chunks,
+# not wait. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
+# run-duration p95 5612 s), so NO value of `WAIT_S` that fits this lane's clock can cover the tail — the
+# 29 runs that exceeded the OLD 7200 s clock could not have been waited out by ANY setting of this
+# constant, and raising `WAIT_S` past 5460 s would only eat the
 # supervision it hands off to. Raising the ceiling is the remedy, and it is not this constant's to make:
 # raise `LANE_BACKSTOP_S`, which raises the derived supervision budget with it (see below). The tail case
 # hands off as `WAITING_CHECKS` (exit 11) and the
@@ -283,21 +286,28 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # measured 5400s (#3584) — the old row read `3300 - 1500 - 900 = 900s / 120s = 7 chunks`, and an
 # arithmetic row that is not recomputed with its operand is the same stale-measurement defect one layer
 # down:
-#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 6240s of the 7200s clock, and a lane that implements within its
-# reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
+#     36000 - 5400 (check wait) - 900 (implementation reserve) = 29700s / 120s = 247 chunks (29640s)
+# i.e. the merge phase is bounded at 35940s of the 36000s clock (60 s of slack), and a lane that
+# implements within its reserve reaches BOTH bounds. The 36000 s is agent-infra#4034's 5x raise of the
+# backstop, and the ROW is recomputed with it because a row that is not recomputed with its operand is
+# the same stale-measurement defect one layer down. The row is a DESIGN ceiling, not a plan: a real
+# lane's `--watch` sequence is clamped at runtime to the watchdog's 2700 s allowance (≈22 chunks) and to
+# the clock it has LEFT, both of which bind first.
+# A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
 # ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
-# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 7200 s
+# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 36000 s
 # — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
 # the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
 # wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
-#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks
+#     36000 - 5400 (check wait) - 900 (implementation reserve) = 29700s / 120s = 247 chunks
 # ⛔ AND THAT IS THE COST OF SIZING THE WAIT HONESTLY, SAID OUT LOUD: at the measured 5400s check wait the
-# supervision allowance is 7 chunks, not 40 — the same 7 the 3300s clock used to afford at a 1500s wait.
+# supervision allowance was 7 chunks on the 7200 s clock (#3584) and is 247 on agent-infra#4034's
+# 36000 s one — the same 7 the 3300s clock used to afford at a 1500s wait at the time.
 # The trade is deliberate. 40 chunks of supervision over a check wait that can never be satisfied is
 # supervision of a phase that never starts; 7 chunks over a wait that reaches the merge phase is
-# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound.
+# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound —
+# which is exactly what #4034 did, and why this number moved while the wait did not.
 # ⛔ AND THE COST IS A MEASURED FALSE-BLOCK TAIL, NOT A HYPOTHETICAL (review, P3 — verified against this
 # box's `state/walltime.tsv`). The 840 s is CUMULATIVE per PR (`state/lanemerge-<pr>.watch`), and the chain
 # it now supervises dispatches a fresh reviewer under `REVIEW_TIMEOUT=1800`. Measured over n=54 reviewer
@@ -342,7 +352,7 @@ case "${LANE_BOUND_WALL_S:-}" in
   ''|*[!0-9]*) : ;;
   *) LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S#"${LANE_BOUND_WALL_S%%[!0]*}"}"; LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S:-0}" ;;
 esac
-LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-36000}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=36000
 # ⛔ THE NUMBER NOW HAS THREE POSSIBLE SOURCES, SO IT CARRIES THE ONE IT GOT (P3, verified by running the
 # message): `LANE_WALL_S` is no longer necessarily `LANE_TIMEOUT`. An operator who set only
 # `LANE_BOUND_WALL_S` was told "LANE_MERGE_MAX_WATCH exceeds what LANE_TIMEOUT=3600s affords" — naming a
@@ -355,7 +365,8 @@ if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; the
 # the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
 # which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
 # `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
-# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# LANE_BACKSTOP_S=7200` (7200 was `spawn-gate.sh`'s own default until agent-infra#4034 raised it to
+# 36000 — i.e. it used to be the value in EVERY lane's env) the
 # backstop happens to equal the shipped default, so the elif matched and every message rendered "from
 # LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
 # itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
@@ -502,10 +513,10 @@ MAX_WATCH_FIT=$(( (LANE_WALL_CALLER_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_p
 [ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
 # ⛔ THE CLAMP ABOVE IS A FLOOR, AND A FLOOR CAN MASK AN OVERSPENT CLOCK (review cycle 3, P3 — verified, not
 # fixed here so the diff stays to its own defect). If an ENV override makes `LANE_WALL_S - WAIT_S -
-# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=6300` gives `(7200-6300-900)/120 = 0` — the clamp
-# hands back 1 chunk and the merge phase becomes `6300 + 120 + 900 = 7320 > 7200`: the lane's own wall clock
+# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=35100` gives `(36000-35100-900)/120 = 0` — the clamp
+# hands back 1 chunk and the merge phase becomes `35100 + 120 + 900 = 36120 > 36000`: the lane's own wall clock
 # kills it mid-supervision, which is the #2888 shape the three-term invariant exists to prevent. The SHIPPED
-# default is safe (7140 of 7200, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
+# default is safe (35940 of 36000, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
 # a regression-guard question and not a live defect. ⛔ AND THE SAFETY NET IS NARROWER THAN IT LOOKS (review
 # cycle 5, P2 — verified by running this block under each override): the suite's arm catches a DEFAULT change,
 # and the ONLY override that warns is `LANE_MERGE_MAX_WATCH` (below). An env override of `LANE_MERGE_WAIT`,
@@ -515,9 +526,13 @@ MAX_WATCH_FIT=$(( (LANE_WALL_CALLER_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_p
 # tell them. The honest fix, when someone owns it, is a `say_err` in this branch.
 MAX_WATCH="$MAX_WATCH_FIT"
 # ⛔ THE `--watch` LAYER NEEDS NO HEARTBEAT, and that is a measured statement rather than an omission: with
-# the DESIGN operand it is bounded by `MAX_WATCH x POLL` (7 x 120 = 840 s at the shipped defaults, and
-# 840 < the 2700 s progress allowance), so it reaches its own verdict before the watchdog can fire. Only the
-# check wait above can outlive the watchdog, which is why only the check wait is capped/hearted.
+# the DESIGN operand it is bounded by `MAX_WATCH x POLL` — 247 x 120 = 29640 s at the shipped defaults on
+# agent-infra#4034's 36000 s clock, which is far ABOVE the 2700 s progress allowance, so the guarantee is
+# NOT the design operand's: it is the `_idle_fit` clamp below, which takes the watchdog's allowance
+# (≈22 chunks) whenever that is the smaller bound, and it applies on EVERY path including the
+# unresolvable-clock one. Before #4034 raised the clock the design operand (7 x 120 = 840 s) fitted under
+# the allowance by itself; it no longer does, so that runtime clamp is the whole of the guarantee now.
+# Only the check wait above can outlive the watchdog, which is why only the check wait is capped/hearted.
 # ⛔ AND THE ALLOWANCE IS RE-DERIVED FROM THE CLOCK THAT IS ACTUALLY LEFT, WHEN `--watch` RUNS (#3850
 # review, P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand
 # above sizes the allowance against the WORST-CASE check wait, which is the right FLOOR — but supervision
@@ -688,7 +703,8 @@ _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
 # loop-restructure on a gate path and deserves its own review: test the deadline BEFORE the read on
 # iterations after the first, keeping "one last look" while taking the read off the critical path — or run
 # `checks_read` under a bounded runner. ⛔ AND THE MARGIN CANNOT SIMPLY GROW TO 60 s+: it is spent out of
-# the SAME 60 s of slack (`7140 + 60 = 7200`), so the fix is the read's placement, not the number.
+# the SAME 60 s of slack (`35940 + 60 = 36000` since agent-infra#4034 took the design clock to 36000; it was
+# `7140 + 60 = 7200` before), so the fix is the read's placement, not the number.
 # ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
 # verified). `--status` is documented "no network, no writes" and exits ABOVE this block, so a read-only
 # status query never emits the cap's multi-line `say_err` about a wait it was never going to sit
@@ -713,6 +729,130 @@ if [ "$WATCH" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT
   say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
 fi
 printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
+
+# ── THE REPO'S REQUIRED SURFACE IS THE GATE THIS LOOP WAITS ON (#4014) ──────────────────────────
+# THE DEFECT. This loop classified EVERY check on the head's surface: any red spent a FIX round, and
+# any non-terminal attempt was waited out to the 5400 s bound — regardless of whether the repo's own
+# branch protection gates on that check at all. MEASURED on a live tortoise PR (#12171, head
+# 49840e6e): 57 check names, 24 of them still queued after 70 minutes, and exactly ONE red —
+# `agent-infra-ci / lint` — which is NOT one of tortoise's 7 required contexts, and which main cannot
+# even be compared against, because main publishes the same ruff program under a DIFFERENT name
+# (`main-lint / lint`). So a lane was told to FIX a red it had not caused and could not fix, spent
+# its rounds on it, and the owner then did the only thing the loop left open: admin-merged past CI.
+# That is the measured mechanism behind "CI is too slow to gate a merge, so merges bypass it".
+#
+# THE RULE, and it is NOT a weakening of the gate — it is the repo's OWN gate, read from the ONE home
+# that already resolves it (`repo-authority.sh::resolve_required_checks`, the same resolver
+# `merge-one.sh` and `orch-loop.sh` use, so a third opinion cannot appear here):
+#   * a REQUIRED red is a FIX_REQUIRED round, exactly as before;
+#   * a REQUIRED name that is not on the surface YET is IN FLIGHT, never green. Tortoise's
+#     `python-ci-gate` is published only when its whole needs-graph finishes, so its absence is the
+#     normal state for most of a PR's life — and a missing required check must never read as
+#     "nothing left to wait for";
+#   * a NON-required red is REPORTED (never hidden) and does not spend a round;
+#   * a NON-required in-flight job is REPORTED and is not waited for.
+# WHO MERGES IS UNCHANGED, and that is why this cannot land anything the repo's contract refuses:
+# this script never merges. `merge-one.sh` runs the repo's own authority — a gate repo merges through
+# a plain `gh pr merge`, where GitHub enforces exactly this required set (so an advisory red still
+# cannot be bypassed INTO main by anything this loop does); a rail repo goes through
+# `admin-merge.sh`, which re-reads the WHOLE surface and refuses on its own rules. What changes here
+# is only that the loop stops *fixing* and *waiting on* checks the merge contract does not gate on.
+# ⛔ FAIL-CLOSED, AND THE UNREADABLE CASE IS THE ONE THAT MATTERS. A contract that could not be read
+# is NOT treated as "nothing is required": the resolver's own fail-closed fallback is tortoise's name
+# list and is FOREIGN to every other repo, so on `REQ_SOURCE=fallback` — or with no `repo-authority.sh`
+# on this box at all — `LM_REQ_TRUSTED=0` and EVERY check on the surface counts as required, which is
+# exactly this script's behaviour before this change. A box whose protection read fails today behaves
+# as it did yesterday, loudly.
+# ⛔ THE COST IS ONE REST READ PER INVOCATION, NOT PER POLL. `required_checks` hits
+# `branches/main/protection/required_status_checks` once, before the wait loop starts — the poll inside
+# the loop is unchanged (and its un-paginated shape answers 304 free). 22 landers share one rate-limited
+# account, so one extra read at startup is the price of not waiting on 24 checks nobody requires; it is
+# the same read `merge-one.sh` already pays once per chain.
+LM_REQ=""; LM_REQ_SRC=""; LM_REQ_TRUSTED=0
+# ⛔ `--watch` MUST NOT PAY FOR IT (review P2, #4039 — verified). `--watch` never classifies a
+# check-run surface (it reads the chain's LOCAL state; the only `WATCH` tests in this file are the
+# `WAIT_S` cap guard and the `--watch` branch, both BELOW this block), so every `--watch` chunk would
+# spend one `branches/main/protection` read — the one read the harness flags ESSENTIAL and lets breach
+# the REST reserve — for a value nothing on that path consumes. `--watch` is also the highest-frequency
+# invocation (`MAX_WATCH` chunks per lane, ~22 lanes). The order is the guard, exactly as the `WAIT_S`
+# cap is deliberately ordered below the `--status` exit (`:699`). Leaving the surface unresolved here is
+# fail-closed by construction: `LM_REQ_TRUSTED` stays 0, so anything that DID classify on this path would
+# treat every check as required.
+lm_resolve_required_surface() {
+  local _ra="" _d="" _c=""
+  [ "${WATCH:-0}" -eq 0 ] || return 0
+  [ -n "${OR:-}" ] || return 0
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _d=""
+  # ⛔ THE CONTRACT HOME IS THE ONE THE MERGE PATH WILL SOURCE, AND `O_WORK` IS FIRST (review P3,
+  # round 3 on #4039 — the suggested reorder was CHECKED AND REFUSED, evidence below). This loop WAITS
+  # and FIXES on the names it resolves here; the merge itself is decided by `merge-one.sh`, so its home
+  # is the one that governs. `merge-one.sh:170` resolves `_M1_MOD="${O_WORK:-$O}"` and falls back to
+  # `_M1_HERE` (the directory that script lives in) — i.e. the WORK ROOT first, the script's own dir
+  # second — which is this same order. The reviewer's P3 read `merge-one.sh:149` as `$O` first, but that
+  # line is the `LANE_REPORT_GATE` source (`. "$SELF/lane-report-gate.sh"`); the repo-authority source
+  # is `:170-173`, and it prefers `O_WORK`. Reordering to `$O` first would therefore BUY exactly the
+  # cross-reader disagreement the finding is about, in the ordinary state where both copies exist and
+  # differ (a rolling deploy). `orch-loop.sh:471` does order `$O` first — that is the CONTROLLER's own
+  # copy and it is a pre-existing divergence between the two consumers, not one this file introduces;
+  # what this file owes is (a) the merge path's order and (b) NOT SILENCE, so the file it used is
+  # printed in the line below and can be compared against the controller's without reading code.
+  for _c in "${O_WORK:-}" "${O:-}" "$_d"; do
+    [ -n "$_c" ] || continue
+    if [ -f "$_c/repo-authority.sh" ]; then _ra="$_c/repo-authority.sh"; break; fi
+  done
+  if [ -z "$_ra" ]; then
+    say_err "lane-merge: no repo-authority.sh beside this script or in \$O or \${O_WORK:-} — the required-check contract cannot be read, so EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  . "$_ra" 2>/dev/null || {
+    say_err "lane-merge: $_ra did not source — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  }
+  if ! command -v resolve_required_checks >/dev/null 2>&1; then
+    say_err "lane-merge: $_ra is stale (no resolve_required_checks) — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # `REQ` in the environment is the operator/controller override the other consumers honour; capture
+  # it ONCE here because `resolve_required_checks` overwrites `REQ` with the resolved value in THIS
+  # shell (that in-place contract is what makes REQ_SOURCE readable — a command substitution would
+  # subshell it away).
+  REQ_OVERRIDE="${REQ:-}"; REQ=""
+  resolve_required_checks "$OR" >/dev/null 2>&1 || true
+  LM_REQ="${REQ:-}"; LM_REQ_SRC="${REQ_SOURCE:-}"
+  case "$LM_REQ_SRC" in
+    protection|env)
+      if [ -n "$LM_REQ" ]; then LM_REQ_TRUSTED=1; fi ;;
+  esac
+  if [ "$LM_REQ_TRUSTED" = 1 ]; then
+    say_err "lane-merge: required surface for $OR (source=$LM_REQ_SRC, contract=$_ra): $LM_REQ"
+  else
+    say_err "lane-merge: the required-check contract for $OR is UNREADABLE (source=${LM_REQ_SRC:-none}, contract=$_ra) — every check on this head is treated as required (fail-closed)"
+  fi
+  # ⛔ THE RESOLVED SET MUST NOT REACH THE CHILD AS AN OPERATOR OVERRIDE (review P2, round 3 on #4039 —
+  # reachable, not theoretical). `REQ` is the documented override variable (`repo-authority.sh:16`,
+  # `merge-one.sh:155`) and the fleet launcher EXPORTS it (`multi-repo-controller.sh:145`), and in bash
+  # an ASSIGNMENT DOES NOT CLEAR THE EXPORT ATTRIBUTE (`export FOO=bar; FOO=""; bash -c 'echo "[$FOO]"'`
+  # prints `[]`). So `REQ=""` above and the resolver's in-place `REQ="$FALLBACK_REQ"` both leave `REQ`
+  # exported, and `launch_chain` spawns the chain DETACHED with this whole environment (`nohup bash -c …`).
+  # merge-one.sh then reads OUR ANSWER as the operator's INPUT: `REQ_OVERRIDE` non-empty,
+  # `REQ_SOURCE=env`, so its UNKNOWN-contract refusal — which fires only on `fallback` with NO override
+  # (`merge-one.sh:983`) — cannot fire, and `merge_authority` answers `gate` from the fallback list (it
+  # carries `ai-review-gate`). On a RAIL repo that skips the rail and can land the change on required
+  # checks alone with no head-bound evidence: the §5.1 bypass merge-one.sh exists to prevent, reached
+  # through the parent instead of an ambient export. Hand the child what the OPERATOR supplied, never
+  # what we resolved: a usable override passes through unchanged (the controller's frozen-contract
+  # intent), and an absent/discarded one stays ABSENT so the child re-resolves — or refuses — on its own
+  # read. `REQ_OVERRIDE` is cleared for the same reason; `REQ_SOURCE` needs no handling because
+  # merge-one.sh re-resolves before it reads it.
+  case "$LM_REQ_SRC" in
+    env) REQ="${REQ_OVERRIDE:-}" ;;
+    *)   REQ="" ;;
+  esac
+  REQ_OVERRIDE=""
+  return 0
+}
+lm_resolve_required_surface
 
 # ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
 # pr_read → "<state>|<merged_at>|<head_sha>|<mergeable_state>"
@@ -791,8 +931,8 @@ checks_read() { # checks_read <head> [--full]
 # conclusion must never fall through a gap. Newest attempt per **(app, name)** by id — a job name
 # shared across two workflows must not let one mask the other; `started_at` is nullable and is only a
 # tiebreak, and grouping by check_suite would shatter one check per re-run.
-classify() {
-  python3 - "$1" <<'PY'
+classify() { # classify <tsv-file> [required-set] [1=trusted]
+  python3 - "$1" "${2:-}" "${3:-0}" <<'PY'
 import sys
 GREEN = {"success", "neutral", "skipped"}
 NONRED = GREEN | {"cancelled", "stale"}
@@ -815,14 +955,66 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     cur = newest.get(key)
     if cur is None or cid > cur[2]:
         newest[key] = (status, conclusion, cid)
-inflight, red = 0, []
+# ── NUMBER 4014: THE REQUIRED SURFACE DECIDES WHAT IS WAITED FOR AND WHAT IS FIXED ────────────
+# `required` is the repo's own branch-protection set (space-separated) and `trusted` says whether it
+# was actually READ. Untrusted => EVERY name is required, i.e. the pre-#4014 behaviour, which is the
+# fail-closed default (see `lm_resolve_required_surface`).
+required = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2] else []
+trusted = (len(sys.argv) > 3 and sys.argv[3] == "1")
+
+
+def _bare_is(name, wanted):
+    """Does THIS surface name name the required context `wanted`?
+
+    GitHub renders a reusable workflow's job as `<caller> / <job>` (measured: `agent-infra-ci / lint`
+    on tortoise). The REQUIRED CONTEXT is the bare name branch protection declares, so a suffixed
+    name must still match its required parent — the same normalisation `merge-one.sh` and
+    `admin-merge.sh` apply to a gate row. The direction matters: this makes MORE names count as
+    required, never fewer.
+    """
+    if name == wanted:
+        return True
+    i = name.rfind(" / ")
+    return i > 0 and name[i + 3:] == wanted
+
+
+def is_required(name):
+    """Is THIS surface check one of the repo's required contexts?"""
+    if not trusted or not required:
+        return True
+    return any(_bare_is(name, r) for r in required)
+
+
+inflight_req, red, red_req, red_adv, names = 0, [], [], [], set()
 for (app, name), (status, conclusion, _cid) in sorted(newest.items()):
+    names.add(name)
+    disp = "%s:%s" % (app, name) if app else name
+    req = is_required(name)
     if status != "completed":
-        inflight += 1
+        # Only a REQUIRED in-flight job is waited for. An advisory job still queued behind the
+        # queue is a fact about the queue, not about whether this head may proceed.
+        if req:
+            inflight_req += 1
     elif conclusion not in NONRED:
-        red.append("%s:%s" % (app, name) if app else name)
-print("INFLIGHT %d" % inflight)
+        red.append(disp)
+        (red_req if req else red_adv).append(disp)
+# A REQUIRED NAME WITH NO ROW AT ALL is neither green nor red — it has not been published yet
+# (tortoise's `python-ci-gate` appears only once its whole needs-graph finishes). It is reported
+# separately so the caller can treat it as in flight; a missing required check must never be read
+# as "nothing left to wait for".
+# ⛔ THE PRESENCE TEST IS THE *SAME* TEST AS `is_required` (review P1, #4039). The first revision
+# asked `n not in names`, so for the very shape 4014-f declares supported — required `lint`, surface
+# row `agent-infra-ci / lint` — the bare name was never in `names` and the check was reported BOTH as
+# required-and-green AND as "not published yet": `_eff` never reached 0, the loop waited out the whole
+# bound on a complete green required surface and exited `WAITING_CHECKS`, printing `(0) in flight`. Two
+# harness readers disagreed about one head. One rule now decides both questions.
+missing = [n for n in required if not any(_bare_is(x, n) for x in names)] if (trusted and required) else []
+print("INFLIGHT %d" % inflight_req)
 print("RED %s" % ",".join(red))
+if trusted and required:
+    print("REQRED %s" % ",".join(red_req))
+    print("ADVRED %s" % ",".join(red_adv))
+    print("REQMISSING %s" % ",".join(missing))
 PY
 }
 
@@ -1805,8 +1997,10 @@ CHECK_ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks-err.XXXXXX")" || { rm
 trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
-# `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
-# than ~1800 s into its run (7200 - 5400) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
+# `LANE_WALL_S` THIS lane had already spent. At the numbers of the day a lane entering its merge phase
+# more than ~1800 s into its run (7200 − 5400, THE PRE-#4034 CLOCK this was measured on; the shipped
+# backstop is 36000 s now, so the same lane enters with ~30 600 s of headroom) was
+# TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
 # `now >= deadline` arm never ran, so `WAITING_CHECKS` was never emitted, no `lanemerge-<pr>.verdict`
 # was written, and `lane.sh` printed "NO merge-phase verdict" over a lane that HAD a labelled hand-off
 # available. ⛔ THAT IS STRICTLY WORSE THAN THE 1500 s BOUND THIS CHANGE REPLACES (which reached its own
@@ -1983,7 +2177,7 @@ while :; do
     IF=1; RED=""
   else
     printf '%s\n' "$rows" > "$CHECK_TMP"
-    classified="$(classify "$CHECK_TMP")"
+    classified="$(classify "$CHECK_TMP" "${LM_REQ:-}" "$LM_REQ_TRUSTED")"
     # ⛔ FAIL CLOSED ON AN UNREADABLE CLASSIFICATION. A missing/broken python3 yields EMPTY output,
     # which would read as "no red, no inflight" — i.e. GREEN — and launch a merge on a head nobody
     # classified. The classifier's own contract is two lines; anything else is "I cannot judge".
@@ -1999,10 +2193,36 @@ while :; do
     fi
     IF="$(printf '%s' "$classified" | awk '/^INFLIGHT /{print $2}')"
     RED="$(printf '%s' "$classified" | awk '/^RED /{sub(/^RED /,""); print}')"
+    # ── THE REQUIRED / ADVISORY SPLIT (#4014). Only present when the contract was READ; when it
+    # was not, the classifier prints neither line and `RED_REQ` falls back to the WHOLE red set —
+    # the fail-closed default (every check required). A `REQMISSING` name is a required check that
+    # has not been published yet, and it is counted as in flight below.
+    RED_REQ="$(printf '%s' "$classified" | awk '/^REQRED /{sub(/^REQRED /,""); print}')"
+    RED_ADV="$(printf '%s' "$classified" | awk '/^ADVRED /{sub(/^ADVRED /,""); print}')"
+    REQ_MISSING="$(printf '%s' "$classified" | awk '/^REQMISSING /{sub(/^REQMISSING /,""); print}')"
+    # ⛔ A TRUNCATED SPLIT MUST NOT READ AS "EVERYTHING IS ADVISORY". The two lines above were the
+    # classifier's whole contract before #4014, so the guard below still only demands them; the SPLIT
+    # is elected here instead — absent, `RED_REQ` reverts to the WHOLE red set, which is the fail-closed
+    # direction (every red is a fix round). A crash between the prints lands here, not in a false green.
+    if [ "$LM_REQ_TRUSTED" = 1 ] && ! grep -q '^REQRED ' <<<"$classified"; then
+      say_err "lane-merge: the classifier printed no required/advisory split — treating EVERY red as required (fail-closed)"
+      LM_REQ_TRUSTED=0
+    fi
+    if [ "$LM_REQ_TRUSTED" != 1 ]; then RED_REQ="${RED:-}"; RED_ADV=""; REQ_MISSING=""; fi
   fi
   [ -n "$RED" ] && { printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
                      printf '%s\n' "${HD:-${HEAD:-}}" > "$LASTHEAD_F" 2>/dev/null || true; }
-  if [ -n "${RED:-}" ]; then
+  # ⛔ AN ADVISORY RED IS REPORTED, NEVER HIDDEN (#4014). It spends no fix round and is not waited
+  # for, but a lane that was told nothing would be the silence this file exists to abolish — and the
+  # MERGE decision is still not made here: the chain re-reads the surface through the repo's own
+  # authority (see the block that resolves `LM_REQ` above).
+  if [ -n "${RED_ADV:-}" ]; then
+    log_line "… ADVISORY (not in $OR's required set: ${LM_REQ:-none}) — reported, NOT a fix round and NOT waited for: $(printf '%s' "$RED_ADV" | tr ',' ' ')"
+  fi
+  if [ -n "${REQ_MISSING:-}" ]; then
+    log_line "… required check(s) NOT PUBLISHED YET at head ${HEAD:0:12} — a missing required check is in flight, never green: $(printf '%s' "$REQ_MISSING" | tr ',' ' ')"
+  fi
+  if [ -n "${RED_REQ:-}" ]; then
     # ── A FLAKE IS NOT A FIX (#2866) ──────────────────────────────────────────────────────────
     # Before this round spends a FIX on the red, ask the router whether the red is a red at all.
     # `RERUN-FLAKE` = the same (app, workflow, job) PASSED on an earlier attempt at THIS SAME head:
@@ -2030,18 +2250,31 @@ while :; do
       esac
     fi
     [ "${lsick_action:-}" = "RERUN-FLAKE" ] && exit 11
-    emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
+    emit_fix FIX_REQUIRED "this head's own required checks are RED: $(printf '%s' "$RED_REQ" | tr ',' ' ')"
   fi
-  [ "${IF:-0}" = "0" ] && break
+  # ⛔ THE WAIT IS ON THE REQUIRED SURFACE (#4014). `IF` is already required-only when the contract
+  # was read (untouched otherwise), and an UNPUBLISHED required name is in flight too. Continuing to
+  # sit through advisory jobs is the 24-queued-checks tax measured on #12171, and it buys nothing:
+  # no merge decision is made here.
+  _eff="${IF:-0}"
+  if [ -n "${REQ_MISSING:-}" ]; then _eff=$(( _eff + 1 )); fi
+  [ "$_eff" = "0" ] && break
   # ⛔ SAY SOMETHING WHILE YOU WAIT (measured live on this change's own PR). With every required
   # check in flight the loop printed NOTHING for up to WAIT_S — and to every liveness instrument we
   # have, a lane that has produced no output for 15 minutes is indistinguishable from a wedged one.
   # The header promises progress; this is it. Printed when the count CHANGES (so a stable wait does
   # not spam 45 identical lines) and at least once a minute otherwise.
   now="$(date +%s)"
-  if [ "${IF:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
-    log_line "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
-    _last_if="$IF"; _last_say="$now"
+  # ⛔ THE COUNT QUOTED HERE IS THE ONE THE LOOP WAITS ON (review P3-3, #4039). `IF` is required-only
+  # and `_eff` adds the unpublished-required reason, so a line rendered from `${IF}` said
+  # `0 check(s) in flight` in the state this change creates — every present required check terminal and
+  # green, with the ONLY outstanding thing an unpublished required name. That is the same
+  # "quote the wrong operand" defect the bound line names, in the one surface a reader and the watchdog
+  # see DURING the wait — and it is the normal state for most of a wait, not a corner. The unpublished
+  # names travel with it because a reason of `0` is not a count.
+  if [ "${_eff:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
+    log_line "… ${_eff} required check(s) outstanding at head ${HEAD:0:12}${REQ_MISSING:+ (${REQ_MISSING} not published yet)} — waiting ($(( deadline - now ))s left in this bound)"
+    _last_if="$_eff"; _last_say="$now"
   fi
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
@@ -2061,8 +2294,14 @@ while :; do
       exit 11
     fi
     log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
+    # ⛔ QUOTING `0` IN FLIGHT OVER A REAL CAUSE IS THE SILENCE THIS FILE ABOLISHES (review P1, #4039).
+    # An unpublished required check is an IN FLIGHT reason, not an in-flight COUNT, so a bound reached
+    # solely because it is missing would otherwise print `(0)` and send the reader after a slow CI run.
+    if [ -n "${REQ_MISSING:-}" ]; then
+      log_line "… the ONLY thing outstanding is required check(s) not published at this head: $(printf '%s' "$REQ_MISSING" | tr ',' ' ') — a required check that GitHub never reports leaves the merge blocked, so waiting is the correct direction"
+    fi
     disposition WAITING_CHECKS
-    verdict WAITING_CHECKS "checks still in flight after ${_waited}s"
+    verdict WAITING_CHECKS "checks still in flight after ${_waited}s${REQ_MISSING:+ (required and unpublished: $(printf '%s' "$REQ_MISSING" | tr ',' ' '))}"
     exit 11
   fi
   # ⛔ WATCHDOG-VISIBLE PROGRESS, EVERY POLL (#3584 review, P1 — measured). `lane_bound`'s only working
@@ -2071,8 +2310,9 @@ while :; do
   # sleep so the first poll is already covered, and unconditionally (not only when the count changes),
   # because an unchanged count is exactly the case the watchdog would read as silence.
   if [ -n "$HB_F" ]; then
-    printf '[lane-merge] heartbeat %s: %s check(s) in flight at head %s (%ss left in this bound)\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${IF:-?}" "${HEAD:0:12}" \
+    printf '[lane-merge] heartbeat %s: %s required check(s) outstanding at head %s%s (%ss left in this bound)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${_eff:-?}" "${HEAD:0:12}" \
+      "${REQ_MISSING:+ (${REQ_MISSING} not published yet)}" \
       "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
         say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
         HB_F=""

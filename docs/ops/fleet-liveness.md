@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, workspace-ownership, dispatch-target, lane-dispatch
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-4046, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, workspace-ownership, dispatch-target, lane-dispatch
 ---
 
 # Fleet session liveness (#1178)
@@ -49,6 +49,57 @@ label — it produces a dispatch into the owner's own work.
 ---
 
 ## 0. Scope — this document is ONE liveness surface, not all of them
+
+### 0z. A liveness verdict is not a ROUTE — and `wedged` means two different things (#4046)
+
+A verdict answers *what state is this lane in*. A **route** answers *what do I DO with it*. They are
+different questions with different failure modes, and #4046 is exactly the cost of conflating them: one
+verdict — "looks idle" — was the answer to three different situations, one of which (a lane waiting on
+the owner) is actively harmed by it. "Continue" sent to a lane whose last turn is a QUESTION tells it
+to proceed on a premise the owner has not decided.
+
+So there is now a router, [`tools/fleet/triage.py`](../../tools/fleet/triage.py), publishing
+
+```
+user-question | wedged | idle-continue | none        (in that PRECEDENCE, which is the safety property)
+and, for wedged, a named SUBCASE: child-stuck · child-overdue · boot-prompt · model-retry ·
+tool-in-flight · open-turn-never-closes · wedged-unverified
+```
+
+Three things about it are load-bearing here, because each is a way a second classifier could creep in:
+
+1. **It publishes no liveness state.** `triage.STATES_DISJOINT` is the intersection of its route names
+   with `liveness.STATES` and a test pins it to exactly `{"wedged"}` — a route `dead` would be a second
+   verdict function, and this document (§"one verdict function") refuses that. The overlap is
+   deliberately not empty: inventing a second word for a state the fleet already decided on is worse.
+2. **It consumes, never re-derives.** `liveness.Turn` (the #1254 open-turn contract) is its only
+   source of "positively open", and `scripts/lane-status.py`'s verdict is its only source of
+   `CHILD-STUCK` / `CHILD-OVERDUE` / `LONG-TOOL` / `WEDGED`. Both directions of that borrowing are
+   pinned: if `Turn` loses `stalled`/`reason`/`abstain`, the router's suite fails rather than silently
+   misrouting every lane.
+3. **`wedged` in this document and `wedged` as a route are DIFFERENT NAMES THAT HAPPEN TO MATCH.**
+   The state asserts *the transcript shows an open turn* (#1254) and prescribes *check the process*.
+   The route names a REMEDY FAMILY, and one of its subcases — `wedged-unverified` — is precisely the
+   case where the STATE was asserted and the turn does not support it; its remedy is `inspect`, never
+   a kill. A reader who treats the two as the same thing will read `wedged-unverified` as a stronger
+   `wedged`, which is the opposite of what it is.
+
+The router's arms are [`tools/fleet/triage_arms.py`](../../tools/fleet/triage_arms.py) — one per route,
+and **each owes a proof taken at its artifact**: a `SENT` marker is a claim, not an effect. The continue
+arm proves *transcript growth inside a bound*; the question arm re-lists the workspaces and requires
+the question lane at index 0, then reads the PANE back and requires it to carry the research mandate
+(the move's return code and the text the arm typed are not artifacts); the child arms WRITE a
+hand-off record and re-read it, and signal nothing (the reaping rule is three gates, and *"report,
+do not reap"* when a read is unclear); the boot-prompt arm reuses `cmux_dispatch.py`'s own
+dismiss-and-resend and reads the pane, deciding the prompt by ORDER — a satisfied marker stays in
+scrollback for the life of the session, so presence alone reports a repaired lane as blocked.
+Every route carries `Route.proof`, and an arm naming no artifact is refused before it can run.
+
+**Where it is wired.** `scripts/turn-end.py` gates its WIP nudge on `triage.may_continue()` — the lane
+it used to nudge was one whose question was asked in a PANE and therefore never carried the
+`owner-decision` label its old guard read. `scripts/lane-route.py` is the operator CLI (`--apply` runs
+the arms and records the verdict of each). Both are stated here because a router with no consumer is
+indistinguishable, in review, from a working one.
 
 Before any state name is compared across tools: the vocabulary on this page
 (`dead | running-quiet | wedged | idle | unknown`) belongs to
@@ -1483,8 +1534,10 @@ lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
 lane-reap.sh reap --apply           signal the lanes that pass all three gates
 ```
 
-**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (125 min — above the
-lane's wall BACKSTOP (`LANE_BACKSTOP_S` = 7200 s), so a long silent tool call is not read as death;
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (601 min since
+agent-infra#4034, 125 min before it — above the
+lane's wall BACKSTOP (`LANE_BACKSTOP_S` = 36000 s since #4034, 7200 s before it), so a long silent
+tool call is not read as death;
 when the wall was the PRIMARY bound of a lane this window followed the wall, and `agent-infra#2888`
 demoted the wall to a backstop without demoting the window's reason), OR its log was
 deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
@@ -1729,12 +1782,13 @@ no-progress allowance**, copied rather than invented: `lane-bound.sh`'s `--idle`
 declared it, not because the two agree — `--idle` resets its clock on EITHER signal, so the two
 instruments CAN disagree (the consequence is stated below), and `frozen` is not a licence to kill.
 
-**It is NOT `LANE_REAP_LIVE_MIN`** (125 min, `agent-infra#2888`), and an earlier revision of this
-paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the 2 h
-wall backstop or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
-well, so its analogue is the **progress** bound; re-pointing it at 125 min would make `frozen`
+**It is NOT `LANE_REAP_LIVE_MIN`** (601 min since `agent-infra#4034`; 125 min since `#2888`), and an
+earlier revision of this
+paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the wall
+backstop (10 h since #4034) or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
+well, so its analogue is the **progress** bound; re-pointing it at that mtime window (601 min since agent-infra#4034) would make `frozen`
 unreachable on exactly the wedge class it exists to name. **And it sits below the wall clock on
-purpose:** `--wall` (`LANE_BACKSTOP_S` = 7200 s) is a BACKSTOP, and since `agent-infra#2888` the
+purpose:** `--wall` (`LANE_BACKSTOP_S` = 36000 s since agent-infra#4034, 7200 s before it) is a BACKSTOP, and since `agent-infra#2888` the
 progress bound is PRIMARY — it must fire first, otherwise the wall pre-empts it and a lane that is
 still working is killed by elapsed time, which is the measured defect #2888 fixes. (That earlier
 revision called this ordering a defect and cited stale literals — `lane.sh`'s `3300`, a `--wall`

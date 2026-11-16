@@ -674,8 +674,8 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "${_FIX_MOD_DIR:-$O}/claims.sh"
   # The fallback used when a malformed FIX_TIMEOUT is refused: the SAME value the run would take.
-  _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-7200}"
-  is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=7200
+  _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-36000}"
+  is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=36000
   FIX_BOUND="${FIX_TIMEOUT:-$_FIX_BOUND_FALLBACK}"
   if ! is_limit "$FIX_BOUND"; then
     echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' (resolved to '$FIX_BOUND') is not an integer in range (at most 9 digits) — using ${_FIX_BOUND_FALLBACK} (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
@@ -683,7 +683,7 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   fi
   # ⛔ ONE RESOLVED BOUND DRIVES BOTH THE LEASE AND THE RUN (agent-infra#2888 review, P1 — verified).
   # They were two independent literals: the run moved to the `${FIX_TIMEOUT:-$LANE_BACKSTOP_S}` backstop
-  # (7200 s) while this lease stayed `FIX_TIMEOUT:-2400 + 1200` = 3600 s. With `FIX_TIMEOUT` unset — the
+  # (36000 s since agent-infra#4034; 7200 s when this was written) while this lease stayed `FIX_TIMEOUT:-2400 + 1200` = 3600 s. With `FIX_TIMEOUT` unset — the
   # shipped default; nothing outside the test suite sets it — the claim then expired an HOUR before the
   # fixer's own bound, a peer read the head as free and ran a SECOND fixer on the same branch: exactly
   # the duplicate dispatch `claims.sh`'s lease/ceiling block says the lease exists to prevent. Resolving
@@ -789,6 +789,8 @@ You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewe
 
 If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
+If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
+
 If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
@@ -893,6 +895,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
     # other box runs the same pair, so both remedies send them to an event that cannot arrive.
     why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991), OR the spawn gate could not resolve `capacity.sh` at all (its `nodeploy` arm, #2293 follow-up). Both are harness defects, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
+  elif [ "$ar" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+    # ⛔ A STALE CHECKOUT IS ITS OWN REMEDY, AND IT IS NOT ON A PEER (agent-infra#3932, this change's
+    # review, P1-2). Before this arm the refusal landed on the CAPABILITY text below — "repair the box
+    # (installed pi/extension set, provider credential) or dispatch the PR elsewhere" — and all three are
+    # wrong: the model call SUCCEEDED (that is how the reading was taken), and the measured wave had every
+    # cell hundreds of commits behind, so the peer refuses identically. The fix is on THIS box's checkout.
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THIS PATH MEASURED, WHICH IS NOT A BASE (this change's review,
+    # P2-4, source-certain). `run_agent` is given `WIP_PATH="$WT"` above, so the probe measures the
+    # FIXER'S WORKTREE — a worktree on the PR BRANCH. The base-path sentence ("git fetch, then cut the
+    # worktree from origin/main") is DESTRUCTIVE here: it discards the PR's own commits, and a PR branch
+    # >MAX_BEHIND behind is exactly the state a fixer gets dispatched to repair. So the remedy is MERGE
+    # INTO the branch, and it says explicitly that re-cutting is not the action.
+    why="STALE-CODE gate: this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932) — work done from it produces a plausible log and a WRONG diff. On THIS path the measured artifact is the FIXER's worktree, which is the PR BRANCH: bring the branch up to date (git -C $WT merge origin/main, resolve, push) and re-run; do NOT re-cut that worktree from origin/main, which would discard the PR's own commits. Do NOT dispatch the PR elsewhere — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. Waiting cannot clear it. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting

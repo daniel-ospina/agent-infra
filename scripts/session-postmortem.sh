@@ -386,8 +386,17 @@ PYEOF
         PATTERN_RC=127
         PATTERN_WHY="producer not found: $POSTMORTEM_SH"
     else
-        cat /tmp/pm-transcript.txt \
-            | bash "$POSTMORTEM_SH" > /tmp/pm-patterns.txt 2>/tmp/pm-patterns.err \
+        # ⛔ THE PRODUCER'S STATUS IS MEASURED FROM THE PRODUCER, NEVER THROUGH A PIPELINE. This was
+        # `cat /tmp/pm-transcript.txt | bash "$POSTMORTEM_SH"`, and the file is `set -euo pipefail`
+        # (:38), so `$?` was the status of the WHOLE PIPELINE: a producer that exits without reading
+        # its stdin — the very "silent producer" case the branch below exists to diagnose — closes the
+        # pipe, `cat` dies of SIGPIPE, and the run reports `producer exited 141`. Measured 2026-11-15
+        # on Linux/bash 5.3.9 (the CI runtime): the silence arm reddened with 141 and the message that
+        # names the SILENCE was never emitted, so `main` was red on `scripts/session-postmortem.test.sh`
+        # while the same suite passed on macOS — where `cat` happens to win the race and the pipeline
+        # exits 0. A status that depends on which process loses a race is not a measurement: input
+        # redirection hands the producer the same bytes and reports ITS OWN exit code.
+        bash "$POSTMORTEM_SH" < /tmp/pm-transcript.txt > /tmp/pm-patterns.txt 2>/tmp/pm-patterns.err \
             || PATTERN_RC=$?
         if [ "$PATTERN_RC" -ne 0 ]; then
             PATTERN_WHY="producer exited $PATTERN_RC: $POSTMORTEM_SH"

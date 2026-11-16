@@ -478,8 +478,8 @@ esac
 # ⛔ THE BOUND IS PER KEYING AND IT IS A CEILING, NOT THE DEFAULT. The shipped callers lease a PR
 # claim for MORE than `CLAIM_TTL`: merge-one.sh asks REVIEW_TIMEOUT + _gw + 300 (=3000s at the
 # default 900s gate wait; more when GATE_POLL_SECS raises `_gw`) and fix-one.sh asks FIX_TIMEOUT+1200
-# (=8400s at the current 7200s LANE_BACKSTOP_S, not the 3600s this sentence carried from before
-# agent-infra#2888 raised the backstop), both deliberately, because the lease has to cover the
+# (=37200s at the current 36000s LANE_BACKSTOP_S — 8400s at the 7200s one agent-infra#2888 landed, and
+# 3600s in the sentence this line carried before that), both deliberately, because the lease has to cover the
 # review+merge the claim is taken for. So "term <= 1800" is NOT the invariant — an assertion of it
 # would redden the merge path. What must hold, and what the incident actually violated, is that no
 # lease can exceed the DOCUMENTED CEILING for its keying (`CLAIM_TTL_MAX` for the per-head/PR keys,
@@ -1158,7 +1158,8 @@ ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the 
 # class was blocked FOREVER could therefore stop handing over the work behind the claims it reaps, in
 # silence. (O20 cannot cover it: O20's fixture is INSIDE the bound, i.e. the KEPT half of the arm. It
 # asserts `kept unreadable-lease` and the ABSENCE of a `pruned …` line; this case is the pruned half.)
-# The claim commit is dated 2001 so its age is FAR past `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s):
+# The claim commit is dated 2001 so its age is FAR past `CLAIM_UNREADABLE_LEASE_MAX_AGE` (48000 s,
+# 18000 until agent-infra#4034):
 # MEASURED 2026-11-07 at 815,770,473 s ≈ 45,000x the bound (not 4,500x — the factor is quoted from a
 # measurement, and a 10x error in it is exactly the kind of unmeasured magnitude this file's
 # labelling-honesty paragraph forbids). That age is the only deterministic way to reach the deleting
