@@ -76,8 +76,8 @@ FALSE-CLEAN class this fleet keeps paying for (#3382 invariant 1: *unknown ≠ z
   "branch": "feat/...", "worktree": "/path",
   "started_at": 1762000000,
   "heartbeat_at": 1762000060,
-  "budget_s": 7200,
-  "lease_until": 1762007260,
+  "budget_s": 36000,
+  "lease_until": 1762036060,
   "artifacts": [{"kind": "pr", "value": "3419"}, {"kind": "sha", "value": "..."}],
   "reason": null, "exit_code": 0, "ended_at": 1762000800, "duration_s": 800
 }
@@ -189,8 +189,9 @@ invisible after the fact.
 
 `EXPIRED` is decided by comparing the reader's clock to `lease_until`. **Cross-box clock skew is therefore
 an exposure**: a reader whose clock runs fast can call a live lane `EXPIRED`. The mitigations are structural
-rather than clever — the default budget is the lane's own absolute backstop (`7200 s`), so the error window
-is bounded by the skew against a two-hour lease; `heartbeat_at` is carried so the reason names both numbers;
+rather than clever — the default budget is the lane's own absolute backstop (`36000 s` since
+agent-infra#4034, `7200 s` before it), so the error window
+is bounded by the skew against a ten-hour lease; `heartbeat_at` is carried so the reason names both numbers;
 and `EXPIRED` is **not** a tombstone, so a late writer can still record `DONE` and correct the reading.
 
 **A false `EXPIRED` costs a re-dispatch. A false `RUNNING` costs the lane's whole result** — the fleet
