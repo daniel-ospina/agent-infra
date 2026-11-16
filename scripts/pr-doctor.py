@@ -1231,6 +1231,11 @@ CONFIRM_WINDOW_S = 1.0
 # `$O/bg/*.rc`). The line that proves an AGENT started is the one lane-exec.sh / merge-one.sh write:
 # `[agent] provider=… model=…`. That is the artifact; the pid is the errand runner.
 AGENT_CONFIRM_S = 5.0
+# ⛔ THE MARKER THAT PROVES A LAUNCH, AND THE ONE THAT DOES NOT (review of #4047, P1).
+# `[agent] provider=` is written BEFORE the capability gate, which can still refuse 5-25 s later;
+# `[agent] launch` is written by both spawn seams immediately before `pi` is exec'd, once nothing
+# can refuse. ONE definition, read by `_agent_started()` and pinned by the tests.
+AGENT_LAUNCH_MARKER = "[agent] launch"
 # The box measurement is one `capacity.sh probe` (a handful of forks, measured <1 s on a quiet box)
 # and it is read ONLY on a pass the box has already refused. It is bounded because the pass runs
 # under `run_bounded`, and a probe that cannot answer must be reported as unreadable, not waited on.
@@ -4029,15 +4034,31 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
 
 
 def _agent_started(name: str) -> bool:
-    """True only when the worker's OWN log carries the agent-start line (agent-infra#4047).
+    """True only when the worker's OWN log carries the POST-GATE launch marker (agent-infra#4047).
 
-    `lane-exec.sh` and `merge-one.sh` append `[agent] provider=… model=…` the moment the agent is
-    actually launched, i.e. AFTER the load/capability/capacity gates have let it through. That line is
-    the launch artifact; a live dispatcher pid is not.
+    ⛔ `[agent] provider=…` IS NOT PROOF OF A LAUNCH (review of #4047, P1 — MEASURED on the path
+    `dispatch()` actually uses: `nonblocking-dispatch.sh` -> `spawn-gate.sh::run_agent`). That line is
+    written at `spawn-gate.sh`'s `AGENT_STARTED=1` point, and the CAPABILITY GATE runs AFTER it and
+    refuses with 71/83 (setting `AGENT_STARTED=0` and returning). Its own comment records the cost:
+    "one bounded call, ~5-25 s measured on a healthy box" -- always OUTSIDE `CONFIRM_WINDOW_S` (1.0 s),
+    with the provider line already in the log. So a capability refusal read as
+    `launched, agent started`, was recorded (row + cooldown + class slot), and the pass printed
+    `dispatched N of M` over a refusal: the measured false PASS (#4047) this change exists to remove,
+    surviving in the slowest gate. The old docstring claimed the provider line landed AFTER the gates.
+    It does not; that claim WAS the bug.
 
-    BOUNDED (AGENT_CONFIRM_S) and CHEAP: the line is written early, so only the first 64 KiB is read,
-    and the poll sleeps 100 ms. A worker whose log cannot be read returns False -- an unreadable
-    artifact is never evidence of a launch.
+    So the artifact read here is the marker both launch seams write IMMEDIATELY BEFORE `pi` is exec'd,
+    once nothing can still refuse: `[agent] launch` (`spawn-gate.sh::run_agent`, `merge-one.sh`).
+
+    ⛔ $O SKEW DIRECTION: an older deployed harness writes no `[agent] launch` line, so the answer is
+    False and `_confirm()` reports `unconfirmed` -- NOT recorded, re-checked next pass (the same cost
+    the live-pid arm already pays). That is the fail-closed direction; the alternative is trusting the
+    pre-gate line, which is the false PASS itself. `[lane-registry] RUNNING` is accepted as a SECOND
+    witness because `lane_registry_begin()` also runs after every refusing gate (#3382), so a harness
+    between #3382 and this change still confirms.
+
+    BOUNDED (AGENT_CONFIRM_S) and CHEAP: only the first 64 KiB is read and the poll sleeps 100 ms. A
+    worker whose log cannot be read returns False -- an unreadable artifact is never evidence of a launch.
     """
     try:
         log_path = bg_path(name, "log")
@@ -4047,7 +4068,8 @@ def _agent_started(name: str) -> bool:
     while time.monotonic() < deadline:
         try:
             with open(log_path, "r", errors="replace") as f:
-                if "[agent] provider=" in f.read(65536):
+                head = f.read(65536)
+                if AGENT_LAUNCH_MARKER in head or "[lane-registry] RUNNING" in head:
                     return True
         except OSError:
             pass

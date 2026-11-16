@@ -596,6 +596,11 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
       fi
     fi
   fi
+  # ⛔ THE LAUNCH IS WITNESSED HERE, AFTER EVERY REFUSING GATE (agent-infra#4047 review, P1) — the same
+  # marker `spawn-gate.sh`'s `run_agent` writes, for the same reason: `[agent] provider=` is written
+  # before the gates that can still refuse, so it is not proof that an agent started, and `pr-doctor`
+  # reads the launch line rather than the provider line. Keep the two strings identical.
+  echo "[agent] launch label=reviewer-PR-$PR provider=$lane_provider model=$lane_model — every refusing gate has passed; the pi spawn is next" >> "$log"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
