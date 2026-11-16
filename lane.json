@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12935-1794787910-p664883-2e8aaf6b",
+  "_sha": "39709530347968aba14cfe44905092a782792ea3",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12935.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12926-refuse-omitted-switches"
+    },
+    {
+      "kind": "sha",
+      "value": "7b3b5af8120181e9bb91bbe0dde62950f6c66a46"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12935"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 2168,
+  "ended_at": 1794790078,
+  "exit_code": 0,
+  "heartbeat_at": 1794790078,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12935-1794787910-p664883-2e8aaf6b",
+  "lease_until": 1794797878,
+  "pid": 664883,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794787910,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12935",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12935"
+}
