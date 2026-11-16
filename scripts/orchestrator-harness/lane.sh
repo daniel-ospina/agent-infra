@@ -1020,37 +1020,95 @@ lane_transport_rotations() {
 # ⛔ A READ THAT CANNOT ANSWER SAYS SO. If the worktree, the repo, or any origin ref cannot be read,
 # the state is `unknown` — never `delivered`. The defect being fixed is precisely that an ABSENCE of
 # evidence was reported as evidence of delivery; defaulting to the old answer here would rebuild that
-# defect inside its own fix.
+# defect inside its own fix. That is why EVERY read below is checked for its own status: the first cut
+# read `git status --porcelain 2>/dev/null | wc -l` and `| tr -dc '0-9'` then defaulted to 0, so a FAILED
+# status read (an `index.lock` held by another git process — a real state in a shared worktree) and a
+# failed `rev-list` both answered `0` = "clean" and "nothing ahead", i.e. exactly `delivered`. `wc` and
+# `tr` succeed on empty input, which is what hid it (review of #4047, P2).
+#
+# ⛔ `delivered` IS RUN-SCOPED, NOT "the branch name is on origin" (review of #4047, P1, MEASURED). A
+# lane dispatched onto a branch an EARLIER run already pushed satisfies "origin/<cur> exists and HEAD is
+# not ahead of it" while this run contributed nothing at all — remote-tracking refs are shared across
+# the clone's worktrees, `lane.sh` never fetches, and `run_agent`'s own exit path may push the branch
+# unprompted (`spawn-gate.sh` lane_end_push). So `delivered` also requires that the head origin now
+# carries is NOT the head this run started from: `$LANE_START_HEAD` is captured immediately before the
+# agent is launched, and a run that ends on it delivered nothing THIS RUN. Reading that as `delivered`
+# is the #4016 false PASS this whole change exists to remove, one level down.
+#
+# ⛔ THE BASE IS RESOLVED, NOT ASSUMED TO BE `main` (review of #4047, P3). The harness's own exit path
+# refuses to assume a default branch (`spawn-gate.sh` resolves it with `ls-remote --symref`); a repo whose
+# default is `trunk`/`master` made every lane read `unknown`, and a stale local `main` could turn a no-op
+# lane into `unpushed-N`. This reads the LOCAL `refs/remotes/origin/HEAD` first (no network), then the two
+# names a default branch actually has (`main`, `master`), each of which must VERIFY before it is used, and
+# accepts the documented `LANE_DELIVERY_BASE` override. With none of them, the read cannot answer and
+# says `unknown` rather than guessing a branch name.
+# ⛔ DECLARED RESIDUAL (review of #4047, P3): NOTHING FETCHES HERE, so a remote-tracking base is only as
+# fresh as the lane's last fetch. A lane whose branch was merged and deleted can therefore still read
+# `unpushed-N` against a stale base, and a no-op lane can read the same against a stale `main`. That is
+# the FAIL-CLOSED direction (it reports work that is not delivered when the work may be delivered), never
+# `delivered` for a lane that delivered nothing, and a fetch here would put a network call on every lane's
+# exit path — including the ones reason=agent-exit-0 is already measuring. The remedy for the residual is
+# the operator's `git fetch` before trusting an `unpushed-` row, which the log line names.
 #
 # States: delivered | unpushed-<N> | uncommitted-<N> | nochange | unknown
+lane_delivery_base() { # -> a verified base ref name, or empty when the read cannot answer
+  local wt="$1" b cand
+  if [ -n "${LANE_DELIVERY_BASE:-}" ]; then
+    b="${LANE_DELIVERY_BASE}"
+    case "$b" in refs/*) : ;; *) b="refs/remotes/origin/$b" ;; esac
+    if git -C "$wt" rev-parse --verify -q "$b" >/dev/null 2>&1; then printf '%s' "$b"; fi
+    return 0
+  fi
+  # ⛔ THE LOCAL SYMBOLIC REF FIRST, THEN THE TWO NAMES A DEFAULT BRANCH ACTUALLY HAS — never a
+  # network call, and never a silent guess at `main`: each candidate must VERIFY before it is used,
+  # and an none-verify answer stays empty so the caller reports `unknown`. `origin/HEAD` is what
+  # `clone` normally sets; the `main`/`master` fallbacks cover a repo whose remote HEAD was never
+  # published (a bare fixture, a `worktree add` checkout), which is the shape the suite constructs.
+  for cand in "$(git -C "$wt" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)" \
+              refs/remotes/origin/main refs/remotes/origin/master; do
+    case "$cand" in ''|refs/*) : ;; *) cand="refs/remotes/origin/${cand#origin/}" ;; esac
+    if [ -n "$cand" ] && git -C "$wt" rev-parse --verify -q "$cand" >/dev/null 2>&1; then
+      printf '%s' "$cand"; return 0
+    fi
+  done
+  return 0
+}
 lane_delivery_state() {
-  local wt="${LANE_WT:-}" cur origin_ref ahead dirty
+  local wt="${LANE_WT:-}" cur origin_ref ahead dirty dirty_out start_head here base
   [ -n "$wt" ] && [ -d "$wt" ] || { printf 'unknown'; return 0; }
   command -v git >/dev/null 2>&1 || { printf 'unknown'; return 0; }
   cur="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   case "$cur" in ''|HEAD) printf 'unknown'; return 0 ;; esac
-  dirty="$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -dc '0-9')"
-  dirty="${dirty:-0}"
+  # ⛔ THE READ'S OWN STATUS IS THE VERDICT, NOT ITS EMPTY OUTPUT: a failed `status` must never count as
+  # "0 dirty files".
+  if ! dirty_out="$(git -C "$wt" status --porcelain 2>/dev/null)"; then printf 'unknown'; return 0; fi
+  dirty="$(printf '%s' "$dirty_out" | grep -c . 2>/dev/null || true)"
+  case "$dirty" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  start_head="${LANE_START_HEAD:-}"
+  here="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  case "$here" in ''|*[!A-Za-z0-9]*) printf 'unknown'; return 0 ;; esac
   origin_ref="refs/remotes/origin/$cur"
   # (1) The branch IS on origin: `ahead` is exactly the undelivered work.
   if git -C "$wt" rev-parse --verify -q "$origin_ref" >/dev/null 2>&1; then
-    ahead="$(git -C "$wt" rev-list --count "$origin_ref..HEAD" 2>/dev/null | tr -dc '0-9')"
-    ahead="${ahead:-0}"
+    ahead="$(git -C "$wt" rev-list --count "$origin_ref..HEAD" 2>/dev/null)" || ahead=""
+    case "$ahead" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
     if [ "$ahead" != "0" ]; then printf 'unpushed-%s' "$ahead"; return 0; fi
     if [ "$dirty" != "0" ]; then printf 'uncommitted-%s' "$dirty"; return 0; fi
+    # Origin carries this head. Did THIS run put it there, or was it already there when we started?
+    if [ -z "$start_head" ]; then printf 'unknown'; return 0; fi
+    if [ "$start_head" = "$here" ]; then printf 'nochange'; return 0; fi
     printf 'delivered'; return 0
   fi
   # (2) No `origin/$cur` at all: nothing was pushed under this branch name — the #4009/#4012 shape.
-  #     Count what sits on top of the fetched main, because "no remote ref" alone cannot tell three
+  #     Count what sits on top of the resolved base, because "no remote ref" alone cannot tell three
   #     commits apart from none, and those are different reports.
-  if ! git -C "$wt" rev-parse --verify -q refs/remotes/origin/main >/dev/null 2>&1; then
-    printf 'unknown'; return 0
-  fi
-  ahead="$(git -C "$wt" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null | tr -dc '0-9')"
-  [ -n "$ahead" ] || { printf 'unknown'; return 0; }
+  base="$(lane_delivery_base "$wt")"
+  if [ -z "$base" ]; then printf 'unknown'; return 0; fi
+  ahead="$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null)" || ahead=""
+  case "$ahead" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
   if [ "$ahead" != "0" ]; then printf 'unpushed-%s' "$ahead"; return 0; fi
   if [ "$dirty" != "0" ]; then printf 'uncommitted-%s' "$dirty"; return 0; fi
-  # (3) Nothing beyond main and a clean tree: the agent produced NO change. That is a legitimate end
+  # (3) Nothing beyond the base and a clean tree: the agent produced NO change. That is a legitimate end
   #     for a lane dispatched to CHECK something, and a silent no-op for one dispatched to CHANGE
   #     something — so it is named rather than being folded into either neighbour.
   printf 'nochange'
@@ -1082,6 +1140,12 @@ lane_bound_killer() {
     *)                         : ;;
   esac
 }
+# ⛔ THE DISPATCH-TIME HEAD, CAPTURED BEFORE THE AGENT IS LAUNCHED (review of #4047, P1). Without it
+# `lane_delivery_state` cannot tell "this run pushed its head" from "an earlier run's push is what the
+# remote-tracking ref shows", and it answered `delivered` for a lane that did nothing. Captured HERE
+# rather than inside the read: by the time the read runs, HEAD has already moved. An unreadable head
+# leaves it empty, and the read then answers `unknown` — never `delivered`.
+LANE_START_HEAD="$(git -C "${LANE_WT:-/nonexistent}" rev-parse HEAD 2>/dev/null || true)"
 run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -1154,14 +1218,41 @@ elif [ "$rc" = "0" ]; then
       lane_outcome done "agent-exit-0" ;;
     nochange)
       lane_outcome done "agent-exit-0-nochange"
-      echo "[lane $N] DELIVERY: the agent exited 0 and produced NO CHANGE — no commit beyond origin/main, clean tree. If this lane was dispatched to CHANGE something it delivered nothing; if it was dispatched to CHECK something, the check itself is the product and this line is its record. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
-    unpushed-*|uncommitted-*)
+      echo "[lane $N] DELIVERY: the agent exited 0 and produced NO CHANGE — the tree is clean and this run's head is the head it started from, with nothing beyond origin's HEAD/base. If this lane was dispatched to CHANGE something it delivered nothing; if it was dispatched to CHECK something, the check itself is the product and this line is its record. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+    unpushed-*)
       lane_outcome done "agent-exit-0-undelivered:$LANE_DELIVERY"
-      echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY). The work may exist in the worktree but no pushed head carries it, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+      # ⛔ SAY ONLY WHAT WAS MEASURED (review of #4047, P2). "NOTHING LEFT THE BOX … no PR can be opened"
+      # was FALSE for the mixed case — a lane that pushed an earlier head and then committed more reads
+      # `unpushed-N` while its branch and PR are live — and the remedy it printed (re-dispatch) is the
+      # redundant relaunch this issue measures. The commits are what is missing, not necessarily the PR.
+      echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) that origin does NOT carry (state=$LANE_DELIVERY). Whatever the branch's pushed head is—and a PR may already exist on it—${LANE_DELIVERY#unpushed-} commit(s) of THIS run's work are on this disk only. Push them (or hand the branch to the merge chain); re-dispatching the item is not the fix while the commits exist here. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+    uncommitted-*)
+      lane_outcome done "agent-exit-0-undelivered:$LANE_DELIVERY"
+      # ⛔ AND THE SAME FOR THE UNCOMMITTED ARM, WHICH WAS THE MOST WRONG OF THE TWO (review of #4047, P2):
+      # it is reachable only when origin ALREADY carries HEAD, so "NOTHING LEFT THE BOX … no pushed head
+      # carries it" denied the very delivery that made the branch current, and told the operator to
+      # re-dispatch an issue that has a pushed head and probably an open PR.
+      echo "[lane $N] DELIVERY: the agent exited 0 leaving ${LANE_DELIVERY#uncommitted-} uncommitted change(s) in the worktree (state=$LANE_DELIVERY). Origin already carries this run's head, so the branch (and any PR on it) is intact — but these ${LANE_DELIVERY#uncommitted-} change(s) are not in it, because they were never committed. Commit and push them rather than re-dispatching. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
     *)
       # The read could not answer. Reported as such, never as `delivered` — see the function's comment.
       lane_outcome done "agent-exit-0-delivery-unknown"
       echo "[lane $N] DELIVERY: state could not be determined (worktree=$LANE_WT branch=$BR) — reporting the read failure instead of assuming delivery. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+  esac
+  # ⛔ TWO READERS, ONE LOG — AND ONLY A CONTRADICTION IS WORTH A THIRD LINE (review of #4047, P3).
+  # `run_agent`'s exit path already measured "did anything leave the box" for the same lane
+  # (`LANE_END_TREE` / `LANE_END_PUSH` / `LANE_END_UNPUSHED`, printed a few lines above as `[lane-exit]`
+  # and `[wip] NOTE`), so this file does hold two readers of one fact. The terminal line uses THIS one
+  # because it is the only one guaranteed to exist (the harness tokens are absent under `$O` skew, the
+  # WIP hatch, and a non-worktree root — the same states where the exit path abstains). Printing both
+  # numbers unconditionally is the drift the one-home rule exists to stop; printing them ONLY when they
+  # DISAGREE is what lets an operator see that one of the two is wrong instead of trusting whichever
+  # line they read first. Values are the harness's own vocabulary (`spawn-gate.sh` LANE_END_TREE).
+  case "${LANE_END_TREE:-}" in
+    dirty|clean|unpushed-only)
+      case "$LANE_DELIVERY:$LANE_END_TREE" in
+        delivered:dirty|delivered:unpushed-only|nochange:dirty|nochange:unpushed-only)
+          echo "[lane $N] DELIVERY CROSS-CHECK: DISAGREEMENT — this read answered state=$LANE_DELIVERY while the harness's exit path measured tree=${LANE_END_TREE} push=${LANE_END_PUSH:-?} unpushed=${LANE_END_UNPUSHED:-?} for the SAME worktree. One of the two is wrong; the terminal line carries THIS one (it was read after the exit path finished). Check the tree by hand before treating the lane as delivered or as safe to reap. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+      esac ;;
   esac
 else
   # ── ATTRIBUTION (#2833): WHO ended this lane, before calling it a work failure ──────────────────

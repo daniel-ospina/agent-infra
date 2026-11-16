@@ -4898,6 +4898,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # Not earlier: the gates above can still refuse, and a refusal has its own record (FAILED,
   # `agent-never-started`) rather than a RUNNING record that would read EXPIRED two hours later.
   lane_registry_begin "$label" "${KIND:-lane}" "$log" "$t"
+  # ⛔ THE LAUNCH IS WITNESSED HERE, AFTER EVERY REFUSING GATE (agent-infra#4047 review, P1). The
+  # `[agent] provider=` line above is written BEFORE the capability gate, which is deliberately slow
+  # (its own comment: "one bounded call, ~5-25 s measured on a healthy box") and REFUSES with 71/83 on
+  # that path. A consumer reading `provider=` as proof of a launch therefore counted a capability
+  # refusal as a dispatch — the same false PASS this issue removes, in the one gate whose refusal is
+  # slow by design (measured 5-25 s, far outside any 1 s confirmation window). This line is the
+  # LAST word before `pi` is exec'd: nothing in this function can still refuse after it, and
+  # `pr-doctor.py`'s `_agent_started()` reads THIS marker rather than the pre-gate one.
+  echo "[agent] launch label=$label provider=$lane_provider model=$lane_model — every refusing gate has passed; the pi spawn is next" >> "$log"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # …and the lease starts renewing as soon as there is a pid to watch. The beat loop exits on its own
