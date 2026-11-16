@@ -1835,20 +1835,23 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  *
  *   - no redirect target at all ⇒ a pure read; nothing can be written;
  *   - otherwise probe `git status --porcelain` on every statically identifiable
- *     candidate checkout — `writeCwd`, plus the nearest EXISTING ancestor
- *     directory of each write target — and allow ONLY if all are free of
- *     tracked dirt.
+ *     candidate checkout — the checkout each write target LANDS in (links are
+ *     resolved, so a symlink sink is judged by the bytes it points at), plus
+ *     `scriptDir` — and allow ONLY if all are free of tracked dirt. A target
+ *     that is a HARDLINK (link count > 1) has no statically identifiable
+ *     landing checkout at all, so it fails closed rather than guess.
  *
  * `discardDestroysWip` (scope "all") already separates tracked dirt (real loss)
  * from untracked-only dirt (nothing tracked is destroyed), so the arm neither
  * blocks on `??` scratch output nor conflates the two in its message. Unlike
  * the comparison it replaces, one wrong ALLOW here is unrecoverable, which is
- * why the arm is conservative: an unresolvable target is probed at its nearest
- * existing ancestor, and an unreadable status FAILS CLOSED.
+ * why the arm is conservative: an unresolvable target is anchored at
+ * `writeCwd` by the `resolve` below and probed at its nearest existing
+ * ancestor, and an unreadable status FAILS CLOSED.
  *
  * Declared residual: a target anchored to a name this command never assigns
  * (`> "$SOME_ENV_VAR/f"`) keeps the literal `$SOME_ENV_VAR` component and is
- * therefore probed at the command's own directory — the same conservative
+ * therefore anchored at the command's own directory — the same conservative
  * answer the old arm gave by failing closed. A target anchored to a name the
  * command DOES assign is resolved here (`_wtCommandVars`), which is the fail-open
  * this predicate exists to close.
@@ -1871,21 +1874,57 @@ function _catFileRevertStateBlock(
   const vars = _wtCommandVars(command);
   const targets = writeTargetsRel.map((rel) => resolve(writeCwd, _wtSubstituteVars(rel, vars)));
 
-  // Candidate checkouts, in a deterministic order: the write cwd FIRST (its
-  // dirt is the one a relative target lands in, and it is the checkout the
-  // message should name first), then each target's nearest existing ancestor,
-  // then the checkout the discard was READ FROM when it came from a script.
+  // Candidate checkouts: each target's nearest EXISTING ancestor (the landing
+  // site), then the checkout the discard was READ FROM when it came from a
+  // script.
   //
-  // The script's own directory earns its place: a script's redirect is often
-  // anchored to a name the script computes at runtime (`hub-worktree.sh`
-  // derives `MAIN_REPO` from `git rev-parse --git-common-dir`), so it is not
-  // statically resolvable from the command text — but the script FILE is a
-  // statically identifiable checkout, and that is where such a discard can
-  // land. On the clean fixture it changes nothing; with tracked dirt there it
-  // is the difference between a block and an unrecoverable loss.
-  const candidates = new Set<string>([writeCwd]);
+  // ⛔ `writeCwd` IS NOT AN UNCONDITIONAL CANDIDATE (#3620, owner ruling on the
+  // issue 2026-11-15). It used to be seeded first, "its dirt is the one a
+  // relative target lands in" — but a target that lands OUTSIDE this checkout
+  // cannot discard this checkout's tracked work, and probing the cwd anyway
+  // refused the plain read-and-export on the merge path:
+  //
+  //     git show origin/main:tools/fleet_state.py > /tmp/fs-main.py
+  //     ⛔ Working-tree discard blocked … it would destroy uncommitted work
+  //
+  // The headline claim there is FALSE of the target (and was measured on a
+  // 1290-staged-path hub in the #3620 report). The arm's question is "does this
+  // redirect land on content that would be lost?", so it must probe the checkouts
+  // the write LANDS in, not the one the shell happens to sit in.
+  //
+  // WHAT THIS DOES NOT RELAX. The #1060 fail-open this arm exists for still
+  // blocks, because every such target lands INSIDE a checkout and the ancestor
+  // walk finds it: `> dirty.txt` / `> "$MAIN_REPO/dirty.txt"` resolve into the
+  // hub or worktree and are probed exactly as before (pinned D1a/D1b/D3, and the
+  // new D7 case for a target inside a DIFFERENT dirty checkout). The scope is
+  // "inside a checkout", never "outside the cwd of this invocation".
+  //
+  // The #1060 residual is preserved rather than special-cased: an UNRESOLVABLE
+  // component (`> "$SOME_ENV_VAR/f"`) is anchored by `resolve(writeCwd, rel)`
+  // above, so its ancestor walk lands on `writeCwd` and it is still probed there.
+  const candidates = new Set<string>();
+  let hardlinked: string | null = null;
   for (const t of targets) {
-    let dir = dirname(t);
+    // ── LINK RESOLUTION (#3620 review, MEASURED fail-open without it) ────
+    // The write lands where the BYTES land. A sink that is a SYMLINK into a
+    // tracked-dirty checkout is an ordinary path here and a real revert to the
+    // shell: `ln -s <dirty wt>/dirty.txt /tmp/sink; git show HEAD:dirty.txt >
+    // /tmp/sink` truncates the wt's uncommitted content and leaves `git status`
+    // clean. origin/main blocked that only INCIDENTALLY (the dirty checkout was
+    // the session cwd, which used to be an unconditional candidate); resolving
+    // the link blocks it on the effect, which is what this arm claims to gate.
+    let landing = t;
+    try {
+      const lst = statSync(t);
+      // A HARDLINK shares the inode with a file that may be tracked content in a
+      // checkout this walk never enumerates, and NO path-based probe can see
+      // that: `realpath` answers with the link's own name. Rather than guess,
+      // fail closed — the arm's own doctrine is that one wrong ALLOW here is
+      // unrecoverable, one wrong BLOCK costs a retry.
+      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = t; continue; }
+      landing = realpathSync(t);
+    } catch { /* target does not exist yet — the ancestor walk below resolves it */ }
+    let dir = dirname(landing);
     // Bounded: a target under a not-yet-existing directory has no checkout of
     // its own, so the walk finds the nearest one that exists.
     for (let i = 0; i < 64 && !existsSync(dir); i++) {
@@ -1893,9 +1932,21 @@ function _catFileRevertStateBlock(
       if (parent === dir) break;
       dir = parent;
     }
+    // …and the ancestor itself may be reached THROUGH a symlinked directory
+    // (`> /tmp/out/f` where `out` → a checkout), so resolve that too.
+    try { dir = realpathSync(dir); } catch { /* keep the lexical dir */ }
     candidates.add(dir);
   }
   if (scriptDir !== null) candidates.add(scriptDir);
+  // A hardlinked sink is the ONE case this walk cannot answer, and the answer is
+  // "cannot be verified" — never a silent allow.
+  if (hardlinked !== null) {
+    return _worktreeDiscardBlockReason(
+      { form: d.form, scope: "paths", pathspecs: [hardlinked] },
+      writeCwd,
+      "the redirect target is a hardlink (link count > 1), so the checkout it would destroy cannot be determined",
+    );
+  }
 
   for (const cand of candidates) {
     // Whole-checkout scope: the redirect's own path is not always statically

@@ -21,7 +21,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-discard-gate.mjs
 import { execSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -2623,8 +2623,19 @@ async function partD() {
     hubDirty();
     expectTrue("D5a (#940 F2): `bash -n <script>` is BLOCKED on a tracked-dirty hub",
       blocked(await bash(`bash -n ${setScript}`, hub)), "was allowed");
-    expectTrue("D5b (#940 F3): `git show HEAD:\"$x\" > /tmp/…` is BLOCKED on a tracked-dirty hub",
-      blocked(await bash(`x=dirty.txt; git show HEAD:"$x" > /tmp/1060-d5-f3.txt`, hub)), "was allowed");
+    // ⚠️ #3620 (owner ruling 2026-11-15) — this row FLIPPED. It used to pin
+    // `> /tmp/…` as BLOCKED on a tracked-dirty hub as a "fail-closed cost"; the
+    // sink is outside every checkout, so it cannot discard tracked work and the
+    // refusal's claim was false of the target. What this row was really
+    // protecting — a `$var` spelling laundering a revert — is now asserted where
+    // it is actually true, in D5b2: the SAME variable, written back into the
+    // dirty tree, still blocks.
+    expectTrue("D5b (#940 F3, #3620): `git show HEAD:\"$x\" > /tmp/…` is ALLOWED on a tracked-dirty hub (sink outside every checkout)",
+      allowed(await bash(`x=dirty.txt; git show HEAD:"$x" > /tmp/1060-d5-f3.txt`, hub)),
+      "was blocked — a /tmp sink discards nothing, and the D7 scope is 'inside a checkout'");
+    expectTrue("D5b2 (#3620): the SAME `$x`, written BACK into the dirty tree, is BLOCKED (a $var cannot launder a revert)",
+      blocked(await bash(`x=dirty.txt; git show HEAD:"$x" > "$x"`, hub)),
+      "was allowed — this is the #1060 fail-open the arm exists to close");
     expectTrue("D5c (#940 F4): the `$var` reader is BLOCKED on a tracked-dirty hub",
       blocked(await bash(`bash ${setScript} dirty.txt`, hub)), "was allowed");
     expectTrue("D5d (#940 F1): the SANCTIONED helper stays ALLOWED on a dirty hub — #1139's exemption is deliberate and precedes the walk",
@@ -2664,23 +2675,41 @@ async function partD() {
       writeFileSync(join(wt, "dirty.txt"), "v1\n");
       hubClean();
     }
-    // The outside-checkout sink is the arm's DECLARED FAIL-CLOSED COST, on BOTH
-    // sides of the state line — pinned so it is a recorded choice and not an
-    // accident. `git show HEAD:dirty.txt > /tmp/out` provably discards nothing,
-    // but the predicate asks whether a candidate checkout is pristine rather
-    // than proving the target is elsewhere (the issue's criterion 2 states
-    // exactly this: the #940 shapes are ALLOWED on a pristine hub and BLOCKED on
-    // a tracked-dirty one). Over-blocking is the direction this arm deliberately
-    // errs in: one wrong ALLOW here is unrecoverable, one wrong BLOCK costs a
-    // retry. A relaxant that scopes the `writeCwd` probe away when every target
-    // is statically outside every checkout would restore the allow — that is the
-    // documented trade, not a bug to "fix" silently.
-    hubClean();
-    expectTrue("D7: outside-checkout sink on a PRISTINE tree ALLOWED (the cost is state-conditional, not constant)",
-      allowed(await bash(`git show HEAD:dirty.txt > ${tmpd}/1060-d7-clean.txt`, hub)), "was blocked");
+    // ── The outside-checkout sink: DECLARED FAIL-CLOSED COST → now SCOPED to
+    // targets that land inside a checkout (#3620, 2026-11-15).
+    //
+    // ⚠️ SUPERSESSION, recorded where the old pin lived. This block used to pin
+    // the opposite: `git show HEAD:dirty.txt > /tmp/out` on a TRACKED-DIRTY tree
+    // was BLOCKED as a "declared fail-closed cost", with the note that a
+    // relaxant scoping the `writeCwd` probe away "is the documented trade, not a
+    // bug to 'fix' silently". The owner reopened it ON #3620 (comment of
+    // 2026-11-15, which post-dates this pin) and named the fix: *"the
+    // `cat-file-revert` arm must be scoped to targets **inside** a checkout (a
+    // redirect to /tmp cannot discard tracked work)"* — after measuring the arm
+    // refuse `git show origin/main:<path> > /tmp/fs-main.py` on the merge path,
+    // where the refusal's headline claim ("it would destroy uncommitted work")
+    // is false of the target. Applying an owner-named change is not adopting over
+    // a decision; leaving the old assertion standing would have been the silent
+    // reversal. The #1060 fail-OPEN this arm exists for is untouched and pinned
+    // above (D1a/D1b/D3): every target that lands INSIDE a checkout still blocks.
     hubDirty();
-    expectTrue("D7: outside-checkout sink on a TRACKED-DIRTY tree BLOCKED (declared fail-closed cost, criterion 2)",
-      blocked(await bash(`git show HEAD:dirty.txt > ${tmpd}/1060-d7-dirty.txt`, hub)), "was allowed");
+    expectTrue("D7 (#3620): outside-checkout sink on a TRACKED-DIRTY tree is ALLOWED (the arm is scoped to targets inside a checkout)",
+      allowed(await bash(`git show HEAD:dirty.txt > ${tmpd}/1060-d7-dirty.txt`, hub)),
+      "was blocked — a redirect whose target is outside every checkout cannot discard tracked work");
+    // …and the reason the scoping is safe: it is not "outside the CWD", it is
+    // "outside every CHECKOUT". A target in a DIFFERENT dirty checkout still
+    // blocks even though it is outside the session's own tree.
+    writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+    try {
+      expectTrue("D7 (#3620): outside-CWD but INSIDE another dirty checkout → still BLOCKED (scope is 'inside a checkout', not 'outside the cwd')",
+        blocked(await bash(`git show HEAD:dirty.txt > ${wt}/dirty.txt`, hub)), "was allowed");
+    } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
+    // The documented read-and-export shapes stay admitted — a `/dev/null` sink
+    // and a bare read are pinned in the allowRows above; this is the export that
+    // #3620 was forced to work around.
+    expectTrue("D7 (#3620): `git show origin/main:<path> > /tmp/…` on a TRACKED-DIRTY hub is ALLOWED (the measured #3620 shape)",
+      allowed(await bash(`git show origin/main:dirty.txt > ${tmpd}/3620-export.txt`, hub)),
+      "was blocked — this is the false block #3620 measured on the merge path");
     // Untracked-only dirt in a candidate checkout is NOT tracked loss — the arm
     // must not degrade into "any dirt anywhere blocks".
     writeFileSync(join(hub, "scratch-untracked-1060.txt"), "wip\n");
@@ -2688,6 +2717,56 @@ async function partD() {
     expectTrue("D7: untracked-only dirt in the hub → the X4 shape is ALLOWED (no tracked loss)",
       allowed(await bash(X4, wt)), "was blocked");
     rmSync(join(hub, "scratch-untracked-1060.txt"), { force: true });
+
+    // ── D9 (#3620 shape 5): a `cd`-chained restore is judged against the
+    // COMMAND's checkout, not the session's. #3620 measured the refusal naming
+    // the HUB for a worktree-only path; this pins the correct attribution so a
+    // future refactor cannot reintroduce the session-cwd answer.
+    writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+    try {
+      const shaped = await bash(`cd ${wt} && git checkout -- dirty.txt`, hub);
+      expectTrue("D9 (#3620): `cd <wt> && git checkout -- <path>` is BLOCKED (the wt carries the dirt)",
+        blocked(shaped), `was allowed: ${JSON.stringify(reason(shaped)).slice(0, 160)}`);
+      expectTrue("D9b (#3620): …and the block names the WORKTREE, not the session's hub checkout",
+        /Checkout: .*\/wt\b/.test(reason(shaped)), `reason=${JSON.stringify(reason(shaped)).slice(0, 240)}`);
+    } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
+    // The admitted half: the same chained shape against a CLEAN checkout is a
+    // no-op discard, so it stays allowed (the cd-chain is not itself suspicious).
+    expectTrue("D9c (#3620): `cd <wt> && git checkout -- <clean path>` ALLOWED (nothing to destroy)",
+      allowed(await bash(`cd ${wt} && git checkout -- clean.txt`, hub)), "was blocked");
+
+    // ── D10 (#3620 review, MEASURED fail-open introduced by the D7 scope):
+    // the landing site must follow LINKS, not the spelling of the target. With
+    // the `writeCwd` seed removed, a sink that is a SYMLINK (or hardlink) into a
+    // tracked-dirty checkout was ALLOWED where origin/main BLOCKED it — the shell
+    // follows the link and truncates the real file, so the uncommitted work is
+    // destroyed while `git status` reports clean. The distance from the cwd is
+    // irrelevant; what matters is where the BYTES land.
+    const linkOut = join(tmpd, "linkout-3620");
+    rmSync(linkOut, { recursive: true, force: true });
+    mkdirSync(linkOut, { recursive: true });
+    writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+    try {
+      symlinkSync(join(wt, "dirty.txt"), join(linkOut, "sink.txt"));
+      const symSink = await bash(`git show HEAD:dirty.txt > ${linkOut}/sink.txt`, wt);
+      expectTrue("D10 (#3620 review): a SYMLINK sink into a tracked-dirty checkout is BLOCKED (the write lands where the bytes land)",
+        blocked(symSink), `was allowed: ${JSON.stringify(reason(symSink)).slice(0, 200)}`);
+      expectTrue("D10b …and the block names the checkout the link RESOLVES into, not the link's own directory",
+        /Checkout: .*\/wt\b/.test(reason(symSink)), `reason=${JSON.stringify(reason(symSink)).slice(0, 240)}`);
+      // A hardlink shares the inode, so `realpath` cannot reveal it. Fail CLOSED
+      // on the link count: a target with nlink > 1 could be tracked content in a
+      // checkout this arm never enumerated, which is exactly the class it must
+      // not guess about.
+      linkSync(join(wt, "dirty.txt"), join(linkOut, "hard.txt"));
+      const hardSink = await bash(`git show HEAD:dirty.txt > ${linkOut}/hard.txt`, wt);
+      expectTrue("D10c a HARDLINK sink (nlink>1, landing checkout unknowable) is BLOCKED — fail closed",
+        blocked(hardSink), `was allowed: ${JSON.stringify(reason(hardSink)).slice(0, 200)}`);
+    } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
+    // Control: the same symlink shape onto CLEAN content is a read-and-export
+    // that destroys nothing — the link resolution must not become a blanket rule.
+    symlinkSync(join(wt, "clean.txt"), join(linkOut, "clean-sink.txt"));
+    expectTrue("D10d a SYMLINK sink into a CLEAN checkout is ALLOWED (resolution is about the effect, not the link)",
+      allowed(await bash(`git show HEAD:clean.txt > ${linkOut}/clean-sink.txt`, wt)), "was blocked");
 
     // ── D8: M4's disorder early-return must not shadow M5 ──
     // The issue names this as a second reachability gap in the same region, to
