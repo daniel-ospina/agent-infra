@@ -2041,16 +2041,23 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * effect. Nothing new fails closed — the class is closed by resolving it, not by
  * refusing it.
  *
- * A chain longer than the bound returns null (unresolvable): the kernel's own
- * MAXSYMLINKS is 40, so the shell refuses such a command with ELOOP and nothing
- * is written — but "harmless by coincidence" is not a reason to return a path
- * this function could not actually resolve.
+ * A chain longer than the kernel would follow returns null (unresolvable → the
+ * caller fails closed, like the hardlink arm): the landing site genuinely cannot
+ * be named, and "harmless by coincidence" is not a reason to hand the probe a
+ * path this function could not resolve.
+ *
+ * ⛔ THE BOUND IS 40 FOLLOWED LINKS, NOT 40 LOOP ITERATIONS (measured). Linux
+ * MAXSYMLINKS is 40 and the kernel FOLLOWS all 40, so a 40-link chain resolves
+ * and its destination is written; 41 is ELOOP. Counting iterations with `< 40`
+ * threw away a correct answer the loop was already holding on the 40th hop and
+ * turned a benign 40-hop sink into a block. Hence `<=`: the extra iteration is
+ * the one that reads the final, non-link destination.
  * @param {string} p
  * @returns {string|null} the path the write would actually create/modify, or null
  */
 function _resolveThroughDanglingLinks(p: string): string | null {
   let cur = p;
-  for (let i = 0; i < 40; i++) {
+  for (let hop = 0; hop <= 40; hop++) {
     let st;
     try { st = lstatSync(cur); } catch { return cur; } // does not exist → this IS the landing path
     if (!st.isSymbolicLink()) return cur;

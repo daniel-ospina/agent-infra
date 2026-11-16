@@ -2879,6 +2879,56 @@ async function partD() {
       rmSync(join(wt, "sub"), { recursive: true, force: true });
     }
 
+    // ── D14 (#3620 verification): the link-hop bound is 40 FOLLOWED links — the
+    // kernel's MAXSYMLINKS — so a 40-hop chain resolves and its destination is an
+    // ordinary landing site, while 41 is ELOOP and cannot be resolved at all.
+    // Counting loop ITERATIONS (`< 40`) turned the 40-hop case into a block, and
+    // the source comment claimed the kernel refused it — measured false: the shell
+    // runs rc 0 and CREATES the tail. Pinned here so the bound cannot drift again,
+    // in one direction or the other.
+    {
+      const hopRoot = join(tmpd, "3620-hops");
+      rmSync(hopRoot, { recursive: true, force: true });
+      mkdirSync(hopRoot, { recursive: true });
+      const chain = (n) => {
+        const first = join(hopRoot, `h0-${n}`);
+        rmSync(first, { force: true });
+        for (let i = 0; i < n; i++) {
+          const from = join(hopRoot, `h${i}-${n}`);
+          rmSync(from, { force: true });
+          symlinkSync(i + 1 === n ? join(hopRoot, `tail-${n}.txt`) : join(hopRoot, `h${i + 1}-${n}`), from);
+        }
+        rmSync(join(hopRoot, `tail-${n}.txt`), { force: true });
+        return first;
+      };
+      const forty = chain(40);
+      expectTrue("D14 a 40-hop symlink chain (kernel MAXSYMLINKS) into a NON-checkout is ALLOWED (the shell resolves it)",
+        allowed(await bash(`git show HEAD:clean.txt > ${forty}`, wt)), "was blocked — the bound is off by one");
+      const fortyOne = chain(41);
+      expectTrue("D14b a 41-hop chain is BLOCKED — the kernel ELOOPs, so the landing site cannot be named",
+        blocked(await bash(`git show HEAD:clean.txt > ${fortyOne}`, wt)), "was allowed");
+      // …and the same bound must not be a hole for a checkout: a 40-hop chain whose
+      // tail is INSIDE a dirty checkout still lands there and must block.
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      try {
+        const hops = 40;
+        // The chain HEAD is the write target: hi0 -> hi1 -> … -> hi39 -> the dirty
+        // tracked file. (The first cut of this row pointed the redirect at a path
+        // that was not part of the chain, so it asserted a create in /tmp — a test
+        // bug, caught by the row failing.)
+        const head = join(hopRoot, "hi0");
+        rmSync(head, { force: true });
+        for (let i = 0; i < hops; i++) {
+          const from = join(hopRoot, `hi${i}`);
+          rmSync(from, { force: true });
+          symlinkSync(i + 1 === hops ? join(wt, "dirty.txt") : join(hopRoot, `hi${i + 1}`), from);
+        }
+        expectTrue("D14c a 40-hop chain whose tail is a DIRTY tracked file is BLOCKED (the bound must not become a hole)",
+          blocked(await bash(`git show HEAD:dirty.txt > ${head}`, wt)), "was allowed");
+      } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
+      rmSync(hopRoot, { recursive: true, force: true });
+    }
+
     // ── D8: M4's disorder early-return must not shadow M5 ──
     // The issue names this as a second reachability gap in the same region, to
     // be assessed with the fix rather than separately. Measured before the fix
