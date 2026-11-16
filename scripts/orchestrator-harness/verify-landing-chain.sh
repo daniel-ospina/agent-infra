@@ -485,27 +485,57 @@ marker_sig_ok() { # <marker line> → 0 iff its own trailing ` sig=<64hex>` veri
 GATE_KEY="$(gate_key)"
 OPENSSL_OK=""
 command -v openssl >/dev/null 2>&1 && OPENSSL_OK=1
+# ⛔ THE MARKER'S WHOLE-LINE GRAMMAR, IN ONE PLACE (fresh-context review, round 11 — BLOCKING, the
+# false-PASS class). A marker is an ARTIFACT only when it is the WHOLE line (`BODY`) / the WHOLE comment
+# body (`COMMENT`), and this is the repo's own predicate, not a shape invented here:
+#   * `scripts/record-review.sh:8157-8179` PRODUCES exactly this line;
+#   * `:6256` (`RB_RE`) reads it back as a whole line;
+#   * `scripts/check-pipeline-compliance.sh:523` (`REVIEW_RECORD_MARKER_RE`) is `^…$`-anchored and its
+#     comment arm applies it to the comment's WHOLE body with trailing whitespace trimmed (`:756-760`),
+#     so a marker embedded in a longer comment — or written as a list item — is REFUSED there;
+#   * `record-review.sh:2360-2377` records that refusal as a fixed-twice defect, naming the reachable
+#     no-attacker case: "a comment whose FIRST LINE is the marker and which continues below".
+# That predicate is applied here, unchanged: a marker that is not the whole artifact is NOT evidence.
+# ⛔ `[0-9a-f]+`, NOT `{40}`/`{64}`: interval expressions are absent from some awks this repo runs (macOS
+# one-true-awk), and the exact lengths are already enforced by the field parse below (40 for the sha) and
+# by `marker_sig_ok` (64 for the sig). What this expression decides is the SHAPE and the LINE BOUNDARY.
+# The trailer alternatives are the recorder's OWN fields — `findings=`/`note=` (not-clean only) and
+# ` sig=` — so the free-text `note=` still matches while ordinary prose does not.
+marker_whole_re() { # <pr> → the anchored ERE a marker must satisfy as a WHOLE body / whole line
+  printf '%s' '^review recorded: reviews/'"$1"'\.json verdict=(clean|clean-micro|clean-low|not-clean) @ [0-9a-f]+( diff=[0-9a-f]+)? \([A-Za-z0-9._-]+/[A-Za-z0-9._-]+\)( findings=[^"]*)?( sig=[0-9a-f]+)?$'
+}
 record_markers() { # record_markers <dir> <pr>
   #   MARK <chan> <verdict> <sha> <repo> <assoc|-> <marker line, verbatim>   ← this repo, admissible shape
   #   SKIP <chan> <sha12> <repo-or-(none)>   a marker that names no repo, or another repo
   #   DENY <chan> <sha12> <assoc|->          a COMMENT whose author is not OWNER/MEMBER/COLLABORATOR
+  #   NOTWHOLE <chan>                        a marker-SHAPED artifact the whole-artifact rule refused
   local dir="$1" pr="$2"
   {
     # ── the COMMENT channel: the producer's frame, one `<author_association>\t<body>` per comment ──
-    # A body is MULTI-LINE, so the frame is split here (`RS = \x1e`) into one line per body line, each
-    # carrying its author; the ONE parser below then handles both channels.
+    # ⛔ ONE RECORD PER COMMENT BODY, NOT ONE PER LINE (fresh-context review, round 11 — BLOCKING). This
+    # used to `split(body, L, "\n")` and hand every line of every comment to the parser, which made any
+    # line of any trusted comment evidence: a trusted author QUOTING a marker inside a longer comment ("…
+    # the recorder said:\n<marker>\nlooks right") satisfied `review_record` AND `review_bound` here while
+    # the required check refuses that comment outright — the one artifact direction this file and its header
+    # forbid. The body is now handed over only when it IS the text, i.e. a single line after trailing
+    # whitespace is trimmed (GitHub bodies arrive CRLF, and a client may append a newline).
+    # ⛔ A MARKER-SHAPED MULTI-LINE BODY IS *REPORTED*, NOT DROPPED: a silent refusal reads as "no record"
+    # and the next reader re-derives the same question (the report names it, `nonwhole_markers`).
     # ⛔ `sub(/^[\n\r]+/)` IS LOAD-BEARING: `jq -r` writes a NEWLINE after each record, so every record
     # but the first would begin with one and the AUTHOR field would read "\nOWNER" — refusing a marker
     # from a trusted author for a reason invisible in the report (measured while building this read).
-    # A `\r` is stripped from each line for the same reason: GitHub bodies arrive CRLF on some clients
-    # and a trailing CR would stop the marker's own ` (<repo>)`/` sig=` anchors matching.
     [ -s "$dir/comments.txt" ] && awk -v RS='\036' '
       {
         sub(/^[\n\r]+/, "")
         i = index($0, "\037")
         if (i == 0) { assoc = "-"; body = $0 } else { assoc = substr($0, 1, i - 1); body = substr($0, i + 1) }
-        n = split(body, L, "\n")
-        for (k = 1; k <= n; k++) { sub(/\r$/, "", L[k]); printf "COMMENT\t%s\t%s\n", assoc, L[k] }
+        sub(/[[:space:]]+$/, "", body)
+        if (body == "") next
+        if (index(body, "\n") != 0 || index(body, "\r") != 0) {
+          if (index(body, "review recorded: reviews/") != 0) printf "NOTWHOLE\tCOMMENT\n"
+          next
+        }
+        printf "COMMENT\t%s\t%s\n", assoc, body
       }' "$dir/comments.txt"
     # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history.
     # ⛔ `awk`, NOT `sed 's/^/COMMENT\t/'` (fresh-context review, round 7, P3). POSIX says an escaped
@@ -518,8 +548,14 @@ record_markers() { # record_markers <dir> <pr>
     # portable form (verified: identical output on gawk, mawk, nawk and `awk --posix`).
     printf 'BODY\t-\t\n'
     [ -s "$dir/body.txt" ] && awk '{ printf "BODY\t-\t%s\n", $0 }' "$dir/body.txt"
-  } | awk -F'\t' -v pr="$pr" -v want="$REPO" '
-    BEGIN { fold = tolower(want) }
+  } | MARKER_WHOLE_RE="$(marker_whole_re "$pr")" awk -F'\t' -v pr="$pr" -v want="$REPO" '
+    # ⛔ THE GRAMMAR ARRIVES THROUGH `ENVIRON`, NOT `-v` (round 11). A `-v` assignment is escape-PROCESSED
+    # by awk (its value is read like a string literal), so `\.` / `\(` in the ERE would be collapsed by
+    # some awks to `.` / `(` and the anchors would weaken silently — the exact class of platform-split
+    # this file has been bitten by before (the round-10 `\x2d` class). `ENVIRON` carries the bytes verbatim; the
+    # four awks this repo runs (gawk, mawk, nawk/one-true-awk, `gawk --posix`) were measured to compile it
+    # identically.
+    BEGIN { fold = tolower(want); whole = ENVIRON["MARKER_WHOLE_RE"] }
     {
       chan = $1
       # ⛔ A CHANNEL WORD OUTSIDE THE FRAME SET IS A CORRUPT FRAME, NOT EVIDENCE (fresh-context review,
@@ -529,6 +565,7 @@ record_markers() { # record_markers <dir> <pr>
       # `last_marker`, so without this an invented channel would reach the ADMISSION instead: a verifying
       # `sig=` admits a marker whose channel is not `COMMENT`-or-`BODY` (a comment is admitted on its
       # signature), which is how the M23 pin first stopped discriminating.
+      if (chan == "NOTWHOLE") { print; next }   # a refusal decided upstream (the COMMENT whole-body rule)
       if (chan != "COMMENT" && chan != "BODY") next
       # the channel and the author come from the FRAME; everything after them is the marker as it was
       # written (tabs included), because a signature covers the bytes the recorder signed
@@ -537,20 +574,29 @@ record_markers() { # record_markers <dir> <pr>
       k = index(line, "\t")
       assoc = (k ? substr(line, 1, k - 1) : "-")
       line  = (k ? substr(line, k + 1) : line)
-      # ⛔ THE HYPHEN IS LITERAL IN LAST POSITION, NOT `\x2d` (fresh-context review, round 10 — P3,
-      # MEASURED). `\x2d` is a GAWK hex escape, not POSIX ERE: where `\x` is not one, the class silently
-      # becomes `[[:space:]>*+x]` — so a marker written as a list item keeps its `-`, fails the
-      # `index(line, "review recorded: …") != 1` guard below, and is dropped with no reason the report
-      # can show (`review_record INCONCLUSIVE` over a real record, the fail-closed direction of the
-      # predicate #4016 closes on), while a line starting with the letter `x` is silently stripped. Both
-      # directions measured under `gawk --posix`. This repo already names the convention
-      # (`check-portability-traps.sh` refuses `\x27` as a gawk extension by name), and this file header
-      # demands the portable subset; the suite dialect discipline reaches only the `--json` emitter. A `-`
-      # at the END of a bracket expression is literal in every awk, verified identical on gawk, mawk,
-      # nawk and `awk --posix`.
-      sub(/^[[:space:]>*+-]+/, "", line)
+      # ⛔ THE PREFIX TOLERANCE IS GONE (fresh-context review, round 11 — BLOCKING), and with it the round-10
+      # `[[:space:]>*+-]` strip. That strip existed to tolerate a LIST ITEM (`- review recorded: …`) — and
+      # a list item is exactly what the required check REFUSES, because its comment arm matches the
+      # `^…$`-anchored `REVIEW_RECORD_MARKER_RE` against the WHOLE comment body and its body arm does the
+      # same per line. Tolerating it here admitted `- review recorded: …` while the gate threw the same
+      # comment away, i.e. `VERDICT: ALL-MET` over an artifact the only required check ignores. The two
+      # readers now agree, and the round-10 portability question (`\x2d` being a gawk-only escape) is gone
+      # with the strip rather than fixed inside it — there is no prefix to strip.
       # the recorder writes: review recorded: reviews/<pr>.json verdict=V @ <40hex> (owner/repo)
-      if (index(line, "review recorded: reviews/" pr ".json verdict=") != 1) next
+      if (index(line, "review recorded: reviews/" pr ".json verdict=") != 1) {
+        # ⛔ A MARKER FOR THIS PR EMBEDDED IN SOMETHING ELSE IS REPORTED (round 11). Its two real shapes are
+        # the ones the finding named: a trusted author QUOTING the marker inside a longer comment, and a
+        # LIST ITEM. Both are refused by the required check and by this reader now — silently dropping them
+        # here would read as "there is no record", which is the report-blindness the whole-artifact rule is
+        # NOT allowed to introduce.
+        if (index(line, "review recorded: reviews/" pr ".json verdict=") != 0) printf "NOTWHOLE\t%s\n", chan
+        next
+      }
+      # ⛔ THE WHOLE-ARTIFACT RULE, applied to BOTH channels (round 11 — BLOCKING). `whole` is
+      # the anchored ERE from `marker_whole_re` (see its header): the same predicate `record-review.sh` produces
+      # against and `check-pipeline-compliance.sh` admits against. Anything that only CONTAINS the marker
+      # — trailing prose, a quoted marker, a list item — is refused and REPORTED, never silently dropped.
+      if (line !~ whole) { printf "NOTWHOLE\t%s\n", chan; next }
       rest = line
       sub(/^review recorded: reviews\/[^ ]* verdict=/, "", rest)
       v = rest; sub(/ .*$/, "", v)
@@ -655,6 +701,12 @@ markers_ordered() { # markers_ordered <dir> <pr> [BODY|COMMENT|*]
 # this repo, one channel: "verdict TAB sha TAB auth", oldest first
 markers_from() {
   markers_ordered "$1" "$2" "${3:-*}" | cut -f1,2,4
+}
+
+nonwhole_markers() { # → "channel" for every marker-SHAPED artifact the whole-artifact rule refused
+  # ⛔ REPORTED, NOT DROPPED (round 11). A refusal a reader cannot see is indistinguishable from "there is
+  # no record", which is how a marker-in-a-longer-comment gets pasted again next round.
+  record_markers "$1" "$2" | awk -F'\t' '$1 == "NOTWHOLE" { print $2 }' | sort -u | paste -sd ',' -
 }
 
 # the recorder's CURRENT word is the NEWEST admitted marker, on whichever channel carried it
@@ -956,7 +1008,7 @@ analyse() { # analyse <dir> <pr>
   # recorder's current word; a comment-only marker is a WEAKER source the recorder itself does not
   # accept as an artifact, and a box-local record file is weaker still (it is not in the PR). Every
   # one of those prints its own `source=` so a reader cannot mistake the strength of the evidence.
-  local marker rverdict rsha rsource="marker-body" rsig="" rskipped rdenied rrefused=""
+  local marker rverdict rsha rsource="marker-body" rsig="" rskipped rdenied rrefused="" rnotwhole
   marker="$(last_marker "$dir" "$pr")"
   rverdict="$(printf '%s' "$marker" | cut -f1)"
   rsha="$(printf '%s' "$marker" | cut -f2)"
@@ -964,6 +1016,7 @@ analyse() { # analyse <dir> <pr>
   rsig="$(printf '%s' "$marker" | cut -f4)"
   rskipped="$(skipped_markers "$dir" "$pr")"
   rdenied="$(denied_markers "$dir" "$pr")"
+  rnotwhole="$(nonwhole_markers "$dir" "$pr")"
   # ⛔ THE BOX-LOCAL RECORD FILE IS EVIDENCE ONLY WHEN ITS OWN `sig=` VERIFIES (fresh-context review,
   # round 8 — the same admission, second channel). It is weaker than a marker in the PR (nobody can
   # audit it: no comment, no body line), and the gate refuses an unauthenticated one outright
@@ -1007,7 +1060,7 @@ analyse() { # analyse <dir> <pr>
   fi
 
   if [ -z "$rsha" ]; then
-    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped}${rdenied:+ · refused by ADMISSION: $rdenied}${rrefused:+ · $rrefused} — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos; a comment from an unattested author or with an unverifiable sig is not evidence either: the gate refuses it)"
+    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped}${rdenied:+ · refused by ADMISSION: $rdenied}${rnotwhole:+ · refused as NOT the whole artifact on channel(s) '$rnotwhole': the required check matches the marker against the WHOLE line / whole comment body, so a marker inside a longer comment, a list item, or a line carrying trailing prose is not evidence}${rrefused:+ · $rrefused} — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos; a comment from an unattested author or with an unverifiable sig is not evidence either: the gate refuses it)"
     emit review_bound INCONCLUSIVE "no reviewed head to bind to the landed tree"
     emit fix_round INCONCLUSIVE "no record history to read a fix round from"
     emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
@@ -1020,7 +1073,7 @@ analyse() { # analyse <dir> <pr>
     # check surface uses: an unrecognised verdict is unknown, never clean.
     case "$rverdict" in
       clean|clean-micro|clean-low)
-        emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource auth=$rsig${rskipped:+ · refused-as-foreign:$rskipped}${rdenied:+ · refused-by-admission:$rdenied}" ;;
+        emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource auth=$rsig${rskipped:+ · refused-as-foreign:$rskipped}${rdenied:+ · refused-by-admission:$rdenied}${rnotwhole:+ · refused-as-not-whole:$rnotwhole}" ;;
       not-clean)
         emit review_record FAIL "the standing record at head ${rsha:0:12} is NOT-CLEAN (source=$rsource) — a reviewer REFUSED this revision, so no clean review covers the content that landed${rskipped:+ · refused-as-foreign:$rskipped}" ;;
       "")

@@ -1000,42 +1000,94 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
-# The MARKER-PREFIX STRIP (fresh-context review, round 10 — P3). `\x2d` is a GAWK hex escape, not
-# POSIX ERE: where `\x` is not one, the class silently becomes `[[:space:]>*+x]`, so a marker written as
-# a LIST ITEM keeps its `-`, misses the `index(line, "review recorded: …") != 1` guard and is dropped as
-# INCONCLUSIVE — while a line starting with the letter `x` IS stripped. Both directions measured under
-# `gawk --posix`. The `-` belongs in LAST position, where it is literal everywhere.
+# THE WHOLE-ARTIFACT RULE (fresh-context review, round 11 — BLOCKING, the false-PASS class).
+#
+# ⛔ What this replaces, and why it is the same defect in the OPPOSITE direction from round 10. Round 10
+# was a P3 about a gawk-only `\x2d` escape inside the marker-prefix strip: under a POSIX-forcing awk the
+# class collapsed, a LIST-ITEM marker kept its `-`, and a real record read as INCONCLUSIVE. The fix then
+# hardened the escape — and in doing so PINNED the lenient grammar, because the strip's whole purpose was
+# to tolerate `- review recorded: …`. The required check refuses that artifact:
+# `check-pipeline-compliance.sh:523` anchors `REVIEW_RECORD_MARKER_RE` `^…$` and its comment arm applies it
+# to the comment's WHOLE body (`:756-760`), its body arm to each whole LINE (`:591-611`); and
+# `record-review.sh:2360-2377` names the reachable no-attacker case as a defect fixed twice — "a comment
+# whose FIRST LINE is the marker and which continues below".
+#
+# So the strip is GONE and the gate's predicate is applied unchanged: a marker is evidence only as the
+# WHOLE line (BODY) / the WHOLE comment body (COMMENT). Each case below MUST stay INCONCLUSIVE — a PASS
+# here is `VERDICT: ALL-MET` and exit 0 over an artifact the only required check throws away.
 # ════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ── case: a LIST ITEM — the artifact round 10 taught this reader to accept ───────────────────────
 R="$(mk comment-list-item 490)"
-: > "$R/pr-490/body.txt"
+: > "$R/pr-490/body.txt"          # the body is blank, so ONLY the comment could answer
 comment "$R" 490 OWNER "$(printf -- '- review recorded: reviews/490.json verdict=clean @ %s (o/r)\n' "$HEAD")"
 run "$R" 490 9001 "CI" 1; group "$R" 490 10 9001 "unit-test" completed success "$MERGED_AT"
 verify "$R"; rc=$?
-ck "comment-list-item: a marker written as a LIST ITEM is admitted (the strip exists to tolerate it)" \
-  "$(has 'PASS  review_record'; echo $?)"
-ck "comment-list-item: …from the comment channel" "$(has 'source=marker-comment'; echo $?)"
+ck "comment-list-item: a LIST-ITEM marker is NOT evidence (the required check anchors ^…$ on the whole body)" \
+  "$(has 'PASS  review_record' && echo 1 || echo 0)"
+ck "comment-list-item: …review_record is INCONCLUSIVE, so the run cannot claim ALL-MET" \
+  "$(has 'INCON review_record'; echo $?)"
+ck "comment-list-item: …and the refusal is REPORTED, never silently dropped" \
+  "$(has 'refused as NOT the whole artifact'; echo $?)"
+ck "comment-list-item: …naming the comment channel" "$(has "refused as NOT the whole artifact on channel(s) 'COMMENT'"; echo $?)"
+ck "comment-list-item: …and the run does not exit 0" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 
-# the ACTUAL shipped regex, executed — never a copy of it, or the case would grade prose
-_SUBLINE="$(grep -F 'sub(/^[[:space:]>*+' "$SCRIPT" | head -1)"
-ck "marker-prefix strip: the rule is present in the source and is the ONLY one (mutation site is real)" \
-  "$([ -n "$_SUBLINE" ] && echo 0 || echo 1)"
-case "$_SUBLINE" in
-  *'\x'*) ck "marker-prefix strip: uses no \`\\x\` escape inside the character class (gawk-only — a POSIX awk strips \`x\` instead of \`-\`)" 1 ;;
-  *)       ck "marker-prefix strip: uses no \`\\x\` escape inside the character class (gawk-only — a POSIX awk strips \`x\` instead of \`-\`)" 0 ;;
-esac
-_POSIX_AWK=""
-if command -v gawk >/dev/null 2>&1; then _POSIX_AWK="gawk --posix"
-elif printf 'x\n' | awk --posix '{ print }' >/dev/null 2>&1; then _POSIX_AWK="awk --posix"; fi
-if [ -n "$_POSIX_AWK" ]; then
-  _P="$(printf -- '- review recorded: x\nx review recorded: y\n' \
-    | $_POSIX_AWK "{ line=\$0; $_SUBLINE; print \"[\" line \"]\" }" 2>&1)"
-  ck "marker-prefix strip under a POSIX-forcing awk: a leading \`-\` IS stripped" \
-    "$(grep -qxF '[review recorded: x]' <<<"$_P" && echo 0 || echo 1)"
-  ck "marker-prefix strip under a POSIX-forcing awk: …and a leading \`x\` is NOT (the \`\\x\` collapse, measured)" \
-    "$(grep -qxF '[x review recorded: y]' <<<"$_P" && echo 0 || echo 1)"
+# ── case: A MARKER QUOTED INSIDE A LONGER COMMENT — the no-attacker case from record-review.sh ───
+# A trusted author pastes a legitimately-signed marker with a note above and below it. The gate refuses
+# that comment (its body is not the marker); so must this reader — and the OTHER comment in this fixture
+# is a real, whole marker at an OLDER head, so a lenient reader would report a PASS with the wrong head.
+R="$(mk comment-not-whole 491)"
+: > "$R/pr-491/body.txt"
+OLDH="5555555555555555555555555555555555555555"
+printf '%s\n%s\n' "$OLDH" "$HEAD" > "$R/pr-491/pr-commits.tsv"
+comment "$R" 491 OWNER "$(printf 'the recorder said:\nreview recorded: reviews/491.json verdict=clean @ %s (o/r)\nlooks right to me\n' "$HEAD")"
+run "$R" 491 9001 "CI" 1; group "$R" 491 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 491
+verify "$R"; rc=$?
+ck "comment-not-whole: a marker embedded in a LONGER comment is not evidence" \
+  "$(has 'PASS  review_record' && echo 1 || echo 0)"
+ck "comment-not-whole: …review_record is INCONCLUSIVE (and review_bound with it)" \
+  "$(has 'INCON review_bound'; echo $?)"
+ck "comment-not-whole: …the refusal is reported as not-the-whole-artifact" \
+  "$(has 'refused as NOT the whole artifact'; echo $?)"
+ck "comment-not-whole: …and exit is not 0" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+
+# ── case: TRAILING PROSE ON THE SAME LINE, and the BODY channel under the same rule ──────────────
+# Two artifacts, one rule: a single-line comment with text after the marker, and a whole-body line in the
+# PR body that carries trailing prose. The gate's comment arm refuses the first; its body arm refuses the
+# second. Both must be refused here, or the two readers have diverged again.
+R="$(mk marker-trailing-prose 492)"
+: > "$R/pr-492/body.txt"
+comment "$R" 492 OWNER "$(printf 'review recorded: reviews/492.json verdict=clean @ %s (o/r) — looks right\n' "$HEAD")"
+run "$R" 492 9001 "CI" 1; group "$R" 492 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "marker-trailing-prose: a single-line marker with TRAILING PROSE is not evidence" \
+  "$(has 'PASS  review_record' && echo 1 || echo 0)"
+ck "marker-trailing-prose: …and it is reported" "$(has 'refused as NOT the whole artifact'; echo $?)"
+
+R="$(mk body-trailing-prose 493)"
+printf 'review recorded: reviews/493.json verdict=clean @ %s (o/r) plus a sentence nobody signed\n' "$HEAD" \
+  > "$R/pr-493/body.txt"
+run "$R" 493 9001 "CI" 1; group "$R" 493 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "body-trailing-prose: the BODY channel is held to the same whole-line rule" \
+  "$(has 'PASS  review_record' && echo 1 || echo 0)"
+ck "body-trailing-prose: …and it is reported, not dropped" \
+  "$(has "refused as NOT the whole artifact on channel(s) 'BODY'"; echo $?)"
+
+# ── the source invariants: the lenient grammar is GONE, and the anchored rule is the ONLY gate ───
+# ⛔ These pin the SHAPE OF THE SOURCE, which is what a future edit would change; the cases above pin the
+# behaviour. Round 10 shipped a source pin for the strip in the wrong direction (it asserted the strip
+# was present), which is how the lenient grammar survived a review cycle.
+if grep -qF 'sub(/^[[:space:]>*+' "$SCRIPT"; then
+  ck "marker-prefix strip: the LIST-ITEM tolerance is ABSENT from the source (it is what admitted an artifact the gate refuses)" 1
 else
-  printf '  \033[33mSKIP\033[0m  the POSIX-awk dialect arm: neither \`gawk\` nor \`awk --posix\` is on this box (the source invariant above still holds everywhere)\n'
+  ck "marker-prefix strip: the LIST-ITEM tolerance is ABSENT from the source (it is what admitted an artifact the gate refuses)" 0
 fi
+ck "whole-artifact rule: the anchored grammar comes from \`marker_whole_re\` and is applied to every line" \
+  "$(grep -qF 'if (line !~ whole)' "$SCRIPT" && echo 0 || echo 1)"
+ck "whole-artifact rule: …and that grammar is anchored at BOTH ends (a prefix match would re-open the same hole)" \
+  "$(grep -F 'marker_whole_re()' -A2 "$SCRIPT" | grep -qF 'verdict=(clean|clean-micro|clean-low|not-clean) @ [0-9a-f]+' && echo 0 || echo 1)"
 
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
@@ -1459,6 +1511,38 @@ MS="$(mutant frame-no-newline-strip '        sub(/^[\n\r]+/, "")' '        x = 0
 VKEY="$TEST_KEY"; verify_with "$MS" "$T/comment-signed"; VKEY=""
 mutation_verdict M23 "auth=sig" \
   "the producer frame's own trailing newline is not stripped, so a trusted author is refused — case comment-signed is discriminating"
+
+# M28 — restore the PRE-FIX per-line split of a comment body (round 11's BLOCKING finding): any line of
+# any trusted comment becomes evidence, so a marker QUOTED inside a longer comment decides the predicate.
+MS="$(mutant comment-per-line-split '        if (index(body, "\n") != 0 || index(body, "\r") != 0) {
+          if (index(body, "review recorded: reviews/") != 0) printf "NOTWHOLE\tCOMMENT\n"
+          next
+        }
+        printf "COMMENT\t%s\t%s\n", assoc, body' '        n = split(body, L, "\n")
+        for (k = 1; k <= n; k++) { printf "COMMENT\t%s\t%s\n", assoc, L[k] }')" \
+  || bad "M28 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/comment-not-whole"
+mutation_verdict M28 "refused as NOT the whole artifact on channel(s) 'COMMENT'" \
+  "splitting a comment body into lines re-admits a marker embedded in a longer comment — case comment-not-whole is discriminating"
+
+# M29 — drop the anchored WHOLE-artifact shape check (the other half of the same finding): a marker with
+# trailing prose on its own line is evidence, on BOTH channels, and the gate refuses both.
+MS="$(mutant marker-no-whole-artifact '      if (line !~ whole) { printf "NOTWHOLE\t%s\n", chan; next }' '      if (0) { printf "NOTWHOLE\t%s\n", chan; next }')" \
+  || bad "M29 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/marker-trailing-prose"
+mutation_verdict M29 "refused as NOT the whole artifact on channel(s) 'COMMENT'" \
+  "without the anchored shape a marker carrying trailing prose is admitted — case marker-trailing-prose is discriminating"
+
+# M30 — the BODY channel under the same rule (the body arm of the gate is anchored per LINE): the same
+# mutation site as M29, measured on the body fixture, so a future edit cannot relax one channel only.
+MS="$(mutant marker-no-whole-artifact-body '      if (line !~ whole) { printf "NOTWHOLE\t%s\n", chan; next }' '      if (0) { printf "NOTWHOLE\t%s\n", chan; next }')" \
+  || bad "M30 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$T/body-trailing-prose"
+mutation_verdict M30 "refused as NOT the whole artifact on channel(s) 'BODY'" \
+  "without the anchored shape a BODY line carrying trailing prose is admitted — case body-trailing-prose is discriminating"
 
 # M27 is only measurable where the producer-side expressions can be EXECUTED (jq + a payload).
 if [ -n "${SHIM:-}" ]; then
