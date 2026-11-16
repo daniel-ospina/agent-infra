@@ -1888,15 +1888,20 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     It dispatches no writer of its own (its dispatcher is a stub), so it joins this equality without
 #     joining the dispatch population. Declared rather than filtered: the filter would have to be
 #     `*worker-supply*`, which is the file the next revalidation lands in.
-#   * ⛔ `pr-sickness.sh` / `pr-sickness.test.sh` (b07e022e9, #4042) landed on `main` after this list was
-#     last edited and are the SAME "red on its own base" class this block keeps recording: measured on
-#     this tree, `found`=47 vs the 45 declared, and BOTH added names are these two. `pr-sickness.sh`
-#     gates its own fix lane on the fixer contract — `brief_gate_probe` (:1184) resolves the SAME copy
-#     `fix-one.sh` would (`brief_gate_lib`, `spawn-gate.sh`) and refuses to dispatch when
-#     `brief-gate.sh --check` rejects it (:1145-1153) — so it is a CALLER of the gate's verdict, in the
-#     same class as `worker-supply.sh`. `pr-sickness.test.sh` is the REFERENCER that drives those arms.
-#     Neither writes a brief of its own. Declared rather than filtered: the filter would have to be
-#     `*pr-sickness*`, which is where the next gate-carrying fix path lands.
+#   * ⛔ `scripts/orchestrator-harness/pr-sickness.sh` (#4011) is a CALLER of the gate's verdict and it
+#     is the SECOND supervisor of the same question: before it spends a fixer it renders the fixer
+#     contract on THIS box with `brief_gate_probe()` — which resolves the SAME copy `fix-one.sh` would
+#     (`brief_gate_lib` first, then the checkout, then the farm destination) and runs
+#     `--section fixer` — and refuses with its own named skip when it cannot. Undeclared it reddens
+#     this equality with `ADDED: scripts/orchestrator-harness/pr-sickness.sh`, which is exactly how it
+#     was found (agent-infra#3906: this arm was the whole `brief-gate.test.sh` shard on `main` for
+#     four days). Declared rather than filtered: the filter would have to be `*sickness*`, which is the
+#     file the next revalidation arm lands in.
+#   * ⛔ `scripts/orchestrator-harness/pr-sickness.test.sh` is a REFERENCER of the same class as
+#     `capacity-transfer.test.sh`: it does not hard-code a brief — it calls the module's own
+#     `brief_gate_probe()` in a subshell ((v6), both directions, plus the `noBrief` mutant), so it
+#     grades the shipped contract rather than a stub's idea of one. It dispatches no writer of its own
+#     (its dispatcher is a stub). Declared, not filtered, for the same reason as its module.
 EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/gh-auth.test.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/pr-sickness.sh scripts/orchestrator-harness/pr-sickness.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/orchestrator-harness/worker-supply.sh scripts/orchestrator-harness/worker-supply.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_dispatch_path.py scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
@@ -1913,6 +1918,7 @@ for pair in "scripts/orchestrator-harness/lane.sh:--section lane" \
             "scripts/orchestrator-harness/merge-one.sh:--section reviewer" \
             "scripts/orchestrator-harness/nonblocking-dispatch.sh:--check" \
             "scripts/orchestrator-harness/spawn-gate.sh:brief_gate_run" \
+            "scripts/orchestrator-harness/pr-sickness.sh:--section fixer" \
             "scripts/orch-send.sh:--check -" \
             "scripts/safe-send.sh:--check" \
             "scripts/pr-doctor.py:brief-gate.sh"; do
