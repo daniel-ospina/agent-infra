@@ -680,7 +680,97 @@ def test_a_live_dispatcher_pid_without_an_agent_start_is_NOT_a_dispatch(tmp_path
     ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False, "a live dispatcher pid with no agent must NOT count as dispatched"
     assert record is False, "nothing may be recorded against the item"
-    assert "NOT counted as a launch" in detail
+    # ⛔ AND IT MUST SAY WHICH KIND OF "NOT LAUNCHED" THIS IS (review of #4047 at this head, P1): the
+    # marker is now written LAST, so "no marker yet" is the NORMAL state for the first ~11-50 s of a
+    # real launch on a slow box. The detail therefore carries the `PENDING:` token, which the pass
+    # classifies as neither a launch nor a delivery failure (see
+    # test_a_pending_spawn_is_not_UNDELIVERED below). A bare "not counted as a launch" here was read by
+    # the caller as `undeliverable += 1`.
+    assert pr.dispatch_pending(detail), detail
+
+
+def test_a_launch_marker_that_arrives_DURING_the_poll_is_still_a_launch(tmp_path, monkeypatch):
+    """⛔ THE SLOW-GATE READING, AND THE FALSIFIER FOR "THE MARKER IS WRITTEN EARLY" (P1, measured).
+
+    The marker is emitted immediately before the `pi` spawn, AFTER the capability gate — whose own
+    comment measures "~5-25 s on a healthy box". Both earlier tests pre-write `$O/bg/prd-9.log`, so
+    their poll succeeds on its FIRST read and neither could see a marker that arrives late. This one
+    writes it from inside the spawn call, i.e. after the poll has already started, which is exactly
+    the ordering a real launch produces on a box where a gate is slow. A poll that only reads once
+    (or that gave up before the marker landed) would answer `unconfirmed` here.
+    """
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: ("/wt/prd-9", ""))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    monkeypatch.setattr(pr, "AGENT_CONFIRM_S", 2.0)
+    os.makedirs(os.path.join(str(tmp_path), "bg"), exist_ok=True)
+    log_path = os.path.join(str(tmp_path), "bg", "prd-9.log")
+    # the pre-marker gates' own lines are all that exist when the dispatcher returns
+    with open(log_path, "w") as fh:
+        fh.write("[load-gate] load=3 < max_load=80\n")
+        fh.write("[capability-gate] LANE_CAPABILITY=ok\n")
+
+    def _spawn(argv, timeout=180, cwd=None, env=None, capture=True):
+        # the launch marker lands ~0.4 s later — inside the 2 s poll, after at least one read
+        def _write():
+            time.sleep(0.4)
+            with open(log_path, "a") as fh:
+                fh.write("[agent] provider=deepseek model=deepseek-flash label=bg prd-9\n")
+        threading.Thread(target=_write, daemon=True).start()
+        return "", "", 0
+
+    monkeypatch.setattr(pr, "sh_err", _spawn)
+    statuses = iter(["lost", "lost", "running"])
+    monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
+    ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is True, detail
+    assert record is True, "a launch that was witnessed must be recorded"
+    assert "agent started" in detail, detail
+
+
+def test_a_pending_spawn_is_not_UNDELIVERED(monkeypatch):
+    """⛔ A SLOW GATE MUST NOT MAKE THE PASS CRY `repair-chain` OVER LIVE AGENTS (P1, measured).
+
+    `dispatch()` legitimately cannot tell, ~11 s after a spawn, whether a worker on a box whose
+    capability gate takes 5-25 s has reached the launch point. Fed into the ordinary `not ok`
+    accounting that `PENDING:` became `undeliverable += 1` → `EXIT 3 / VERDICT=UNDELIVERED /
+    next=repair-chain`, whose own text says a human must repair the dispatch chain and that it "does
+    NOT clear by waiting" — over N agents that were alive at that moment and about to deliver. It is a
+    THIRD outcome: not a launch (so nothing is recorded and no slot is spent), not a failure (so the
+    pass may exit clean), re-read next pass.
+
+    REDDENS ON THE PRE-FIX TREE: there, this detail fell through to `undeliverable += 1` and the pass
+    returned `EXIT_UNDELIVERED` (3).
+    """
+    logs = []
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (
+                            False,
+                            "PENDING: the dispatcher pid is alive and no launch marker has appeared "
+                            "yet (the capability gate alone can take 5-25 s on a healthy box) and no "
+                            "exit status was recorded -- NOT a launch and NOT a refusal",
+                            False))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    assert rc == pr.EXIT_CLEAN == 0, (rc, joined)
+    assert "spawn-pending=1" in joined, joined
+    assert "repair-chain" not in joined, joined
+    assert not [k for k in saved if not k.startswith("_")], \
+        "a pending spawn consumed nothing, so it must hold no state row"
 
 
 def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
