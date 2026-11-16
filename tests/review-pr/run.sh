@@ -106,6 +106,15 @@
 #      exit 6, and so is a marker placed BEFORE the verdict — the presence of the block is not proof
 #      that a reviewer concluded anything (P2 finding, measured at the first review of this change)
 #
+#   §BK (#3987) the CLEAN ARTIFACT carries the MUTATION ATTRIBUTION block `record-review.sh`
+#      demands: the reviewer's own section is extracted and published in the evidence comment, the
+#      POSTED artifact is judged by the recorder's OWN predicate (`brief-gate.sh --mutation-missing`),
+#      the prompt carries the canonical shape byte for byte, the docs-only `NO NEW ASSERTIONS:` class
+#      records on that line alone, and a reviewer that omits the section is refused LOUDLY (exit 11,
+#      nothing posted, nothing recorded) instead of posting a verdict the recorder will reject. Two
+#      MUTATION controls: drop the extraction and the compliant transcript is refused; drop the
+#      pre-post validation and the refused artifact IS posted, with the real parser confirming it.
+#
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
 # proof of coverage.
@@ -160,7 +169,8 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
        FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE \
-       FIXTURE_NO_MARKER FIXTURE_MARKER_VERDICT FIXTURE_MARKER_COUNT
+       FIXTURE_NO_MARKER FIXTURE_MARKER_VERDICT FIXTURE_MARKER_COUNT \
+       FIXTURE_NO_MUTATION FIXTURE_MUTATION_EXEMPT
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -337,12 +347,43 @@ if [ -f "$TMP/reviewer-out" ] && grep -q '@TAILPROOF@' "$TMP/reviewer-out" 2>/de
   proof="$(printf '%s%s' "$nonce" "$tail_line" | sha256sum 2>/dev/null | cut -d' ' -f1)"
   [ -n "$proof" ] || proof="$(printf '%s%s' "$nonce" "$tail_line" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
   sed "s/@TAILPROOF@/$proof/g" "$TMP/reviewer-out" > "$TMP/reviewer-out.expanded" 2>/dev/null \
-    && cat "$TMP/reviewer-out.expanded"
-  REVIEWER_SRC="$TMP/reviewer-out.expanded"
+    && REVIEWER_SRC="$TMP/reviewer-out.expanded"
+  REVIEWER_SRC="${REVIEWER_SRC:-$TMP/reviewer-out}"
 else
-  cat "$TMP/reviewer-out" 2>/dev/null
   REVIEWER_SRC="$TMP/reviewer-out"
 fi
+# ── THE NON-VACUITY BLOCK (agent-infra#3987 / #3442) ──────────────────────────────────────────
+# This fake stands in for a COMPLIANT reviewer, so a transcript that REACHED a verdict also carries
+# the caller's required `## MUTATION ATTRIBUTION` section, printed immediately BEFORE the verdict line
+# exactly as the prompt says — the same discipline as the marker block below. A transcript with no
+# verdict-shaped line gets none (inventing one on a crashed review would un-cover the very refusal
+# §BK measures), and two knobs drive the refusal arms the seam must own:
+#   FIXTURE_NO_MUTATION=1     the reviewer OMITTED the section entirely (the mode-6 defect itself)
+#   FIXTURE_MUTATION_EXEMPT=1 the docs-only spelling: `NO NEW ASSERTIONS: <why>` at column 0
+if [ -z "${FIXTURE_NO_MUTATION:-}" ] && [ -f "${REVIEWER_SRC:-/nonexistent}" ]; then
+  _vl_no="$(grep -anE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" "$REVIEWER_SRC" 2>/dev/null | tail -1 | cut -d: -f1)"
+  if [ -n "${_vl_no:-}" ]; then
+    if [ "${FIXTURE_MUTATION_EXEMPT:-0}" = "1" ]; then
+      printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and adds no executable assertion.\n\n' > "$TMP/mutation-section.md"
+    else
+      cat > "$TMP/mutation-section.md" <<'MUT'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/x.sh:120` — the gate refuses an empty brief | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `REFUSED with 80 (got 0)`, rc=1 |
+
+MUT
+    fi
+    # Insert immediately BEFORE the last verdict-shaped line — the seam cuts the section there.
+    {
+      head -n $(( _vl_no - 1 )) "$REVIEWER_SRC"
+      cat "$TMP/mutation-section.md"
+      tail -n +"$_vl_no" "$REVIEWER_SRC"
+    } > "$TMP/reviewer-out.nonvacuous" 2>/dev/null && REVIEWER_SRC="$TMP/reviewer-out.nonvacuous"
+  fi
+fi
+cat "$REVIEWER_SRC" 2>/dev/null
 # ── THE STRUCTURED VERDICT MARKER (issue #2670) ───────────────────────────────────────────────
 # This fake stands in for a COMPLIANT reviewer, so a run that REACHED a verdict also prints the
 # caller's required marker block — the same way it prints the `diff-tail:` proof only when there is
@@ -502,6 +543,9 @@ reset() {
   # the structured-verdict marker (issue #2670): absent by default means "derive it from the
   # transcript", which is what every scenario written before the marker contract expects.
   FIXTURE_NO_MARKER=""; FIXTURE_MARKER_VERDICT=""; FIXTURE_MARKER_COUNT=""
+  # The NON-VACUITY block (agent-infra#3987): absent by default means a COMPLIANT reviewer, i.e. one
+  # that prints the attribution section before its verdict line. The two knobs drive the refusal arms.
+  FIXTURE_NO_MUTATION=""; FIXTURE_MUTATION_EXEMPT=0
   # The reviewer's model pair (agent-infra#2208/#3413): empty means "let the seam resolve its own
   # defaults", which is what every scenario except §A5 wants.
   FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
@@ -516,8 +560,16 @@ reset() {
 # cannot run — had NO assertion behind it, and deleting it left the suite green.
 run() {
   local script="$1"; shift
+  # ⛔ `AGENT_INFRA_PATH` IS PINNED TO THIS TREE (agent-infra#3987). The seam resolves
+  # `brief-gate.sh` through the ladder `$AGENT_INFRA_PATH/scripts/orchestrator-harness` — the same
+  # ladder `record-review.sh` uses — and the suite runs MUTANT copies of the script from `$TMP`,
+  # where no sibling `orchestrator-harness/` exists. Inheriting the caller's `AGENT_INFRA_PATH` made
+  # those scenarios depend on a box's HUB checkout (a different, possibly stale gate) or fail with
+  # the not-found refusal when it was unset; pinning it here makes every scenario validate against
+  # the tree under test, and no ambient value can change which gate answers.
   HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" \
     REVIEW_PR_RECORD_SH="${RECORDER_OVERRIDE:-$TMP/bin/fake-record}" \
+    AGENT_INFRA_PATH="$ROOT" \
     AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
     REVIEW_PR_MIN_TIMEOUT="${REVIEW_PR_MIN_TIMEOUT-}" \
     REVIEW_PR_KILL_GRACE="${REVIEW_PR_KILL_GRACE-}" \
@@ -3391,6 +3443,117 @@ else
   err_has "failed its own canary"; ck $? "  ...and the refusal names the canary"
 fi
 # ══ end §AQ ══
+
+# ── §BK the CLEAN artifact carries the NON-VACUITY block (agent-infra#3987 / #3442) ────────────
+# THE DEFECT THIS PINS. `record-review.sh` refuses to mint a clean record over an artifact carrying no
+# MUTATION ATTRIBUTION block (its #3442 arm), and this seam COMPOSES the artifact from a fixed
+# template that carried no reviewer text at all — so every clean review it produced was refused BY
+# CONSTRUCTION (issue #3987; measured on #4095, refused twice, and on #4038). The assertions below are
+# about the ARTIFACT THE RECORDER READS, judged by THE RECORDER'S OWN PREDICATE
+# (`brief-gate.sh --mutation-missing`, the exact parser its arm calls) — grepping this script's text
+# would prove the intent, never the artifact, which is the shape of test that let this ship.
+echo; echo "§BK a CLEAN artifact carries the MUTATION ATTRIBUTION block record-review.sh demands"
+GATE_SH="$ROOT/scripts/orchestrator-harness/brief-gate.sh"
+[ -f "$GATE_SH" ]; ck $? "the validator the recorder consults is present ($GATE_SH)"
+
+reset
+printf '[P3] scripts/x.sh:9 — a non-blocking style nit (does not block)\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a CLEAN whose reviewer wrote the attribution section still records (rc=$(rc_of))"
+_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
+[ -z "$_miss" ]; ck $? "…and the POSTED artifact SATISFIES record-review.sh's own parser (--mutation-missing='${_miss:-<accepted>}') — so its mode-6 refusal is unreachable for this run"
+grep -q '^## MUTATION ATTRIBUTION' "$TMP/comment.md" 2>/dev/null; ck $? "…the section is in the artifact with its heading intact"
+grep -qF 'the gate refuses an empty brief' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the REVIEWER's own rows, published verbatim (the claim is its own, never re-worded by this script)"
+grep -qF 'rc=80/rc=0' "$TMP/comment.md" 2>/dev/null; ck $? "…including the mutant column that names the edit reverting the behaviour"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in *"a non-blocking style nit"*) rc=1;; *) rc=0;; esac
+ck $rc "…while the reviewer's P3 prose stays OUT of the evidence body (the recorder's veto scans it)"
+
+# THE PROMPT MUST CARRY THE SHAPE (the producer half): the reviewer cannot emit what it was never
+# told, and #3987 is precisely the ingress that was left out when #3442 taught the others.
+BP="$(cat "$TMP/pi-prompt.txt" 2>/dev/null)"
+case "$BP" in *"MUTATION ATTRIBUTION"*) rc=0;; *) rc=1;; esac
+ck $rc "the reviewer's PROMPT requires the MUTATION ATTRIBUTION block"
+case "$BP" in *"NO NEW ASSERTIONS:"*) rc=0;; *) rc=1;; esac
+ck $rc "  …including the exemption line for a diff that adds no assertion (the docs-only class)"
+case "$BP" in *"reddened row"*) rc=0;; *) rc=1;; esac
+ck $rc "  …and the canonical column names, taken from brief-gate.sh --mutation-section (ONE text, no second template)"
+# The prompt must be the GATE'S OWN TEXT, not a paraphrase: render the gate and compare a sentence
+# while one that only exists in the canonical block (a paraphrase drops it, and a shape the recorder
+# does not recognise is the #3442 drift this reuses the verb to avoid).
+CANON="$(bash "$GATE_SH" --mutation-section 2>/dev/null)"
+CANON_LINE="$(printf '%s\n' "$CANON" | grep -F 'A verdict with no attribution block is INCOMPLETE, not clean' | head -1)"
+[ -n "$CANON_LINE" ]; ck $? "…the canonical block still carries its closing sentence (the byte-for-byte check below rests on it)"
+case "$BP" in *"$CANON_LINE"*) rc=0;; *) rc=1;; esac
+ck $rc "  …and that sentence reached the reviewer's prompt BYTE FOR BYTE (the block is pasted, not paraphrased)"
+
+# THE DOCS-ONLY CLASS from the issue: no assertion added, so the reviewer's ONE labelled line is what
+# satisfies the contract — driven, because "no new assertions" must not become a demand for a table.
+reset; FIXTURE_MUTATION_EXEMPT=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a docs-only CLEAN records on the reviewer's 'NO NEW ASSERTIONS:' line alone (rc=$(rc_of))"
+_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
+[ -z "$_miss" ]; ck $? "  …the artifact satisfies the parser (='${_miss:-<accepted>}')"
+grep -q '^NO NEW ASSERTIONS: docs-only' "$TMP/comment.md" 2>/dev/null; ck $? "  …at COLUMN 0, so it is a live exemption and not a quoted code block"
+
+# THE OMISSION — the mode-6 defect itself: a reviewer that concluded CLEAN and printed the marker but
+# wrote no section. It must FAIL LOUDLY, NAME the block, post NOTHING and record NOTHING.
+reset; FIXTURE_NO_MUTATION=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a CLEAN artifact with NO attribution section is refused with rc=11 (rc=$(rc_of))"
+no_comment; ck $? "  …NOTHING was posted (no CLEAN artifact for the recorder to reject)"
+no_record; ck $? "  …and NO record was minted"
+err_has "MUTATION ATTRIBUTION"; ck $? "  …the refusal NAMES the missing block"
+err_has "NO NEW ASSERTIONS"; ck $? "  …and the exemption line that would have satisfied it"
+err_has "--mutation-section"; ck $? "  …and the verb that prints the exact shape"
+err_has "REVIEWER OMISSION"; ck $? "  …and says whose omission it is, so the operator does not re-read the code for it"
+# …and with a P3 note in hand the NOTES comment may post (it is not the verdict), but no clean
+# artifact may: the PR must not carry a comment that says `Outcome: clean` and cannot be recorded.
+reset; FIXTURE_NO_MUTATION=1
+printf '[P3] scripts/x.sh:9 — a non-blocking style nit (does not block)\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "the same omission alongside a P3 note still refuses (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+[ ! -f "$TMP/comment-2.md" ]; ck $? "  …and no SECOND (verdict) comment was posted"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in *"Outcome: clean"*) rc=1;; *) rc=0;; esac
+ck $rc "  …so the PR never carries an 'Outcome: clean' artifact the recorder refuses"
+
+# ⛔ MUTATION 1 — the section is what satisfies the parser. With the extraction emptied the SAME
+# compliant transcript is refused, so §BK's positive arms are the block's doing, not luck.
+reset
+MB="$TMP/mutant-no-extract.sh"
+cp "$SRC" "$MB"; chmod +x "$MB"
+sed 's/^  MUTATION_SECTION_SEEN=.*/  MUTATION_SECTION_SEEN=""/' "$SRC" > "$MB"
+if cmp -s "$SRC" "$MB"; then
+  fail "the extraction mutation did not apply — §BK's positive arms would prove nothing"
+else
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MB" 2284
+  [ "$(rc_of)" = "11" ]; ck $? "the MUTANT that drops the reviewer's section is refused (rc=$(rc_of)) — the block in the artifact is what the recorder's parser reads"
+  no_comment; ck $? "  …posting nothing"
+fi
+
+# ⛔ MUTATION 2 — the PRE-POST validation is what keeps a refused artifact off the PR. Without it the
+# same transcript POSTS a clean artifact, and the recorder's own predicate then refuses it: the exact
+# #3987 shape, one layer down. That is the fail-open this gate removes.
+reset
+MG="$TMP/mutant-no-prepost.sh"
+cp "$SRC" "$MG"; chmod +x "$MG"
+sed 's/^  if \[ "\$_mv_rc" -ne 0 \] || \[ -n "\$_mv_miss" \]; then$/  if false; then/' "$SRC" > "$MG"
+if cmp -s "$SRC" "$MG"; then
+  fail "the pre-post mutation did not apply — the gate could be deleted with §BK green"
+else
+  FIXTURE_NO_MUTATION=1
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MG" 2284
+  grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null
+  ck $? "the MUTANT posts the clean artifact instead of refusing it (so the refusal is the gate's doing)"
+  _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
+  [ -n "$_miss" ]; ck $? "  …and record-review.sh's OWN parser refuses that posted artifact ('$_miss') — the exact silent refusal #3987 removed"
+fi
+reset
+# ══ end §BK ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

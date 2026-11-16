@@ -161,6 +161,13 @@
 #   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
 #      read for blocking findings, so a clean verdict cannot be certified — NOT recorded,
 #      and NOT read as clean (a failed scan is not an empty one)
+#   11 the reviewer concluded CLEAN but the artifact this run would post carries no MUTATION
+#      ATTRIBUTION block (agent-infra#3987 / #3442) — `record-review.sh` REFUSES to mint a clean
+#      record over such a comment, so posting it would buy a review that can never be recorded.
+#      Nothing was posted and NO record was written; the cause is a REVIEWER OMISSION (it was told
+#      the shape — the prompt carries `brief-gate.sh --mutation-section`), so the remedy is a re-run,
+#      not a code change. Distinct from 6/7 because the reviewer DID conclude clean and DID print
+#      the marker: the only missing thing is the non-vacuity block, and it is named by token.
 #
 # TEST SEAMS (the fixtures in tests/review-pr/run.sh drive exactly these; they are
 # not operational knobs and no production path sets them):
@@ -179,6 +186,7 @@ set -uo pipefail
 
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
+E_VACUOUS=11
 
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -276,6 +284,40 @@ if [ -z "$RECORDER" ]; then
 fi
 [ -f "$RECORDER" ] && [ -x "$RECORDER" ] \
   || die "$E_RECORD" "recorder '$RECORDER' is not a regular executable file — refusing to pay for a review whose record step cannot run"
+
+# ── THE NON-VACUITY VALIDATOR — resolved and PROVED before a review is paid for (agent-infra#3987)
+# A CLEAN record cannot be minted unless the artifact carries a MUTATION ATTRIBUTION block, and
+# `brief-gate.sh` owns BOTH halves of that contract: `--mutation-section` renders the shape the
+# reviewer must produce (it is pasted into the prompt below, so the shape taught and the shape
+# demanded are ONE text — the drift #3442 was filed over) and `--mutation-missing` is the predicate
+# `record-review.sh` itself runs on the artifact. Resolving it HERE, in the preflight, is what turns
+# "the recorder refused after a ten-minute review" into "the review was never paid for": a box whose
+# gate is missing, stale (a copy that predates #3442 answers 78 for the verb) or unreadable is a
+# HARNESS provisioning fault, and paying for a review whose record step is already known to be
+# unreachable is the waste this whole preflight section exists to prevent.
+# ⛔ THE LADDER IS `record-review.sh`'s, VERBATIM (self-adjacent, then `orchestrator-harness`, then
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness`, then `$HOME/.pi/agent/scripts`). Two different
+# ladders would let this file demand a shape from one copy while the recorder validates with another.
+BRIEF_GATE=""
+_bg_self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+for _bg_d in "$_bg_self" "$_bg_self/orchestrator-harness" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness" "${HOME:-}/.pi/agent/scripts"; do
+  [ -n "$_bg_d" ] && [ -f "$_bg_d/brief-gate.sh" ] && { BRIEF_GATE="$_bg_d/brief-gate.sh"; break; }
+done
+unset _bg_d _bg_self
+[ -n "$BRIEF_GATE" ] \
+  || die "$E_RECORD" "brief-gate.sh not found (looked beside this script, in ./orchestrator-harness, in \$AGENT_INFRA_PATH/scripts/orchestrator-harness and in \$HOME/.pi/agent/scripts) — it is the ONE definition of the MUTATION ATTRIBUTION block that record-review.sh demands of a clean artifact (agent-infra#3442/#3987), so without it this command can only buy a review it cannot record. Nothing was paid for. Provision the harness (bash scripts/orchestrator-harness/install.sh), then re-run."
+MUTATION_SECTION="$(bash "$BRIEF_GATE" --mutation-section 2>/dev/null)"; _ms_rc=$?
+if [ "$_ms_rc" -ne 0 ] || [ -z "${MUTATION_SECTION//[[:space:]]/}" ]; then
+  die "$E_RECORD" "the non-vacuity validator '$BRIEF_GATE' could not render the canonical MUTATION ATTRIBUTION block (--mutation-section rc=$_ms_rc, a copy that predates agent-infra#3442 answers 78 for it) — the reviewer could not be told the shape, so the artifact could not be recorded. This is HARNESS SKEW, not a review defect: refresh that copy (bash scripts/orchestrator-harness/install.sh, or \$AGENT_INFRA_PATH), then re-run. Nothing was paid for."
+fi
+# ⛔ NO SECOND PROBE HERE FOR `--mutation-missing`, AND THAT IS DELIBERATE (found by running §Q's
+# scanner-stub arm). Both verbs are answered by the SAME awk program, so a preflight probe would
+# preempt this file's own FINDINGS-scanner refusal — measured: with a broken `awk` on PATH the arm
+# that pins "a scanner that cannot run is never a clean scan" (exit 10) instead exited 9 from here, so
+# one failure got a second, differently-named refusal. The two verbs ship together (#3442 added both),
+# so `--mutation-section` answering already rules out a stale copy; what remains — a copy that answers
+# one and not the other — is caught by the PRE-POST check below, which refuses (exit 11) rather than
+# posting. Keep the preflight to the one question that only it can answer.
 
 # ── 1) EVIDENCE: repo + head, from the PR object itself ───────────────────────
 # `env -u GH_REPO` is load-bearing, not hygiene: an ambient GH_REPO is a global
@@ -735,12 +777,27 @@ prove it); a claim in the PR body the diff does not deliver; regressions;
 fail-open paths; and violations of the repo's own stated rules.
 Do NOT report style preferences, missing refactors, or "consider adding tests".
 
+## REQUIRED for a CLEAN verdict — the MUTATION ATTRIBUTION block (agent-infra#3442)
+The caller EXTRACTS this section from your output and publishes it in the review comment that
+\`record-review.sh\` reads, and that recorder REFUSES to mint a clean record over a comment with no
+such block (exit 3) — so a CLEAN verdict that omits it cannot be recorded and the PR cannot merge.
+Print it AFTER your per-line findings and IMMEDIATELY BEFORE your verdict line (the caller cuts the
+section there), and do not wrap it in a fence.
+The contract below is the recorder's OWN text, printed by
+\`brief-gate.sh --mutation-section\` — it is not a paraphrase, so do not paraphrase its heading,
+its column names, or the exemption line:
+
+$MUTATION_SECTION
+
 ## Output format — the caller PARSES this, so it is a contract
-One finding per line, graded by whether it BLOCKS a merge, then the verdict line, then
-the REQUIRED structured marker block described immediately below it:
+One finding per line, graded by whether it BLOCKS a merge, then the MUTATION ATTRIBUTION section
+above (REQUIRED when your verdict is CLEAN), then the verdict line, then the REQUIRED structured
+marker block described immediately below it:
   [P0|P1|P2] <file>:<line> — <what is wrong> — <why it matters>   <- BLOCKING
   [P3] <file>:<line> — a non-blocking note                        <- does NOT block
   ...
+  ## MUTATION ATTRIBUTION   <- one row per NEW assertion, or 'NO NEW ASSERTIONS: <why>' at
+                               COLUMN 0 when the diff adds none (see the section above)
   CLEAN        <- NO P0/P1/P2 finding above: nothing blocks the merge. P3 notes may
                   still be listed; the caller posts them as non-blocking notes.
   ISSUES <n>   <- n BLOCKING (P0/P1/P2) findings above; n = their count, not the P3s
@@ -2424,6 +2481,58 @@ if [ "$VERDICT" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
   exit "$E_ISSUES"
 fi
 
+# ── 5a2) THE NON-VACUITY BLOCK — extracted from the reviewer's OWN output (agent-infra#3987) ──
+# THE BUG THIS CLOSES, MEASURED. `record-review.sh` refuses to mint a FRESH `clean` over an artifact
+# carrying no MUTATION ATTRIBUTION block (its #3442 arm), and THIS file composes the artifact — from a
+# fixed template that contains no reviewer text at all. So every clean review this seam produced was
+# refused BY CONSTRUCTION: the comment said `Outcome: clean`, the recorder answered
+# `carries no MUTATION ATTRIBUTION block … a CLEAN verdict requires it`, and a correct change blocked
+# on the one seam the skill tells a lander to run (issue #3987; live on #4095, and #4038 before it).
+# The gate is right and is NOT weakened — the PRODUCER is fixed, in three places:
+#   1. the prompt now carries the canonical shape (`brief-gate.sh --mutation-section`, resolved and
+#      proved in the preflight above — one text, so the shape taught and the shape demanded cannot
+#      drift);
+#   2. the reviewer's own section is EXTRACTED here and published inside the artifact, verbatim, so
+#      the claim in the comment is the reviewer's, not this script's;
+#   3. the composed artifact is RE-VALIDATED with the recorder's own predicate (`--mutation-missing`)
+#      BEFORE it is posted, and the run refuses (exit 11, naming the missing block) rather than
+#      posting a verdict the recorder will reject. A silent refusal downstream of a paid review is
+#      the defect; a loud refusal here is the fix.
+# ⛔ WHAT THIS MUST NOT DO: invent the block. `review-pr.sh` cannot decide that a diff "adds no
+# assertions" — that is a review judgement, and a tool that wrote `NO NEW ASSERTIONS:` on its own
+# would be fabricating exactly the claim the block exists to make (a false PASS, the class #3442 was
+# filed over). The exemption line is only ever the REVIEWER's, and an absent one is a refusal.
+# ⛔ THE "NO ASSERTIONS" CASE IS THE PARSER'S, NOT A DIFF CLASSIFIER (the issue warns not to guess):
+# `record-review.sh` never inspects the diff. It asks `brief-gate.sh --mutation-missing` whether the
+# ARTIFACT carries the table OR a `NO NEW ASSERTIONS: <why>` line, so the docs-only class this issue
+# measured satisfies it with that one line — and this file asks the identical question of the
+# identical text. No second opinion about what "adds an assertion" means exists here.
+mutation_section_from() { # <transcript> -> the reviewer's section on stdout (empty when absent)
+  [ -r "$1" ] || return 0
+  # The section is the LAST `## MUTATION ATTRIBUTION` heading in the transcript (a reviewer that
+  # quotes the canonical shape and then writes its own claim must be read for its claim), running to
+  # the line before the verdict/marker block that follows it — the caller publishes the claim, not a
+  # second copy of the verdict. ⛔ THE CUT IS BEST-EFFORT AND FAILS CLOSED: over-cutting yields a
+  # section the parser then refuses (the run stops, naming the block) — never a passing artifact with
+  # someone else's text in it.
+  awk '
+    { n++; L[n] = $0 }
+    END {
+      start = 0
+      for (i = 1; i <= n; i++) { t = tolower(L[i]); if (t ~ /^[ \t]*#+[ \t]*mutation[ -]attribution/) start = i }
+      if (!start) exit
+      end = n
+      for (i = start + 1; i <= n; i++) {
+        s = L[i]; sub(/^[ \t]+/, "", s); tl = tolower(s)
+        if (tl ~ /^#*[ \t]*(\*\*|__)?[ \t]*(clean|issues)([^[:alnum:]_]|$)/) { end = i - 1; break }
+        if (tl ~ /^[ \t]*(\*\*|__)?[ \t]*(review_verdict|findings_blocking)([^[:alnum:]_]|$)/) { end = i - 1; break }
+      }
+      while (end > start && L[end] ~ /^[ \t]*$/) end--
+      for (i = start; i <= end; i++) print L[i]
+    }
+  ' "$1"
+}
+
 # ⛔ THE STRUCTURED MARKER GATE, ON THE SAME ONE PATH, AND AFTER THE FINDINGS ARMS (issue #2670).
 # A prose CLEAN alone is no longer a verdict: the marker makes "reports findings" a field comparison
 # instead of a grammar over the reviewer's English, which is the class twelve fix rounds of prose
@@ -2434,6 +2543,7 @@ fi
 # refused for the missing marker (exit 6).
 if [ "$VERDICT" = clean ]; then
   require_verdict_marker
+  MUTATION_SECTION_SEEN="$(mutation_section_from "$LOG")"
 fi
 
 # ── 5b) clean => CONFIRM THE HEAD HAS NOT MOVED, **BEFORE** ANY ARTIFACT EXISTS ──
@@ -2605,6 +2715,18 @@ if [ "$VERDICT" = clean ]; then
       printf 'The reviewer also left %s non-blocking note(s), quoted verbatim in comment %s on this PR — the `follow_up` disposition, not a verdict input (a note may repeat a severity label the reviewer quoted; it never blocks).\n' \
         "$(printf '%s\n' "$FINDINGS" | grep -c . )" "$NOTES_CID"
     fi
+    # ── THE NON-VACUITY BLOCK, IN THE ARTIFACT (agent-infra#3987) ───────────────────────────
+    # `record-review.sh` will not mint a clean record over an artifact without it (#3442), and this
+    # template is the artifact — so the reviewer's own section is published here, VERBATIM, with its
+    # provenance stated. Nothing is re-worded and nothing is invented: the row claims are the
+    # reviewer's, and the next check (after this block) is the recorder's own predicate run on these
+    # exact bytes. An empty section is not silently dropped — the check below refuses the run.
+    if [ -n "${MUTATION_SECTION_SEEN:-}" ]; then
+      printf '### Non-vacuity — the reviewer’s own MUTATION ATTRIBUTION block (agent-infra#3442)\n\n'
+      printf 'Quoted verbatim from the reviewer’s output for this revision; the recorder validates its shape\n'
+      printf '(presence of a mutant per new assertion, or an explicit exemption), never its substance.\n\n'
+      printf '%s\n' "$MUTATION_SECTION_SEEN"
+    fi
   } > "$COMMENT_FILE"
 else
   {
@@ -2623,6 +2745,35 @@ else
 fi
 
 POST_CID=""
+
+# ⛔ THE PRE-POST GATE THAT MAKES THE DOWNSTREAM REFUSAL UNREACHABLE (agent-infra#3987). The artifact
+# above is exactly what `record-review.sh --evidence` will read, so the recorder's OWN predicate is
+# run on these exact bytes (`brief-gate.sh --mutation-missing`, the same parser the recorder calls)
+# BEFORE they are published. A non-empty answer means the recorder would refuse the artifact it is
+# about to be handed — so the run stops here, naming the block, with NOTHING posted: a `CLEAN`
+# comment the recorder rejects is a false artifact on the PR and a paid review reported as a success
+# that never happened. ⛔ A CANNOT-VERIFY IS NEVER A PASS (this file's posture everywhere else, and
+# record-review.sh's `ma_rc` arm): a validator that does not answer refuses the run rather than
+# waving the artifact through, because the only thing silence could mean here is "the check did not
+# run" — and the failure it would hide is a merge permanently blocked by a missing paragraph.
+if [ "$VERDICT" = clean ]; then
+  _mv_rc=0
+  _mv_miss="$(bash "$BRIEF_GATE" --mutation-missing "$COMMENT_FILE" 2>/dev/null)" || _mv_rc=$?
+  if [ "$_mv_rc" -ne 0 ] || [ -n "$_mv_miss" ]; then
+    if [ -z "${MUTATION_SECTION_SEEN:-}" ]; then
+      err "$PROG: the reviewer concluded CLEAN but its output carries NO '## MUTATION ATTRIBUTION' section, so the comment this run would post could never be recorded: record-review.sh refuses a clean artifact without that block (agent-infra#3442), which is why agent-infra#3987 exists."
+      err "  This is a REVIEWER OMISSION, not a code defect — the prompt this run composed carries the canonical shape (\`bash $BRIEF_GATE --mutation-section\`), so the review is intact and a re-run is the remedy."
+    else
+      err "$PROG: the reviewer DID write a MUTATION ATTRIBUTION section but the composed artifact does not satisfy the recorder's parser ($(printf '%s' "$_mv_miss" | tr '\n' ' ')) — refusing to post an artifact record-review.sh would reject."
+      err "  That mismatch is a defect in THIS script's section extraction, not a reviewer error; the reviewer's section is in $LOG."
+    fi
+    err "  Recorded: one row per NEW assertion — assertion | mutant (the edit that reverts the fix) | reddened row | observed — or the single line 'NO NEW ASSERTIONS: <why>' at COLUMN 0 when the diff adds none. A CLEAN verdict without it is INCOMPLETE, not clean."
+    err "  The exact shape: bash $BRIEF_GATE --mutation-section"
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact carries no MUTATION ATTRIBUTION block ($(printf '%s' "${_mv_miss:-validator-unanswerable rc=$_mv_rc}" | tr '\n' ' ')) — record-review.sh would refuse it, so it was never posted; re-run the review"
+  fi
+fi
+
 if post_comment "$COMMENT_FILE"; then
   CID="$POST_CID"
 else
