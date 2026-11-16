@@ -138,8 +138,12 @@
 # the one documented route this widening newly reds. The contract that matters here is the helper's:
 # README §4.1 / `deploy-harness.sh:266-276`.)
 # ⛔ WHAT DEPTH 1 + THE DECLARED SET DOES **NOT** COMPARE, stated where the comparison is made rather
-# than only in the README: files at depth ≥ 2 (`retired/*`, the two `*/gh` shims), and depth-1 files
-# whose kind is in NEITHER declaration (`launchd.plist.template`, `port-provenance.txt`, the docs).
+# than only in the README: files at depth ≥ 2 (`retired/*`, the two `*/gh` shims), depth-1 files
+# whose kind is in NEITHER declaration (`launchd.plist.template`, `port-provenance.txt`, the docs), and
+# **every file of `$REL`'s PARENT that is not itself inside `$REL`** — `scripts/objective.py` is the one
+# that has been mis-read as covered: the repo ships it as a SIBLING of the harness dir, so a repo-side
+# edit to it is compared by nothing here, before or after #4015. A `$O/objective.py` is named only by
+# the present-but-not-shipped arm (below), as a hand-placed file — a different claim, not coverage.
 # `HARNESS_EXTENSIONLESS` exists so that the second list is a DECISION per file, not an accident of
 # the suffix list — an executable harness file must be named there or it is not compared.
 #

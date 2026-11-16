@@ -725,8 +725,10 @@ never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
-Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty-two `*.sh` plus `gh-rest/gh`
-and `gh-limit.py` — twenty-four entries (`install.sh:855`, moved by this PR's own added line) —
+Its `DRIFTED` warning iterates an explicit `for f in …` list of forty-two `*.sh` plus five `*.py`
+(`check-class.py`, `gh-limit.py`, `lane_registry.py`, `merge-reminder.py`, `nochk-resolve.py`) and
+`gh-rest/gh` — **forty-eight** entries at `install.sh:1725` (a stale "twenty-four entries, `install.sh:855`"
+stood here; the pointer moved with `write_provenance`) —
 and this file **is** on it (added when
 `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale `$O/nonblocking-dispatch.sh`
 names itself instead of silently leaving every background dispatch to fail. ⛔ A stale copy is
@@ -1328,17 +1330,28 @@ every listing — i.e. **depth-1 files of a DECLARED kind, in BOTH directions**.
 recursive `find`, so **the rule is: a file is outside that comparison if it sits deeper than depth 1, or
 if its kind is in neither declaration.** Concretely, OUTSIDE: `$O/retired/` (six `.sh` and four `.py`),
 `$O/gh-rest/gh`, `$O/gh-limit/gh`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two
-docs. INSIDE — and this is what #4015 changed: `$O/gh-limit.py`, `$O/gh-cred.py`, `$O/objective.py`,
-`$O/gh-app-token` and every other depth-1 driver. An earlier revision of this paragraph offered
+docs. INSIDE — and this is what #4015 changed: `$O/gh-limit.py`, `$O/gh-cred.py`, `$O/gh-app-token` and
+every other depth-1 driver **the harness dir ships** — compared as a blob in BOTH directions (MISSING,
+DIFFERS, and `$O`-carries-an-unshipped one). An earlier revision of this paragraph offered
 `$O/gh-limit.py` as its example of an UNCOVERED file: that was true of the `*.sh`-only gate and is now
 exactly wrong, in the one example most likely to be copied.
+⚠️ **`$O/objective.py` is NOT one of those, and an earlier revision of this paragraph listed it as if it
+were — measured, not argued.** The repo ships `objective.py` as a **sibling** of the harness dir
+(`scripts/objective.py`), not at depth 1 of it, so it is in neither listing as a shipped file: **a
+repo-side edit to `scripts/objective.py` is compared by nothing here**, before or after #4015. What
+*does* change is the other direction — a `$O/objective.py` no longer matching the repo is now NAMED,
+but by the **present-but-not-shipped** arm ("a hand-placed or retired script"), not by a blob
+comparison. Two arms, two meanings; the file's own comment says which is which.
 ⛔ **The aggregate payload FOLD is a separate scope and stays `*.sh`-only** — said here because this is
 the one place a reader will conflate "compared" with "folded". `o_payload_hash` / `prov_payload_hash`
 is a digest CONTRACT shared by three writers, so a stamp cannot name a `.py` difference; the per-file
 comparison can, and it does.
 
-`install.sh`'s `DRIFTED` list (`install.sh:855`) carries `gh-rest/gh` and
-`gh-limit.py` — the first is outside the gate, the second is now inside it — and never `retired/*` or
+`install.sh`'s `DRIFTED` list (`install.sh:1725`; an earlier revision cited `:855`, which is the
+`gh-app.pem` check) is a hand-maintained `for f in …` of forty-eight entries — forty-two `*.sh`, five
+`.py` (`check-class.py`, `gh-limit.py`, `lane_registry.py`, `merge-reminder.py`, `nochk-resolve.py`) and
+`gh-rest/gh`. It carries `gh-rest/gh`
+and `gh-limit.py` — the first is outside the gate, the second is now inside it — and never `retired/*` or
 `gh-limit/gh`. `check-single-source.sh --o` **does** compare
 `gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
 `launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
@@ -1353,20 +1366,33 @@ for a *missing* one, nor for an undeclared kind: more than the bare `cp *.sh` it
 
 ⚠️ **A verdict change on a route this repo still documents.** §4 step 1's plain-directory route
 (`cp scripts/orchestrator-harness/*.sh ~/orchestrator/`) deploys `*.sh` only, and a box prepared that way
-now reports one MISSING row per `.py` driver (up to eleven) and exits 1 where it previously read
-`OK … harness=current`. The verdict is truthful — the box genuinely lacks the drivers, which is the
-whole point of #3016/#4015 — but it is a NEW red on a documented route, so it is stated here rather than
-discovered on a box. `scripts/harness-up` / this helper (recursive `find`) or `install.sh` clears it.
+now reports **twelve** MISSING rows — the eleven depth-1 `.py` drivers **plus** the extensionless
+`gh-app-token` — and exits 1 where it previously read `OK … harness=current`. The verdict is truthful —
+the box genuinely lacks the drivers, which is the whole point of #3016/#4015 — but it is a NEW red on a
+documented route, so it is stated here rather than discovered on a box.
+⛔ **ONLY THIS HELPER (recursive `find`) CLEARS IT.** Two commands that earlier revisions of this
+paragraph named as clearers **cannot**, and that is measured off the seeders, not a style call:
+`scripts/harness-up` is `orchestrator-bringup.sh deploy_harness`, whose seeder is
+`for src in "$SRC_HARNESS"/*.sh` (`scripts/orchestrator-bringup.sh:716`, `:791`) — `*.sh` only, so every
+`.py` row and the `gh-app-token` row persist; and `install.sh` never seeds the harness tree at all — it
+seeds exactly four files (`$O/gh-rest/gh` `:800`, `$O/gh-limit.py` `:817`, `$O/gh-cred.py` `:833`,
+`$O/gh-app-token` `:843`, which its own comment at `:1897-1898` states), clearing 2 of the 11 `.py`
+rows. An operator sent to either would re-run it, watch the same red, and conclude *the check* is
+broken — the one failure mode this file exists to prevent.
 Widening the `*.sh`-only seeders (`orchestrator-bringup.sh deploy_harness`, `cloud-cell-quiesce.sh`,
 `cloud-cell-supervisor.sh seed_and_stamp`, `deploy-crossbox.sh`) is the DEPLOYMENT half of #4015 and is
 deliberately not part of this change.
 
-⚠️ Three earlier drafts of this paragraph were wrong and are recorded rather than quietly replaced: one
+⚠️ **Six** earlier claims in this section were wrong and are recorded rather than quietly replaced: one
 said the shim had "no comparator on any path" (false — `check-single-source.sh --o` compares it for
 *difference*), one said **four** populations were uncovered (false — the set is defined by the rule
-above, not by a count), and one named `$O/gh-limit.py` as an uncovered file (true only of the
-`*.sh`-only gate; #4015 put it inside — corrected above, not deleted). An unverified claim in a file
-about unverified claims is this issue, so all three are stated here.
+above, not by a count), one named `$O/gh-limit.py` as an uncovered file (true only of the
+`*.sh`-only gate; #4015 put it inside — corrected above, not deleted), one listed `$O/objective.py`
+as now covered (false — it is a sibling of the harness dir in the repo, so only the
+present-but-not-shipped arm can ever name it), one named `scripts/harness-up` and `install.sh` as
+clearers of the new red (neither ships the drivers — measured above), and one said "up to eleven"
+MISSING rows (twelve: the `gh-app-token` row is the one the count dropped). An unverified claim in a
+file about unverified claims is this issue, so all six are stated here.
 
 **AND THIS HELPER NOW RECORDS THE BOX'S OWN PROVENANCE (`agent-infra`, 2026-10-29).** At the end of a
 verified deploy it writes `$O/.harness-provenance` — the source commit, the ref, and a sha256 for
