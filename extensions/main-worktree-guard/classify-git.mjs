@@ -2276,6 +2276,10 @@ function _walkShell(command, h = {}, seedVars = {}) {
     let workTreeHint = pendingHints.workTreeHint ?? frame().persistHints.workTreeHint ?? null;
     let indexFileHint = pendingHints.indexFileHint ?? null;
     let objDirsHint = pendingHints.objDirsHint ?? null;
+    // #594 review round 12: git's HIGHEST-precedence exec path, from the argv
+    // option `--exec-path=<dir>` (see the capture in the flag loop). Per
+    // invocation only — it is not a hint that carries across segments.
+    let execPathHint = null;
     const envPrefixes = pendingHints.envPrefixes ? [...pendingHints.envPrefixes] : [];
     pendingHints = {};
     h.onGitStart?.(f);
@@ -2314,6 +2318,22 @@ function _walkShell(command, h = {}, seedVars = {}) {
       if (/^GIT_OBJECT_DIRECTORY=/.test(g) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(g)) { objDirsHint = expand(g.slice(g.indexOf("=") + 1)); i++; continue; }
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
+      // ⛔ #594 review round 12 (MEASURED FAIL-OPEN): `--exec-path=<dir>` is the
+      // HIGHEST-precedence channel in git's search for `git-<cmd>`.
+      // `handle_options` hands it to `git_set_exec_path()` (git.c:163-166, at the
+      // v2.43.0 this box runs) and `setup_path()` then puts THAT directory at the
+      // front of the search, ahead of `GIT_EXEC_PATH` and the built-in gitexecdir
+      // (git.c:913-918; exec-cmd.c:281-325 — `git_set_exec_path` also overwrites
+      // the variable, so the option REPLACES the env, it does not add to it).
+      // Unrecorded, the flag fell through the `startsWith("-")` skip below and
+      // `_gitExternalOnPath` kept resolving against the GUARD's exec path — so
+      // `git --exec-path=<empty> submodule` bought the installed-extension
+      // exemption for a lookup in which git cannot see `git-submodule` at all,
+      // and git fell through to a persisted `alias.submodule` (measured: it moved
+      // `refs/heads/victim`). Recorded argv-ordered, LAST WINS, as git applies it.
+      // The bare `--exec-path` form is deliberately NOT consumed: git prints the
+      // path and exits(0) there (git.c:166-170) — it never takes the next token.
+      if (g.startsWith("--exec-path=")) { execPathHint = expand(g.slice("--exec-path=".length)); i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
       if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "c", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; }
       if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "env", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; } // cycle-6 P1: space form
@@ -2362,6 +2382,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     h.onGitEnd?.({
       verb, args, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
+      execPathHint,
       configOverrides, configEnvOverrides, configOps, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
@@ -4478,6 +4499,20 @@ function _splitAliasValue(value) {
  * @returns {boolean} true iff a `git-<verb>` executable is resolvable
  */
 const _gitExternalPathCache = new Map();
+/**
+ * The `--exec-path=<dir>` VALUE the invocation carries, last occurrence winning,
+ * or `undefined` when it carries none. The `"\u0000"` sentinel (the walker's
+ * "value set, but a `$VAR` in it was never readable") is passed through so the
+ * caller can fail closed instead of treating it as a path.
+ * @param {object} [inv]
+ * @returns {string|undefined}
+ */
+function _invExecPathArg(inv) {
+  if (!inv) return undefined;
+  const v = inv.execPathHint;
+  if (v === undefined || v === null) return undefined;
+  return String(v);
+}
 // The exec-path list is probed ONCE per process: it needs a `git` call, and the
 // GUARD's own view of it cannot change inside a session. A command-local
 // `GIT_EXEC_PATH` prefix is NOT this list — it is read per invocation by
@@ -4539,11 +4574,33 @@ function _invEnvUnreadable(inv, name) {
 function _gitSearchDirs(inv) {
   const prefixPath = _invEnvValue(inv, "PATH");
   const prefixExec = _invEnvValue(inv, "GIT_EXEC_PATH");
+  // ⛔ THE ARGV OPTION IS A THIRD CHANNEL AND IT OUTRANKS BOTH OTHERS (review
+  // round 12, measured fail-open). `git --exec-path=<dir> <verb>` makes git search
+  // `<dir>` for `git-<verb>` INSTEAD of `GIT_EXEC_PATH`/the built-in gitexecdir —
+  // `git_set_exec_path()` sets the value `git_exec_path()` returns, and
+  // `setup_path()` prepends only that one (git.c:163-166, :913-918; exec-cmd.c:281
+  // at v2.43.0). So an option value REPLACES the exec dirs, exactly as a
+  // command-local `GIT_EXEC_PATH` prefix does, and the guard's own probed list
+  // must not survive it: leaving it in bought an exemption for a `git-<verb>` git
+  // could not reach. Measured on the pre-fix head: `alias.submodule='branch -fq
+  // victim'` + `git --exec-path=<empty> submodule master` force-moved the ref, rc
+  // 0, while the classifier answered `branchState:false` (ALLOW).
+  // The value is `PATH`-inserted by git (`add_path` appends it plus a PATH_SEP,
+  // exec-cmd.c:303-325), so a colon-bearing value really does name several
+  // entries — split it the same way. An EMPTY value contributes nothing (git's
+  // `add_path` skips it), which `split` already yields as a skipped "".
+  const optExec = _invExecPathArg(inv);
   if (prefixPath === undefined && _invEnvUnreadable(inv, "PATH")) return null;
-  if (prefixExec === undefined && _invEnvUnreadable(inv, "GIT_EXEC_PATH")) return null;
-  const execDirs = prefixExec !== undefined
-    ? String(prefixExec).split(":")
-    : _gitExecPathDirs();
+  if (optExec === "\u0000") return null; // option value unreadable → fail closed
+  let execDirs;
+  if (optExec !== undefined) {
+    execDirs = optExec.split(":");
+  } else {
+    if (prefixExec === undefined && _invEnvUnreadable(inv, "GIT_EXEC_PATH")) return null;
+    execDirs = prefixExec !== undefined
+      ? String(prefixExec).split(":")
+      : _gitExecPathDirs();
+  }
   const pathDirs = prefixPath !== undefined
     ? String(prefixPath).split(":")
     : String(process.env.PATH ?? "").split(":");

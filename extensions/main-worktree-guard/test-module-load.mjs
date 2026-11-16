@@ -503,12 +503,54 @@ async function partB() {
       const replaced = fresh.classifyGitCommandDetailed(`GIT_EXEC_PATH=${execEmptyDir} git fx594exe pull`);
       expectTrue("B10p2e: #594 a child `GIT_EXEC_PATH` REPLACES git's exec path — the shim is gone, so the verb is opaque (fail closed)",
         replaced.branchState === true, `branchState=${replaced.branchState}`);
+      // ── B10p3: review round 12 — `--exec-path=<dir>` is git's THIRD and HIGHEST-
+      //    precedence exec-path channel: `handle_options` hands it to
+      //    `git_set_exec_path()`, and `git_exec_path()` then returns THAT value, so
+      //    `setup_path()` prepends it INSTEAD of `GIT_EXEC_PATH` and instead of the
+      //    built-in gitexecdir (git.c:163-166, :913-918; exec-cmd.c:281-325 at the
+      //    v2.43.0 this box runs). The walk dropped the flag, so `_gitExternalOnPath`
+      //    resolved against the GUARD's exec path (here: `GIT_EXEC_PATH=<shim dir>`
+      //    from the block above) and bought the exemption for a lookup git could
+      //    not satisfy — git then fell through to a persisted `alias.fx594exe`.
+      //    Measured pre-fix: `alias.submodule='branch -fq victim'` +
+      //    `git --exec-path=<empty> submodule master` force-moved the ref rc 0 while
+      //    the classifier answered `branchState:false` (ALLOW).
+      const optResident = fresh.classifyGitCommandDetailed(`git --exec-path=${execShimDir} fx594exe pull`);
+      expectTrue("B10p3a: control — an `--exec-path=` dir that HOLDS the `git-<cmd>` still buys the exemption (the option's dir is searched, no over-block)",
+        optResident.branchState === false, `branchState=${optResident.branchState}`);
+      const optReplaced = fresh.classifyGitCommandDetailed(`git --exec-path=${execEmptyDir} fx594exe pull`);
+      expectTrue("B10p3b: #594 `--exec-path=<empty>` REPLACES the exec path (the guard's own `GIT_EXEC_PATH` must not survive it) — the shim is unreachable, so the verb is aliasOpaque (fail closed)",
+        optReplaced.branchState === true, `branchState=${optReplaced.branchState}`);
+      const optLast = fresh.classifyGitCommandDetailed(`git --exec-path=${execEmptyDir} --exec-path=${execShimDir} fx594exe pull`);
+      expectTrue("B10p3c: …and the LAST `--exec-path=` wins, as git applies them in turn, so the shim is found again (not a blanket refusal of the spelling)",
+        optLast.branchState === false, `branchState=${optLast.branchState}`);
+      const optUnreadable = fresh.classifyGitCommandDetailed("git --exec-path=$MWG594_UNSET_VAR fx594exe pull");
+      expectTrue("B10p3d: an `--exec-path=$VAR` whose value the walk never saw set stays opaque — unreadable, never a silent admission",
+        optUnreadable.branchState === true, `branchState=${optUnreadable.branchState}`);
     } finally {
       if (prevExecPath === undefined) delete process.env.GIT_EXEC_PATH;
       else process.env.GIT_EXEC_PATH = prevExecPath;
       for (const d of [execShimDir, execEmptyDir]) {
         try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
       }
+    }
+    // ── B10p3e/f: the same channel at the HANDLER layer, on git's OWN resident
+    //    extension (host-independent: `git-submodule` lives in `<git --exec-path>`,
+    //    which is on no shell PATH, and B10p1b already relies on that). Pre-fix the
+    //    guard resolved `git-submodule` through its own exec path and exempted the
+    //    verb while GIT — told `--exec-path=<empty>` — could not find it at all and
+    //    fell through to a persisted `alias.submodule` (measured ref force-move).
+    const optEmptyDir = mkdtempSync(join(tmpdir(), "mwg594optnone-"));
+    try {
+      const subOptNone = await callBash(`git --exec-path=${optEmptyDir} submodule master`);
+      expectTrue("B10p3e: #594 `--exec-path=<empty> submodule master` is BLOCKED aliasOpaque (pre-fix: the guard's exec path exempted it, so a persisted `alias.submodule` ran)",
+        !!subOptNone && subOptNone.block === true && /alias/i.test(String(subOptNone.reason ?? subOptNone.message ?? "")),
+        `handler returned ${JSON.stringify(subOptNone)}`);
+      const subOptReal = await callBash(`git --exec-path=${execSync("git --exec-path", { encoding: "utf-8" }).trim()} submodule update --init --recursive`);
+      expectTrue("B10p3f: control — pointing `--exec-path=` at the REAL exec dir keeps the resident extension ALLOWED (the option is MODELLED, not refused)",
+        subOptReal === undefined, `handler returned ${JSON.stringify(subOptReal)}`);
+    } finally {
+      try { rmSync(optEmptyDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
     // CONTROL: where an alias genuinely CAN win, the destructive shape is still
     // gated exactly as it was (the review's verified `branch(op=force)` case).

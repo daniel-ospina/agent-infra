@@ -1490,6 +1490,47 @@ dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d 
 // --dry-run stays a normal push (no false delete).
 dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
 
+// ── #594 review round 12: the `--exec-path=<dir>` CHANNEL must be RECORDED ────
+// git resolves `git-<cmd>` against the `--exec-path` OPTION first, then
+// `GIT_EXEC_PATH`, then its built-in gitexecdir: `handle_options` hands the
+// option to `git_set_exec_path()` and `setup_path()` prepends exactly that one
+// directory to the search (git.c:163-166 and :913-918, exec-cmd.c:281-325 at the
+// v2.43.0 this box runs). The walk consumed pre-verb `--opt=value` tokens without
+// RECORDING them, so the installed-extension exemption in `_gitExternalOnPath`
+// kept resolving against the GUARD's exec path even when the option had just
+// replaced it. Measured on the pre-fix head: `alias.submodule='branch -fq victim'`
+// plus `git --exec-path=<empty> submodule master` force-moved `refs/heads/victim`,
+// rc 0, while the classifier answered `branchState:false` (ALLOW) — so
+// `index.ts:6306` (`if (det && det.branchState && !allowActive)`) never reached
+// M3 at all. These pins are the RECORD half and are host-independent; the SEARCH
+// half (real shim directories) is pinned in test-module-load.mjs B10p3*.
+function execPathHintOf(cmd) {
+  const inv = allGitInvocations(cmd)[0];
+  return inv ? inv.execPathHint : "<no-invocation>";
+}
+function expectExecPath(name, cmd, expected) {
+  const got = execPathHintOf(cmd);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
+  ok ? pass++ : fail++;
+}
+expectExecPath("#594-R12a the `--exec-path=<dir>` option is part of the invocation record", `git --exec-path=/tmp/r12x594 submodule master`, "/tmp/r12x594");
+expectExecPath("#594-R12b …argv-ordered, LAST occurrence winning (git applies each in turn, `git_set_exec_path` overwrites)", `git --exec-path=/tmp/r12a594 --exec-path=/tmp/r12b594 submodule`, "/tmp/r12b594");
+expectExecPath("#594-R12c …also after another pre-verb option (`-C`), so position does not hide it", `git -C /repo --exec-path=/tmp/r12y594 submodule`, "/tmp/r12y594");
+expectExecPath("#594-R12d …with a `$VAR` resolved from a PRIOR segment, as `-C` operands are", `D=/tmp/r12d594 && git --exec-path=$D submodule`, "/tmp/r12d594");
+expectExecPath("#594-R12e …and a `$VAR` the walk never saw set leaves the value UNREADABLE (\\u0000 → the search fails closed)", `git --exec-path=$R12_UNSET_594 submodule`, "\u0000");
+expectExecPath("#594-R12f control — after the verb it is NOT the channel (it is an argument of the subcommand)", `git submodule --exec-path=/tmp/r12z594`, null);
+expectExecPath("#594-R12g control — the BARE `--exec-path` form consumes no value (`git.c`: it prints the path and exits 0)", `git --exec-path submodule`, null);
+// A per-invocation option must not leak FORWARD into the next segment's search.
+const r12Segs = allGitInvocations(`git --exec-path=/tmp/r12seg594 log --oneline && git submodule`);
+expectBoolForR12("#594-R12h …and it does not leak into a LATER segment (per invocation, not per command)",
+  r12Segs.length === 2 && r12Segs[0].execPathHint === "/tmp/r12seg594" && r12Segs[1].execPathHint === null);
+function expectBoolForR12(name, cond) {
+  const ok = cond === true;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${ok}`);
+  ok ? pass++ : fail++;
+}
+
 // ── #653: the delete target must be a LITERAL ref, or the arm fails closed ──
 // The #73 arm matched the delete target as TEXT, so a target the SHELL produces
 // named no ref, nothing was checked out under it, and the delete was ALLOWED.
