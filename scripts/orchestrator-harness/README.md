@@ -723,8 +723,10 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 
-⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:800`) and `$O/gh-limit.py` (`:817`); everything else is the operator's `cp`, §4 step 1.
+⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all: the four files it seeds are
+`$O/gh-rest/gh` (`install.sh:800`), `$O/gh-limit.py` (`:817`), `$O/gh-cred.py` (`:833`) and
+`$O/gh-app-token` (`:843`), and everything else is the operator's `cp`, §4 step 1. (An earlier revision
+named only the first two — the same four-file set §4.1 states, so the two sections now agree.)
 Its `DRIFTED` warning iterates an explicit `for f in …` list of forty-two `*.sh` plus five `*.py`
 (`check-class.py`, `gh-limit.py`, `lane_registry.py`, `merge-reminder.py`, `nochk-resolve.py`) and
 `gh-rest/gh` — **forty-eight** entries at `install.sh:1725` (a stale "twenty-four entries, `install.sh:855`"
@@ -1271,7 +1273,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 | Path | What it still does |
 |---|---|
 | `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:800`) and `$O/gh-limit.py` (`install.sh:817`) — the four files it seeds in total are named in §4.1's "only this helper clears it" paragraph — no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:1749`, `:1981`; an earlier revision cited `:822`/`:1003`, which are unrelated statements). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
-| `deploy-mac-orchestrator.sh` phase A (`:292-296`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-mac-orchestrator.sh` phase A (`install_phase_a` `:114-127`, called at `:395`, with `install_file` at `:161`) | `cp -R` for subdirectories and `install_file` for files — **every** entry of the staged harness except `orch-loop.sh`, so it DOES seed the `.py` drivers and `gh-app-token`; since #4003 a failed entry is counted and FAILS the run (`exit 1`), the `copied N entries` line is a count of the *source listing*, and the byte `cmp` still covers **only `claims.sh`** (plus the `lib/lane-ceiling.sh` stage below) |
 | `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
 | `cloud-cell-quiesce.sh` step 4 (`scripts/cloud-cell-quiesce.sh:74-79`) | the cell-recovery redeploy: `cp "$HARNESS"/*.sh "$O"/ 2>/dev/null || true` — depth-1, **rc discarded**, then `seeded $O with $(ls "$O"/*.sh | wc -l)` read from the **target**, and a controller started on it (`:89-92`). That is all three mechanisms #2041 names, verbatim; it is listed here rather than quietly omitted |
@@ -1371,29 +1373,42 @@ now reports **twelve** MISSING rows — the eleven depth-1 `.py` drivers **plus*
 `gh-app-token` — and exits 1 where it previously read `OK … harness=current`. The verdict is truthful —
 the box genuinely lacks the drivers, which is the whole point of #3016/#4015 — but it is a NEW red on a
 documented route, so it is stated here rather than discovered on a box.
-⛔ **ONLY THIS HELPER (recursive `find`) CLEARS IT.** Two commands that earlier revisions of this
-paragraph named as clearers **cannot**, and that is measured off the seeders, not a style call:
-`scripts/harness-up` is `orchestrator-bringup.sh deploy_harness`, whose seeder is
+⛔ **TWO ROUTES CLEAR IT: this helper (recursive `find`) and the Mac's own copier.**
+`scripts/deploy-mac-orchestrator.sh`'s `install_phase_a` (`:114-127`, called at `:395`) loops
+`for f in "$H"/*` and installs **every** entry of the staged harness — `cp -R` for a subdirectory,
+`install_file` (`:161`) for a file, and `orch-loop.sh` the deliberate exception — so it seeds all eleven
+`.py` drivers and the extensionless `gh-app-token`, and does clear the twelve rows. It is the
+`deploy-mac-orchestrator.sh` row in the table above, and unlike the `*.sh`-only seeders below it lands a
+per-entry verdict as it goes. Two commands that earlier revisions of this paragraph named as clearers
+**cannot**, and that is measured off the seeders, not a style call: `scripts/harness-up` is
+`orchestrator-bringup.sh deploy_harness`, whose seeder is
 `for src in "$SRC_HARNESS"/*.sh` (`scripts/orchestrator-bringup.sh:716`, `:791`) — `*.sh` only, so every
 `.py` row and the `gh-app-token` row persist; and `install.sh` never seeds the harness tree at all — it
 seeds exactly four files (`$O/gh-rest/gh` `:800`, `$O/gh-limit.py` `:817`, `$O/gh-cred.py` `:833`,
-`$O/gh-app-token` `:843`, which its own comment at `:1897-1898` states), clearing 2 of the 11 `.py`
-rows. An operator sent to either would re-run it, watch the same red, and conclude *the check* is
-broken — the one failure mode this file exists to prevent.
+`$O/gh-app-token` `:843`), clearing **3 of the twelve** rows — the two `.py` seeds and the extensionless
+one — and none of the other nine `.py` drivers. (An earlier revision of this sentence attributed that
+four-file set to "its own comment at `:1897-1898`": that comment names only two of the four,
+`$O/gh-rest/gh` and `$O/gh-limit.py`, and says nothing about the set — the four are established at the
+four seed sites, not by a comment.) An operator sent to either non-clearing route would re-run it,
+watch the same red, and conclude *the check* is broken — the one failure mode this file exists to
+prevent.
 Widening the `*.sh`-only seeders (`orchestrator-bringup.sh deploy_harness`, `cloud-cell-quiesce.sh`,
 `cloud-cell-supervisor.sh seed_and_stamp`, `deploy-crossbox.sh`) is the DEPLOYMENT half of #4015 and is
 deliberately not part of this change.
 
-⚠️ **Six** earlier claims in this section were wrong and are recorded rather than quietly replaced: one
+⚠️ **Seven** earlier claims in this section were wrong and are recorded rather than quietly replaced: one
 said the shim had "no comparator on any path" (false — `check-single-source.sh --o` compares it for
 *difference*), one said **four** populations were uncovered (false — the set is defined by the rule
 above, not by a count), one named `$O/gh-limit.py` as an uncovered file (true only of the
 `*.sh`-only gate; #4015 put it inside — corrected above, not deleted), one listed `$O/objective.py`
 as now covered (false — it is a sibling of the harness dir in the repo, so only the
 present-but-not-shipped arm can ever name it), one named `scripts/harness-up` and `install.sh` as
-clearers of the new red (neither ships the drivers — measured above), and one said "up to eleven"
+clearers of the new red (neither ships the drivers — measured above), one then over-corrected to
+"**only** this helper clears it" (false: `deploy-mac-orchestrator.sh`'s phase A seeds every entry, so a
+Mac operator was told the Mac's own copier could not clear it — the same absolute in the opposite
+direction, in the section whose job is removing them), and one said "up to eleven"
 MISSING rows (twelve: the `gh-app-token` row is the one the count dropped). An unverified claim in a
-file about unverified claims is this issue, so all six are stated here.
+file about unverified claims is this issue, so all seven are stated here.
 
 **AND THIS HELPER NOW RECORDS THE BOX'S OWN PROVENANCE (`agent-infra`, 2026-10-29).** At the end of a
 verified deploy it writes `$O/.harness-provenance` — the source commit, the ref, and a sha256 for

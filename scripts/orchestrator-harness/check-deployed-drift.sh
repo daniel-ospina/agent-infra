@@ -500,7 +500,7 @@ fi
 # (`scripts/check-*.mjs`) are `.mjs`, and a harness wrapper added later must not need this line
 # changed before it can be compared. A declared set that only names today's files is the #4015 defect.
 # ⛔ A FUTURE `mjs` MEMBER NEEDS TWO THINGS OUTSIDE THIS FILE, named here so the author is not left to
-# discover them on a red box: `deploy-mac-orchestrator.sh`'s `is_program` (`:146`) classifies only
+# discover them on a red box: `deploy-mac-orchestrator.sh`'s `is_program` (`:144`) classifies only
 # `*.sh|*.py`, and `install.sh`'s `bash -n` sweep never parses a `.mjs`. Both are deploy-time, not
 # comparison-time — declaring `mjs` here makes a `.mjs` file COMPARED, not DEPLOYED — so the arm is
 # declared ahead of need deliberately and neither file is widened by this change.
@@ -527,6 +527,17 @@ HARNESS_EXT_RE="${HARNESS_EXTS// /|}"
 # Same rule for the extensionless members: derived, never a second literal. An EMPTY declaration yields
 # `^()$`, which matches only the empty line — never every name — so an emptied list degrades to
 # "no extensionless member", not to "everything is a member".
+# ⛔ RECORDED RESIDUAL (review note, PR #4038 — no live member is affected TODAY): these two
+# alternations are interpolated into an ERE with no escaping, so a FUTURE declared name carrying a
+# regex metacharacter (`gh-app-token.v2`, where `.` matches any byte) or a malformed `HARNESS_EXTS`
+# with a doubled space (`"sh  py"` -> `sh||py`, whose empty alternative matches a bare `name.`) would
+# make the derivation match names it does not declare — a false PASS inside the gate this PR widens.
+# The total fix is `grep -F -x` per declared name (both are POSIX; `-F` reads the pattern as a fixed
+# string and `-x` as a whole line — GNU grep manual, 'Invoking grep', `-F`/`-x`), which needs no
+# escaping at all; it is NOT done here because it restructures the ONE listing both the ref side and
+# the deployed side read, and this change's review surface is the declared SET, not that derivation.
+# Until then: a new extensionless member must be a plain `[A-Za-z0-9._-]` name, and a new extension a
+# bare suffix — §12e grades the widening arm, not a metacharacter.
 HARNESS_EXTENSIONLESS_RE="${HARNESS_EXTENSIONLESS// /|}"
 # The same set as an operator-facing LIST (`*.sh, *.py, *.mjs`), for the THREE messages that have to
 # say what was looked for — the `DRIFT(exec)` line, the surface arm's cannot-verify line, and the
