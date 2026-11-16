@@ -1230,7 +1230,29 @@ elif [ "$rc" = "0" ]; then
       # is false in every clause and prescribes the redundant relaunch this issue exists to remove.
       case "$LANE_DELIVERY" in
         unpushed-*)
-          echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — the commit(s) exist only on this disk. No pushed head carries them, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+          # ⛔ "NOTHING LEFT THE BOX" IS A MEASURED-ABSENCE CLAIM, AND ONE PUSH VERDICT FORBIDS IT
+          # (review of #4047 at this head, P2 — MEASURED against the writer). `spawn-gate.sh` assigns
+          # `FAILED` in the arm where the push target POSITIVELY holds `refs/heads/<branch>` at a
+          # DIFFERENT sha, and that arm's own log line ends "whether they are on some OTHER ref is not
+          # measured here" — so a sentence saying "no pushed head carries them … the issue is not
+          # delivered and no PR can be opened" contradicts a line two above it in the SAME log, and its
+          # remedy (re-dispatch) is inverted when a peer or the rail landed the commits under another
+          # ref. `UNAVAILABLE`/`detached`/`refused-*` are the same class from the other side: the exit
+          # path could not read the remote, so it says nothing about what origin holds. Only a verdict
+          # that TRIED and established the remote carries no such ref may print the absence — which is
+          # what the `*)` arm is: the count is `unpushed` and the push never landed anywhere.
+          case "${LANE_END_PUSH:-}" in
+            FAILED)
+              if [ -n "${LANE_END_ORIGIN:-}" ]; then
+                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) that the push target does NOT carry under this branch name (state=$LANE_DELIVERY). ${LANE_END_PUSH_URL:-origin} holds refs/heads/${LANE_END_BRANCH:-$BR} at ${LANE_END_ORIGIN}, a DIFFERENT head, and this run's commits are NOT on that ref — whether they are on some OTHER ref is NOT measured here, so do NOT read this as 'nothing left the box'. Land or push them explicitly (or hand the branch to the merge chain) rather than re-dispatching: the commits exist here and a relaunch abandons them. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+              else
+                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) the exit path's push could not deliver (state=$LANE_DELIVERY, push=FAILED); the remote's content was not established for this ref. Push them explicitly (or hand the branch to the merge chain) rather than re-dispatching. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+              fi ;;
+            UNAVAILABLE|detached|refused-*)
+              echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) on this disk (state=$LANE_DELIVERY, push=${LANE_END_PUSH}) — the exit path could NOT establish what the push target holds, so this line asserts NOTHING about origin either way. Push them explicitly and verify with a remote read; do not read this as delivered and do not read it as lost. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+            *)
+              echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — the commit(s) exist only on this disk. No pushed head carries them, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+          esac ;;
         *)
           if [ "$(lane_origin_has_branch)" = "yes" ]; then
             echo "[lane $N] DELIVERY: the agent exited 0 and LEFT UNCOMMITTED WORK (state=$LANE_DELIVERY) — origin already carries this branch, but the tree still holds path(s) no pushed head has. That is the only part that did not leave the box: COMMIT AND PUSH it on the same branch, then carry on with the existing PR. Do NOT re-dispatch — the pushed head is already there, and a relaunch would abandon this work on top of it. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
