@@ -708,7 +708,10 @@ function _inertMarkerLines(): string[] {
 /** Refusal for a marker `touch` that provably cannot open a window.
  *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check. */
 function _markerTouchBlockReason(cause: string | null, sessionId: string | null): string {
-  if (cause === null) {
+  // `no-session-id` after a stamp means the same thing as before it (an empty
+  // PI_SESSION_ID normalizes to null here), and the remedy is identical: a
+  // re-touch cannot help. Route it to the same text rather than prescribing one.
+  if (cause === null || cause === "no-session-id") {
     return [
       `⛔ The escape marker cannot be opened from this session (#3620).`,
       `   Why: this session's id does not resolve — no PI_SESSION_ID in the env and`,
@@ -6312,7 +6315,10 @@ export default function (pi: ExtensionAPI) {
         // marker. `_stampMarker` writes unconditionally, so an id-less lane
         // would not only mint an inert file — it would REPLACE a sibling's live
         // marker with `{session_id: null}` and revoke that sibling's window.
-        const markerSid = _currentSessionId(_ctx);
+        // An EMPTY PI_SESSION_ID (`PI_SESSION_ID= pi …`) is no id at all: the read
+        // side treats "" as no-session-id, so the mint must not stamp `""` and
+        // claim a window it cannot have.
+        const markerSid = _currentSessionId(_ctx) || null;
         if (markerSid === null) {
           return { block: true, reason: _markerTouchBlockReason(null, null) };
         }
