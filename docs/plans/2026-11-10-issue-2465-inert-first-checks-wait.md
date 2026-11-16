@@ -41,15 +41,15 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | A | Attenuate `ADMIN_MERGE_FIRST_CHECKS_WAIT` when the lane is inapplicable | Hides the defect behind a shorter clock; a real fresh-PR race still needs the window. |
 | B | Change the #2862 re-derive budget to "spend on outcome, not attempt" | **Reverses a recorded in-code decision** (`scripts/admin-merge.sh`: "THE BUDGET IS SPENT ON THE ATTEMPT, NOT ON THE OUTCOME", with its reason — an unreadable probe must not retry per poll) and its pinned arm (e). Not adopted. |
 | C | **Refuse** instead of falling back when the lane is structurally inapplicable | Turns an inert wait into a false block on a green PR. |
-| D ✅ | Classify ONCE (§0b) and let the wait consume that decision; the probe is consulted for **EVERY** inapplicable class — `none` → widen, `has-run` → keep the lane (#1614), `unreadable` → widen **only** where the lane's OWN run can never attach to the head (`STRUCTURAL` **and** none of `push` / `workflow_dispatch` / `pull_request_review`; `workflow_call`-only and `schedule` are inert) | The issue's own suggested direction; keeps `paths-excluded` (where "did it run?" IS information) on the probe; unfiltered ⊇ filtered, and §4.5 still grades every workflow. ⛔ **NOT "skip the run probe for the structural class"** — that was the first cut, it reversed the recorded #1614 dead-end gate, and it was rejected as a review P0 (`09d19b159`). The probe is called unconditionally (`admin-merge.sh`, `lane_head_run_state` before the `case`). ⛔ **AND NOT "unreadable → widen for the whole STRUCTURAL class"** (review P1, merged `e4716a058`): `no PR trigger` is not `cannot run for this head` — an `on: push` / `on: workflow_dispatch` member DOES get a run of itself attached to the head while the wait runs, so widening on one failed read merged past the watched lane's fresh-PR race where `origin/main` failed closed. The predicate is `lane_own_run_can_attach` over the producer's own `(declared triggers: …)` clause; an absent clause, **and a present one whose members are not plain `on:` keys**, answer "can attach" (fail closed — the shape gate `''|*[!a-z0-9_,]*` in the helper, round 3 P2, because reading an unclassifiable list as "no attachable trigger" would widen on a list the code never parsed). |
+| D ✅ | Classify ONCE (§0b) and let the wait consume that decision; the probe is consulted for **EVERY** inapplicable class — `none` → widen, `has-run` → keep the lane (#1614), `unreadable` → widen **only** where the lane's OWN run can never attach to the head (`STRUCTURAL` **and** EVERY declared member a KNOWN-INERT trigger — `workflow_call`, `schedule`; an ALLOW-LIST, so any member not proven inert keeps the filter — round 8) | The issue's own suggested direction; keeps `paths-excluded` (where "did it run?" IS information) on the probe; unfiltered ⊇ filtered, and §4.5 still grades every workflow. ⛔ **NOT "skip the run probe for the structural class"** — that was the first cut, it reversed the recorded #1614 dead-end gate, and it was rejected as a review P0 (`09d19b159`). The probe is called unconditionally (`admin-merge.sh`, `lane_head_run_state` before the `case`). ⛔ **AND NOT "unreadable → widen for the whole STRUCTURAL class"** (review P1, merged `e4716a058`): `no PR trigger` is not `cannot run for this head` — an `on: push` / `on: workflow_dispatch` member DOES get a run of itself attached to the head while the wait runs, so widening on one failed read merged past the watched lane's fresh-PR race where `origin/main` failed closed. The predicate is `lane_own_run_can_attach` over the producer's own `(declared triggers: …)` clause; an absent clause, **and a present one whose members are not plain `on:` keys**, answer "can attach" (fail closed — the shape gate `''|*[!a-z0-9_,]*` in the helper, round 3 P2, because reading an unclassifiable list as "no attachable trigger" would widen on a list the code never parsed). |
 | E ✅ | Carry `--no-wait` to the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` **plus the rail's dedicated `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` seam** | The rail has no `--no-wait` flag; its 0 seam already means "one observation, no waiting". ⛔ The seam is CONDITIONAL on neither progress bound being set, so carrying the window alone lets an inherited `STALL`/`CEILING` re-enable the wait and bound it there (8760 s / 18064 s) — the same defect one layer down. ⛔ **Clearing those bounds is the WRONG remedy**: `ADMIN_MERGE_FIRST_CHECKS_CEILING` is also a TERM of the derived whole-attempt bound (`rail_deadline_default`) that `rail_attempt_start` ties to `ADMIN_MERGE_LOCK_TTL`, so emptying it RAISES the bound (CEILING 600 → 18064 is 3990 s → 21454 s) and a legal `LOCK_TTL=6000` is refused with exit 2 — a working land invocation turned into a hard failure by the flag that exists to stop waiting. `ONESHOT` carries the intent without touching the arithmetic. An explicit `ADMIN_MERGE_FIRST_CHECKS_WAIT` in the environment still wins. |
 
 ## Integration Surface Map
 
 | Surface | Change | Test layer |
 |---|---|---|
-| `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only where the lane's own run can never attach (`STRUCTURAL` + none of `push`/`workflow_dispatch`/`pull_request_review`) | `tests/issue-2465-inert-wait/run.sh` A(a)–(a14), (b)–(d), (g), plus mutations (f)/(h) and the helper mutants (a5)/(a6)/(a7)/(a11); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
-| `admin-merge.sh` `lane_own_run_can_attach` (new helper) | trigger classifier — can this lane's OWN name appear on a run for a PR head? gates the `unreadable` widening; the member SHAPE is validated too, so an unclassifiable list is non-`measured` (fail closed) rather than a silent widen, and the MESSAGE names which ground it is on (`unread` vs read-but-`unclassifiable`) | unit: arms (a2)/(a3)/(a3b)/(a3c)/(a4)/(a7)/(a8)/(a10)/(a12) with mutants (a5)/(a6)/(a7)/(a11)/(a14) (`tests/issue-2465-inert-wait/run.sh`) — (a3b) is the multi-trigger list naming ONLY the attachable member, (a3c) the JOINED value whose push mechanism is qualified by its own `branches`/`paths` filter, (a7) proves both are load-bearing, (a8) pins the shape gate and the read-vs-unclassifiable wording, (a10)/(a11) pin `pull_request_review` as ATTACHABLE (a review runs the lane on the PR head), and (a12)/(a14) pin the mixed-list wording |
+| `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only where the lane's own run can never attach (`STRUCTURAL` + EVERY declared member proven INERT — an allow-list, round 8) | `tests/issue-2465-inert-wait/run.sh` A(a)–(a16), (b)–(d), (g), plus mutations (f)/(h) and the helper mutants (a5)/(a6)/(a7)/(a11); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
+| `admin-merge.sh` `lane_own_run_can_attach` (new helper) | trigger classifier — can this lane's OWN name appear on a run for a PR head? It answers "cannot attach" ONLY when every declared member is on the KNOWN-INERT allow-list (`workflow_call`, `schedule`), so a trigger the code has never seen keeps the filter; the member SHAPE is validated too, so an unclassifiable list is non-`measured` (fail closed) rather than a silent widen, and the MESSAGE names which ground it is on (`unread` / `empty` / read-but-`unclassifiable` / `measured`) | unit: arms (a2)/(a3)/(a3b)/(a3c)/(a4)/(a7)/(a8)/(a10)/(a12)/(a15)/(a16) with mutants (a5)/(a6)/(a7)/(a11)/(a14) (`tests/issue-2465-inert-wait/run.sh`) — (a3b) is the multi-trigger list naming ONLY the member not proven inert, (a3c) the JOINED value whose push mechanism is qualified by its own `branches`/`paths` filter, (a7) proves both are load-bearing, (a8) pins the shape gate and the read-vs-unclassifiable wording, (a10)/(a11) pin `pull_request_review` as ATTACHABLE (a review runs the lane on the PR head), (a12)/(a14) pin the mixed-list wording, (a15) pins that an UNENUMERATED trigger (`pull_request_review_comment`) keeps the filter with no mechanism claimed, and (a16) pins the empty-clause ground |
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
 | `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in; its RECORD states the shipped two-condition gate, not the rejected class-wide widen | unit: arm (a) is the attributable row, plus the single-definition guard, the record↔predicate pin (a0) with mutant (a9), and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | `wait_enabled` gains the `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` conjunct (it may disable the wait only with a zero window, and only together with the zero window — never by touching the bounds), and the `*)` refusal is re-cut so its two states do not share a verdict. The POLL/BUDGET contract (`#2862`: spent on the attempt), the stall/ceiling bounds and §4.5 are **unchanged**. | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) for the unchanged contract; `tests/admin-merge/run.sh` §79 (g1)-(g4) for the seam; `tests/issue-2465-inert-wait/run.sh` B1-B7 and the state-keyed text arm |
@@ -221,14 +221,50 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   message and the helper's record say "not ENTIRELY classifiable / at least one member", and
   **(a12)/(a14)** pin the honest wording, (a14) being the mutant that restores the false one.
 
+- R16 the attachable set was a **DENY-list**, so an unenumerated trigger widened (review round 8,
+  P2) — `lane_own_run_can_attach` named the three triggers that DO attach (`push`,
+  `workflow_dispatch`, and `pull_request_review`, added at round 7) and answered "cannot attach"
+  for everything else, which is the WIDENING direction. Round 7 closed one instance and the next
+  was already live: `pull_request_review_comment` is not in `PR_TRIGGERS`
+  (`scripts/ci-workflow-pr-evaluable.sh:106`), so such a lane is STRUCTURAL — while the run's
+  `head_sha` IS the PR head, so `gh run list --commit $head --workflow $lane` CAN return it (the
+  reviewer measured it on live data: `replicate/cog` run 42472266861 has `head_sha 01fd5b9cfb` =
+  PR #3216's head). §0b therefore dropped the lane filter on one failed read — the exact loosening
+  review P1 rejected for `push` — and the widen message then said "no run of it can attach", false
+  for that lane. → the predicate is INVERTED into an allow-list of INERTNESS: the helper answers
+  "cannot attach" only when EVERY declared member is a known-inert trigger (`workflow_call`,
+  `schedule`), so a name this code has never seen keeps the filter **by construction** and no arm
+  needs to be taught it. `LANE_RUN_ATTACH_INERT` carries the members it proved inert, and the widen
+  message quotes that measurement instead of the deny-list sentence it no longer holds.
+  **(a15)/(a7)** pin it: (a15) drives `pull_request_review_comment` (ANY_WORKFLOW=0, no mechanism
+  claimed, "has not measured that"), and (a7) — the round-8 defect in mutant form — treats an
+  unclassified member as inert and WIDENS that lane. Against the pre-fix rail the same suite is
+  **159 passed, 17 failed**, (a15) widening there with `lane='any workflow'`.
+- R17 an EMPTY trigger clause was reported as `unclassifiable` (review round 8, P3) —
+  `(declared triggers: )` is REACHABLE (`on: []` / `on: {}` reach the producer's inline path as an
+  empty set, `scripts/ci-workflow-pr-evaluable.sh:161-190`), and the `unclassifiable` message says
+  "at least one member is not a plain lowercase `on:` key" — false about a list with zero members.
+  The decision (keep) is unchanged and correct; the GROUND was wrong. → `LANE_RUN_ATTACH_SOURCE`
+  gains a fourth value (`empty`) with its own wording ("declares NO trigger at all"), and **(a16)**
+  asserts both directions (it must not print the "at least one member" or "could not be READ"
+  wordings).
+- R18 the bullet pin proved less than it claimed (review round 8, P3) — `bullet_with` set
+  `end = NR` for the LAST bullet, so the KEPT bullet's extracted text ran through the docstring's
+  closing prose and a claim moved OUT of the bullet into that prose still satisfied "the KEPT bullet
+  carries it". → the bound is the bullet's own continuation lines (`#     `), and **(a0)** asserts
+  the extract stops before the post-bullet prose (`NOT a class-wide widen`), which the old
+  implementation leaked.
+
 **Accepted residual (recorded, not fixed — review round 5, P3):** the shape gate accepts
 `[a-z0-9_,]` while the producer's `_KEY_RE` (`scripts/ci-workflow-pr-evaluable.sh:111`) also admits
-`-`, `.` and uppercase. A declared key inside that difference keeps the lane on the FAIL-CLOSED arm,
-so such a lane can never widen and keeps the #2465 inert wait. It is recorded rather than widened
-because **accepting those characters LOOSENS**: a value that passes the gate but names no trigger
-this helper knows answers "cannot attach", which WIDENS. Every documented `on:` event name is
-lowercase snake_case (GitHub's own events reference), so the gap is empty against real event names;
-if it ever is not, the cost is friction on one lane, with `--any-workflow` as the documented escape.
+`-`, `.` and uppercase. A declared key inside that difference keeps the lane on the FAIL-CLOSED arm
+(`unclassifiable`), so such a lane can never widen and keeps the #2465 inert wait. Since round 8 that
+is **friction, not a fail-open risk**: with the inert set expressed as an allow-list, accepting those
+characters could only ever put an unknown name on the "can attach" side — which KEEPS the filter —
+so the consequence of the gap is one lane's inert wait, never a loosened merge surface. Every
+documented `on:` event name is lowercase snake_case (GitHub's own events reference), so the gap is
+empty against real event names; if it ever is not, the cost is friction on that lane, with
+`--any-workflow` as the documented escape.
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5
