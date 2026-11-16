@@ -1254,8 +1254,51 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # resolution at all) because `_OC_TOTAL`'s third alternative degenerated to "a parenthetical naming
   # a P1, followed by a resolution", with nothing declaring it. Grouping keeps each copy of the shape
   # the shape it was written to be.
-  local _OC_SEVLIST="(\([^)]*p[01][^)]*[,;/+&][^)]*\)|\([^)]*[,;/+&][^)]*p[01][^)]*\))"
+  # ⛔ THE COMMENT ABOVE SAYS "NOTHING BUT severity tags and separators" AND THE REGEX DID NOT SAY IT
+  # (agent-infra#3902 LAST review, P3 — MEASURED false refusal). `\([^)]*p[01][^)]*[,;/+&][^)]*\)`
+  # matches any PROSE as long as one separator sits in it, so the gate could not tell an enumeration
+  # from a descriptive parenthetical — and honest clean closures were REFUSED as clean evidence:
+  #   `Outcome: CLEAN — fixed 2 issues (P1 routing, P2 logging).`         => VETOED
+  #   `Outcome: CLEAN — 2 findings (P1 fixed, P2 filed).`                 => VETOED
+  #   `Outcome: CLEAN — 2 tests added (P1 path covered, P2 path added).`  => VETOED
+  # (its comma-free twin `2 tests added (P1 path covered)` records — 13n137 — so the same meaning
+  # recorded or was refused depending on how many items it listed). The shape is now the one the
+  # comment describes: severity tags and separators, nothing else, with at least one P0|P1 in it.
+  # `(P1, P2)` still IS this shape (13n129 depends on it) and `2 nits (P2, P3)` still is not (no
+  # P0|P1, 13n138); prose between the tags is what stops being a declaration. 13n146-13n148 pin all
+  # three directions.
+  local _OC_SEVLIST="(\([[:space:]]*\(?p[01]\)?[[:space:]]*[,;/+&][[:space:]]*\(?p[0-3]\)?[[:space:]]*\)|\([[:space:]]*\(?p[0-3]\)?[[:space:]]*[,;/+&][[:space:]]*\(?p[01]\)?[[:space:]]*\))"
   local _OC_PGROUP="[1-9][0-9]*([[:space:]]+[[:alpha:]]+){0,3}[[:space:]]+${_OC_SEVLIST}"
+  # ⛔ A BARE SEVERITY TAG ON THE DECLARATION LINE IS A DECLARATION, AND IT WAS SKIPPED
+  # (agent-infra#3902 LAST review, F2 — MEASURED fail-open). The severity branch above requires the
+  # tag to be BONDED TO A COUNT, so a verdict field that names the house severity and no count was
+  # invisible and a `clean` record was minted over it:
+  #   `**Outcome: ISSUES — P1: dispatcher leaks the socket.**`   => ADMITTED
+  #   `**Outcome: ISSUES (P1)**`                                => ADMITTED
+  #   `**Outcome: ISSUES (P1, P2)**`                            => ADMITTED
+  # The gate's own stated rule is that it "must NAME blocking findings — by the NOUN or by the HOUSE
+  # SEVERITY", and `P1` alone is what that severity means by this file's own convention. The two
+  # shapes below are a TAG, not prose: `(P1)` / `(P1, P2)` as a parenthesised enumeration, or `P1` as
+  # a label closing on `:`, `.`, `,`, `)` or the line end. That distinction is load-bearing in the
+  # other direction too — `(P1 path covered)` and `(P1 routing, P2 logging)` are DESCRIPTIONS, not
+  # enumerations, and they must keep recording (13n137, 13n146) — so a tag followed by a word is not
+  # this shape. 13n143-13n145 pin it; 13n146/13n147 are its over-block controls.
+  local _OC_BTAG='\(p[01]\)|(^|[^[:alnum:]])p[01]([[:space:]]*[:.,;)*_]+|[[:space:]]*$)'
+  # ⛔ A DECLARATION IS A MARKDOWN BLOCK, NOT A LINE (agent-infra#3902 LAST review, F1 — MEASURED
+  # fail-open, five vectors). Everything below is scoped to the `Outcome:` LINE, but what a reviewer
+  # actually writes is a label line and the findings listed UNDER it:
+  #   `**Outcome: 3 findings:**` ⏎ `- 2 blocking (P1)`                      => ADMITTED
+  #   `**Outcome: ISSUES**` ⏎ `- 2 blocking (P1): dispatcher leak`          => ADMITTED
+  # The label line carries no blocking noun and no count-bonded severity, so the gate SKIPS it, and
+  # the bullet never gets its own `Outcome:` anchor — neither is judged, and a `clean` record is
+  # minted over an artifact that declares two live P1s. (13n12's neutered-arm pin proves the arm is
+  # load-bearing for the single-line spelling; this is the same artifact one markdown construct over.)
+  # A BLOCK is the label plus its immediately-following list items — `-`/`*`/`+`/`1.`/`1)`/`>` — with
+  # NO blank line between, which is what a list is in Markdown (spec.commonmark.org 0.31.2 §5.2): a
+  # blank line ends it. 13n10 keeps 13n10: its blocking note sits after a blank line and prose, so it
+  # is still a different block and still ADMITS. The join is skipped on a mutant to prove attribution
+  # (13n153). Declared residual: a WRAPPED (non-list) continuation line is still not joined.
+  local _OC_BLOCK_JOIN=1
   # ⛔ A TOKEN MAY CARRY DIGITS, DOTS AND SLASHES, AND THE RUN IS SIX TOKENS WIDE
   # (agent-infra#3902 THIRD review, P2 — MEASURED false refusal). The class was `[[:alpha:]-]+` with
   # a THREE-token run, so the sentences a fixer actually writes when it says WHERE or WHICH cycle it
@@ -1360,6 +1403,12 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # #3902`, `... (commit 30ce585)` are references, not counts); the arithmetic simply had no mask for
   # it. Masked BEFORE the `<count> <P0|P1>` remainder read, so a reference never becomes a remainder
   # either — and only the NOUN+number pair, so `2 were fixed` keeps its count.
+  # ⛔ THE NOUN AND ITS NUMBER MAY BE HYPHENATED (agent-infra#3902 review, P2 — MEASURED false
+  # refusal, carried over from the parallel fix line). The separator was `[[:space:]]+`, so the
+  # hyphenated spelling of the very same reference was NOT masked and its `1` was then read as a
+  # SECOND, resolving count: `Outcome: CLEAN — 2 blocking findings from cycle-1 were fixed and
+  # re-verified.` was REFUSED while `… from cycle 1 were fixed …` recorded. A hyphen is not a count,
+  # and the noun set is unchanged, so this widens the MASK and not the escape. 13n156 pins it.
   # ⛔ THE MASK IS SCOPED TO THE MATCH IT EXCEPTS — it is NOT a free pass for any `<noun> <n>`
   # (agent-infra#3902 review, F3 — MEASURED fail-open). It was applied GLOBALLY to `_rest` before
   # EVERY remainder belt, so on a line whose remainder happened to be NUMBERED with one of its own
@@ -1373,7 +1422,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # mask now requires its own CONTEXT — a reference that is the SUBJECT of a resolution verb — which
   # is the only shape it was ever written to except. `_OC_REFMASK` is the file's own rule (a negation
   # or exception is scoped to the match it excepts) applied to its own exception.
-  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+([[:space:]]+([[:alpha:]-]+[[:space:]]+){0,3}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified))/\1REFCNT\3/g'
+  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]-]*#?[0-9]+([[:space:]]+([[:alpha:]-]+[[:space:]]+){0,3}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified))/\1REFCNT\3/g'
   # ⛔ THE BOND IS READ WITH THE ONE SEPARATOR CLASS (`_OC_SEP`), not `[[:space:]]+`
   # (agent-infra#3902 review, P1). This belt is what reads a SURVIVING count as a severity
   # remainder, so if it spells the bond more narrowly than the declaration does, `1 × P1` reads as a
@@ -1444,7 +1493,31 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # (`[^.;:]`, which no connective can cross), so the bound is removed rather than raised. Polarity
   # decides the trade: a false PASS merges unreviewed code, a false refusal costs a reworded re-run.
   local _OC_EXCEPT_SCOPE="($|[[:space:]]*[.,;:)]|[[:space:]]+(in|on|at|to|from|with|for|of|which|that|whose|is|was|are|were|has|have|remains?|remained|open|still|left|pending|unresolved|deferred|outstanding|carried|waived|known|partial|skipped|re-?opened))"
-  local _OC_EXCEPT="(all|both|every)[^.;:]*((excepting|except[[:space:]]+for|except|excluding|barring|(^|[^[:alpha:]])bar|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|short[[:space:]]+of|(^|[^[:alpha:]])less([[:space:]]+than)?|saving|(^|[^[:alpha:]])aside([[:space:]]+from)?|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}${_OC_EXCEPT_SCOPE}|${_OC_CNT}[[:space:]]+(exception|aside))"
+  # ⛔ THE EXCEPTION WAS ANCHORED ON THE WORD, NOT ON THE DECLARATION (agent-infra#3902 LAST review,
+  # P1 — MEASURED fail-open). The leader was the literal `(all|both|every)`, so an exception attached
+  # to a declared COUNT was never read at all, and a review that declared 2 blocking findings and
+  # excepted 1 was minted `clean`:
+  #   `Outcome: CLEAN — 2 blocking findings were fixed except 1 in the retry path.`            => ADMIT
+  #   `… with the exception of 1.` / `… save 1.` / `… aside from 1.` / `… but for 1.`          => ADMIT
+  #   `… 3 blocking (P1) findings were fixed, except 1 that touches the rail.`                 => ADMIT
+  # while every SPELLED twin (`… except one …`) was VETOED by `_OC_SELLED` — the "#2661 closed for
+  # one spelling and open for the other" class, in the arm's ONE belt whose own comment already said
+  # "A COUNT is required in the exception slot". A count is a totality subject like `all|both|every`
+  # (it is the same subject `_OC_TOTAL` accepts), so the leader admits either form and the belt reads
+  # the digit and spelled twins identically. 13n149-13n151 pin both directions; 13n152 is the
+  # resolution control that must keep recording.
+  # ⛔ AND THE LEADER MUST READ THE MASKED DECLARATION TOKEN, NOT JUST ITS DIGIT. `_OC_EXCEPT` is read
+  # by `_OC_SECOND_COUNT` against `_rest`, where the declared count has ALREADY been masked to the
+  # literal `BLKDECL` — so a leader that only knew `<count>` saw `BLKDECL findings were fixed except 1`
+  # and matched nothing, which is how the fix for the anchor alone still minted `clean`. This is the
+  # one place `BLKDECL` is genuinely the declaration (MEASURED: without it, `2 blocking findings were
+  # fixed except 1 in the retry path` still RECORDED at this head), unlike the `_OC_TOTAL` copy that
+  # was dead code and is deleted in the same class of fix. 13n149 reds if this alternative is removed.
+  # ⛔ AND IT IS UPPERCASE ON PURPOSE: this belt reads `_rest`, where the mask was written as the
+  # literal `BLKDECL` into an otherwise LOWERCASED copy, and `grep -qE` here is case-SENSITIVE. A
+  # lowercased leader matched nothing and the fix measured as still-open (that error was made and
+  # caught in this very commit).
+  local _OC_EXCEPT="(all|both|every|BLKDECL|${_OC_CNT})[^.;:]*((excepting|except[[:space:]]+for|except|excluding|barring|(^|[^[:alpha:]])bar|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|short[[:space:]]+of|(^|[^[:alpha:]])less([[:space:]]+than)?|saving|(^|[^[:alpha:]])aside([[:space:]]+from)?|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}${_OC_EXCEPT_SCOPE}|${_OC_CNT}[[:space:]]+(exception|aside))"
   # ⛔ A COUNT HANDED ONWARD IS A REMAINDER, NOT A RESOLUTION (agent-infra#3902 review, P1 — MEASURED
   # fail-open). The surviving count is the SUBJECT of a hand-off predicate — it needs a follow-up, its
   # own issue, another PR — which says the finding was NOT closed. It reached no belt: `needs` is not a
@@ -1504,6 +1577,27 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # lines affected are ones that declare no blocker at all.
   local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)|(^|[^[:alnum:]])(no|non|zero|none)[[:space:]]*\(?p[01]\)?|(^|[^0-9])0[[:space:]]*\(?p[01]\)?|(^|[^[:alnum:]])(nothing|none|neither|no)[^.;:]{0,25}block(ing|ers?)|block(ing|ers?)[^.]{0,60}([[:space:]](none|nothing|zero)[[:space:]]*(found|at[[:space:]]+all|remain|remains|open|left)|[[:space:]](found|saw|observed|identified|spotted)[[:space:]]+(none|nothing|zero))'
   decoded="$(tsv_decode "$1")"
+  # ⛔ THE BLOCK JOIN (agent-infra#3902 LAST review, F1). See `_OC_BLOCK_JOIN` for the measured
+  # vectors and the boundary rule: the declaration's own list items are joined onto the label line so
+  # the arm judges the DECLARATION rather than the label, and a blank line still ends the block, which
+  # is what keeps 13n10 (a blocking note paragraphs below an honest cleaning line) admitted.
+  # `printf '%s\n' | awk` and not `mapfile`: this file must still parse and run on macOS bash 3.2
+  # (`bash32-parse`). The list-item test is the CommonMark marker set, anchored at line start.
+  if [ "${_OC_BLOCK_JOIN:-1}" = "1" ]; then
+    decoded="$(printf '%s\n' "$decoded" | awk '
+      { L[NR] = $0 }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (tolower(L[i]) ~ /(^|[^[:alnum:]])outcome[[:space:]_*]*:/) {
+            out = L[i]; j = i + 1
+            while (j <= NR && L[j] ~ /^[[:space:]]*([-*+]|[0-9]+[.)]|>)[[:space:]]/) {
+              out = out " " L[j]; j++
+            }
+            print out
+          } else print L[i]
+        }
+      }')"
+  fi
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
     # so prose that discusses an outcome is untouched.
@@ -1554,7 +1648,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # the third alternative. MEASURED at 043b1ab91: all four forms ADMITTED; all four are gated here
     # now and pinned by 13n129.
     if ! grep -qiE 'block(ing|ers?)' <<<"$line" \
-       && ! grep -qiE "(^|[^0-9])[1-9][0-9]*${_OC_SEP}\\(?p[01]\\)?|(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)${_OC_SEP}\\(?p[01]\\)?|(^|[^0-9])${_OC_PGROUP}" <<<"$line"; then
+       && ! grep -qiE "(^|[^0-9])[1-9][0-9]*${_OC_SEP}\\(?p[01]\\)?|(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)${_OC_SEP}\\(?p[01]\\)?|(^|[^0-9])${_OC_PGROUP}|${_OC_BTAG}" <<<"$line"; then
       continue
     fi
     # A LIVE POSITIVE COUNT — the number that qualifies a blocking NOUN or a P0/P1 severity, as

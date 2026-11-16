@@ -6455,6 +6455,176 @@ $VACUITY_BLOCK"
     assert_eq "$NS_B" "0" "13n139 MUTATION PIN: …and 13n130's '1 × P1' remainder is ADMITTED (rc 0) — the belt reads the same class"
 fi
 
+# 13n140-13n156 — THE LAST REVIEW'S FINDINGS, ALL FOUR MEASURED THROUGH THE SHIPPED RECORDER
+# (agent-infra#3902: F1 + F2 at `ad85f797b`, and the `[P1] _OC_EXCEPT` / `[P3] _OC_PGROUP` pair from
+# the review recorded on the same head). Three of them are FAIL-OPENS in an evidence gate — a `clean`
+# record minted over an artifact that declares a live blocking finding — so each row asserts the
+# refusal AND the ABSENCE of the record file, because a row that only checked rc could be green for
+# an unrelated belt's reason.
+#   * 13n140-13n142 — F1: a declaration is a Markdown BLOCK. The label line carried no blocking noun,
+#     so it was SKIPPED, and the bullet under it never got its own `Outcome:` anchor, so neither was
+#     judged. 13n142 is the over-block control: an adjacent bullet that RESOLVES still records, and
+#     the block boundary is the blank line (13n10 stays green for that reason, not by luck).
+#   * 13n143-13n145 — F2: a bare severity TAG is a declaration. `P1` in a verdict field names the
+#     house severity with no count, which the gate's own rule says is the noun it cares about.
+#   * 13n146-13n148 — the `[P3]`: the severity-enumeration alternative promised "nothing but severity
+#     tags and separators" and accepted any prose, so honest closures were refused. Prose between the
+#     tags is now a description, not an enumeration; 13n129 keeps the real enumeration refused.
+#   * 13n149-13n152 — the `[P1]` belt: an exception attached to a DECLARED COUNT was invisible (the
+#     leader was the literal `all|both|every`), so `2 blocking … fixed except 1` recorded clean while
+#     its spelled twin was refused. 13n152 is the resolution control.
+#   * 13n153-13n156 are MUTATION PINS — each fix reverted in a copy, and the body it refuses must then
+#     RECORD. A row that only asserts the refusal proves the refusal, never that THIS change caused it.
+rm -f "$(Q2 427030)"
+EV_REF="comment:42703001" run_record_ev 427030 STUB_EVIDENCE_BODY="**Outcome: 3 findings:**
+- 2 blocking (P1): the dispatcher leak and the evidence reader
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n140 F1: a BULLETED declaration ('Outcome: 3 findings:' + '- 2 blocking (P1)') is REFUSED (rc 3)"
+[ ! -f "$(Q2 427030)" ] && ok "13n140 no clean record minted over a bulleted blocking declaration" || bad "13n140 minted a record — the arm judged the label line and skipped the block"
+
+rm -f "$(Q2 427031)"
+EV_REF="comment:42703101" run_record_ev 427031 STUB_EVIDENCE_BODY="**Outcome: ISSUES**
+1. blocking (P1) — dispatcher leak
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n141 F1: a NUMBERED declaration ('Outcome: ISSUES' + '1. blocking (P1)') is REFUSED (rc 3)"
+
+rm -f "$(Q2 427032)"
+EV_REF="comment:42703201" run_record_ev 427032 STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified.**
+- 2 blocking findings were fixed and re-verified.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n142 OVER-BLOCK GUARD for F1: a list item under a clean label that RESOLVES still records (rc 0)"
+
+rm -f "$(Q2 427033)"
+EV_REF="comment:42703301" run_record_ev 427033 STUB_EVIDENCE_BODY="**Outcome: ISSUES — P1: dispatcher leaks the socket.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n143 F2: a BARE severity tag ('Outcome: ISSUES — P1: …') is REFUSED (rc 3)"
+[ ! -f "$(Q2 427033)" ] && ok "13n143 no clean record minted over a bare P1 verdict" || bad "13n143 minted a record — the entry gate required the severity to be count-bonded"
+
+rm -f "$(Q2 427034)"
+EV_REF="comment:42703401" run_record_ev 427034 STUB_EVIDENCE_BODY="**Outcome: ISSUES (P1)**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n144 F2: a parenthesised bare tag ('Outcome: ISSUES (P1)') is REFUSED (rc 3)"
+
+rm -f "$(Q2 427035)"
+EV_REF="comment:42703501" run_record_ev 427035 STUB_EVIDENCE_BODY="**Outcome: ISSUES (P1, P2)**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n145 F2: a bare severity enumeration ('Outcome: ISSUES (P1, P2)') is REFUSED (rc 3)"
+
+rm -f "$(Q2 427036)"
+EV_REF="comment:42703601" run_record_ev 427036 STUB_EVIDENCE_BODY="**Outcome: CLEAN — fixed 2 issues (P1 routing, P2 logging).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n146 OVER-BLOCK GUARD: a DESCRIPTIVE parenthetical ('(P1 routing, P2 logging)') is not an enumeration (rc 0)"
+
+rm -f "$(Q2 427037)"
+EV_REF="comment:42703701" run_record_ev 427037 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 findings (P1 fixed, P2 filed).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n147 OVER-BLOCK GUARD: '(P1 fixed, P2 filed)' is prose between the tags, not an enumeration (rc 0)"
+
+rm -f "$(Q2 427038)"
+EV_REF="comment:42703801" run_record_ev 427038 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 tests added (P1 path covered, P2 path added).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n148 OVER-BLOCK GUARD: '(P1 path covered, P2 path added)' is prose, not an enumeration (rc 0)"
+
+rm -f "$(Q2 427039)"
+EV_REF="comment:42703901" run_record_ev 427039 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n149 _OC_EXCEPT: an exception attached to a DECLARED COUNT ('fixed except 1') is REFUSED (rc 3)"
+[ ! -f "$(Q2 427039)" ] && ok "13n149 no clean record minted over '2 declared, 1 excepted'" || bad "13n149 minted a record — the exception belt was anchored on the literal word 'all'"
+
+rm -f "$(Q2 427040)"
+EV_REF="comment:42704001" run_record_ev 427040 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed with the exception of 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n150 _OC_EXCEPT: 'with the exception of 1' after a declared count is REFUSED (rc 3)"
+
+rm -f "$(Q2 427041)"
+EV_REF="comment:42704101" run_record_ev 427041 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking (P1) findings were fixed, except 1 that touches the rail.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n151 _OC_EXCEPT: '…, except 1 that touches the rail' is REFUSED (rc 3)"
+
+rm -f "$(Q2 427042)"
+EV_REF="comment:42704201" run_record_ev 427042 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n152 CONTROL for the exception belt: a total resolution with NO exception still records (rc 0)"
+
+rm -f "$(Q2 427043)"
+EV_REF="comment:42704301" run_record_ev 427043 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings from cycle-1 were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n156 OVER-BLOCK GUARD: a HYPHENATED reference ('cycle-1') is a reference, not a second count (rc 0)"
+
+# 13n153 — MUTATION PIN for the BLOCK JOIN (F1). The join is switched off in a copy; the body 13n140
+# refuses must then RECORD, which is the only way to show the join — and not some other belt — is
+# what closed the bulleted declaration.
+N_BJ_MUT="$T/mutant-blockjoin-off.sh"
+sed 's#^  local _OC_BLOCK_JOIN=1$#  local _OC_BLOCK_JOIN=0#' "$RECORD" > "$N_BJ_MUT"
+if cmp -s "$RECORD" "$N_BJ_MUT"; then
+    bad "13n153 MUTANT: the _OC_BLOCK_JOIN sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_BJ_MUT" && ok "13n153 MUTANT: the block-join-off mutant still parses" || bad "13n153 MUTANT: the mutant does not parse"
+    BJ_SAVE="$RECORD"
+    RECORD="$N_BJ_MUT"
+    rm -f "$(Q2 427044)"
+    EV_REF="comment:42704401" run_record_ev 427044 STUB_EVIDENCE_BODY="**Outcome: 3 findings:**
+- 2 blocking (P1): the dispatcher leak and the evidence reader
+
+$VACUITY_BLOCK"
+    BJ_A="$RECORD_RC"
+    RECORD="$BJ_SAVE"
+    assert_eq "$BJ_A" "0" "13n153 MUTATION PIN: with the block join OFF, the bulleted declaration is ADMITTED (rc 0) — the join is load-bearing"
+fi
+
+# 13n154 — MUTATION PIN for the bare-severity TAG (F2). With `_OC_BTAG` neutered, `Outcome: ISSUES (P1)`
+# must record: that is what makes 13n144 a pin about THIS alternative rather than about some other belt.
+N_BT_MUT="$T/mutant-btag-off.sh"
+sed "s#^  local _OC_BTAG=.*#  local _OC_BTAG='@@NEVERMATCH@@'#" "$RECORD" > "$N_BT_MUT"
+if cmp -s "$RECORD" "$N_BT_MUT"; then
+    bad "13n154 MUTANT: the _OC_BTAG sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_BT_MUT" && ok "13n154 MUTANT: the btag-neutered mutant still parses" || bad "13n154 MUTANT: the mutant does not parse"
+    BT_SAVE="$RECORD"
+    RECORD="$N_BT_MUT"
+    rm -f "$(Q2 427045)"
+    EV_REF="comment:42704501" run_record_ev 427045 STUB_EVIDENCE_BODY="**Outcome: ISSUES (P1)**
+
+$VACUITY_BLOCK"
+    BT_A="$RECORD_RC"
+    RECORD="$BT_SAVE"
+    assert_eq "$BT_A" "0" "13n154 MUTATION PIN: with the bare-tag entry neutered, 'Outcome: ISSUES (P1)' is ADMITTED (rc 0) — the tag is load-bearing"
+fi
+
+# 13n155 — MUTATION PIN for the COUNT-ANCHORED EXCEPTION (the `[P1]`). With `_OC_EXCEPT` neutered,
+# `2 blocking findings were fixed except 1 …` must record — and the SPELLED twin is pinned by the
+# suite's existing `_OC_SELLED` rows, so both directions are covered.
+N_EX_MUT="$T/mutant-except-off.sh"
+sed "s#^  local _OC_EXCEPT=.*#  local _OC_EXCEPT='@@NEVERMATCH@@'#" "$RECORD" > "$N_EX_MUT"
+if cmp -s "$RECORD" "$N_EX_MUT"; then
+    bad "13n155 MUTANT: the _OC_EXCEPT sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_EX_MUT" && ok "13n155 MUTANT: the except-neutered mutant still parses" || bad "13n155 MUTANT: the mutant does not parse"
+    EX_SAVE="$RECORD"
+    RECORD="$N_EX_MUT"
+    rm -f "$(Q2 427046)"
+    EV_REF="comment:42704601" run_record_ev 427046 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed except 1 in the retry path.
+
+$VACUITY_BLOCK"
+    EX_A="$RECORD_RC"
+    RECORD="$EX_SAVE"
+    assert_eq "$EX_A" "0" "13n155 MUTATION PIN: with _OC_EXCEPT neutered, '… except 1' is ADMITTED (rc 0) — the belt is load-bearing"
+fi
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -7521,13 +7691,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4900 :6626 :9000 :9174, plus a comment mention at :4769; `14.1c-CITE` below
+#     CITE-CHECK: :4994 :6720 :9094 :9268, plus a comment mention at :4863; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4878) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4972) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4900) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4994) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9000). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9094). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7553,7 +7723,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:9000` / `:9174` — CITE-CHECK: :9000 :9174 — re-derived by the
+#     this head the predicates are `:9094` / `:9268` — CITE-CHECK: :9094 :9268 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8455,14 +8625,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :4398) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :4972) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4576) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4994) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6626 :9000 :9174 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6720 :9094 :9268 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
