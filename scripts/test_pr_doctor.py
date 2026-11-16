@@ -621,11 +621,11 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)   # no .rc will appear; do not wait
     monkeypatch.setattr(pr, "AGENT_CONFIRM_S", 0.05)
     # ⛔ THE HAPPY PATH NOW NEEDS THE AGENT-START ARTIFACT (agent-infra#4047). `running` alone is the
-    # dispatcher's pid; the launch is proved by the `[agent] provider=` line the worker writes once
-    # the gates let the agent through. Without it this test asserted the false PASS it now forbids.
+    # dispatcher's pid; the launch is proved by the `[agent] launch` line the worker writes once
+    # EVERY refusing gate has passed. Without it this test asserted the false PASS it now forbids.
     os.makedirs(os.path.join(str(tmp_path), "bg"), exist_ok=True)
     with open(os.path.join(str(tmp_path), "bg", "prd-9.log"), "w") as fh:
-        fh.write("[agent] provider=deepseek model=deepseek-flash label=bg prd-9\n")
+        fh.write("[agent] launch provider=deepseek model=deepseek-flash label=bg prd-9\n")
     # two pre-spawn liveness probes (both "not live"), then the post-window confirmation
     statuses = iter(["lost", "lost", "running"])
     monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
@@ -657,8 +657,8 @@ def test_a_live_dispatcher_pid_without_an_agent_start_is_NOT_a_dispatch(tmp_path
     alive through preflight and uv-env before the gate decides. Measured on this fleet: a pass printed
     `dispatched 9 of 16 queued — VERDICT=OK` over nine workers whose `.rc` read 75.
 
-    A live pid with no `[agent] provider=` line and no exit status is therefore NOT a launch, and the
-    pass must not count it. REDDENS ON THE PRE-CHANGE TREE: the old tail returned
+    A live pid with no post-gate `[agent] launch` line and no exit status is therefore NOT a launch,
+    and the pass must not count it. REDDENS ON THE PRE-CHANGE TREE: the old tail returned
     `("launched", "launched, running")` here, so `ok` was True.
     """
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
@@ -680,6 +680,47 @@ def test_a_live_dispatcher_pid_without_an_agent_start_is_NOT_a_dispatch(tmp_path
     ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False, "a live dispatcher pid with no agent must NOT count as dispatched"
     assert record is False, "nothing may be recorded against the item"
+    assert "NOT counted as a launch" in detail
+
+
+def test_a_capability_refusal_is_NOT_a_dispatch_even_though_the_provider_line_is_written(
+        tmp_path, monkeypatch):
+    """⛔ THE SLOW GATE'S FALSE PASS (review of #4047, P1 — MEASURED on the code path `dispatch()` uses).
+
+    `spawn-gate.sh::run_agent` writes `[agent] provider=…` at its `AGENT_STARTED=1` point, and the
+    CAPABILITY GATE runs AFTER that point and refuses with 71/83 (setting `AGENT_STARTED=0` and
+    returning). Its own comment records why this matters: "one bounded call, ~5-25 s measured on a
+    healthy box" — always outside CONFIRM_WINDOW_S, with the provider line already in the log. Reading
+    that line as proof of a launch therefore counted EVERY capability refusal as a dispatch, recorded a
+    cooldown and a class slot, and printed it in the pass's `dispatched N of M` — the same false PASS
+    #4047 removes, surviving in the one gate whose refusal is slow by design.
+
+    REDDENS ON THE PRE-FIX TREE: with `[agent] provider=` as the marker this returns `ok=True,
+    record=True` and the assertion below fails. The fixture is the exact refusal log — the provider
+    line, then the capability gate's reading and its REFUSED line — with the dispatcher still `running`
+    and no `.rc` yet (a `.rc` landing later is caught by `gate_refused`) .
+    """
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: ("/wt/prd-9", ""))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    monkeypatch.setattr(pr, "AGENT_CONFIRM_S", 0.05)
+    os.makedirs(os.path.join(str(tmp_path), "bg"), exist_ok=True)
+    with open(os.path.join(str(tmp_path), "bg", "prd-9.log"), "w") as fh:
+        fh.write("[load-gate] load=12 < max_load=80\n")
+        fh.write("[agent] provider=deepseek model=deepseek-flash label=bg prd-9\n")
+        fh.write("[capability-gate] LANE_CAPABILITY=refused why=exit-hang\n")
+        fh.write("[capability-gate] REFUSED bg prd-9: LANE_CAPABILITY (exit 71) - no agent was "
+                 "started\n")
+    statuses = iter(["lost", "lost", "running"])
+    monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
+    monkeypatch.setattr(pr, "sh_err", lambda argv, timeout=180, cwd=None, env=None, capture=True:
+                        ("", "", 0))
+    ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False, "a capability refusal has no agent in it and must NOT count as dispatched"
+    assert record is False, "a refusal consumed nothing, so nothing may be recorded against the item"
     assert "NOT counted as a launch" in detail
 
 
@@ -1851,12 +1892,12 @@ def test_the_action_for_a_free_workspace_is_a_BACKGROUND_SPAWN_not_a_workspace_s
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
     monkeypatch.setattr(pr, "AGENT_CONFIRM_S", 0.05)
     # ⛔ THE SPAWN ONLY COUNTS ONCE AN AGENT HAS STARTED (agent-infra#4047). `running` is the
-    # dispatcher's pid; the launch is the `[agent] provider=` line. Without this fixture artifact
-    # this arm asserted the false PASS the fix now forbids.
+    # dispatcher's pid; the launch is the `[agent] launch` line. Without this fixture artifact this
+    # arm asserted the false PASS the fix now forbids.
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
     os.makedirs(str(tmp_path / "bg"), exist_ok=True)
     (tmp_path / "bg" / "prd-9.log").write_text(
-        "[agent] provider=deepseek model=deepseek-flash label=bg prd-9\n")
+        "[agent] launch provider=deepseek model=deepseek-flash label=bg prd-9\n")
     statuses = iter(["lost", "lost", "running"])
     monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
     calls = []
@@ -1999,21 +2040,22 @@ _WORKERS = {
     # from the worker's own lifetime.
     # silent for its whole life
     # ⛔ EVERY STUB EMITS THE AGENT-START MARKER (agent-infra#4047). A REAL worker writes
-    # `[agent] provider=… model=…` the moment `lane-exec.sh`/`merge-one.sh` launches it, and that line
-    # is now what `_confirm()` accepts as proof of a launch — a live dispatcher pid alone is not
-    # (that pid is alive through preflight, before the load gate decides). A stub that omits the
-    # marker is a worker whose agent never started, which the dispatcher correctly reports as
+    # `[agent] launch` the moment `spawn-gate.sh::run_agent`/`merge-one.sh` is about to exec `pi`, and
+    # that line is what `_confirm()` accepts as proof of a launch — neither a live dispatcher pid (it
+    # is alive through preflight, before the load gate decides) nor the `[agent] provider=` line (it
+    # is written BEFORE the capability gate, which can still refuse 5-25 s later). A stub that omits
+    # the marker is a worker whose agent never started, which the dispatcher correctly reports as
     # `unconfirmed`; these arms are about promptness and pipe handling, so they must look like a
     # worker that really started.
     "sleeps past the window and writes nothing":
-        'run_agent() { echo "[agent] provider=deepseek model=deepseek-flash" >> "$2"; sleep 12; return 0; }\n',
+        'run_agent() { echo "[agent] launch provider=deepseek model=deepseek-flash" >> "$2"; sleep 12; return 0; }\n',
     # writes IMMEDIATELY (the shape where a caller with a pipe receives output first) and runs on
     "writes at once, then sleeps":
-        'run_agent() { echo "[agent] provider=deepseek model=deepseek-flash" >> "$2"; echo starting; '
+        'run_agent() { echo "[agent] launch provider=deepseek model=deepseek-flash" >> "$2"; echo starting; '
         'sleep 12; return 0; }\n',
     # writes to BOTH streams at the end
     "sleeps, then writes to stdout and stderr":
-        'run_agent() { echo "[agent] provider=deepseek model=deepseek-flash" >> "$2"; sleep 12; '
+        'run_agent() { echo "[agent] launch provider=deepseek model=deepseek-flash" >> "$2"; sleep 12; '
         'echo OUT; echo ERR >&2; }\n',
 }
 
@@ -2127,7 +2169,7 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     every later pass re-spawning every actionable PR.
     """
     saved = {}
-    d, wt = _orch(tmp_path, 'run_agent() { echo "[agent] provider=deepseek model=deepseek-flash" >> "$2"; '
+    d, wt = _orch(tmp_path, 'run_agent() { echo "[agent] launch provider=deepseek model=deepseek-flash" >> "$2"; '
                                'sleep 6; return 0; }\n')
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
     monkeypatch.setattr(pr, "load_state", lambda: {})
@@ -2162,7 +2204,7 @@ def test_a_live_worker_is_never_spawned_over(monkeypatch, tmp_path):
     """
     # 30 s, not 6: the assertion is about the SECOND dispatch, so the first worker must still be
     # alive however slow the runner is (nothing waits on it -- it is disowned by the harness).
-    d, wt = _orch(tmp_path, 'run_agent() { echo "[agent] provider=deepseek model=deepseek-flash" >> "$2"; '
+    d, wt = _orch(tmp_path, 'run_agent() { echo "[agent] launch provider=deepseek model=deepseek-flash" >> "$2"; '
                                'sleep 30; return 0; }\n')
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
     ok1, detail1, record1 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
