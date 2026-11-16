@@ -6833,9 +6833,11 @@ lane_no_pr_trigger() {
 #                     and §0b's message must not call a list it read "unreadable" either)
 #   LANE_RUN_ATTACH_TRIGGERS   the members NOT proven inert (empty on every default) —
 #                              what §0b quotes as the reason the widen was withheld
-#   LANE_RUN_ATTACH_INERT      the members it DID prove inert — what §0b's WIDEN message
-#                              quotes, so it states the measurement it took instead of the
-#                              deny-list it replaced (round 8, P2)
+#   LANE_RUN_ATTACH_INERT      the members it DID prove inert, `", "`-joined — what §0b's
+#                              WIDEN message quotes, so it states the measurement it took
+#                              instead of the deny-list it replaced (round 8, P2).
+#                              (`LANE_RUN_ATTACH_TRIGGERS` stays space-joined because §0b
+#                              ITERATES it; this one is only ever printed.)
 #
 # Without these, §0b's message told an absent-clause lane that it "declares a trigger" — a
 # declaration the code never read, which is the one thing this file forbids in a message
@@ -6862,13 +6864,16 @@ lane_own_run_can_attach() {
   #
   # ⛔ THE CHARSET IS DELIBERATELY NARROWER THAN THE PRODUCER'S KEY VALIDATOR, and that
   # is an ACCEPTED RESIDUAL, not an oversight (round 5, P3). The producer's `_KEY_RE`
-  # (scripts/ci-workflow-pr-evaluable.sh:111) also admits `-`, `.` and uppercase;
-  # accepting them here would be the LOOSENING direction, because a member that passes
-  # the gate but is not on the INERT allow-list answers "can attach" — which KEEPS the
-  # filter. Every documented `on:` event name is lowercase snake_case (GitHub's own
-  # events reference: `branch_protection_rule`, `check_run`, `deployment_status`, …), so
-  # the difference is empty in practice, and a value inside it keeps this fail-closed
-  # arm: the lane cannot widen on a list this code cannot name (#2465's inert wait).
+  # (scripts/ci-workflow-pr-evaluable.sh:111) also admits `-`, `.` and uppercase.
+  # ⛔ ITS COST CHANGED AT ROUND 8 and the record is updated rather than left standing: it
+  # used to say accepting those characters would LOOSEN (a name the helper did not know
+  # answered "cannot attach" → widen). With the inert set expressed as an allow-list, such a
+  # member would answer "can attach" → KEEP, so the gap is now FRICTION, never a loosened
+  # merge surface. Every documented `on:` event name is lowercase snake_case (GitHub's own
+  # events reference: `branch_protection_rule`, `check_run`, `deployment_status`, …), so the
+  # difference is empty in practice, and a value inside it keeps this fail-closed arm: the
+  # lane cannot widen on a list this code cannot name (#2465's inert wait), with
+  # `--any-workflow` as the documented escape.
   norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   case "$norm" in
     '')
@@ -6904,7 +6909,7 @@ lane_own_run_can_attach() {
   local IFS=','
   for member in $norm; do
     case "$member" in
-      workflow_call|schedule) inert="${inert:+$inert }$member" ;;
+      workflow_call|schedule) inert="${inert:+$inert, }$member" ;;
       *)
         all_inert=0
         found="${found:+$found }$member"
@@ -10491,6 +10496,11 @@ main() {
               #     helper's classified set cannot leave the message describing a mechanism the
               #     lane's own `on:` block cannot provide — the defect this case used to fix by
               #     enumeration, which stopped serving the moment the set grew (round 7, P2).
+              # ⛔ THIS THREE-NAME SET IS FOR THE MESSAGE, NOT FOR THE DECISION (round 8, P2).
+              # The DECISION reads the inert allow-list in `lane_own_run_can_attach`; this set
+              # only says which of the members it reported has a described MECHANISM here.
+              # Keeping them separate is what stops the next `pull_request_review_comment` from
+              # being a decision bug: a member missing HERE loses a sentence, not the filter.
               local lane_attach_how="" lane_attach_part="" lane_attach_parts="" lane_attach_all_known=1
               for lane_attach_part in $LANE_RUN_ATTACH_TRIGGERS; do
                 case "$lane_attach_part" in
@@ -10517,7 +10527,7 @@ main() {
                 # lands here, so the claim must be the measured one: this code cannot PROVE
                 # the member inert, widening requires proof, so the filter is kept. It says
                 # nothing about whether that member attaches — it has not measured that.
-                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — and it declares '$LANE_RUN_ATTACH_TRIGGERS', which this code cannot prove INERT ('$LANE_RUN_ATTACH_TRIGGERS' is not a member of the known-inert set: workflow_call, schedule), so the filter is kept: widening requires EVERY declared member to be proven inert"
+                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — and it declares '$LANE_RUN_ATTACH_TRIGGERS', which this code cannot prove INERT (the known-inert set is: workflow_call, schedule), so the filter is kept: widening requires EVERY declared member to be proven inert"
                 lane_kept_tail="The unproven member may or may not attach a run — this code has not measured that — and an unproven member is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
               fi
             else
