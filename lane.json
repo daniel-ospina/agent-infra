@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12897-1794802408-p3522119-a1e084bd",
+  "_sha": "8eca7ec09ab86905472655644d1f2afc8a291141",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12897.log"
+    },
+    {
+      "kind": "branch",
+      "value": "docs/12894-storage-archaeology"
+    },
+    {
+      "kind": "sha",
+      "value": "afd3b32fe328b897de03d11b8802337cc928a382"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12897"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7243,
+  "ended_at": 1794809651,
+  "exit_code": 143,
+  "heartbeat_at": 1794809651,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12897-1794802408-p3522119-a1e084bd",
+  "lease_until": 1794817451,
+  "pid": 3522119,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794802408,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-12897",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12897"
+}
