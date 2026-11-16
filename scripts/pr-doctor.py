@@ -4031,9 +4031,16 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
 def _agent_started(name: str) -> bool:
     """True only when the worker's OWN log carries the agent-start line (agent-infra#4047).
 
-    `lane-exec.sh` and `merge-one.sh` append `[agent] provider=… model=…` the moment the agent is
-    actually launched, i.e. AFTER the load/capability/capacity gates have let it through. That line is
-    the launch artifact; a live dispatcher pid is not.
+    ⛔ THE LINE MEANS "AN AGENT IS BEING STARTED", AND THAT IS A PROPERTY OF WHERE IT IS WRITTEN, not of
+    its text (review P1, MEASURED). This function is only as honest as the emitter: `spawn-gate.sh`'s
+    `run_agent` used to write it ABOVE the capability/harness-skew gate, so on the one gate that is slow
+    by DESIGN (a single bounded probe, 5-25 s measured on a healthy box) the 71/83 refusal always landed
+    outside `CONFIRM_WINDOW_S` (1.0 s) with the marker already in the log — and every capability refusal
+    was confirmed `launched, agent started` and recorded. It is now emitted immediately before the `pi`
+    spawn, after every gate that can still refuse, and `spawn-gate.test.sh` pins that ordering in both
+    directions (a refusal writes no marker; a real launch does). `lane-exec.sh` and `merge-one.sh` write
+    theirs at their own launch points, where nothing after them can refuse. That line is the launch
+    artifact; a live dispatcher pid is not.
 
     BOUNDED (AGENT_CONFIRM_S) and CHEAP: the line is written early, so only the first 64 KiB is read,
     and the poll sleeps 100 ms. A worker whose log cannot be read returns False -- an unreadable
