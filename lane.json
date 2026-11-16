@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12902-1794819257-p1973141-e992b1cd",
+  "_sha": "42c575395c66419d207655df967eea7af198ffa1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12902.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12549-resolve-compose-and-fly"
+    },
+    {
+      "kind": "sha",
+      "value": "0d1f4e39cbdbd33bdf624f896861ebb79f09d4be"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12902"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7243,
+  "ended_at": 1794826500,
+  "exit_code": 143,
+  "heartbeat_at": 1794826500,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12902-1794819257-p1973141-e992b1cd",
+  "lease_until": 1794834300,
+  "pid": 1973141,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794819257,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-12902",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12902"
+}
