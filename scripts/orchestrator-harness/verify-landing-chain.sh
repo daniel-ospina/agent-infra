@@ -621,6 +621,13 @@ record_markers() { # record_markers <dir> <pr>
       if (match(line, /\([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\)/)) {
         repo = substr(line, RSTART + 1, RLENGTH - 2)
       }
+      # ⛔ THIS ARM IS NOW UNREACHABLE BY CONSTRUCTION, AND IS KEPT AS A GUARD, NOT AS DEAD CODE: the
+      # whole-artifact regex above (`marker_whole_re`) REQUIRES the `(owner/repo)` group — the gate predicate
+      # does, `REVIEW_RECORD_MARKER_RE` has it non-optional — so a marker that reaches here has a
+      # repo. It stays because it is the ONLY path that reports a repo-less marker instead of silently
+      # dropping it: loosening the regex (to tolerate a legacy shape, say) would otherwise delete that
+      # REPORT while keeping the silence. A repo-less marker is refused either way; what changes is
+      # whether the report can say so.
       if (repo == "")            { printf "SKIP\t%s\t%s\t(none)\n", chan, substr(s, 1, 12); next }
       if (tolower(repo) != fold) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }
       # ⛔ THE AUTHOR ADMISSION, on the COMMENT channel only (check-pipeline-compliance.sh:763): a body
