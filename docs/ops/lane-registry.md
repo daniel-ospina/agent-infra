@@ -76,8 +76,8 @@ FALSE-CLEAN class this fleet keeps paying for (#3382 invariant 1: *unknown ≠ z
   "branch": "feat/...", "worktree": "/path",
   "started_at": 1762000000,
   "heartbeat_at": 1762000060,
-  "budget_s": 7200,
-  "lease_until": 1762007260,
+  "budget_s": 36000,
+  "lease_until": 1762036060,
   "artifacts": [{"kind": "pr", "value": "3419"}, {"kind": "sha", "value": "..."}],
   "reason": null, "exit_code": 0, "ended_at": 1762000800, "duration_s": 800
 }
@@ -189,8 +189,9 @@ invisible after the fact.
 
 `EXPIRED` is decided by comparing the reader's clock to `lease_until`. **Cross-box clock skew is therefore
 an exposure**: a reader whose clock runs fast can call a live lane `EXPIRED`. The mitigations are structural
-rather than clever — the default budget is the lane's own absolute backstop (`7200 s`), so the error window
-is bounded by the skew against a two-hour lease; `heartbeat_at` is carried so the reason names both numbers;
+rather than clever — the default budget is the lane's own absolute backstop (`36000 s` since
+agent-infra#4034, `7200 s` before it), so the error window
+is bounded by the skew against a ten-hour lease; `heartbeat_at` is carried so the reason names both numbers;
 and `EXPIRED` is **not** a tombstone, so a late writer can still record `DONE` and correct the reading.
 
 **A false `EXPIRED` costs a re-dispatch. A false `RUNNING` costs the lane's whole result** — the fleet
@@ -356,9 +357,15 @@ Or from a session, without a shell: `lane.list` / `lane.show`.
 
 1. **`merge-one.sh` carries its own `run_agent()`** (this is not new — `spawn-gate.sh`'s header already
    names it for the disk gate). Reviewer and merge lanes reached that way do **not** write a record.
-2. **`check-deployed-drift.sh` hashes only `*.sh`** (#3016), so a stale `lane_registry.py` in `$O` is not
-   caught by that gate. The mitigation shipped here is the `registry_sha256` fingerprint on every payload;
-   adding python to the drift gate is #3016's work, not this slice's.
+2. **The aggregate payload FOLD is `*.sh`-only** (#3016 / #4015). `o_payload_hash` is a digest contract
+   shared with two other writers (`install.sh::prov_payload_hash`, `cloud-cell-supervisor.sh::o_payload_hash`),
+   so a *stamp* cannot name a `.py` or `.mjs` difference. ⚠️ The per-file comparisons no longer share that
+   blind spot: since #4015 `check-deployed-drift.sh` compares every depth-1 file of its DECLARED shipped
+   set (`*.sh`, `*.py`, `*.mjs`, and the extensionless `gh-app-token`) against the ref in BOTH directions,
+   so a stale `$O/lane_registry.py` now reads `DRIFT(checkout): lane_registry.py — the deployed copy
+   DIFFERS` and exits 1. The mitigation shipped here is the `registry_sha256` fingerprint on every payload;
+   the residual that REMAINS is narrower than the old wording — a `.py` edit is invisible only to a
+   *stamp-only* box's aggregate digest, and the byte arm catches it there.
 3. **Clock skew** — see §3.4.
 3b. **A corrupt record has no shipped remedy.** A record that fails `_record_problem` (a bad `lease_until`,
    a `DONE` with no artifacts, a ref/payload id mismatch) fails the **whole** read by design — skipping it

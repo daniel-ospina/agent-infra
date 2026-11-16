@@ -187,6 +187,16 @@ newlog() {
   printf '%s' "$f"
 }
 
+# ⛔ A "STALE" FIXTURE MUST BE STALE AGAINST THE SHIPPED LIVE WINDOW, NOT A HARDCODED AGE
+# (agent-infra#4034). `LIVE_MIN` moved 125 → 601 min WITH the lane backstop (it must stay above it), and
+# the 3 h / 6 h ages the legs below used fell INSIDE the new window: a lane meant to be "resident but not
+# live" became LIVE, so `lanes=` grew a numerator — and four arms (EVIDENCE-TEE-LSOF's census, COUNT,
+# COUNT-NO-EVIDENCE, FALLBACK) went red on a CORRECT change to the code. The age is DERIVED from the
+# shipped file exactly the way lane-bound.test.sh (i0) derives it, so raising the window again cannot
+# silently invert these legs: a leg that must read "resident, not live" ages its log past the window.
+LIVE_MIN_SHIPPED="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$REAPER" | head -1)"
+STALE_S=$(( (${LIVE_MIN_SHIPPED:-601} + 60) * 60 ))   # one hour past the LIVE window (11 h 1 m at the defaults)
+
 # run_reap <table1> [table2] -- <args…>
 # REAP_PROC_ROOT_OVERRIDE — set to "" to exercise the lsof branch (macOS shape) on a fixture that
 # has no fake /proc; every other leg keeps the /proc root, so this seam changes nothing for them.
@@ -294,7 +304,8 @@ fdlink 701 1 "$MID_LOG"; fdlink 701 2 "$MID_LOG"
 out="$(run_reap "$T/t-mid" "" -- --dry-run)"
 hasnt "$out" "WOULD REAP" "DEFAULT: a 90 m idle log is UNDER the shipped LANE_IDLE_MIN (2 h)"
 # ⛔ `trees=<working>/<judged>` MUST ACCOUNT FOR EVERY JUDGED TREE (#2163 review, P3). `live` was
-# incremented only for a CPU delta above the tolerance or a log younger than LIVE_MIN (125 m), so a
+# incremented only for a CPU delta above the tolerance or a log younger than LIVE_MIN (601 m since
+# agent-infra#4034; 125 m before it), so a
 # lane idle BETWEEN the live window and 2 h — this one — counted as neither working nor a candidate and the field
 # under-reported the box. A judged tree is working unless it is a candidate.
 has "$out" "trees=1/1" "DEFAULT: an idle-but-not-stale lane is counted WORKING in trees=<working>/<judged>"
@@ -534,7 +545,7 @@ exit 0
 SH
 chmod +x "$T/bin/lsof-tee"
 echo "== EVIDENCE-TEE-LSOF (an ADDRESS both sides reproduce identifies the lane's own tee)"
-TEE2_LOG="$(newlog L-tee2.log $((3 * 3600)))"
+TEE2_LOG="$(newlog L-tee2.log "$STALE_S")"      # same reason: the census leg needs resident-but-not-live
 : > "$T/t-tee2"; psinit >> "$T/t-tee2"
 psrow 960 400 Ss 00:00:00 05:00:00 "bash -c 'pi | tee $TEE2_LOG'" >> "$T/t-tee2"
 psrow 961 960 Sl 00:00:05 05:00:00 pi >> "$T/t-tee2"
@@ -1072,7 +1083,7 @@ eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "ACTIVE: no signal"
 # ── COUNT: evidence, not a string ───────────────────────────────────────────────────────────────
 echo "== COUNT (lanes=<live>/<total>, zombie=<n>)"
 FRESH="$(newlog L-fresh.log 30)"
-OLD="$(newlog L-stale.log $((6 * 3600)))"
+OLD="$(newlog L-stale.log "$STALE_S")"          # NOT live, but RESIDENT: past the LIVE window, still a lane
 : > "$T/t-count"; psinit >> "$T/t-count"
 psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $FRESH 2>&1" >> "$T/t-count"
 psrow 501 500 Sl 00:00:01 05:00:00 pi >> "$T/t-count"
@@ -1087,6 +1098,34 @@ psrow 900 1 Z 00:00:00 05:00:00 "[pi] <defunct>" >> "$T/t-count"
 psrow 901 1 Z 00:00:00 05:00:00 "[bash] <defunct>" >> "$T/t-count"
 out="$(run_count "$T/t-count")"
 eq "$out" "lanes=1/2 zombie=2" "COUNT: one live of two resident lanes; two zombies"
+
+# ── LIVE-WINDOW: the widened window errs in BOTH directions, and BOTH are measured ──────────────
+# ⛔ THE COUPLING IS TWO-WAY AND THIS ARM MEASURES THE HALF THE PROSE DID NOT STATE
+# (agent-infra#4034 review, P2). `live` is decided on the lane log's mtime ALONE (`lane-reap.sh:952`),
+# and its numerator is what `orch-loop.sh:8525` refuses dispatch on (`[ "$LANES" -ge "$MAX_LANES" ]` →
+# `GATE_WHY=lanes_full`). Raising the window 125 → 601 min therefore errs in two directions and the
+# change stated only one:
+#   • window TOO SHORT — a live lane inside one long silent tool call reads dead, the ceiling test is
+#     false, and the box OVER-ADMITS (the #2159 OOM direction). This is what forces 601 (> the 36000 s
+#     backstop), and it is the direction the seam doc carried.
+#   • window TOO LONG — a leaked/stuck tree whose log stopped 2–10 h ago now reads LIVE where it read
+#     dead, so the numerator inflates toward `total` and the controller REFUSES dispatch (lanes_full)
+#     for up to 10 h. Against the repo's own measured shape (`lanes=14/76`, 62 silent residents,
+#     orch-loop.sh:2955-2961) that shape collapses toward 76/76. This arm is that direction, measured
+#     rather than asserted: the SAME tree, graded at the shipped window and at the pre-#4034 one.
+# Neither direction is repairable by a number — the window is a log-mtime proxy and liveness proper
+# needs a process/progress reading the every-cycle census deliberately does not take. So the trade is
+# stated at the seam and the operator's escape is the documented `LANE_REAP_LIVE_MIN` override.
+echo "== LIVE-WINDOW (a silent resident reads LIVE at the shipped 601 min and dead at the old 125 min)"
+SILENT="$(newlog L-silent.log $(( (125 + 60) * 60 )))"   # 3 h 5 m: INSIDE 601 min, OUTSIDE 125 min
+: > "$T/t-live"; psinit >> "$T/t-live"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $SILENT 2>&1" >> "$T/t-live"
+psrow 501 500 Sl 00:00:01 05:00:00 pi >> "$T/t-live"
+fdlink 501 1 "$SILENT"
+out="$(run_count "$T/t-live")"
+eq "$out" "lanes=1/1 zombie=0" "LIVE-WINDOW: at the shipped ${LIVE_MIN_SHIPPED:-601} min a 3 h-silent resident counts LIVE — it holds a MAX_LANES slot, so the controller refuses dispatch (lanes_full)"
+out="$(LANE_REAP_LIVE_MIN=125 run_count "$T/t-live")"
+eq "$out" "lanes=0/1 zombie=0" "LIVE-WINDOW: …and at the pre-#4034 125 min the SAME tree counts dead — the OVER-ADMIT direction that forces the window above the backstop"
 
 # ── COUNT-NO-EVIDENCE: a census that cannot read a descriptor abstains ──────────────────────────
 # ⛔ THE MEASURED FAIL-OPEN (#2163 review, P0). `count` printed `lanes=0/0 zombie=<n>` with exit 0
