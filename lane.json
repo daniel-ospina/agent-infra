@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-4038-1794788675-p842885-7c171b75",
+  "_sha": "e2aa5bf37d4b565e5eb50022cb3bcef8ddfb305c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/fix-4038.log"
+    },
+    {
+      "kind": "branch",
+      "value": "main"
+    },
+    {
+      "kind": "sha",
+      "value": "3a0688fb18bc884f60876d2c646d23d78e94e8c5"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4389,
+  "ended_at": 1794793064,
+  "exit_code": 0,
+  "heartbeat_at": 1794793064,
+  "host": "cmux",
+  "issue": 4038,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-4038-1794788675-p842885-7c171b75",
+  "lease_until": 1794800864,
+  "pid": 842885,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794788675,
+  "state": "DONE",
+  "tag": "4038",
+  "worktree": "/home/cmux/agent-infra"
+}
