@@ -110,6 +110,16 @@ reject_pushes() { # <armdir>
   chmod +x "$1/origin.git/hooks/pre-receive"
 }
 
+# refixture_recreate — re-create the arm's worktree AND branch after a run reclaimed them.
+# ⛔ THE RECLAIM IS THE SHIPPED BEHAVIOUR: `lane_exit_cleanup` → `wt_reap_if_empty` removes a checkout a
+# lane left with nothing on it (#2033), and the branch it held (0 commits ahead) goes with it — so a later
+# `worktree add <path> <branch>` answers `fatal: invalid reference`. Two arms dispatch a SECOND time into
+# the same `$O` (2f's dry run and 7h's refusing stub). Before this suite was hermetic neither observed the
+# reclaim, because every arm measured the RUNNER's `WIP_PATH` checkout instead of its own fixture.
+refixture_recreate() {
+  "$REAL_GIT" -C "$ARMDIR/repo" worktree add -q "$ARMWT" -b "$BR" main 2>/dev/null || true
+}
+
 # ⛔ `ENV_FILE` IS PINNED TO A FIXTURE-OWNED (ABSENT) FILE, AND THAT IS NOT COSMETIC — IT IS WHAT MAKES
 # THE SUITE HERMETIC IN THE FIRST PLACE. `lane.sh` dots `lane-env.sh`, which sources
 # `${ENV_FILE:-$HOME/keys.env}`; `ENV_FILE` is exported by the CONTROLLER, so a suite run on a real box
@@ -472,10 +482,7 @@ printf 'outcome=failed reason=STALE-PREVIOUS-RUN lane=3331 rc=9 utc=1999-01-01T0
 # behind, #2033). This arm needs a SECOND dispatch into the same `$O`, so it re-creates the checkout
 # explicitly instead of relying on an unclean tree to keep it alive — which is what it silently relied on
 # before, because the fixture inherited the RUNNER's `WIP_PATH` and measured the runner's dirty checkout.
-# ⛔ `-b $BR` AGAIN, BECAUSE THE RECLAIM TOOK THE BRANCH TOO: `wt_reap_if_empty` removes a worktree the lane
-# left with nothing on it, and the branch it held (0 commits ahead) goes with it — so a later `worktree add
-# <path> <branch>` answers `fatal: invalid reference`. Re-creating the pair is the honest fixture.
-"$REAL_GIT" -C "$ARMDIR/repo" worktree add -q "$ARMWT" -b "$BR" main 2>/dev/null || true
+refixture_recreate
 drive "$WT" LANE_DRY_RUN=1
 has "$(cat "$RUNOUT" 2>/dev/null)" "reason=dry-run" "2f a re-dispatch OVERWRITES it — a pre-seeded previous-run verdict is gone, so no reader can act on it"
 hasnt "$(cat "$RUNOUT" 2>/dev/null)" "STALE-PREVIOUS-RUN" "2g …and the stale line does not survive anywhere in the run-scoped read"
@@ -755,6 +762,7 @@ eqv "$LANE_RC" "0" "7h1 the stub-companion lane runs"
 has "$(cat "$(LOG)" 2>/dev/null)" "check=warn reason=box-default-not-provisioned" \
     "7h2 the fixture really printed the companion's warn line FIRST (else the arm measures nothing)"
 has "$(lastline)" "keygate=checked " "7h3 …and the terminal line still reports the VERDICT (checked), not the companion's warning nor notrun"
+refixture_recreate      # the first run reclaimed the empty worktree (and its branch) — see the helper
 : > "$PI_MARK"
 LANE_BIN="$STUBH/lane.sh" drive "$WT" "KG_STUB_REFUSE=1"
 eqv "$LANE_RC" "82" "7h4 the same stub refuses with 82 when told to"
