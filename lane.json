@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12904-1794789969-p1499413-20bee244",
+  "_sha": "8c4bc6adb324b7689f026595d0118ddb31598cde",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12904.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/9318-journal-collision-loud"
+    },
+    {
+      "kind": "sha",
+      "value": "6d7fd63a07fd0686c45f792f4a311114e08cc88a"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12904"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 6690,
+  "ended_at": 1794796659,
+  "exit_code": 0,
+  "heartbeat_at": 1794796659,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12904-1794789969-p1499413-20bee244",
+  "lease_until": 1794804459,
+  "pid": 1499413,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794789969,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12904",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12904"
+}
