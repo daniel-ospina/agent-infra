@@ -1039,6 +1039,34 @@ check_terminal "10b" done "agent-exit-0-undelivered:unpushed-1" 0
 has "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
     "10b2 …and the log says it in words, not only in a grep key — an operator reads the log, not the census"
 
+# 10b3 THE OTHER SHAPE OF "THE PUSH DID NOT LAND", AND THE ONE THE SENTENCE WAS FALSE FOR (review of
+# #4047 at this head, P2 — MEASURED against the writer): the push target POSITIVELY holds
+# `refs/heads/<br>` at a DIFFERENT sha, so the client's push is rejected/moved under it and
+# `spawn-gate.sh` assigns `FAILED` — whose own log line ends "whether they are on some OTHER ref is not
+# measured here". The pre-fix sentence ("NOTHING LEFT THE BOX … no pushed head carries it … no PR can be
+# opened … Re-dispatch") asserted exactly the absence the writer refuses to assert, two lines above it in
+# the same log, and prescribed the redundant relaunch. The state and the reason token are unchanged (the
+# lane really did not deliver); only the claim and the remedy are.
+mk_arm deliv_unpushed_other_sha; WT="$ARMWT"
+# an UNRELATED commit on origin's copy of the branch: different sha, not an ancestor of this lane's HEAD
+"$REAL_GIT" -C "$ARMDIR/repo" -c user.email=t@t -c user.name=t commit --allow-empty -qm 'peer work' >/dev/null 2>&1
+PEER_SHA="$("$REAL_GIT" -C "$ARMDIR/repo" rev-parse HEAD)"
+"$REAL_GIT" -C "$ARMDIR/repo" push -q "$ARMDIR/origin.git" "$PEER_SHA:refs/heads/$BR"
+reject_pushes "$ARMDIR"
+pi() {
+  printf 'work\n' > "$PWD/pushed-later.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  printf 'ran\n'; return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10b3" done "agent-exit-0-undelivered:unpushed-1" 0
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+    "10b3b …and it does NOT claim the box was empty: the push target holds a DIFFERENT sha on this branch, which the writer says is not a measurement about any other ref"
+has "$(cat "$(LOG)" 2>/dev/null)" "NOT measured here" \
+    "10b3c …and it says in words what was NOT measured, mirroring the writer's own FAILED note"
+
 # 10c UNCOMMITTED — the #4011 shape: files written, never committed — WITH THE BRANCH AND ITS PR ALREADY
 # LIVE on origin. That is the shape whose remedy the first cut got BACKWARDS (review P2): it printed
 # "NOTHING LEFT THE BOX … no pushed head carries it … Re-dispatch", every clause of which is false here,
