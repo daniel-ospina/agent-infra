@@ -756,6 +756,13 @@ has "$(cat "$(LOG)" 2>/dev/null)" "check=warn reason=box-default-not-provisioned
     "7h2 the fixture really printed the companion's warn line FIRST (else the arm measures nothing)"
 has "$(lastline)" "keygate=checked " "7h3 …and the terminal line still reports the VERDICT (checked), not the companion's warning nor notrun"
 : > "$PI_MARK"
+# ⛔ THE FIRST DRIVE RECLAIMED THE WORKTREE, AND THAT IS THE SHIPPED BEHAVIOUR, NOT A FIXTURE BUG
+# (`lane_exit_cleanup` → `wt_reap_if_empty`: a lane that produced no commits must not leave a checkout
+# behind, #2033) — the same pair the 2f arm re-creates for the same reason. ⛔ AND IT ONLY BECAME VISIBLE
+# WHEN THE FIXTURE STOPPED INHERITING THE RUNNER'S `WIP_PATH`: the dirty checkout of whichever tree ran
+# this suite used to make the probe refuse the reap, so this arm silently depended on the runner's state.
+# `-b $BR` again because the reap took the branch with it.
+"$REAL_GIT" -C "$ARMDIR/repo" worktree add -q "$ARMWT" -b "$BR" main 2>/dev/null || true
 LANE_BIN="$STUBH/lane.sh" drive "$WT" "KG_STUB_REFUSE=1"
 eqv "$LANE_RC" "82" "7h4 the same stub refuses with 82 when told to"
 has "$(lastline)" "keygate=refused " "7h5 …and that refusal is reported as keygate=refused, not notrun (a warn-first refusal used to read as a harness bug)"
