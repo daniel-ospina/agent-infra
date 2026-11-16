@@ -183,7 +183,7 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean; markerInertLines?: string[] | null } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -338,10 +338,14 @@ let extractMarkerReason: (command: string) => string | null = () => null;
 let parseMarkerContent: (content: string) => Record<string, unknown> | null = () => null;
 let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
+// #3620 — the SAME decision as readAllowMarkerState, carrying WHY it refused.
+// Fail-safe default: inactive, and the cause says the classifier never loaded
+// (so a degraded import can neither open a window nor claim one is open).
+let diagnoseAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => { active: boolean; cause: string } = () => ({ active: false, cause: "unavailable" });
 // #1484: ONE three-shape dirty-hub recovery text, shared by every block message
 // (M4's classifier reason and this file's write/edit + bash-write surfaces) so
 // the advice cannot drift from the enforcement.
-let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
+let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean, inertMarkerLines?: string[] | null) => string[] = () => [];
 let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
 // Round 11 (P2): the REAL hatch state for the CURRENT tool call, resolved with the
 // ctx session id (not the env-only form). `_hubWriteRecoverLines` used to derive
@@ -349,6 +353,11 @@ let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
 // sets PI_SESSION_ID only in bash CHILDREN), so the hatch-active paragraph was
 // unreachable on the write/edit, bash-write and inline-payload surfaces.
 let _currentHatchActive = false;
+// #3620 — the marker's diagnosis for THIS tool call (same ctx id, same read as
+// `_currentHatchActive`). Every refusal that prescribes the escape marker reads
+// this, so a marker that is present but inert is explained rather than
+// re-prescribed. Fail-safe default: inactive/absent (nothing to explain).
+let _currentMarkerDiagnosis: { active: boolean; cause: string } = { active: false, cause: "absent" };
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
@@ -357,6 +366,7 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      hubDirtyRecoveryLines, isRepoSelectingEnvKey,
      readAllowMarkerState, readHubDisorder,
+     diagnoseAllowMarkerState,
      extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
@@ -609,6 +619,114 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
   }
 }
 
+// ── #3620: the marker mint is VERIFIED, and an inert marker is DIAGNOSED ─────
+//
+// WHAT WENT WRONG. `_stampMarker` is deliberately try/catch fail-silent (F7): a
+// failed stamp must never weaken the gate, so "no stamp ⇒ empty/inert marker ⇒
+// blocked" is the safe direction. The DIRECTION OF THE MESSAGE was not safe. Two
+// session shapes produced a marker file that is byte-fresh, parses, and cannot
+// open a window, while the guard logged `🔓 Escape marker active …` and wrote a
+// `gate_bypass` audit row:
+//
+//   * the session id does not resolve → `{"session_id": null}`. The read side
+//     requires a STRING id (pinned: `test.mjs` "headless null session id →
+//     inactive (cannot escalate)"), so `pi -p --no-session` — every orchestrator
+//     lane and every unhatched `task` child — mints an inert marker EVERY time;
+//   * the stamp itself fails (an unwritable/symlinked `~/.pi/agent`), leaving the
+//     EMPTY file the shell's own `touch` creates.
+//
+// Both then refused the recovery op with "stamp the marker", which the agent had
+// just done. That is the same false-PASS shape as a no-op gate: the guard reports
+// the escape open while it is shut, so the honest response (stop) is a dead end
+// and the dishonest one (retry) cannot help.
+//
+// THE FIX IS DIAGNOSTIC, NOT ANY WIDENING (see the fail-safe above: no id ⇒ still
+// no window). One, the touch is refused BEFORE the stamp when this session can
+// never hold an active marker, so no misleading file is created — which also
+// stops an id-less lane from OVERWRITING a sibling's live marker, since
+// `_stampMarker` writes unconditionally. Two, a refusal that runs while an inert
+// marker sits on disk names the cause instead of re-prescribing the touch.
+const _MARKER_CAUSE_TEXT: Record<string, string> = {
+  "no-session-id": "this session has no resolvable id, and the marker is scoped to one",
+  unscoped: "the file carries no string `session_id` (an un-guarded `touch`, or a null-id stamp)",
+  "session-mismatch": "the marker belongs to ANOTHER session (a sibling touched it, or a subagent re-scoped it)",
+  expired: "its mtime is older than the 15-minute TTL",
+  unparseable: "its content is not the guard's one-line JSON stamp (an out-of-band write)",
+  symlinked: "it is reached through a symlink, which the guard never trusts",
+  unreadable: "it could not be read",
+  absent: "there is no marker file",
+  unavailable: "the guard's marker rules failed to load in this process",
+};
+
+/** The INERT-marker paragraph for a refusal, or [] when there is nothing to
+ *  explain (no marker, or an active one). Reads the per-tool_call diagnosis. */
+function _inertMarkerLines(): string[] {
+  const d = _currentMarkerDiagnosis;
+  if (d.active || d.cause === "absent") return [];
+  const why = _MARKER_CAUSE_TEXT[d.cause] ?? d.cause;
+  const lines = [
+    `     ⚠️ A marker file EXISTS at ${_markerPath()} but is INERT [${d.cause}] — ${why}.`,
+  ];
+  if (d.cause === "no-session-id") {
+    lines.push(
+      `        No marker can ever be active for an id-less session, so this is not`,
+      `        something a re-touch fixes: recover from a session that HAS an id, or`,
+      `        from a human terminal (terminals are never intercepted):`,
+      `          git -C <repo> restore <path>`,
+    );
+  } else if (d.cause === "session-mismatch") {
+    lines.push(
+      `        Re-touch it from THIS session, as its own bash call, to re-scope it:`,
+      `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+    );
+  } else {
+    lines.push(
+      `        Re-touch it from THIS session, as its own bash call:`,
+      `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+          `        (if that is refused, the refusal names the cause.)`,
+    );
+  }
+  return lines;
+}
+
+/** Refusal for a marker `touch` that provably cannot open a window.
+ *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check. */
+function _markerTouchBlockReason(cause: string | null, sessionId: string | null): string {
+  if (cause === null) {
+    return [
+      `⛔ The escape marker cannot be opened from this session (#3620).`,
+      `   Why: this session's id does not resolve — no PI_SESSION_ID in the env and`,
+      `   none from the session manager — and the marker is SCOPED to a session id.`,
+      `   The read side refuses a marker with no id (deliberate, and pinned), so an`,
+      `   allowed \`touch\` here would leave a fresh file that opens nothing while the`,
+      `   guard logged \`🔓 marker active\`. It is refused instead of reported as open.`,
+      `   This is the \`pi -p --no-session\` class (orchestrator lanes and unhatched`,
+      `   task children); an id-less lane also must not clobber a sibling's marker.`,
+      `   → Recover from a session that HAS an id, or from a human terminal`,
+      `     (terminals are never intercepted):`,
+      `       git -C <repo> restore <path>`,
+      `   → For anything beyond recovery, work in a worktree:`,
+      `       bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+      `   ⛔ \`AGENT_ALLOW_MAIN_EDITS=1\` is NOT an alternative here: it is read from`,
+      `      the session-start host env, so an inline prefix or an \`export\` in a`,
+      `      running session cannot set it (#1239).`,
+    ].join("\n");
+  }
+  const why = _MARKER_CAUSE_TEXT[cause] ?? cause;
+  return [
+    `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
+    `   Diagnosis: ${why}.`,
+    `   Allowing the \`touch\` would leave a file that cannot open the recovery`,
+    `   window and a log line claiming it did, so it is refused instead.`,
+    `   → Check that ${dirname(_markerPath())} is writable and is not a symlink,`,
+    `     then run the touch again as its own bash call:`,
+    `       touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+    `   → Or recover from a human terminal (terminals are never intercepted):`,
+    `     git -C <repo> restore <path>`,
+    `   (session id: ${sessionId ?? "<none>"})`,
+  ].join("\n");
+}
+
 function _mainTopLevel(): string | null {
   try {
     return resolve(
@@ -740,7 +858,11 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
 function _hubWriteRecoverLines(st: { disorder: string | null } | null, hatchActive: boolean = _currentHatchActive): string[] {
   // ONE text, shared with M4's classifier reason (round 9): the two used to
   // diverge, and only the classifier's covered all three dirt shapes.
-  const lines = hubDirtyRecoveryLines(st, hatchActive);
+  //
+  // #3620 — the INERT-marker diagnosis rides along: this route is where a
+  // stranded lane lands, and telling a reader to stamp a marker that is already
+  // on disk (and inert) is the dead end the report measured.
+  const lines = hubDirtyRecoveryLines(st, hatchActive, _inertMarkerLines());
   if (lines.length > 0) return lines;
   return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
@@ -5910,6 +6032,12 @@ export default function (pi: ExtensionAPI) {
     // hatch-active paragraph was unreachable on exactly the surfaces a stranded
     // lane hits.
     _currentHatchActive = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+    // #3620 — resolve the marker's DIAGNOSIS on the same call, with the same id,
+    // so every refusal below can say why a marker that is present did not open
+    // the window instead of re-prescribing it. One read, one id, no drift.
+    _currentMarkerDiagnosis = _isAllowMainEdits()
+      ? { active: true, cause: "env-hatch" }
+      : diagnoseAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
     // mid-review sees the warn before proceeding, AC8). Active under the
@@ -6014,7 +6142,7 @@ export default function (pi: ExtensionAPI) {
           // recovery and M5 never consulted. Wiring the hatch to the shape (not
           // just to the window) makes M4 refuse those forms exactly as main does.
           const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(localCommand);
-          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
+          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive, markerInertLines: _inertMarkerLines() });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -6156,7 +6284,27 @@ export default function (pi: ExtensionAPI) {
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
       if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
+        // ── #3620: verify the mint, never assume it ──────────────────────
+        // (a) FAIL BEFORE STAMPING when this session can never hold an active
+        // marker. `_stampMarker` writes unconditionally, so an id-less lane
+        // would not only mint an inert file — it would REPLACE a sibling's live
+        // marker with `{session_id: null}` and revoke that sibling's window.
+        const markerSid = _currentSessionId(_ctx);
+        if (markerSid === null) {
+          return { block: true, reason: _markerTouchBlockReason(null, null) };
+        }
+        _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
+        // (b) read back what we just minted, with the same id the read side will
+        // use. A stamp that did not land (unwritable/symlinked ~/.pi/agent, a
+        // disk error) leaves an empty or absent file: the touch is refused with
+        // the cause instead of being reported as an open window (F7 stays
+        // fail-safe; only the REPORTING changes).
+        const minted = diagnoseAllowMarkerState(_markerPath(), markerSid);
+        if (!minted.active) {
+          _currentMarkerDiagnosis = minted;
+          return { block: true, reason: _markerTouchBlockReason(minted.cause, markerSid) };
+        }
+        _currentMarkerDiagnosis = minted;
         return undefined;
       }
     }

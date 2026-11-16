@@ -2158,7 +2158,10 @@ The marker is **per-process-session-scoped**, not machine-wide:
   blocked.** The touch must be a bash tool call inside a guard-loaded session
   for the guard to stamp it.
 - **Headless / print-mode sessions with a null session id cannot escalate**
-  (fail-safe block).
+  (fail-safe block). Since #3620 the `touch` itself is **refused with the cause**
+  instead of being allowed and minting an inert marker (see *the mint is
+  verified* below); the window is still unopenable for that class — recovering
+  one needs a session WITH an id, or a human terminal.
 
 ### Delegation caveat
 
@@ -2203,6 +2206,36 @@ any symlink indirection) marker → treated as absent → **blocked**. A
 it clobbers the guard's stamp, the marker becomes unscoped, and the guard
 blocks. The env hatch is unchanged — the marker is an additional OR branch,
 never a replacement.
+
+### The mint is verified, and an inert marker is named (#3620)
+
+The stamp is written by `_stampMarker`, which is fail-**silent** (`F7`) — a failed
+stamp must never weaken the gate, so "no stamp ⇒ inert marker ⇒ blocked" is the
+safe direction. That made the *reporting* unsafe: two session shapes produced a
+marker file that is byte-fresh, parses, and opens nothing, while the guard
+printed `🔓 Escape marker active …` and wrote a `gate_bypass` audit row —
+
+- **a session whose id does not resolve** stamped `{"session_id": null}`, and the
+  read side requires a *string* id (the deliberate `headless null session id →
+  inactive` pin), so a `pi -p --no-session` lane's marker could never work;
+- **a stamp that did not land** (an unwritable or symlinked `~/.pi/agent`) left the
+  empty file the shell's own `touch` creates.
+
+Both then refused the recovery op with "stamp the marker" — which the agent had
+just done. Two changes, **neither of which widens the hatch**:
+
+- a marker `touch` from a session whose id does not resolve is **refused before
+  the stamp**, with the cause. Nothing is written, which also stops an id-less
+  lane from replacing a sibling's live marker (`_stampMarker` writes
+  unconditionally);
+- after a stamp the guard **reads back what it minted** (`diagnoseAllowMarkerState`,
+  the same function `readAllowMarkerState` delegates to) and refuses with the
+  cause if it is not active for this session.
+
+A refusal that runs while an *inert* marker is on disk now says so and names the
+cause — `absent` / `symlinked` / `expired` / `unparseable` / `unscoped` /
+`no-session-id` / `session-mismatch` / `unreadable` — so "I stamped it and
+nothing happened" cannot recur silently.
 
 ## The script backdoor — closed since #1484 (shell + #627 interpreters)
 

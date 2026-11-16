@@ -317,7 +317,7 @@ async function partB() {
   // uses), so this suite never touches the operator's file at all. The sibling
   // suite in this directory does the same (test-discard-gate.mjs).
   const { homedir } = await import("node:os");
-  const { readFileSync, existsSync, unlinkSync, mkdirSync } = await import("node:fs");
+  const { readFileSync, existsSync, unlinkSync, mkdirSync, utimesSync } = await import("node:fs");
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "m4-recovery-window-")));
   const savedHomedir = process.env.HOME;
   process.env.HOME = tmp;
@@ -352,15 +352,21 @@ async function partB() {
     writeFileSync(join(hub, "wip.txt"), ""); // truncated to 0 bytes, as the incident
     process.chdir(hub);
 
-    const drive = async (command) => {
+    // #3620 — the ctx's session id is a PARAMETER: a `pi -p --no-session` lane
+    // resolves to null, which is the population whose marker mint is inert.
+    const driveWith = async (sessionId, command) => {
       const mod = await import(pathToFileURL(join(HERE, "index.ts")).href);
       const handlers = new Map();
       mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
       delete process.env.PI_SESSION_ID; // production: the id comes from ctx, not env
-      const ctx = { sessionManager: { getSessionId: () => TID } };
+      const ctx = { sessionManager: { getSessionId: () => sessionId } };
       const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
       return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
     };
+    const drive = (command) => driveWith(TID, command);
+    // Like check(), but a FAILURE carries the refusal text (these cases assert on
+    // message content, and "got false" alone would say nothing about why).
+    const checkD = (name, cond, detail) => check(cond ? name : `${name} — ${String(detail ?? "").slice(0, 400)}`, cond, true);
 
     // B1 — the acceptance test for the incident: with the MARKER the named-path
     // restore is PERMITTED (nothing in the chain refuses it: before the M5
@@ -598,6 +604,69 @@ async function partB() {
     check("B6g3 inline-payload still BLOCKED", b6g3 !== null, true);
     check("B6g4 …and it does NOT prescribe the branch switch as recovery",
       /recovery: git checkout main/.test(b6g3?.reason ?? ""), false);
+
+    // ── B7/B8 (#3620): the marker mint must be VERIFIED, not assumed ─────────
+    //
+    // The defect: the guard's mint is `_stampMarker` (try/catch fail-silent)
+    // writing `{session_id: <id>, …}`. When the session's id does not resolve —
+    // `pi -p --no-session`, the fleet's own lanes, whose ctx sessionManager has
+    // no id and whose env carries no PI_SESSION_ID — it writes
+    // `{"session_id": null}`, logs `🔓 Escape marker active for session null`,
+    // audits a gate_bypass row, and the READ side then refuses it because it
+    // requires a string id. Measured end-to-end before the fix: touch ALLOWED,
+    // marker file present and byte-fresh, recovery op still BLOCKED.
+    //
+    // That is a FALSE PASS on the escape hatch — the guard reports the window
+    // open while the window is shut — which is the shape the #3620 report hit
+    // ("the three remedies are all inert"). It is NOT a request to widen the
+    // hatch: `test.mjs` pins null-id → inactive as DELIBERATE and B7 keeps it.
+    setMarker(false);
+    mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+    const noSessTouch = await driveWith(null, `touch ${markerPath}  # recovery: stranded main`);
+    check("B7 a NO-SESSION lane's marker touch is REFUSED (the window can never open for it)",
+      noSessTouch !== null, true);
+    checkD("B7b …the refusal names the missing session id as the cause",
+      /session id/i.test(noSessTouch?.reason ?? ""), noSessTouch?.reason);
+    // The misleading log line was `🔓 Escape marker active …`; the refusal must
+    // state the window is CLOSED, not merely avoid the word "active" (it quotes
+    // the old log line to explain what used to happen).
+    checkD("B7c …and it states the window CANNOT be opened (no false PASS)",
+      /cannot be opened/i.test(noSessTouch?.reason ?? "") && !/IS active/.test(noSessTouch?.reason ?? ""), noSessTouch?.reason);
+    check("B7d …and no marker file is left behind that LOOKS honoured",
+      existsSync(markerPath), false);
+    const noSessRestore = await driveWith(null, "git restore wip.txt");
+    check("B7e …and the recovery op still stays BLOCKED end-to-end (the pin is intact)",
+      noSessRestore !== null, true);
+    // …AND the refusal must not offer the session-start env as though the reader
+    // could use it (#1239): a running session cannot set it, so a message that
+    // presents it as THE remedy is a second dead end.
+    checkD("B7f …and it says the session-start env cannot be set from a running session",
+      /session-start/i.test(noSessRestore?.reason ?? "") && /cannot/i.test(noSessRestore?.reason ?? ""),
+      noSessRestore?.reason);
+
+    // B8 — a REAL session, with a marker that exists but is INERT (here: it
+    // belongs to another session). The refusal used to tell this reader to
+    // stamp the marker it already has; it must instead say the file is inert
+    // and why, so "I stamped it and nothing happened" cannot recur silently.
+    writeFileSync(markerPath, JSON.stringify({ session_id: "some-other-session", reason: "elsewhere", ts: new Date().toISOString() }) + "\n");
+    const inertMismatch = await drive("git restore wip.txt");
+    check("B8 a present-but-INERT marker (other session) is BLOCKED", inertMismatch !== null, true);
+    checkD("B8b …and the refusal DIAGNOSES it as inert, naming the session mismatch",
+      /INERT \[session-mismatch\]/.test(inertMismatch?.reason ?? ""), inertMismatch?.reason);
+    // B8c — an EXPIRED marker is the same class (mtime past the 15-min TTL) and
+    // must be diagnosed as expired, not as absent.
+    writeFileSync(markerPath, JSON.stringify({ session_id: TID, reason: "stale", ts: new Date().toISOString() }) + "\n");
+    utimesSync(markerPath, new Date(Date.now() - 20 * 60 * 1000), new Date(Date.now() - 20 * 60 * 1000));
+    const inertStale = await drive("git restore wip.txt");
+    checkD("B8c an EXPIRED marker is diagnosed as expired",
+      /INERT \[expired\]/.test(inertStale?.reason ?? ""), inertStale?.reason);
+    // B8d — the ACTIVE case must stay silent about inertness (the diagnosis is
+    // about a present-but-inert file, never a blanket paragraph).
+    setMarker(true);
+    const activeWholeTree = await drive("git checkout -- .");
+    check("B8d marker ACTIVE ⇒ no INERT paragraph (the diagnosis is conditional)",
+      /INERT/.test(activeWholeTree?.reason ?? ""), false);
+    setMarker(false);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

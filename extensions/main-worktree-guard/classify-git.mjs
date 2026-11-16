@@ -6539,18 +6539,62 @@ export function isAllowMarkerRealpath(path) {
  * @returns {boolean}
  */
 export function readAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
+  return diagnoseAllowMarkerState(path, sessionId, nowMs, ttlMs).active;
+}
+
+/**
+ * #3620 — the SAME decision as readAllowMarkerState, with the REASON it refused.
+ *
+ * One implementation, two readers, because the two must never disagree: the
+ * decision is `active`, and every message that explains an inert marker is
+ * reading `cause` from this call rather than re-deriving it. A second copy of
+ * this logic is how a guard ends up telling an agent to do what it just did.
+ *
+ * Why this exists at all: the D3 escape marker is the only mid-session route
+ * out of a dirty shared hub, and its mint is fail-SILENT by design (F7 — a
+ * failed stamp must never weaken the gate). Silent in the safe direction is
+ * correct; silent in the DIAGNOSTIC direction is a false PASS, because the
+ * touch is allowed, the file looks fresh, and the window is shut. Measured
+ * 2026-11-16: a `pi -p --no-session` lane stamps `{session_id: null}`, logs
+ * `🔓 Escape marker active for session null`, audits a `gate_bypass` row — and
+ * readAllowMarkerState answers false, so the recovery op is refused with
+ * "stamp the marker", which the agent has just done.
+ *
+ * The causes are deliberately distinct, because the remedy differs for each:
+ *   absent            no marker file — the normal, expected refusal
+ *   symlinked         a marker behind a symlink is never trusted (pinned F6)
+ *   expired           mtime older than the TTL — re-touch (or `touch` again)
+ *   unparseable       not the guard's one-JSON-line stamp — out-of-band write
+ *   unscoped          parses, but carries no string session_id — an un-guarded
+ *                     `touch` (a human terminal) or a null-id stamp
+ *   no-session-id     THIS reader has no resolvable id, so no marker can ever be
+ *                     active for it; the class `pi -p --no-session` lives in
+ *   session-mismatch  the marker belongs to ANOTHER session (parallel-session
+ *                     safety) — a sibling touched it, or a subagent re-scoped it
+ *   unreadable        stat/read failed
+ * @param {string} path
+ * @param {string|null|undefined} sessionId
+ * @param {number} [nowMs]
+ * @param {number} [ttlMs]
+ * @returns {{active: boolean, cause: string}}
+ */
+export function diagnoseAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
   try {
-    if (!isAllowMarkerRealpath(path)) return false;
+    if (!existsSync(path)) return { active: false, cause: "absent" };
+    // The SOLE symlink defense (pinned F6/round-2 F3): realpath inequality.
+    if (!isAllowMarkerRealpath(path)) return { active: false, cause: "symlinked" };
     const stats = statSync(path);
-    if (!isAllowMarkerActive(stats, nowMs, ttlMs)) return false;
+    if (!isAllowMarkerActive(stats, nowMs, ttlMs)) return { active: false, cause: "expired" };
     const content = readFileSync(path, "utf-8");
     const parsed = parseMarkerContent(content);
-    if (!parsed) return false;
+    if (!parsed) return { active: false, cause: "unparseable" };
     const sid = parsed.session_id;
-    if (typeof sid !== "string" || !sessionId || sid !== sessionId) return false;
-    return true;
+    if (typeof sid !== "string" || sid === "") return { active: false, cause: "unscoped" };
+    if (!sessionId) return { active: false, cause: "no-session-id" };
+    if (sid !== sessionId) return { active: false, cause: "session-mismatch" };
+    return { active: true, cause: "active" };
   } catch {
-    return false;
+    return { active: false, cause: "unreadable" };
   }
 }
 
@@ -8120,10 +8164,17 @@ function _ambientGitEnvLines() {
   ];
 }
 
-export function hubDirtyRecoveryLines(hubContext, hatchActive = false) {
+export function hubDirtyRecoveryLines(hubContext, hatchActive = false, inertMarkerLines = null) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) return [];
   _dirtyHatchActive = hatchActive === true;
+  // #3620 — a PRESENT but INERT marker is the one state in which the advice
+  // below is actively misleading: it tells the reader to acquire the hatch, the
+  // reader has already tried, and the file that proves they tried is exactly
+  // what makes the next attempt look identical. The caller renders the cause
+  // (it owns the marker path and the session id); the classifier only splices it
+  // in at the one place the hatch is prescribed.
+  _dirtyInertMarkerLines = Array.isArray(inertMarkerLines) ? inertMarkerLines : [];
   return _dirtyRecoveryBody();
 }
 
@@ -8141,14 +8192,34 @@ function _hatchParagraph(hatchActive) {
       `     \`cd … &&\` prefix, no \`-C\`/\`GIT_DIR\` target, no wrapper (\`env\`/\`nice\`).`,
     ];
   }
+  // #3620/#1239 — the two hatches are NOT interchangeable and the old text
+  // presented them as an either/or. `AGENT_ALLOW_MAIN_EDITS=1` is read from the
+  // PROCESS env at session start: an `AGENT_ALLOW_MAIN_EDITS=1 git restore …`
+  // prefix sets it in the CHILD shell, which the guard's own process never
+  // sees, and an `export` in a running session cannot reach it either. The
+  // marker is the ONLY one a running session can open — so it is named first,
+  // with the one-touch-per-call contract, and the env is labelled for what it
+  // is. (Measured: the report that produced this text tried BOTH spellings and
+  // the env form was inert by construction.)
   return [
-    `     These named-path recoveries need an active escape hatch: the`,
-    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
-    `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
+    `     These named-path recoveries need an active escape hatch, and only ONE`,
+    `     of them is reachable from a running session:`,
+    `       → THE MARKER — as its OWN bash call, nothing else in it:`,
+    `           touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+    `         then run the restore as ONE bare command in the NEXT call.`,
+    `         (15-min TTL, re-read every call; re-touch to refresh.)`,
+    `       ✗ \`AGENT_ALLOW_MAIN_EDITS=1 <cmd>\` does NOT work: it is read from the`,
+    `         session-START host env, so an inline prefix or an \`export\` in a`,
+    `         running session cannot set it (#1239).`,
+    ...(_dirtyInertMarkerLines.length > 0 ? _dirtyInertMarkerLines : []),
   ];
 }
 
 let _dirtyHatchActive = false;
+// #3620 — caller-rendered INERT-marker diagnosis, spliced into the hatch
+// paragraph. Per-call state, like `_dirtyHatchActive`: set by
+// hubDirtyRecoveryLines, read immediately by the body builder.
+let _dirtyInertMarkerLines = [];
 
 function _dirtyRecoveryBody() {
   const _ambientLines = _ambientGitEnvLines();
@@ -8178,7 +8249,7 @@ function _dirtyRecoveryBody() {
   ];
 }
 
-function _m4RecoveryLines(hubContext, hatchActive = false) {
+function _m4RecoveryLines(hubContext, hatchActive = false, inertMarkerLines = null) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) {
     return [
@@ -8187,6 +8258,10 @@ function _m4RecoveryLines(hubContext, hatchActive = false) {
     ];
   }
   _dirtyHatchActive = hatchActive === true;
+  // #3620 — the caller owns the marker path and session id, so it renders the
+  // INERT diagnosis; this only carries it to the paragraph that prescribes the
+  // marker. Absent/active markers pass null and change nothing.
+  _dirtyInertMarkerLines = Array.isArray(inertMarkerLines) ? inertMarkerLines : [];
   return _dirtyRecoveryBody();
 }
 
@@ -8212,7 +8287,7 @@ export function evaluateHubGate(command, currentBranch, opts = {}) {
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
@@ -8899,7 +8974,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
-        ..._m4RecoveryLines(hubContext, hatchActive),
+        ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
       ].join("\n"),
     };
   }
@@ -8916,7 +8991,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
@@ -9116,7 +9191,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
