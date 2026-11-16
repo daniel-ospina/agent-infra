@@ -4499,8 +4499,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # changes it for every lane with no log line, no ledger field and no `walltime.tsv` column; the
   # provider half also moves the cost tier (flash vs pro) and which credential the lane needs
   # (#1852). Resolve ONCE into locals so the log and the argv cannot disagree.
+  # ⛔ AND THE LINE THAT CARRIES IT IS THE LAUNCH ARTIFACT, SO IT IS WRITTEN AT THE LAUNCH (agent-infra#4047
+  # review, P1). It used to be emitted HERE — before the capability gate below — and that made it a LIE
+  # about a refusal: a box whose probe answers and never returns refuses 71 five to twenty-five seconds
+  # later, i.e. long outside `pr-doctor.py`'s CONFIRM_WINDOW_S (1.0 s), so a caller polling for this line
+  # read a capability REFUSAL as a launch. Measured shape: `dispatched 9 of 16 queued — VERDICT=OK` over
+  # nine workers whose `.rc` read 71 (pr-doctor#4047). The line is a claim that an agent STARTED, so it is
+  # written immediately before the `pi` spawn, after every gate that can still refuse — see
+  # `lane_registry_begin`'s neighbouring comment. `lane-exec.sh` and `merge-one.sh` emit theirs at their
+  # own launch points, where nothing after them can refuse.
   local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
-  echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
   # ⛔ THE AGENT GETS ITS OWN PROCESS GROUP AND NONE OF ITS CHILDREN OUTLIVE THE TURN (#2163).
   # A `pi` that has finished its turn can leave tool children behind, and a wrapper that merely
   # `wait`s for pi then exits lets those children be reparented to init where nothing owns them —
@@ -4898,6 +4906,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # Not earlier: the gates above can still refuse, and a refusal has its own record (FAILED,
   # `agent-never-started`) rather than a RUNNING record that would read EXPIRED two hours later.
   lane_registry_begin "$label" "${KIND:-lane}" "$log" "$t"
+  # ⛔ THE AGENT-START MARKER IS WRITTEN HERE, AND ONLY HERE (agent-infra#4047 review, P1). Every gate that
+  # can refuse — brief, load, land-backlog, disk, capability/harness-skew — has already returned by this
+  # line, so `[agent] provider=… model=…` now means what a reader with no other evidence takes it to mean:
+  # an agent is being started. Callers that read it as proof of a launch (`pr-doctor.py`'s
+  # `_agent_started`) otherwise counted a 71/83 refusal — whose probe takes 5-25 s by design — as a
+  # dispatch, which is the false PASS #4047 exists to remove, in the one gate that is slow on purpose.
+  echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # …and the lease starts renewing as soon as there is a pid to watch. The beat loop exits on its own
