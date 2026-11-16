@@ -280,12 +280,30 @@ fetch_one() { # fetch_one <dir> <pr>
   # check applies to exactly this artifact: on a public repo any account can post one line naming the
   # public head sha, and this verifier would report `PASS review_record` + `PASS review_bound` and
   # `VERDICT: ALL-MET`, exit 0 — the value the #4016 capstone closes on — over a hand-typed comment.
-  # The frame and the jq are `check-pipeline-compliance.sh`'s OWN (`REVIEW_COMMENTS_JQ`, `:711`), copied
+  # The frame and the jq are `check-pipeline-compliance.sh`'s OWN (`REVIEW_COMMENTS_JQ`, `:707`), copied
   # rather than re-invented, so the two readers admit the same artifact for the same reasons: one record
   # per comment, `<author_association>\x1f<body>\x1e`. The 0x1e/0x1f bytes are stripped from the body
   # first, so a comment cannot forge a record boundary.
+  # ⛔ THE FILTER TRAVELLED WITH THE GATE; ITS ENDPOINT DID NOT (fresh-context review, round 10 —
+  # BLOCKING, measured). This read was `pr view --repo … --json comments`, which answers a JSON OBJECT
+  # (`{"comments":[…]}` — exactly the shape the `pr.meta` read above assumes with `.number`/`.state`)
+  # in gh's CAMELCASE field spelling. `REVIEW_COMMENTS_JQ` is written for REST
+  # `repos/<o>/<r>/issues/<n>/comments`: ARRAY root, SNAKE_CASE fields. On the endpoint it was pointed
+  # at it failed TWICE, independently — `.[]` yields the comment ARRAY, so `.author_association` is a jq
+  # RUNTIME error (`expected an object but got: array`), and even under `.comments[]` the REST key does
+  # not exist there, so the association read `null` and `record_markers` emitted `DENY` for EVERY
+  # comment marker. Either alone made `store_read` return 2 and write `comments.txt.unread`;
+  # `analyse` short-circuits on `rc_unread` BEFORE the `record.json` fallback, so review_record,
+  # review_bound, fix_round and green_gated were INCONCLUSIVE on every LIVE run and `VERDICT: ALL-MET`
+  # was unreachable live — the one value the #4016 capstone closes on. The suite could not see it: every
+  # case is `--from-snapshot`, and the fixtures hand-write `comments.txt` in the frame the READER wants,
+  # so the producer-side expression never executed (the `gh`-shim case at the end of the suite exists to
+  # keep that from recurring). The fix is to take the ENDPOINT with the filter, which is the same read
+  # the required check performs (`check-pipeline-compliance.sh:6021`, `issues/$PR_NUMBER/comments`) — so
+  # one artifact, one frame, and no field-spelling translation to drift (`--paginate`: a PR past the
+  # first page of comments is read whole, as the gate reads it).
   store_read "$dir" comments.txt \
-    "$GH" pr view "$pr" --repo "$REPO" --json comments \
+    "$GH" api "repos/$REPO/issues/$pr/comments?per_page=100" --paginate \
       --jq '.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"'
 
   rec="$HOME/.pi/agent/reviews/${OWNER}-${RNAME}-${pr}.json"
@@ -519,7 +537,18 @@ record_markers() { # record_markers <dir> <pr>
       k = index(line, "\t")
       assoc = (k ? substr(line, 1, k - 1) : "-")
       line  = (k ? substr(line, k + 1) : line)
-      sub(/^[[:space:]>*+\x2d]+/, "", line)
+      # ⛔ THE HYPHEN IS LITERAL IN LAST POSITION, NOT `\x2d` (fresh-context review, round 10 — P3,
+      # MEASURED). `\x2d` is a GAWK hex escape, not POSIX ERE: where `\x` is not one, the class silently
+      # becomes `[[:space:]>*+x]` — so a marker written as a list item keeps its `-`, fails the
+      # `index(line, "review recorded: …") != 1` guard below, and is dropped with no reason the report
+      # can show (`review_record INCONCLUSIVE` over a real record, the fail-closed direction of the
+      # predicate #4016 closes on), while a line starting with the letter `x` is silently stripped. Both
+      # directions measured under `gawk --posix`. This repo already names the convention
+      # (`check-portability-traps.sh` refuses `\x27` as a gawk extension by name), and this file header
+      # demands the portable subset; the suite dialect discipline reaches only the `--json` emitter. A `-`
+      # at the END of a bracket expression is literal in every awk, verified identical on gawk, mawk,
+      # nawk and `awk --posix`.
+      sub(/^[[:space:]>*+-]+/, "", line)
       # the recorder writes: review recorded: reviews/<pr>.json verdict=V @ <40hex> (owner/repo)
       if (index(line, "review recorded: reviews/" pr ".json verdict=") != 1) next
       rest = line

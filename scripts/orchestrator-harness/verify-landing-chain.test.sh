@@ -867,6 +867,176 @@ ck "record-file-other-pr: a record signed for ANOTHER PR is refused, naming the 
 ck "record-file-other-pr: …never PASS review_record" "$(has "PASS  review_record" && echo 1 || echo 0)"
 ck "record-file-other-pr: …and the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# THE LIVE FETCH PATH (fresh-context review, round 10 — BLOCKING, and the CLASS the rest of this
+# suite was structurally blind to).
+#
+# ⛔ EVERY CASE ABOVE IS `--from-snapshot`, and every fixture HAND-WRITES `comments.txt` in the frame
+# the READER wants — so `fetch_one`'s seven read expressions had ZERO coverage and the producer-side
+# jq never executed. The P1 that survived nine rounds lived exactly there: the comment read was
+# `pr view --json comments` (a JSON OBJECT in gh's camelCase spelling) carrying `REVIEW_COMMENTS_JQ`,
+# which is written for REST `issues/<n>/comments` (ARRAY root, snake_case). `.[]` on an object is a
+# jq RUNTIME error and `.author_association` does not exist under `pr view`, so the channel was
+# unreadable on EVERY live run — `review_record`, `review_bound`, `fix_round` and `green_gated`
+# INCONCLUSIVE, `VERDICT: ALL-MET` unreachable — while this suite stayed green.
+#
+# So this case drives the REAL script through a `gh` SHIM that serves each endpoint's REAL payload
+# SHAPE and applies the `--jq` it is given with the REAL jq. A shim that pre-bakes the jq OUTPUT would
+# grade nothing (it would encode the answer instead of exercising the expression), which is the same
+# fixture-bypasses-the-transport defect one level up.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+live_payloads() { # live_payloads <dir> <pr> → writes the five raw endpoint payloads under <dir>
+  local d="$1" pr="$2"
+  # `gh pr view --json <fields>` — an OBJECT, camelCase (`authorAssociation`, `mergeCommit.oid`).
+  # MEASURED on `gh` 2.x: `.comments[] | keys` = author, authorAssociation, body, createdAt, id, …
+  # ⛔ THE BODY IS EMPTY ON PURPOSE. The BODY channel is read LAST (it is the recorder's current word),
+  # so a marker in both would answer from the body and leave the COMMENT channel untested — the exact
+  # channel the P1 made inert.
+  cat > "$d/pr-view.json" <<EOF
+{"number":$pr,"state":"MERGED","mergedAt":"$MERGED_AT","mergeCommit":{"oid":"$MERGE"},
+ "body":"",
+ "comments":[
+  {"author":{"login":"daniel-ospina"},"authorAssociation":"OWNER",
+   "body":"review recorded: reviews/$pr.json verdict=clean @ $HEAD (o/r)\n"},
+  {"author":{"login":"stranger"},"authorAssociation":"NONE",
+   "body":"a stranger passing through"}]}
+EOF
+  # `gh api repos/…/pulls/<n>/commits` — an ARRAY of commit objects (`.sha`).
+  printf '[{"sha":"%s"}]\n' "$HEAD" > "$d/pr-commits.json"
+  # `gh api repos/…/issues/<n>/comments` — an ARRAY, REST snake_case (`author_association`).
+  cat > "$d/comments.json" <<EOF
+[{"author_association":"OWNER",
+  "body":"review recorded: reviews/$pr.json verdict=clean @ $HEAD (o/r)\n"},
+ {"author_association":"NONE","body":"a stranger passing through"}]
+EOF
+  printf '{"sha":"%s","commit":{"tree":{"sha":"%s"}},"parents":[]}\n' \
+    "$HEAD" "$HEAD_TREE" > "$d/commit.json"
+  printf '{"workflow_runs":[{"id":9001,"name":"CI","run_attempt":1,"path":".github/workflows/ci.yml"}]}\n' \
+    > "$d/runs.json"
+  printf '{"total_count":1,"check_runs":[{"id":10,"app":{"slug":"github-actions"},"name":"unit-test","status":"completed","conclusion":"success","completed_at":"%s","details_url":"https://github.com/o/r/actions/runs/9001/job/1","started_at":"2026-11-12T04:00:00Z"}]}\n' \
+    "$MERGED_AT" > "$d/checkruns.json"
+}
+gh_shim() { # gh_shim <payload-dir> → prints the path of a `gh` that serves those payloads
+  local d="$1" shim="$T/gh-shim-$RANDOM"
+  cat > "$shim" <<'SHIM'
+#!/usr/bin/env bash
+# gh shim — answers only the read shapes `fetch_one` issues, serves the REAL payload shape for each,
+# and runs the `--jq` it was GIVEN through the real jq so the expression under test actually executes.
+set -u
+jqexpr=""; args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq)       jqexpr="$2"; shift 2 ;;
+    --paginate) shift ;;
+    --repo|--json) shift 2 ;;
+    *)          args+=("$1"); shift ;;
+  esac
+done
+payload=""
+case "${args[0]:-} ${args[1]:-}" in
+  "pr view"*) payload="$SHIM_PAYLOAD/pr-view.json" ;;
+  "api "*"comments"*)  payload="$SHIM_PAYLOAD/comments.json" ;;
+  "api "*"pulls/"*"commits"*) payload="$SHIM_PAYLOAD/pr-commits.json" ;;
+  "api "*"check-runs"*) payload="$SHIM_PAYLOAD/checkruns.json" ;;
+  "api "*"actions/runs"*) payload="$SHIM_PAYLOAD/runs.json" ;;
+  "api "*"commits/"*) payload="$SHIM_PAYLOAD/commit.json" ;;
+  *) printf 'gh-shim: unexpected read: %s\n' "$*" >&2; exit 1 ;;
+esac
+if [ -n "$jqexpr" ]; then jq -r "$jqexpr" < "$payload"; else cat "$payload"; fi
+SHIM
+  chmod +x "$shim"
+  printf '%s\n' "$shim"
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '  \033[33mSKIP\033[0m  the live-fetch cases: no `jq` on this box, so the producer-side expressions cannot be executed (the fetch path needs jq in production too)\n'
+else
+  PAY="$T/live-payloads"; mkdir -p "$PAY"
+  live_payloads "$PAY" 501
+  SHIM="$(gh_shim "$PAY")"
+  # ⛔ THE FIXTURE IS THE REAL SHAPE, AND THE MUTATION IT WOULD HAVE PASSED IS MEASURED HERE. These two
+  # assertions are what make the case below non-vacuous: if the payload were shaped to suit the OLD
+  # expressions, the case would prove nothing about the live path.
+  jq -r '.[] | "\(.author_association)"' < "$PAY/pr-view.json" >/dev/null 2>&1
+  ck "live-fetch fixture: \`.[]\` on \`pr view\`'s payload is a jq RUNTIME error (the object root, measured — the P1's first half)" \
+    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+  ck "live-fetch fixture: \`.author_association\` under \`pr view\` reads null (camelCase \`authorAssociation\` — the P1's second half)" \
+    "$(jq -r '.comments[0] | "[\(.author_association)]"' < "$PAY/pr-view.json" | grep -qxF '[null]'; echo $?)"
+
+  LIVE="$T/live"; mkdir -p "$LIVE"
+  SHIM_PAYLOAD="$PAY" AGENT_GH_REAL="$SHIM" HOME="$T/home" AI_REVIEW_GATE_KEY="" \
+    bash "$SCRIPT" 501 --repo "$REPO_FIXTURE" --write-snapshot "$LIVE" > "$T/live.out" 2>&1; livrc=$?
+  ck "live-fetch: the comment channel is READ on a live-shaped payload (no comments.txt.unread sentinel)" \
+    "$([ -e "$LIVE/pr-501/comments.txt.unread" ] && echo 1 || echo 0)"
+  ck "live-fetch: …so the run does NOT report the channel as unread" \
+    "$(grep -qF 'were NOT READ' "$T/live.out" && echo 1 || echo 0)"
+  # the ASSOCIATION has to travel with the body, or the admission rule cannot be applied at all
+  ck "live-fetch: the association travels in the producer frame (an 0x1f separator precedes the body)" \
+    "$(grep -q "$(printf '\037')" "$LIVE/pr-501/comments.txt" && echo 0 || echo 1)"
+  ck "live-fetch: …and a trusted author is admitted while an untrusted one still travels as NONE" \
+    "$(grep -q 'OWNER' "$LIVE/pr-501/comments.txt" && grep -q 'NONE' "$LIVE/pr-501/comments.txt"; echo $?)"
+  OUTL="$(HOME="$T/home" AI_REVIEW_GATE_KEY="" bash "$SCRIPT" --from-snapshot "$LIVE" --repo "$REPO_FIXTURE" 2>&1)"; livrc2=$?
+  ck "live-fetch: the marker admitted from the LIVE payload satisfies review_record" \
+    "$(grep -qF 'PASS  review_record' <<<"$OUTL"; echo $?)"
+  ck "live-fetch: …naming the COMMENT channel as its source" \
+    "$(grep -qF 'source=marker-comment' <<<"$OUTL"; echo $?)"
+  # review_bound is one of the four predicates the unread short-circuit suppressed, so it is the
+  # second independent witness that the channel is live (a single PASS could come from the body).
+  ck "live-fetch: …and review_bound PASSes too (the second predicate the unread short-circuit suppressed)" \
+    "$(grep -qF 'PASS  review_bound' <<<"$OUTL"; echo $?)"
+
+  # ⛔ THE FILTER AND ITS ENDPOINT ARE ONE DECISION, SO THEY ARE PINNED TOGETHER (drift pin). The gate
+  # and this verifier must read ONE artifact in ONE frame; the P1 was a filter copied without its
+  # endpoint. Nothing else in this repo compares the two, so a future edit to either alone is invisible.
+  _gate_jq="$(sed -nE "s/^REVIEW_COMMENTS_JQ='(.*)'\$/\\1/p" "$HERE/../check-pipeline-compliance.sh" | head -1)"
+  _vlc_jq="$(grep -F -- "--jq '.[] | \"\\(.author_association)" "$SCRIPT" | head -1 \
+    | sed -e "s/^[[:space:]]*--jq '//" -e "s/'[[:space:]]*\$//")"
+  ck "drift pin: this verifier's comment-frame jq is non-empty and present" "$([ -n "$_vlc_jq" ] && echo 0 || echo 1)"
+  ck "drift pin: …and BYTE-IDENTICAL to check-pipeline-compliance.sh's REVIEW_COMMENTS_JQ (one filter, one frame)" \
+    "$([ -n "$_gate_jq" ] && [ "$_gate_jq" = "$_vlc_jq" ] && echo 0 || echo 1)"
+  ck "drift pin: …and it is issued against the SAME endpoint the gate reads (issues/<n>/comments, not pr view)" \
+    "$(grep -qF 'api "repos/$REPO/issues/$pr/comments' "$SCRIPT"; echo $?)"
+
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# The MARKER-PREFIX STRIP (fresh-context review, round 10 — P3). `\x2d` is a GAWK hex escape, not
+# POSIX ERE: where `\x` is not one, the class silently becomes `[[:space:]>*+x]`, so a marker written as
+# a LIST ITEM keeps its `-`, misses the `index(line, "review recorded: …") != 1` guard and is dropped as
+# INCONCLUSIVE — while a line starting with the letter `x` IS stripped. Both directions measured under
+# `gawk --posix`. The `-` belongs in LAST position, where it is literal everywhere.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+R="$(mk comment-list-item 490)"
+: > "$R/pr-490/body.txt"
+comment "$R" 490 OWNER "$(printf -- '- review recorded: reviews/490.json verdict=clean @ %s (o/r)\n' "$HEAD")"
+run "$R" 490 9001 "CI" 1; group "$R" 490 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "comment-list-item: a marker written as a LIST ITEM is admitted (the strip exists to tolerate it)" \
+  "$(has 'PASS  review_record'; echo $?)"
+ck "comment-list-item: …from the comment channel" "$(has 'source=marker-comment'; echo $?)"
+
+# the ACTUAL shipped regex, executed — never a copy of it, or the case would grade prose
+_SUBLINE="$(grep -F 'sub(/^[[:space:]>*+' "$SCRIPT" | head -1)"
+ck "marker-prefix strip: the rule is present in the source and is the ONLY one (mutation site is real)" \
+  "$([ -n "$_SUBLINE" ] && echo 0 || echo 1)"
+case "$_SUBLINE" in
+  *'\x'*) ck "marker-prefix strip: uses no \`\\x\` escape inside the character class (gawk-only — a POSIX awk strips \`x\` instead of \`-\`)" 1 ;;
+  *)       ck "marker-prefix strip: uses no \`\\x\` escape inside the character class (gawk-only — a POSIX awk strips \`x\` instead of \`-\`)" 0 ;;
+esac
+_POSIX_AWK=""
+if command -v gawk >/dev/null 2>&1; then _POSIX_AWK="gawk --posix"
+elif printf 'x\n' | awk --posix '{ print }' >/dev/null 2>&1; then _POSIX_AWK="awk --posix"; fi
+if [ -n "$_POSIX_AWK" ]; then
+  _P="$(printf -- '- review recorded: x\nx review recorded: y\n' \
+    | $_POSIX_AWK "{ line=\$0; $_SUBLINE; print \"[\" line \"]\" }" 2>&1)"
+  ck "marker-prefix strip under a POSIX-forcing awk: a leading \`-\` IS stripped" \
+    "$(grep -qxF '[review recorded: x]' <<<"$_P" && echo 0 || echo 1)"
+  ck "marker-prefix strip under a POSIX-forcing awk: …and a leading \`x\` is NOT (the \`\\x\` collapse, measured)" \
+    "$(grep -qxF '[x review recorded: y]' <<<"$_P" && echo 0 || echo 1)"
+else
+  printf '  \033[33mSKIP\033[0m  the POSIX-awk dialect arm: neither \`gawk\` nor \`awk --posix\` is on this box (the source invariant above still holds everywhere)\n'
+fi
+
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
 # mutation below breaks exactly the decision one case exists for; the case must then FLIP. This is the
@@ -1289,6 +1459,26 @@ MS="$(mutant frame-no-newline-strip '        sub(/^[\n\r]+/, "")' '        x = 0
 VKEY="$TEST_KEY"; verify_with "$MS" "$T/comment-signed"; VKEY=""
 mutation_verdict M23 "auth=sig" \
   "the producer frame's own trailing newline is not stripped, so a trusted author is refused — case comment-signed is discriminating"
+
+# M27 is only measurable where the producer-side expressions can be EXECUTED (jq + a payload).
+if [ -n "${SHIM:-}" ]; then
+  # ⛔ M27 — THE EXACT CODE THIS PR SHIPPED, RE-RUN AGAINST A LIVE-SHAPED PAYLOAD: filter kept, endpoint
+  # reverted to `pr view`. No snapshot case in this file can see it, because every fixture writes
+  # `comments.txt` itself — which is precisely how nine rounds of review passed over an inert channel.
+  MS="$(mutant live-fetch-endpoint \
+    '"$GH" api "repos/$REPO/issues/$pr/comments?per_page=100" --paginate' \
+    '"$GH" pr view "$pr" --repo "$REPO" --json comments')" \
+    || bad "M27 mutation could not be applied"
+  [ -n "$MS" ] || MS=/nonexistent-mutant
+  OUTM="$(SHIM_PAYLOAD="$PAY" AGENT_GH_REAL="$SHIM" HOME="$T/home" AI_REVIEW_GATE_KEY="" \
+    bash "$MS" 501 --repo "$REPO_FIXTURE" --write-snapshot "$T/live-m" 2>&1)"; mrc=$?
+  REFOUT="$OUTL"; REF_SEEN=1
+  AOUT="$OUTM"; AOUT_RC=$mrc
+  mutation_verdict M27 "PASS  review_record" \
+    "reverting the endpoint to \`pr view --json comments\` makes the comment channel unreadable on a LIVE payload — the live-fetch case is discriminating"
+else
+  printf '  \033[33mSKIP\033[0m  M27: no `jq` on this box, so the live-fetch read cannot be re-executed\n'
+fi
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
