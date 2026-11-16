@@ -1140,7 +1140,13 @@ wcdt("redirect between push and the --delete spelling", "block:push", "git push 
 // correct one; it is the resolution that is load-bearing, not the commit that carried it.
 wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git push $(cat .remote) origin -d b", ["origin", "b"]);
 wcdt("substitution in an option VALUE keeps the flag and target", "block:push", "git push -o $(date) origin -d b", ["b"]);
-wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["$(…)", "b"]);
+// ⛔ MERGE (#3962 × main): the expected array is the UNION of the extractor's two surfaces. The tokenizer
+// collapses the backtick span to `$(…)`, and the PARSER adds the span's own tokenisation (`` `date` ``) plus
+// the refspec that follows it. Every added element carries a backtick or `$`, so all of them are
+// unresolved and #653 refuses the row either way; `b` — the REAL refspec — is still attributed, which is
+// this row's pin. ⚠️ The `$(…)` element is NOT droppable: if the tokenizer's span folding regresses, that
+// element disappears and the row reds, which is exactly the discrimination the round-2 mutant measured.
+wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["`date`", "b", "$(…)"]);
 // ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
 // it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach the redirect handler, and
 // with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
@@ -1199,7 +1205,11 @@ wcdt("a substitution span INSIDE a parameter expansion", "block:push", "git push
 //     `-d $(echo held/branch)` / `` -d `date` `` / `--delete $(echo …)` were all REFUSED there (on the
 //     fragment) and came back ALLOWED from the drop, i.e. the drop was a REGRESSION against main, not a
 //     residual. The marker `$(…)` is what keeps #653's refusal reachable.
-wcdt("substitution in the TARGET position is reported UNRESOLVABLE — not a phantom ref, and not dropped", "block:push", "git push origin -d $(echo b)", ["$(…)"]);
+// ⛔ MERGE (#3962 × main): union of both surfaces — the parser reports the span as the marker token `$`,
+// the tokenizer collapses it to `$(…)`. Both are unresolvable (a bare `$` is not a ref name), so the
+// TARGET-position rule this row exists for — "reported UNRESOLVABLE, never a phantom ref and never
+// dropped" — still holds, and a phantom ref would show up as an element with neither `$` nor a backtick.
+wcdt("substitution in the TARGET position is reported UNRESOLVABLE — not a phantom ref, and not dropped", "block:push", "git push origin -d $(echo b)", ["$", "$(…)"]);
 // The fold-in path (frozen legacy evidence in a LATER segment) overrides
 // pushTargets with the SAME extractor — the parenthesized twin must attribute
 // the real target there too, not the phantom `b)`.

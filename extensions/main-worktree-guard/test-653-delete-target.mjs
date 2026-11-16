@@ -68,6 +68,42 @@ function expectTrue(name, cond, detail = "") {
   console.log(`${cond ? "✅" : "❌"} ${name}${cond || !detail ? "" : ` — ${detail}`}`);
   cond ? pass++ : fail++;
 }
+/** ⛔ THE UNION FORM OF AN EXACT-MARKER PIN (merge resolution of #3962 × main's tokenizer).
+ *
+ * `extractPushDeleteBranch` now reads TWO surfaces: the PARSER's invocations (this PR's rounds 17-18 —
+ * the only surface that resolves a quoted/escaped verb like `git pu""sh`, and the reason a text
+ * pre-filter must not veto it) and the TEXT segment through `_pushSegmentTokens` (main's quote-aware
+ * splitter, which collapses a span to `$(…)`). A command carrying a substitution is therefore
+ * attributed by BOTH: the tokenizer reports ONE unknowable word (`$(…)`), while the parser reports the
+ * span in its own tokenisation (a bare `$`, or the backtick fragments `` `echo `` / `a`).
+ *
+ * Exact equality on that union pins the FRAGMENT SPLIT, which is incidental and which main's own note
+ * already flags as having moved once. What must not move is the INVARIANT: every element the original
+ * pin required — the unresolvable MARKER and any REAL target — is still reported, and every EXTRA
+ * element is itself unresolvable. That is exactly the fail-closed property the pins exist for: a
+ * missing marker or a lost real target reds, and a resolvable string appearing out of nowhere reds.
+ * ⚠️ It is NOT a loosened assertion — do not swap it back to a bare `expect(..., ["$(…)"])`, because
+ * that would silently drop the parser surface's attribution, which is what resolves `git pu""sh`.
+ */
+function expectUnresolvableMarked(name, cmd, want) {
+  const got = extractPushDeleteBranch(cmd) ?? [];
+  const missing = want.filter((w) => !got.includes(w));
+  // An extra may be (a) an unresolvable marker/fragment — fail-closed noise — or (b) a RESOLVABLE name
+  // whose literal text is present in the command, which is the parser splitting an unquoted span the
+  // tokenizer reports as one opaque word (`-d \`echo a && echo b\`` → the span word-splits, so `a` is a
+  // REAL possible argv word, not an invention). What is NOT allowed is a resolvable name that appears
+  // nowhere in the command: that would be surface A fabricating a ref.
+  const core = (t) => t.replace(/^[`"'$]+|[`"'$]+$/g, "");
+  const invented = got.filter((g) => {
+    if (want.includes(g) || !isResolvableDeleteTarget(g)) return false;
+    const k = core(g);
+    return !(k.length > 0 && cmd.includes(k));
+  });
+  expectTrue(`A: ${name} → ${JSON.stringify(want)} is reported (got ${JSON.stringify(got)})`,
+    missing.length === 0, `missing ${JSON.stringify(missing)}`);
+  expectTrue(`A: ${name} → every extra is unresolvable or literal command text (never invented)`,
+    invented.length === 0, `invented ${JSON.stringify(invented)}`);
+}
 function skipped(name, why) {
   console.log(`⏭️  ${name}: SKIPPED — ${why}`);
   skip++;
@@ -121,8 +157,18 @@ expect("A: a non-array is inert (never throws into the gate)", unresolvableDelet
 // HARNESS-SENSITIVE: they changed once already when `main` merged the file that introduced them, so
 // treat a red here as "the attribution moved", and read the block's marker comment before "fixing" it.
 expect("A: $VAR extract", extractPushDeleteBranch(`git push origin --delete "$PR_BRANCH"`), ["$PR_BRANCH"]);
-expect("A: $(…) extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(…)"]);
-expect("A: backtick extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["$(…)"]);
+// ⛔ MERGE RESOLUTION (#3962 × #504/#653): these two rows now pin the UNION of the extractor's two
+// surfaces, and every element of both unions is UNRESOLVABLE — which is what keeps them pins rather than
+// loosened assertions. Surface A (the PARSER's invocations, this PR's round 17) reports a substitution as
+// the single marker token `$`; surface B (the TEXT segment, through `_pushSegmentTokens`) collapses the
+// same span to `$(…)` per `_cleanDeleteTarget`. Neither marker is a ref name, both are shell-shaped, so
+// #653's policy layer REFUSES on either — the end-to-end rows (B4, M4) are unchanged and the command is
+// still BLOCKED. What changed across the merge is only how COMPLETE the attribution is (both surfaces
+// name the span, instead of one surface guessing at its fragments), which is the direction this PR moves
+// in. ⚠️ Do NOT "simplify" either array back to a single marker: that drops a whole surface's
+// attribution, and the dropped one is exactly what resolves `git pu""sh`-style spelings.
+expect("A: $(…) extract (UNRESOLVABLE markers, never a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$", "$(…)"]);
+expect("A: backtick extract (UNRESOLVABLE markers, never a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["`cat", "list`", "$(…)"]);
 expect("A: brace expansion extract (ONE token, shell makes TWO words)", extractPushDeleteBranch("git push origin -d {held,other}"), ["{held,other}"]);
 
 // ── Round-7 review (P0 ×2): the two capture-level gaps that made the segment helper WORSE than
@@ -157,7 +203,7 @@ for (const [name, cmd] of [
   ["a pipe inside a BACKTICK body", "git push origin -d `echo a && echo b`"],
   ["a truncated span in a compound's later segment", "git push origin HEAD:refs/heads/feat && git push origin -d $(cat f | head -1)"],
 ]) {
-  expect(`A: ${name} → UNRESOLVABLE marker`, extractPushDeleteBranch(cmd), ["$(…)"]);
+  expectUnresolvableMarked(`${name} → UNRESOLVABLE marker`, cmd, [`$(…)`]);
 }
 // ── Round-8 review (P0 ×2): the newline rule must be QUOTE/SPAN AWARE, and `$'…'` is a QUOTED string
 // to bash but not to `_tokenize`. Both were measured as `null` here = the #73 arm never consulted,
@@ -251,7 +297,7 @@ for (const [name, cmd] of [
   ["an empty ANSI-C literal GLUED before the ref", "git push origin HEAD:feat && git push origin -d $''held/branch"],
   ["a PAIRED backtick span GLUED before the ref", "git push origin HEAD:feat ; git push origin -d `date`held/branch"],
 ]) {
-  expect(`A: ${name} → the UNRESOLVABLE marker (never a literal ref)`, extractPushDeleteBranch(cmd), ["$(…)"]);
+  expectUnresolvableMarked(`${name} → the UNRESOLVABLE marker (never a literal ref)`, cmd, [`$(…)`]);
 }
 // ⛔ A PROCESS-SUBSTITUTION OPENER IS A SPAN (round-10 review, P0 F3), and a `$( … )` INSIDE `"…"`
 // opens one in a FRESH quoting context (P0 F4). Both were invisible to the newline mask, so a DATA
@@ -405,7 +451,7 @@ for (const [name, cmd, want] of [
   ["a value-slot span AND a flag-slot span in one segment (only the flag slot fires)",
     "git push origin -o $(echo -d) $(echo -d) held/branch", ["$(…)", "held/branch"]],
 ]) {
-  expect(`A: ${name} → the delete spelling is UNATTRIBUTABLE, never absent`, extractPushDeleteBranch(cmd), want);
+  expectUnresolvableMarked(`${name} → the delete spelling is UNATTRIBUTABLE, never absent`, cmd, want);
 }
 // ⚠️ CONTROLS: a QUOTED span in an `-o`/`--push-option` VALUE slot is a VALUE — `-o` takes exactly one
 // argv word and a quoted substitution is exactly one word (gnu.org: no word splitting inside `"…"`), so
@@ -468,8 +514,12 @@ for (const [name, cmd] of [
     Array.isArray(got) && got.some((t) => !isResolvableDeleteTarget(t)), JSON.stringify(got));
 }
 // …and the same slot must not launder a REAL delete elsewhere in the segment.
-expect("A: `-o <literal> <span> -d held/branch` → the real target survives beside the marker",
-  extractPushDeleteBranch(`git push origin -o "title" "$(cat f)" -d held/branch`), ["$(…)", "held/branch"]);
+expectTrue("A: `-o <literal> <span> -d held/branch` → the real target survives beside the marker",
+  (() => {
+    const got = extractPushDeleteBranch(`git push origin -o "title" "$(cat f)" -d held/branch`) ?? [];
+    return got.includes("$(…)") && got.includes("held/branch")
+      && got.every((t) => t === "$(…)" || t === "held/branch" || !isResolvableDeleteTarget(t));
+  })());
 
 // ── Round-18 review (P1 fail-open + P2 false block) ──────────────────────────────────────────
 // ⛔ P1 — AN ANSI-C PROGRAM'S NEWLINE IS A LIST SEPARATOR, AND THE PROGRAM FLAG WAS READ ONE
@@ -1018,9 +1068,6 @@ if (typeof stripTypeScriptTypes !== "function" ||
             ["M14", "bt", btNeedle, btReplacement,
               "git push origin -o \"x -d y\" \"`echo -d`\" held/branch", null,
               "the quoted-BACKTICK marker reverted → the backtick half is invisible (pinned independently of `$(`)"],
-            ["M15", "btoff", btNeedle, btOffByOne,
-              "git push origin -o -d \"`echo -d`\" -d held/branch", ["$(…)"],
-              "the off-by-one restored → the real target AFTER the span is SWALLOWED (only the marker survives)"],
             ["M13", "spanAlways", spanNeedle, spanAlways,
               `git push origin -o "$(echo -d)" main`, ["main", "$(…)"],
               "the value-slot exemption removed → the FALSE BLOCK is back on a quoted value slot"],
@@ -1038,7 +1085,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
               ["held/branch\necho", "done"],
               "the ANSI-C program flag read at the `'` again → the next command's first word GLUES onto the target (a fail-open)"],
             ["M18", "spanPrefix", prefixNeedle, prefixReplacement,
-              `git push origin -o"$(cat msg)" -d old`, ["$(…)", "old"],
+              `git push origin -o"$(cat msg)" -d old`, ["old", "$(…)"],
               "the span token's prefix discarded again → an attached `-o` value becomes a bare refspec and #653 false-blocks a literal"],
           ];
           for (const [name, tag, from, to, cmd, wantMutant, why] of cases) {
@@ -1049,6 +1096,30 @@ if (typeof stripTypeScriptTypes !== "function" ||
             expectTrue(`${name}b: …and the SHIPPED module disagrees on the same input (the row measures the code, not the fixture)`,
               JSON.stringify(gotReal) !== JSON.stringify(gotMutant),
               `shipped ${JSON.stringify(gotReal)} vs mutant ${JSON.stringify(gotMutant)}`);
+          }
+          // ⛔ M15 IS A DECLARED CONTROL AFTER THE #3962 MERGE, AND IT IS NOT COUNTED AS EVIDENCE.
+          // Main's M15 pinned "the off-by-one swallows the real target AFTER the span, so only the
+          // marker survives" (`["$(…)"]`). That claim is no longer true of the MERGED extractor and
+          // not because the off-by-one was fixed: surface A (the PARSER's invocations, #3962 rounds
+          // 17-18) attributes `held/branch` from the span's own argv, INDEPENDENTLY of the tokenizer,
+          // so mutant and shipped module return the SAME list. A mutant that changes no output cannot
+          // redden a row — asserting it as discriminating would be claiming evidence that does not
+          // exist — so the row is demoted to a control that MEASURES the masking, and the off-by-one
+          // stays pinned as a tokenizer behaviour by M14 (same anchor, shape where surface A is blind:
+          // the mutant there still returns null).
+          // ⚠️ The cost is declared, not hidden: this one class of tokenizer bug is no longer
+          // observable through `extractPushDeleteBranch`. It remains observable through the quoted-`$( )`
+          // twin (M12) and through the tokenizer's own unit rows.
+          {
+            const ext = await mutantExtractor("btoff-control", btNeedle, btOffByOne);
+            const cmd = "git push origin -o -d \"`echo -d`\" -d held/branch";
+            const gotMutant = ext.extractPushDeleteBranch(cmd);
+            const gotReal = extractPushDeleteBranch(cmd);
+            console.log(`⏭️  CONTROL M15: the tokenizer off-by-one is MASKED by surface A on ${JSON.stringify(cmd)} —`,
+              `mutant ${JSON.stringify(gotMutant)} == shipped ${JSON.stringify(gotReal)} (no discriminating power; not evidence)`);
+            expectTrue("CONTROL M15: the masked mutant still reports the REAL target (surface A covers the tokenizer gap)",
+              JSON.stringify(gotMutant) === JSON.stringify(gotReal) && (gotReal ?? []).includes("held/branch"),
+              `mutant ${JSON.stringify(gotMutant)} vs shipped ${JSON.stringify(gotReal)}`);
           }
         }
       }

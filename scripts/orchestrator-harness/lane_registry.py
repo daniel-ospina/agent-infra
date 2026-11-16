@@ -154,7 +154,8 @@ WRITABLE = ("RUNNING", "DONE", "FAILED")   # `EXPIRED` is DERIVED — see the mo
 # this pattern exists to prevent, reachable with one byte. `\Z` is the absolute end of the string.
 LANE_ID_RE = re.compile(r"^(?!.*\.\.)(?!.*\.lock\Z)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,158}[A-Za-z0-9_-])?\Z")
 
-DEFAULT_BUDGET_S = 7200      # == spawn-gate.sh's LANE_BACKSTOP_S (the lane's absolute backstop)
+DEFAULT_BUDGET_S = 36000     # == spawn-gate.sh's LANE_BACKSTOP_S (the lane's absolute backstop,
+#                            #    agent-infra#4034: 5x the 7200 this carried when the seam was landed)
 DEFAULT_BEAT_S = 60
 DEFAULT_TIMEOUT_S = 20.0
 MAX_BUDGET_S = 86_400        # a budget above a day is a typo, not a plan; clamp LOUDLY

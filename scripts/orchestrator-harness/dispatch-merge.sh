@@ -39,7 +39,7 @@ chmod +x "${_DM_WORK:-$O}/lane.sh" "${_DM_WORK:-$O}/merge-one.sh" "${_DM_WORK:-$
 # from its EXIT trap — the NORMAL path. This is the path that never reaches that trap: the worktree
 # could not be created, so no lane and no chain are spawned and NOTHING else will ever release the
 # claim. Without this, a single failed `git worktree add` would hold a FREE issue across every box
-# until the lease ran out (CLAIM_ISSUE_TTL, 4h since #2029) — and the reaper would meanwhile return the issue to
+# until the lease ran out (CLAIM_ISSUE_TTL, 5 h since #2029 and 13 h 20 m since agent-infra#4034) — and the reaper would meanwhile return the issue to
 # the pool, where every box would read it as another box's live claim.
 # The record/fence convention is claims.sh's `claim_issue_release_record` (one implementation; see
 # its comment for why the handover file exists rather than the acquiring process doing the release).
@@ -393,7 +393,7 @@ for N in "$@"; do
        # ⛔ AND A STOPPED BATCH RELEASES **EVERY** CLAIM IT WILL NOT ATTEMPT (review round 2, P1).
        # The controller has ALREADY taken `refs/claims/issue-<N>` for every id it handed us, and this
        # file's own rule says "Nothing will start" must also mean "nothing stays claimed" — otherwise
-       # each skipped issue is refused by every peer until `CLAIM_ISSUE_TTL` (18,000 s) expires. The
+       # each skipped issue is refused by every peer until `CLAIM_ISSUE_TTL` (48,000 s since agent-infra#4034; 18,000 s before it) expires. The
        # first version released only `$N` and broke, which BOTH left the rest claimed for the lease and
        # was a regression against the old `*)` arm, where each issue released its own claim as it went.
        echo "#$N: $WT_RESULT"
@@ -515,7 +515,7 @@ for N in "$@"; do
   # ⚠️ The window is NOT microseconds for every member of a batch: the loop sleeps between issues, so
   # the k-th issue's record is read ~30·(k-1)s after it was written. The read is still correct because
   # the record can only be OVERWRITTEN by a re-acquire, and a re-acquire needs the current claim to be
-  # RELEASED or to reach its CLAIM_ISSUE_TTL (4h) first — not because the gap is small. Do not shorten
+  # RELEASED or to reach its CLAIM_ISSUE_TTL (13 h 20 m) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "${_DM_WORK:-$O}/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   # ⛔ `${REPO_ABS:-$REPO}`, NOT `$REPO_ABS` (#2762 review, 4th cycle, P1): refresh-scout.test.sh
