@@ -138,8 +138,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, dirname, join, relative, sep } from "node:path";
-import { realpathSync, existsSync, lstatSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolve, dirname, join, relative, sep, isAbsolute } from "node:path";
+import { realpathSync, existsSync, lstatSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -699,7 +699,7 @@ function _inertMarkerLines(): string[] {
     lines.push(
       `        Re-touch it from THIS session, as its own bash call:`,
       `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
-          `        (if that is refused, the refusal names the cause.)`,
+      `        (if that is refused, the refusal names the cause.)`,
     );
   }
   return lines;
@@ -2003,6 +2003,41 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * command DOES assign is resolved here (`_wtCommandVars`), which is the fail-open
  * this predicate exists to close.
  */
+/**
+ * #3620 — follow a chain of symlinks whose FINAL destination may not exist yet.
+ *
+ * `statSync`/`realpathSync` both throw on a dangling link, so the arm used to
+ * fall back to the link's OWN path and probe its parent — which is not where the
+ * bytes land (reviewer-reproduced, cycle 1): with `<wt>/deleted.txt` tracked and
+ * DELETED in the worktree,
+ *
+ *     ln -s <wt>/deleted.txt /tmp/sink && git show HEAD:deleted.txt > /tmp/sink
+ *
+ * CREATES the file, erasing the deletion, and `git status` reads clean. The
+ * landing site is `<wt>/deleted.txt`; the spelling is `/tmp/sink`.
+ *
+ * So resolve the chain BY HAND (`lstat` + `readlink`, bounded) until a
+ * non-symlink or a non-existent path is reached. That answer is then treated
+ * exactly like any other target: the ancestor walk below finds the nearest
+ * existing directory and probes THAT checkout, so a dangling sink into `/tmp`
+ * stays admitted and one into a checkout is blocked by its effect. Nothing new
+ * fails closed — the class is closed by resolving it, not by refusing it.
+ * @param {string} p
+ * @returns {string} the path the write would actually create/modify
+ */
+function _resolveThroughDanglingLinks(p: string): string {
+  let cur = p;
+  for (let i = 0; i < 40; i++) {
+    let st;
+    try { st = lstatSync(cur); } catch { return cur; } // does not exist → this IS the landing path
+    if (!st.isSymbolicLink()) return cur;
+    let target: string;
+    try { target = readlinkSync(cur); } catch { return cur; }
+    cur = isAbsolute(target) ? target : resolve(dirname(cur), target);
+  }
+  return cur; // a link cycle: the caller's ancestor probe is still the conservative answer
+}
+
 function _catFileRevertStateBlock(
   d: { form: string; scope: string; pathspecs: string[] },
   writeTargetsRel: string[],
@@ -2060,17 +2095,20 @@ function _catFileRevertStateBlock(
     // clean. origin/main blocked that only INCIDENTALLY (the dirty checkout was
     // the session cwd, which used to be an unconditional candidate); resolving
     // the link blocks it on the effect, which is what this arm claims to gate.
-    let landing = t;
+    // Resolve FIRST (by hand, so a DANGLING link is followed too — `statSync` and
+    // `realpathSync` both throw there and the write then lands on the link's own
+    // parent instead of its destination), then decide the landing directory.
+    let landing = _resolveThroughDanglingLinks(t);
     try {
-      const lst = statSync(t);
+      const lst = statSync(landing);
       // A HARDLINK shares the inode with a file that may be tracked content in a
       // checkout this walk never enumerates, and NO path-based probe can see
       // that: `realpath` answers with the link's own name. Rather than guess,
       // fail closed — the arm's own doctrine is that one wrong ALLOW here is
       // unrecoverable, one wrong BLOCK costs a retry.
-      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = t; continue; }
-      landing = realpathSync(t);
-    } catch { /* target does not exist yet — the ancestor walk below resolves it */ }
+      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = landing; continue; }
+      landing = realpathSync(landing);
+    } catch { /* landing does not exist yet — the ancestor walk below resolves it */ }
     let dir = dirname(landing);
     // Bounded: a target under a not-yet-existing directory has no checkout of
     // its own, so the walk finds the nearest one that exists.
@@ -6057,13 +6095,10 @@ export default function (pi: ExtensionAPI) {
     // empty in production (pi sets PI_SESSION_ID only in bash CHILDREN) — so the
     // hatch-active paragraph was unreachable on exactly the surfaces a stranded
     // lane hits.
-    _currentHatchActive = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
-    // #3620 — resolve the marker's DIAGNOSIS on the same call, with the same id,
-    // so every refusal below can say why a marker that is present did not open
-    // the window instead of re-prescribing it. One read, one id, no drift.
     _currentMarkerDiagnosis = _isAllowMainEdits()
       ? { active: true, cause: "env-hatch" }
       : diagnoseAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+    _currentHatchActive = _currentMarkerDiagnosis.active;
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
     // mid-review sees the warn before proceeding, AC8). Active under the

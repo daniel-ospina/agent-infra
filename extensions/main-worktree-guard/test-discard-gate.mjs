@@ -2768,6 +2768,42 @@ async function partD() {
     expectTrue("D10d a SYMLINK sink into a CLEAN checkout is ALLOWED (resolution is about the effect, not the link)",
       allowed(await bash(`git show HEAD:clean.txt > ${linkOut}/clean-sink.txt`, wt)), "was blocked");
 
+    // ── D11 (#3620 review, MEASURED fail-open left by the D10 link resolution):
+    // a DANGLING symlink sink. `statSync`/`realpathSync` both throw when the
+    // link's destination does not exist, so the old catch fell back to the
+    // link's OWN parent (/tmp) and probed that — while the shell CREATES the file
+    // where the link points. With a tracked file DELETED in a worktree,
+    // `ln -s <wt>/gone.txt /tmp/sink; git show HEAD:gone.txt > /tmp/sink`
+    // re-creates it and leaves `git status` clean: the deletion is erased.
+    // The chain is resolved by hand now, so the landing site is probed like any
+    // other target — admitted into /tmp, blocked into a checkout.
+    writeFileSync(join(wt, "gone.txt"), "tracked-then-deleted\n");
+    gg("add gone.txt", wt);
+    gg("commit -qm gone", wt);
+    rmSync(join(wt, "gone.txt"), { force: true });
+    try {
+      const danglingSink = join(linkOut, "dangling-sink.txt");
+      rmSync(danglingSink, { force: true });
+      symlinkSync(join(wt, "gone.txt"), danglingSink);
+      const dangling = await bash(`git show HEAD:gone.txt > ${danglingSink}`, wt);
+      expectTrue("D11 a DANGLING symlink sink into a checkout is BLOCKED (the write CREATES the deleted tracked file)",
+        blocked(dangling), `was allowed: ${JSON.stringify(reason(dangling)).slice(0, 200)}`);
+      expectTrue("D11b …and the block names the checkout the link RESOLVES into",
+        /Checkout: .*\/wt\b/.test(reason(dangling)), `reason=${JSON.stringify(reason(dangling)).slice(0, 240)}`);
+      // Control: a dangling link whose destination is outside every checkout is an
+      // ordinary create — resolving the chain must not become a blanket refusal.
+      const danglingOut = join(linkOut, "dangling-out.txt");
+      const danglingTarget = join(tmpd, "1060-d11-out.txt");
+      rmSync(danglingTarget, { force: true });
+      rmSync(danglingOut, { force: true });
+      symlinkSync(danglingTarget, danglingOut);
+      expectTrue("D11c a DANGLING symlink sink into a NON-checkout is ALLOWED (it creates a file no checkout can see)",
+        allowed(await bash(`git show HEAD:gone.txt > ${danglingOut}`, wt)), "was blocked");
+    } finally {
+      gg("reset -q --hard HEAD~1", wt);
+      rmSync(join(wt, "gone.txt"), { force: true });
+    }
+
     // ── D8: M4's disorder early-return must not shadow M5 ──
     // The issue names this as a second reachability gap in the same region, to
     // be assessed with the fix rather than separately. Measured before the fix
