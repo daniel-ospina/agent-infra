@@ -42,8 +42,11 @@
 # is what makes the docstring/predicate pin (a0) provably load-bearing. (a13) moves the
 # fail-closed default back under "Widen" in the record, and (a14) restores the "no
 # member is classifiable" wording — both round-7 P2/P3 defects that shipped green
-# because the wording arms could not see a NEW wording. Each is counted, so a silent
-# no-op proves nothing.
+# because the wording arms could not see a NEW wording. (a18) puts the DENY-list predicate
+# back into the DESIGN RECORD's own step-1 bullet, which is what makes the plan-doc pin
+# (a17) — load-bearing: (a0) pins only the DOCSTRING, so the plan doc stayed GREEN while it drifted
+# to the superseded predicate (round 9, P2). Each is counted, so a silent no-op proves
+# nothing.
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
 # (arm (e) there is the integration proof of the #1614 gate, arm (f) the integration
@@ -597,6 +600,65 @@ ck "(a16) ⛔ it does NOT claim 'at least one member is not a plain lowercase' �
    "$(grep -q 'at least one member is not a plain lowercase' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a16) ⛔ …and it does NOT call the list unread ('could not be READ') — the code read it" \
    "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 1 || echo 0)"
+
+# ── (a17) THE DESIGN RECORD STATES THE SHIPPED PREDICATE, NOT THE DENY-LIST (round 9, P2) ──
+# The plan doc's Implementation-steps bullet is the prose a NEXT LANE IMPLEMENTS FROM, and it
+# survived round 8 stating the superseded predicate: `unreadable` widens when the lane is
+# "STRUCTURAL and its `on:` declares neither `push` nor `workflow_dispatch`" — a DENY-list, under
+# which a `pull_request_review_comment`-only lane widens on one failed read (the R16 fail-open
+# restored by the record). It also collapsed every non-measured shape into `unread`, which the
+# code splits into three grounds (`unread` / `unclassifiable` / `empty`). No arm read the plan doc,
+# so the suite stayed green while it drifted — (a0) pins the DOCSTRING only. This arm reads that
+# bullet the way (a0) reads the docstring, and mutant (a18) restores the deny-list sentence to
+# prove the pin is load-bearing rather than decorative.
+PLAN_DOC="${PLAN_DOC_SRC:-$ROOT/docs/plans/2026-11-10-issue-2465-inert-first-checks-wait.md}"
+extract_plan_bullet() { # $1 = plan doc — the `unreadable` sub-bullet of step 1
+  awk '
+    /^[[:space:]]*- `unreadable` → widen only where/ { inb = 1 }
+    inb && /^[[:space:]]*⛔/ { exit }
+    inb { print }
+  ' "$1"
+}
+echo "(a17) the plan doc's step-1 unreadable-bullet states the SHIPPED allow-list, not the deny-list"
+ck "(a17) the design record is present at $PLAN_DOC" \
+   "$([ -f "$PLAN_DOC" ] && echo 0 || echo 1)"
+PLAN_BULLET="$(extract_plan_bullet "$PLAN_DOC")"
+ck "(a17) extracted step 1's unreadable-bullet (not pinning an empty seam)" \
+   "$([ -n "$PLAN_BULLET" ] && echo 0 || echo 1)"
+ck "(a17) ⛔ it does NOT state the DENY-list predicate ('declares neither …') — a review-comment lane widens under it (round 9 P2)" \
+   "$(grep -q 'declares neither' <<<"$PLAN_BULLET" && echo 1 || echo 0)"
+ck "(a17) it states the ALLOW-LIST polarity: EVERY declared member proven INERT" \
+   "$(grep -q 'EVERY declared' <<<"$PLAN_BULLET" && grep -q 'ALLOW-LIST' <<<"$PLAN_BULLET" && echo 0 || echo 1)"
+ck "(a17) it names BOTH known-inert members the helper's set carries ('workflow_call', 'schedule')" \
+   "$(grep -q 'workflow_call' <<<"$PLAN_BULLET" && grep -q 'schedule' <<<"$PLAN_BULLET" && echo 0 || echo 1)"
+ck "(a17) ⛔ it does NOT collapse a clause that WAS read into 'unread' (the round-5 enum)" \
+   "$(grep -q 'UNCLASSIFIABLE shape is' <<<"$PLAN_BULLET" && echo 1 || echo 0)"
+ck "(a17) it names the THREE non-measured grounds the code distinguishes (unread / unclassifiable / empty)" \
+   "$(grep -qF '`unread` (no clause at all)' <<<"$PLAN_BULLET" && grep -qF '`unclassifiable`' <<<"$PLAN_BULLET" && grep -qF '`empty`' <<<"$PLAN_BULLET" && echo 0 || echo 1)"
+
+# ── (a18) MUTATION — the deny-list sentence restored in the plan doc turns (a17) RED ──
+# The round-9 defect verbatim. A prose pin that no mutation can falsify proves nothing (the
+# round-8 lesson), so the pre-round-8 sentence is re-inserted into a COPY of the design record
+# and the same assertion that guards it must go RED there.
+echo "(a18) MUTATION: the deny-list predicate put back in the plan doc → the (a17) pin is RED there"
+PLANMUT="$TMP/plan-deny-list-mutant.md"
+awk '
+  /^[[:space:]]*- `unreadable` → widen only where/ {
+    print
+    print "     `STRUCTURAL` **and** its `on:` declares neither `push` nor `workflow_dispatch`."
+    n++; next
+  }
+  { print }
+  END { exit (n == 1 ? 0 : 1) }
+' "$PLAN_DOC" > "$PLANMUT"
+ck "(a18) the mutation applied EXACTLY once to step 1's unreadable-bullet (a silent no-op mutation would prove nothing)" "$?"
+PLANMUT_BULLET="$(extract_plan_bullet "$PLANMUT")"
+ck "(a18) the mutant bullet is still extractable (not testing an empty seam)" \
+   "$([ -n "$PLANMUT_BULLET" ] && echo 0 || echo 1)"
+ck "(a18) against the mutant, (a17)'s deny-list row is RED — the shipped record would fail this pin" \
+   "$(grep -q 'declares neither' <<<"$PLANMUT_BULLET" && echo 0 || echo 1)"
+ck "(a18) …and the mutant still satisfies the allow-list rows, so the pin fails on the DENY-LIST alone, not on an unrelated regression" \
+   "$(grep -q 'EVERY declared' <<<"$PLANMUT_BULLET" && grep -q 'ALLOW-LIST' <<<"$PLANMUT_BULLET" && echo 0 || echo 1)"
 
 # ── (a12) A MIXED LIST: "NO MEMBER IS CLASSIFIABLE" IS FALSE ABOUT THE MEMBER THAT IS ──
 # (round 7, P3) The shape gate is ALL-OR-NOTHING, so `push, push-to-fork` fails the whole

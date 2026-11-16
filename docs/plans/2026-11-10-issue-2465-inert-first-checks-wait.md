@@ -51,6 +51,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only where the lane's own run can never attach (`STRUCTURAL` + EVERY declared member proven INERT — an allow-list, round 8) | `tests/issue-2465-inert-wait/run.sh` A(a)–(a16), (b)–(d), (g), plus mutations (f)/(h) and the helper mutants (a5)/(a6)/(a7)/(a11); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
 | `admin-merge.sh` `lane_own_run_can_attach` (new helper) | trigger classifier — can this lane's OWN name appear on a run for a PR head? It answers "cannot attach" ONLY when every declared member is on the KNOWN-INERT allow-list (`workflow_call`, `schedule`), so a trigger the code has never seen keeps the filter; the member SHAPE is validated too, so an unclassifiable list is non-`measured` (fail closed) rather than a silent widen, and the MESSAGE names which ground it is on (`unread` / `empty` / read-but-`unclassifiable` / `measured`) | unit: arms (a2)/(a3)/(a3b)/(a3c)/(a4)/(a7)/(a8)/(a10)/(a12)/(a15)/(a16) with mutants (a5)/(a6)/(a7)/(a11)/(a14) (`tests/issue-2465-inert-wait/run.sh`) — (a3b) is the multi-trigger list naming ONLY the member not proven inert, (a3c) the JOINED value whose push mechanism is qualified by its own `branches`/`paths` filter, (a7) proves both are load-bearing, (a8) pins the shape gate and the read-vs-unclassifiable wording, (a10)/(a11) pin `pull_request_review` as ATTACHABLE (a review runs the lane on the PR head), (a12)/(a14) pin the mixed-list wording, (a15) pins that an UNENUMERATED trigger (`pull_request_review_comment`) keeps the filter with no mechanism claimed, and (a16) pins the empty-clause ground |
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
+| THIS plan doc (design record) | step 1's `unreadable` bullet states the shipped ALLOW-LIST (`workflow_call`, `schedule`) and the THREE non-measured grounds (`unread` / `unclassifiable` / `empty`), not the deny-list predicate nor the round-5 "unclassifiable is `unread`" enum (round 9) | `tests/issue-2465-inert-wait/run.sh` **(a17)** reads that bullet out of this file (the way (a0) reads the docstring) with mutant **(a18)** restoring the deny-list sentence |
 | `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in; its RECORD states the shipped two-condition gate, not the rejected class-wide widen | unit: arm (a) is the attributable row, plus the single-definition guard, the record↔predicate pin (a0) with mutant (a9), and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | `wait_enabled` gains the `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` conjunct (it may disable the wait only with a zero window, and only together with the zero window — never by touching the bounds), and the `*)` refusal is re-cut so its two states do not share a verdict. The POLL/BUDGET contract (`#2862`: spent on the attempt), the stall/ceiling bounds and §4.5 are **unchanged**. | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) for the unchanged contract; `tests/admin-merge/run.sh` §79 (g1)-(g4) for the seam; `tests/issue-2465-inert-wait/run.sh` B1-B7 and the state-keyed text arm |
 | `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B7, `tests/admin-merge/run.sh` §79 (g1)-(g4) |
@@ -75,14 +76,22 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    - `has-run` → no widening, the certificate keeps the lane's name (the RECORDED #1614 gate);
    - `none` → widen, loudly (waiting cannot create a run that does not exist);
    - `unreadable` → widen only where the lane's own run can never attach to the head:
-     `STRUCTURAL` **and** its `on:` declares neither `push` nor `workflow_dispatch`. Such a
-     lane's own workflow name can never appear on a run for the head (`workflow_call`-only
-     attaches under a CALLER's name, #1413; `schedule` fires on the default branch), so the
-     filtered wait is inert — #2465's measured burn. A `push`/`workflow_dispatch` member
-     KEEPS the filter (fail closed), because such a run CAN attach to this head while the
-     wait runs; every other class keeps the filter too and lets §1b refuse. The trigger
-     list must be a well-formed set of plain `on:` keys — an UNCLASSIFIABLE shape is
-     `unread`, and keeping the filter is the ONLY fail-closed answer.
+     `STRUCTURAL` **and** EVERY declared `on:` member is a KNOWN-INERT trigger
+     (`workflow_call`, `schedule`) — an ALLOW-LIST of inertness, so any member this code has
+     not proven inert keeps the filter and fails closed (round 8). Those are the two that
+     cannot put a run of the lane on a PR head (`workflow_call`-only attaches under a
+     CALLER's name, #1413; `schedule` fires on the default branch), so the filtered wait is
+     inert — #2465's measured burn. ⛔ It is NOT a DENY-list (the pre-round-8 polarity,
+     recorded in R19): a `push`, `workflow_dispatch`, `pull_request_review` or
+     `pull_request_review_comment` member all run the lane ON this head while the wait runs,
+     so they KEEP the filter (fail closed) — as does a name this code has never classified,
+     which is the whole reason the polarity is inverted. Every other class keeps the filter
+     too and lets §1b refuse. The declared list must be a well-formed set of plain `on:`
+     keys, and the THREE non-measured grounds are distinct —
+     `unread` (no clause at all), `unclassifiable` (the clause WAS read and at least one
+     member is not a plain key), `empty` (the clause WAS read and declares no member at
+     all). ⛔ A clause that WAS read is never reported as `unread` (that was the round-5
+     enum), and keeping the filter is the ONLY fail-closed answer on all three grounds.
    ⛔ NOT "skip the probe for STRUCTURAL" — a first cut did that and reversed #1614 (review P0).
    ⛔ NOT "unreadable widens for the whole STRUCTURAL class" — that was the merged first
    landing (`e4716a058`), and it failed open on one transient read for exactly the
@@ -91,7 +100,11 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    pins this helper's own RECORD to the shipped two-condition gate — the docstring must name
    `lane_own_run_can_attach` and carry neither class-wide claim, and mutant (a9) reduces the gate to
    the class LABEL to prove that pin is load-bearing (round 5, P2: prose a next lane restores must
-   not be able to re-open the fail-open with every behavioural arm green); A(b) the
+   not be able to re-open the fail-open with every behavioural arm green); **A(a17)** pins THIS
+   bullet the way (a0) pins the docstring — it must state the allow-list and the three grounds and
+   must not carry the deny-list sentence, with mutant (a18) restoring that sentence to prove the pin
+   bites (round 9, P2: the docstring and row D were corrected while this normative bullet, the one a
+   next lane implements from, still shipped the deny-list); A(b) the
    measured-`none` half; A(c)/A(c2) `paths-excluded` still probes; A(c3) non-structural
    `unreadable` still fails closed; **A(g) STRUCTURAL + `has-run` → NO widening**, with mutant
    (f) rebuilding the reversal to prove (g) is load-bearing. The integration proof of the #1614
@@ -254,6 +267,18 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   carries it". → the bound is the bullet's own continuation lines (`#     `), and **(a0)** asserts
   the extract stops before the post-bullet prose (`NOT a class-wide widen`), which the old
   implementation leaked.
+- R19 THIS FILE's own Implementation-steps bullet still shipped the DENY-list (review round 9, P2)
+  — round 8 corrected row D, the surface map and R16–R18, but **step 1** (27 lines above R16, in
+  the same file, and the bullet a next lane implements from) still said `unreadable` widens when
+  the lane "`STRUCTURAL` **and** its `on:` declares neither `push` nor `workflow_dispatch`", and
+  still collapsed every non-measured shape into `unread`. Under that predicate a
+  `pull_request_review_comment`-only lane widens on one failed read — the R16 fail-open, restored
+  by the record with every behavioural arm green, because **no arm read the plan doc**
+  (`grep -n 'docs/plans' tests/issue-2465-inert-wait/run.sh` was empty). → step 1 states the
+  allow-list and the three grounds, and **(a17)** reads that bullet the way (a0) reads the
+  docstring, with mutant (a18) restoring the deny-list sentence to prove the pin is load-bearing.
+  The rule this closes is the file's own: prose a next lane restores must not be able to re-open the
+  fail-open.
 
 **Accepted residual (recorded, not fixed — review round 5, P3):** the shape gate accepts
 `[a-z0-9_,]` while the producer's `_KEY_RE` (`scripts/ci-workflow-pr-evaluable.sh:111`) also admits
