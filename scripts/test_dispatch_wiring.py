@@ -193,6 +193,16 @@ _NON_DISPATCH_STEPS = frozenset({
     "lane-scan-fallback.sh",      # detached roster scan when the tick has no fresh snapshot
     "beat-pair.sh",              # SOURCED into the beat's shell (beat-pair helpers), not launched
     "lib",                        # sourced helper directory (`$SCRIPTS/lib/...`)
+    # ⛔ DIRECTORIES IN THE BEAT'S PATH PIN (#1867). The pin spells its entries `$HOME/<dir>` so that
+    # nothing in it is a literal user home, and `_EXEC_PATH_REF` enumerates EVERY `$VAR/<name>` —
+    # including these, whose base is the DIRECTORY. They are the same class as `lib` above: names the
+    # beat MENTIONS, not programs it launches. Declared here rather than respelled to dodge the
+    # enumerator, which is what this list exists for. The cost is stated so it is not discovered
+    # later: a file actually NAMED `bin`/`shims` under `$SCRIPTS` would be invisible to this one arm —
+    # the trade `lib` already makes — and the launch-floor assertion in the same test still requires
+    # the four real steps to be seen, so an enumerator that broke cannot read as "nothing undeclared".
+    "bin",                        # a PATH-pin directory (`$HOME/bin`, `$HOME/.pi/agent/bin`), never launched
+    "shims",                      # ditto: `$HOME/.pi/agent/shims`, the gh shim directory
 })
 _ASSIGNMENT_RUNS = re.compile(r"\$\(|`")
 _DISPATCH_STEP = "pr-doctor.py"

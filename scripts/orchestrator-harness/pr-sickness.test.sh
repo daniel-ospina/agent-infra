@@ -203,7 +203,19 @@ run_pass() { # [<module>] [extra args…]  — a first arg that is a FILE is the
   # which its `*)` arm drops), so the capacity lever the load gate and `fix_slots` headroom rest on had
   # no coverage at all.
   ( . "$mod"; . "$TMP/stubs.sh"
+    # ⛔ `AGENT_INFRA_PATH` IS PART OF THE FIXTURE, NOT AN AMBIENT CONVENIENCE. Before a fixer is spent
+    # the module renders the fixer contract on THIS box (`brief_gate_probe`, #4011) and refuses with a
+    # named skip when nothing renders one. The probe's ladder resolves the gate from the MODULE'S OWN
+    # directory first — correct for the shipped layout, but every mutation arm below sources a MUTANT
+    # copy in `$TMP`, whose directory has no `brief-gate.sh`. The remaining rungs are `${O}/`, the
+    # checkout via `AGENT_INFRA_PATH`, and this box's farmed `$HOME/.pi/agent/scripts/`. A developer box
+    # has the farm, so (v2)/(v3)/(v4) dispatched by accident there; on CI there is no farm and no
+    # `AGENT_INFRA_PATH`, so the probe answered 80, `ps` skipped by name, and the three arms reported
+    # "still holds with … mutated — vacuous" (measured 2026-11-15 on the CI runtime: 163 passed, 3
+    # failed, every one of them on `skip #77: brief-gate.sh --section fixer REFUSED (exit 80)`). Naming
+    # the checkout here makes the arms assert the module's behaviour instead of the runner's farm.
     PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" PS_OR="$OR" PS_REPO_PATH="$TMP/repo" \
+      AGENT_INFRA_PATH="$HERE/../.." \
       PS_RECORD_DIR="$TMP/records" PS_MAX_REVIEW="${PS_MAX_REVIEW:-}" \
       ps_select --repo "$OR" --limit 8 "$@" ) 2>&1
 }
