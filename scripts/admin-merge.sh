@@ -6729,27 +6729,41 @@ lane_applicable() {
 #
 #     lane_structural && ! lane_own_run_can_attach
 #
-#   * BOTH hold — STRUCTURAL, and its `on:` names none of `push`, `workflow_dispatch`
-#     or `pull_request_review`. No run of this lane can attach to the head, so the
-#     filtered wait is INERT — it can only ever clear on a run that cannot appear —
-#     and #2465's measured 3900 s burn was caused by exactly ONE failed
-#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a run".
-#     Waiting longer cannot outlast a failed read. Widen.
+#   * BOTH hold — STRUCTURAL, and EVERY declared `on:` member is a KNOWN-INERT
+#     trigger (`workflow_call`, `schedule`). No run of this lane can attach to the
+#     head, so the filtered wait is INERT — it can only ever clear on a run that
+#     cannot appear — and #2465's measured 3900 s burn was caused by exactly ONE
+#     failed `gh run list` (§0b runs the probe once), not by a probe that answered
+#     "has a run". Waiting longer cannot outlast a failed read. Widen.
+#     ⛔ THE POLARITY IS AN ALLOW-LIST OF INERTNESS, NOT A DENY-LIST OF ATTACHABLE
+#     NAMES (round 8, P2). Widening is the LOOSENING direction, so it needs POSITIVE
+#     knowledge of EVERY member: one member this code cannot prove inert keeps the
+#     filter. The deny-list form widened on every trigger it had not enumerated —
+#     `pull_request_review` (fixed at round 7), then `pull_request_review_comment`,
+#     whose run's `head_sha` IS the PR head (round 8), then whatever GitHub ships
+#     next — each one re-opening the fail-open with every arm green. An allow-list
+#     cannot fail that way: a name it does not know is KEPT by construction.
 #   * Otherwise the filter is KEPT (fail closed). That covers every other class, AND a
 #     STRUCTURAL lane that CAN attach a run of itself to the head: there a run CAN
 #     appear, so an unread answer is not an exemption.
 #     ⛔ IT ALSO COVERS AN ABSENT OR UNCLASSIFIABLE TRIGGER LIST, and that is where the
 #     fail-closed DEFAULT lands. `lane_own_run_can_attach` answers "CAN attach" (returns
-#     0) for both shapes, and §0b widens only when it returns 1 — so an absent or
+#     0) for both shapes — and for an EMPTY one (`(declared triggers: )`) too, which is a
+#     third ground with its own wording since round 8 — and §0b widens only when it
+#     returns 1 — so an absent or
 #     unclassifiable list keeps the filter. Round 7 (P2): this record listed that default
 #     under "Widen", i.e. the fail-OPEN direction of exactly the drift this bullet layout
 #     exists to prevent, in the docstring the PR had just rewritten to fix the same class
 #     of defect — so the placement is pinned, not the prose (arms (a0)/(a13)).
+#     ⛔ AND IT COVERS EVERY MEMBER THIS CODE CANNOT NAME, which is now the RULE and
+#     not a residual: with the inert set expressed as an allow-list, `pull_request_review`,
+#     `pull_request_review_comment`, `issues`, `workflow_run`, `merge_group` and every
+#     event GitHub ships after this line all land in this KEEP arm.
 #
 # ⛔ NOT a class-wide widen. The whole-structural-class reading was the merged landing
-# (`e4716a058`), it reversed the fail-closed answer for this class's `push` /
-# `workflow_dispatch` / `pull_request_review` members on ONE transient read, and it is
-# what review P1 rejected.
+# (`e4716a058`), it reversed the fail-closed answer for a STRUCTURAL lane whose own `on:`
+# lets a run of it attach to the head on ONE transient read, and it is what review P1
+# rejected.
 # `tests/issue-2465-inert-wait/run.sh` pins the two-condition predicate itself
 # (mutation (a9)), the RECORD's wording (arm (a0)), and WHICH BULLET carries the
 # fail-closed default (mutant (a13)), so the two cannot drift apart again.
@@ -6764,24 +6778,25 @@ lane_no_pr_trigger() {
   return 1
 }
 
-# lane_own_run_can_attach <reason> — TRUE (0) when the MEASURED applicability reason's
-# `(declared triggers: …)` clause names a trigger that can start a run OF THIS WORKFLOW
-# on the PR head, i.e. a run that can BE this head's run while the wait runs:
+# lane_own_run_can_attach <reason> — TRUE (0) when a run OF THIS WORKFLOW can still
+# attach to the PR head, i.e. whenever the MEASURED `(declared triggers: …)` clause does
+# NOT prove the filtered wait inert. It answers FALSE (1) — the ONLY widening answer in
+# this file — when EVERY declared member is a KNOWN-INERT trigger:
 #
-#   push                 a push whose tip is $head runs it on $head
-#   workflow_dispatch    `gh workflow run <wf> --ref <branch>` runs it on that branch tip
-#   pull_request_review  a submitted review runs it ON the PR HEAD, so
-#                        `gh run list --commit $head --workflow $lane` CAN return it —
-#                        and a `pull_request_review`-only lane is STRUCTURAL
-#                        (`PR_TRIGGERS` in scripts/ci-workflow-pr-evaluable.sh:106 covers
-#                        only pull_request/pull_request_target), so leaving it out of this
-#                        set widened a lane whose own run DOES attach: the exact loosening
-#                        review P1 rejected for `push` (round 7, P2).
+#   workflow_call  a reusable workflow's checks attach under the CALLER's workflow name
+#                  (#1413), so filtering by the lane's OWN name can never match — that is
+#                  #2465's `python-ci.yml` case, and it is the one that MUST widen
+#   schedule       fires on the default branch, never on a PR head
 #
-# `workflow_call` does NOT count: a reusable workflow's checks attach under the CALLER's
-# workflow name (#1413), so filtering by the lane's OWN name can never match — that is
-# #2465's `python-ci.yml` case, and it is the one that MUST keep widening. `schedule`
-# does NOT count either: it fires on the default branch, never on a PR head.
+# ⛔ INERT IS AN ALLOW-LIST, AND THAT IS THE WHOLE FIX (round 8, P2). This set used to be
+# a DENY-list of names that DO attach (`push`, `workflow_dispatch`, and `pull_request_review`
+# added at round 7) — and a deny-list answers "cannot attach" for every trigger it has not
+# enumerated, which is the WIDENING, loosening direction. It answered so twice, with the
+# whole suite green each time: `pull_request_review` (round 7), then
+# `pull_request_review_comment` (round 8) — a review-comment run's `head_sha` IS the PR
+# head, so the filtered wait clears on it. A member this code cannot prove INERT therefore
+# answers "can attach" (keep the filter): `issues`, `workflow_run`, `merge_group`, and
+# every event GitHub ships after this line, with no arm needing to be taught the new name.
 #
 # ⛔ AN ABSENT / UNPARSEABLE CLAUSE IS "CAN ATTACH" (returns 0, the fail-closed answer).
 # Widening is the LOOSENING direction, so an unknown trigger shape must keep the filter
@@ -6796,30 +6811,42 @@ lane_no_pr_trigger() {
 # `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape gate below is what
 # makes the sentence true: the producer emits a `", "`-joined list of `on:` keys
 # (scripts/ci-workflow-pr-evaluable.sh:831), so every member MUST be `[a-z0-9_]+`. Any
-# other shape is treated exactly like an ABSENT one — `unread`, fail closed.
+# other shape keeps this fail-closed arm, exactly like an ABSENT one — `unread`, `empty`
+# or `unclassifiable`, never `measured`.
 #
-# ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
-# attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
-# reason, the other could not read the list at all and defaulted fail-closed. So the
-# helper also records WHICH ground it is on — LANE_RUN_ATTACH_SOURCE is
-# `measured` only when a clause was present AND every member had a classifiable
-# shape, `unread` when there was no clause to read, and `unclassifiable` when the
-# clause WAS read but AT LEAST ONE member is not a shape this helper can name — the
-# shape gate is all-or-nothing, so on a MIXED list (`push, push-to-fork`) a classifiable
-# member is still present (round 7, P3: "no member is classifiable" is false about that
-# member; §0b's message must not call a list it read "unreadable" either) — and
-# LANE_RUN_ATTACH_TRIGGERS
-# names what it found (empty on every default). Without that, §0b's message told an
-# absent-clause lane that it "declares a trigger" — a declaration the code never read,
-# which is the one thing this file forbids in a message (`nothing below may claim a
-# MEASUREMENT the code did not take`).
+# ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The grounds for "can
+# attach" are NOT the same claim — one PARSED the member list out of the reason, the others
+# could not read it, or could not classify it, and defaulted fail-closed. So the helper also
+# records WHICH ground it is on:
 #
+#   LANE_RUN_ATTACH_SOURCE
+#     measured        a clause was present AND every member had a classifiable shape
+#     unread          there was no clause to read
+#     empty           the clause WAS read and declares NO member at all (round 8, P3:
+#                     `(declared triggers: )` is reachable — `on: []` / `on: {}` reach the
+#                     producer's inline path as an empty set — and "no member is a plain
+#                     lowercase `on:` key" is false about a list with zero members)
+#     unclassifiable  the clause WAS read but AT LEAST ONE member is not a shape this
+#                     helper can name (the shape gate is all-or-nothing, so on a MIXED list
+#                     — `push, push-to-fork` — a classifiable member is still present;
+#                     round 7, P3: "no member is classifiable" is false about that member,
+#                     and §0b's message must not call a list it read "unreadable" either)
+#   LANE_RUN_ATTACH_TRIGGERS   the members NOT proven inert (empty on every default) —
+#                              what §0b quotes as the reason the widen was withheld
+#   LANE_RUN_ATTACH_INERT      the members it DID prove inert — what §0b's WIDEN message
+#                              quotes, so it states the measurement it took instead of the
+#                              deny-list it replaced (round 8, P2)
+#
+# Without these, §0b's message told an absent-clause lane that it "declares a trigger" — a
+# declaration the code never read, which is the one thing this file forbids in a message
+# (`nothing below may claim a MEASUREMENT the code did not take`).
 # The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
 # present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
 lane_own_run_can_attach() {
-  local reason="${1:-}" triggers="" norm="" list="" found=""
+  local reason="${1:-}" triggers="" norm="" member="" inert="" found="" all_inert=1
   LANE_RUN_ATTACH_SOURCE="unread"
   LANE_RUN_ATTACH_TRIGGERS=""
+  LANE_RUN_ATTACH_INERT=""
   case "$reason" in
     *'(declared triggers:'*')'*)
       triggers="${reason##*'(declared triggers:'}"
@@ -6836,15 +6863,24 @@ lane_own_run_can_attach() {
   # ⛔ THE CHARSET IS DELIBERATELY NARROWER THAN THE PRODUCER'S KEY VALIDATOR, and that
   # is an ACCEPTED RESIDUAL, not an oversight (round 5, P3). The producer's `_KEY_RE`
   # (scripts/ci-workflow-pr-evaluable.sh:111) also admits `-`, `.` and uppercase;
-  # accepting them here would be the LOOSENING direction, because a value that passes
-  # the gate but names no trigger this helper knows answers "cannot attach" — which
-  # WIDENS. Every documented `on:` event name is lowercase snake_case (GitHub's own
+  # accepting them here would be the LOOSENING direction, because a member that passes
+  # the gate but is not on the INERT allow-list answers "can attach" — which KEEPS the
+  # filter. Every documented `on:` event name is lowercase snake_case (GitHub's own
   # events reference: `branch_protection_rule`, `check_run`, `deployment_status`, …), so
   # the difference is empty in practice, and a value inside it keeps this fail-closed
   # arm: the lane cannot widen on a list this code cannot name (#2465's inert wait).
   norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   case "$norm" in
-    ''|*[!a-z0-9_,]*)
+    '')
+      # PRESENT and EMPTY (round 8, P3): the clause WAS read, and it declares no member
+      # at all — reachable, because `on: []` / `on: {}` reach the producer's inline path
+      # as an empty set and it emits `(declared triggers: )`
+      # (scripts/ci-workflow-pr-evaluable.sh:161-190). NOT `unclassifiable`: "no member is
+      # a plain lowercase `on:` key" is false about a list with zero members. Fail closed
+      # all the same — an empty declaration proves no member inert.
+      LANE_RUN_ATTACH_SOURCE="empty"
+      return 0 ;;
+    *[!a-z0-9_,]*)
       # PRESENT but unclassifiable: the clause WAS read, so the message must say that
       # rather than "could not be READ" (round 5, P3 — claim accuracy, and it is the
       # difference between "we learned nothing" and "we learned something we cannot use").
@@ -6852,26 +6888,34 @@ lane_own_run_can_attach() {
       return 0 ;;
   esac
   LANE_RUN_ATTACH_SOURCE="measured"
-  list=",$norm,"
-  case "$list" in
-    *,push,*) found="push" ;;
-  esac
-  case "$list" in
-    *,workflow_dispatch,*) found="${found:+$found }workflow_dispatch" ;;
-  esac
-  # ⛔ `pull_request_review` COUNTS (round 7, P2). A review submission runs the workflow
-  # ON THE PR HEAD, so a filtered `gh run list --commit $head --workflow $lane` CAN return
-  # it — and a `pull_request_review`-only lane is STRUCTURAL, so omitting it from this set
-  # widened a lane whose own run DOES attach: the very loosening review P1 rejected for
-  # `push`. The class check that produces this reason is `PR_TRIGGERS = {pull_request,
-  # pull_request_target}` (scripts/ci-workflow-pr-evaluable.sh:106), which a review-triggered
-  # lane never satisfies.
-  case "$list" in
-    *,pull_request_review,*) found="${found:+$found }pull_request_review" ;;
-  esac
-  [ -n "$found" ] || return 1
+  # ⛔ THE ALLOW-LIST OF INERTNESS (round 8, P2) — the polarity of this whole fix. Each
+  # member is classified against the KNOWN-INERT set; anything NOT on it is not proven
+  # inert, so it lands in `found` (named by §0b's message) and forbids the widen. That is
+  # what makes a trigger this code has never heard of — `pull_request_review_comment`,
+  # `issues`, whatever GitHub ships next — keep the filter by CONSTRUCTION rather than by
+  # someone remembering to extend a deny-list. Widening requires EVERY member known inert.
+  #
+  # `pull_request_review` (round 7) and `pull_request_review_comment` (round 8) are both
+  # legitimately ATTACHABLE this way WITHOUT being enumerated: a submitted review and a
+  # review comment each run the workflow ON THE PR HEAD, so `gh run list --commit $head
+  # --workflow $lane` CAN return it — while the producer's `PR_TRIGGERS = {pull_request,
+  # pull_request_target}` (scripts/ci-workflow-pr-evaluable.sh:106) never classifies such a
+  # lane as applicable, so it reaches this helper as STRUCTURAL.
+  local IFS=','
+  for member in $norm; do
+    case "$member" in
+      workflow_call|schedule) inert="${inert:+$inert }$member" ;;
+      *)
+        all_inert=0
+        found="${found:+$found }$member"
+        ;;
+    esac
+  done
+  unset IFS
   LANE_RUN_ATTACH_TRIGGERS="$found"
-  return 0
+  LANE_RUN_ATTACH_INERT="$inert"
+  [ "$all_inert" -eq 1 ] || return 0
+  return 1
 }
 
 # lane_head_run_state <head> — MEASURE whether the watched lane has a run for
@@ -10230,22 +10274,30 @@ main() {
         #   unreadable  → class- AND TRIGGER-dependent, because the question that decides
         #                 is not "does it have a PR trigger" but "can a run OF THIS
         #                 WORKFLOW still appear on THIS head while the wait runs":
-        #                 * STRUCTURAL and the lane declares none of `push`,
-        #                   `workflow_dispatch` or `pull_request_review` — no run of this
-        #                   workflow can be started on the PR head, so the filtered wait is
-        #                   INERT and one failed `gh run list` is not something waiting can
-        #                   outlast. Widen, loudly. THIS is #2465's measured burn (3900 s
-        #                   decided by one unread REST response); its `python-ci.yml` is
-        #                   exactly this shape (`workflow_call` only — its checks attach
-        #                   under a CALLER's name, so filtering by its OWN name can never
-        #                   match).
-        #                 * STRUCTURAL WITH `push` / `workflow_dispatch` /
-        #                   `pull_request_review` — such a run CAN attach to this head while
-        #                   the wait runs (a push whose tip is $head, a
-        #                   `gh workflow run --ref`, a SUBMITTED REVIEW, or a rerun of a
-        #                   CANCELLED run — this repo's own cancel-in-progress produces
-        #                   exactly that), and it carries THIS workflow's name, so the
-        #                   filtered wait is still a SIGNAL. An unread answer is NOT an
+        #                 * STRUCTURAL and EVERY declared `on:` member is a KNOWN-INERT
+        #                   trigger (`workflow_call`, `schedule`) — no run of this workflow
+        #                   can be started on the PR head, so the filtered wait is INERT and
+        #                   one failed `gh run list` is not something waiting can outlast.
+        #                   Widen, loudly. THIS is #2465's measured burn (3900 s decided by
+        #                   one unread REST response); its `python-ci.yml` is exactly this
+        #                   shape (`workflow_call` only — its checks attach under a CALLER's
+        #                   name, so filtering by its OWN name can never match).
+        #                   ⛔ THE TEST IS "EVERY MEMBER PROVEN INERT", NOT "NO MEMBER NAMED
+        #                   ON A DENY-LIST" (round 8, P2). A deny-list widened on every
+        #                   trigger it had not enumerated — `pull_request_review` at round 7,
+        #                   `pull_request_review_comment` at round 8 (its run's `head_sha` IS
+        #                   the PR head) — because "not listed as attachable" was read as
+        #                   "cannot attach". An allow-list is the fail-closed form: a member
+        #                   this code cannot prove inert keeps the filter, so the next
+        #                   trigger GitHub ships cannot silently re-open the fail-open.
+        #                 * STRUCTURAL WITH ANY MEMBER NOT PROVEN INERT — `push`,
+        #                   `workflow_dispatch`, `pull_request_review`,
+        #                   `pull_request_review_comment`, `issues`, … — a run CAN attach to
+        #                   this head while the wait runs (a push whose tip is $head, a
+        #                   `gh workflow run --ref`, a SUBMITTED REVIEW, a review COMMENT, or
+        #                   a rerun of a CANCELLED run — this repo's own cancel-in-progress
+        #                   produces exactly that), and it carries THIS workflow's name, so
+        #                   the filtered wait is still a SIGNAL. An unread answer is NOT an
         #                   exemption: KEEP the filter and let §1b refuse — which is what
         #                   `origin/main` did for EVERY class (#2465 review P1: widening
         #                   here turned one transient read failure into a merge past the
@@ -10264,7 +10316,7 @@ main() {
         # Dynamic scoping: the helper writes these, and they are READ only by the message
         # below — so an absent/unparseable trigger list can be described as what it is
         # (a fail-closed DEFAULT) instead of as a declaration that was never read.
-        local LANE_RUN_ATTACH_SOURCE="" LANE_RUN_ATTACH_TRIGGERS=""
+        local LANE_RUN_ATTACH_SOURCE="" LANE_RUN_ATTACH_TRIGGERS="" LANE_RUN_ATTACH_INERT=""
         # …and the MECHANISMS, derived from what was measured. A fixed list would tell a
         # `workflow_dispatch`-only lane that "a push whose tip is $head" can attach a run
         # of it, which is false for that lane (round 3, P2) — the same rule as above.
@@ -10322,21 +10374,29 @@ main() {
             say_err "   only started by an actual push to the branch), and $lane_run_clause."
             if [ "$lane_probe_state" = unreadable ]; then
               # ⛔ ACCURATE FOR THIS ARM ONLY (review P1). This block is reached on an
-              # UNREADABLE probe AND only when the lane's own `on:` names none of `push`,
-              # `workflow_dispatch` or `pull_request_review` — the triggers that can start a
-              # run of it on a branch tip / on this head. The class lines just above describe
-              # the whole STRUCTURAL class (and stay true for a `push`-triggered lane that
-              # MEASURED no run), but THIS arm is narrower: the TRIGGER LIST, not the failed
-              # read, is what makes the filtered wait inert here. A `push` /
-              # `workflow_dispatch` / `pull_request_review` member never reaches this line —
-              # it KEEPS its filter and fails closed on the same failed read, because a push
-              # whose tip is $head, a `--ref` dispatch or a submitted review attaches a run
-              # to this head while the wait runs.
-              say_err "   This lane's own 'on:' declares no 'push', no 'workflow_dispatch' and no"
-              say_err "   'pull_request_review', so no run of it can attach to head $head however long"
-              say_err "   the wait runs — the filtered wait cannot outlast the failed read (#2465: one"
-              say_err "   failed read cost 3900 s). A lane that declares any of those three is NOT"
-              say_err "   widened here: it keeps its filter."
+              # UNREADABLE probe AND only when the lane's own `on:` PROVES its filtered wait
+              # inert: every declared member is a known-inert trigger
+              # (`lane_own_run_can_attach` answers "cannot attach"). The class lines just
+              # above describe the whole STRUCTURAL class (and stay true for a
+              # `push`-triggered lane that MEASURED no run), but THIS arm is narrower: the
+              # TRIGGER LIST, not the failed read, is what makes the filtered wait inert
+              # here. A lane declaring any member this code cannot PROVE inert never reaches
+              # this line — it KEEPS its filter and fails closed on the same failed read.
+              # ⛔ AND IT QUOTES THE MEASUREMENT (round 8, P2): the inert members it read, not
+              # the deny-list it no longer has. With the allow-list, "the triggers that DO
+              # attach" is an open set (`pull_request_review_comment` broke the closed one at
+              # round 8), so a fixed three-name sentence is a claim the code stopped taking.
+              local lane_inert_clause=""
+              if [ -n "$LANE_RUN_ATTACH_INERT" ]; then
+                lane_inert_clause="every trigger it declares ('$LANE_RUN_ATTACH_INERT') is one that cannot put a run of it on a PR head, so"
+              else
+                lane_inert_clause="every trigger it declares was measured inert, so"
+              fi
+              say_err "   This lane's own 'on:' PROVES the filtered wait inert: $lane_inert_clause no"
+              say_err "   run of it can attach to head $head however long the wait runs — the filtered"
+              say_err "   wait cannot outlast the failed read (#2465: one failed read cost 3900 s)."
+              say_err "   Widening needs EVERY declared member proven inert; a lane declaring any member"
+              say_err "   this code cannot prove inert is NOT widened here: it keeps its filter."
             fi
           else
             say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
@@ -10419,15 +10479,16 @@ main() {
               #     `branches`/`paths` filter — `on: push: branches: [main]` cannot attach a
               #     run to a PR head, and the filter is NOT in the reason clause, so the
               #     qualifier is stated rather than assumed;
-              #   · an UNRECOGNISED value names NO mechanism. `found` is built from a closed
-              #     set today, so that case exists for the next trigger someone adds — and
-              #     offering the known mechanisms for a value this code has not classified is
-              #     precisely the claim-without-a-measurement this clause must never make.
-              #     It stays ALL-OR-NOTHING (round 4 P2, kept by round 7 P2): one unrecognised
-              #     member silences every mechanism, rather than describing the members it did
-              #     recognise beside a value it cannot vouch for.
+              #   · a member this code has NOT classified names NO mechanism — and, since
+              #     round 8, it also gets NO "CAN attach" claim. `found` is now an OPEN set
+              #     (every member not proven inert), so it is the normal case for a trigger
+              #     shipped after this line, and offering the known mechanisms beside a value
+              #     this code cannot vouch for is exactly the claim-without-a-measurement this
+              #     clause must never make. It stays ALL-OR-NOTHING (round 4 P2, kept by rounds
+              #     7/8 P2): one unclassified member silences every mechanism, rather than
+              #     describing the members it did recognise beside a value it cannot vouch for.
               #   · the MECHANISM LIST IS COMPOSED FROM THE NAMES, so a member added to the
-              #     helper's closed set cannot leave the message describing a mechanism the
+              #     helper's classified set cannot leave the message describing a mechanism the
               #     lane's own `on:` block cannot provide — the defect this case used to fix by
               #     enumeration, which stopped serving the moment the set grew (round 7, P2).
               local lane_attach_how="" lane_attach_part="" lane_attach_parts="" lane_attach_all_known=1
@@ -10446,9 +10507,19 @@ main() {
                   esac
                 done
                 lane_attach_how=" ($lane_attach_parts, or a rerun of a CANCELLED run)"
+                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs$lane_attach_how"
+                lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
+              else
+                # ⛔ AN UNCLASSIFIED MEMBER IS NOT THEREBY AN ATTACHABLE ONE (round 8, P2).
+                # This arm used to fall through to the "CAN attach" sentence with no
+                # mechanism named — and, before the allow-list, that sentence was only ever
+                # reached for members the helper had CLASSIFIED. Now any trigger GitHub ships
+                # lands here, so the claim must be the measured one: this code cannot PROVE
+                # the member inert, widening requires proof, so the filter is kept. It says
+                # nothing about whether that member attaches — it has not measured that.
+                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — and it declares '$LANE_RUN_ATTACH_TRIGGERS', which this code cannot prove INERT ('$LANE_RUN_ATTACH_TRIGGERS' is not a member of the known-inert set: workflow_call, schedule), so the filter is kept: widening requires EVERY declared member to be proven inert"
+                lane_kept_tail="The unproven member may or may not attach a run — this code has not measured that — and an unproven member is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
               fi
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs$lane_attach_how"
-              lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
             else
               # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code did
               # not CLASSIFY a trigger, so the only honest statement is that no attachable
@@ -10464,7 +10535,14 @@ main() {
               # under-claimed in the safe direction, but claim accuracy is this block's
               # own rule, so the ground is carried in LANE_RUN_ATTACH_SOURCE and named.
               local lane_list_ground="could not be READ from the applicability reason"
-              if [ "$LANE_RUN_ATTACH_SOURCE" = unclassifiable ]; then
+              if [ "$LANE_RUN_ATTACH_SOURCE" = empty ]; then
+                # ⛔ ZERO MEMBERS IS ITS OWN GROUND (round 8, P3). `(declared triggers: )` is
+                # reachable (`on: []` / `on: {}` reach the producer's inline path as an empty
+                # set), and "no member of it is a plain lowercase `on:` key" is FALSE about a
+                # list with no members — under-claiming is still a mis-claim by this block's
+                # rule. The decision is unchanged: an empty declaration proves no member inert.
+                lane_list_ground="WAS READ from the applicability reason, but it declares NO trigger at all (an empty 'on:' set), so there is no member in it this code could prove inert"
+              elif [ "$LANE_RUN_ATTACH_SOURCE" = unclassifiable ]; then
                 lane_list_ground="WAS READ from the applicability reason, but it is not ENTIRELY classifiable: at least one member is not a plain lowercase 'on:' key this code can classify"
               fi
               lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list $lane_list_ground — so the filter is kept because an unclassified answer is not an exemption, not because a run was measured absent"

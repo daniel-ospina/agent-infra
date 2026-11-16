@@ -14,10 +14,9 @@
 #      it DOES run on the PR head's own commit). The probe is THREE-valued and its
 #      answer decides — `has-run` keeps the filter and the lane's name (#1614),
 #      `none` widens, and `unreadable` widens ONLY where the lane's own run can never
-#      attach to the head: `STRUCTURAL` and its `on:` declares neither `push` nor
-#      `workflow_dispatch` (`lane_own_run_can_attach` — a push whose tip is the head, or a
-#      `gh workflow run --ref`, CAN put its own name on a run for the head while the wait
-#      runs, so such a member keeps the filter and fails closed). This file pins all three,
+#      attach to the head: `STRUCTURAL` and EVERY declared `on:` member is a KNOWN-INERT
+#      trigger (`lane_own_run_can_attach` — an ALLOW-LIST of inertness, since round 8: any
+#      member not proven inert keeps the filter and fails closed). This file pins all three,
 #      including the #1614 arm the reversal broke.
 #      ⛔ AND NOT "unreadable widens for the whole STRUCTURAL class" — that was the merged
 #      first landing (`e4716a058`) and it failed open on one transient read (review P1).
@@ -29,20 +28,22 @@
 # extracted from the REAL `atomic-land.sh`. Both are awk extractions over the shipped
 # files (never copies — a copy would drift), each asserted non-empty and asserted to
 # contain the fix, so a refactor that moves the seam fails loudly instead of testing
-# nothing. NINE mutation arms: (f) re-introduces the #1614 reversal in a mutant and
+# nothing. TEN mutation arms: (f) re-introduces the #1614 reversal in a mutant and
 # shows the dead-end-gate arm goes RED there, and (h) re-spells the classifier's
 # reason prefix and shows arm (a) — the only arm the classification can change — goes
 # RED there. (h) exists because a copy of that CLASSIFIER used to be emitted inside
 # the extracted lib's body and silently shadow the extract (review P1). Four are the
-# helper mutants: (a5) makes 'push' unattachable, (a6) flips the absent-clause default,
-# (a7) makes the helper name an UNATTACHABLE trigger, and (a11) drops
-# 'pull_request_review' from the attachable set. (a9) reduces the §0b gate to the class
-# LABEL — the one-condition policy the docstring used to record — and is what makes the
-# docstring/predicate pin (a0) provably load-bearing. (a13) moves the fail-closed
-# default back under "Widen" in the record, and (a14) restores the "no member is
-# classifiable" wording — both round-7 P2/P3 defects that shipped green because the
-# wording arms could not see a NEW wording. Each is counted, so a silent no-op proves
-# nothing.
+# helper mutants, all expressed in the ALLOW-LIST's terms (round 8 — the deny-list they
+# used to re-spell no longer exists): (a5) puts 'push' wrongly ON the inert set, (a6)
+# flips the absent-clause default, (a7) treats an UNCLASSIFIED member as inert — the
+# round-8 defect itself, which widens the `pull_request_review_comment` lane of (a15) —
+# and (a11) puts 'pull_request_review' wrongly ON the inert set. (a9) reduces the §0b
+# gate to the class LABEL — the one-condition policy the docstring used to record — and
+# is what makes the docstring/predicate pin (a0) provably load-bearing. (a13) moves the
+# fail-closed default back under "Widen" in the record, and (a14) restores the "no
+# member is classifiable" wording — both round-7 P2/P3 defects that shipped green
+# because the wording arms could not see a NEW wording. Each is counted, so a silent
+# no-op proves nothing.
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
 # (arm (e) there is the integration proof of the #1614 gate, arm (f) the integration
@@ -94,6 +95,12 @@ extract_docstring() { # $1 = source path  $2 = function name — the `#` block A
 # STARTS, so the returned text is exactly one bullet — which is what lets an arm assert
 # WHICH bullet a claim sits in (round 7, P2: the record put the fail-closed default
 # under "Widen", the fail-OPEN direction, and no arm read the placement).
+# ⛔ THE BOUND IS THE BULLET'S OWN END, NOT THE NEXT BULLET **OR EOF** (round 8, P3).
+# `end = NR` for the LAST bullet meant its extracted text ran through the docstring's
+# closing prose, so "the KEPT bullet carries the default" was satisfied by a sentence that
+# had been moved OUT of the bullet and into the paragraph below it. A bullet continuation
+# line is `#     ` (bullet marker plus wrap indent); the docstring's post-bullet prose
+# starts at `#` or `# ⛔`, so the first line that is not a continuation ends the bullet.
 bullet_with() {
   printf '%s\n' "$1" | awk -v pat="$2" '
     { line[NR] = $0 }
@@ -102,6 +109,11 @@ bullet_with() {
     END {
       if (!hit) exit 3
       end = (hit + 1 <= nb) ? start[hit + 1] - 1 : NR
+      if (hit + 1 > nb) {
+        for (i = start[hit] + 1; i <= NR; i++) {
+          if (line[i] !~ /^#     /) { end = i - 1; break }
+        }
+      }
       for (i = start[hit]; i <= end; i++) print line[i]
     }
   '
@@ -219,6 +231,13 @@ ck "(a0) the KEPT bullet DOES carry it, so a next lane reads the default on the 
    "$(grep -qi 'absent or unclassifiable' <<<"$KEPT_BULLET" && echo 0 || echo 1)"
 ck "(a0) …and the KEPT bullet says the default is the FAIL-CLOSED one" \
    "$(grep -qi 'fail-closed DEFAULT' <<<"$KEPT_BULLET" && echo 0 || echo 1)"
+# ⛔ THE EXTRACTION ITSELF (round 8, P3). `bullet_with` used to set `end = NR` for the LAST
+# bullet, so the KEPT bullet's text ran through the docstring's closing prose — and a claim
+# moved OUT of the bullet into that prose still satisfied "the KEPT bullet carries it".
+# The docstring's post-bullet prose begins `# ⛔ NOT a class-wide widen.`, so its absence
+# from the extracted KEPT bullet is the proof that the bound is the bullet, not EOF.
+ck "(a0) ⛔ the KEPT bullet's text STOPS at the bullet — it does not swallow the post-bullet prose (round 8 P3)" \
+   "$(grep -q 'NOT a class-wide widen' <<<"$KEPT_BULLET" && echo 1 || echo 0)"
 
 # ── (a9) MUTATION PROOF — reducing the gate to the class LABEL turns (a0)/(a2) RED ──
 # The mutation is exactly the rejected policy in code: `lane_structural` alone widens.
@@ -264,6 +283,15 @@ ck "(a) ⛔ it does NOT claim the lane has no run for the head — the probe nev
    "$(grep -q 'lane has NO run for head' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a) it still prints the loud LANE INAPPLICABLE heading and the §4.5 reassurance" \
    "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && grep -q '§4.5' <<<"$R_ERR" && echo 0 || echo 1)"
+# ⛔ AND IT QUOTES THE MEASUREMENT IT TOOK (round 8, P2). The widen set is now "every declared
+# member proven INERT", so the message must name the inert member it READ. The fixed
+# three-name sentence it used to print ("declares no 'push', no 'workflow_dispatch' and no
+# 'pull_request_review'") is a deny-list the code no longer holds — and it is exactly the
+# wording that made a `pull_request_review_comment` lane look inert at round 7.
+ck "(a) it quotes the MEASURED inert member it read ('workflow_call'), not a deny-list of names" \
+   "$(grep -q "every trigger it declares ('workflow_call') is one that cannot put a run of it on a PR head" <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a) ⛔ the old deny-list sentence is GONE — a lane the code never classified as attachable is not called inert by name" \
+   "$(grep -q "declares no 'push', no 'workflow_dispatch'" <<<"$R_ERR" && echo 1 || echo 0)"
 
 # ── (a2)–(a4) THE FAIL-CLOSED DIRECTION (review P1) ────────────────────────
 # `unreadable` is NOT an exemption for a STRUCTURAL lane whose OWN name can still
@@ -379,11 +407,18 @@ ck "(a4) …but it still states the consequence, so the operator knows the wait 
 # Both mutations hit ONLY lane_own_run_can_attach, counted so a silent no-op proves
 # nothing. (a5) makes the "can attach" answer unreachable for push; (a6) flips the
 # absent-clause default to the LOOSENING one. Each must turn exactly its own arm RED.
-echo "(a5) MUTATION: 'push' no longer counts as attachable → arm (a2) is RED there"
+echo "(a5) MUTATION: 'push' counted as INERT → arm (a2) is RED there"
+# ⛔ THE MUTATION MOVED WITH THE POLARITY (round 8, P2). The allow-list is what decides, so
+# the falsifier is a member wrongly ON it: put `push` in the inert set and a `push`-only lane
+# widens on one failed read — the loosening review P1 rejected. (The old mutation re-spelled
+# the deny-list's `case` arm, which no longer exists.)
 HMUT="$TMP/helper-mutant-push.sh"
-awk '
+# The replacement line is passed in with -v so this suite never has to escape `$` inside an
+# awk program (the same trick the collector uses below).
+REPL='      workflow_call|schedule|push) inert="${inert:+$inert }$member" ;;'
+awk -v repl="$REPL" '
   /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
-  inh && /^    \*,push,\*\) found="push" ;;$/ { print "    __never_matches__) found=\"push\" ;;"; n++; next }
+  inh && /^      workflow_call\|schedule\) inert=/ { print repl; n++; next }
   { print }
   inh && /^}$/ { inh = 0 }
   END { exit (n == 1 ? 0 : 1) }
@@ -420,33 +455,35 @@ HM2_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM2_ERR")"
 ck "(a6) against the mutant (a4)'s assertion is RED (ANY_WORKFLOW='$HM2_ANY' — an unparseable trigger list widened)" \
    "$([ "$HM2_ANY" = 1 ] && echo 0 || echo 1)"
 
-echo "(a7) MUTATION: the helper names an UNATTACHABLE trigger ('workflow_call') → arm (a3b) is RED there"
-HMUT3="$TMP/helper-mutant-names-call.sh"
-awk '
+echo "(a7) MUTATION: an UNCLASSIFIED member treated as INERT → arm (a15) is RED there"
+# ⛔ THIS IS THE ROUND-8 DEFECT ITSELF, in mutant form (review P2). The shipped helper keeps
+# the filter for any member it cannot prove inert; the mutant does the opposite — the `*)`
+# arm of the member loop stops forbidding the widen — so a lane whose only trigger is
+# `pull_request_review_comment` WIDENS on one failed read. That is the loosening the review
+# measured to be live (`replicate/cog` run 42472266861 has `head_sha` = PR #3216's head), and
+# the reason the attachable set became an allow-list: a deny-list cannot be made complete.
+HMUT3="$TMP/helper-mutant-unknown-inert.sh"
+REPL3='        : # mutant: an unclassified member does NOT forbid the widen'
+awk -v repl="$REPL3" '
   /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
-  inh && /^    \*,workflow_dispatch,\*\) found="\$\{found:\+\$found \}workflow_dispatch" ;;$/ { print "    *,workflow_dispatch,*) found=\"${found:+$found }workflow_dispatch workflow_call\" ;;"; n++; next }
+  inh && /^      \*\)$/ { print; print repl; skip = 1; n++; next }
+  skip && /^        ;;$/ { skip = 0; print; next }
+  skip { next }
   { print }
   inh && /^}$/ { inh = 0 }
   END { exit (n == 1 ? 0 : 1) }
 ' "$SRC" > "$HMUT3"
-ck "(a7) the mutation applied EXACTLY once to the workflow_dispatch branch" "$?"
+ck "(a7) the mutation applied EXACTLY once to the member loop's unclassified arm" "$?"
 ck "(a7) the mutant parses (bash -n)" "$(bash -n "$HMUT3" 2>/dev/null && echo 0 || echo 1)"
-HMUT3LIB="$TMP/helper-mutant-names-call-lib.sh"
+HMUT3LIB="$TMP/helper-mutant-unknown-inert-lib.sh"
 ck "(a7) the mutant still builds a lib carrying the helper" \
    "$(build_lib "$HMUT3" "$HMUT3LIB" && grep -q 'lane_own_run_can_attach' "$HMUT3LIB" && echo 0 || echo 1)"
 HM3_ERR="$(AP_VERDICT=inapplicable \
-  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call, workflow_dispatch)' \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: pull_request_review_comment)' \
   AP_PROBE_STATE=unreadable bash < "$HMUT3LIB" 2>&1 >/dev/null)"
-ck "(a7) against the mutant (a3b)'s assertion is RED (the message names 'workflow_call' as attachable)" \
-   "$(grep 'LANE KEPT' <<<"$HM3_ERR" | grep -q 'workflow_call' && echo 0 || echo 1)"
-# ⛔ AND AN UNRECOGNISED VALUE NAMES NO MECHANISM (round 4, P2). `found` is a closed set
-# today; the catch-all exists for the NEXT trigger someone adds. The mutant's answer
-# ("workflow_dispatch workflow_call") is exactly that shape, and offering both known
-# mechanisms for a value this code has not classified is the claim-without-a-measurement the
-# clause forbids — so the catch-all must stay silent about mechanisms.
-HM3_KEPT="$(grep 'LANE KEPT' <<<"$HM3_ERR")"
-ck "(a7) …and the UNRECOGNISED value names NO mechanism (no assumed push, no assumed dispatch)" \
-   "$(if grep -q 'a push whose tip is' <<<"$HM3_KEPT" || grep -q 'gh workflow run --ref' <<<"$HM3_KEPT"; then echo 1; else echo 0; fi)"
+HM3_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM3_ERR")"
+ck "(a7) against the mutant (a15)'s assertion is RED (ANY_WORKFLOW='$HM3_ANY' — a review-comment-triggered lane widened on one failed read)" \
+   "$([ "$HM3_ANY" = 1 ] && echo 0 || echo 1)"
 
 # ── (a8) a PRESENT but UNCLASSIFIABLE clause must fail CLOSED ──
 # The prose in `lane_own_run_can_attach` (and row D of the plan) said an unparseable
@@ -491,18 +528,19 @@ ck "(a10) it names the MEASURED member it found ('pull_request_review')" \
 ck "(a10) it names the mechanism a review provides (a submitted review), not a push the lane cannot do" \
    "$(grep -q 'a submitted review of this PR' <<<"$KEPT_A10" && grep -q 'a push whose tip is' <<<"$KEPT_A10" && echo 1 || { grep -q 'a submitted review of this PR' <<<"$KEPT_A10" && echo 0 || echo 1; })"
 
-echo "(a11) MUTATION: 'pull_request_review' dropped from the attachable set → arm (a10) is RED there"
-HMUT4="$TMP/helper-mutant-no-review.sh"
-awk '
+echo "(a11) MUTATION: 'pull_request_review' counted as INERT → arm (a10) is RED there"
+HMUT4="$TMP/helper-mutant-review-inert.sh"
+REPL4='      workflow_call|schedule|pull_request_review) inert="${inert:+$inert }$member" ;;'
+awk -v repl="$REPL4" '
   /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
-  inh && /^    \*,pull_request_review,\*\) found="\$\{found:\+\$found \}pull_request_review" ;;$/ { print "    __never_matches__) found=\"pull_request_review\" ;;"; n++; next }
+  inh && /^      workflow_call\|schedule\) inert=/ { print repl; n++; next }
   { print }
   inh && /^}$/ { inh = 0 }
   END { exit (n == 1 ? 0 : 1) }
 ' "$SRC" > "$HMUT4"
-ck "(a11) the mutation applied EXACTLY once to the pull_request_review branch" "$?"
+ck "(a11) the mutation applied EXACTLY once to the inert set" "$?"
 ck "(a11) the mutant parses (bash -n)" "$(bash -n "$HMUT4" 2>/dev/null && echo 0 || echo 1)"
-HMUT4LIB="$TMP/helper-mutant-no-review-lib.sh"
+HMUT4LIB="$TMP/helper-mutant-review-inert-lib.sh"
 ck "(a11) the mutant still builds a lib carrying the helper" \
    "$(build_lib "$HMUT4" "$HMUT4LIB" && grep -q 'lane_own_run_can_attach' "$HMUT4LIB" && echo 0 || echo 1)"
 HM4_ERR="$(AP_VERDICT=inapplicable \
@@ -511,6 +549,54 @@ HM4_ERR="$(AP_VERDICT=inapplicable \
 HM4_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM4_ERR")"
 ck "(a11) against the mutant (a10)'s assertion is RED (ANY_WORKFLOW='$HM4_ANY' — a review-triggered lane widened on one failed read)" \
    "$([ "$HM4_ANY" = 1 ] && echo 0 || echo 1)"
+
+# ── (a15) A TRIGGER THIS CODE HAS NEVER HEARD OF IS NOT THEREBY INERT (round 8, P2) ──
+# The helper's attachable set used to be a DENY-list, so any trigger it had not enumerated
+# answered "cannot attach" — which WIDENS. `pull_request_review_comment` is the measured case:
+# `PR_TRIGGERS` is `{pull_request, pull_request_target}`
+# (scripts/ci-workflow-pr-evaluable.sh:106), so a review-comment-only lane is STRUCTURAL,
+# while the run's `head_sha` IS the PR head (`replicate/cog` run 42472266861 has
+# `head_sha 01fd5b9cfb` = PR #3216's head), so `gh run list --commit $head --workflow $lane`
+# CAN return it and the filtered wait is NOT inert. Under the allow-list it is kept WITHOUT
+# being enumerated — and that is the point: the next event GitHub ships needs no new arm.
+# Mutation (a7) is the falsifier: it treats an unclassified member as inert and widens THIS lane.
+echo "(a15) STRUCTURAL + 'pull_request_review_comment' (never enumerated) + UNREADABLE — KEEP"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: pull_request_review_comment)' unreadable
+ck "(a15) NO widening (ANY_WORKFLOW='$R_ANY', wf_args='$R_WFARGS') — its run's head_sha IS the PR head" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+ck "(a15) the certificate still names the requested lane (lane='$R_LANE')" \
+   "$([ "$R_LANE" = "python-ci.yml" ] && echo 0 || echo 1)"
+KEPT_A15="$(grep 'LANE KEPT' <<<"$R_ERR")"
+ck "(a15) it names the member it could not prove inert ('pull_request_review_comment')" \
+   "$(grep -q "declares 'pull_request_review_comment'" <<<"$KEPT_A15" && echo 0 || echo 1)"
+ck "(a15) it says the code cannot prove that member INERT, and that every member must be proven" \
+   "$(grep -q 'cannot prove INERT' <<<"$KEPT_A15" && grep -q 'EVERY declared member to be proven inert' <<<"$KEPT_A15" && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT CLASSIFY WHAT IT DID NOT CLASSIFY (round 8, P2). Offering the known
+# mechanisms for a value this code has never seen asserts how the run attaches — the
+# claim-without-a-measurement this block forbids. The tail states the consequence only.
+ck "(a15) ⛔ it names NO mechanism for the unclassified member (no assumed push / dispatch / review)" \
+   "$(if grep -q 'a push whose tip is' <<<"$KEPT_A15" || grep -q 'gh workflow run --ref' <<<"$KEPT_A15" || grep -q 'a submitted review of this PR' <<<"$KEPT_A15"; then echo 1; else echo 0; fi)"
+ck "(a15) ⛔ …and it does not claim the member CAN attach either ('has not measured that')" \
+   "$(grep -q 'has not measured that' <<<"$KEPT_A15" && echo 0 || echo 1)"
+ck "(a15) ⛔ it does NOT print 'LANE INAPPLICABLE' (the lane was KEPT, not dropped)" \
+   "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && echo 1 || echo 0)"
+
+# ── (a16) AN EMPTY CLAUSE IS ITS OWN GROUND, NOT "NO MEMBER IS CLASSIFIABLE" (round 8, P3) ──
+# `(declared triggers: )` is REACHABLE: `on: []` / `on: {}` reach the producer's inline path
+# as an empty set (`scripts/ci-workflow-pr-evaluable.sh:161-190`) and it emits the clause with
+# no member. The shape gate's `''` arm used to report `unclassifiable`, whose message says "at
+# least one member is not a plain lowercase 'on:' key" — false about a list with zero members.
+# Behaviour (keep) is unchanged and correct; the GROUND is what the message must name.
+echo "(a16) STRUCTURAL + an EMPTY clause '(declared triggers: )' + UNREADABLE — kept, own ground"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: )' unreadable
+ck "(a16) the filter is KEPT on an empty declaration (ANY_WORKFLOW='$R_ANY') — an empty set proves no member inert" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+ck "(a16) it says the list WAS READ and declares NO trigger at all" \
+   "$(grep -q 'WAS READ from the applicability reason' <<<"$R_ERR" && grep -q 'declares NO trigger at all' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a16) ⛔ it does NOT claim 'at least one member is not a plain lowercase' — there is no member" \
+   "$(grep -q 'at least one member is not a plain lowercase' <<<"$R_ERR" && echo 1 || echo 0)"
+ck "(a16) ⛔ …and it does NOT call the list unread ('could not be READ') — the code read it" \
+   "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 1 || echo 0)"
 
 # ── (a12) A MIXED LIST: "NO MEMBER IS CLASSIFIABLE" IS FALSE ABOUT THE MEMBER THAT IS ──
 # (round 7, P3) The shape gate is ALL-OR-NOTHING, so `push, push-to-fork` fails the whole
@@ -559,7 +645,7 @@ ck "(a14) against the mutant (a12)'s assertion is RED (the false 'no member' wor
 echo "(a13) MUTATION: the fail-closed default put back under 'Widen' → the (a0) placement pin is RED there"
 DMUT="$TMP/docstring-mutant.sh"
 awk '
-  /^#   \* BOTH hold — STRUCTURAL, and its .on:. names none of/ {
+  /^#   \* BOTH hold — STRUCTURAL, and EVERY declared .on:. member is a KNOWN-INERT/ {
     print
     print "#     (an absent or unclassifiable trigger list included: the fail-closed default)."
     n++; next
