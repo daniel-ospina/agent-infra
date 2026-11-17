@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-63 tests with 132 paired mutations: every mutation re-
+64 tests with 135 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 63 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (132)
+    python3 tools/fleet/liveness.test.py                # the 64 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (135)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3818,10 +3818,46 @@ def t62():
           "a host-free mutant adds no host note; got %r" % _miss_note(plain))
 
 
+@test("T63 every mutant run is BOUNDED: stdin is DEVNULL and the wait has a timeout")
+def t63():
+    # ⛔ THE HARNESS ITSELF WAS THE HANG (#4110 round 5). T61(5) deliberately reads the REAL stdin
+    # (that is how it proves the refusal happens BEFORE the read), so its paired mutant — the
+    # source-age gate deleted — reached `sys.stdin.read()` on whatever stdin the RUNNER inherited.
+    # CI handed it a non-tty (EOF ⇒ red); a terminal hands it a tty (blocks forever), and from a
+    # tty `--mutations` therefore could not produce the evidence this header and docs §8 quote.
+    # Both bounds are pinned here by BEHAVIOUR — a blocking fd 0 and a child that never exits — so
+    # the rows fail on what the harness DOES, not on how its source is spelled.
+    child = "import sys; sys.stdin.read(); print('PASS=0 FAIL=1'); sys.exit(1)"
+    r, w = os.pipe()               # an open pipe: read() blocks until EOF, which never arrives
+    saved = os.dup(0)
+    try:
+        os.dup2(r, 0)              # exactly what a tty (or a live pipe) hands a child
+        rc, body, timed_out = _run_mutant({}, argv=[sys.executable, "-c", child], timeout=10)
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+        os.close(r)
+        os.close(w)
+    check(not timed_out and rc == 1,
+          "a mutant that READS STDIN still finishes — it is given DEVNULL, so read() is EOF; "
+          "got rc=%r timed_out=%r" % (rc, timed_out))
+    check("PASS=0 FAIL=1" in body, "…and its own output still comes back; got %r" % body)
+
+    rc, body, timed_out = _run_mutant(
+        {}, argv=[sys.executable, "-c", "import time; time.sleep(8)"], timeout=1)
+    check(timed_out and rc is None,
+          "a mutant that never EXITS is REPORTED as a timeout instead of waited for; "
+          "got rc=%r timed_out=%r" % (rc, timed_out))
+    check(_mutation_caught(None, "PASS=0 FAIL=1\n", True) is False,
+          "…and a timed-out run is NEVER counted as caught, however red its partial output looks")
+    check(_mutation_caught(1, "PASS=0 FAIL=1\n", False) is True,
+          "…while a completed RED run still is — the bound must not eat real catches")
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why, requires=""):
         self.test_name = test_name
-        self.target = target          # "module" | "lib"
+        self.target = target          # "module" | "lib" | "harness" (a guard in THIS file)
         self.old = old
         self.new = new
         self.why = why
@@ -3835,6 +3871,33 @@ class Mutation:
 
 
 MUTATIONS = [
+    # ⛔ A `harness` ANCHOR IS WRITTEN AS TWO ADJACENT LITERALS ON PURPOSE. A harness mutant's
+    # anchor lives in THIS file, so a single literal would also match itself in this table: the
+    # uniqueness check would see two hits and refuse to run. Do not "tidy" these into one string.
+    Mutation(
+        "T63", "harness",
+        '            stdin=subprocess.' + 'DEVNULL,',
+        '            stdin=None,',
+        "the mutant child inherits the CALLER's stdin again, so a mutant that reaches a READ "
+        "(T61(5)'s pipe row, on the child's own fd 0) blocks forever on a tty: neither RED nor "
+        "MISSED, and `--mutations` never returns — measured at the pre-fix head, 20s in "
+        "`sys.stdin.read()` with no exit",
+    ),
+    Mutation(
+        "T63", "harness",
+        '            timeout=' + 'bound,',
+        '            timeout=None,',
+        "the wait loses its bound, so a mutant that never exits hangs the whole run instead of "
+        "being REPORTED as a timeout — the failure the other half of this pair only bounds, not "
+        "fixes",
+    ),
+    Mutation(
+        "T63", "harness",
+        '    return (not timed_out)' + ' and _mutation_verdict(returncode, body)',
+        '    return _mutation_verdict(returncode, body)',
+        "a timed-out run is scored on its partial output, so a hang whose truncated `PASS=0 "
+        "FAIL=1` survived in the pipe reads as CAUGHT — a catch nobody observed",
+    ),
     Mutation(
         "T58", "module",
         '        if len(hb.samples) < 2:',
@@ -4896,6 +4959,23 @@ def run_tests(only=None):
 
 def _mutated_env(mut):
     tmp = tempfile.mkdtemp(prefix="liv-mutant-")
+    if mut.target == "harness":
+        # ⛔ THE HARNESS IS CODE TOO (#4110 round 5). A mutant that reverts a guard living in THIS
+        # file cannot be expressed against the module, so the copy is of the suite itself. The
+        # copy's own `HERE`/`MODULE_PATH` point at the temp dir, so both are handed in explicitly:
+        # `LIVENESS_MODULE` is read first by `_load_module`, and `PI_PID_IDENTITY_LIB` is
+        # `setdefault`ed below — an explicit value wins over the copy's derived path.
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+            src = fh.read()
+        if src.count(mut.old) != 1:
+            raise SystemExit("mutation anchor not unique in %s (%d hits):\n%s"
+                             % (os.path.abspath(__file__), src.count(mut.old), mut.old))
+        out = os.path.join(tmp, "liveness.test.py")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(src.replace(mut.old, mut.new, 1))
+        env = {"LIVENESS_MODULE": MODULE_PATH, "PI_PID_IDENTITY_LIB": LIB_PATH,
+               "LIVENESS_ONLY": mut.test_name}
+        return tmp, out, env
     if mut.target == "lib":
         with open(LIB_PATH, "r", encoding="utf-8") as fh:
             src = fh.read()
@@ -4920,6 +5000,44 @@ def _mutated_env(mut):
         env = {"LIVENESS_MODULE": out, "PI_PID_IDENTITY_LIB": LIB_PATH,
                "LIVENESS_ONLY": mut.test_name}
     return tmp, out, env
+
+
+# ⛔ ONE MUTANT'S RUN IS BOUNDED, because a mutant can reach a READ (#4110 round 5). T61(5)
+# calls `gather_heartbeat("-")` on the REAL stdin — that is how the row proves the refusal happens
+# BEFORE the read — so its paired mutant (the source-age gate deleted) reaches `sys.stdin.read()`.
+# A child spawned without `stdin=` inherits the CALLER's stdin, so from a tty or a live pipe that
+# read never returns: the mutant is neither RED nor MISSED, `--mutations` never finishes, and the
+# one command this header and docs §8 both print could not produce its own evidence locally. CI
+# passed only because the runner hands the step a non-tty stdin, which reads EOF. DEVNULL makes
+# the read an EOF for every future mutant; the timeout turns "hang" into a REPORTED outcome (PIT
+# scores a timeout, it does not wait for one) instead of a silent wait.
+MUTATION_TIMEOUT_S = 60
+
+
+def _run_mutant(env, argv=None, timeout=None):
+    """Run ONE mutant's paired test; return ``(returncode, body, timed_out)``.
+
+    ``returncode`` is ``None`` when the wait was CUT OFF — a timed-out run has no exit status, and
+    it must not be read as one (see :func:`_mutation_caught`).
+    """
+    argv = [sys.executable, os.path.abspath(__file__)] if argv is None else list(argv)
+    bound = MUTATION_TIMEOUT_S if timeout is None else timeout
+    try:
+        proc = subprocess.run(
+            argv,
+            env=dict(os.environ, **env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return None, (exc.stdout or b"").decode("utf-8", "replace"), True
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), False
+
+
+def _mutation_caught(returncode, body: str, timed_out) -> bool:
+    """Is this mutant CAUGHT? Only a COMPLETED run can be — a hang is not a catch."""
+    return (not timed_out) and _mutation_verdict(returncode, body)
 
 
 def _mutation_verdict(returncode: int, body: str) -> bool:
@@ -4974,23 +5092,23 @@ def run_mutations():
     for mut in MUTATIONS:
         tmp, out, env = _mutated_env(mut)
         try:
-            proc = subprocess.run(
-                [sys.executable, os.path.abspath(__file__)],
-                env=dict(os.environ, **env),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            body = proc.stdout.decode("utf-8", "replace")
+            rc, body, timed_out = _run_mutant(
+                env, argv=[sys.executable, out if mut.target == "harness"
+                           else os.path.abspath(__file__)])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        red = _mutation_verdict(proc.returncode, body)
+        red = _mutation_caught(rc, body, timed_out)
         print("── %s mutation → %s ───────────────────────────────────────" % (mut.test_name, mut.why))
         for line in body.splitlines():
             print("   | %s" % line)
         if red:
-            print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % proc.returncode)
+            print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % rc)
         else:
             bad += 1
-            if "PASS=0" in body and "FAIL=0" in body:
+            if timed_out:
+                print("   ⚠️  TIMED OUT after %ds — the paired test never finished, so this "
+                      "mutant caught NOTHING (a hang is not a catch)\n" % MUTATION_TIMEOUT_S)
+            elif "PASS=0" in body and "FAIL=0" in body:
                 print("   ❌ NOT RUN — no test matched `%s`; this mutation verified NOTHING\n"
                       % mut.test_name)
             else:

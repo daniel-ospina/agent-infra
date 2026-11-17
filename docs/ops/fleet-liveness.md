@@ -933,8 +933,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 63 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (132)
+python3 tools/fleet/liveness.test.py               # 64 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (135)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -951,6 +951,18 @@ asserting that pid 1 gets **no** number, which only a host whose `ps` answers in
 Linux shape can distinguish — so its miss on macOS is a fact about macOS, and it now prints that
 requirement instead of implicating the code (T62 pins both halves). Two readings of the same bytes
 were argued as a contradiction about the code once already; the host in the line is what stops it.
+
+⛔ **EVERY MUTANT RUN IS BOUNDED — stdin is `/dev/null` and the wait has a timeout, because a
+mutant can reach a READ** (#4110 round 5). `T61(5)` deliberately calls `gather_heartbeat("-")` on
+the real stdin (that is how the row proves the refusal happens *before* the read), so its paired
+mutant — the source-age gate deleted — reaches `sys.stdin.read()`. A child spawned without `stdin=`
+inherits the CALLER's stdin, so on a tty (or any live pipe) that read never returns: the mutant is
+neither RED nor MISSED, `--mutations` never finishes, and the command above cannot produce its own
+evidence locally. CI passed only because the runner hands the step a non-tty stdin, which reads EOF.
+`_run_mutant()` now passes `stdin=subprocess.DEVNULL` and `timeout=MUTATION_TIMEOUT_S` (60 s), and a
+run cut off by that bound prints `⚠️ TIMED OUT` and counts as **not** caught — a hang is not a
+catch. `T63` pins both halves by BEHAVIOUR (a blocking fd 0, and a child that never exits), and
+three `harness` mutants revert each half, so the guarantee is mutation-proven like the rest.
 
 The last suite is also the only place the fence default is pinned against
 `scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
