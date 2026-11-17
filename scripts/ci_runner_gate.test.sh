@@ -2897,6 +2897,12 @@ assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UN
 # true there — which is why this is pinned arm by arm and not as a file-wide grep.
 assert_not_contains "$OUT" "leaving mode=" \
   "(d6) the terminal line does not publish the PRE-write mode after a repair that partly landed"
+# ⛔ AND THE SHARED CLOSING SENTENCE MAY NOT BE USED ON THIS ARM EITHER (review: unpinned, measured):
+# "pool converged to the recorded mode=… where it differed" names a convergence that did not happen, and the
+# comment above the arm names it as the defect fixed — but the assertion above pins only the OTHER phrasing.
+# A mutant restoring the shared sentence on this arm left the suite green until this line existed.
+assert_not_contains "$OUT" "pool converged to the recorded mode" \
+  "(d6) …and does not fall back to the shared 'pool converged … where it differed' sentence"
 
 # (d7) A FAILED LABEL READ MUST NOT REPLACE THE CENSUS'S CAPABILITY IN THE VERDICT (review P2, measured).
 # `$CAPABILITY` is a global that `set_labels` overwrites when ITS read fails, and the repair runs BETWEEN the

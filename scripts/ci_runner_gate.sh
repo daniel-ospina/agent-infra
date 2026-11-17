@@ -1066,11 +1066,13 @@ print(comp, len(inc))
     # window never reached the runs behind the ghosts — it would book the WHOLE tail as demand, which
     # is a number this read never measured. Empty is rendered `unmeasured` on every surface and is
     # excluded from every numeric test below, so it cannot be read as 0 and cannot be read as demand.
-    # ⛔ AND IT MUST BE CLEARED, NOT MERELY SKIPPED (measured while writing this): the declaration at
-    # the top of `evaluate` seeds `queued_demanding=${queued:-0}` — and `queued` is not parsed yet at
-    # that point, so a skipped assignment leaves the seed `0` in place and the probe line publishes
-    # `queued_demanding=0` for a queue nobody measured. That is literally "the refusal read as no
-    # demand", the one thing #2344/#3995 forbid; arm (d1) reddens on it.
+    # ⛔ AND IT MUST BE CLEARED, NOT MERELY SKIPPED (measured while writing this, and again under
+    # review — the mechanism is NOT the seed): leaving the assignment to the `else` would leave
+    # `queued_demanding` as the value the queue parse RE-SEEDS (`:951`), i.e. the RAW depth, so a pass
+    # whose scan window never reached the runs behind the ghosts would publish the WHOLE tail as
+    # demand and the LENGTH LEG would arm the pool on it. That is the fail-open direction — the refusal
+    # read as demand, the one thing #2344/#3995 forbid — and it is why the clear is explicit. Arm (d1)
+    # reddens on it.
     if [ "$DEMAND_BLIND" = 0 ]; then queued_demanding=$((queued - QUEUE_GHOSTS)); else queued_demanding=""; fi
     fi
   fi
@@ -1991,7 +1993,7 @@ if [ "$healthy" = 3 ]; then
     # So the durable line may not say the labels are unchanged, and it may not say the pool still
     # advertises `$mode` either — the pass measured `$mode` BEFORE the write. It names what it knows:
     # the write did not complete, and the recorded mode is NOT confirmed.
-    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (see the set_labels lines above: the ok=/fail= count when runners were written, 'no labels changed' when the enumeration refused, 'fallback arm resolved EMPTY' when the engage arm carried nothing), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
+    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (see the set_labels lines above: the ok=/fail= count when runners were written, 'no labels changed' when the enumeration refused, 'fallback arm resolved EMPTY' when the engage arm carried nothing), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision"
     write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see the set_labels lines in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
