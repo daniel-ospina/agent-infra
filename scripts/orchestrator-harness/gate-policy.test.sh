@@ -360,16 +360,19 @@ fi
 # still print PASS.
 echo
 echo "== unit declarations (#4002) =="
+# ⛔ DECLARATIONS THAT LIVE *OUTSIDE* `templates/` ARE SHIPPED DECLARATIONS TOO (fresh code review of PR
+# #4020 at `4f9ff9b3e`, P2). The root set used to be `templates/` only, so
+# `scripts/orchestrator-harness/launchd.plist.template` — which `install.sh` renders into
+# `~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`, an `EnvironmentVariables` dict whose own
+# comment says "a pin placed here reaches every lane on the box" — was graded by NOTHING while the header
+# claimed every shipped declaration was. The sweep below is tree-wide (depth 2, which is where this repo's
+# declarations live) rather than a hand-listed file, so the NEXT one is graded without anyone remembering
+# to extend a list. ⛔ THE COMMENT LIVES OUT HERE, NOT INSIDE THE SUBSTITUTION: a `(` or an unbalanced
+# quote inside a `$( … )` body desynchronises the bash 3.2 scanner and the file stops parsing on the
+# platform the harness actually runs (`scripts/check-bash32-parse.sh`, #2930) — measured on this very
+# block, which is why it reads as prose above the assignment.
 DECL_LIST="$( { ls "$REPO"/templates/systemd/*.service "$REPO"/templates/systemd/*.timer 2>/dev/null
                find "$REPO/templates/launchd" -name '*.plist' -type f 2>/dev/null
-               # ⛔ DECLARATIONS THAT LIVE *OUTSIDE* `templates/` ARE SHIPPED DECLARATIONS TOO (fresh code
-               # review of PR #4020 at `4f9ff9b3e`, P2). The root set used to be `templates/` only, so
-               # `scripts/orchestrator-harness/launchd.plist.template` — which `install.sh` renders into
-               # `~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`, an `EnvironmentVariables`
-               # dict whose own comment says "a pin placed here reaches every lane on the box" — was graded
-               # by NOTHING while the header claimed every shipped declaration was. A tree-wide sweep (
-               # depth 2, which is where this repo's declarations live) rather than a hand-listed file, so
-               # the NEXT one is graded without anyone remembering to extend a list.
                find "$REPO/scripts" -maxdepth 2 -type f \
                     \( -name '*.plist' -o -name '*.plist.template' -o -name '*.service' -o -name '*.timer' \) 2>/dev/null; } | LC_ALL=C sort )"
 DECL_SEEN=0; DECL_VETOED=""; DECL_SEEN_REL=""
@@ -860,7 +863,12 @@ DERIVED_N="$(grep -c . <<<"$DERIVED")"
 # a vocabulary that does not admit `STATE_MACHINE` — and each has its own mutant (drop `*/*.ts` from the glob;
 # drop `|STATE_MACHINE` from the vocabulary). Without these, the round-10 failure mode recurs silently: BOTH
 # sides lose the same two names and the equality passes EXACTLY over a set that is not the gates' set.
-if printf '%s\n' $FILES | grep -q '/extensions/shared/kill-switch\.ts$'; then
+# ⛔ NO `printf … | grep -q` HERE (#841/#864). The guard flags the SHAPE, and it is right to: under
+# `pipefail` a producer killed by SIGPIPE makes a PRESENT match read as ABSENT, so the one arm that proves
+# the scan set reaches `extensions/shared/kill-switch.ts` could go permanently green for the wrong reason.
+# A here-string carries the same list with no pipe to break. (Pre-existing on this branch and reddening
+# `sigpipe-grep` before this fix; the guard is the arbiter, and it names this line.)
+if grep -q '/extensions/shared/kill-switch\.ts$' <<<"$(printf '%s\n' $FILES)"; then
   ok "(5f) scan set: the file whose PARAMETERISED env read carries the kill switch (extensions/shared/kill-switch.ts) is IN the graded set — the glob reaches extensions/shared/"
 else
   bad "(5f) scan set: extensions/shared/kill-switch.ts is NOT in the graded set — the glob reads $(printf '%s\n' $FILES | grep -c .) files but not the one the third read form lives in, so a hatch there is invisible while this arm prints PASS"
