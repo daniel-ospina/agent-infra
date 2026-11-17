@@ -934,7 +934,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 62 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (126)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (129)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -2193,11 +2193,24 @@ each of the three was measured producing a wrong state before it was gated:
 | its **mtime age** is past the watchdog's own heartbeat bound (`HEARTBEAT_TIMEOUT_MS`, 30 min) | `unknown` / `heartbeat-stale` | `running-quiet` rc 0 from a **29-day-old** log of a long-gone child — a reading of something that stopped emitting |
 | it carries markers from **several** `nonce=` values and the caller named none | `unknown` / `heartbeat-ambiguous-nonce` | one appended `nonce=FORGED … tool_age_max_ms=0` line flipping `wedged` → `running-quiet` (a forged life sign on the child's inherited fd 2 — the case `task-heartbeat.ts` puts the nonce there for) |
 
-`--nonce <n>` is that fence, honoured rather than re-invented: markers for any other dispatch are
-**dropped**, not read. A source of one dispatch's markers needs no nonce (the common case), and the
-`task_status` JSON / `Alive state:` line are not fenced by it — the parent produced those and had
-already applied its own check. A nonce that matches nothing is `heartbeat-unreadable`, never an
-empty read.
+**Every read also needs an AGE, or it does not decide.** A file's age is its mtime;
+`--source-age-ms` overrides it (a log **copied** off a cell has the copy's mtime, not the child's
+last emission), and a **pipe** has no mtime at all — so `--heartbeat -` requires `--source-age-ms`
+and is an abstention naming the flag without it. An unknown age used to skip the gate silently,
+which is how a 29-day-old log piped in published `running-quiet` rc 0.
+
+`--nonce <n>` is that fence, honoured rather than re-invented: **every** line is fenced once a
+nonce is given, not only marker-shaped ones — the capture log is raw stdout+stderr
+(`extensions/shared/task-runs.ts:83`), so a `task_status`-shaped line is exactly what a forged
+append would look like (measured: `samples=18000000,18010000,3,4`, `running-quiet` rc 0). Without
+`--nonce` the source is **unfenced** and trusted — which is right for a log you own and wrong for a
+file another writer can append to, so pass the nonce whenever that is possible. A nonce that matches
+nothing is `heartbeat-unreadable`, never an empty read.
+
+The end marker is recognised only as a LINE that **is** the marker
+(`^[task-heartbeat] session_end`), because the same log carries the child's raw stdout: a child that
+prints the words (a child editing `extensions/task-heartbeat.ts`, a child quoting this document) must
+not abstain its own diagnosis.
 
 The bound is **cited, not invented**: `tool_stall_ms()` (the watchdog's `tool-stall` age backstop,
 4 h at the 6 h cap; `tool_veto_expired`), compared with the same strict `>`. Both pairs in the
@@ -2212,14 +2225,22 @@ ever be `tool-age-single-sample`. A pair that genuinely sits open under the back
 python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052
 python3 tools/fleet/liveness.py --tool-age-ms 6961576          # rc 3: tool-age-single-sample
 
-# …or point it at the child's own log / a `task_status` dump. ONE pattern reads the three shapes
-# the fleet really writes: the `[task-heartbeat] tick … tool_age_max_ms=` marker, the
-# `task_status` JSON ("tool_age_max_ms": N), and the watchdog's `Alive state: … toolAgeMaxMs=`.
+# …or point it at the child's own log. ONE pattern reads the three shapes the fleet really writes:
+# the `[task-heartbeat] tick … tool_age_max_ms=` marker, the `task_status` JSON
+# ("tool_age_max_ms": N), and the watchdog's `Alive state: … toolAgeMaxMs=`.
 python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
-python3 tools/fleet/liveness.py --heartbeat-json status.json     # accepted alias of --heartbeat
 
-# …and, when the source may carry more than one dispatch's markers, the fleet's own fence:
+# ⛔ ONE `task_status` DUMP IS ONE SAMPLE, so a single view CANNOT answer (§15's table, row 5):
+#    it reads `unknown tool-age-single-sample`, rc 3. Two polls in one file do.
+cat status1.json status2.json > both.json
+python3 tools/fleet/liveness.py --heartbeat both.json
+
+# …and, when the source may carry more than one dispatch's markers, the fleet's own fence. Given a
+# nonce, a line that cannot show it is DROPPED — marker-shaped or not.
 python3 tools/fleet/liveness.py --heartbeat <run_id>.log --nonce <TASK_HEARTBEAT_NONCE>
+
+# A PIPE has no mtime, so it must be told its age (`--heartbeat-json` is an accepted alias):
+cat <run_id>.log | python3 tools/fleet/liveness.py --heartbeat - --source-age-ms 12000
 ```
 
 A **two-axis query is a usage error (rc `2`)**, not an abstention: `--sid` together with a heartbeat

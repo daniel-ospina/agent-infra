@@ -2407,23 +2407,65 @@ def _heartbeat_nonce_re():
     global _HEARTBEAT_NONCE_RE
     if _HEARTBEAT_NONCE_RE is None:
         import re as _re
-        _HEARTBEAT_NONCE_RE = _re.compile(r"\bnonce=([^\s\"']+)")
+        _HEARTBEAT_NONCE_RE = _re.compile(r"\bnonce=([^\s\"',}]+)")
     return _HEARTBEAT_NONCE_RE
 
 
 def _heartbeat_ended_re():
-    """POSITIVE terminal evidence of the RUN, in the shapes the fleet really writes.
+    """POSITIVE terminal evidence of the RUN, and nothing else.
 
-    The child's own end marker (`[task-heartbeat] session_end …`, ``task-heartbeat.ts:35``) and the
-    two terminal facts `task_status` publishes (``"session_ended": true``, ``"alive": false``). An
-    age read out of a finished run is HISTORY: it must never become a live state.
+    The child's own end marker — matched as a LINE that IS the marker
+    (``^[task-heartbeat] session_end``), because the source is the run's CAPTURE LOG, i.e. raw
+    stdout+stderr (``extensions/shared/task-runs.ts:83``). A child that merely PRINTS the token —
+    its own output, a quoted marker, a child editing `extensions/task-heartbeat.ts` — must not
+    abstain its own diagnosis, and without the line anchor any line containing the words did. The
+    two `task_status` facts are matched as the JSON pairs they are, with `true`/`false` required:
+    `"session_ended": false` is a LIVE run and must not read as ended.
     """
     global _HEARTBEAT_ENDED_RE
     if _HEARTBEAT_ENDED_RE is None:
         import re as _re
         _HEARTBEAT_ENDED_RE = _re.compile(
-            r"session_end\b|\"session_ended\"\s*:\s*true|\"alive\"\s*:\s*false")
+            r"^\s*\[task-heartbeat\]\s+session_end\b"
+            r"|\"session_ended\"\s*:\s*true|\"alive\"\s*:\s*false")
     return _HEARTBEAT_ENDED_RE
+
+
+def _scan_heartbeat(text: str, nonce: str = ""):
+    """One pass over ``text``: ``(samples, ended, nonces)``.
+
+    ⛔ THE NONCE FENCE APPLIES TO EVERY LINE ONCE IT IS GIVEN. Filtering only `[task-heartbeat]`
+    lines left the `task_status`-shaped lines unfenced, and the run's capture log is raw
+    stdout+stderr (`extensions/shared/task-runs.ts:83`) — so an appendable file accepted a forged
+    `{"tools_in_flight": 0, "tool_age_max_ms": 3}` line and flipped `wedged` → `running-quiet`
+    THROUGH the fence. With a nonce named, a line that cannot show it is not this dispatch's.
+    Without one, the source is unfenced and the whole read is trusted; `--nonce` is how a caller
+    says "this file is appendable by another writer".
+    """
+    if not text:
+        return [], False, ()
+    age_rx = _heartbeat_tool_age_re()
+    if_rx = _heartbeat_in_flight_re()
+    nonce_rx = _heartbeat_nonce_re()
+    ended_rx = _heartbeat_ended_re()
+    samples: List[HeartbeatSample] = []
+    nonces: List[str] = []
+    ended = False
+    for line in text.splitlines():
+        got = nonce_rx.search(line)
+        if got is not None and got.group(1) not in nonces:
+            nonces.append(got.group(1))
+        if nonce and (got is None or got.group(1) != nonce):
+            continue
+        if ended_rx.search(line) is not None:
+            ended = True
+        m = age_rx.search(line)
+        if m is None:
+            continue
+        n = if_rx.search(line)
+        samples.append(HeartbeatSample(age_ms=int(m.group(1)),
+                                       in_flight=(int(n.group(1)) > 0) if n else None))
+    return samples, ended, tuple(nonces)
 
 
 def parse_heartbeat_samples(text: str, *, nonce: str = "") -> List[HeartbeatSample]:
@@ -2439,84 +2481,48 @@ def parse_heartbeat_samples(text: str, *, nonce: str = "") -> List[HeartbeatSamp
     Parsing is ACQUISITION, never a verdict: this returns readings and nothing else, and
     :func:`evaluate` decides what TWO of them mean. Order is preserved because the last pair is
     the decision — sorting or de-duplicating here would destroy the only signal the axis has.
-
-    ``nonce`` is the fleet's OWN fence, honoured where it exists rather than re-invented:
-    ``extensions/task-heartbeat.ts`` puts the per-dispatch nonce on every marker because "MCP
-    servers inherit the child's fd 2 and could otherwise inject forged life signs", and the parent
-    rejects markers without the matching nonce. A ``[task-heartbeat]`` line whose ``nonce=`` does
-    not match is therefore DROPPED, not read. A line that is not a marker (the `task_status` JSON,
-    the `Alive state:` diagnostic) carries no nonce and is not fenced by it — that view is produced
-    by the parent, which already applied the fence.
     """
-    if not text:
-        return []
-    age_rx = _heartbeat_tool_age_re()
-    if_rx = _heartbeat_in_flight_re()
-    nonce_rx = _heartbeat_nonce_re()
-    out: List[HeartbeatSample] = []
-    for line in text.splitlines():
-        if nonce and "[task-heartbeat]" in line:
-            m = nonce_rx.search(line)
-            if m is None or m.group(1) != nonce:
-                continue
-        m = age_rx.search(line)
-        if m is None:
-            continue
-        n = if_rx.search(line)
-        out.append(HeartbeatSample(age_ms=int(m.group(1)),
-                                   in_flight=(int(n.group(1)) > 0) if n else None))
-    return out
-
-
-def _heartbeat_nonces(text: str) -> Tuple[str, ...]:
-    """Every DISTINCT `nonce=` value on a marker line, in first-seen order."""
-    rx = _heartbeat_nonce_re()
-    seen: List[str] = []
-    for line in text.splitlines():
-        if "[task-heartbeat]" not in line:
-            continue
-        m = rx.search(line)
-        if m is not None and m.group(1) not in seen:
-            seen.append(m.group(1))
-    return tuple(seen)
+    return _scan_heartbeat(text, nonce)[0]
 
 
 def heartbeat_from_text(text: str, source: str = "", *, nonce: str = "",
                         age_ms: Optional[int] = None) -> HeartbeatRead:
     """Build a :class:`HeartbeatRead` from text ALREADY in hand (a file, stdin, a fixture)."""
-    samples = tuple(parse_heartbeat_samples(text, nonce=nonce))
-    ended = _heartbeat_ended_re().search(text) is not None
-    nonces = _heartbeat_nonces(text)
+    samples, ended, nonces = _scan_heartbeat(text, nonce)
     if not samples:
         why = "no tool_age_max token"
         if nonce:
             why += " for nonce=%s" % nonce
         return HeartbeatRead(readable=False, source=source, age_ms=age_ms,
                              detail="%s in %s" % (why, source or "the source"))
-    return HeartbeatRead(readable=True, samples=samples, source=source,
+    return HeartbeatRead(readable=True, samples=tuple(samples), source=source,
                          age_ms=age_ms, ended=ended, nonces=nonces, fenced_nonce=nonce)
 
 
-def gather_heartbeat(path: str, *, nonce: str = "", now_ms: Optional[int] = None) -> HeartbeatRead:
+def gather_heartbeat(path: str, *, nonce: str = "", source_age_ms: Optional[int] = None,
+                     now_ms: Optional[int] = None) -> HeartbeatRead:
     """Read ``path`` (``-`` = stdin) into a :class:`HeartbeatRead` — acquisition only.
 
     A file that cannot be opened, or that carries no `tool_age` token at all, is
     ``readable=False`` — an ABSTENTION. Never ``0 ms``: an absent reading is not a reading of
     zero, and the whole axis exists to stop verdicts being inferred from silence.
 
-    For a FILE source the mtime age is carried too (``None`` for stdin: a pipe has no age this door
-    may honestly claim). A source older than the watchdog's own heartbeat bound is stale and
-    :func:`evaluate` abstains on it — a days-old log of a long-gone child must not publish a live
-    state, the same rule the log axis states for ``LogRead.age_ms``.
+    ⛔ EVERY READ CARRIES AN AGE, OR IT DOES NOT DECIDE. A FILE source's age is its mtime, and
+    ``source_age_ms`` lets a caller override it (a log COPIED off a cell has the copy's mtime, not
+    the child's last emission). A PIPE has no age at all, so ``--heartbeat -`` requires
+    ``source_age_ms`` and is a usage error without one: an unknown age silently skipped the
+    staleness gate, which published `running-quiet` rc 0 for a 29-day-old log piped in.
     """
-    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     if path == "-":
+        if source_age_ms is None:
+            return HeartbeatRead(readable=False, source="stdin",
+                                 detail="a pipe carries no source age; state --source-age-ms")
         try:
             text = sys.stdin.read()
         except (OSError, ValueError) as exc:
             return HeartbeatRead(readable=False, source="stdin",
                                  detail="unreadable:stdin (%s)" % exc.__class__.__name__)
-        return heartbeat_from_text(text, source="stdin", nonce=nonce)
+        return heartbeat_from_text(text, source="stdin", nonce=nonce, age_ms=source_age_ms)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -2524,9 +2530,13 @@ def gather_heartbeat(path: str, *, nonce: str = "", now_ms: Optional[int] = None
     except (OSError, ValueError) as exc:
         return HeartbeatRead(readable=False, source=path,
                              detail="unreadable:%s (%s)" % (path, exc.__class__.__name__))
-    # A future mtime (clock skew, a touch) clamps to 0 — the direction `tool_from_jsonl` already
-    # takes on a future-dated entry stamp: a skew must not manufacture a stale read either.
-    age = max(0, now - int(st.st_mtime * 1000))
+    if source_age_ms is not None:
+        age = max(0, int(source_age_ms))
+    else:
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        # A future mtime (clock skew, a touch) clamps to 0 — the direction `tool_from_jsonl`
+        # already takes on a future-dated entry stamp: a skew must not manufacture a stale read.
+        age = max(0, now - int(st.st_mtime * 1000))
     return heartbeat_from_text(text, source=path, nonce=nonce, age_ms=age)
 
 
@@ -4023,7 +4033,8 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
 
 def _usage() -> str:
     return ("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
-            "       liveness.py --heartbeat FILE|- [--nonce N] [--json]   (| --tool-age-ms N repeated)\n"
+            "       liveness.py --heartbeat FILE|- [--nonce N] [--source-age-ms N] [--json]\n"
+            "                                        (| --tool-age-ms N repeated)\n"
             "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
             "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
             "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]")
@@ -4040,6 +4051,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tool_ages: List[int] = []
     heartbeat_path: Optional[str] = None
     heartbeat_nonce = ""
+    source_age_ms: Optional[int] = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -4077,6 +4089,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # child's inherited fd 2 could otherwise flip a `wedged` child to `running-quiet`.
         if arg == "--nonce" and i + 1 < len(argv):
             heartbeat_nonce = argv[i + 1]; i += 2; continue
+        # The SOURCE's own age, for the two cases a file mtime cannot answer for: a pipe (no
+        # mtime at all, so `--heartbeat -` refuses without this) and a log COPIED off another box
+        # (whose mtime is the copy's, not the child's last emission).
+        if arg == "--source-age-ms" and i + 1 < len(argv):
+            try:
+                source_age_ms = int(argv[i + 1])
+            except ValueError:
+                print("liveness.py: --source-age-ms must be an integer (milliseconds)",
+                      file=sys.stderr)
+                return 2
+            if source_age_ms < 0:
+                print("liveness.py: --source-age-ms must be >= 0", file=sys.stderr)
+                return 2
+            i += 2; continue
         print(_usage(), file=sys.stderr)
         return 2
 
@@ -4103,7 +4129,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "--sid (ask the session question separately)", file=sys.stderr)
         return 2
     if heartbeat_path is not None or tool_ages:
-        hb = (gather_heartbeat(heartbeat_path, nonce=heartbeat_nonce)
+        hb = (gather_heartbeat(heartbeat_path, nonce=heartbeat_nonce,
+                               source_age_ms=source_age_ms)
               if heartbeat_path is not None
               else HeartbeatRead(readable=True, source="flag",
                                  samples=tuple(HeartbeatSample(age_ms=a) for a in tool_ages)))

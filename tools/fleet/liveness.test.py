@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-62 tests with 126 paired mutations: every mutation re-
+62 tests with 129 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 62 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (126)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (129)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3671,6 +3671,66 @@ def t61():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # (3) THE FENCE APPLIES TO EVERY LINE ONCE IT IS GIVEN — not only to `[task-heartbeat]` ones.
+    #     The capture log is raw stdout+stderr (`extensions/shared/task-runs.ts:83`), so an
+    #     appendable file accepted a forged `task_status`-shaped line THROUGH the fence and flipped
+    #     `wedged` -> `running-quiet`. Measured before the fix:
+    #     `--heartbeat forged.log --nonce abc` printed `running-quiet tool-age-no-call-open
+    #     samples=18000000,18010000,3,4` rc 0 for a child whose own markers said `wedged`.
+    forged = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+              "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+              '{"status": "alive", "heartbeat": {"tools_in_flight": 0, "tool_age_max_ms": 3}}\n'
+              '{"status": "alive", "heartbeat": {"tools_in_flight": 0, "tool_age_max_ms": 4}}\n')
+    v = ev_text(forged, nonce="abc")
+    check(v.state == "wedged",
+          "a line that cannot show the dispatch's nonce is not its evidence; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+
+    # (4) A CHILD'S OWN OUTPUT IS NOT ITS END MARKER. The source is the capture log (raw stdout), so
+    #     a child that PRINTS the token — editing `task-heartbeat.ts`, quoting this doc — must not
+    #     abstain its own diagnosis. The marker is recognised only as a LINE that IS the marker.
+    prose = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+             "the marker is spelled [task-heartbeat] session_end nonce=abc\n")
+    v = ev_text(prose)
+    check(v.state == "wedged", "quoted prose must not read as an end marker; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    # …and another DISPATCH's end marker is fenced out with it, instead of poisoning the query.
+    other_end = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                 "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                 "[task-heartbeat] session_end nonce=OTHER\n")
+    check(ev_text(other_end, nonce="abc").state == "wedged",
+          "a fenced-out dispatch's session_end is dropped, not read")
+    check(ev_text(other_end).reason == "heartbeat-session-ended",
+          "…while the unfenced read still sees it and abstains")
+
+    # (5) A PIPE HAS NO AGE, SO IT MUST BE STATED. An unknown age silently skipped the staleness
+    #     gate, and `cat old.log | liveness.py --heartbeat -` published `running-quiet` rc 0 for a
+    #     29-day-old log. `--source-age-ms` is the caller's statement (it also covers a log COPIED
+    #     off another box, whose mtime is the copy's, not the child's last emission).
+    piped = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=6961576\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18052\n")
+
+    def through_pipe(text, **kw):
+        real, sys.stdin = sys.stdin, io.StringIO(text)
+        try:
+            return liv.gather_heartbeat("-", **kw)
+        finally:
+            sys.stdin = real
+
+    hb = through_pipe(piped, source_age_ms=29 * 24 * 3600 * 1000)
+    check(hb.readable, "a stated age is enough for a pipe")
+    v = liv.evaluate(liv.Evidence(heartbeat=hb))
+    check(v.state == "unknown" and v.reason == "heartbeat-stale",
+          "a pipe with a stated stale age abstains; got %s/%s" % (v.state, v.reason))
+    hb = through_pipe(piped, source_age_ms=0)
+    fresh = liv.evaluate(liv.Evidence(heartbeat=hb))
+    check(fresh.reason == "tool-age-reset",
+          "a fresh stated age decides; got %s/%s" % (fresh.state, fresh.reason))
+    hb = liv.gather_heartbeat("-")
+    check(not hb.readable and "--source-age-ms" in hb.detail,
+          "a pipe with NO stated age is an abstention naming the flag; got %r" % hb.detail)
+
     # (3) THE FENCE, two ways: named nonce filters; several nonces abstain.
     mixed = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
              "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
@@ -3768,6 +3828,28 @@ MUTATIONS = [
         "the source's own in-flight count stops deciding, so a STALE `toolAgeMaxMs` (`tools=0`, the "
         "value the parent deliberately does not reset at `tool_end`) reads as an open call and "
         "convicts — the false-`wedged` class #4106 exists to remove",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if nonce and (got is None or got.group(1) != nonce):',
+        '        if nonce and "[task-heartbeat]" in line and (got is None or got.group(1) != nonce):',
+        "the nonce fence stops covering every line and covers only marker-shaped ones, so a forged "
+        "`task_status` line in the run's appendable capture log flips `wedged` -> `running-quiet` "
+        "THROUGH the fence (measured: `samples=18000000,18010000,3,4`, rc 0)",
+    ),
+    Mutation(
+        "T61", "module",
+        'r"^\\s*\\[task-heartbeat\\]\\s+session_end\\b"',
+        'r"\\[task-heartbeat\\]\\s+session_end\\b"',
+        "the end marker loses its LINE anchor, so any line that merely PRINTS the words — a child's "
+        "own stdout in the capture log, this doc quoted — abstains the child's diagnosis",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if source_age_ms is None:',
+        '        if False:',
+        "a PIPE stops requiring a stated age, so `cat old.log | liveness.py --heartbeat -` decides "
+        "on an UNKNOWN source age — the freshness gate skipped exactly where it cannot be measured",
     ),
     Mutation(
         "T61", "module",
