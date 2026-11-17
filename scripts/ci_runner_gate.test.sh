@@ -661,6 +661,23 @@ if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
   echo "❌ FATAL: cannot read QUEUE_HEAD_SCAN_MAX's own default out of $GATE — the suite refuses to guess it" >&2
   exit 3
 fi
+# ⛔ AND THE READ PAGE SIZE IS DERIVED TOO, FROM THE SAME FILE (agent-infra#3995 review cycle 8, F2).
+# `QUEUE_PAGE` is a BARE literal in the gate (`QUEUE_PAGE=100`), not an env-overridable
+# `${CI_GATE_…:-100}`, so `_derive_shipped` cannot read it — it gets its own `sed`, and the `^…$` anchor
+# is what makes a respelled constant a FATAL rather than a silently-empty fixture. ⛔ IT READS
+# `${GATE_UNDER_TEST:-$GATE}` — NOT `"$GATE"` — unlike `QUEUE_HEAD_SCAN_SHIPPED` above, and the
+# difference is deliberate (#4113 cycle 4's correction, which this pin follows): the bound's value is
+# consumed by ARMS whose fixtures are built from it, so following a mutant would make those arms
+# self-fulfilling; NO ARM consumes `QUEUE_PAGE_SHIPPED` — only the literal pin below does — so there is
+# no fixture to move, and following the mutant is what closes the second route. MEASURED both ways: with
+# `"$GATE"` a `GATE_UNDER_TEST=<gate shipping QUEUE_PAGE=50>` left the pin GREEN (the mutant reds 362
+# rows and NONE of them names the constant — the exact defect #4113 recorded for the re-prove interval);
+# with `${GATE_UNDER_TEST:-$GATE}` it reds and prints `(got: 50, want: 100)`.
+QUEUE_PAGE_SHIPPED="$(sed -n 's/^QUEUE_PAGE=\([0-9][0-9]*\)$/\1/p' "${GATE_UNDER_TEST:-$GATE}" | head -1)"
+if [ -z "$QUEUE_PAGE_SHIPPED" ]; then
+  echo "❌ FATAL: cannot read QUEUE_PAGE's own value out of ${GATE_UNDER_TEST:-$GATE} — the suite refuses to guess it" >&2
+  exit 3
+fi
 
 # ghost_window_fixture <n> — a queue page whose head holds EXACTLY <n> ghost rows and a real demand
 # row behind them. `ids` and `rows` are returned `|`-separated so the caller can hand them to
@@ -857,6 +874,25 @@ assert_eq "$GH_THRESHOLD_DEFAULT" "10" \
 echo "── #3995: the gate SHIPS the measured head-scan bound (25), not the falsified 5 ──"
 assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
   "the gate ships a head-scan bound above the measured ghost population (14 on tortoise 2026-11-12, agent-infra#3995) — a REVERSAL to 5 must redden THIS line"
+# ⛔ AND THE READ PAGE SIZE IS PINNED LITERALLY FOR THE SAME REASON (agent-infra#3995 review cycle 8,
+# F2). `QUEUE_PAGE_SHIPPED` above is derived, which is the half that keeps a fixture honest and the half
+# that CANNOT catch a reversal on its own — the derivation moves with whatever it reads. MEASURED at this
+# head, both routes:
+#   * `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` IN PLACE in the shipped gate (the route that actually ships):
+#     **382 failures / 312 passed**, and EXACTLY ONE of them names the constant — THIS line, printing
+#     `(got: 50, want: 100)`. The other 381 are incidental (the read page, the multi-page walk's page
+#     arithmetic and every fixture built on 100 move together), and every one of them is the kind of row
+#     a reader repairs by editing the EXPECTED value;
+#   * `GATE_UNDER_TEST=<gate shipping QUEUE_PAGE=50>`: **363 failures / 331 passed**, THIS line among
+#     them — the route the `"$GATE"` spelling used by the bound above would have left green (see the
+#     derivation's comment).
+# That split is the point: without this line nothing would say the READ PAGE was the thing that moved,
+# and a reversal would read as fixture drift instead of as a decision reversed. The literal is the
+# two-sided half, the arms are the wired half — the same split, and the same argument, as the bound's pin
+# above and as #4113's pins for the ghost-ledger and page-cap knobs.
+echo "── #3995: the gate SHIPS GitHub's per_page cap (100) as the read page ──"
+assert_eq "$QUEUE_PAGE_SHIPPED" "100" \
+  "the gate ships QUEUE_PAGE=100 (GitHub's per_page maximum — no response can carry 101 rows) — a REVERSAL must redden THIS line"
 # …and the number is WIRED, not merely present: a queue exactly AT the shipped threshold takes the
 # fallback, one job under it does not. (Threshold-relative on purpose — see (i): this half proves the
 # constant reaches the LENGTH leg, and the literal above proves which constant it is.)

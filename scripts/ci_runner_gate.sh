@@ -204,13 +204,23 @@ GHOST_REPROVE_AFTER_S="${CI_GATE_GHOST_REPROVE_AFTER_S:-43200}"
 # Ghosts accumulate at the OLD end (they never start while newer runs come and go), which is both
 # where they are and where the age comes from — so the bound must exceed the LIVE ghost population or
 # every pass refuses. ⛔ IT WAS 5, ON THE MEASUREMENT "3 on agent-infra, 3 on tortoise with headroom",
-# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43Z): tortoise's queue
-# carried **14 consecutive job-less runs** at the head of the gate's own candidate list (2026-11-11
-# 20:49:45Z…20:53:24Z, `jobs: 0` on every one), so a 5-run window refused on EVERY pass —
-# `beyond the 5-run scan window`, no verdict written for 15 h (the verdict file still said `queued=83`
-# against a live queue of 238), and the `local → github` release unreachable. The SAME script with
-# `CI_GATE_QUEUE_HEAD_SCAN_MAX=25` measured the queue on the same minute. 25 is that population with
-# ~1.8x headroom; the cost is one jobs read per skipped ghost, on a pass whose cadence is minutes.
+# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43–03:47Z). Two readings of
+# the SAME queue head, kept separate because they are different measurements:
+#   * a walk of page 1 of `status=queued` (oldest-first, this gate's own `jobs[].status == "queued"`
+#     predicate) found **14 consecutive rows with ZERO jobs created at all**, 2026-11-11
+#     20:49:45Z…20:53:24Z, with real demand at index 15 (run 43130574723, 30 jobs, 1 queued);
+#   * the gate's own 25-row pass one minute earlier discounted **10** ghosts before reaching demand
+#     (`probe: … ghost_runs=10 … oldest_queued_s=11178 in_progress=9` — quoted with an elision: the
+#     line in the log carries `threshold=` between those fields, so it cannot be grepped contiguously)
+#     — the head moves as new runs arrive, so the two counts differ by WHEN they were taken, not by
+#     method.
+# Either way a 5-run window cannot reach demand, and the pass refuses: measured twice by hand on
+# 2026-11-12 (`beyond the 5-run scan window`, exit 2 — and `--dry-run` writes no verdict, so a box
+# that only ever hand-runs this gate keeps an arbitrarily old verdict file; this box's said
+# `queued=83`). 25 is the 14 with ~1.8x headroom; the cost is one jobs read per skipped ghost, on a
+# pass whose cadence is minutes. WHICH COPY ACTUALLY RUNS ON THE OWNER'S MAC IS NOT MEASURED HERE
+# (agent-infra#3936: the farm/plist chain can sit behind the repo) — this constant is what the repo
+# ships, and the fix reaches an executed copy by sync, not by an env var (see the next paragraph).
 # ⛔ THE POPULATION GROWS (3 a week earlier → 14), so if this refuses again the answer is to raise the
 # bound HERE — the default — and never to treat the refusal as "no demand". ⛔ AND NOT BY SETTING THE
 # ENV KNOB ON THE DEPLOYED COPY: the farmed `~/.pi/agent/scripts/ci_runner_gate.sh` is overwritten by
@@ -1282,6 +1292,17 @@ print(comp, len(inc))
     ??????????*)  log "ghost proof re-prove interval OUT OF RANGE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   QUEUE_GHOSTS=0
+  # ⛔ `scanned` IS INITIALISED BESIDE THE SCAN, NOT HERE (agent-infra#3995 review, F3 — the line that
+  # sat here is gone, removed by 4304f70c4). It was DEAD: every read of `$scanned` is inside the `else`
+  # block below, which assigns it (`scanned=0; scan_exhausted=1`) before its first use, and the degraded
+  # no-candidate path never expands it. The reason recorded for ADDING it — "so the degraded
+  # no-candidate path cannot hit `set -u`" — was false, and the half of that reason a reader is most
+  # likely to carry away is the DANGEROUS half: a `local` declaration gives a name no VALUE, so it is
+  # no defence against `set -u` at all (measured on bash 5.2: `set -u; f(){ local b; echo "${b}"; }`
+  # aborts with `b: unbound variable`, rc 1 — an exit code this gate never emits deliberately). What
+  # actually protects the path is that NOTHING READS IT THERE, and that `scanned=0` below precedes the
+  # first read. The durable record is corrected HERE, where the next reader looks, because that commit
+  # message is append-only.
   GHOST_CACHED=0     # how many of those ghosts were REMEMBERED (no read spent this pass)
   GHOST_KEEP=""      # ids to persist: this pass's proofs, plus prior entries still in the queue
   reads=0            # jobs reads SPENT this pass — what QUEUE_HEAD_SCAN_MAX actually bounds
