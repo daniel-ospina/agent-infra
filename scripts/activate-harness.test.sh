@@ -295,6 +295,36 @@ export FX
 
 echo "activate-harness.test.sh"
 
+# ── T0: EVERY REPEATING TIMER TEMPLATE CARRIES A FIRST ELAPSE ─────────────────────────────────
+# `OnUnitActiveSec` is defined as "relative to when the unit the timer unit is activating was LAST
+# ACTIVATED" (systemd.timer(5)). A template that declares it with NO boot/active/calendar anchor has
+# nothing to measure the first elapse FROM: `next_elapse=infinity`, the service never starts, and
+# `systemctl` still reports the timer `active (elapsed)` — the inert-enforcer shape this whole file
+# exists to detect, sitting in the shipped templates rather than in a box's state.
+# MEASURED on cmux 2026-11-17, two shipped templates in exactly that state (18 h after enabling):
+#   eldato-controller-watchdog.timer  next_elapse=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-objective-reminder.timer   next_elapse=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-harness-apply.timer        next_elapse=18h12m    LastTriggerUSec=15:09:41Z  (control: fires)
+# The only difference was the `OnBootSec` the control had. This arm is static (no fixture): it reads the
+# templates, so it cannot be satisfied by a box that merely looks armed.
+TPL_SEEN=0
+for tpl in "$REPO"/templates/systemd/*.timer; do
+    [ -f "$tpl" ] || continue
+    grep -qE '^OnUnitActiveSec=' "$tpl" || continue
+    TPL_SEEN=$((TPL_SEEN + 1))
+    if grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar=' "$tpl"; then
+        ok "T0 $(basename "$tpl") anchors its first elapse"
+    else
+        bad "T0 $(basename "$tpl") declares OnUnitActiveSec with NO boot/active/calendar anchor — next_elapse=infinity, it can never fire"
+    fi
+done
+# NON-VACUITY: a glob that matches nothing would make the loop above pass by not running.
+if [ "$TPL_SEEN" -gt 0 ]; then
+    ok "T0 checked $TPL_SEEN repeating timer template(s)"
+else
+    bad "T0 no repeating timer template was checked (vacuous pass)"
+fi
+
 # ── T1: a fully armed box exits 0 and every must row reads OK ─────────────────────────────────
 arm_all
 PLATFORM_SEAM="" SKIP_SEAM="" RUN --check

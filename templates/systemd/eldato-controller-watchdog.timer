@@ -12,7 +12,19 @@
 # controller from a state that no longer exists.
 Description=eldato controller watchdog every 5 minutes
 
+# ⛔ `OnUnitActiveSec` ALONE IS INERT — IT HAS NO FIRST REFERENCE. The directive is defined as
+# "relative to when the unit the timer unit is activating was LAST ACTIVATED" (systemd.timer(5)), and this
+# service has never been activated, so there is no reference to measure from: `next_elapse=infinity`,
+# `LastTriggerUSec=` empty, and the timer never fires — while `systemctl` still reports it
+# `active (elapsed)`. Measured on cmux 2026-11-17 (18 h after the timer was enabled):
+#   eldato-controller-watchdog.timer  next_elapse=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-objective-reminder.timer   next_elapse=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-harness-apply.timer        next_elapse=18h12m    LastTriggerUSec=15:09:41Z   (CONTROL: fires)
+# The only difference is the `OnBootSec` the control has and these two lacked. That is precisely the
+# "watchdog with no clock" this unit's own service description exists to end — so the first elapse is
+# anchored to boot, and `OnUnitActiveSec` then carries the 5-minute cadence from each pass.
 [Timer]
+OnBootSec=5min
 OnUnitActiveSec=5min
 AccuracySec=30s
 RandomizedDelaySec=45

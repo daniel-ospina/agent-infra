@@ -13,7 +13,15 @@
 # opposite reason: its work is cumulative and must not be skipped.)
 Description=eldato objective reminder every 10 minutes
 
+# ⛔ `OnUnitActiveSec` NEEDS A FIRST REFERENCE OR IT NEVER FIRES. It is defined as "relative to when the
+# unit the timer unit is activating was LAST ACTIVATED" (systemd.timer(5)); on a service that has never
+# been activated there is nothing to measure from, so `next_elapse=infinity` and the timer sits `active
+# (elapsed)` forever without ever running. Measured on cmux 2026-11-17: this timer's service had NEVER
+# started (`ExecMainStartTimestamp=` empty, zero journal entries) while `eldato-harness-apply.timer`,
+# identical except for its `OnBootSec`, was firing every 10 minutes. So boot anchors the FIRST elapse and
+# `OnUnitActiveSec` carries the cadence from each pass (still not wall-clock aligned, per the note above).
 [Timer]
+OnBootSec=10min
 OnUnitActiveSec=10min
 AccuracySec=30s
 RandomizedDelaySec=60
