@@ -48,7 +48,7 @@ BELOW_ALL=1
 
 # ── the fixture: one $O, one uv cache, one scratch root, one stand-in uv ──────────────────────────
 mk_fixture() { # <name> -> sets F (fixture dir)
-  F="$T/$1"; rm -rf "$F"; mkdir -p "$F/o/state" "$F/cache" "$F/scratch" "$F/bin"
+  F="$T/$1"; rm -rf "$F"; mkdir -p "$F/o/state" "$F/cache" "$F/scratch" "$F/bin" "$F/shim"
   # 6 MiB of "cache" in 1 MiB files: big enough that a reclaim is measurable in `df` whole MB on a
   # filesystem that reports KiB blocks, small enough to be free.
   local i
@@ -66,6 +66,20 @@ case "$verb" in
 esac
 SH
   chmod +x "$F/bin/uv"
+  # ⛔ THE LIVENESS PROBE IS BOX-GLOBAL UNLESS THE FIXTURE PINS IT (measured 2026-11-16 ON THIS FLEET:
+  # this suite reddened on 4 assertions of case (a) on every box that had ANY `uv` process running —
+  # `pgrep -x uv` reads the whole machine, and a shared CI runner carries other jobs' `uv run`). The
+  # gate's own seam is `command -v pgrep`, so a `pgrep` FIRST on PATH is an operator-shaped seam, not a
+  # stubbed measurement: the deferral decision it feeds is a fact about the box the gate is on, and the
+  # fixture decides which box this is. Default (no FAKE_PGREP_LIVE): no live uv → the hard clean runs,
+  # which is what case (a) needs. FAKE_PGREP_LIVE=1 answers "a live uv is resolving" and pins the
+  # deferral arm (a2), so neither polarity is unreachable.
+  cat > "$F/shim/pgrep" <<'SH'
+#!/bin/sh
+[ "${FAKE_PGREP_LIVE:-0}" = 1 ] && exit 0
+exit 1
+SH
+  chmod +x "$F/shim/pgrep"
 }
 
 # run_gate <floor-mb> [<reclaim 0|1>] -> sets OUT (the gate's single line) and RC
@@ -74,7 +88,7 @@ run_gate() {
   OUT="$(DISK_FLOOR_MB="$floor" DISK_FLOOR_RECLAIM="$reclaim" \
          UV_CACHE_DIR="$F/cache" XDG_CACHE_HOME="$F/nocache" \
          DISK_FLOOR_UV_BIN="$F/bin/uv" FAKE_UV_LOG="$F/uv.log" \
-         DISK_FLOOR_SCRATCH_ROOT="$F/scratch" \
+         DISK_FLOOR_SCRATCH_ROOT="$F/scratch" PATH="$F/shim:$PATH" \
          bash -c '. "$1"; disk_floor_gate "$2"; exit $?' _ "$GATE" "$F/o" 2>&1)"
   RC=$?
 }
@@ -103,6 +117,26 @@ if [ -z "$FREE_A" ]; then bad "(a) df could not answer for the fixture — the s
      'grep -qx "cache clean" "$F/uv.log" 2>/dev/null'
   ck "(a) the reclaim was attributed to the uv class in the line" \
      'case "$OUT" in *"uv-cache="*) true ;; *) false ;; esac'
+fi
+
+printf '== (a2) NON-VACUITY of the liveness gate: a LIVE uv defers the hard clean\n'
+# ⛔ (a) CANNOT PASS BY ACCIDENT OF A STUBBED MEASUREMENT. `disk_floor_uv_live()` is what decides
+# whether the HARD arm runs, and case (a) needs it to say "nothing is resolving". If the `pgrep` shim
+# above were the only thing making (a) green, the gate's liveness check would be unexercised — so the
+# same fixture, one variable changed, must DEFER: the blob survives, the line SAYS it was deferred, and
+# nothing is deleted. This is the polarity the suite could never express before (the answer came from
+# whatever else the box was running).
+mk_fixture a2
+FREE_A2="$(df -Pk "$F/o" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d\n", $4 / 1024}')"
+if [ -z "$FREE_A2" ]; then bad "(a2) df could not answer for the fixture"; else
+  FLOOR_A2=$(( FREE_A2 + 4 ))
+  FAKE_PGREP_LIVE=1 run_gate "$FLOOR_A2" 1
+  case "$OUT" in
+    *"clean-DEFERRED"*) ok "(a2) with a live uv the HARD clean is DEFERRED and the line says so" ;;
+    *) bad "(a2) expected a clean-DEFERRED line, got: ${OUT:-<empty>}" ;;
+  esac
+  ck "(a2) the deferred class deleted NOTHING" '[ -e "$F/cache/blob-6" ]'
+  ck "(a2) the escalate-to-clean verb never ran" '! grep -qx "cache clean" "$F/uv.log" 2>/dev/null'
 fi
 
 printf '== (b) below the floor with NOTHING reclaimable: SKIP, name free + floor, do NOT dispatch\n'
