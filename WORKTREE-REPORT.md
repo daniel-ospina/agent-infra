@@ -370,3 +370,87 @@ NOT re-read `systemd-analyze`'s full unit-loading semantics (a masked unit, a ge
 git checkout cannot be the truth source for `/run`. Also unchanged and named: the `%`-specifier refusal
 turns an unrelated `Environment=HOME=%h` into UNKNOWN (5); that is fail-closed, it is what
 `cell-self-pin.sh:855-863` rules, and an arm asserts it.
+
+## Round 6 — verification at the POST-MERGE head `2ee4da42`: no finding is open, and no code change is owed
+
+**The state I found, stated first because it changes whose work this is.** The dispatch named `2416fa99a`
+for the CI brief (its `head12` is `2416fa99a800`) and `c5e372fe7d6b`-era reviews for the findings; by the
+time this lane started the branch had advanced through rounds 3–5 **and a merge of `origin/main`
+(`6ae4777fc`) into this branch**, whose result `2ee4da420` is the head. So the CI brief is **stale** (its
+head prefix is not this head's), and the review history's last verdict is round 5's *"every finding is
+closed, and no code change is owed"*. This lane therefore **verified that work at the merged head rather
+than re-implementing it**, and added nothing it could not measure.
+
+`git log --oneline origin/main..HEAD` → 22 commits; the merge commit's own diff is `origin/main`'s eight
+files (`extensions/main-worktree-guard/*`, `extensions/shared/*`, `scripts/ci_runner_gate.*`) and **touches
+nothing in this PR's diff**, which is why nothing below had to be re-fixed after it.
+
+### Every finding in this PR's review history, re-checked at `2ee4da42` (by reading, then by measuring)
+
+| class | where it lived | state at this head |
+|---|---|---|
+| P2 — pin read was a `^Environment=LANE_TIMEOUT=` spelling match | `install-drainer-timer.sh:214` @ `c5e372f` | closed — `effective_env` over the drop-in-aware text |
+| P2 — no-pin `ExecStart=` arm read the base file only | `install-drainer-timer.sh:290` @ `c5e372f` | closed — `effective_execstarts` over `unit_text_effective` |
+| P2 F1 — `EnvironmentFile=`/`UnsetEnvironment=`/`PassEnvironment=` | shared lib | closed — `env_compile_hazards`, named, section-scoped, → 5 |
+| P2 F2 — section-blind readers (`[Install]` pin graded as a pin) | shared lib | closed — both readers track `[Service]`; a repeated header CONTINUES it |
+| P2 F3/F3b — backslash continuation / C-style escape / `%`-specifier | shared lib | closed — continuations joined, opaque constructs → 5 |
+| P3 — claim of total coverage | PR body · `docs/ops/ai-drainer.md` · this file | withdrawn in all three |
+| F5 — HEADERLESS drop-in read as effective | `unit_text_from_files` | closed — the `[]` file boundary |
+| P3 — drop-in merge path was `$UNIT_DIR` only | `install-drainer-timer.sh:283` | closed — `unit_text_effective` (`systemctl cat`) |
+| P3 — whitespace-only `Environment=` "neither a reset nor unparseable" | `systemd-unit-parse.sh:72` | **falsified, not "corrected"** — `normalize_unit_lines` trims it, so it IS the reset arm |
+| P3 — `claims.sh:143` `1710 s` crossing / `README.md:2353` `origin/main` label / `ai-drainer.md:361` "PIN was read" | three doc sites | closed (1410 s, "pre-#4034 tree", "a CAP was read") |
+
+### My own measurements through the shipped `--status` (not carried from a commit message)
+
+Temp tree, head files laid out `infra/scripts/…`, `SYSTEMCTL=/bin/true`, `SYSTEMD_UNIT_DIR` the seam,
+seam 36000 s, two scripts whose compiled defaults are 36000 and 7200:
+
+| fixture | systemd hands the process | `--status` | rc |
+|---|---|---|---|
+| control: base fresh, pin 36000 | 36000 | `pin: 36000 s installed · 36000 s would be rendered now` | **0** |
+| control: base pin 7200 | 7200 | `⚠️ STALE PIN … 7200 s installed` | **3** |
+| F1: drop-in `EnvironmentFile=<LANE_TIMEOUT=7200>` over a 36000 pin | 7200 | `⚠️ UNREADABLE CAP`, naming `EnvironmentFile=` | **5** |
+| F2: pin under `[Install]` (systemd IGNORES it), no pin in `[Service]`, stale script | 7200 | `STALE CAP … 7200 s compiled into <script>` | **3** |
+| F2 mirror: same `[Install]` pin, FRESH script | 36000 | `agrees with the 36000 s this checkout would render` | **0** (a correct clean, not a false one) |
+| F3: `Environment=HOME=/x \` + `LANE_TIMEOUT=7200` | 7200 | `pin: 7200 s installed` | **3** |
+| F3b: `Environment=\x4CA\x4EE_TIMEOUT=7200` | 7200 | `⚠️ UNREADABLE CAP`, quoting the line | **5** |
+| F5: base pin 7200 + HEADERLESS drop-in pin 36000 (systemd DROPS it) | 7200 | `pin: 7200 s installed · 36000 s would be rendered now` | **3** |
+| control: base pin 7200 + drop-in `[Service]` pin 36000 (drop-in WINS) | 36000 | `pin: 36000 s installed` | **0** |
+| control: no pin, drop-in `ExecStart=` reset to the FRESH script | 36000 | `agrees with the … 36000 s` | **0** |
+| control: `Environment=LANE_TIMEOUT=36000 HOME="/x/\"y"` (escaped quote) | 36000 | `pin: 36000 s installed` | **0** (no false block) |
+
+No row returns 0 over a cap that disagrees with the seam; the three control rows are the false-block half.
+
+### Suites at `2ee4da42` (this worktree, this host)
+
+| command | result |
+|---|---|
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **226 passed, 0 failed** |
+| `bash scripts/disk-reaper.test.sh` | **ALL PASS (727 assertions)** |
+| `bash scripts/rail-run.test.sh` (twice) | **250 passed, 0 failed** both runs |
+| `node scripts/check-skill-lint.test.mjs` | **171 passed, 0 failed** |
+| `node scripts/check-pi-pin-lockstep.mjs` | **132 passed, 0 failed** |
+| `bash scripts/check-bash32-parse.sh` | **471 script(s) parse** under bash 3.2.57 |
+
+### The build at this head: one required red, and it is not a code finding
+
+Branch protection requires exactly one context (`pipeline-compliance`). Read by polarity on the newest
+attempt per (app, name) at `2ee4da42`:
+
+* `pipeline-compliance` — **fail**, and its single failing leg is **(c) no head-bound code-review record**.
+  `(a)` traceability and `(b)` the scoping marker pass; `(d)`/`(e)` are skipped. Re-run locally with
+  `GH_REPO=… PR_NUMBER=4103 bash scripts/check-pipeline-compliance.sh` → `BLOCKED (1 failure(s))`, `(c)`
+  only. Only `record-review.sh` mints that record, at the final head, and that is the harness reviewer's
+  step (`merge-one.sh`) — this lane does not attest its own review and does not merge (#2148).
+* `bash-suites (8)` — fail, **NON-required**, and the failing shard is `scripts/rail-run.test.sh`'s two
+  `CONCURRENT:` arms (`want rc=1, got rc=2`). This diff changes no rail-run file
+  (`git diff --name-only origin/main...HEAD | grep -c rail-run` → `0`) and the suite is **250/0 on this
+  tree, on this box, twice**. That is the starved-runner flake tracked as **#4087** (already annotated at
+  three PRs); it is left alone rather than chased, and it is not reported as the reason this PR cannot merge.
+
+### What this lane did NOT do
+
+No finding was re-litigated, no assertion weakened, no `PR` body edit (the F4 wording it corrected is in the
+body and stays there). The one finding the round-2 review FALSIFIED (whitespace-only `Environment=` reset)
+was re-measured here as the reset arm, not "corrected" — a `⚠️ CORRECTED` marker over a correct line is how
+this file's own rule says an artifact gets broken. Nothing merged, no review attested.
