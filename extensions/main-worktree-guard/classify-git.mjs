@@ -5416,8 +5416,11 @@ export function classifyGitCommandDetailed(command) {
       // `refs/heads/<b>` re-point and the `-m`-prefixed HEAD form are both
       // state mutations while `git symbolic-ref refs/heads/x` stays a read.
       // An UNRESOLVABLE operand (`$R`, `$(…)`) counts too — fail closed.
-      const w = symbolicRefWriteTarget(v.args);
-      return !!w && (w.opaque === true || w.name === "HEAD" || w.branch !== null);
+      // #594 round 16: the expression itself lives in
+      // `_symbolicRefBranchStateMutation` because `_argAwareBranchStateMutation`
+      // (the substitution surface) must reach the SAME verdict — a fourth copy
+      // here is what let `$(git symbolic-ref -qd <ref>)` through.
+      return _symbolicRefBranchStateMutation(v.args);
     }
     if (v.verb === "update-ref") {
       // #594: `-m <reason>` value slots, the stdin channel (`--stdin` and every
@@ -8787,19 +8790,45 @@ const BRANCH_STATE_VERBS = new Set(["branch", "checkout", "switch", "symbolic-re
  * documented READ, admitted on main, with an unusable remedy).
  * @param {{verb?: string, args?: string[]}} inv
  */
+/**
+ * #594 (review round 16, MEASURED-CLASS FAIL-OPEN): the ONE `symbolic-ref`
+ * branch-state reading, shared by the DIRECT surface (`_isStateMutating`) and the
+ * SUBSTITUTION surface (`_argAwareBranchStateMutation`) so the same spelling can
+ * never be read one way behind a `$( … )` and another way in the open.
+ *
+ * `symbolicRefWriteTarget` owns the grammar (`-qd` clusters, `--del…` prefixes,
+ * `-m` value slots, unresolvable operands); this only decides whether its answer
+ * is BRANCH state. A write outside `refs/heads/**` (a `refs/tags/…` symref) is a
+ * write, but not a branch-state write — the same boundary the direct surface has
+ * always drawn, so the two copies cannot drift.
+ * @param {string[]} args
+ * @returns {boolean}
+ */
+function _symbolicRefBranchStateMutation(args) {
+  const w = symbolicRefWriteTarget(args);
+  return !!w && (w.opaque === true || w.name === "HEAD" || w.branch !== null);
+}
+
 function _argAwareBranchStateMutation(inv) {
   const args = inv.args || [];
-  const flags = args.filter((x) => x.startsWith("-")).map((x) => _stripQuotes(x));
-  const pos = args.filter((x) => !x.startsWith("-"));
   if (inv.verb === "checkout" || inv.verb === "switch") return true;
-  if (inv.verb === "symbolic-ref") {
-    if (flags.some((f) => f === "-d" || f === "--delete")) return true;
-    return pos.length >= 2; // one arity = read
-  }
-  if (inv.verb === "update-ref") {
-    if (flags.some((f) => f === "-d" || f === "--delete" || f === "--stdin")) return true;
-    return pos.length >= 2; // `<ref>` alone is a usage error, not a move
-  }
+  // ⛔ #594 (review round 16, MEASURED-CLASS FAIL-OPEN): this function held the
+  // THIRD copy of the ref-write reading and was never migrated when
+  // `_isStateMutating` (the direct surface) and `_isCarveOutReadOnlyInvocation`
+  // were. Its value-blind tests compared the EXACT tokens `-d`/`--delete`/
+  // `--stdin`, so every spelling the direct surface learned to read was still
+  // ADMITTED behind a `$( … )` — measured at `c666b162` against git 2.43.0 in a
+  // throwaway repo (rc 0, the ref really moved, `hiddenStateMutation: false`):
+  //   git log "$(git symbolic-ref -qd refs/heads/victim)"   -> symref DELETED
+  //   git log "$(git symbolic-ref --del refs/heads/victim3)" -> symref DELETED
+  //   git log "$(… | git update-ref --stdi)"                 -> branch CREATED
+  // `hiddenStateMutation` is the ONLY input to index.ts's
+  // `hiddenBranchStateRefusal`, so each of those moved a hub branch with
+  // `verdict: allow` while the direct spelling of the same command was blocked.
+  // Delegate to the ONE reading — the same two predicates the migrated copies
+  // call — rather than re-deriving the grammar a fourth time.
+  if (inv.verb === "symbolic-ref") return _symbolicRefBranchStateMutation(args);
+  if (inv.verb === "update-ref") return updateRefWriteTarget(args) !== null;
   // #596 (round-2 reviewer F1): the arm-exact mirror — cluster/long-form renames
   // and force-copy spellings (`-Mq`/`--move`/`-Cq`/…) must be seen.
   return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);

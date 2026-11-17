@@ -1559,11 +1559,44 @@ async function partB() {
     expectTrue("#607 predicate: a TWO-positional `symbolic-ref` DOES write, so it IS a hidden mutation (the read narrowing is not blanket)",
       classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation === true,
       JSON.stringify(classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation));
-    expectTrue("#607 predicate: `update-ref <ref>` alone is a USAGE ERROR (rc 129, moves nothing) — not a hidden mutation; `--stdin`/`<ref> <new>` are",
-      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === false
-      && classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
+    expectTrue("#607 predicate: `update-ref <ref>` alone — no hidden mutation on the READ side; `--stdin`/`<ref> <new>` are [flipped by #594 round 16, see below]",
+      classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
       && classify607('echo "$(git update-ref refs/heads/x HEAD)"').hiddenStateMutation === true,
       "update-ref arity narrowing is wrong");
+    // ⛔ #594 (review round 16, P2): the substitution surface held the THIRD copy of
+    // the ref-write reading (`_argAwareBranchStateMutation`) and still compared the
+    // EXACT tokens `-d`/`--delete`/`--stdin`. Every clustered/abbreviated spelling
+    // the DIRECT surface already blocks was therefore admitted behind a `$( … )`,
+    // and `hiddenStateMutation` is the only input to index.ts's
+    // `hiddenBranchStateRefusal` — so these moved a hub branch while the direct
+    // spelling of the same command was already blocked. Measured at `c666b162`
+    // against git 2.43.0 in a throwaway repo: each row below is rc 0 and the ref
+    // really moves, while the head reported `hiddenStateMutation: false`.
+    expectTrue("#594-R16a: `$(git symbolic-ref -qd <ref>)` (clustered delete) IS a hidden mutation — the exact-token `-d` test missed it",
+      classify607('git log "$(git symbolic-ref -qd refs/heads/victim)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('git log "$(git symbolic-ref -qd refs/heads/victim)"').hiddenStateMutation));
+    expectTrue("#594-R16b: `$(git symbolic-ref --del <ref>)` (unambiguous prefix) IS a hidden mutation",
+      classify607('git log "$(git symbolic-ref --del refs/heads/victim3)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('git log "$(git symbolic-ref --del refs/heads/victim3)"').hiddenStateMutation));
+    expectTrue("#594-R16c: `$(… | git update-ref --stdi)` (parse-options prefix of `--stdin`) IS a hidden mutation",
+      classify607(`git log "$(printf 'update refs/heads/v2 HEAD\\n' | git update-ref --stdi)"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`git log "$(printf 'update refs/heads/v2 HEAD\\n' | git update-ref --stdi)"`).hiddenStateMutation));
+    // ── #594-R16 negative controls: the delegation did NOT become blanket ─────
+    expectTrue("#594-R16d: the #607 documented READ `$(git symbolic-ref --short HEAD)` is STILL not a hidden mutation",
+      classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation));
+    expectTrue("#594-R16e: a `refs/tags/**` symref write is NOT branch state — the delegation keeps the direct surface's own namespace boundary",
+      classify607('echo "$(git symbolic-ref refs/tags/x refs/heads/y)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('echo "$(git symbolic-ref refs/tags/x refs/heads/y)"').hiddenStateMutation));
+    // #594 round 16 REVERSES one #607 pin, deliberately and for the reason the
+    // review gave: `_argAwareBranchStateMutation` now reaches the SAME
+    // `updateRefWriteTarget` the direct surface uses, and that predicate returns a
+    // write for a bare `<ref>` ("today's behaviour and the over-block is free" —
+    // an rc-129 no-op). Reading it the other way here would be exactly the split
+    // reading this round removed, so the pin moves with it and says why.
+    expectTrue("#594-R16f: a bare `$(git update-ref <ref>)` is a hidden mutation too — the direct surface's historic over-block, now read ONCE",
+      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation));
 
     // ── NO worktree exemption — and this is the SECOND attempt at one ────────
     // ATTEMPT 1 exempted a session whose cwd resolved to a worktree, on the
