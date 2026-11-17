@@ -805,7 +805,7 @@ any indent. A copy is refused FOUR ways, all of them measured, and a refusal dis
   • it reads four-or-more columns of indent as an indented code block, same thing;
   • and the caller refuses a section that REPUBLISHES the contract's own worked example row, fenced
     or not — that row is the shape you were handed, so it can never be evidence about this diff;
-  • and the caller ALSO refuses a `NO NEW ASSERTIONS:` line that repeats the contract's example
+  • and the caller ALSO refuses a \`NO NEW ASSERTIONS:\` line that repeats the contract's example
     REASON — that reason names the contract's own example files, so it says nothing about THIS diff.
 If the diff genuinely adds no assertion, the exemption line is still YOURS to type: the contract
 shows it indented on purpose, and an indented copy is refused as quoted material — but an UNINDENTED
@@ -860,7 +860,7 @@ $(if [ -n "$t" ]; then cat <<TAIL
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
 The diff inlined above is NOT the whole change. Fetch the remainder yourself, then print ONE
 line giving the digest below, and nothing else on it. Position: AFTER your per-line findings,
-IMMEDIATELY BEFORE your `## MUTATION ATTRIBUTION` section when this prompt asks you for one (that
+IMMEDIATELY BEFORE your \`## MUTATION ATTRIBUTION\` section when this prompt asks you for one (that
 section is the last thing before the verdict line), or IMMEDIATELY BEFORE your verdict line when it
 does not. Never put it BETWEEN the section and the verdict:
   diff-tail: <the SHA-256 of THIS RUN'S NONCE followed immediately by the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>

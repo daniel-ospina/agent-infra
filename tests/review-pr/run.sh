@@ -674,6 +674,22 @@ case "$P" in *"This PR fixes the thing"*) rc=0;; *) rc=1;; esac; ck $rc "…and 
 case "$P" in *"the linked issue body"*) rc=0;; *) rc=1;; esac; ck $rc "…and the linked issue"
 case "$P" in *'web_search(model="sonar")'*) rc=0;; *) rc=1;; esac; ck $rc "…and names research rung 2 explicitly (web_search model=\"sonar\")"
 case "$(cat "$TMP/pi-argv.txt")" in *"--no-session"*) rc=0;; *) rc=1;; esac; ck $rc "…spawned with --no-session (a genuinely fresh context)"
+# ⛔ THE PROMPT IS COMPOSED BY AN UNQUOTED HEREDOC, SO A BACKTICK SPAN IN IT IS COMMAND
+# SUBSTITUTION (measured at 71207625d, and it is why this arm exists): the sentence below carried
+# unescaped backticks, so `NO NEW ASSERTIONS:` ran as a COMMAND — the seam printed
+# "NO: command not found" on its own stderr, and the clause VANISHED from the prompt the reviewer
+# is graded on. Both spans are INSTRUCTIONS the reviewer is told to obey, so a mangled one is a
+# prompt the reviewer cannot comply with, and nothing reported it: this suite stayed green through
+# eleven rounds while the text was silently missing. Asserted on the RENDERED prompt (plus the
+# seam's own stderr), so unescaping either span reddens these arms.
+case "$P" in
+  *'ALSO refuses a `NO NEW ASSERTIONS:` line that repeats the contract'*) rc=0;;
+  *) rc=1;;
+esac; ck $rc "…every backtick span in the prompt survives composition VERBATIM (an unescaped one is command substitution)"
+case "$(cat "$TMP/err.txt" 2>/dev/null)" in
+  *"command not found"*) rc=1;;
+  *) rc=0;;
+esac; ck $rc "…and composing the prompt executes no command from its own text (no 'command not found' on stderr)"
 # ⛔ THE MODEL PAIR, DRIVEN — not grepped (P2-F of the #3413 review). This seam used to hardcode
 # `--model deepseek-v4-flash`, a LEGACY alias that answers nothing on the box: the reviewer session
 # came up, loaded every extension, and produced ZERO assistant turns while the seam exited 0 with no
@@ -1232,6 +1248,16 @@ case "$(cat "$TMP/pi-prompt.txt")" in
   *"fetch the whole thing yourself"*|*"NOT inlined"*) rc=0;;
   *) rc=1;;
 esac; ck $rc "…and it tells the reviewer to FETCH the diff instead of carrying it"
+# ⛔ THE TAIL BLOCK'S OWN BACKTICK SPAN IS SHELL-ACTIVE TOO (same class as §A's arm; second
+# measured instance at 71207625d). `## MUTATION ATTRIBUTION` sat unescaped between backticks
+# INSIDE the nested `$(if … cat <<TAIL)` command substitution, where a line beginning with `#` is a
+# COMMENT — so it expanded to EMPTY, silently, with no error at all: the reviewer was told
+# "IMMEDIATELY BEFORE your  section", and the heading it must place the digest before was gone.
+# This arm runs in the TRUNCATED path because that is the only path that composes the block.
+case "$(cat "$TMP/pi-prompt.txt")" in
+  *'IMMEDIATELY BEFORE your `## MUTATION ATTRIBUTION` section'*) rc=0;;
+  *) rc=1;;
+esac; ck $rc "…and the TAIL block's backtick span survives too (a '#' line inside \$() is a comment: it vanished with no error)"
 if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -gt 190000 ]; then rc=1; else rc=0; fi
 ck $rc "…so the 200 KB payload is not in the prompt at all"
 # The BYTE-budget branch (PROMPT_MAX) is only reachable when the CAP'd diff is multi-byte:
@@ -1479,7 +1505,7 @@ if [ -d "$TMP/bin" ]; then
   [ "$(rc_of)" = "10" ]; ck $? "a FAILING scanner refuses with exit 10, never a silent clean (rc=$(rc_of))"
   no_record; ck $? "  …no record written on a scanner failure"
   err_has "SCANNER failed"; ck $? "  …and the failure is named, with the scanner's own rc"
-  err_has "rc=2"; ck $? "  …the REAL rc (the negated-`\$?` bug reported 0)"
+  err_has "rc=2"; ck $? "  …the REAL rc (the negated-\`\$?\` bug reported 0)"
   no_comment; ck $? "  …and nothing was posted as a review artifact"
   rm -f "$TMP/bin/awk"
 else
@@ -4259,7 +4285,7 @@ for _b in del fst sub pre glob real; do
   case "${!_bs_ref}" in "NO NEW ASSERTIONS: "*) ;; *) _bs_bad=1 ;; esac
 done
 unset _b _bs_ref
-[ "$_bs_bad" -eq 0 ]; ck $? "  …and every one still carries the `NO NEW ASSERTIONS:` LABEL, so each is judged on its PAYLOAD, not on a stripped label"
+[ "$_bs_bad" -eq 0 ]; ck $? "  …and every one still carries the \`NO NEW ASSERTIONS:\` LABEL, so each is judged on its PAYLOAD, not on a stripped label"
 for _b in del fst sub pre; do
   _bs_ref="_bs_$_b"; _bs_line="${!_bs_ref}"
   printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bs_line" > "$TMP/bs-$_b.md"
