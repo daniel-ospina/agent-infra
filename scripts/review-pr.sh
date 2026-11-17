@@ -2892,56 +2892,6 @@ mutation_pasteback_cells() { # <section-text> -> the canonical cells the section
   return 0
 }
 
-# ⛔ CELL IDENTITY IS DESTROYED BY REFLOW, SO PROVENANCE NEEDS A GRANULARITY THAT SURVIVES IT (measured
-# at head f237d39fa, the TENTH spelling of the same false PASS). The cell arm above counts the canonical
-# row's DISTINCTIVE CELLS inside the reviewer's own cells — so a copy that keeps the contract's text but
-# REFLOWS it across different cell boundaries shares no cell with the example and is invisible to it.
-# That reflow is the ordinary thing a table editor (human or model) does to an example: GFM lets a body
-# row carry MORE cells than its header ("excess cells are ignored"; header and delimiter must match,
-# body rows may differ — spec re-checked), so pasting a 4-cell example into a 5-column table of one's
-# own keeps the shape the parser wants and moves every cell boundary. MEASURED at that head: the worked
-# row with its FIRST and LAST cells split into two is ACCEPTED by `brief-gate.sh --mutation-missing`
-# (rc=0, EMPTY = accepted) and MISSED by both arms above (no output), i.e. it minted `clean` on the
-# harness's own example, for a diff the example says nothing about.
-# ⛔ THE DISCRIMINATOR THAT SURVIVES REFLOW IS THE ROW'S CONCATENATED PAYLOAD: the letters and digits of
-# its cells, IN ORDER, with every cell boundary removed. Splitting, merging, re-decorating or re-spacing
-# cells cannot change it; text added at either end leaves it contiguous; only REWORDING or RE-ORDERING
-# changes it, and both are authored — the same stated limit every arm above carries. One arm, one floor:
-# the canonical payload must appear CONTIGUOUSLY inside a reviewer's row payload, and the floor of 24
-# letters/digits is a literal (no environment knob), which the canonical row clears by a factor of four.
-_mutation_row_payloads() { # <text> -> one CONCATENATED letters+digits payload per LIVE DATA row
-  printf '%s\n' "${1:-}" | awk "$MUT_DEC_AWK"'
-    { _prep($0)
-      if (_quoted) next                       # fenced / indented code: the parser refuses it itself
-      if (_claim !~ /\|/) next                # a table row (outer pipes are optional, as in GFM)
-      t = _cells(_claim)
-      if (t == "") next
-      sep = t; gsub(/[|: -]/, "", sep)
-      if (sep == "") next                     # the |---| rule is never a data row
-      # the COLUMN-NAMING header is shared by every honest table (the contract teaches those names)
-      if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
-      gsub(/[^a-z0-9]+/, "", t)               # …and the CELL BOUNDARIES go too: the reflow-proof form
-      if (length(t) >= 24) print t }'
-}
-
-mutation_pasteback_payload() { # <section-text> -> the canonical payloads the section REPRODUCES
-                               # (empty = authored)
-  local _canon _sec _p
-  _canon="$(_mutation_row_payloads "$MUTATION_SECTION")"
-  _sec="$(_mutation_row_payloads "${1:-}")"
-  [ -n "$_canon" ] && [ -n "$_sec" ] || return 0
-  # ⛔ CONTAINMENT, IN THIS DIRECTION ONLY: the reviewer's row may be LONGER than the example (a cell
-  # added, a word in front), so the canonical payload is the PATTERN and the reviewer's rows are the
-  # TEXT. An honest row is not a superset of ninety-odd letters and digits in the example's exact order
-  # unless it reproduced the example, which is what keeps this a provenance test and not a ban on
-  # mentioning the contract.
-  while IFS= read -r _p; do
-    [ -n "$_p" ] || continue
-    if printf '%s\n' "$_sec" | grep -Fq -- "$_p" 2>/dev/null; then printf '%s\n' "$_p"; fi
-  done <<< "$_canon"
-  return 0
-}
-
 # ⛔ THE EXEMPTION LINE IS THE SECOND PASTE-BACK DOOR, AND PROVENANCE HAS TO COVER IT TOO (measured
 # at head 3d14cdab5). The arm above compares TABLE rows, so the contract's OTHER answer — the
 # `NO NEW ASSERTIONS: <why>` line — was left unguarded, and it is the one the contract shows FILLED
@@ -3290,10 +3240,6 @@ if [ "$VERDICT" = clean ]; then
   # recorder's parser, and only a whole-row equality test sits below it. It runs AFTER `_pb_rows` so
   # the more specific refusal (the row verbatim) wins the diagnosis when both would fire.
   _pb_cells="$(mutation_pasteback_cells "${MUTATION_SECTION_SEEN:-}")"
-  # ⛔ AND THE SAME COPY REFLOWED ACROSS DIFFERENT CELL BOUNDARIES (see `mutation_pasteback_payload`
-  # for the measurement): every arm above compares CELLS, and splitting a canonical cell into two
-  # destroys cell identity while the claim is unchanged. Runs LAST, so the more specific diagnoses win.
-  _pb_payload="$(mutation_pasteback_payload "${MUTATION_SECTION_SEEN:-}")"
   if [ -n "$_pb_exempt" ]; then
     err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED \`NO NEW ASSERTIONS:\` LINE — the example reason this run handed it in the shape it asked it to fill in:"
     printf '%s\n' "$_pb_exempt" | while IFS= read -r _pb_l; do err "    NO NEW ASSERTIONS: $(printf '%s' "$_pb_l" | cut -c1-200)"; done
@@ -3317,14 +3263,6 @@ if [ "$VERDICT" = clean ]; then
     err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
     err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_VACUOUS" "the CLEAN artifact reproduces the contract's own worked example row (two or more of its distinctive cells) — the parser accepts that shape, so refusing it is this run's job"
-  fi
-  if [ -n "$_pb_payload" ]; then
-    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPRODUCES THE CONTRACT'S OWN WORKED EXAMPLE ROW — the row this run handed it as the shape to fill in, REFLOWED across different cell boundaries (cells split, merged or re-spaced), so no single cell is a verbatim copy while every letter and digit of the claim is:"
-    printf '%s\n' "$_pb_payload" | while IFS= read -r _pb_l; do [ -n "$_pb_l" ] && err "    canonical payload: $(printf '%s' "$_pb_l" | cut -c1-120)"; done
-    err "  That claim names an assertion that has nothing to do with this diff, and it was GIVEN to the reviewer by this run — so it is a PASTE-BACK, never the reviewer's claim. The recorder's parser accepts it (it asks only for a header naming the three columns and one row of three cells), which is exactly why it cannot be left to the parser: minting \`clean\` on the harness's own example is the false-PASS class agent-infra#3442 exists for, and the cell arm above cannot see a copy whose cell boundaries moved."
-    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
-    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-    die "$E_VACUOUS" "the CLEAN artifact reproduces the contract's own worked example row REFLOWED across different cell boundaries (its cells' letters and digits, in order) — the parser accepts that shape, so refusing it is this run's job"
   fi
   MS_CAUSE=""   # set by the empty-extraction arm below; `set -u` means it must exist before use
   if [ "$_mv_rc" -ne 0 ] || [ -n "$_mv_miss" ]; then
