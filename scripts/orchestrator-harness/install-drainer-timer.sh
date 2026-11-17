@@ -53,12 +53,70 @@
 #             4 --status: the service and/or the timer is MISSING, so this box dispatches NOTHING
 #             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
 #             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
-#             dispatches at cannot be DETERMINED (no pin and an unreadable `ExecStart` script), which
-#             is named as unknown rather than silently graded clean.
+#             dispatches at cannot be DETERMINED — no pin and an unreadable `ExecStart` script, a pin
+#             whose value is not a number of seconds, a pin line systemd would REJECT (an
+#             unterminated quote makes systemd abandon the line), a directive that moves the environment
+#             BEHIND `Environment=`, or a SYSTEM unit the manager could not report (`systemctl cat` — the
+#             only source that merges every drop-in directory) — named as unknown rather than
+#             silently graded clean.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
+# ⛔ THE `Environment=` GRAMMAR IS A SHARED LIBRARY, NOT A COPY (re-review of #4065, finding 1). This
+# installer reads the INSTALLED unit's `Environment=LANE_TIMEOUT` pin, and the disk reaper's installer
+# already owned a parser for exactly that grammar — with the measured defeats behind it (a quoted pin,
+# several assignments on one line, whitespace around the `=`, a `<unit>.d/*.conf` drop-in). Reading the
+# pin here with a single-line `grep` made the two readers disagree about the SAME unit, and this one
+# failed OPEN (rc 0 = "provably agrees with the seam") over a box dispatching at the old cap. One
+# definition, two callers: `scripts/lib/systemd-unit-parse.sh` documents the grammar and the
+# `!unparseable:` contract, and it is farmed (`pi-bootstrap/setup.sh`'s `lib_srcs`) so a cell resolves it.
+# ⛔ A MISSING LIBRARY IS FATAL: without `effective_env` the pin would resolve as empty, and empty is the
+# "no pin" branch — the false clean this file exists to remove, recreated by a missing file.
+SYSTEMD_UNIT_PARSE_LIB="$INFRA_ROOT/scripts/lib/systemd-unit-parse.sh"
+if [ ! -f "$SYSTEMD_UNIT_PARSE_LIB" ]; then
+    printf 'install-drainer-timer: ERROR — %s is missing; --status parses the installed pin with it and cannot grade this box without it\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2
+    exit 1
+fi
+# shellcheck source=scripts/lib/systemd-unit-parse.sh
+. "$SYSTEMD_UNIT_PARSE_LIB"
+command -v effective_env >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define effective_env\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ THE `ExecStart=` GRAMMAR IS THE SAME LIBRARY (round-2 re-review, P2). This verb's no-pin arm graded
+# the script named by the BASE unit file, so a drop-in that replaces `ExecStart=` was invisible and the
+# arm returned 0 over a unit systemd runs differently. A missing definition here would silently grade
+# NOTHING (the loop would see no ExecStart at all and report UNKNOWN), so it is fatal for the same reason
+# the `Environment=` reader's is: an unreadable grammar must not become a verdict.
+command -v effective_execstarts >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define effective_execstarts\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND SO IS THE HAZARD LIST (round-2 re-review, F1/F3). `env_compile_hazards` names the directives and
+# the raw-text constructs that move the environment BEHIND `Environment=` (`EnvironmentFile=`,
+# `UnsetEnvironment=`, `PassEnvironment=`, a C-style escape, a `%`-specifier) — each MEASURED as an rc 0
+# false clean in this verb. A cell farmed from an older lib would not define it, and treating that as
+# "no hazards" would recreate the false PASS silently, which is exactly the failure mode this file's
+# other two guards exist to prevent.
+command -v env_compile_hazards >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define env_compile_hazards\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND THE FILE BOUNDARY IS FATAL TOO (round-3 verification, F5 — MEASURED rc 0). `unit_text_from_files`
+# puts a `[]` boundary before each file, because systemd parses the unit and every drop-in SEPARATELY and
+# DROPS an assignment that precedes that file's first `[Section]` header (`src/shared/conf-parser.c:253`:
+# "Assignment outside of section. Ignoring."). A bare `cat` attached such a line to whatever section the
+# previous file ended in — a headerless drop-in claiming the seam over a stale base read "agrees", rc 0,
+# while systemd ran the base's 7200. Without this function the boundary silently disappears and that
+# false PASS returns, so a farmed older lib must refuse here rather than degrade quietly.
+command -v unit_text_from_files >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define unit_text_from_files\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND THE TARGET-AWARE RESOLVER IS FATAL (round-2 re-review P3, left open by round 3 and closed here).
+# `$UNIT_DIR/<unit>.d/*.conf` is ONE directory in a PRIORITY-ORDERED list: systemd also merges
+# `/run/systemd/system/<unit>.d` and `/usr/lib/systemd/system/<unit>.d` for a system unit
+# (systemd.unit(5): drop-ins are read "from `<unit>.d/` directories in all the directories searched for
+# unit files"). A hand-placed drop-in in any of those was invisible here, so `--status` certified a cap
+# systemd does not dispatch at — the same false PASS as the drop-in this round already taught the reader
+# to consult, one directory over. Only the manager knows the merged answer.
+# A farmed lib that predates `unit_text_effective` must REFUSE rather than fall back to the file-only
+# read: the fallback is exactly the false clean this guard exists to remove.
+command -v unit_text_effective >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define unit_text_effective\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -179,6 +237,26 @@ render() { # <template> <dest>
     mv -f "$tmp" "$2"
 }
 
+# execstart_script <one effective ExecStart command line> — the SCRIPT an interpreter invocation runs
+# (`/bin/bash <script> [args…]`), or empty when the line is not that shape.
+#
+# ⛔ EMPTY IS NOT "NO SCRIPT" — it is "this verb cannot read the script from the artifact", and every
+# caller here turns it into UNKNOWN (5), never into a clean. Deliberately narrow: the first word must be
+# a shell (`bash`, `/bin/bash`, `/usr/bin/bash`, `sh`, …), the second must be a literal path. A `bash -c
+# '…'` form puts the script INSIDE a string and a quoted path is not resolvable here, so both read as
+# unreadable rather than being guessed at — the fail-closed direction, and named as such in the output.
+execstart_script() {
+    printf '%s\n' "$1" | awk '
+        { line = $0
+          sub(/^[ \t]+/, "", line)
+          n = split(line, w, /[ \t]+/)
+          if (n < 2) exit
+          if (w[1] !~ /(^|\/)(ba)?sh$/) exit      # not a shell in program position
+          if (w[2] ~ /^-/) exit                   # `bash -c …`: the script is inside the string
+          if (w[2] ~ /^["\047]/) exit            # quoted path: not readable as a literal here
+          print w[2] }'
+}
+
 say_status() {
     local svc="$1" tmr="$2" installed want missing=0
     printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
@@ -209,12 +287,120 @@ say_status() {
     # installed/MISSING + timer state, so such a box read healthy. Print the pin beside the value this
     # checkout would render now, and WARN on a mismatch; exit 3 so an automated check can act on it.
     if [ -f "$UNIT_DIR/$svc" ]; then
-        # Last occurrence wins: systemd merges repeated `Environment=` lines and the last one is what the
-        # unit sees, so reading the first would vouch for a value the box does not use.
-        installed="$(grep '^Environment=LANE_TIMEOUT=' "$UNIT_DIR/$svc" 2>/dev/null \
-                     | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
+        # ⛔ ONE LINE SHAPE IS NOT "THE PIN" (re-review of #4065, finding 1 — verified). This reader was
+        # `grep '^Environment=LANE_TIMEOUT='`, a SPELLING match, and it was the FAIL-OPEN arm of this
+        # verb: every spelling below is LEGAL systemd and every one of them read as "the unit carries no
+        # pin", which falls through to the `ExecStart=` grading below and exits 0 — published as
+        # "provably agrees with the seam" (docs/ops/ai-drainer.md) — over a box dispatching at the old
+        # cap. The `ExecStart=` reader below fails SAFE (rc 5); this one failed OPEN, in the one verb
+        # whose whole purpose is making a stale pin visible.
+        #
+        #     Environment="LANE_TIMEOUT=7200"          (quoted — systemd.exec(5) `Environment=`)
+        #     Environment=HOME=/x LANE_TIMEOUT=7200    (several assignments on one line)
+        #     Environment = LANE_TIMEOUT=7200          (whitespace around the key and the `=`)
+        #     <unit>.service.d/*.conf                  (parsed AFTER the unit, so it WINS)
+        #
+        # ⛔ SO THE PIN IS READ WITH THE SAME PARSER THE DISK REAPER'S READ-BACK USES, not with a second
+        # one that can disagree with it about the same unit (`scripts/lib/systemd-unit-parse.sh`; a
+        # reader anchored on one line shape is exactly the "#1872 shape" of two readers of one fact). It
+        # normalises indentation, whitespace and both quote styles, takes several assignments per line,
+        # applies last-assignment-wins (`Environment=` repeats MERGE, the last wins), honours a bare
+        # `Environment=` RESET, and reports a line systemd would REJECT as `!unparseable:` instead of
+        # guessing at its value. The unit is fed in first and its drop-ins after it, in systemd's own
+        # order, so a drop-in's override is what this verb grades.
+        local unit_text envmap unparsed installed want pin_unreadable=0 hazards
+        # ⛔ ONE FILE AT A TIME, WITH A BOUNDARY BETWEEN THEM (round-3 verification, F5 — MEASURED rc 0).
+        # This used to be a bare `cat` of the unit and then its drop-ins, which is not the text systemd
+        # reads: the manager parses each file SEPARATELY and DROPS an assignment that appears before that
+        # file's first `[Section]` header (`v257 src/shared/conf-parser.c:253`: "Assignment outside of
+        # section. Ignoring."), while the concatenation attached it to whatever section the previous file
+        # ended in. MEASURED false CLEAN at `c4edfd1fd`: base `[Service] Environment=LANE_TIMEOUT=7200` +
+        # a headerless drop-in `Environment=LANE_TIMEOUT=36000` read "pin: 36000 s installed · agrees",
+        # **rc 0**, over a box systemd dispatches at 7200 — the same false PASS this whole round is about,
+        # in the one file the reader is allowed to consult. `unit_text_from_files` (the shared lib) emits
+        # each file behind a `[]` boundary, which no reader honours and which systemd, by construction,
+        # never sees.
+        # ⛔ THE UNIT IS READ FROM THE SOURCE THAT IS TRUTHFUL FOR THIS TARGET, NOT FROM `$UNIT_DIR`
+        # (round-2 re-review P3, left open by round 3 and closed here — MEASURED on the sibling reader).
+        # This read was `unit_text_from_files "$UNIT_DIR/$svc" "$UNIT_DIR/$svc.d"/*.conf`, which is ONE
+        # directory in a PRIORITY-ORDERED list. systemd also merges `/run/systemd/system/<unit>.d` and
+        # `/usr/lib/systemd/system/<unit>.d` (systemd.unit(5): drop-ins are read "from `<unit>.d/`
+        # directories in all the directories searched for unit files"), and for a user unit the
+        # higher-priority user dirs too — so an operator's drop-in in any of those was invisible and this
+        # verb certified a cap the box does not dispatch at. That is the false PASS the whole round is
+        # about, one directory over, and it is the same fact `install-disk-reaper-timer.sh` already
+        # resolved with `systemctl cat`: the resolver is now ONE definition in the shared lib
+        # (`unit_text_effective`), so the two readers this PR unifies cannot disagree about one unit.
+        # ⛔ A MANAGER THAT CANNOT ANSWER IS NOT "NO DROP-IN": for a system unit the fail-closed answer is
+        # UNKNOWN (5), because an unreadable merge is indistinguishable from an empty one. For a user
+        # unit the installed file plus its own `<unit>.d` is still a truthful source (that directory IS
+        # the user config dir the manager just failed to list), so it falls back there. The `override`
+        # target — the documented test seam — reads the files, exactly as before.
+        unit_text=""
+        if ! unit_text="$(unit_text_effective "$SYSTEMCTL" "$TARGET" "$UNIT_DIR" "$svc")"; then
+            printf '  ⚠️  UNREADABLE UNIT: this target (%s) needs `%s cat %s` to report the unit systemd actually loads —\n' "$TARGET" "$SYSTEMCTL" "$svc"
+            printf '      drop-ins are merged from every directory in systemd search path, so the copy under %s is\n' "$UNIT_DIR"
+            printf '      not the whole unit and an unreadable answer cannot be told from "no drop-in". The cap this box\n'
+            printf '      dispatches at is UNKNOWN, not healthy: re-run `%s cat %s` and fix the failure.\n' "$SYSTEMCTL" "$svc"
+            return 5
+        fi
+        # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` MAKES THE CAP UNCERTIFIABLE, AND
+        # THIS VERB USED TO GRADE IT ANYWAY (round-2 re-review, F1/F3 — both MEASURED at rc 0). The pin
+        # map below is a reading of `Environment=` and of nothing else, while systemd compiles the
+        # environment from SEVERAL sources (`systemd.exec(5)`: `Environment=`, then `EnvironmentFile=`, then
+        # `PassEnvironment=`, and `UnsetEnvironment=` "as the final step", so "the later source … wins"):
+        #
+        #     EnvironmentFile=/…/lane.env   (that file: LANE_TIMEOUT=7200)
+        #     Environment=\x4CA\x4EE_TIMEOUT=7200     (systemd expands \x4C→L, \x4E→N: a 7200 pin)
+        #
+        # both read here as "36000 s installed … agrees" and exited **0** over a box at 7200. The family
+        # is the one `scripts/cell-self-pin.sh` refuses BY NAME (`ENV_MUTATING_DIRECTIVES`) and closes at
+        # the raw-text boundary, and the check now lives in the shared lib so both callers inherit it.
+        #
+        # ⛔ UNKNOWN (5) OUTRANKS THE GRADING BELOW, IN BOTH DIRECTIONS: a hazard means the `Environment=`
+        # map is NOT the environment systemd compiles, so no value taken from it — a matching pin, a stale
+        # pin, or the absence of one — can be certified. This is not the harmless direction: reporting a
+        # STALE pin whose override we cannot read would send an operator to re-render a unit that is
+        # already right, and reporting CLEAN is the false PASS this whole verb exists to remove.
+        #
+        # ⛔ AND A MISSING ARM IS NOT A SILENT PASS: a hazard the lib cannot report is worth nothing, so
+        # the lib guard at the top of this file refuses to run without it (fail-closed, like its siblings).
+        hazards="$(env_compile_hazards "$unit_text")"
+        if [ -n "$hazards" ]; then
+            printf '  ⚠️  UNREADABLE CAP: this unit (or one of its drop-ins) carries a directive that changes the\n'
+            printf '      environment BEHIND `Environment=`, so the value this box actually dispatches at cannot be\n'
+            printf '      certified from this file — systemd compiles the environment from several sources and the\n'
+            printf '      later one wins (`EnvironmentFile=`), `UnsetEnvironment=` clears a variable as the final\n'
+            printf '      step, and a `%%`-specifier or a C-style escape (`\\x4C` is `L`) can spell a variable name\n'
+            printf '      this reader cannot reconstruct:\n'
+            printf '%s\n' "$hazards" | sed -n 's/^/        /p'
+            printf '      A cap that cannot be certified is UNKNOWN, not healthy: re-render the pin in the unit with\n'
+            printf '      this installer (no arguments), or move the variable it sets out of the environment.\n'
+            return 5
+        fi
+        envmap="$(effective_env "$unit_text")"
+        unparsed="$(printf '%s\n' "$envmap" | sed -n 's/^!unparseable://p')"
+        case "$unparsed" in *LANE_TIMEOUT*) pin_unreadable=1 ;; esac
+        installed="$(printf '%s\n' "$envmap" | sed -n 's/^LANE_TIMEOUT=//p' | tail -1 | tr -d '\r')"
         want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
-        if [ -z "$installed" ]; then
+        case "${installed:-}" in
+        '')
+            # ⛔ A PIN NOTHING COULD RESOLVE IS ITS OWN STATE — UNKNOWN (5), NEVER "NO PIN" (re-review of
+            # #4065, finding 1). `LANE_TIMEOUT` is mentioned on an `Environment=` line that systemd would
+            # REJECT (an unterminated quote: systemd returns EINVAL, logs, and ABANDONS the whole line,
+            # so the process starts WITHOUT it) — this box's cap is therefore UNKNOWABLE from the unit,
+            # and reporting it as absent would be the false clean this exit code exists to remove, one
+            # spelling over. ⛔ NOT a text grep for the name: a bare `Environment=` RESET legitimately
+            # CLEARS an earlier pin, and the shipped template carries the name in a COMMENT — both must
+            # still read as "no pin", so only the parser's own failure signal counts.
+            if [ "$pin_unreadable" -eq 1 ]; then
+                printf '  ⚠️  UNREADABLE PIN: an `Environment=` line in this unit names LANE_TIMEOUT but is not a line systemd\n'
+                printf '      would accept (unbalanced quotes), and systemd ABANDONS such a line — so the cap this box\n'
+                printf '      dispatches at is UNKNOWN, not healthy:\n'
+                printf '%s\n' "$unparsed" | sed -n 's/.*LANE_TIMEOUT.*/        Environment=\0/p'
+                printf '      Re-run this installer (no arguments) on this cell to re-render the pin.\n'
+                return 5
+            fi
             # ⛔ "NO PIN" IS NOT "CLEAN" (agent-infra#4034 review, P3). With no pin the unit dispatches at
             # the default COMPILED INTO THE SCRIPT ITS OWN `ExecStart=` NAMES — so a box whose `$O` tree
             # predates the seam keeps the OLD cap while the checkout, the docs and the suite all say the
@@ -223,39 +409,80 @@ say_status() {
             # the copy this checkout happens to hold), and decide on ITS literal. An ExecStart that is not
             # an ai-drainer.sh at all is named as UNKNOWN rather than being called clean — it is not
             # evidence of a stale cap, and it is not evidence of a fresh one either.
-            local exe have
-            exe="$(sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc" 2>/dev/null | tail -1 | tr -d '\r')"
-            have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
-                      "${exe:-/nonexistent}" 2>/dev/null | head -1)"
-            case "${have:-}" in ''|*[!0-9]*) have="" ;; esac
-            if [ -z "${exe:-}" ] || [ ! -f "${exe:-/nonexistent}" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
-                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
-                return 5
-            elif [ -z "$have" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s declares no readable default, so the cap this\n' "$exe"
-                printf '      box dispatches at is UNKNOWN; re-run this installer to pin it)\n'
-                return 5
-            elif [ "$have" != "$want" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "$have"
-                printf '      %s)\n' "$exe"
-                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "$have" "$want"
+            #
+            # ⛔ "THE UNIT" MEANS UNIT **+ DROP-INS**, IN SYSTEMD'S ORDER (round-2 re-review, P2 — verified).
+            # This read was `sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc"` — THE BASE FILE ALONE, on
+            # one spelling — while the `Environment=` reader three arms above already used the drop-in-aware
+            # `$unit_text`. So a `<unit>.service.d/*.conf` carrying `ExecStart=` + `ExecStart=/bin/bash
+            # <other script>` was INVISIBLE here: the arm graded the base file's script, printed "agrees with
+            # the … s this checkout would render" at :310 and returned 0 — a false clean in the verb whose
+            # exit code is the published contract, over a unit systemd runs differently. MEASURED on this
+            # fixture: base `ExecStart=/bin/bash <fresh>`, drop-in `ExecStart=` + `ExecStart=/bin/bash
+            # <stale 7200>` read **rc 0** before this change and **rc 3** after it. It is the same shape
+            # `install-disk-reaper-timer.sh` closed with `effective_execstarts` (a drop-in made the install
+            # print "verify: ExecStart + HOME read back", exit 0, over a unit that ran `/bin/true`). ⛔ AND
+            # THE CLAIM IT WAS PROPPING UP IS WITHDRAWN (round-2 re-review, F4): "closed in every spelling"
+            # was false at that head — four measured spellings outside this arm still exited 0 — so what
+            # this file asserts is the narrower thing it tests: the command is read from the text systemd
+            # parses, and a cap that CANNOT be certified is 5, never 0.
+            #
+            # Systemd's own semantics, not a last-line guess: `ExecStart=` is read from `$unit_text` by
+            # `effective_execstarts` from the SHARED parser (`scripts/lib/systemd-unit-parse.sh` — one
+            # definition, both callers), so a bare `ExecStart=` RESET (which is how a drop-in MASKS a unit)
+            # drops every earlier assignment, `ExecStart = /bin/bash …` normalises, and `Type=oneshot`'s
+            # several commands are ALL graded: a oneshot runs every one of them, so a stale cap in any of
+            # them is this box's stale cap. UNKNOWN (5) outranks clean but not stale: a script we cannot
+            # resolve is not evidence of a fresh cap, and a stale one among them is a definite finding.
+            local execs line exe have stale="" unknown="" fresh=""
+            execs="$(effective_execstarts "$unit_text")"
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                exe="$(execstart_script "$line")"
+                if [ -z "$exe" ] || [ ! -f "$exe" ]; then
+                    unknown="${exe:-$line}"; continue
+                fi
+                have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
+                          "$exe" 2>/dev/null | head -1)"
+                case "${have:-}" in ''|*[!0-9]*) unknown="$exe"; continue ;; esac
+                if [ "$have" != "$want" ]; then stale="$have $exe"; else fresh="$have"; fi
+            done <<<"$execs"
+            if [ -n "$stale" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "${stale%% *}"
+                printf '      %s)\n' "${stale#* }"
+                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "${stale%% *}" "$want"
                 printf '      the box keeps the old cap until this unit is re-rendered: re-run this installer\n'
                 printf '      (no arguments) on this cell.\n'
                 return 3
+            elif [ -z "$execs" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
+                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
+            elif [ -n "$unknown" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s names no script this verb can read (an\n' "$unknown"
+                printf '      ExecStart that is not `bash <script>`, or one whose script is missing), so the cap this box\n'
+                printf '      dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
             else
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$have" "$exe"
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$fresh" "${exe}"
                 printf '      agrees with the %s s this checkout would render)\n' "$want"
-            fi
-        else
+            fi ;;
+        *[!0-9]*)
+            # ⛔ THE SAME RULE FOR A VALUE THAT IS NOT A NUMBER OF SECONDS (re-review of #4065, finding 1).
+            # `LANE_TIMEOUT=abc` is a box whose cap is UNKNOWN: it is not evidence of a stale cap (so not
+            # 3) and it is certainly not evidence of a fresh one (so never 0). Naming it is the whole job.
+            printf '  ⚠️  UNREADABLE PIN: this unit sets LANE_TIMEOUT to `%s`, which is not a number of seconds. The seam\n' "$installed"
+            printf '      cannot compare against it, so the cap this box dispatches at is UNKNOWN, not healthy: re-run this\n'
+            printf '      installer (no arguments) on this cell to re-render the pin.\n'
+            return 5 ;;
+        *)
             printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
-        fi
-        if [ -n "$installed" ] && [ "$installed" != "$want" ]; then
-            printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
-            printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
-            printf '      (no arguments) on this cell.\n'
-            return 3
-        fi
+            if [ "$installed" != "$want" ]; then
+                printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
+                printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
+                printf '      (no arguments) on this cell.\n'
+                return 3
+            fi ;;
+        esac
     fi
     return 0
 }
