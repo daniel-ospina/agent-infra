@@ -2698,6 +2698,11 @@ fi
 # projection note above `MUT_DEC_AWK`), so a reviewer who REWRITES
 # the example row's wording into a different row has authored a row — at which point the row is
 # theirs to defend, which is what the block asks for.
+# ⛔ AND "REWORDED" IS NOT "EDITED": a copy that keeps the example's cells and adds one, drops one or
+# carries a word in front of the row is NOT reworded, and this whole-row equality test never saw it —
+# measured at head 7bff1388d and closed by the CELL-level arm below (`mutation_pasteback_cells`). The
+# two are one provenance test at two granularities, not two spellings of one rule: this one names the
+# row verbatim (the best diagnosis when it fires), that one catches the copies this one cannot.
 # ⛔ THE DECORATION IS NOT THE DEFENCE — THE CLAIM IS READ THROUGH THE RECORDER'S OWN DECORATION
 # GRAMMAR, IN ONE HOME (measured at c43c996c5, the third and fourth spelling of the same defect).
 # The parser (`brief-gate.sh --mutation-missing`) does not test the raw line: it expands indent in
@@ -2820,6 +2825,73 @@ mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the co
   printf '%s\n' "$sec" | grep -Fxf <(printf '%s\n' "$canon") 2>/dev/null || return 0
 }
 
+# ⛔ THE WHOLE-ROW COMPARISON ABOVE IS STILL ONE GRANULARITY TOO COARSE, AND THE GAP IS THE SAME FALSE
+# PASS IN THREE MORE SPELLINGS (measured at head 7bff1388d). It refuses a copy only while the copy
+# reproduces the row's text EXACTLY; the parser is far looser — it asks for a header naming the three
+# columns plus at least one row of >= 3 cells — so ONE edited cell keeps the shape. Measured on that
+# head, each of these is ACCEPTED by `brief-gate.sh --mutation-missing` (rc=0, EMPTY = the "accepted" answer) AND
+# missed by the whole-row arm, so each mints `clean` on the harness's own worked example, for a diff
+# that example says nothing about:
+#   • the worked row with one cell APPENDED (`| … | also verified |`) — a reviewer annotating the shape
+#     it was handed, which is exactly what the prompt invites it to think about;
+#   • the worked row with its last cell DROPPED — the ordinary outcome of pasting a 4-column example
+#     into a 3-column table (GFM requires the header and delimiter rows to carry the SAME number of
+#     cells, so a narrower table is the natural way a reviewer normalises the shape to its own);
+#   • the worked row PREFIXED with a word (`See: | `scripts/x.sh:120` … |`) — the leading text becomes
+#     the first cell, and the row is still >= 3 cells.
+# ⛔ THE DISCRIMINATOR IS PROVENANCE AT THE UNIT A REVIEWER ACTUALLY COPIES — THE CELL — NOT THE ROW'S
+# WHOLE TEXT. The contract's worked row has four cells and a copy keeps them, whatever it adds, drops
+# or re-decorates around them. So the canonical row's DISTINCTIVE CELLS (>= 12 letters/digits, which
+# drops the decoration-only ones such as `§A (i)`) are counted inside the reviewer's own cells, and TWO
+# of them is a copy. ONE can appear honestly — a reviewer may cite the example's file while saying why
+# it is not a claim — two cannot, and that floor is what keeps this a provenance test rather than a ban
+# on mentioning the contract at all. Rewording is still authored (the stated limit above is unchanged):
+# cells are compared on letters and digits, so decoration cannot launder a copy, and a cell the reviewer
+# reworded is the reviewer's.
+# ⛔ NO ENVIRONMENT KNOB: the two bounds are literals, not `$VAR`s with defaults, because a gate that
+# an ambient variable can widen is a gate an agent can defeat without touching this file (the
+# disable-it-by-ambient-env bypass class). The suite proves the arm is what refuses by MUTATING this
+# script's own thresholds in a copy, which is the shape §BP already uses.
+_mutation_canon_cells() { # <text> -> the DISTINCTIVE cells of its DATA rows, normalised, one per line
+  printf '%s\n' "${1:-}" | awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      if (_quoted) next                       # fenced / indented code: the parser refuses it itself
+      if (_claim !~ /\|/) next                # a table row (outer pipes are optional, as in GFM)
+      t = _cells(_claim)
+      if (t == "") next
+      sep = t; gsub(/[|: -]/, "", sep)
+      if (sep == "") next                     # the |---| rule is never a data row
+      # the COLUMN-NAMING header is shared by every honest table, so it is never evidence (the same
+      # exemption the whole-row arm makes)
+      if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
+      n = split(t, C, "|")
+      for (i = 1; i <= n; i++) {
+        c = C[i]; gsub(/[^a-z0-9]+/, "", c)
+        if (length(c) >= 12) print c           # decoration-only cells (`§A (i)`) never qualify
+      } }'
+}
+
+mutation_pasteback_cells() { # <section-text> -> the canonical cells the section REPRODUCES (empty =
+                             # authored); printed one per line, at most the two that decided it
+  local _canon _sec _c _hits="" _n=0
+  _canon="$(_mutation_canon_cells "$MUTATION_SECTION")"
+  _sec="$(_mutation_canon_cells "${1:-}")"
+  [ -n "$_canon" ] && [ -n "$_sec" ] || return 0
+  while IFS= read -r _c; do
+    [ -n "$_c" ] || continue
+    if printf '%s\n' "$_sec" | grep -Fxq -- "$_c" 2>/dev/null; then
+      _n=$((_n + 1))
+      _hits="$_hits$_c"$'\n'
+      # ⛔ THE FLOOR IS ENFORCED ON THE OUTPUT, NOT ON THE LOOP: `_hits` must stay EMPTY below two, or
+      # the arm refuses a reviewer that reproduces ONE canonical cell — the count is the discriminator,
+      # and emitting at n=1 would make the documented floor a comment rather than a rule (measured: it
+      # did exactly that in the first draft of this arm, which the widened-threshold mutant caught).
+      [ "$_n" -ge 2 ] && { printf '%s' "$_hits"; return 0; }
+    fi
+  done <<< "$_canon"
+  return 0
+}
+
 # ⛔ THE EXEMPTION LINE IS THE SECOND PASTE-BACK DOOR, AND PROVENANCE HAS TO COVER IT TOO (measured
 # at head 3d14cdab5). The arm above compares TABLE rows, so the contract's OTHER answer — the
 # `NO NEW ASSERTIONS: <why>` line — was left unguarded, and it is the one the contract shows FILLED
@@ -2870,11 +2942,31 @@ _mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTION
 
 mutation_pasteback_exempt() { # <section-text> -> the reviewer's LIVE exemption lines that ARE the
                               # contract's own worked exemption (empty when it authored its own)
-  local canon sec
+  local canon sec _ec _eh
   canon="$(_mutation_norm_exempt "$MUTATION_SECTION")"
   sec="$(_mutation_norm_exempt "${1:-}" --live-only)"
   [ -n "$canon" ] && [ -n "$sec" ] || return 0
-  printf '%s\n' "$sec" | grep -Fxf <(printf '%s\n' "$canon") 2>/dev/null || return 0
+  # ⛔ CONTAINMENT, NOT EQUALITY — the same granularity gap the row arm was measured to have: an
+  # EXTENDED copy (`"<the contract's reason>" — plus one more clause of its own`) is the canonical
+  # payload with more text after it, so an equality test misses it while the parser accepts the line
+  # (it only asks for a non-placeholder reason). Containment is safe in THIS direction and only this
+  # one: a reviewer's honest reason would have to contain the contract's ENTIRE example reason
+  # verbatim, which is a copy. The reverse test (a TRUNCATED copy) is deliberately NOT applied: a
+  # genuine reason that ends in the contract's own generic tail ("… and no executable assertion") is
+  # an authored sentence naming the files of THIS diff, and refusing it is a false block — the
+  # direction that costs a review, and the direction this file protects in every other arm.
+  # A payload shorter than 16 letters/digits is compared EXACTLY instead, because a short one could
+  # occur inside honest prose; the contract's own reason is 54.
+  while IFS= read -r _ec; do
+    [ -n "$_ec" ] || continue
+    if [ "${#_ec}" -ge 16 ]; then
+      _eh="$(printf '%s\n' "$sec" | grep -F -- "$_ec" 2>/dev/null)" || true
+    else
+      _eh="$(printf '%s\n' "$sec" | grep -Fx -- "$_ec" 2>/dev/null)" || true
+    fi
+    if [ -n "$_eh" ]; then printf '%s\n' "$_eh"; return 0; fi
+  done <<< "$canon"
+  return 0
 }
 
 # ── 5a4) THE RECORDER'S UNCONDITIONAL VETO ARMS ARE SCANNED HERE, BEFORE ANYTHING IS POSTED ────
@@ -3143,6 +3235,11 @@ if [ "$VERDICT" = clean ]; then
   # the contract's own example is a paste-back, not an attribution for this diff.
   _pb_rows="$(mutation_pasteback_rows "${MUTATION_SECTION_SEEN:-}")"
   _pb_exempt="$(mutation_pasteback_exempt "${MUTATION_SECTION_SEEN:-}")"
+  # ⛔ THE CELL-GRANULARITY ARM (see `mutation_pasteback_cells` for the measurement): a copy that ADDS
+  # a cell, DROPS its last cell, or is PREFIXED with a word is still the contract's worked row to the
+  # recorder's parser, and only a whole-row equality test sits below it. It runs AFTER `_pb_rows` so
+  # the more specific refusal (the row verbatim) wins the diagnosis when both would fire.
+  _pb_cells="$(mutation_pasteback_cells "${MUTATION_SECTION_SEEN:-}")"
   if [ -n "$_pb_exempt" ]; then
     err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED \`NO NEW ASSERTIONS:\` LINE — the example reason this run handed it in the shape it asked it to fill in:"
     printf '%s\n' "$_pb_exempt" | while IFS= read -r _pb_l; do err "    NO NEW ASSERTIONS: $(printf '%s' "$_pb_l" | cut -c1-200)"; done
@@ -3158,6 +3255,14 @@ if [ "$VERDICT" = clean ]; then
     err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
     err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_VACUOUS" "the CLEAN artifact's attribution row is the contract's own worked example, pasted back — the parser accepts that shape, so refusing it is this run's job"
+  fi
+  if [ -n "$_pb_cells" ]; then
+    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPRODUCES THE CONTRACT'S OWN WORKED EXAMPLE ROW cell for cell — the row this run handed it as the shape to fill in, with a cell added, dropped or a word in front of it:"
+    printf '%s\n' "$_pb_cells" | while IFS= read -r _pb_c; do [ -n "$_pb_c" ] && err "    canonical cell: $(printf '%s' "$_pb_c" | cut -c1-120)"; done
+    err "  Those cells ARE the contract's example (the assertion, the mutant and the observation it prints), and they were GIVEN to the reviewer by this run — so this is a PASTE-BACK, never a claim about THIS diff. The recorder's parser accepts it (it asks only for a header naming the three columns and one row of three cells), which is exactly why it cannot be left to the parser: minting \`clean\` on the harness's own example is the false-PASS class agent-infra#3442 exists for, and a whole-row equality test misses every copy that edits one cell."
+    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact reproduces the contract's own worked example row (two or more of its distinctive cells) — the parser accepts that shape, so refusing it is this run's job"
   fi
   MS_CAUSE=""   # set by the empty-extraction arm below; `set -u` means it must exist before use
   if [ "$_mv_rc" -ne 0 ] || [ -n "$_mv_miss" ]; then

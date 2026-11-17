@@ -126,6 +126,13 @@
 #      the seam, with the mutant that records it proving the arm is what refuses and an AUTHORED
 #      reason proving the arm refuses copies, not exemptions.
 #
+#   §BQ (#3987) PROVENANCE AT THE CELL, NOT AT THE ROW: the parser asks only for a header naming the
+#      three columns plus one row of >= 3 cells, so a copy that APPENDS a cell, DROPS its last cell or
+#      PREFIXES a word to the worked row is still accepted while a whole-row equality test never sees
+#      it. The seam counts the canonical row's distinctive CELLS instead, and refuses the EXTENDED
+#      exemption too — with authored controls proving both are provenance tests and the widened-arm
+#      mutant proving the arm is what refuses.
+#
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
 # proof of coverage.
@@ -3779,9 +3786,13 @@ err_has "REPUBLISHES THE CONTRACT'S OWN WORKED EXAMPLE ROW"; ck $? "  …and the
 err_has "PASTE-BACK"; ck $? "  …as the reviewer-side paste it is"
 # …and the SAME transcript proves the parser alone would have passed it: this is the measurement the
 # arm rests on, taken on the artifact the MUTANT below actually publishes.
+# ⛔ THE MUTANT REVERTS THE WHOLE PROVENANCE CAPABILITY, NOT ONE VARIABLE (the arm is two granularities
+# — the row verbatim, and the canonical CELLS — so bypassing only `_pb_rows` would leave §BQ's cell arm
+# refusing the same copy and the control would prove nothing). That is what this section claims: with
+# provenance gone, the parser accepts the paste-back and the record is minted.
 PB="$TMP/mutant-no-pasteback.sh"
 cp "$SRC" "$PB"; chmod +x "$PB"
-sed 's|^  _pb_rows=.*|  _pb_rows=""|' "$SRC" > "$PB"
+sed -e 's|^  _pb_rows=.*|  _pb_rows=""|' -e 's|^  _pb_cells=.*|  _pb_cells=""|' "$SRC" > "$PB"
 if cmp -s "$SRC" "$PB"; then
   fail "the paste-back mutation did not apply - this control proves NOTHING"
 else
@@ -4047,11 +4058,19 @@ run "$SRC" 2284
 [ "$(rc_of)" = "11" ]; ck $? "a QUOTE-wrapped paste-back of the worked ROW is REFUSED (rc=$(rc_of), want 11)"
 no_record; ck $? "  …nothing recorded on the harness's own row"
 
-# The internal mutant: drop ONLY the projection. If the refusal above came from the projection, this
-# copy must RECORD the quoted paste-back while the parser still accepts the artifact it publishes —
-# i.e. the false PASS measured end to end, on the bytes this seam would have posted.
+# The internal mutant: drop the provenance PROJECTION and the cell granularity it feeds, leaving the
+# shaped comparisons. If the refusals above came from those, this copy must RECORD the quoted paste-back
+# while the parser still accepts the artifact it publishes — i.e. the false PASS measured end to end, on
+# the bytes this seam would have posted. ⛔ It is a CAPABILITY mutant rather than a one-line one because
+# every provenance comparison now projects (the row's text, each CELL, and the exemption payload), so
+# reverting ONE of them still leaves two others refusing the copy — which is the property this whole
+# issue is about: a decorated copy is refused by the projection wherever it is applied.
 BP="$TMP/mutant-no-projection.sh"
-sed 's|gsub(/\[\^a-z0-9\][+]/, "", t)|t = t|; s|gsub(/\[\^a-z0-9\][+]/, "", low)|low = low|' "$SRC" > "$BP"
+sed -e 's|gsub(/\[\^a-z0-9\][+]/, "", t)|t = t|' \
+    -e 's|gsub(/\[\^a-z0-9\][+]/, "", low)|low = low|' \
+    -e 's|^  _pb_cells=.*|  _pb_cells=""|' \
+    -e 's|grep -F -- "$_ec"|grep -Fx -- "$_ec"|' \
+    "$SRC" > "$BP"
 if cmp -s "$SRC" "$BP"; then
   fail "the projection mutation did not apply - this control proves NOTHING"
 else
@@ -4078,6 +4097,103 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a QUOTED row that is the reviewer's OWN still records (rc=$(rc_of)) - decoration does not make an authored row a copy"
 reset
 # ══ end §BP ══
+
+# ── §BQ THE COPY THAT EDITS ONE CELL: PROVENANCE AT THE CELL, NOT AT THE ROW ──────────────────────
+# ⛔ MEASURED AT 7bff1388d — the SEVENTH, EIGHTH and NINTH spelling of the same false PASS, and the
+# class the whole-row arm structurally CANNOT see. `mutation_pasteback_rows` compares a row's WHOLE
+# text, while the parser (`brief-gate.sh --mutation-missing`) asks only for a header naming the three
+# columns plus ONE row of >= 3 cells — so a copy only has to keep the SHAPE. Measured on that head:
+#   • the worked row with ONE CELL APPENDED (`| … | also verified |`) — ACCEPTED (rc=0, empty);
+#   • the worked row with its LAST CELL DROPPED — the ordinary result of pasting a 4-column example
+#     into a 3-column table (GFM wants header and delimiter to carry the same number of cells) —
+#     ACCEPTED;
+#   • the worked row PREFIXED with a word (`See: | `scripts/x.sh:120` … |`) — the leading text becomes
+#     the first cell, the row is still >= 3 cells — ACCEPTED;
+#   • the worked EXEMPTION extended by one clause of the reviewer's own (`… assertion and one more
+#     clause`) — ACCEPTED, and an equality test on the payload misses it.
+# All four minted `clean` on the harness's own example text, for a diff it says nothing about. The arm
+# that closes them is provenance at the unit a reviewer actually copies — the CELL — plus containment
+# for the single-line exemption; each assertion below FIRST asks the recorder's own parser (a copy is
+# only a defect when the parser ACCEPTS it), then requires the seam to REFUSE, and the authored
+# controls keep this a provenance test rather than a ban on mentioning the contract.
+echo; echo "§BQ a copy that edits one CELL is still a copy — provenance at the cell, not the row"
+_bq_hdr='| assertion | mutant (the edit that reverts the fix) | reddened row | observed |'
+_bq_rule='|---|---|---|---|'
+# The three edited-cell copies, BUILT FROM THE REAL `--mutation-section` row (never retyped): only the
+# ONE edit each is made by this file, so the section cannot go stale as the contract changes.
+_bq_extra="${CANON_ROW%|*} | also verified |"
+_bq_drop="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ OFS="|"; $5=""; print }')"
+_bq_pref="See: ${CANON_ROW}"
+for _k in extra drop pref; do
+  _bq_ref="_bq_$_k"; _bq_row="${!_bq_ref}"
+  printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_row" > "$TMP/bq-$_k.md"
+  _bq_rc=0; _bq_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bq-$_k.md" 2>/dev/null)" || _bq_rc=$?
+  [ "$_bq_rc" -eq 0 ] && [ -z "$_bq_miss" ]; ck $? "the parser ACCEPTS the worked row with the '$_k' edit (rc=$_bq_rc, ='${_bq_miss:-<accepted>}') - measured, so this is a live hole, not a hypothetical"
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_row" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "11" ]; ck $? "  …and that '$_k' copy is REFUSED before anything is posted (rc=$(rc_of), want 11)"
+  no_comment; ck $? "    …nothing posted as a review artifact ('$_k')"
+  no_record; ck $? "    …and no record minted on the harness's own row ('$_k')"
+  err_has "REPRODUCES THE CONTRACT'S OWN WORKED EXAMPLE ROW"; ck $? "    …with the refusal naming the provenance ('$_k')"
+done
+unset _k _bq_row
+# The exemption's EXTENDED copy: the canonical payload with the reviewer's own clause after it.
+_bq_pay="${CANON_EXEMPT#NO NEW ASSERTIONS: }"
+_bq_ext="NO NEW ASSERTIONS: ${_bq_pay} and one more clause of my own"
+printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bq_ext" > "$TMP/bq-ext.md"
+_bq_rc=0; _bq_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bq-ext.md" 2>/dev/null)" || _bq_rc=$?
+[ "$_bq_rc" -eq 0 ] && [ -z "$_bq_miss" ]; ck $? "the parser ACCEPTS the worked exemption EXTENDED by a clause (rc=$_bq_rc, ='${_bq_miss:-<accepted>}')"
+reset; FIXTURE_NO_MUTATION=1
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bq_ext" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "  …and the EXTENDED copy of the worked exemption is REFUSED (rc=$(rc_of), want 11)"
+no_record; ck $? "    …nothing recorded on the harness's own reason"
+# ⛔ THE FALSE-BLOCK DIRECTION IS PROTECTED TOO, AND IT IS WHY THE TEST IS NOT SYMMETRIC: an honest
+# reason that ends in the contract's own GENERIC TAIL (`… and no executable assertion`) is an authored
+# sentence naming THIS diff's files, and a truncated-copy test would refuse it. Both authored controls
+# below must still RECORD.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — this diff touches the new contract section and no executable assertion.\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "an AUTHORED reason sharing the contract's generic tail still records (rc=$(rc_of)) - the arm refuses copies, not phrasing"
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n| `tests/review-pr/run.sh` §BQ — a cell-edited copy is refused | `_pb_cells=` emptied | §BQ (authored) | `RED`, rc=11 |\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "an AUTHORED row that merely NAMES the contract's files still records (rc=$(rc_of)) - the arm counts canonical CELLS, so citing them is not a copy"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+# ⛔ THE FLOOR ITSELF, DRIVEN: ONE canonical cell is NOT a copy. A reviewer may legitimately reuse the
+# example's OBSERVATION cell (the `❌ … REFUSED with 80 (got 0)`, rc=1 shape it prints) in a row of its
+# own; refusing that would be the false block this floor exists to prevent. The cell is taken from the
+# real contract row, so the arm is tested against the text it will actually meet.
+reset; FIXTURE_NO_MUTATION=1
+_bq_cell4="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ print $5 }')"
+printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n| `tests/review-pr/run.sh` §BQ — the cell floor is two | `mv x y` | §BQ (floor) |%s|\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_cell4" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "ONE canonical cell reused in an otherwise AUTHORED row still records (rc=$(rc_of)) - the floor is two, and it is enforced on the output"
+[ -f "$TMP/comment.md" ]; ck $? "  …because that artifact WAS posted (no refusal was taken)"
+unset _bq_cell4
+# The internal mutant: WIDEN the cell arm's floor in a COPY, leaving everything else intact (the
+# comparison, the projection and both other provenance arms). If the refusals above came from this arm,
+# the copy must RECORD the cell-edited paste-back while the recorder's parser still accepts the artifact
+# it publishes — the false PASS, measured end to end. The mutant is a FLOOR change and not a deleted
+# arm because a deleted arm would also remove the message, while the floor is what the arm's own
+# docstring promises: two canonical cells is a copy, one is not.
+BQ="$TMP/mutant-cell-arm.sh"
+sed 's/\[ "$_n" -ge 2 \] \&\& { printf/\[ "$_n" -ge 99 \] \&\& { printf/' "$SRC" > "$BQ"
+if cmp -s "$SRC" "$BQ"; then
+  fail "the cell-arm mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_extra" > "$TMP/reviewer-out"
+  run "$BQ" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT with the cell arm widened RECORDS the cell-edited paste-back (rc=$(rc_of)) - so the arm is what refuses it"
+  _bq_rc=0; _bq_miss=""
+  _bq_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _bq_rc=$?
+  [ "$_bq_rc" -eq 0 ] && [ -z "$_bq_miss" ]; ck $? "  …and the recorder's OWN parser ACCEPTS that posted artifact (rc=$_bq_rc, ='${_bq_miss:-<accepted>}') - the false PASS, measured"
+fi
+reset
+# ══ end §BQ ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
