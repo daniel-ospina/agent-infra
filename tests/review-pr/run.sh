@@ -3942,6 +3942,63 @@ run "$SRC" 2284
 reset
 # ══ end §BM ══
 
+# ── §BO THE DECORATION MATRIX: EVERY FORM THE PARSER ACCEPTS, THE ARM REFUSES ─────────────────────
+# ⛔ MEASURED AT c43c996c5, AND IT IS THE SAME FALSE PASS FOR THE THIRD AND FOURTH TIME. The paste-back
+# arms were written against the RAW line while the parser (`brief-gate.sh --mutation-missing`) reads it
+# through its own decoration grammar — indent in COLUMNS, fenced/4-column material QUOTED, then
+# BLOCKQUOTE markers stripped repeatedly, then one bullet. Two forms fell in the gap and both minted a
+# `clean` record on the harness's OWN example text:
+#   • `> - <the contract's worked exemption>` — the parser strips both and reads a LIVE exemption
+#     (ACCEPTED, rc=0); the arm's one-shot `[-+>]+` strip ate the `>` and stopped at the space, so the
+#     line never reached the comparison (MEASURED: arm MISSED, parser ACCEPTED);
+#   • a `>`-quoted table carrying the worked row — the parser strips the marker and counts the row
+#     (ACCEPTED); the arm skipped every line not starting with `|` (MEASURED: arm MISSED).
+# A fifth spelling test cannot close that class, so the arms now read through ONE mirror of the
+# parser's strip (`MUT_DEC_AWK`, scripts/review-pr.sh 5a3) and this section is a PROPERTY, not a list:
+# for EVERY decoration, ask the recorder's parser what it answers, and require the seam to REFUSE
+# whenever the parser ACCEPTS. A form the parser refuses is not asserted on (the parser refuses it; the
+# arm need not) — that is what keeps the property honest instead of a spelling list, and
+# `driven` is asserted so the section cannot silently degrade into an all-skipped no-op.
+echo; echo "§BO the decoration matrix — whatever the parser accepts, the arm must refuse"
+DECO_P=( "" "- " "**" "- **" "> " "> - " "- > " "> > " "   " $'\t' ">> - " )
+DECO_S=( "" "" "**" "**" "" "" "" "" "" "" "" )
+_drv_x=0; _drv_r=0
+for _i in "${!DECO_P[@]}"; do
+  _p="${DECO_P[$_i]}"; _s="${DECO_S[$_i]}"
+  printf -v _lbl '%q' "$_p"
+  # (a) the EXEMPTION line, in this decoration
+  printf '## MUTATION ATTRIBUTION\n\n%s%s%s\n\nCLEAN\n' "$_p" "$CANON_EXEMPT" "$_s" > "$TMP/bo-exempt.md"
+  _bo_rc=0; _bo_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bo-exempt.md" 2>/dev/null)" || _bo_rc=$?
+  if [ "$_bo_rc" -eq 0 ] && [ -z "$_bo_miss" ]; then
+    _drv_x=$((_drv_x + 1))
+    reset; FIXTURE_NO_MUTATION=1
+    printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s%s%s\n\nCLEAN\n' "$_p" "$CANON_EXEMPT" "$_s" > "$TMP/reviewer-out"
+    run "$SRC" 2284
+    [ "$(rc_of)" = "11" ]; ck $? "exemption decorated with ${_lbl}…${_s} is LIVE to the parser and REFUSED by the arm (rc=$(rc_of), want 11)"
+    no_record; ck $? "  …nothing recorded on the contract's own worked reason"
+  fi
+  # (b) the TABLE carrying the contract's worked row, in this decoration
+  { printf '%s| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n' "$_p"
+    printf '%s|---|---|---|---|\n' "$_p"
+    printf '%s%s\n' "$_p" "$CANON_ROW"; } > "$TMP/bo-rows.md"
+  printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$(cat "$TMP/bo-rows.md")" > "$TMP/bo-rows-artifact.md"
+  _bo_rc=0; _bo_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bo-rows-artifact.md" 2>/dev/null)" || _bo_rc=$?
+  if [ "$_bo_rc" -eq 0 ] && [ -z "$_bo_miss" ]; then
+    _drv_r=$((_drv_r + 1))
+    reset; FIXTURE_NO_MUTATION=1
+    { printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n'; cat "$TMP/bo-rows.md"; printf '\nCLEAN\n'; } > "$TMP/reviewer-out"
+    run "$SRC" 2284
+    [ "$(rc_of)" = "11" ]; ck $? "worked-row table decorated with ${_lbl} is LIVE to the parser and REFUSED by the arm (rc=$(rc_of), want 11)"
+    no_record; ck $? "  …nothing recorded on the contract's own worked row"
+  fi
+done
+# The property's own floor: both halves must have been DRIVEN, or every assertion above was skipped and
+# the section proves nothing (a matrix that silently empties is the no-op-gate shape this file refuses).
+[ "$_drv_x" -ge 7 ]; ck $? "the exemption matrix DROVE >= 7 parser-accepted decorations ($_drv_x) — a skipped matrix proves nothing"
+[ "$_drv_r" -ge 6 ]; ck $? "the worked-row matrix DROVE >= 6 parser-accepted decorations ($_drv_r) — a skipped matrix proves nothing"
+reset
+# ══ end §BO ══
+
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

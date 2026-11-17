@@ -2697,18 +2697,96 @@ fi
 # STATED LIMIT, in kind with the parser's own: this is an exact-text test, so a reviewer who rewrites
 # the example row's wording into a different row has authored a row — at which point the row is
 # theirs to defend, which is what the block asks for.
+# ⛔ THE DECORATION IS NOT THE DEFENCE — THE CLAIM IS READ THROUGH THE RECORDER'S OWN DECORATION
+# GRAMMAR, IN ONE HOME (measured at c43c996c5, the third and fourth spelling of the same defect).
+# The parser (`brief-gate.sh --mutation-missing`) does not test the raw line: it expands indent in
+# COLUMNS, skips 4+ columns as a quoted code block, tracks ``` / ~~~ fences with the CommonMark
+# closer rules, and then — in this order — strips BLOCKQUOTE markers repeatedly, strips leading
+# whitespace, and strips ONE bullet, before it decides whether a line is a live exemption or a table
+# row. Both normalisers below used to test the raw line instead (a `^|` prefix test for rows, and a
+# single `^[-+>]+` strip for the exemption), and that divergence is a FALSE PASS, measured:
+#   • `> | assertion | mutant | … |` + the contract's worked row (`>`-quoted table): the parser
+#     strips the marker and counts the row — ACCEPTED — while `_mutation_norm_rows` skipped every
+#     line not starting with `|`, so the paste-back arm saw no rows at all;
+#   • `> - NO NEW ASSERTIONS: docs-only — the diff touches `docs/ops/*.md` …` (the contract's worked
+#     reason behind a blockquote AND a bullet): the parser strips both and reads a LIVE exemption —
+#     ACCEPTED — while the one-shot `[-+>]+` strip consumed the `>` and stopped at the space, so the
+#     line never reached the comparison.
+# In both, `clean` was minted on the harness's OWN example text, for a diff the example says nothing
+# about: the same false-PASS class agent-infra#3442 exists for, through decorations the parser eats
+# and the arm did not. So the strip is written ONCE, as a mirror of that grammar, and both arms read
+# through it — the same one-home discipline this file applies to the veto list and the verdict
+# grammar. Fenced and indented material is marked QUOTED here for the same reason: the parser refuses
+# it on its own, and refusing an honest reviewer that quotes the SHAPE in a fence and then writes its
+# own row would be a false block.
+# STATED LIMIT, unchanged in kind: this mirrors the parser's decoration grammar, not its cell
+# arithmetic. `tests/review-pr/run.sh` §BO drives a decoration MATRIX through both and fails if any
+# form the parser ACCEPTS is missed here, so a future spelling of this bug cannot land silently.
+MUT_DEC_AWK='
+BEGIN { _fence = 0; _fencec = ""; _fencelen = 0 }
+# leading whitespace -> text after it; indent in COLUMNS (a TAB is the next 4-column stop)
+function _ws(l,   col, q, ln, c) {
+  col = 0; ln = length(l); q = 1
+  while (q <= ln) {
+    c = substr(l, q, 1)
+    if (c == " ") { col++; q++; continue }
+    if (c == "\t") { col += 4 - (col % 4); q++; continue }
+    break
+  }
+  _col = col
+  return substr(l, q)
+}
+# the parser’s cell read: split on |, undress each cell, drop empties, and drop a leading blockquote
+# marker that the parser itself leaves standing when the `>` follows the bullet (`- > | … |`) — that
+# character is decoration, never a cell of the reviewer’s claim.
+function _cells(l,   n, i, x, out, k, arr) {
+  n = split(l, arr, "|"); k = 0; out = ""
+  for (i = 1; i <= n; i++) {
+    x = arr[i]
+    gsub(/^[ \t`*_]+/, "", x); gsub(/[ \t`*_]+$/, "", x)
+    if (length(x) == 0) continue
+    x = tolower(x)
+    if (k == 0 && x == ">") continue
+    k++; out = out (k > 1 ? "|" : "") x
+  }
+  return out
+}
+# per-line preparation, in the parser’s own ORDER: indent -> fence state -> quoted? -> strip
+# blockquotes (repeatedly) -> strip leading whitespace -> strip ONE bullet.
+function _prep(line,   lrest, fc, flen, tail, k, r, bq) {
+  sub(/\r$/, "", line)
+  lrest = _ws(line); _ind = _col
+  if (_ind >= 4) { _quoted = 1; _claim = lrest; return }
+  if (match(lrest, /^(```|~~~)/)) {
+    fc = substr(lrest, RLENGTH - 2, 1); flen = 0
+    for (k = RLENGTH - 2; substr(lrest, k, 1) == fc; k++) flen++
+    tail = substr(lrest, k)
+    if (!_fence) { _fence = 1; _fencec = fc; _fencelen = flen }
+    else if (fc == _fencec && flen >= _fencelen && tail ~ /^[ \t]*$/) _fence = 0
+    _quoted = 1; _claim = ""; return
+  }
+  if (_fence) { _quoted = 1; _claim = lrest; return }
+  _quoted = 0
+  r = lrest
+  bq = 1
+  while (bq) bq = sub(/^[ \t]*>[ \t]?/, "", r)
+  sub(/^[ \t]+/, "", r)
+  sub(/^[-*+][ \t]+/, "", r)
+  _claim = r
+}
+'
 _mutation_norm_rows() { # <text> -> normalised table DATA rows (header/rule dropped), lowercased
-  printf '%s\n' "${1:-}" | awk '
-    { l = $0; sub(/\r$/, "", l)
-      if (l !~ /^[ \t]*\|/) next              # only table rows
-      gsub(/[`*_]/, "", l)                    # markdown decoration is not the claim
-      gsub(/[ \t]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l)
-      t = l; gsub(/[|: -]/, "", t)
-      if (t == "") next                       # the |---| rule is never a data row
-      low = tolower(l)
+  printf '%s\n' "${1:-}" | awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      if (_quoted) next                       # fenced / indented code: the parser refuses it itself
+      if (_claim !~ /\|/) next                # a table row (outer pipes are optional, as in GFM)
+      t = _cells(_claim)
+      if (t == "") next
+      sep = t; gsub(/[|: -]/, "", sep)
+      if (sep == "") next                     # the |---| rule is never a data row
       # the COLUMN-NAMING header is shared by every honest table (the contract teaches those names)
-      if (low ~ /assertion/ && low ~ /mutant/ && low ~ /reddened/) next
-      print low }'
+      if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
+      print t }'
 }
 mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the contract's worked row
   local canon sec
@@ -2743,21 +2821,18 @@ mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the co
 _mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTIONS:` payloads
   local _live=""
   [ "${2:-}" = "--live-only" ] && _live=1
-  printf '%s\n' "${1:-}" | _ME_LIVE="$_live" awk '
-    { l = $0; sub(/\r$/, "", l)
-      col = 0; ln = length(l); q = 1
-      while (q <= ln) {
-        c = substr(l, q, 1)
-        if (c == " ") { col++; q++; continue }
-        if (c == "\t") { col += 4 - (col % 4); q++; continue }
-        break
-      }
-      if (ENVIRON["_ME_LIVE"] == "1" && col >= 4) next   # indented code block: quoted, not the claim
-      rest = substr(l, q)
-      gsub(/[`*_]/, "", rest)                            # markdown decoration is not the claim
-      gsub(/[ \t]+/, " ", rest); sub(/^ /, "", rest); sub(/ $/, "", rest)
-      low = tolower(rest)
-      sub(/^[-+>]+[ \t]*/, "", low)                      # a bullet is still the line
+  printf '%s\n' "${1:-}" | _ME_LIVE="$_live" awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      # quoted (fenced / 4+ columns of indent) is not a live claim TO THE PARSER, so on the review-
+      # er’s side it is not one here either — while the CANON side reads it, because indentation is
+      # no protection against a copy that drops it.
+      if (ENVIRON["_ME_LIVE"] == "1" && _quoted) next
+      l = _claim
+      gsub(/[`*_]/, "", l)                               # markdown decoration is not the claim
+      gsub(/[ \t]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l)
+      low = tolower(l)
+      # ⛔ NO `[-+>]+` SHORTHAND HERE: the blockquote/bullet strip is `_prep`’s, in the parser’s own
+      # order. The one-shot form this replaces is what let `> - <the contract’s reason>` through.
       if (low !~ /^no new assertions[ \t]*:/) next
       sub(/^no new assertions[ \t]*:[ \t]*/, "", low)
       if (low == "") next
