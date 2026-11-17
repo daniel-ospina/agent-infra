@@ -133,6 +133,15 @@
 #      exemption too — with authored controls proving both are provenance tests and the widened-arm
 #      mutant proving the arm is what refuses.
 #
+#   §BS (#3987) THE EXEMPTION'S STATED LIMIT, MEASURED AND PINNED: an INTERIOR-EDITED copy of the
+#      worked `NO NEW ASSERTIONS:` reason (a word deleted, the first word changed, a word substituted,
+#      the opening dropped) or a TRUNCATED one RECORDS. That is the documented limit, not an
+#      oversight: the only rules that would refuse those shapes also refuse the natural phrasing of
+#      the SAME claim ("docs-only — the diff touches docs/ops/<this diff's file>.md"), which is a
+#      false block on an honest docs-only review. Both directions are asserted here — the copies
+#      record AND the honest phrasings record — so a future round cannot close the limit silently,
+#      and cannot "close" it into a gate that refuses the honest sentence it exists beside.
+#
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
 # proof of coverage.
@@ -4194,6 +4203,89 @@ else
 fi
 reset
 # ══ end §BQ ══
+
+# ── §BS THE EXEMPTION'S STATED LIMIT: AN INTERIOR-EDITED COPY RECORDS, AND THAT IS PINNED ────────
+# ⛔ THIS SECTION ASSERTS A RECORD, NOT A REFUSAL, AND THAT IS DELIBERATE (agent-infra#3987).
+# The provenance arms close every copy whose refusal is UNAMBIGUOUS: the fenced echo, the indented
+# one, the row verbatim, the row with a cell added / dropped / prefixed, the verbatim exemption and
+# the exemption EXTENDED by a clause. What they do NOT close is an exemption reason that is the
+# contract's worked example with an INTERIOR edit — one word deleted, the first word changed, one
+# word substituted, or its opening dropped — because every rule that would refuse those also refuses
+# the natural way an honest docs-only reviewer writes the SAME claim ("docs-only — the diff touches
+# docs/ops/<this diff's file>.md"). MEASURED through this seam at f4a345126, not through a helper
+# (the round that measured one ARM of the composition and "found" a hole the gate already refused is
+# why this drives `run`): all four edited shapes exit 0 and mint a record; the verbatim line exits 11;
+# and BOTH honest phrasings — the truncated one naming the glob, and the full one naming a real file —
+# exit 0 as well. So the boundary sits between "retyped exactly" and "edited", and a single-granularity
+# text rule cannot move it without taking the honest sentence with it: a word-run rule ("six contiguous
+# canonical words is a copy") refuses `docs-only — the diff touches docs/ops/self-healing-contract.md
+# and no executable assertion.`, which is an authored reason about THIS diff.
+# ⛔ WHY THE RESIDUAL IS ACCEPTED RATHER THAN CLOSED (the same judgement §BQ's floor makes one arm
+# over): the exemption names NO assertion. A pasted ROW mints a specific false claim — `scripts/x.sh:120`
+# was reverted by that mutant and went red — about an assertion this diff does not contain, which is the
+# fabricated-evidence class #3442 exists for. An edited EXEMPTION still says only "this diff adds no
+# assertion", which is the reviewer's judgement either way; no text rule can make that judgement
+# correct, because the recorder deliberately never looks at the diff. Refusing the honest sentence to
+# narrow a vague one is the false block this file pays for everywhere else.
+# ⛔ SO THIS IS A PIN, IN BOTH DIRECTIONS: a future round that ADDS a rule narrowing the limit reddens
+# the first four scenarios, and a future round that REFUSES the natural phrasing reddens the last two.
+# Neither can land silently, and neither can land claiming the other is unaffected.
+echo; echo "§BS the exemption's stated limit: an INTERIOR-EDITED copy records, and the honest phrasing does too"
+# Every shape is DERIVED from the contract's own text (`$CANON_EXEMPT`), never re-typed: a fixture that
+# re-spells the example becomes a second, drifting definition of the thing under test.
+_bs_del="$(printf '%s' "$CANON_EXEMPT" | sed 's/ touches / /')"
+_bs_fst="$(printf '%s' "$CANON_EXEMPT" | sed 's/docs-only/Documentation-only/')"
+_bs_sub="$(printf '%s' "$CANON_EXEMPT" | sed 's/ and no executable/ with no executable/')"
+_bs_pre="$(printf '%s' "$CANON_EXEMPT" | sed 's/^NO NEW ASSERTIONS: docs-only — //')"
+# The two honest phrasings a docs-only reviewer actually writes.
+_bs_glob="$(printf '%s' "$CANON_EXEMPT" | sed 's/ and no executable assertion\.$//')"
+_bs_real="$(printf '%s' "$CANON_EXEMPT" | sed 's|`docs/ops/\*\.md`|docs/ops/self-healing-contract.md|')"
+# A derivation that silently did not apply would make the loop below assert the CANONICAL line (already
+# refused) four times — every scenario green for the wrong reason. Tripwired, as the mutants are.
+_bs_bad=0
+[ "$_bs_del" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_fst" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_sub" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_pre" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_glob" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_real" != "$CANON_EXEMPT" ] || _bs_bad=1
+[ "$_bs_bad" -eq 0 ]; ck $? "all six shapes are DERIVED from the contract's own text (a no-op edit would assert the canonical line, already refused)"
+for _b in del fst sub pre; do
+  _bs_ref="_bs_$_b"; _bs_line="${!_bs_ref}"
+  printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bs_line" > "$TMP/bs-$_b.md"
+  _bs_rc=0; _bs_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bs-$_b.md" 2>/dev/null)" || _bs_rc=$?
+  [ "$_bs_rc" -eq 0 ] && [ -z "$_bs_miss" ]; ck $? "the parser ACCEPTS the worked reason with the '$_b' edit (rc=$_bs_rc, ='${_bs_miss:-<accepted>}') - so this is a live copy the arms do not read"
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'I edited the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bs_line" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  …and the '$_b' edit RECORDS (rc=$(rc_of)) - the STATED LIMIT, pinned: no rule close enough to refuse it leaves the honest phrasing alone"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "    …with a record minted ('$_b'): the limit is a recorded behaviour, not a broken arm"
+  err_not_has "PASTE-BACK"; ck $? "    …and no provenance refusal fired ('$_b'), so the arms behave exactly as documented"
+done
+unset _b _bs_ref _bs_line
+# The other side of the pin: the VERBATIM line must still be refused, by the provenance arm. Without
+# this, a round could "close the limit" by deleting the arm and leave the four scenarios above green.
+reset; FIXTURE_NO_MUTATION=1
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$CANON_EXEMPT" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "the VERBATIM worked reason is still REFUSED (rc=$(rc_of), want 11) - the limit is about EDITS, not about the arm being gone"
+no_record; ck $? "  …nothing recorded on the harness's own reason"
+err_has "REPUBLISHES THE CONTRACT'S OWN WORKED"; ck $? "  …with the refusal naming the provenance, so §BS's green asserts an arm that still exists"
+# ⛔ THE FALSE-BLOCK SIDE, ASSERTED BECAUSE IT IS THE REASON THE LIMIT EXISTS. Both sentences below
+# are authored claims about THIS diff: the first is the natural truncation (the diff touches the glob),
+# the second is the same claim with the file actually read named. A word-run or similarity rule narrow
+# enough to refuse the four edits above refuses these too, so these two are the tripwire that stops it.
+for _b in glob real; do
+  _bs_ref="_bs_$_b"; _bs_line="${!_bs_ref}"
+  reset; FIXTURE_NO_MUTATION=1
+  printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bs_line" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "an AUTHORED '$_b' reason still records (rc=$(rc_of)) - the FALSE BLOCK any narrower rule would take with it"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written ('$_b')"
+done
+unset _b _bs_ref _bs_line
+reset
+# ══ end §BS ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
