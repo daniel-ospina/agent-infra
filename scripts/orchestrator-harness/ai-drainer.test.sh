@@ -2059,10 +2059,16 @@ SC_EOF
   # ...and the DROP-IN both ways, because it is the case where reading the base file alone gives a
   # CONFIDENT WRONG answer rather than merely a missing one: stale base + fresh drop-in must read CLEAN,
   # fresh base + stale drop-in must read STALE.
+  # ⛔ EVERY FIXTURE BELOW CARRIES ITS `[Service]` HEADER, and after the round-2 F2 finding that is
+  # LOAD-BEARING, not decoration: `Environment=`/`ExecStart=` are honoured only in `[Service]`
+  # (systemd.exec(5): "The execution specific configuration options are configured in the `[Service]`,
+  # `[Socket]`, `[Mount]`, or `[Swap]` sections"), so a headerless fixture is a unit whose directives
+  # systemd IGNORES — it would measure the parser against an artifact the installer can never write, and
+  # that is exactly the section-blindness the arms at the end of this block now pin in both directions.
   grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
   printf 'Environment=LANE_TIMEOUT=%s\n' "${SEAM_T:?}" >>"$T4/units/eldato-ai-drainer.service"
   mkdir -p "$T4/units/eldato-ai-drainer.service.d"
-  printf 'Environment=LANE_TIMEOUT=7200\n' >"$T4/units/eldato-ai-drainer.service.d/override.conf"
+  printf '[Service]\nEnvironment=LANE_TIMEOUT=7200\n' >"$T4/units/eldato-ai-drainer.service.d/override.conf"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status reads a DROP-IN's pin, which systemd applies AFTER the unit and therefore WINS" \
@@ -2070,7 +2076,7 @@ SC_EOF
     "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
   grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
   printf 'Environment=LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
-  printf 'Environment="LANE_TIMEOUT=%s"\n' "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service.d/override.conf"
+  printf '[Service]\nEnvironment="LANE_TIMEOUT=%s"\n' "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service.d/override.conf"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: …and the drop-in wins in the OTHER direction too — a stale base overridden back to the seam reads CLEAN" \
@@ -2107,7 +2113,7 @@ SC_EOF
   check "installer: --status NAMES a non-numeric pin and exits 5 (a cap that cannot be compared is UNKNOWN, not STALE and not clean)" \
     '[ "$rc" -eq 5 ] && grep -q "UNREADABLE PIN" <<<"$out" && grep -q "abc" <<<"$out" && ! grep -q STALE <<<"$out"' \
     "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
-  printf 'ExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   # ⛔ AND "UNKNOWN" IS NOT "CLEAN" EITHER (agent-infra#4034 review, P3). Once the exit code is the
@@ -2127,7 +2133,7 @@ SC_EOF
   # One ExecStart and no pin: the shape a real no-pin unit has. (Appending to `svc.bak` would leave TWO
   # ExecStart lines, which systemd rejects for a Type=simple unit — a fixture should look like the
   # artifact it stands for, not like something the installer could never have written.)
-  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status grades an ABSENT pin against the unit's OWN ExecStart script, and is clean when they agree" \
@@ -2136,7 +2142,7 @@ SC_EOF
   # A one-line stand-in for the `$O` copy a pre-#4034 box still has: the reader below parses exactly this
   # line, so the fixture carries the shape and not a paraphrase of it.
   printf 'LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"\n' >"$T4/drainer-stale.sh"
-  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status WARNS and exits 3 when a NO-PIN unit's ExecStart script still carries the OLD compiled default" \
@@ -2149,9 +2155,9 @@ SC_EOF
   # `ExecStart=` a RESET — so a drop-in that masks the command is what systemd RUNS. The arm graded the
   # base file's script instead, printed "agrees with the … s this checkout would render" and returned 0.
   # MEASURED pre-fix on the fixture below: **rc 0** (the false clean this block removes); post-fix rc 3.
-  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
   mkdir -p "$T4/units/eldato-ai-drainer.service.d"
-  printf 'ExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" \
+  printf '[Service]\nExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" \
     >"$T4/units/eldato-ai-drainer.service.d/mask.conf"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
@@ -2160,8 +2166,8 @@ SC_EOF
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
   # ...and in the OTHER direction, so the arm is not simply 'a drop-in always reds': a drop-in that
   # overrides a stale base back to the seam is what systemd runs, and that box IS at the seam.
-  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
-  printf 'ExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" \
+  printf '[Service]\nExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" \
     >"$T4/units/eldato-ai-drainer.service.d/mask.conf"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
@@ -2173,12 +2179,110 @@ SC_EOF
   # syntax), so `ExecStart = /bin/bash <script>` is the SAME directive. The old reader matched only the
   # literal `^ExecStart=/bin/bash `, so this legal unit read as "names no readable script" — UNKNOWN (5)
   # — instead of being graded at all (measured pre-fix: rc 5, post-fix rc 3).
-  printf 'ExecStart = /bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf '[Service]\nExecStart = /bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status READS 'ExecStart = /bin/bash <script>' (whitespace around the '=' is legal systemd) and grades it" \
     '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` IS NOT A CERTIFIED PIN (round-2
+  # re-review, F1/F3 — every arm below was MEASURED at rc 0 before this change). The pin reader compiles
+  # `Environment=` and nothing else, while systemd builds the environment from SEVERAL sources and
+  # `systemd.exec(5)` makes the LATER one win: `Environment=`, then `EnvironmentFile=`, then
+  # `PassEnvironment=`, with `UnsetEnvironment=` applied "as the final step". A C-style escape or a
+  # `%`-specifier (`systemd.syntax(7)` Table 1; `\x4C` is `L`) rewrites a NAME, not just a value, so it
+  # can spell `LANE_TIMEOUT` on a line this text spells differently. In all of those the cap is
+  # UNKNOWABLE from the unit, so the honest verdict is UNKNOWN (5) NAMING the construct — never
+  # "36000 s installed … agrees" (rc 0) over a box dispatching at 7200.
+  #
+  # `EnvironmentFile=` is the shape an operator reaches for first, and the drop-in directory it is written
+  # in is the very one this reader now scans.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=%s\n' "${SEAM_T:?}" >>"$T4/units/eldato-ai-drainer.service"
+  printf 'LANE_TIMEOUT=7200\n' >"$T4/lane.env"
+  mkdir -p "$T4/units/eldato-ai-drainer.service.d"
+  printf '[Service]\nEnvironmentFile=%s\n' "$T4/lane.env" >"$T4/units/eldato-ai-drainer.service.d/envfile.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status REFUSES (5) when a drop-in sets the cap via EnvironmentFile=, which systemd applies OVER Environment= (pre-fix: rc 0 'agrees')" \
+    '[ "$rc" -eq 5 ] && grep -q "UNREADABLE CAP" <<<"$out" && grep -q "EnvironmentFile=" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -iE 'UNREADABLE|pin:' <<<"$out" | head -1)"
+  # ...and the SAME directive under a header systemd IGNORES is NOT a reason to refuse: an `[Install]`
+  # `EnvironmentFile=` does nothing, and refusing on it would be the section-blindness F2 is about, in
+  # the other direction (a false block on a unit that is exactly right).
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\n[Install]\nEnvironmentFile=%s\nWantedBy=timers.target\n' \
+    "$T4/drainer-fresh.sh" "${SEAM_T:?}" "$T4/lane.env" >"$T4/units/eldato-ai-drainer.service"
+  rm -rf "$T4/units/eldato-ai-drainer.service.d"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: an EnvironmentFile= under [Install] is a directive systemd IGNORES, so --status stays CLEAN (refusing would be a false block)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q "UNREADABLE CAP" <<<"$out"' \
+    "rc=$rc · $(grep -iE 'UNREADABLE|pin:' <<<"$out" | head -1)"
+  # ⛔ A PIN systemd IGNORES IS NOT A PIN (round-2 re-review, F2). `Environment=` is honoured in
+  # `[Service]` only (systemd.exec(5), quoted at the fixture header above), so this unit dispatches at
+  # the 7200 compiled into its `[Service]` script while the section-blind reader certified the `[Install]`
+  # pin at 36000 and exited 0. The section-aware reader grades the SCRIPT and exits 3.
+  printf '[Service]\nExecStart=/bin/bash %s\n[Install]\nEnvironment=LANE_TIMEOUT=%s\nWantedBy=timers.target\n' \
+    "$T4/drainer-stale.sh" "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status does NOT read a pin from [Install] — it grades the [Service] script's 7200 and exits 3 (pre-fix: rc 0 'clean')" \
+    '[ "$rc" -eq 3 ] && grep -q "carries no pin" <<<"$out" && grep -q "7200 s" <<<"$out" && ! grep -q "s installed" <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ...and the mirror, which red in the OTHER direction: a stale `Environment=` left in `[Unit]` behind a
+  # correct `[Service]` pin is a directive systemd does not read, so the box IS at the seam. The
+  # section-blind reader called it STALE (rc 3) and would have sent an operator to re-render a right unit.
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\n[Unit]\nEnvironment=LANE_TIMEOUT=7200\n' \
+    "$T4/drainer-fresh.sh" "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: …and a stale Environment= left in [Unit] is NOT read — the [Service] pin grades CLEAN (pre-fix: false STALE, rc 3)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ⛔ A BACKSLASH CONTINUATION IS ONE DIRECTIVE, NOT TWO LINES (round-2 re-review, F3 — MEASURED at rc 0
+  # before this change). systemd.syntax(7): "Lines ending in a backslash are concatenated with the
+  # following line while reading and the backslash is replaced by a space character", so the SECOND
+  # assignment on the joined directive wins and systemd hands the process 7200 — while a physical-line
+  # reader saw `HOME=/x` alone and reported "carries no pin … agrees" (rc 0). Read through the join, the
+  # pin is 7200 and the box is named STALE (3).
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=HOME=/x \\\nLANE_TIMEOUT=7200\n' \
+    "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status READS a pin written after a backslash CONTINUATION and exits 3 (pre-fix: rc 0 'carries no pin … agrees')" \
+    '[ "$rc" -eq 3 ] && grep -q "7200 s installed" <<<"$out" && grep -q STALE <<<"$out" && ! grep -q "carries no pin" <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ⛔ AND A C-STYLE ESCAPE SPELLS THE NAME (round-2 re-review, F3b — MEASURED at rc 0 before this change).
+  # systemd.syntax(7) Table 1: `\x4C` is `L` and `\x4E` is `N`, so `Environment=\x4CA\x4EE_TIMEOUT=7200` is
+  # a 7200 pin to the manager and an unknown variable to every reader here. A name this text cannot spell
+  # is not "no pin": it is UNKNOWN (5), naming the line.
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=\\x4CA\\x4EE_TIMEOUT=7200\nEnvironment=LANE_TIMEOUT=%s\n' \
+    "$T4/drainer-fresh.sh" "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status REFUSES (5) on a C-style escape that can spell LANE_TIMEOUT (pre-fix: rc 0 '36000 s installed')" \
+    '[ "$rc" -eq 5 ] && grep -q "UNREADABLE CAP" <<<"$out" && grep -qF 'x4CA' <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -iE 'UNREADABLE|pin:' <<<"$out" | head -1)"
+  # ...and a `%`-SPECIFIER is the same class: systemd expands `%h` to the manager user's home in
+  # `Environment=` values and in the `ExecStart=` command line, so the value this reader sees is not the
+  # value the service gets. (% is doubled here only because printf reads it as a format character.)
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\nEnvironment=HOME=%%h\n' \
+    "$T4/drainer-fresh.sh" "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status REFUSES (5) on a '%'-specifier, which systemd expands in Environment= (pre-fix: rc 0 'agrees')" \
+    '[ "$rc" -eq 5 ] && grep -q "UNREADABLE CAP" <<<"$out" && grep -qF "HOME=%h" <<<"$out"' \
+    "rc=$rc · $(grep -iE 'UNREADABLE|pin:' <<<"$out" | head -1)"
+  # ⛔ AND THE CONTROLS THAT KEEP THOSE ARMS HONEST: an ESCAPED QUOTE inside a quoted value is legal
+  # systemd AND read correctly here (the disk reaper's read-back has the same arm, and refusing it would
+  # be a false block with an untrue reason), so it must stay CLEAN rather than trip the hazard list.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=%s\nEnvironment="HOME=%s/h\\"ome"\n' "${SEAM_T:?}" "$T4" >>"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: an escaped quote in a quoted value is NOT a hazard — the pin still grades CLEAN (no false block)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q "UNREADABLE CAP" <<<"$out"' \
+    "rc=$rc · $(grep -iE 'UNREADABLE|pin:' <<<"$out" | head -1)"
   # ⛔ AND A BOX WITH NO UNIT AT ALL IS NOT HEALTHY (agent-infra#4034 review, P3 — verified). The whole
   # grading block is inside `if [ -f "$UNIT_DIR/$svc" ]`, so an empty unit dir printed `… MISSING` and
   # exited 0 — indistinguishable, to an automated check reading the published contract, from "the drainer

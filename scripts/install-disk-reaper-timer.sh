@@ -692,6 +692,11 @@ fi
 . "$SYSTEMD_UNIT_PARSE_LIB"
 command -v effective_env >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_env"; exit 1; }
 command -v effective_execstarts >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_execstarts"; exit 1; }
+# ⛔ AND THE HAZARD LIST (round-2 re-review, F1/F3). `env_compile_hazards` names the directives that move
+# the environment BEHIND `Environment=` and the raw-text constructs that can spell a variable name. It is
+# fatal for the same reason its siblings are: an undefined function would print nothing, "nothing" reads
+# as "no hazards", and this read-back would then certify a HOME a later source already replaced.
+command -v env_compile_hazards >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define env_compile_hazards"; exit 1; }
 
 # split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
 # group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token
@@ -893,7 +898,7 @@ argv_has_token() {
 }
 
 verify_installed_unit() {
-    local unit="" execs="" exec="" tokens="" rc=0 want_home="" got_home="" envmap="" ok=0 bad=""
+    local unit="" execs="" exec="" tokens="" rc=0 want_home="" got_home="" envmap="" hazards="" ok=0 bad=""
     if ! unit="$(service_effective_unit)"; then
         err "REFUSING to report this as installed: the installed unit could not be READ BACK from the"
         err "  $TARGET manager (\`$SC cat $UNIT_NAME.service\`). An unreadable artifact is not a"
@@ -950,6 +955,26 @@ verify_installed_unit() {
     # HOME is what `gh` resolves its auth from; the measured exit-3 class ("gh unavailable") is exactly
     # a service whose HOME is not the cell's home.
     want_home="$HOME"
+    # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` IS NOT A VERIFIED HOME EITHER
+    # (round-2 re-review, F1/F3 — the drainer's --status was measured at rc 0 through both). This read-back
+    # certifies `Environment=HOME=` from `effective_env`, but systemd compiles the environment from several
+    # sources (`EnvironmentFile=` OVERRIDES `Environment=`, `UnsetEnvironment=` clears a variable as the
+    # final step, `PassEnvironment=` imports the manager's) and a `\x43`-style escape or a `%`-specifier can
+    # spell a name this reader cannot reconstruct. So a unit carrying one of those can hand `gh` a HOME
+    # this verification never saw while still printing "verify: … read back" — the same false PASS the
+    # `!unparseable:` arm below removes, one construct over. The list lives in the shared lib so both
+    # callers read ONE definition of what systemd compiles.
+    hazards="$(env_compile_hazards "$unit")"
+    if [ -n "$hazards" ]; then
+        err "REFUSING: the installed unit carries a directive that changes its environment BEHIND the"
+        err "  Environment= lines this read-back can see (EnvironmentFile= / UnsetEnvironment= /"
+        err "  PassEnvironment=, or a `%`-specifier / C-style escape that can spell a variable name)."
+        err "  systemd applies those OVER or AFTER Environment=, so HOME — which is what gh resolves its"
+        err "  auth from — cannot be verified from this file:"
+        printf '%s\n' "$hazards" | sed -n 's/^/  /p' >&2
+        err "  Remove the directive from the unit (or its drop-ins), then re-run."
+        return 1
+    fi
     envmap="$(effective_env "$unit")"
     # ⛔ A LINE SYSTEMD WOULD REJECT IS NOT A VERIFIED HOME. Refuse and name it: an unbalanced quote
     # makes systemd drop that line (the service runs without the variable), so "verified" would be a

@@ -87,6 +87,14 @@ command -v effective_env >/dev/null 2>&1 \
 # the `Environment=` reader's is: an unreadable grammar must not become a verdict.
 command -v effective_execstarts >/dev/null 2>&1 \
     || { printf 'install-drainer-timer: ERROR — %s did not define effective_execstarts\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND SO IS THE HAZARD LIST (round-2 re-review, F1/F3). `env_compile_hazards` names the directives and
+# the raw-text constructs that move the environment BEHIND `Environment=` (`EnvironmentFile=`,
+# `UnsetEnvironment=`, `PassEnvironment=`, a C-style escape, a `%`-specifier) — each MEASURED as an rc 0
+# false clean in this verb. A cell farmed from an older lib would not define it, and treating that as
+# "no hazards" would recreate the false PASS silently, which is exactly the failure mode this file's
+# other two guards exist to prevent.
+command -v env_compile_hazards >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define env_compile_hazards\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -278,10 +286,44 @@ say_status() {
         # `Environment=` RESET, and reports a line systemd would REJECT as `!unparseable:` instead of
         # guessing at its value. The unit is fed in first and its drop-ins after it, in systemd's own
         # order, so a drop-in's override is what this verb grades.
-        local unit_text envmap unparsed installed want pin_unreadable=0
+        local unit_text envmap unparsed installed want pin_unreadable=0 hazards
         unit_text="$( { cat "$UNIT_DIR/$svc"
                         for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && cat "$_d"; done
                       } 2>/dev/null )"
+        # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` MAKES THE CAP UNCERTIFIABLE, AND
+        # THIS VERB USED TO GRADE IT ANYWAY (round-2 re-review, F1/F3 — both MEASURED at rc 0). The pin
+        # map below is a reading of `Environment=` and of nothing else, while systemd compiles the
+        # environment from SEVERAL sources (`systemd.exec(5)`: `Environment=`, then `EnvironmentFile=`, then
+        # `PassEnvironment=`, and `UnsetEnvironment=` "as the final step", so "the later source … wins"):
+        #
+        #     EnvironmentFile=/…/lane.env   (that file: LANE_TIMEOUT=7200)
+        #     Environment=\x4CA\x4EE_TIMEOUT=7200     (systemd expands \x4C→L, \x4E→N: a 7200 pin)
+        #
+        # both read here as "36000 s installed … agrees" and exited **0** over a box at 7200. The family
+        # is the one `scripts/cell-self-pin.sh` refuses BY NAME (`ENV_MUTATING_DIRECTIVES`) and closes at
+        # the raw-text boundary, and the check now lives in the shared lib so both callers inherit it.
+        #
+        # ⛔ UNKNOWN (5) OUTRANKS THE GRADING BELOW, IN BOTH DIRECTIONS: a hazard means the `Environment=`
+        # map is NOT the environment systemd compiles, so no value taken from it — a matching pin, a stale
+        # pin, or the absence of one — can be certified. This is not the harmless direction: reporting a
+        # STALE pin whose override we cannot read would send an operator to re-render a unit that is
+        # already right, and reporting CLEAN is the false PASS this whole verb exists to remove.
+        #
+        # ⛔ AND A MISSING ARM IS NOT A SILENT PASS: a hazard the lib cannot report is worth nothing, so
+        # the lib guard at the top of this file refuses to run without it (fail-closed, like its siblings).
+        hazards="$(env_compile_hazards "$unit_text")"
+        if [ -n "$hazards" ]; then
+            printf '  ⚠️  UNREADABLE CAP: this unit (or one of its drop-ins) carries a directive that changes the\n'
+            printf '      environment BEHIND `Environment=`, so the value this box actually dispatches at cannot be\n'
+            printf '      certified from this file — systemd compiles the environment from several sources and the\n'
+            printf '      later one wins (`EnvironmentFile=`), `UnsetEnvironment=` clears a variable as the final\n'
+            printf '      step, and a `%%`-specifier or a C-style escape (`\\x4C` is `L`) can spell a variable name\n'
+            printf '      this reader cannot reconstruct:\n'
+            printf '%s\n' "$hazards" | sed -n 's/^/        /p'
+            printf '      A cap that cannot be certified is UNKNOWN, not healthy: re-render the pin in the unit with\n'
+            printf '      this installer (no arguments), or move the variable it sets out of the environment.\n'
+            return 5
+        fi
         envmap="$(effective_env "$unit_text")"
         unparsed="$(printf '%s\n' "$envmap" | sed -n 's/^!unparseable://p')"
         case "$unparsed" in *LANE_TIMEOUT*) pin_unreadable=1 ;; esac

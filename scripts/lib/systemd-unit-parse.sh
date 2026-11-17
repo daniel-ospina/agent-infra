@@ -15,6 +15,15 @@
 # both callers, and a unit a caller cannot parse is REPORTED (`!unparseable:`) rather than guessed at.
 #
 # ── THE GRAMMAR (systemd.exec(5) `Environment=`; systemd.service(5) + systemd.unit(5) `ExecStart=`) ──
+# * A DIRECTIVE IS HONOURED IN ONE SECTION ONLY. systemd.exec(5): "The execution specific configuration
+#   options are configured in the `[Service]`, `[Socket]`, `[Mount]`, or `[Swap]` sections, depending
+#   on the unit type." For the `.service` files every caller here reads, that is `[Service]` — so an
+#   `Environment=` left under `[Unit]` or `[Install]` is a SILENT SKIP to systemd, not a pin, and
+#   grading it is the false PASS `scripts/cell-self-pin.sh:801-807` records as load-bearing
+#   ("SECTION-AWARE PARSING … a rule built on `directive` alone therefore reads a directive that does
+#   nothing as satisfied, which is a false PASS"). Both readers below are section-scoped, and a
+#   REPEATED `[Service]` header CONTINUES the section (it does not restart it), which is what systemd
+#   does.
 # * `Environment=` may appear many times; the assignments MERGE, and a LATER assignment of the SAME
 #   name wins. A bare `Environment=` (no value) RESETS the list to empty.
 # * One line may carry SEVERAL space-separated assignments: `Environment=HOME=/x LANE_TIMEOUT=7200`.
@@ -22,6 +31,19 @@
 #   escapes the next character (`Environment="A=/tmp/q\"uo"`). Quotes are NOT part of the value.
 # * Whitespace is allowed around the key and the `=` and before the value; lines may be indented:
 #   `  Environment = LANE_TIMEOUT=7200` is legal and means the same thing.
+# * LINES ENDING IN A BACKSLASH ARE CONCATENATED (systemd.syntax(7): "Lines ending in a backslash are
+#   concatenated with the following line while reading and the backslash is replaced by a space
+#   character"), and "When a comment line or lines follow a line ending with a backslash, the comment
+#   block is ignored". `normalize_unit_lines` performs BOTH — see the measured defeat at its definition.
+# * C-STYLE ESCAPES AND `%`-SPECIFIERS ARE NOT RECONSTRUCTED HERE, and pretending otherwise is how a
+#   name hides. systemd.syntax(7) Table 1: `\x43` is `C`, `\s` a space, `\n` a newline; and
+#   `Environment=` values and the `ExecStart=` command line both take `%` specifiers. So
+#   `Environment=\x4CA\x4EE_TIMEOUT=7200` is a `LANE_TIMEOUT=7200` pin to systemd and an unknown name
+#   to a line reader. The two escapes this file DOES read the way systemd does — `\"`, `\'` and `\\`
+#   inside quotes — are kept, and every OTHER `\` and every `%` is reported by
+#   `env_compile_hazards` so a caller refuses instead of certifying (`scripts/cell-self-pin.sh:838-848`
+#   closes the same boundary by refusing, "plus any future spelling built on the same two constructs,
+#   instead of enumerating them").
 # * An UNTERMINATED quote makes systemd return EINVAL, log, and ABANDON that line — the process
 #   starts WITHOUT those variables. So an unparseable line is not an empty value; it is a line whose
 #   content nobody can know, and `effective_env` prints `!unparseable:<rest of line>` for it so the
@@ -45,13 +67,44 @@
 # normalize_unit_lines — systemd's own reading of `Key = value`: strip indentation, strip whitespace
 # around the key and around the `=`, strip whitespace before the value. Everything else is preserved
 # verbatim, including an empty value (`NAME=`) and a comment line (which simply never matches a key).
+#
+# ⛔ IT ALSO JOINS CONTINUATIONS, because a physical-line reader cannot see the directive systemd reads.
+# systemd.syntax(7): a line ending in a backslash is "concatenated with the following line … and the
+# backslash is replaced by a space character", and a comment block after such a line is ignored. Being
+# blind to that is a MEASURED false clean (round-2 re-review, F3):
+#     Environment=HOME=/x \
+#     LANE_TIMEOUT=7200
+# is ONE directive whose SECOND assignment wins, while a physical-line reader saw `HOME=/x` alone and
+# certified "the unit carries no pin" at rc 0 over a box at 7200.
 normalize_unit_lines() {
-    sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
+    awk '
+        { sub(/\r$/, "") }
+        {
+            # a continuation is IN FLIGHT: a comment line is part of the ignored comment block, anything
+            # else is the line systemd is still reading (systemd.syntax(7), quoted at the header).
+            if (held) {
+                if ($0 ~ /^[ \t]*[#;]/) next
+                $0 = pending " " $0
+                held = 0
+            }
+            if ($0 ~ /\\$/) { pending = substr($0, 1, length($0) - 1); held = 1; next }
+            print
+        }
+        END { if (held) print pending }
+    ' | sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
 }
 
 # effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as
 # `NAME=VALUE` lines (one per variable, in first-assignment order, last assignment wins), plus one
 # `!unparseable:<rest of the line>` line per `Environment=` line whose quoting systemd would reject.
+#
+# ⛔ `[Service]` ONLY (see the header): `Environment=` in `[Unit]`/`[Install]` is a silent skip to
+# systemd, so reading it certifies a variable the process never gets — MEASURED in the round-2 re-review
+# (F2): `Environment=LANE_TIMEOUT=36000` under `[Install]` over a 7200-default script read rc 0, and its
+# mirror (a stale `Environment=` left in `[Unit]`) read a false STALE (rc 3).
+#
+# ⛔ WHAT THIS FUNCTION CANNOT SEE, `env_compile_hazards` REPORTS: `EnvironmentFile=`,
+# `UnsetEnvironment=`, `PassEnvironment=`, C-style escapes and `%`-specifiers.
 #
 # ⛔ THE `!unparseable:` LINES ARE THE POINT, not a debug aid: a caller that ignores them cannot tell
 # "this unit sets no such variable" from "this unit sets it on a line nothing can read", which is the
@@ -67,6 +120,8 @@ effective_env() {
             vals[name] = substr(tok, eq + 1)
             if (!(name in seen)) { seen[name] = 1; order[++n] = name }
         }
+        /^\[/ { s = substr($0, 2); sub(/\].*$/, "", s); sec = s; next }
+        sec != "Service" { next }                       # the section systemd honours these in
         /^Environment=/ {
             rest = substr($0, 13)
             if (rest == "") { n = 0; split("", order); split("", vals); split("", seen); next }
@@ -121,9 +176,81 @@ effective_env() {
 # re-review, P2): base `ExecStart=/bin/bash <fresh>`, drop-in `ExecStart=` + `ExecStart=/bin/bash
 # <stale>` read rc 0 "agrees with what this checkout would render" over a unit that runs the STALE
 # script. A second reader that can disagree with the first about the same unit is the #1872 shape.
+# ⛔ `[Service]` ONLY, for the same measured reason as `effective_env`: an `ExecStart=` under another
+# header is one systemd would not run, and grading it certifies the wrong command.
+#
+# ⛔ A `\` (other than the `\"`, `\'`, `\\` the splitter understands) or a `%` in the command line can
+# move the SCRIPT systemd resolves — `%h` is the manager user's home, `\x2F` is `/` — so a caller that
+# needs the script's identity must consult `env_compile_hazards` first. This function still returns the
+# literal text; it does not silently rewrite it.
 effective_execstarts() {
     printf '%s\n' "$1" | normalize_unit_lines | awk '
+        /^\[/ { s = substr($0, 2); sub(/\].*$/, "", s); sec = s; next }
+        sec != "Service" { next }
         /^ExecStart=$/ { n = 0; next }                  # a bare assignment RESETS the list
         /^ExecStart=/  { L[++n] = substr($0, 11); next } # 10 chars + 1: everything after `ExecStart=`
         END            { for (i = 1; i <= n; i++) print L[i] }'
+}
+
+# env_compile_hazards <unit text> — one line per construct that makes the COMPILED environment
+# impossible for a line reader to certify. EMPTY OUTPUT MEANS "the map above is the manager's"; a caller
+# that certifies a value while this prints anything is the false PASS these findings are about.
+#
+# ⛔ WHY THIS EXISTS AS ITS OWN FUNCTION AND NOT AS MORE PARSING. Each construct below changes the
+# environment BEHIND `Environment=` and cannot be reconstructed from the unit text alone:
+#
+#   1. `EnvironmentFile=`     — systemd READS the named file, and its variables OVERRIDE `Environment=`
+#                              (systemd.exec(5): "If the same environment variable is set by multiple of
+#                              these sources, the later source … wins", with `EnvironmentFile=` listed
+#                              after `Environment=`). MEASURED (round-2 F1): a drop-in carrying
+#                              `EnvironmentFile=<LANE_TIMEOUT=7200>` over a `LANE_TIMEOUT=36000` pin read
+#                              "36000 s installed" at rc 0 over a box systemd dispatches at 7200.
+#   2. `UnsetEnvironment=`    — "applied as the final step", so it can CLEAR a pin `effective_env` returns.
+#   3. `PassEnvironment=`     — imports names from the MANAGER's environment.
+#   4. a C-style escape (`\x4C`, `\s`) or a `%`-specifier — they rewrite NAMES as well as values, so the
+#                              variable the manager sets is not the one this text spells. MEASURED
+#                              (round-2 F3b): `Environment=\x4CA\x4EE_TIMEOUT=7200` is a 7200 pin to
+#                              systemd ("\x4C" is "L") and an unknown name here — a false clean at rc 0.
+#
+# These are the SAME family `scripts/cell-self-pin.sh` refuses by name (`ENV_MUTATING_DIRECTIVES`) and
+# closes at the raw-text boundary ("refusing a backslash in a directive closes BOTH, plus any future
+# spelling built on the same two constructs, instead of enumerating them"). This file is where that rule
+# has to land now that it is the ONE definition of "what systemd reads" — one list, both callers.
+#
+# ⛔ THE TWO ESCAPES A SPLITTER CAN HONESTLY HANDLE ARE NOT HAZARDS: `\"`, `\'` and `\\` mean exactly
+# what this repo's tokenisers make of them, so a quoted value containing an escaped quote stays
+# certifiable (the disk reaper has an arm for that line, and refusing it would be a false block with an
+# untrue reason). Every other backslash is uncertain — including one at end-of-line that the
+# continuation join could not consume.
+#
+# ⛔ SECTION-SCOPED, like the readers: `EnvironmentFile=` under `[Install]` is a directive systemd
+# IGNORES, and refusing on it would be the same section-blindness in the other direction.
+ENV_MUTATING_DIRECTIVES="EnvironmentFile UnsetEnvironment PassEnvironment"
+env_compile_hazards() {
+    printf '%s\n' "$1" | normalize_unit_lines | awk -v mut="$ENV_MUTATING_DIRECTIVES" '
+        # 1 = this line contains an escape or a specifier that can rewrite a variable NAME or the
+        # command systemd resolves. `\\"`, `\\047` and `\\\\` are the ones the splitter reads the way
+        # systemd does; anything else (\x43, \s, \n, a lone trailing `\`) is opaque.
+        function opaque_escape(s,   i, n, nx) {
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                if (substr(s, i, 1) != "\\") continue
+                if (i == n) return 1
+                nx = substr(s, i + 1, 1)
+                if (nx != "\"" && nx != "\047" && nx != "\\") return 1
+                i++
+            }
+            return 0
+        }
+        BEGIN { k = split(mut, M, " "); for (i = 1; i <= k; i++) mutator[M[i]] = 1 }
+        /^\[/ { s = substr($0, 2); sub(/\].*$/, "", s); sec = s; next }
+        sec != "Service" { next }
+        {
+            name = $0; sub(/=.*$/, "", name)
+            if (name in mutator)            { print $0; next }
+            if (name == "Environment" || name == "ExecStart") {
+                if (index($0, "%") > 0)     { print $0; next }
+                if (opaque_escape($0))      { print $0 }
+            }
+        }'
 }
