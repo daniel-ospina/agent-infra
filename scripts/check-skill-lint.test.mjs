@@ -176,19 +176,14 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  // ⛔ A FRESH EMPTY DIR, NEVER `os.tmpdir()` AS THE FIXTURE. `os.tmpdir()` is AMBIENT, not fixture:
-  // the arm asserts "there is no skills tree HERE", and it does not own what a shared runner happens
-  // to have left at /tmp. Measured on this repo's CI (`ci / unit-test`, run 44136099442 — the shared
-  // runner `gh-runner-ai-cell1-3`): a sibling job had left `/tmp/skills` behind, `resolveSkillsDir`
-  // found it, the run printed `0 SKILL.md files checked. 0 issue(s). Clean.` and the assertion red as
-  //   ❌ implicit no-dir → exit 0 …: The input did not match the regular expression
-  //      /No skills directory found/ … '0 SKILL.md files checked. 0 issue(s).\nClean.\n'
-  // on a head that does not touch this script at all — and the same arm has both a red and a green
-  // attempt on PR #4110 with nothing changed between them. An assertion about the absence of a
-  // skills tree must run in a directory the test created and owns; otherwise it reds a correct PR
-  // (fail-closed in the wrong direction, which the rail still reads as RED).
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-nodir-"));
-  const r = runLint([], dir);
+  // Hermetic: a FRESH unique dir, never os.tmpdir() itself. The shared temp root is
+  // ambient state — on the self-hosted runner a leftover `<tmp>/skills` from another
+  // job made the implicit resolution SUCCEED, so this arm read "0 SKILL.md files
+  // checked" instead of the no-directory message and `ci / unit-test` went red at
+  // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
+  // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
+  const r = runLint([], emptyCwd);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /No skills directory found/);
 });
