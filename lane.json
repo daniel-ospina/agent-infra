@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-13143-1794897004-p1790929-e07d315e",
+  "_sha": "87b156f07a511c7fc1f432f9d05208b12f71e596",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/fix-13143.log"
+    },
+    {
+      "kind": "branch",
+      "value": "main"
+    },
+    {
+      "kind": "sha",
+      "value": "6916a6cd89d7193c6fde21e49e5a9f3b34d563ee"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 5947,
+  "ended_at": 1794902951,
+  "exit_code": 0,
+  "heartbeat_at": 1794902951,
+  "host": "cmux",
+  "issue": 13143,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-13143-1794897004-p1790929-e07d315e",
+  "lease_until": 1794939551,
+  "pid": 1790929,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794897004,
+  "state": "DONE",
+  "tag": "13143",
+  "worktree": "/home/cmux/tortoise"
+}
