@@ -16,13 +16,19 @@ Description=eldato controller watchdog every 5 minutes
 # "relative to when the unit the timer unit is activating was LAST ACTIVATED" (systemd.timer(5)), and this
 # service has never been activated, so there is no reference to measure from: `next_elapse=infinity`,
 # `LastTriggerUSec=` empty, and the timer never fires — while `systemctl` still reports it
-# `active (elapsed)`. Measured on cmux 2026-11-17 (18 h after the timer was enabled):
-#   eldato-controller-watchdog.timer  next_elapse=infinity  LastTriggerUSec=  service NEVER started
-#   eldato-objective-reminder.timer   next_elapse=infinity  LastTriggerUSec=  service NEVER started
-#   eldato-harness-apply.timer        next_elapse=18h12m    LastTriggerUSec=15:09:41Z   (CONTROL: fires)
-# The only difference is the `OnBootSec` the control has and these two lacked. That is precisely the
-# "watchdog with no clock" this unit's own service description exists to end — so the first elapse is
-# anchored to boot, and `OnUnitActiveSec` then carries the 5-minute cadence from each pass.
+# `active (elapsed)`. Measured on cmux 2026-11-17 (18 h after the timer was enabled), against a LIVE
+# control on the same box:
+#   eldato-controller-watchdog.timer  NextElapseUSecMonotonic=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-objective-reminder.timer   NextElapseUSecMonotonic=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-harness-apply.timer        CONTROL: `list-timers` LAST 15:40:33Z, NEXT 15:50:53Z (~10 min cadence)
+# ⛔ THE CONTROL IS NOT "IDENTICAL EXCEPT FOR ITS ANCHOR" — it is a different unit with a different Unit=,
+# cadence and RandomizedDelaySec. What is true and load-bearing is narrower: it is the only member of the
+# set that HAS an initial-elapse directive, it visibly fires, and the only setting that can produce
+# `infinity` is that directive (`AccuracySec`/`Persistent`/`RandomizedDelaySec` cannot — they shape WHEN a
+# scheduled pass lands, not whether one is ever scheduled). Quote its `list-timers` LAST/NEXT, never its
+# `NextElapseUSecMonotonic`: that field is monotonic-since-BOOT (18h33m here) and reads like "fires every
+# 18 h". That is precisely the "watchdog with no clock" this unit's own service description exists to end
+# — so the first elapse is anchored to boot, and `OnUnitActiveSec` carries the 5-minute cadence from each pass.
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=5min

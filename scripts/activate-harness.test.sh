@@ -295,27 +295,49 @@ export FX
 
 echo "activate-harness.test.sh"
 
-# ── T0: EVERY REPEATING TIMER TEMPLATE CARRIES A FIRST ELAPSE ─────────────────────────────────
+# ── T0: EVERY REPEATING TIMER TEMPLATE CARRIES A FIRST ELAPSE, INSIDE [Timer] ────────────────
 # `OnUnitActiveSec` is defined as "relative to when the unit the timer unit is activating was LAST
 # ACTIVATED" (systemd.timer(5)). A template that declares it with NO boot/active/calendar anchor has
 # nothing to measure the first elapse FROM: `next_elapse=infinity`, the service never starts, and
 # `systemctl` still reports the timer `active (elapsed)` — the inert-enforcer shape this whole file
 # exists to detect, sitting in the shipped templates rather than in a box's state.
 # MEASURED on cmux 2026-11-17, two shipped templates in exactly that state (18 h after enabling):
-#   eldato-controller-watchdog.timer  next_elapse=infinity  LastTriggerUSec=  service NEVER started
-#   eldato-objective-reminder.timer   next_elapse=infinity  LastTriggerUSec=  service NEVER started
-#   eldato-harness-apply.timer        next_elapse=18h12m    LastTriggerUSec=15:09:41Z  (control: fires)
-# The only difference was the `OnBootSec` the control had. This arm is static (no fixture): it reads the
-# templates, so it cannot be satisfied by a box that merely looks armed.
+#   eldato-controller-watchdog.timer  NextElapseUSecMonotonic=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-objective-reminder.timer   NextElapseUSecMonotonic=infinity  LastTriggerUSec=  service NEVER started
+#   eldato-harness-apply.timer        CONTROL, fires: `list-timers` LAST 15:40:33Z NEXT 15:50:53Z (~10 min
+#                                     cadence). ⛔ Do NOT quote its `NextElapseUSecMonotonic` as an interval:
+#                                     that field is monotonic-since-BOOT (18h33m), so it reads like "fires in
+#                                     18 h" and invites the opposite conclusion. The discriminating datum is
+#                                     `infinity` vs finite, and this control's is finite.
+# THIS ARM IS SECTION-AWARE, AND THAT IS THE POINT (review cycle 1, P2). A directive at column 0 in the
+# WRONG section is accepted by systemd's parser and then IGNORED — measured: `systemd-analyze verify` on
+# a template carrying `OnBootSec=5min` under `[Unit]` reports "Unknown key name 'OnBootSec' in section
+# 'Unit', ignoring." and the timer keeps `next_elapse=infinity`. A whole-file grep called that file
+# anchored, i.e. the gate was defeatable by exactly the edit its own author had already made once. So
+# every test below reads the `[Timer]` block only, and a cadence declared outside it is its own failure.
 TPL_SEEN=0
 for tpl in "$REPO"/templates/systemd/*.timer; do
     [ -f "$tpl" ] || continue
     grep -qE '^OnUnitActiveSec=' "$tpl" || continue
     TPL_SEEN=$((TPL_SEEN + 1))
-    if grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar=' "$tpl"; then
-        ok "T0 $(basename "$tpl") anchors its first elapse"
+    # ⛔ DIRECTIVES ONLY, ANCHORED. Two separate ways to be blind, both measured:
+    #   • a directive in the WRONG SECTION is parsed and IGNORED ("Unknown key name ... ignoring");
+    #   • a COMMENT that merely MENTIONS an anchor satisfies a substring match while systemd ignores it —
+    #     `eldato-runner-autoscale.timer`'s [Timer] block carries comment lines naming `OnCalendar=`, so a
+    #     substring match printed OK after its real `OnBootSec` was deleted. That regression was introduced
+    #     by this arm's own first rewrite and caught in review; the anchored `^` greps below are what close it.
+    TPL_SEC="$(awk '/^\[Timer\]/{f=1; next} /^\[/{f=0} f' "$tpl" | grep -Ev '^[[:space:]]*(#|;|$)')"
+    if ! printf '%s\n' "$TPL_SEC" | grep -qE '^OnUnitActiveSec='; then
+        bad "T0 $(basename "$tpl") declares OnUnitActiveSec OUTSIDE the [Timer] section — systemd IGNORES it, so the timer has no cadence at all"
+        continue
+    fi
+    if printf '%s\n' "$TPL_SEC" | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
+        ok "T0 $(basename "$tpl") anchors its first elapse inside [Timer]"
+    elif grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
+        # Same verdict, different defect — name it, or a reader cannot tell "deleted" from "misfiled".
+        bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
     else
-        bad "T0 $(basename "$tpl") declares OnUnitActiveSec with NO boot/active/calendar anchor — next_elapse=infinity, it can never fire"
+        bad "T0 $(basename "$tpl") declares OnUnitActiveSec in [Timer] with NO boot/active/calendar anchor anywhere — next_elapse=infinity, it can never fire"
     fi
 done
 # NON-VACUITY: a glob that matches nothing would make the loop above pass by not running.
