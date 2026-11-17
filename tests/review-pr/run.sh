@@ -2415,19 +2415,35 @@ chmod +x "$RESOLVE/only-home/home/.pi/agent/scripts/record-review.sh"
 cp "$SRC" "$RESOLVE/none/review-pr.sh"; chmod +x "$RESOLVE/none/review-pr.sh"
 
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+# ⛔ THESE THREE INVOKE THE COPIED SCRIPT DIRECTLY, NOT THROUGH `run()` — so they get the SAME
+# `AGENT_INFRA_PATH="$ROOT"` pin `run()` applies, and for the same reason (P1, fresh review). They
+# cannot go through `run()`: the whole point of §AY is that `REVIEW_PR_RECORD_SH` is UNSET so the
+# recorder RESOLUTION ladder is exercised, and `run()` injects a recorder. Without the pin the copied
+# `review-pr.sh` in `$RESOLVE/...` finds no `brief-gate.sh` in any ladder root (its own dir, its
+# `orchestrator-harness/`, `$AGENT_INFRA_PATH/scripts/orchestrator-harness` with the variable empty,
+# and a `$HOME/.pi/agent/scripts` that does not exist), so the seam dies at the PREFLIGHT with exit 9
+# `brief-gate.sh not found` — before the recorder is ever called — and the four `rc=0`/`record-argv`
+# assertions below fail on any box without `AGENT_INFRA_PATH`. That is CI: `ci.yml`'s `bash-suites`
+# step passes only `BASH_SHARD_SLICE`, `ci-main.yml` sets nothing, and `scripts/run-bash-shards.sh`
+# never exports it — measured: `env -u AGENT_INFRA_PATH bash tests/review-pr/run.sh` failed exactly
+# these four assertions (rc=9) at head 1eec75cf0. Pinning it here makes the scenarios test what their
+# captions claim (recorder RESOLUTION) instead of slice-order luck with a stray farmed gate.
 HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  AGENT_INFRA_PATH="$ROOT" \
   bash "$RESOLVE/sib/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
 [ "$(rc_of)" = "0" ]; ck $? "the SIBLING recorder is found with REVIEW_PR_RECORD_SH unset (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "  …and it is the one that was called"
 
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
 HOME="$RESOLVE/only-home/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  AGENT_INFRA_PATH="$ROOT" \
   bash "$RESOLVE/only-home/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
 [ "$(rc_of)" = "0" ]; ck $? "  …and \$HOME/.pi/agent/scripts/review-pr.sh finds its recorder in the SAME dir (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "    …which was called"
 
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
 HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  AGENT_INFRA_PATH="$ROOT" \
   bash "$RESOLVE/none/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
 [ "$(rc_of)" = "9" ]; ck $? "  …and with NEITHER, it refuses before paying for a review (rc=$(rc_of))"
 err_has "record-review.sh not found"; ck $? "    …naming the missing recorder"
@@ -3460,8 +3476,13 @@ reset
 printf '[P3] scripts/x.sh:9 — a non-blocking style nit (does not block)\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a CLEAN whose reviewer wrote the attribution section still records (rc=$(rc_of))"
-_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
-[ -z "$_miss" ]; ck $? "…and the POSTED artifact SATISFIES record-review.sh's own parser (--mutation-missing='${_miss:-<accepted>}') — so its mode-6 refusal is unreachable for this run"
+# ⛔ THE PREDICATE IS READ FOR BOTH ITS ANSWER AND ITS EXIT STATUS (P3, fresh review). Testing
+# stdout alone reads a validator that CANNOT ANSWER (a copy predating #3442 exits 78 with EMPTY
+# stdout) as "accepted" — the exact cannot-verify-is-a-pass shape this seam refuses at the pre-post
+# gate, and no assertion drove that arm: an empty answer and an answered-empty answer were the same
+# thing to this suite.
+_miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
+[ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "…and the POSTED artifact SATISFIES record-review.sh's own parser (rc=$_miss_rc, --mutation-missing='${_miss:-<accepted>}') — so its mode-6 refusal is unreachable for this run"
 grep -q '^## MUTATION ATTRIBUTION' "$TMP/comment.md" 2>/dev/null; ck $? "…the section is in the artifact with its heading intact"
 grep -qF 'the gate refuses an empty brief' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the REVIEWER's own rows, published verbatim (the claim is its own, never re-worded by this script)"
 grep -qF 'rc=80/rc=0' "$TMP/comment.md" 2>/dev/null; ck $? "…including the mutant column that names the edit reverting the behaviour"
@@ -3492,9 +3513,131 @@ reset; FIXTURE_MUTATION_EXEMPT=1
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a docs-only CLEAN records on the reviewer's 'NO NEW ASSERTIONS:' line alone (rc=$(rc_of))"
-_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
-[ -z "$_miss" ]; ck $? "  …the artifact satisfies the parser (='${_miss:-<accepted>}')"
+_miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
+[ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "  …the artifact satisfies the parser (rc=$_miss_rc, ='${_miss:-<accepted>}')"
 grep -q '^NO NEW ASSERTIONS: docs-only' "$TMP/comment.md" 2>/dev/null; ck $? "  …at COLUMN 0, so it is a live exemption and not a quoted code block"
+
+# ⛔ A FENCED ECHO IS QUOTED MATERIAL, NOT A CLAIM — AND THE EXTRACTOR MUST AGREE WITH THE PARSER
+# (P1, fresh review). This prompt now HANDS the reviewer a complete, copyable, already-valid row, so
+# "echo the shape back" is one keystroke away, and the extraction used to be fence-blind: it opened at
+# the last `## MUTATION ATTRIBUTION` line wherever it sat, its opening ``` fell OUTSIDE the extracted
+# range, and the quote was republished with the closing fence stripped back off — so the parser saw an
+# unfenced heading plus the harness's own worked row and ACCEPTED it. Measured on the pre-fix code:
+# rc=0 and a `clean` record minted on a row about `scripts/x.sh:120`, unrelated to the diff. That is
+# the false-PASS class #3442 exists for. NOTE the transcript below is EXACTLY the canonical block: it
+# is what a compliant-but-literal reviewer emits.
+reset; FIXTURE_NO_MUTATION=1
+cat > "$TMP/reviewer-out" <<'ECHO'
+I was given this shape, so here it is back:
+
+```markdown
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/x.sh:120` — the gate refuses an empty brief | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `REFUSED with 80 (got 0)`, rc=1 |
+```
+
+CLEAN
+ECHO
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a FENCED echo of the canonical block is NOT promoted to the claim (rc=$(rc_of), want 11)"
+no_comment; ck $? "  …so no artifact carrying a quoted row is posted"
+no_record; ck $? "  …and no record is minted on the harness's own example row"
+err_has "carries NO '## MUTATION ATTRIBUTION' section"; ck $? "  …and it is reported as the reviewer omission it is"
+
+# ⛔ AND A FENCE THAT IS NOT CLOSED BEFORE THE VERDICT SWALLOWS IT, so the whole transcript is
+# quoted: the extractor finds no LIVE heading and the seam fails CLOSED. The exact code is not pinned
+# here because TWO independent readers fence-read — the extractor refuses (11) when the verdict is
+# still live, and the verdict/marker reader refuses (6) when the verdict itself is inside the fence.
+# Both are refusals; pinning one would let this arm pass for the wrong reason.
+reset; FIXTURE_NO_MUTATION=1
+printf '```\n## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" != "0" ]; ck $? "an UNCLOSED fence above the heading keeps it quoted, so the run refuses (rc=$(rc_of))"
+no_record; ck $? "  …recording nothing on a block it cannot prove is live"
+# …and the same block with the fence CLOSED before the verdict (a pure quoted echo) is the exact
+# byte shape this PR made one keystroke away, and it must refuse as the reviewer omission it is.
+reset; FIXTURE_NO_MUTATION=1
+printf '```markdown\n## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n```\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a CLOSED fenced echo is quoted material, so the run refuses with 11 (rc=$(rc_of))"
+no_record; ck $? "  …recording nothing"
+
+# ⛔ THE CUT USES THE SEAM'S OWN VERDICT GRAMMAR (P3, fresh reviews). `**Verdict:** CLEAN` is a verdict
+# to VD_LABEL but matched neither arm of the old home-made `clean|issues` prefix cut, so the "verbatim
+# reviewer section" ran to EOF and republished the reviewer's verdict line — and, in a real transcript,
+# its marker block and this script's own status line — inside a block captioned as the reviewer's claim.
+reset; FIXTURE_NO_MUTATION=1
+# A LIVE (unfenced) section, cut by a labelled verdict line.
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/y.sh:5` — real | `mv guard` | `y.test.sh` §A | `RED`, rc=1 |\n\n**Verdict:** CLEAN — no blocking findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a live section cut by a labelled verdict line still records (rc=$(rc_of))"
+grep -qF '`tests/y.sh:5`' "$TMP/comment.md" 2>/dev/null; ck $? "  …the reviewer's own row is published"
+# ⛔ THE DISCRIMINATOR IS THE COUNT, NOT PRESENCE: the clean artifact opens with its OWN
+# `**Verdict:** CLEAN — no blocking findings.` line, so a presence test would pass on the PRE-FIX
+# code. One occurrence = only the artifact's own; two = the reviewer's was republished inside the
+# section because the cut grammar did not recognise the labelled verdict shape.
+_nv="$(grep -cF '**Verdict:** CLEAN' "$TMP/comment.md" 2>/dev/null || true)"
+[ "${_nv:-0}" = "1" ]; ck $? "  …and the reviewer's VERDICT LINE is not republished inside the verbatim section (occurrences=$_nv, want 1) — the cut grammar is the seam's own"
+# …and a BACKTICK-DECORATED marker cuts it too (MD_DEC in VD_MK_VERDICT).
+# The backticked marker pair sits BETWEEN the section and the verdict, which is the shape a reviewer
+# produces when it decorates the labels (MD_DEC exists precisely because models do). The fake appends
+# its own compliant marker after `CLEAN`, so the position anchor is satisfied and the ONLY question
+# left is where the CUT stopped.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/z.sh:5` — real | `mv guard` | `z.test.sh` §A | `RED`, rc=1 |\n`REVIEW_VERDICT`: CLEAN\n`FINDINGS_BLOCKING`: 0\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a live section cut by a backticked marker still records (rc=$(rc_of))"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'REVIEW_VERDICT'*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "  …and the marker block is not republished inside it either (the artifact never prints one)"
+
+# ⛔ THE VALIDATOR MUST BE ABLE TO REFUSE, OR ITS SILENCE IS NOT A PASS (P3, fresh review). `_mv_miss`
+# being EMPTY is the "accepted" answer, so a `brief-gate.sh` copy that answers empty for EVERYTHING
+# clears the pre-post gate for any artifact at all — an INERT gate that reports green. The canary is a
+# body the predicate MUST refuse, so it cannot be satisfied by the very bug that empties the real
+# answer. Driven with an AGENT_INFRA_PATH pointing at a fake tree that answers the section verbatim
+# and the predicate with nothing.
+reset
+FG="$TMP/fakegate"; mkdir -p "$FG/scripts/orchestrator-harness"
+bash "$GATE_SH" --mutation-section > "$TMP/mutsec.txt" 2>/dev/null
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'case "${1:-}" in\n'
+  printf '  --mutation-section) cat %s ;;\n' "$(printf '%q' "$TMP/mutsec.txt")"
+  printf '  *) exit 0 ;;\n'
+  printf 'esac\n'
+} > "$FG/scripts/orchestrator-harness/brief-gate.sh"
+chmod +x "$FG/scripts/orchestrator-harness/brief-gate.sh"
+# the script must be run from $TMP (self dir) so the ladder reaches AGENT_INFRA_PATH, not this tree
+cp "$SRC" "$TMP/fakegate/review-pr.sh"; chmod +x "$TMP/fakegate/review-pr.sh"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" \
+  AGENT_INFRA_PATH="$FG" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  bash "$TMP/fakegate/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "11" ]; ck $? "a validator that answers EMPTY for a body it must refuse refuses the run (rc=$(rc_of), want 11)"
+err_has "cannot refuse anything"; ck $? "  …naming the inert validator rather than reporting a pass"
+no_comment; ck $? "  …posting nothing"
+no_record; ck $? "  …and recording nothing"
+
+# ⛔ THE PRE-POST GATE READS THE BYTES THAT WILL BE POSTED, NOT THE FILE THEY WERE COMPOSED FROM (P3,
+# fresh review): `post_comment` publishes `redact_file`'s output, so a redaction edit that touched the
+# block was invisible to the gate while `record-review.sh` read the posted bytes. A secret value the
+# scrubber replaces with a token of a different word is the plainest such edit — here it lands in the
+# table header, and the recorder's parser (which requires the header to name the three columns) then
+# refuses the POSTED artifact. Pre-fix this run went rc=0 and posted it; pre-post it must refuse.
+reset
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" \
+  REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AGENT_INFRA_PATH="$ROOT" \
+  AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" FIXTURE_LEAK_TOKEN="assertion" \
+  bash "$SRC" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "11" ]; ck $? "a REDACTION that breaks the block is caught before it is posted (rc=$(rc_of), want 11)"
+err_has "REDACTION"; ck $? "  …and the refusal names redaction, not the reviewer"
+no_record; ck $? "  …recording nothing"
 
 # THE OMISSION — the mode-6 defect itself: a reviewer that concluded CLEAN and printed the marker but
 # wrote no section. It must FAIL LOUDLY, NAME the block, post NOTHING and record NOTHING.
@@ -3549,8 +3692,8 @@ else
   run "$MG" 2284
   grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null
   ck $? "the MUTANT posts the clean artifact instead of refusing it (so the refusal is the gate's doing)"
-  _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)"
-  [ -n "$_miss" ]; ck $? "  …and record-review.sh's OWN parser refuses that posted artifact ('$_miss') — the exact silent refusal #3987 removed"
+  _miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
+  [ "$_miss_rc" -eq 0 ] && [ -n "$_miss" ]; ck $? "  …and record-review.sh's OWN parser refuses that posted artifact (rc=$_miss_rc, '$_miss') — the exact silent refusal #3987 removed"
 fi
 reset
 # ══ end §BK ══
