@@ -3024,7 +3024,7 @@ assert_eq "$GHOST_TRUST_SHIPPED" "3600" \
 assert_eq "$GHOST_REPROVE_SHIPPED" "43200" \
   "the gate SHIPS a 12 h re-prove interval — a proof is re-proven, never trusted forever"
 assert_eq "$QUEUE_MAX_PAGES_SHIPPED" "5" \
-  "the gate SHIPS a 5-page queue read (the page cap is a bound, not a knob a caller widens)"
+  "the gate SHIPS a 5-page queue read — 5 is the DEFAULT bound (CI_GATE_QUEUE_READ_MAX_PAGES can raise it, needing a measured queue depth: each page is one more list call per pass)"
 
 # ── (r1) A TRANSIENT CENSUS FAILURE IS RETRIED, NOT LOST (agent-infra#4085) ────────────────────
 # The measured shape: `net/http: TLS handshake timeout` on the runners read. One attempt per 300 s
