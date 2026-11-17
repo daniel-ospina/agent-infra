@@ -2714,6 +2714,21 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   refund_bailed_fixer 88 abc 0
   [ "$(cat "$O/state/fixcount-88" 2>/dev/null)" = "0" ] && [ ! -f "$O/state/needsfix-88-abc" ] && rc=0 || rc=1
   ck "a bail on an arm that deleted no findings marker does not invent one" $rc
+  # (b2) ⛔ THE REFUND GOES TO THE BUDGET THE BAILED SPAWN SPENT (fresh-context review, P2 —
+  # agent-infra#4120). The CONFLICT router books `state/conflictcount-<PR>` and leaves
+  # `conflictspend-<PR>-<head>`; the review/CI arms book `fixcount`. A refund that always decremented
+  # `fixcount` would either consume the review budget for a rebase that never ran, or leave a real
+  # conflict attempt spent for ever. Both directions are asserted: conflictcount drops, fixcount is
+  # UNTOUCHED, and the spend marker is consumed.
+  rm -f "$O/state/conflictspend-89-abc" "$O/state/conflictcount-89" "$O/state/fixbail-89-abc"
+  echo 2 > "$O/state/conflictcount-89"; echo 3 > "$O/state/fixcount-89"
+  : > "$O/state/fixbail-89-abc"; : > "$O/state/conflictspend-89-abc"
+  refund_bailed_fixer 89 abc 0
+  if [ "$(cat "$O/state/conflictcount-89" 2>/dev/null)" = "1" ] \
+     && [ "$(cat "$O/state/fixcount-89" 2>/dev/null)" = "3" ] \
+     && [ ! -f "$O/state/conflictspend-89-abc" ] && [ ! -f "$O/state/needsfix-89-abc" ]; then rc=0
+  else rc=1; echo "      conflict=$(cat "$O/state/conflictcount-89" 2>/dev/null) fix=$(cat "$O/state/fixcount-89" 2>/dev/null) spend=$([ -f "$O/state/conflictspend-89-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-89-abc" ] && echo yes || echo no)"; fi
+  ck "a bailed CONFLICT dispatch refunds the CONFLICT budget and leaves the repair budget alone" $rc
   # (c) NO bail marker -> nothing to refund. Non-vacuity: the refund is conditional on a real bail.
   echo 3 > "$O/state/fixcount-99"; refund_bailed_fixer 99 abc 1
   [ "$(cat "$O/state/fixcount-99" 2>/dev/null)" = "3" ] && [ ! -f "$O/state/needsfix-99-abc" ] && rc=0 || rc=1

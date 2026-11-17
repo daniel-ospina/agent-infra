@@ -470,9 +470,10 @@ drive_route() {
     V="$1"; MSTAT="${2:-}"; MERGE_AUTHORITY=rail; AUTHORITY_UNKNOWN=0
     MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
     SPAWN_OK="${5:-1}"; WT_DIR="$O/state"; WT_TABLE_TTL=0
-    # The conflict budget is `state/fixcount-<PR>`, seeded here so "N rounds already spent" is a
-    # fixture fact rather than something the drive has to reach by spawning N times.
-    case "${3:-0}" in ''|*[!0-9]*) : ;; *) [ "${3:-0}" -gt 0 ] && printf '%s\n' "$3" > "$O/state/fixcount-$PR" ;; esac
+    # The CONFLICT budget is `state/conflictcount-<PR>` (its OWN file — see the P2 note in the shipped
+    # arm), seeded here so "N rounds already spent" is a fixture fact rather than something the drive
+    # has to reach by spawning N times.
+    case "${3:-0}" in ''|*[!0-9]*) : ;; *) [ "${3:-0}" -gt 0 ] && printf '%s\n' "$3" > "$O/state/conflictcount-$PR" ;; esac
     # shellcheck disable=SC1090
     . "$HERE/worker-terminal.sh"
     cmux() {
@@ -763,12 +764,16 @@ drive 'FAILED:docs-lint' rail 0 1
   && ok "a red that is not a required check: nothing spawned, but the PR is NAMED (no silent red)" \
   || bad "a non-required red is still unattributed (acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';'))"
 
-# ⛔ THE THREE DRIVES ABOVE SPAWN, SO THEY CONSUME THE SHARED `fixcount-4242` AND LEAVE A `fixspend`
-# RECORD BEHIND (the defer arms they replaced changed no state at all). Each one therefore starts from
-# a cleared counter: without it the third drive reads an exhausted attempt cap and parks instead of
-# spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…` path (#709).
+# ⛔ THE THREE DRIVES ABOVE SPAWN, SO THEY CONSUME THE ATTEMPT BUDGET AND LEAVE A SPEND RECORD
+# BEHIND (the defer arms they replaced changed no state at all). ⛔ THE CONFLICT DRIVE CONSUMES
+# `state/conflictcount-4242`, the OTHERS `state/fixcount-4242` — the two budgets are separate files
+# since the #4120 review's P2 (one "hot" failure mode must not starve the other), so clearing only
+# one leaves the other's spend behind and a later drive reads a cap it never spent. Each drive
+# therefore starts from BOTH cleared: without it a drive reads an exhausted attempt cap and parks
+# instead of spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…`
+# path (#709).
 t5_clear() {
-  for _f in fixcount-4242 fixspend-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
+  for _f in fixcount-4242 conflictcount-4242 fixspend-4242-abc1234 conflictspend-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
     [ -e "$TMP/O/state/$_f" ] && mv "$TMP/O/state/$_f" "$TMP/state.spent.$_f.$RANDOM" 2>/dev/null
   done
   return 0
@@ -828,9 +833,21 @@ drive_route 'FAILED:ai-review-gate' CONFLICTING    # the measured production cas
   && ! grep -q 'ai-review-gate' "$LEDGER" \
   && ok "…its ONE disposition is a CONFLICTED act — no review-side row exists for that PR" \
   || bad "…the ledger carries a review-side disposition for a conflicting PR: $(head -2 "$LEDGER" 2>/dev/null | tr '\n' ';')"
-[ "$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null)" = "1" ] \
-  && ok "…and the rebase consumed exactly one round of the existing MAX_FIX_TRIES counter" \
-  || bad "…the round was not booked (state/fixcount-4242=$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null))"
+[ "$(cat "$TMP/O/state/conflictcount-4242" 2>/dev/null)" = "1" ] \
+  && ok "…and the rebase consumed exactly one round of the CONFLICT budget (its own counter)" \
+  || bad "…the round was not booked (state/conflictcount-4242=$(cat "$TMP/O/state/conflictcount-4242" 2>/dev/null))"
+# ⛔ THE CONFLICT BUDGET IS NOT THE REPAIR BUDGET (fresh-context review, P2 — agent-infra#4120). A PR
+# that spent `MAX_FIX_TRIES` on REVIEW/CI repairs used to arrive at the router already at cap and park
+# having attempted ZERO rebases — this drive is the measurement of that, and it is RED on the pre-fix
+# counter (which read `fixcount-4242` = 3 and parked).
+t5_clear; printf '3\n' > "$TMP/O/state/fixcount-4242"
+drive_route 'FAILED:ai-review-gate' CONFLICTING 0
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] \
+  && ok "a PR whose REVIEW/CI repair budget is exhausted still gets its rebase (separate budgets)" \
+  || bad "a review-exhausted PR was refused its FIRST rebase (acts=$(acts)): $(head -2 "$TMP/d.log" | tr '\n' ';')"
+[ "$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null)" = "3" ] \
+  && ok "…and the rebase does not spend the REVIEW budget (fixcount stays 3)" \
+  || bad "…the rebase charged the review budget (state/fixcount-4242=$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null))"
 # ── THE CONTROL, so "no review" above is a MEASUREMENT and not a dead rig ──────────────────────────
 # The same class, NOT conflicting: the review path must be live in this suite, or the assertion above
 # would pass against an arm that cannot dispatch anything.
@@ -864,10 +881,12 @@ t5_clear; drive_route 'GREEN' ''
   && ok "an UNREADABLE mergeable ('') is not a conflict — allow-list polarity, the row falls through" \
   || bad "an unreadable mergeable was treated as a conflict (route=$(cat "$TMP/route" 2>/dev/null))"
 # ── THE BOUND (acceptance #3): still conflicting after N rebases -> an EXISTING terminal state ─────
-# `lane-merge.sh`'s round-counter is the precedent: the counter is `state/fixcount-<PR>` (the SAME
-# file the review-gate and red-fixer arms book against) and the terminator is `park_ctrl`, which the
-# sweep's own parked-guard honours BEFORE any arm runs. The park is graded through the SHIPPED
-# `park_ctrl` (`$TMP/parkctrl.sh`), so "parked" means the file the guard reads actually landed.
+# `lane-merge.sh`'s round-counter is the precedent: the counter is a per-PR round file and the
+# terminator is `park_ctrl`, which the sweep's own parked-guard honours BEFORE any arm runs. The park
+# is graded through the SHIPPED `park_ctrl` (`$TMP/parkctrl.sh`), so "parked" means the file the guard
+# reads actually landed. ⛔ The file is `state/conflictcount-<PR>`, NOT `state/fixcount-<PR>`: the
+# review-gate and red-fixer arms book against that one, and sharing it parked a conflicting PR that had
+# merely spent its review budget (fresh-context review, P2 — driven above).
 t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 3
 [ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
   && ok "3 of 3 rebases spent: the router still claims the row (the bound is inside it)" \
@@ -878,10 +897,10 @@ t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 3
 [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
   && ok "…and it is PARKED at its head: the terminal state an operator already knows" \
   || bad "…no park landed at head abc1234 (state/parked-4242=$(cat "$TMP/O/state/parked-4242" 2>/dev/null))"
-grep -q 'still CONFLICTING after 3 fixes' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+grep -q 'still CONFLICTING after 3 rebases' "$TMP/O/state/parkreason-4242" 2>/dev/null \
   && ok "…the park NAMES the round count, so the reason is auditable" \
   || bad "…the park reason does not name the round count: $(head -c 160 "$TMP/O/state/parkreason-4242" 2>/dev/null)"
-grep -q 'PARKED (still CONFLICTING after 3 fixes)' "$TMP/d.log" 2>/dev/null \
+grep -q 'PARKED (still CONFLICTING after 3 rebases)' "$TMP/d.log" 2>/dev/null \
   && ok "…and the log line names the same fact" \
   || bad "…no PARKED log line: $(head -2 "$TMP/d.log" 2>/dev/null | tr '\n' ';')"
 [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] \
@@ -922,6 +941,7 @@ t5_clear
 mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/fixcount-4242" "$TMP/fixcount.t5b.end.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/conflictcount-4242" "$TMP/conflictcount.t5b.end.$RANDOM" 2>/dev/null || true
 
 
 echo

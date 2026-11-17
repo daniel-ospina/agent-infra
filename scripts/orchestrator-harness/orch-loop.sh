@@ -1812,12 +1812,24 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 # ai-review-gate arm, because that is the only arm that deletes the marker at spawn — the CI-red and
 # CONFLICTING arms never touch it, so restoring there would invent a findings record.
 refund_bailed_fixer() {
-  local pr="$1" head="$2" restore="${3:-0}" b f n
+  local pr="$1" head="$2" restore="${3:-0}" b f n cnt="fixcount"
   [ -n "${head:-}" ] || return 0
   b="$O/state/fixbail-$pr-$head"
   [ -f "$b" ] || return 0
   rm -f "$b"
-  f="$O/state/fixcount-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
+  # ⛔ WHICH BUDGET THE ATTEMPT CAME FROM IS A FACT ON DISK, NOT AN ARGUMENT (fresh-context review, P2,
+  # agent-infra#4120). This function is called by THREE arms and they no longer share one counter: the
+  # review-gate and CI-red arms spend the PR-lifetime `fixcount-<PR>`, the CONFLICT router spends its
+  # own `conflictcount-<PR>`. Refunding the wrong one is silent in both directions — a real attempt
+  # stays spent for ever, or an attempt is invented against a budget nothing booked — so the refund
+  # reads the marker the bailed SPAWN left, exactly as `fixspend` already proves the findings restore
+  # below. Each booking arm writes `<budget>spend-<PR>-<head>` at spawn and removes it on a failed
+  # spawn, so a marker present here means that budget was charged for this head.
+  if [ -f "$O/state/conflictspend-$pr-$head" ]; then
+    cnt="conflictcount"
+    rm -f "$O/state/conflictspend-$pr-$head"
+  fi
+  f="$O/state/$cnt-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
   is_num "$n" || n=0
   [ "$n" -gt 0 ] && n=$(( n - 1 ))
   echo "$n" > "$f"
@@ -1832,12 +1844,12 @@ refund_bailed_fixer() {
     if [ -f "$O/state/fixspend-$pr-$head" ]; then
       rm -f "$O/state/fixspend-$pr-$head"
       touch "$O/state/needsfix-$pr-$head"
-      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, findings marker restored" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n [budget state/$cnt-$pr], findings marker restored" >>"$LOG"
     else
-      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n [budget state/$cnt-$pr], NO findings marker restored (this dispatch consumed none)" >>"$LOG"
     fi
   else
-    echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n [budget state/$cnt-$pr]" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -2112,8 +2124,8 @@ review_ceiling_line() { # <pr> <head> <n> <max>
 }
 # [reviewround:end]
 
-# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*`
-# markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
+# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*` /
+# `conflictspend-*` / `conflictcount-*` markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
 # in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
 # listing it is never visited again, so its markers would live forever — the monotonic `state/` growth
 # this file rejects elsewhere. Delete-only, against the listing the cycle already read.
@@ -2143,7 +2155,7 @@ prune_orphan_markers() {
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/conflictspend-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -2154,7 +2166,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend|conflictspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
@@ -4553,8 +4565,14 @@ cascade_level() {
   # stubs `pr_owned` in `drive_block`/`drive_level`, so the suite cannot grade this cost.
   # The loop's fork headroom is itself a dispatch gate (agent-infra#2293).
   # ⛔ EVERY FIELD IS SANITISED BEFORE IT ENTERS THE STRING: the head must look like a git object id
-  # and the class must be one of the four the sweep writes, so a crafted row cannot forge a token
+  # and the class must be one of the classes the sweep writes, so a crafted row cannot forge a token
   # that matches some other PR (the same hardening `disp()` applies to its own record).
+  # ⛔ FIVE, NOT FOUR (fresh-context review, P3 — agent-infra#4120). The allow-list admitted
+  # GREEN/RED/PENDING/NOCHECKS only, so every `CONFLICTED` row the `[prclass]` block now writes was
+  # DROPPED here and its PR fell into the `*)` arm below — counted as REVIEW work (level 4) when the
+  # conflict router's own repair is level 3. An allow-list that omits a class the writer emits does
+  # not fail loudly, it silently re-labels the population: the rank `lo_order` sorts FIRST was written
+  # and then thrown away by the reader.
   # ⛔ LAST ROW WINS, NOT FIRST — AND IT IS THE FILE'S OWN DOCUMENTED RULE (`lo_class_compact`,
   # live-ownership.sh: *"keep only the LAST row per PR … last-row-wins is the same rule the ordering
   # read applies"*). The set below deduped instead, so when one head carried BOTH a GREEN and a RED
@@ -4570,7 +4588,7 @@ cascade_level() {
       NF >= 3 {
         p = $1; h = $2; c = $3
         if (p !~ /^[0-9]+$/) next
-        if (c != "GREEN" && c != "RED" && c != "PENDING" && c != "NOCHECKS") next
+        if (c != "GREEN" && c != "RED" && c != "PENDING" && c != "NOCHECKS" && c != "CONFLICTED") next
         if (h == "" || h ~ /[^A-Za-z0-9]/) next
         last[p SUBSEP h] = c          # LAST observation wins (the file is append-only)
         key[p SUBSEP h] = p ":" h
@@ -4589,8 +4607,15 @@ cascade_level() {
     n_u=$(( n_u + 1 ))
     # HEAD-BOUND: only a class observation of THIS head may decide the level.
     case "$cls_set" in
-      *" $pr:$sha:GREEN "*) n_m=$(( n_m + 1 )) ;;
-      *" $pr:$sha:RED "*)   n_f=$(( n_f + 1 )) ;;
+      *" $pr:$sha:GREEN "*)      n_m=$(( n_m + 1 )) ;;
+      *" $pr:$sha:RED "*)        n_f=$(( n_f + 1 )) ;;
+      # ⛔ A CONFLICT IS A REPAIR, SO IT IS LEVEL 3's WORK, NOT LEVEL 4's (fresh-context review, P3).
+      # `mergeable=CONFLICTING` is orthogonal to the check surface, so the row can carry ANY check
+      # class and is what the sweep writes when GitHub refuses to run workflows on a conflicted PR
+      # (the measured population: ten of ten conflicted PRs classified `FAILED:*`). Counting it as
+      # `n_f` is what the cascade's own fill order means by "fix": level 3 is where a PR is repaired,
+      # and the conflict router even opens `stg_lvl_start l3_fix` for exactly that work.
+      *" $pr:$sha:CONFLICTED "*) n_f=$(( n_f + 1 )) ;;
       *)                    n_r=$(( n_r + 1 )) ;;
     esac
   done
@@ -6617,7 +6642,7 @@ while true; do
     # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
-      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/conflictspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
       # of the hand-rolled `rm -f` lines that also clear it (`merge-one.sh`'s CLEAN path).
@@ -7217,17 +7242,31 @@ while true; do
           stg_lvl_start l3_fix || :   # a conflicting PR is repaired: cascade level 3
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
-          CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
+          # ⛔ THE CONFLICT BUDGET IS ITS OWN FILE, AND SHARING IT WAS A REAL DEFECT (fresh-context
+          # review, P2 — agent-infra#4120). This arm used to book against `state/fixcount-<PR>`, the
+          # PR-LIFETIME repair budget the review-gate and CI-red arms also spend (and whose only
+          # decrement is `refund_bailed_fixer`). So a PR that had already spent `MAX_FIX_TRIES` on
+          # review/CI repairs arrived here AT CAP and parked on the next line having attempted
+          # **zero** rebases — and, because the parked-guard above never skips a CONFLICTING head, that
+          # park then OVERWROTE the review arm's accurate `REVIEW-CAP` parkreason with the false
+          # "still CONFLICTING after N fixes", every cycle. Two ORTHOGONAL failure modes sharing one
+          # budget is the documented anti-pattern (one circuit breaker per failure domain; a hot
+          # failure mode starves the other): money spent re-recording a review says nothing about
+          # whether `origin/main` has ever been integrated. ⛔ THE CAP VALUE IS UNCHANGED
+          # (`MAX_FIX_TRIES`) — only the budget it counts is the rebase's own, so a head still gets at
+          # most `MAX_FIX_TRIES` conflict attempts and a first rebase is never refused because a
+          # review had been paid for.
+          CF="$O/state/conflictcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
             # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
             # a park left by a previous head must be REFRESHED or the new head never parks. The log
             # line stays novel-only (evaluated BEFORE the write) so the log does not repeat.
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
-              echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
+              echo "#$PR PARKED (still CONFLICTING after $NFC rebases)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC fixes — needs a human"
+            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/conflictcount-$PR'"
+            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC rebases — needs a human"
           elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
@@ -7244,11 +7283,18 @@ while true; do
             # `fix-one.sh`'s own spawn gate. `ci-queue.sh`'s header states the class rule: only work
             # that ADDS a new CI run is queue-gated. Do not re-nest it here.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            # ⛔ THE SPEND RECORD IS WRITTEN BEFORE THE SPAWN, for the same race the review arm's
+            # `fixspend` closes: `fix-one.sh` starts concurrently inside the tmux session and can write
+            # `fixbail-<PR>-<head>` before `wt_spawn` returns, and `refund_bailed_fixer` needs this
+            # marker to know WHICH budget to refund. Written only for a readable head (an empty
+            # `HEAD_N` is not a key — the refund refuses one too).
+            [ -n "${HEAD_N:-}" ] && : > "$O/state/conflictspend-$PR-$HEAD_N"
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
             else
+              [ -n "${HEAD_N:-}" ] && rm -f "$O/state/conflictspend-$PR-$HEAD_N"
               echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
             fi
