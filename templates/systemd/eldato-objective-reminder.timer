@@ -11,9 +11,25 @@
 # one on boot would deliver a stale objective into a box that has not yet started a lane, and the pass
 # would log UNSENT for a surface that does not exist yet. (The disk reaper sets Persistent=true for the
 # opposite reason: its work is cumulative and must not be skipped.)
+# ⛔ AND THE `OnBootSec=` BELOW DOES NOT CONTRADICT THAT — the two are different things. `Persistent=true`
+# REPLAYS the activation that was MISSED while the box was down, at once, holding a timestamp from before
+# the outage (potentially days old): that is the stale objective. `OnBootSec=10min` schedules a FRESH
+# elapse ten minutes after boot, against the box's current state, and is not a replay. Without it the
+# timer never fires at all (see the block below), so "no replay" was being implemented as "no clock".
 Description=eldato objective reminder every 10 minutes
 
+# ⛔ `OnUnitActiveSec` NEEDS A FIRST REFERENCE OR IT NEVER FIRES. It is defined as "relative to when the
+# unit the timer unit is activating was LAST ACTIVATED" (systemd.timer(5)); on a service that has never
+# been activated there is nothing to measure from, so `next_elapse=infinity` and the timer sits `active
+# (elapsed)` forever without ever running. Measured on cmux 2026-11-17: this timer's service had NEVER
+# started (`ExecMainStartTimestamp=` empty, zero journal entries, `NextElapseUSecMonotonic=infinity`),
+# while `eldato-harness-apply.timer` — a different unit, and of the three timers compared on this box the
+# one carrying an initial-elapse directive (across the shipped set, 5 of 7 already had one; exactly these
+# 2 did not) — was visibly firing (`list-timers` LAST 15:40:33Z, NEXT 15:50:53Z, ~10 min cadence). So boot
+# anchors the FIRST elapse and
+# `OnUnitActiveSec` carries the cadence from each pass (still not wall-clock aligned, per the note above).
 [Timer]
+OnBootSec=10min
 OnUnitActiveSec=10min
 AccuracySec=30s
 RandomizedDelaySec=60
