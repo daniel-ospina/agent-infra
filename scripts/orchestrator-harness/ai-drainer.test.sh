@@ -2083,6 +2083,34 @@ SC_EOF
     '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
     "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
   rm -rf "$T4/units/eldato-ai-drainer.service.d"
+  # ⛔ AND A DROP-IN SYSTEMD DROPS CANNOT MOVE THE PIN, IN EITHER DIRECTION (round-3 verification of the
+  # round-2 fix, F5 — MEASURED rc 0). `Environment=` is a `[Service]` directive, and a drop-in whose first
+  # line IS a directive (no `[Service]` header) has that line belong to NO section: systemd's own parser
+  # (`v257 src/shared/conf-parser.c:253`) logs "Assignment outside of section. Ignoring." and DROPS it. The
+  # reader used to `cat` the unit and then its drop-ins into ONE text, so such a line was attached to
+  # whatever section the unit file ended in — the drop-in the manager ignores was graded as the effective
+  # pin. On a stale base that is the exact false PASS this round removes: "pin: 36000 s installed ·
+  # agrees", **rc 0**, over a box at 7200.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
+  mkdir -p "$T4/units/eldato-ai-drainer.service.d"
+  printf 'Environment=LANE_TIMEOUT=%s\n' "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service.d/headerless.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: a HEADERLESS drop-in is a file systemd DROPS, so its pin cannot rescue a stale base — the unit's 7200 still grades STALE (pre-fix: rc 0 'agrees')" \
+    '[ "$rc" -eq 3 ] && grep -q "7200 s installed" <<<"$out" && grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ...and the mirror, so the arm is not just "a stray file always reds": a headerless drop-in naming a
+  # STALE cap over a base that pins the seam is equally ignored, so that box IS at the seam and reads CLEAN.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=%s\n' "${SEAM_T:?}" >>"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=7200\n' >"$T4/units/eldato-ai-drainer.service.d/headerless.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: …and a headerless drop-in cannot make a seam-pinned unit read STALE either — it is dropped, so the pin grades CLEAN (pre-fix: false STALE, rc 3)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  rm -rf "$T4/units/eldato-ai-drainer.service.d"
   # ⛔ A BARE `Environment=` RESET CLEARS AN EARLIER PIN (systemd.exec(5)), and the shipped template carries
   # the name `LANE_TIMEOUT` in a COMMENT — so "some line mentions it" is NOT the test for UNKNOWN. This arm
   # is what keeps the UNKNOWN arm below from being a text grep that reds a well-formed unit.

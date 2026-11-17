@@ -76,6 +76,13 @@
 #     LANE_TIMEOUT=7200
 # is ONE directive whose SECOND assignment wins, while a physical-line reader saw `HOME=/x` alone and
 # certified "the unit carries no pin" at rc 0 over a box at 7200.
+#
+# ⛔ AND IT STOPS AT A FILE BOUNDARY (`[]`, see `unit_text_from_files`). systemd reads the unit and each
+# drop-in as a SEPARATE file, so a trailing `\` at one file's end joins with NOTHING — never with the
+# next file's first line. Joining across the boundary would both corrupt the boundary and DESTROY the
+# hazard (the renamed `\` is what tells `env_compile_hazards` this text cannot be certified), so the
+# pending line keeps its backslash and the boundary is re-emitted after it: an EOF-dangling continuation
+# is unknowable, and unknowable must stay visible.
 normalize_unit_lines() {
     awk '
         { sub(/\r$/, "") }
@@ -84,14 +91,54 @@ normalize_unit_lines() {
             # else is the line systemd is still reading (systemd.syntax(7), quoted at the header).
             if (held) {
                 if ($0 ~ /^[ \t]*[#;]/) next
+                if ($0 ~ /^[ \t]*\[\]/) { held = 0; print pending "\\"; print "[]"; next }
                 $0 = pending " " $0
                 held = 0
             }
             if ($0 ~ /\\$/) { pending = substr($0, 1, length($0) - 1); held = 1; next }
             print
         }
-        END { if (held) print pending }
+        END { if (held) print pending "\\" }
     ' | sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
+}
+
+# unit_text_from_files <path>... — the text of every file that EXISTS, in the order given, each one
+# preceded by a FILE BOUNDARY (`[]`).
+#
+# ⛔ A FILE BOUNDARY IS NOT COSMETIC, AND ITS ABSENCE WAS A MEASURED FALSE CLEAN. systemd reads the unit
+# and every drop-in as SEPARATE files, so an assignment that appears before that file's first
+# `[Section]` header belongs to NO section and is DROPPED — systemd's own diagnostic (v257,
+# `src/shared/conf-parser.c:253`): "Assignment outside of section. Ignoring." A bare `cat` of
+# unit-then-drop-ins instead attaches such a line to whatever section the PREVIOUS file happened to end
+# in, which certifies a value systemd never compiles: MEASURED at `c4edfd1fd`, a base
+# `[Service] Environment=LANE_TIMEOUT=7200` plus a HEADERLESS drop-in
+# `Environment=LANE_TIMEOUT=36000` read "pin: 36000 s installed · agrees" at **rc 0**, while systemd
+# ignores the drop-in and the box runs the base's 7200. The mirror matters too: a headerless drop-in
+# cannot RESCUE a stale base either.
+#
+# `[]` is the truthful encoding rather than a trick: it is the header of a section that does not exist,
+# so no reader honours anything under it (exactly as systemd honours nothing before the first real
+# header), it can never collide with a real section name, and `normalize_unit_lines` treats it as a
+# continuation barrier so a trailing `\` at one file's EOF cannot swallow the next file's first line.
+unit_text_from_files() {
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        printf '[]\n'
+        cat "$f"
+        printf '\n'
+    done
+}
+
+# unit_text_cat_boundaries — the same boundaries for `systemctl cat` output, which concatenates a unit
+# and its drop-ins with a `# <path>` comment line before each file (so the caller cannot pass file paths
+# at all: the manager, not the checkout, is the only truthful source for a system unit).
+# ⛔ A unit COMMENT that begins `# /` would over-reset here; the consequence is fail-closed in both
+# callers (the readers stop seeing directives until the next real header, so a caller reports UNKNOWN or
+# refuses rather than certifying), which is why the filter is keyed on the separator shape and nothing
+# more ambitious.
+unit_text_cat_boundaries() {
+    awk '/^# \//{print "[]"} {print}'
 }
 
 # effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as

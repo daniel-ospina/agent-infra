@@ -95,6 +95,15 @@ command -v effective_execstarts >/dev/null 2>&1 \
 # other two guards exist to prevent.
 command -v env_compile_hazards >/dev/null 2>&1 \
     || { printf 'install-drainer-timer: ERROR — %s did not define env_compile_hazards\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND THE FILE BOUNDARY IS FATAL TOO (round-3 verification, F5 — MEASURED rc 0). `unit_text_from_files`
+# puts a `[]` boundary before each file, because systemd parses the unit and every drop-in SEPARATELY and
+# DROPS an assignment that precedes that file's first `[Section]` header (`src/shared/conf-parser.c:253`:
+# "Assignment outside of section. Ignoring."). A bare `cat` attached such a line to whatever section the
+# previous file ended in — a headerless drop-in claiming the seam over a stale base read "agrees", rc 0,
+# while systemd ran the base's 7200. Without this function the boundary silently disappears and that
+# false PASS returns, so a farmed older lib must refuse here rather than degrade quietly.
+command -v unit_text_from_files >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define unit_text_from_files\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -287,9 +296,18 @@ say_status() {
         # guessing at its value. The unit is fed in first and its drop-ins after it, in systemd's own
         # order, so a drop-in's override is what this verb grades.
         local unit_text envmap unparsed installed want pin_unreadable=0 hazards
-        unit_text="$( { cat "$UNIT_DIR/$svc"
-                        for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && cat "$_d"; done
-                      } 2>/dev/null )"
+        # ⛔ ONE FILE AT A TIME, WITH A BOUNDARY BETWEEN THEM (round-3 verification, F5 — MEASURED rc 0).
+        # This used to be a bare `cat` of the unit and then its drop-ins, which is not the text systemd
+        # reads: the manager parses each file SEPARATELY and DROPS an assignment that appears before that
+        # file's first `[Section]` header (`v257 src/shared/conf-parser.c:253`: "Assignment outside of
+        # section. Ignoring."), while the concatenation attached it to whatever section the previous file
+        # ended in. MEASURED false CLEAN at `c4edfd1fd`: base `[Service] Environment=LANE_TIMEOUT=7200` +
+        # a headerless drop-in `Environment=LANE_TIMEOUT=36000` read "pin: 36000 s installed · agrees",
+        # **rc 0**, over a box systemd dispatches at 7200 — the same false PASS this whole round is about,
+        # in the one file the reader is allowed to consult. `unit_text_from_files` (the shared lib) emits
+        # each file behind a `[]` boundary, which no reader honours and which systemd, by construction,
+        # never sees.
+        unit_text="$(unit_text_from_files "$UNIT_DIR/$svc" "$UNIT_DIR/$svc.d"/*.conf 2>/dev/null)"
         # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` MAKES THE CAP UNCERTIFIABLE, AND
         # THIS VERB USED TO GRADE IT ANYWAY (round-2 re-review, F1/F3 — both MEASURED at rc 0). The pin
         # map below is a reading of `Environment=` and of nothing else, while systemd compiles the

@@ -642,23 +642,35 @@ unit_dropins() { # <dir> — cat every drop-in, lexical order (systemd's order)
     done
 }
 
+# ⛔ A FILE BOUNDARY IS LOAD-BEARING HERE, NOT COSMETIC (round-3 verification, F5 — MEASURED false CLEAN
+# on its sibling caller). `unit_dropins` above prints each file's text but NO boundary between files, so
+# a drop-in whose first line is a directive (no `[Service]` header) was attached to whatever section the
+# unit file happened to end in — while systemd parses each file SEPARATELY and DROPS such a line
+# (`v257 src/shared/conf-parser.c:253`: "Assignment outside of section. Ignoring."). For a read-back that
+# grades HOME, that is a false PASS in the dangerous direction: a headerless drop-in `Environment=HOME=`
+# naming the home we rendered would have certified a unit systemd gives a DIFFERENT home.
+# The two file-reading arms below therefore go through the shared lib's `unit_text_from_files` (one
+# definition, both callers, the same `[]` boundary the drainer's `--status` uses), and the two
+# `systemctl cat` arms insert the same boundary at the manager's own `# <path>` separators
+# (`unit_text_cat_boundaries`). Both functions are guarded as fatal below: a farmed older lib must refuse,
+# not quietly certify.
 service_effective_unit() { # prints the bytes systemd will load; rc 1 when that cannot be known
     local f="$UNIT_DIR/$UNIT_NAME.service" out=""
     case "$TARGET" in
         override)
             [ -f "$f" ] || return 1
-            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
+            unit_text_from_files "$f" "$UNIT_DIR/$UNIT_NAME.service.d"/*.conf
             return 0 ;;
         user)
             out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
-            if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+            if [ -n "$out" ]; then printf '%s\n' "$out" | unit_text_cat_boundaries; return 0; fi
             [ -f "$f" ] || return 1
-            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
+            unit_text_from_files "$f" "$UNIT_DIR/$UNIT_NAME.service.d"/*.conf
             return 0 ;;
         *)
             out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
             [ -n "$out" ] || return 1
-            printf '%s\n' "$out"
+            printf '%s\n' "$out" | unit_text_cat_boundaries
             return 0 ;;
     esac
 }
@@ -697,6 +709,14 @@ command -v effective_execstarts >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNI
 # fatal for the same reason its siblings are: an undefined function would print nothing, "nothing" reads
 # as "no hazards", and this read-back would then certify a HOME a later source already replaced.
 command -v env_compile_hazards >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define env_compile_hazards"; exit 1; }
+# ⛔ AND THE FILE-BOUNDARY HELPERS (round-3 verification, F5). `service_effective_unit` merges the unit with
+# its drop-ins, and systemd parses those as SEPARATE files — an assignment before a file's first
+# `[Section]` header is DROPPED (`v257 src/shared/conf-parser.c:253`: "Assignment outside of section.
+# Ignoring."), so a merge with no boundary between files reads a HOME systemd never compiles. A farmed
+# lib without these would silently fall back to that merge, which is the false PASS this read-back exists
+# to remove; refuse instead.
+command -v unit_text_from_files >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_from_files"; exit 1; }
+command -v unit_text_cat_boundaries >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_cat_boundaries"; exit 1; }
 
 # split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
 # group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token
