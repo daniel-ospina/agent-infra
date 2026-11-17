@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-64 tests with 135 paired mutations: every mutation re-
+64 tests with 137 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 64 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (135)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (137)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3874,6 +3874,26 @@ MUTATIONS = [
     # ⛔ A `harness` ANCHOR IS WRITTEN AS TWO ADJACENT LITERALS ON PURPOSE. A harness mutant's
     # anchor lives in THIS file, so a single literal would also match itself in this table: the
     # uniqueness check would see two hits and refuse to run. Do not "tidy" these into one string.
+    #
+    # ⛔ T62's TWO GUARDS ARE THE EVIDENCE LAYER ITSELF (#4110 round 6). Everything else in this
+    # diff is mutation-attributed; these two were the exception — and they are the ones a reader
+    # TRUSTS when quoting a count, so a silent regression puts the count back to being quoted
+    # without its host and a host-coupled miss back to reading as a defect in the code.
+    Mutation(
+        "T62", "harness",
+        'missed, platform.' + 'system().lower(),',
+        'missed, "",',
+        "the summary line loses its HOST again: `MUTATIONS=… CAUGHT=… MISSED=…` is quoted as a "
+        "property of the CODE, and the same bytes then read 137/0 on Linux and 136/1 on macOS "
+        "with nothing saying which box produced which",
+    ),
+    Mutation(
+        "T62", "harness",
+        '    if not mut.requires:' + '\n        return ""',
+        '    return ""',
+        "a host-coupled MISS stops naming the requirement the host lacked, so the miss reads as "
+        "\"the code lost this behaviour\" — the misattribution T62 exists to stop",
+    ),
     Mutation(
         "T63", "harness",
         '            stdin=subprocess.' + 'DEVNULL,',

@@ -934,7 +934,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 64 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (135)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (137)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
