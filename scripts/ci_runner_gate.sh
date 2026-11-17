@@ -66,7 +66,10 @@
 #   ci_runner_gate.sh --dry-run  # evaluate and report, change nothing
 #   ci_runner_gate.sh --status   # print mode + capacity census, exit 0 (2 when either is unmeasured)
 #
-# EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
+# EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act. On exit 2 NO mode DECISION is taken
+# (the pool is neither engaged nor released on a value that was not read), and since #4085's second leg
+# a pass that could not measure the QUEUE'S DEMAND still CONVERGES the pool to the mode the state file
+# records — a repair of an earlier pass's decision, never a new one (see the rc 3 block in `main`).
 #
 # OUTPUT A SCHEDULER CAN BRANCH ON: `$STATE_DIR/ci-runner-gate.verdict`, one `key=value` line per
 # run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `reason=` (last). The mode
