@@ -216,6 +216,31 @@ QUEUE_STUCK_AFTER_S="${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}"   # seconds of queue 
 # again is the failure #2897 measured (`launchctl list` showed last exit status 2, silently, for as
 # long as the state existed). 1800 s = at most one alarm per half hour, and it REPEATS.
 BLIND_ALARM_EVERY_S="${CI_GATE_BLIND_ALARM_EVERY_S:-1800}"
+# ⛔ A RECURRING ALARM IS NOT AN ALARM (agent-infra#4085). The blind alarm repeats every
+# BLIND_ALARM_EVERY_S by design, and on 2026-11-16 the inbox held 43 identical records spanning a
+# month while the pool served 3 of 24 runners. Repetition created no action, so past this many
+# CONSECUTIVE blind passes the condition stops being reported as a blip and is recorded as a DEFECT
+# at most once per BLIND_DEFECT_EVERY_S (default 21600 s): the threshold decides WHEN escalation
+# starts, the time bound decides how often it is WRITTEN. 6 x 300 s = 30 min of continuous blindness.
+BLIND_DEFECT_AFTER="${CI_GATE_BLIND_DEFECT_AFTER:-6}"
+# ⛔ THE STREAK'S EXPIRY IS ITS OWN BOUND, NOT THE ALARM'S (agent-infra#4085, caught by arm r2). The
+# first draft expired the streak after 2 x BLIND_ALARM_EVERY_S, which collapses to "any gap at all"
+# the moment an operator (or a test) sets the alarm interval to 0 to stop the suppression — so the
+# streak could never grow and the escalation this issue exists for would never fire. Coupling two
+# independent intervals is how a guard silently disables itself: 3600 s = 12 x the 300 s tick, i.e. a
+# blind episode an hour apart is a NEW episode, and one that keeps ticking is the same one.
+BLIND_STREAK_RESET_S="${CI_GATE_BLIND_STREAK_RESET_S:-3600}"
+# ⛔ THE DEFECT FILE IS RATE-LIMITED IN TIME, NOT IN PASSES (#4085 review P2). One record per
+# `BLIND_DEFECT_AFTER` passes is one record per 1800 s at the shipped cadence — exactly the inbox rate
+# this replaced, i.e. ~48/day and unbounded growth with no rotation. One record per 6 h states the
+# volume claim the comment makes, and the streak keeps the severity in the wording.
+BLIND_DEFECT_EVERY_S="${CI_GATE_BLIND_DEFECT_EVERY_S:-21600}"
+# ⛔ THE CAPACITY READ IS THE ONE READ THAT CANCELS THE WRITE IT GATES (agent-infra#4085). Measured:
+# 183 failed enumerations and 245 relabel failures between 2026-10-18 and 2026-11-14, with
+# `API rate limit exceeded` (125) and `net/http: TLS handshake timeout` as the causes — both
+# TRANSIENT. One attempt per 300 s pass threw the whole pass away on a blip, so retry in-pass.
+CENSUS_READ_ATTEMPTS="${CI_GATE_CENSUS_READ_ATTEMPTS:-3}"
+CENSUS_READ_BACKOFF_S="${CI_GATE_CENSUS_READ_BACKOFF_S:-2}"
 # How many in-progress runs the mode substitute inspects. Bounded, and the bound is stated: an
 # idle repo has none, which is the hole this substitute cannot fill — it says `unknown` there.
 MODE_INFER_RUNS="${CI_GATE_MODE_INFER_RUNS:-3}"
@@ -382,8 +407,62 @@ runner_census() {
   # `runner_inventory:unreadable` alarm that blamed the token for our own grammar. Any edit here must
   # be COMPILED, not eyeballed: `scripts/ci_runner_gate.test.sh` now runs every `--jq` this script ships
   # through real `jq` (stub, "does not COMPILE"), so a recurrence reddens the suite instead of production.
-  gh api --paginate "$RUNNER_LIST_PATH" \
-    --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
+  # ⛔ RETRY IN-PASS, ON THE EXIT CODE ONLY (agent-infra#4085). A SUCCESSFUL read emits at least the
+  # page row, so on rc 0 the output is ours to classify — emptiness included, and classification (not
+  # a retry) is what decides it. The jq program below is byte-identical to the one the
+  # suite compiles; any edit to it must still compile (`scripts/ci_runner_gate.test.sh` runs every
+  # shipped `--jq` through real jq).
+  local attempt=1 out rc wait_s="$CENSUS_READ_BACKOFF_S"
+  # ⛔ OUT-OF-RANGE VALUES ARE BOUNDED, LIKE EVERY OTHER BOUND IN THIS FILE (#4085, review P2). A
+  # shape check alone is not enough: `CI_GATE_CENSUS_READ_ATTEMPTS=99999999999999999999` makes both the
+  # floor test and the `-ge $max` terminate test fail on an integer-expression error, so the loop never
+  # returns — MEASURED: 81 census calls in 8 s. The backoff is clamped for the same class of reason: a
+  # doubling chain is unbounded, and a 10-attempt value would sleep ~17 min inside a pass whose
+  # `StartInterval` is 300 s.
+  case "$CENSUS_READ_ATTEMPTS" in ''|*[!0-9]*) local max=3 ;; ??????????*) local max=3; log "census read attempts OUT OF RANGE (${#CENSUS_READ_ATTEMPTS} digits) — using 3" ;; *) local max="$CENSUS_READ_ATTEMPTS" ;; esac
+  [ "$max" -lt 1 ] && max=1
+  [ "$max" -gt 5 ] && max=5
+  # …and the backoff gets the same out-of-range branch: a 20-digit value passes the shape check, the
+  # `-gt 30` clamp then errors on the integer comparison and `sleep` fires with no delay at all.
+  case "$wait_s" in ''|*[!0-9]*) wait_s=2 ;; ??????????*) wait_s=2 ;; esac
+  [ "$wait_s" -gt 30 ] && wait_s=30
+  while : ; do
+    out="$(gh api --paginate "$RUNNER_LIST_PATH" \
+      --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR")"
+    rc=$?
+    # ⛔ RETRY ON THE EXIT CODE, NOT ON AN EMPTY BODY (agent-infra#4085; caught by this suite's 7b/m9).
+    # A blank 200 is a MEASURED schema failure that `census_classify` must name as UNREADABLE — folding
+    # it into "transport failed" would retry it, then report it as a transport failure and skip the
+    # schema verdict entirely, which is how a blank body starts reading as a zero pool. The transient
+    # causes are `TLS handshake timeout` and rate-limit 403s, and both exit NON-ZERO.
+    if [ "$rc" -eq 0 ]; then
+      [ "$attempt" -gt 1 ] && log "runner census READ RECOVERED on attempt $attempt/$max — a transient failure is no longer a lost pass"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    # ⛔ RETRY TRANSIENT CLASSES ONLY (#4085, and #2931's "name the missing capability"). A permission
+    # or auth failure is DETERMINISTIC: retrying it spends the pass's budget to learn the same answer,
+    # and the capability it names is the actionable part. `API rate limit exceeded` is deliberately NOT
+    # in this list — a rate-limit 403 IS transient, and it is 125 of the measured failures.
+    _gerr="$(head -c 400 "$GH_ERR" 2>/dev/null)"
+    case "$_gerr" in
+      *"Resource not accessible"*|*"needs-admin"*|*"Bad credentials"*|*"HTTP 401"*|*"HTTP 404"*|*"Not Found"*)
+        log "runner census READ FAILED (rc=$rc) with a NON-TRANSIENT error — NOT retried, capability=$(census_capability "$_gerr"): ${_gerr:0:200}"
+        return 1 ;;
+    esac
+    if [ "$attempt" -ge "$max" ]; then
+      [ "$attempt" -gt 1 ] && log "runner census READ FAILED after $attempt attempt(s) — reporting the LAST error (earlier attempts discarded)"
+      return 1
+    fi
+    log "runner census READ attempt $attempt/$max failed (rc=$rc) — retrying in ${wait_s}s; gh said: $(head -c 200 "$GH_ERR" 2>/dev/null)"
+    sleep "$wait_s"
+    attempt=$((attempt + 1))
+    # ⛔ THE CLAMP IS INSIDE THE CHAIN, not only on the first wait (#4085 review round 4). Clamping the
+    # initial value alone leaves 30+60+120+240 = 450 s of sleep inside a pass whose StartInterval is
+    # 300 s — the overrun the clamp claims to prevent.
+    wait_s=$((wait_s * 2))
+    [ "$wait_s" -gt 30 ] && wait_s=30
+  done
 }
 
 # census_capability <body> — WHICH permission the read needed, named from the response itself.
@@ -1018,6 +1097,13 @@ print(age)
       CENSUS_VERDICT=unknown; CENSUS_BLIND=1
       return 2
     fi
+    # ⛔ A MEASURABLE POOL CLEARS THE STREAK (agent-infra#4085). The alarm's self-expiry covers the
+    # gap case; this covers the fast one — the gate saw the pool, so the next blindness is a new
+    # episode and must not inherit a count from the last one.
+    # ⛔ A READ VERB CHANGES NOTHING (#3002, and #4085 review P2). `evaluate` runs BEFORE the DRY gate,
+    # so an unguarded clear here made `--dry-run` reset the escalation counter the gate exists to make
+    # trustworthy — MEASURED: a seeded streak was gone after a dry run.
+    [ "${DRY:-0}" = 0 ] && rm -f "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null || true
   else
     census_err="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$census_err")"
@@ -1500,18 +1586,64 @@ notify() { # $1 = text
 # same silence one step later. The stamp file means a restarting job cannot spam the lane.
 alarm_blind() { # $1 = the signature (what could not be measured, and why)
   local sig="$1" now last=0 stamp="$STATE_DIR/ci-runner-gate.blind"
+  local streak_file="$STATE_DIR/ci-runner-gate.blind-streak"
+  local defect_file="$STATE_DIR/ci-runner-gate.DEFECT"
+  local streak=0 prev_now=0 defect_after="$BLIND_DEFECT_AFTER"
   now="$(date -u +%s)"
+  # ⛔ THE STREAK IS SELF-EXPIRING, SO NO SUCCESS HOOK IS NEEDED (agent-infra#4085). Each pass is its
+  # own process, so "consecutive" can only be counted across passes in a file. A gap longer than
+  # BLIND_STREAK_RESET_S (default 3600 s) means the condition ENDED and this is a NEW episode, so the
+  # count restarts without any pass having to remember to clear it — a reset hook is a second thing
+  # that can be forgotten, and the direction it fails in is the silent one. The window is deliberately
+  # NOT the alarm interval: coupling them collapses it to "any gap" as soon as that interval is 0.
+  case "$defect_after" in ''|*[!0-9]*) defect_after=6 ;; esac
+  if [ "$defect_after" -lt 1 ]; then defect_after=1; fi
+  if [ -f "$streak_file" ]; then
+    read -r streak prev_now < "$streak_file" 2>/dev/null || true
+    case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+    case "$prev_now" in ''|*[!0-9]*) prev_now=0 ;; esac
+    # ⛔ OUT-OF-RANGE IS REJECTED TO THE DEFAULT, NOT LEFT TO ERROR (#4085 review round 2). An
+    # out-of-intmax value errors inside the arithmetic test, which reads as FALSE — i.e. it silently
+    # DISABLES the very record this issue adds, decided by nothing but an unvalidated operand.
+    case "$BLIND_STREAK_RESET_S" in ''|*[!0-9]*) local reset_s=3600 ;; ??????????*) local reset_s=3600 ;; *) local reset_s="$BLIND_STREAK_RESET_S" ;; esac
+    [ "$reset_s" -lt 1 ] && reset_s=3600
+    if [ "$prev_now" -gt 0 ] && [ "$((now - prev_now))" -gt "$reset_s" ]; then
+      streak=0
+    fi
+  fi
+  streak=$((streak + 1))
+  printf '%s %s\n' "$streak" "$now" > "$streak_file"
+  # ⛔ ESCALATION IS THE PART THAT WAS MISSING (#4085): 43 identical alarms produced no action. Past
+  # `BLIND_DEFECT_AFTER` consecutive blind passes a durable DEFECT record is appended — one line per
+  # `BLIND_DEFECT_AFTER` passes, so a month-long condition leaves a readable handful of records
+  # instead of a wall of repeats. ⛔ THIS RUNS BEFORE THE ALARM WINDOW IS CONSULTED, on purpose: a
+  # suppressed NOTIFICATION is not a suppressed CONDITION, and a record that depends on the notify
+  # interval disappears exactly when the pass rate outruns the interval — the long outage.
+  local escalation=""
+  if [ "$streak" -ge "$defect_after" ]; then
+    escalation=" This is now a RECURRING DEFECT: ${streak} consecutive blind passes."
+    local defect_stamp="${defect_file}.stamp" last_defect=0
+    case "$BLIND_DEFECT_EVERY_S" in ''|*[!0-9]*) local every_s=21600 ;; ??????????*) local every_s=21600 ;; *) local every_s="$BLIND_DEFECT_EVERY_S" ;; esac
+    [ "$every_s" -lt 1 ] && every_s=1
+    [ -f "$defect_stamp" ] && last_defect="$(sed -n 1p "$defect_stamp" 2>/dev/null)"
+    case "$last_defect" in ''|*[!0-9]*) last_defect=0 ;; esac
+    if [ "$last_defect" -eq 0 ] || [ "$((now - last_defect))" -ge "$every_s" ]; then
+      printf '%s\tstreak=%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$streak" "$sig" >> "$defect_file"
+      printf '%s\n' "$now" > "$defect_stamp"
+      log "BLIND DEFECT recorded -> ${defect_file} (streak=$streak, at most one per ${every_s}s)"
+    fi
+  fi
   if [ -f "$stamp" ]; then
     last="$(sed -n 1p "$stamp" 2>/dev/null)"
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
   fi
   if [ "$last" -gt 0 ] && [ "$((now - last))" -lt "$BLIND_ALARM_EVERY_S" ]; then
-    log "BLIND alarm SUPPRESSED (sent $((now - last))s ago, floor ${BLIND_ALARM_EVERY_S}s) — ${sig}"
+    log "BLIND alarm SUPPRESSED (sent $((now - last))s ago, floor ${BLIND_ALARM_EVERY_S}s) — ${sig}${escalation}"
     return 0
   fi
   printf '%s\n' "$now" > "$stamp"
-  notify ":warning: CI runner gate is BLIND — ${sig}. It is refusing to certify capacity (exit 2, changing nothing). Repo: ${REPO}."
-  log "BLIND alarm SENT (at most one per ${BLIND_ALARM_EVERY_S}s while the condition lasts)"
+  notify ":warning: CI runner gate is BLIND — ${sig}. It is refusing to certify capacity (exit 2, changing nothing). Repo: ${REPO}.${escalation}"
+  log "BLIND alarm SENT (at most one per ${BLIND_ALARM_EVERY_S}s while the condition lasts; streak=${streak}${escalation})"
 }
 
 # ── main ────────────────────────────────────────────────────────────────────────
