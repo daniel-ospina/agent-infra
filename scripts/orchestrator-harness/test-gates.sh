@@ -776,7 +776,14 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 # ⛔ #2126: the extracted range END is the guard LINE, not the literal `&& continue` — the guard now
 # records the refusal inside the same `&& { … }`, so a literal-end sed would truncate the extraction
 # and this drive would silently grade a half block (the "a test that cannot run" shape).
-sed -n '/^    HEAD_N="\$(gh\(_bounded\)\? pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
+# ⛔ agent-infra#4120: THE START ANCHOR MOVED WITH THE ROW'S `gh pr view`, AND THE ANCHOR IS WHY.
+# `HEAD_N` is no longer read on its own — the row reads `headRefOid,mergeable` in ONE call and parses
+# both out of it — so the old anchor matched nothing and this drive went red with "could not extract
+# the shipped AUTHORITY_UNKNOWN block". A drive whose anchor is a shipped line must track that line:
+# the block still starts at the row's head read and still ends at the authority guard.
+# The mock below answers a bare `deadbeef` (no space), which the shipped parser reads as the head with
+# an empty MSTAT — the same shape an UNKNOWN/unreadable mergeable produces on a live box.
+sed -n '/^    _pr_row="\$(gh\(_bounded\)\? pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
   _au_run() { # _au_run <flag> [<claim-verdict rc>] -> prints how many PRs passed the guard
