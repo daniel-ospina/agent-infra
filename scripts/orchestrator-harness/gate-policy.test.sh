@@ -361,7 +361,17 @@ fi
 echo
 echo "== unit declarations (#4002) =="
 DECL_LIST="$( { ls "$REPO"/templates/systemd/*.service "$REPO"/templates/systemd/*.timer 2>/dev/null
-               find "$REPO/templates/launchd" -name '*.plist' -type f 2>/dev/null; } | LC_ALL=C sort )"
+               find "$REPO/templates/launchd" -name '*.plist' -type f 2>/dev/null
+               # ⛔ DECLARATIONS THAT LIVE *OUTSIDE* `templates/` ARE SHIPPED DECLARATIONS TOO (fresh code
+               # review of PR #4020 at `4f9ff9b3e`, P2). The root set used to be `templates/` only, so
+               # `scripts/orchestrator-harness/launchd.plist.template` — which `install.sh` renders into
+               # `~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`, an `EnvironmentVariables`
+               # dict whose own comment says "a pin placed here reaches every lane on the box" — was graded
+               # by NOTHING while the header claimed every shipped declaration was. A tree-wide sweep (
+               # depth 2, which is where this repo's declarations live) rather than a hand-listed file, so
+               # the NEXT one is graded without anyone remembering to extend a list.
+               find "$REPO/scripts" -maxdepth 2 -type f \
+                    \( -name '*.plist' -o -name '*.plist.template' -o -name '*.service' -o -name '*.timer' \) 2>/dev/null; } | LC_ALL=C sort )"
 DECL_SEEN=0; DECL_VETOED=""; DECL_SEEN_REL=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
@@ -380,7 +390,9 @@ EOF
 # `ls templates/systemd/*.service` does not descend, while git's pathspec does — so a future
 # `templates/systemd/<sub>/*.service` would be graded by NOTHING and this arm would have reported PASS.
 DECL_TRACKED="$(git -C "$REPO" ls-files 'templates/systemd/*.service' 'templates/systemd/*.timer' \
-                 'templates/launchd/*.plist' 'templates/launchd/**/*.plist' 2>/dev/null | LC_ALL=C sort -u)"
+                 'templates/launchd/*.plist' 'templates/launchd/**/*.plist' \
+                 'scripts/*.plist' 'scripts/*.plist.template' 'scripts/*.service' 'scripts/*.timer' \
+                 'scripts/*/*.plist' 'scripts/*/*.plist.template' 'scripts/*/*.service' 'scripts/*/*.timer' 2>/dev/null | LC_ALL=C sort -u)"
 DECL_TRACKED_N="$(printf '%s\n' "$DECL_TRACKED" | sed '/^$/d' | grep -c . || true)"
 DECL_SEEN_SORTED="$(printf '%s\n' "$DECL_SEEN_REL" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
 DECL_MISSED="$(comm -13 <(printf '%s\n' "$DECL_SEEN_SORTED") <(printf '%s\n' "$DECL_TRACKED" | sed '/^$/d') | tr '\n' ' ')"
@@ -392,6 +404,17 @@ DECL_MISSED="$(comm -13 <(printf '%s\n' "$DECL_SEEN_SORTED") <(printf '%s\n' "$D
 [ -z "$DECL_VETOED" ] \
   && ok "(5a) census: none of the $DECL_SEEN declarations names a gate-bypass flag in its environment" \
   || bad "(5a) census: a shipped declaration hands the hatch to everything it spawns:$DECL_VETOED"
+# ⛔ AND THE FILE THAT WAS INVISIBLE IS NAMED, not just counted (fresh code review of PR #4020 at
+# `4f9ff9b3e`, P2). `scripts/orchestrator-harness/install.sh` renders
+# `scripts/orchestrator-harness/launchd.plist.template` into the macOS controller loop's LaunchAgent — an
+# unattended dispatcher — and it lives under `scripts/`, so the first root set could not see it at all. A
+# sweep that slips by one file is a count a reader cannot act on, so the file itself is asserted here as
+# well as covered by the two sets above.
+if grep -qx 'scripts/orchestrator-harness/launchd.plist.template' <<<"$DECL_SEEN_SORTED"; then
+  ok "(5a) census: the macOS controller plist template (scripts/orchestrator-harness/launchd.plist.template) IS graded — a declaration under scripts/ is no longer invisible"
+else
+  bad "(5a) census: scripts/orchestrator-harness/launchd.plist.template is NOT in the graded set — an EnvironmentVariables hatch on the controller loop would install with no refusal while this arm printed PASS"
+fi
 
 # (5b) THE RENDERED UNIT — the bytes the installer would put on a box, not the template.
 INST="$HERE/install-drainer-timer.sh"
@@ -469,6 +492,51 @@ grep -q 'GATE.BYPASS' <<<"$MG_OUT" \
 [ ! -f "$MG/units/eldato-ai-drainer.service" ] \
   && ok "(5c2) install path: …and nothing is written (an unvetted unit is not a clean one)" \
   || bad "(5c2) install path: a refused install still wrote $MG/units/eldato-ai-drainer.service"
+# ⛔ (5c3) A PRESENT-BUT-STALE OR UNGRADABLE JUDGE IS A REFUSAL, BUT NOT A BYPASS ACCUSATION (fresh review
+# of PR #4020, P3). The preflight above only tests `-f`, so two OTHER answers reach `render()` and both used
+# to be reported as "the rendered unit carries a GATE-BYPASS Environment= entry (named above)" — with
+# NOTHING named above, because the judge never graded anything:
+#   * rc 64 — a `gate-policy.sh` that PREDATES `--unit-veto` (a stale farmed/ambient copy, which the
+#     resolver above accepts). Reachable on a box whose `AGENT_INFRA_PATH` points at an old checkout.
+#   * rc 2  — the judge could not grade the rendered bytes.
+# The verdict is fail-closed either way, so this is a wrong-DIAGNOSIS defect (the operator is told to hunt a
+# hatch that no line in the unit names). Ported from the sibling installer's T13, which pins the same split;
+# the two installers' refusals are the same refusal and must not tell two different stories about it.
+# Both arms REDDEN on the pre-fix installer: it printed the GATE-BYPASS accusation for both, and neither of
+# the two cause-specific sentences existed at all.
+for _jcase in stale ungradable; do
+  JD="$TMP/judge-$_jcase/run"; mkdir -p "$JD/state" "$TMP/judge-$_jcase"
+  if [ "$_jcase" = stale ]; then
+    # A judge from BEFORE the flag: anything but `--probe` is a usage error (rc 64), exactly as an older
+    # copy of this repo answers.
+    printf '#!/usr/bin/env bash\ncase "${1:-}" in --probe) printf "review_satisfiable=0 vgate_satisfiable=0 missing=- note=-\\n"; exit 1 ;; esac\nprintf "usage: gate-policy.sh --probe\\n" >&2\nexit 64\n' \
+      >"$TMP/judge-$_jcase/gate-policy.sh"
+  else
+    # A judge that exists and is executable but cannot answer (rc 2 = ungradable).
+    printf '#!/usr/bin/env bash\nexit 2\n' >"$TMP/judge-$_jcase/gate-policy.sh"
+  fi
+  J_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$JD/units" TEMPLATES_DIR="$REPO/templates/systemd" \
+            DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$JD/state" DRAINER_O="$JD" \
+            GP_GUARD="$TMP/judge-$_jcase/gate-policy.sh" bash "$INST" 2>&1)"; J_RC=$?
+  [ "$J_RC" -ne 0 ] \
+    && ok "(5c3) install path: a $_jcase judge still REFUSES the install (fail-closed — an unvetted unit is never installed)" \
+    || bad "(5c3) install path: a $_jcase judge installed the unit anyway (rc=$J_RC) — the refusal is not fail-closed"
+  ! grep -q 'GATE.BYPASS' <<<"$J_OUT" \
+    && ok "(5c3) install path: …and does NOT accuse it of a GATE-BYPASS/GATE BYPASS it never found" \
+    || bad "(5c3) install path: a $_jcase judge was reported as a GATE-BYPASS/GATE BYPASS (false accusation): $(printf '%s' "$J_OUT" | grep -m1 'GATE.BYPASS')"
+  if [ "$_jcase" = stale ]; then
+    grep -q 'predates the flag' <<<"$J_OUT" \
+      && ok "(5c3) install path: a STALE judge names its own cause (rc 64 — a copy that predates --unit-veto)" \
+      || bad "(5c3) install path: a stale judge's refusal does not say the judge predates the flag — the operator is sent hunting a hatch instead: $(printf '%s' "$J_OUT" | tail -1)"
+  else
+    grep -q 'could not GRADE' <<<"$J_OUT" \
+      && ok "(5c3) install path: an UNGRADABLE judge names its own cause (rc 2 — nothing was graded)" \
+      || bad "(5c3) install path: an ungradable judge's refusal does not say it could not grade — the operator is sent hunting a hatch instead: $(printf '%s' "$J_OUT" | tail -1)"
+  fi
+  [ ! -f "$JD/units/eldato-ai-drainer.service" ] \
+    && ok "(5c3) install path: …and nothing is written (a $_jcase judge never certifies an install)" \
+    || bad "(5c3) install path: a $_jcase judge still wrote $JD/units/eldato-ai-drainer.service"
+done
 
 printf '[Service]\nEnvironment="O=/x ELDATO_SKIP_VGATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted.service"
 # ⛔ EXACTLY rc 1, NOT "non-zero" (fresh review of PR #4020, round 3; every sibling arm below asserts a
@@ -613,6 +681,23 @@ CRLFC_RC=0; bash "$POLICY" --unit-veto "$TMP/crlf-clean.service" crlf-clean >/de
 [ "$CRLFC_RC" -eq 0 ] \
   && ok "(5d) edges: …and a CRLF spelling of the ESCAPED fixture is still CLEAN (stripping the CR does not veto a CRLF template)" \
   || bad "(5d) edges: the clean CRLF fixture answered rc=$CRLFC_RC (want 0) — the CR strip turned a CRLF unit into a false positive"
+# ⛔ A CR-ONLY FILE IS A NORMAL MULTI-LINE FILE TO systemd (fresh code review of PR #4020 at `4f9ff9b3e`,
+# P3 — REPRODUCED as a fail-open: rc 0 while the hatch was live). `categorize_eol` classifies `\r` as an EOL
+# (`src/basic/fileio.c` — `EOL_THIRTEEN`), so systemd reads `[Service]` and
+# `Environment=AGENT_SKIP_REVIEW_GATE=1` as TWO lines; `bash read` splits on `\n` only, so the fold used to
+# see ONE line starting with `[Service]` and never extracted the declaration at all. The hatch is on a line
+# of its OWN — no continuation and no comment — which is what makes this a real discriminator rather than a
+# second spelling of an arm that already exists.
+printf '[Service]\rEnvironment=AGENT_SKIP_REVIEW_GATE=1\rExecStart=/bin/true\r' >"$TMP/cronly.service"
+CRONLY_RC=0; bash "$POLICY" --unit-veto "$TMP/cronly.service" cronly >/dev/null 2>&1 || CRONLY_RC=$?
+[ "$CRONLY_RC" -eq 1 ] \
+  && ok "(5d) edges: a CR-ONLY declaration's Environment= line IS a declaration (a lone \\r is an EOL to systemd) — vetoed" \
+  || bad "(5d) edges: the CR-only declaration answered rc=$CRONLY_RC (want 1) — the file is read as ONE line, so a hatch on any line but the first is invisible"
+# …and its clean twin must stay clean: a CR-only file must not be refused for being CR-only.
+printf '[Service]\rEnvironment=PATH=/opt/bin\rExecStart=/bin/true\r' >"$TMP/cronly-clean.service"
+bash "$POLICY" --unit-veto "$TMP/cronly-clean.service" cronly-clean >/dev/null 2>&1 \
+  && ok "(5d) edges: …and a CR-only declaration with no hatch is still CLEAN (the split does not veto a CR-only file)" \
+  || bad "(5d) edges: the clean CR-only fixture was vetoed — the CR split turned a valid declaration into a false positive"
 # …and the LAUNCHD half of the grader must be able to REDDEN (fresh review of #4002, P2). 5a passes if the
 # `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
 # "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the
@@ -828,6 +913,97 @@ bash "$POLICY" --unit-veto "$LG/rendered.txt" "install-lane-arm-timer service_bo
 bash "$POLICY" --unit-veto "$LG/mutated.txt" "install-lane-arm-timer mutant" >/dev/null 2>&1 \
   && bad "(5g) inline generator: a hatch injected into those SAME bytes was NOT vetoed — the arm cannot redden" \
   || ok "(5g) inline generator: a hatch injected into those same bytes IS vetoed (the arm reads a declaration, not an error message)"
+
+# ── 5h. THE THIRD INLINE GENERATOR IS VETTED ON ITS INSTALL PATH (fresh review of PR #4020 at
+# `4f9ff9b3e`, P2) ────────────────────────────────────────────────────────────────────────────────
+# `scripts/install-runner-autoscale-timer.sh` composes a WHOLE `Environment=` line at render time
+# (`provisioner_env_for`: `Environment="RUNNER_AUTOSCALE_PROVISIONER=…"`, substituted into
+# `{{PROVISIONER_ENV}}`). The shipped templates carry only the placeholder, so the §5a census never sees an
+# `Environment=` line at all — and the installer IS farmed (`pi-bootstrap/setup.sh`'s `fleet_srcs`), so it
+# is a live install path. Before this arm the bytes were graded by NOTHING and refused by NOTHING: a hatch
+# typed onto that line, or any future installer written in the same "whole line from a seam" shape,
+# installed green. §5g is the same arm for the other inline generator.
+# ⛔ IT IS AN *INSTALL-PATH* ARM, NOT A DRY-RUN-ONLY ONE: the veto sits in `render()`, which `--dry-run`
+# and `--install` share, ABOVE the `--dry-run` branch — so a preview cannot show what an install would
+# refuse, and the refusal this arm measures is the install's own. (The installer's own suite covers
+# `--install` end to end; this arm exists so the CENSUS suite reddens when the call is deleted.)
+echo
+echo "== the third inline generator is vetted (#4002) =="
+RA="$REPO/scripts/install-runner-autoscale-timer.sh"
+RAG="$TMP/runner-autoscale"; mkdir -p "$RAG/bin" "$RAG/home/.pi/agent/state" "$RAG/tpl" "$RAG/units"
+cat >"$RAG/bin/systemctl" <<'RA_SC'
+#!/usr/bin/env bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  show-environment) exit 0 ;;
+  is-enabled) printf 'enabled\n'; exit 0 ;;
+  is-active)  printf 'active\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+RA_SC
+chmod +x "$RAG/bin/systemctl"
+: >"$RAG/home/converger.py"
+cp "$REPO/templates/systemd/eldato-runner-autoscale.service" "$REPO/templates/systemd/eldato-runner-autoscale.timer" "$RAG/tpl/"
+# The installer refuses an interpreter older than 3.12 (the pass refuses itself), so this arm needs a real
+# one — and where the host has none the arm is SKIPPED WITH ITS REASON, never green: `env -u` keeps an
+# ambient pin from deciding which case runs.
+RA_PY="$(type -P python3.12 2>/dev/null)" || RA_PY=""
+[ -n "$RA_PY" ] || { RA_PY="$(type -P python3 2>/dev/null)" || RA_PY=""; }
+RA_PY_VER=""
+[ -n "$RA_PY" ] && RA_PY_VER="$("$RA_PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || true
+case "$RA_PY_VER" in
+  3.12|3.1[3-9]|[4-9].*) RA_PY_OK=1 ;;
+  *) RA_PY_OK=0 ;;
+esac
+# ra_run <templates-dir> [extra env assignment…] — one hermetic invocation of the installer's PREVIEW path.
+ra_run() {
+  local tpl="$1"; shift
+  env -u GP_GUARD HOME="$RAG/home" PATH="$RAG/bin:$PATH" \
+      RUNNER_AUTOSCALE_SCRIPT="$RAG/home/converger.py" \
+      RUNNER_AUTOSCALE_PYTHON="$RA_PY" \
+      RUNNER_AUTOSCALE_STATE_DIR="$RAG/home/.pi/agent/state" \
+      RUNNER_AUTOSCALE_ARM_FILE="$RAG/home/.pi/agent/state/runner-autoscale.armed" \
+      RUNNER_AUTOSCALE_REPO="o/r" ELDATO_PLATFORM=Linux \
+      SYSTEMCTL="$RAG/bin/systemctl" LOGINCTL="$RAG/bin/systemctl" LAUNCHCTL="$RAG/bin/systemctl" \
+      SYSTEMD_UNIT_DIR="$RAG/units" RUNNER_AUTOSCALE_SCOPE_SCAN="$RAG/units" \
+      RUNNER_AUTOSCALE_PROVISIONER="$RAG/absent-provisioner.sh" SUDO=false TEMPLATES_DIR="$tpl" \
+      ${@+"$@"} bash "$RA" --dry-run 2>&1
+}
+if [ "$RA_PY_OK" != 1 ]; then
+  skip "(5h) inline generator: no python >= 3.12 on this host (found '${RA_PY_VER:-none}'), so install-runner-autoscale-timer.sh refuses before it renders — the arm that grades its generated declaration DID NOT RUN (a host limit, not a pass)"
+else
+  # NON-VACUITY FIRST: the render must have HAPPENED, or the veto below grades a usage message.
+  RA_OUT="$(ra_run "$RAG/tpl")"; RA_RC=$?
+  if [ "$RA_RC" -eq 0 ] && grep -q '^[[:space:]]*Environment=' <<<"$RA_OUT" && grep -q '^[[:space:]]*ExecStart=' <<<"$RA_OUT"; then
+    ok "(5h) inline generator: install-runner-autoscale-timer.sh --dry-run rendered a real declaration (Environment= + ExecStart=)"
+  else
+    bad "(5h) inline generator: --dry-run produced no gradeable declaration (rc=$RA_RC) — the arms below would grade nothing: $(printf '%s' "$RA_OUT" | tail -1)"
+  fi
+  # …and the ORDINARY path (a real checkout's templates, no seam) must resolve its judge without one being
+  # handed to it — or the enforcement exists only where a test arranges it.
+  RAD_OUT="$(ra_run "$REPO/templates/systemd")"; RAD_RC=$?
+  [ "$RAD_RC" -eq 0 ] \
+    && ok "(5h) inline generator: the ordinary checkout path resolves its own judge and installs a clean declaration (rc=0, no GP_GUARD handed to it)" \
+    || bad "(5h) inline generator: the ordinary checkout path answered rc=$RAD_RC — either the judge does not resolve where the templates live, or a clean declaration is refused: $(printf '%s' "$RAD_OUT" | tail -1)"
+  # THE MUTANT: a hatch on the template's declaration → the installer must REFUSE and name the flag.
+  # Pre-fix it rendered and exited 0 (no judge was wired into this installer at all), which is the
+  # "installs with no refusal" the review reproduced.
+  mkdir -p "$RAG/mut"
+  cp "$REPO/templates/systemd/eldato-runner-autoscale.service" "$REPO/templates/systemd/eldato-runner-autoscale.timer" "$RAG/mut/"
+  printf 'Environment=AGENT_SKIP_REVIEW_GATE=1\n' >>"$RAG/mut/eldato-runner-autoscale.service"
+  RMT_OUT="$(ra_run "$RAG/mut")"; RMT_RC=$?
+  [ "$RMT_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$RMT_OUT" && grep -q 'GATE.BYPASS' <<<"$RMT_OUT" \
+    && ok "(5h) inline generator: a hatch on the generated declaration is REFUSED, and the flag is named" \
+    || bad "(5h) inline generator: install-runner-autoscale-timer.sh accepted a hatch-bearing declaration (rc=$RMT_RC) — no judge is wired into its render path"
+  # THE MISSING JUDGE: fail-closed AND with its own diagnosis (the pre-fix installer had neither).
+  RMG_OUT="$(ra_run "$RAG/tpl" GP_GUARD=/nonexistent/absent.sh)"; RMG_RC=$?
+  [ "$RMG_RC" -ne 0 ] && grep -q 'gate-policy.sh not found' <<<"$RMG_OUT" \
+    && ok "(5h) inline generator: an unresolvable JUDGE refuses by name — an unvetted unit is never installed" \
+    || bad "(5h) inline generator: a missing judge answered rc=$RMG_RC — an unvetted declaration installs: $(printf '%s' "$RMG_OUT" | tail -1)"
+  grep -q 'GATE.BYPASS' <<<"$RMG_OUT" \
+    && bad "(5h) inline generator: a missing judge was reported as a GATE-BYPASS/GATE BYPASS it never found — wrong diagnosis" \
+    || ok "(5h) inline generator: …and it does NOT claim a bypass it could not have seen"
+fi
 
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -56,7 +56,7 @@
 # `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
 # Wired into the drainer's installer because that is the unit the measured defect ran, and into the test's
 # census — which grades EVERY shipped template AND the declarations that are GENERATED INLINE by an
-# installer rather than rendered from `templates/` (§5a, §5b, §5e, §5g). ⛔ An earlier revision of this
+# installer rather than rendered from `templates/` (§5a, §5b, §5c3, §5e, §5g, §5h). ⛔ An earlier revision of this
 # paragraph said a bypass "can only reach a box through a template", and that was FALSE: `scripts/
 # install-lane-arm-timer.sh` writes its `Environment=` lines from a heredoc (`service_body`) and is farmed,
 # so it is a live install path that no template census sees. A generated declaration is graded like any
@@ -66,8 +66,17 @@
 # writes the plist's `EnvironmentVariables` with python, and it too is farmed — so this paragraph's claim
 # was again wider than the coverage behind it. It now calls `gate_policy_unit_veto` on both rendered
 # artifacts (`--dry-run` included, so the preview cannot show what an install would refuse), and its own
-# suite carries the arm that reddens when that call is deleted. The claim is therefore true by
-# construction, not by a census that happens to be complete today.
+# suite carries the arm that reddens when that call is deleted.
+# ⛔ AND THERE WAS A THIRD (fresh code review of PR #4020 at `4f9ff9b3e`, P2 — the same claim-wider-than-
+# coverage defect, one occurrence later): `scripts/install-runner-autoscale-timer.sh` composes a whole
+# `Environment="RUNNER_AUTOSCALE_PROVISIONER=…"` line from a seam, so its templates carry only a placeholder
+# and no census saw an `Environment=` line at all — while the file is farmed. It now asks this same judge on
+# its render path too (§5h grades the refusal). And the two sentences above were themselves only about
+# `templates/`: a declaration under `scripts/` (the macOS controller's `launchd.plist.template`, an
+# unattended dispatcher's `EnvironmentVariables` dict) was in NEITHER the census root set nor any arm. The
+# census now sweeps declarations outside `templates/` too, so "EVERY shipped template" means the files
+# rather than the directory they happen to live in. The claim is therefore true by construction, not by a
+# census that happens to be complete today.
 # STATED LIMIT, so no reader over-reads it: this grades the DECLARATION TEXT of the unit. `EnvironmentFile=`
 # (a file the unit names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own
 # `export` are outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so
@@ -169,23 +178,27 @@ gate_policy_unit_veto() {
   # The continuation is replaced by a SPACE, which is what systemd writes into its buffer.
   # The accumulator is the convention this tree already uses twice for the same man-page rule:
   # `scripts/harness-apply-pass.sh`'s `logical_lines()` (whose own comment cites `systemd.syntax(7)`).
-  local _ln _cmt _tail _bs _acc=""
+  local _ln _cmt _tail _bs _acc="" _body=""
   folded=""
+  # ⛔ `\r` IS AN EOL MARKER TO systemd, NOT DECLARATION TEXT — AND THAT IS TRUE OF A LONE `\r` TOO (fresh
+  # code review of PR #4020 at `4f9ff9b3e`, P3 — REPRODUCED AS A FAIL-OPEN). `read_line` never puts a line
+  # terminator in the buffer: `categorize_eol` classifies `\r` as an EOL (`src/basic/fileio.c` —
+  # `EOL_THIRTEEN`), and the append is on the `eol == EOL_NONE` path only, so NEITHER `\r` NOR `\n` reaches
+  # `conf-parser.c`. A CRLF declaration is therefore byte-identical to its LF twin, and a CR-ONLY file is a
+  # NORMAL multi-line file to systemd. `bash read` splits on `\n` alone, so without this transform a
+  # CR-only file arrives as ONE physical line and every rule below (the comment test, the parity scan, and
+  # most importantly the `^Environment=` extraction) is applied to a line that is not one of systemd's:
+  # MEASURED at the reviewed head — `[Service]\rEnvironment=AGENT_SKIP_REVIEW_GATE=1\r…`, a declaration
+  # systemd reads as a live `Environment=` with the hatch SET, answered **rc 0 CLEAN**, because the single
+  # logical line it was folded into starts with `[Service]`. That is the "silently stopped matching"
+  # fail-open class this whole function exists to close, so the split is done FIRST, before BOTH the comment
+  # test and the parity scan — the order systemd uses. CRLF is collapsed to LF first, so a `\r\n` remains
+  # ONE EOL and the CRLF fixtures below are unchanged; only a LONE `\r` becomes a line break.
+  # (`$(<"$f")` is a builtin read: no fork, and every declaration in this tree is small.)
+  _body="$(<"$f")"
+  _body="${_body//$'\r'$'\n'/$'\n'}"
+  _body="${_body//$'\r'/$'\n'}"
   while IFS= read -r _ln || [ -n "$_ln" ]; do
-    # ⛔ A TRAILING `\r` IS AN EOL MARKER, NOT DECLARATION TEXT (fresh review of PR #4020, P2 — reproduced).
-    # `read_line` never puts a line terminator in the buffer: `categorize_eol` classifies `\r` as an EOL
-    # (`src/basic/fileio.c` — `EOL_THIRTEEN`), and the append is on the `eol == EOL_NONE` path only, so
-    # NEITHER `\r` NOR `\n` reaches `conf-parser.c`. A CRLF declaration is therefore byte-identical to its
-    # LF twin by the time the escape scan runs. `bash read` splits on `\n` alone and KEEPS the `\r`, so
-    # without this strip the trailing run of `…FOO=1 \` is `\`+`\r`: the parity scan below counts ZERO
-    # backslashes, the join never happens, and the hatch lands on a line that no longer starts with
-    # `Environment=` — CLEAN, while systemd sets it. That is the same "silently stopped matching" fail-open
-    # this whole function exists to close, so the strip belongs in the fold, before BOTH the comment test
-    # and the parity scan (the order systemd uses).
-    # STATED LIMIT: a file written with CR-ONLY endings is ONE physical line to `read`, so it is not split
-    # here; no path in this tree writes one (every template is LF and every installer heredoc is LF), and
-    # the CRLF case is the one an editor or a `core.autocrlf` checkout actually produces.
-    _ln="${_ln%$'\r'}"
     # The comment test skips LEADING blanks (systemd does), and the line is then dropped whole.
     _cmt="$_ln"
     while :; do case "$_cmt" in [[:space:]]*) _cmt="${_cmt#?}" ;; *) break ;; esac; done
@@ -199,7 +212,7 @@ gate_policy_unit_veto() {
     fi
     folded="$folded$_acc$_ln"$'\n'
     _acc=""
-  done <"$f" 2>/dev/null
+  done <<<"$_body"
   # ⛔ NO `|| return 2` HERE: a `while` whose read fails on the first iteration still exits 0, so an error
   # branch on this loop would be a NO-OP GATE — it could never fire. The ungradable cases are refused by
   # the preflight above (absent, unreadable, or a directory), which is where they are actually reachable.
