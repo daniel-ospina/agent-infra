@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-62 tests with 131 paired mutations: every mutation re-
+62 tests with 132 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 62 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (131)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (132)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3713,6 +3713,15 @@ def t61():
     v = ev_text(prose)
     check(v.state == "wedged", "quoted prose must not read as an end marker; got %s/%s %s"
           % (v.state, v.reason, v.detail))
+    # …and printing a `nonce=` TOKEN must not turn one dispatch's log into several: the HARVEST is
+    # marker-scoped (the fence is not), so the ambiguity gate is about markers, not prose.
+    printed_nonce = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                     "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                     "every marker carries nonce=${nonce} on its line\n")
+    v = ev_text(printed_nonce)
+    check(v.state == "wedged",
+          "a PRINTED nonce token is not a second dispatch; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
     # …and another DISPATCH's end marker is fenced out with it, instead of poisoning the query.
     other_end = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
                  "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
@@ -3850,6 +3859,14 @@ MUTATIONS = [
         "the source's own in-flight count stops deciding, so a STALE `toolAgeMaxMs` (`tools=0`, the "
         "value the parent deliberately does not reset at `tool_end`) reads as an open call and "
         "convicts — the false-`wedged` class #4106 exists to remove",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if got is not None and "[task-heartbeat]" in line and got.group(1) not in nonces:',
+        '        if got is not None and got.group(1) not in nonces:',
+        "the nonce HARVEST widens to every line, so a child that merely PRINTS a `nonce=` token in "
+        "its own output reads as several dispatches and abstains a query whose answer was never in "
+        "doubt (`heartbeat-ambiguous-nonce`)",
     ),
     Mutation(
         "T61", "module",

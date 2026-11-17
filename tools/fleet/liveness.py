@@ -2464,7 +2464,12 @@ def _scan_heartbeat(text: str, nonce: str = ""):
     ended = False
     for line in text.splitlines():
         got = nonce_rx.search(line)
-        if got is not None and got.group(1) not in nonces:
+        # The HARVEST is marker-scoped while the FENCE is not: a child printing `nonce=` in its own
+        # output (a child editing `extensions/task-heartbeat.ts`, say) must not make a
+        # single-dispatch log read as several dispatches — `heartbeat-ambiguous-nonce` there would
+        # abstain a query whose answer was never in doubt. Measured over the 1,956 real capture logs
+        # on this box: the two scopes differ on ZERO of them, so this is the conservative reading.
+        if got is not None and "[task-heartbeat]" in line and got.group(1) not in nonces:
             nonces.append(got.group(1))
         if nonce and (got is None or got.group(1) != nonce):
             continue
@@ -2520,9 +2525,10 @@ def gather_heartbeat(path: str, *, nonce: str = "", source_age_ms: Optional[int]
 
     ⛔ EVERY READ CARRIES AN AGE, OR IT DOES NOT DECIDE. A FILE source's age is its mtime, and
     ``source_age_ms`` lets a caller override it (a log COPIED off a cell has the copy's mtime, not
-    the child's last emission). A PIPE has no age at all, so ``--heartbeat -`` requires
-    ``source_age_ms`` and is a usage error without one: an unknown age silently skipped the
-    staleness gate, which published `running-quiet` rc 0 for a 29-day-old log piped in.
+    the child's last emission). A PIPE has no age at all, so a ``-`` read without ``source_age_ms``
+    returns ``readable=False`` with the flag NAMED — an ABSTENTION (rc 3), not a usage error, because
+    only the read can establish that the age is missing. An unknown age used to skip the staleness
+    gate silently, which published `running-quiet` rc 0 for a 29-day-old log piped in.
     """
     if path == "-":
         if source_age_ms is None:

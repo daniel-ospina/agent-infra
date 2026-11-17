@@ -934,7 +934,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 62 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (131)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (132)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -2210,7 +2210,9 @@ name like `--nonce`: the session ladder never reads a heartbeat source, so honou
 impossible and accepting it would claim it was.
 
 `--nonce <n>` is that fence, honoured rather than re-invented: **every** line is fenced once a
-nonce is given, not only marker-shaped ones — the capture log is raw stdout+stderr
+nonce is given, not only marker-shaped ones (the reverse does not hold: only `[task-heartbeat]`
+lines are SCANNED for the nonce, so a child that merely prints a `nonce=` token in its own output
+does not make its log look like several dispatches) — the capture log is raw stdout+stderr
 (`extensions/shared/task-runs.ts:83`), so a `task_status`-shaped line is exactly what a forged
 append would look like (measured: `samples=18000000,18010000,3,4`, `running-quiet` rc 0). Without
 `--nonce` the source is **unfenced** and trusted — which is right for a log you own and wrong for a
