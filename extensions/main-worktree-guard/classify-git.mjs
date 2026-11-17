@@ -4152,6 +4152,71 @@ const GIT_BUILTIN_COMMANDS = new Set([
 ]);
 
 /**
+ * #594 (review round 14, P3 — the DOWNGRADE direction is fail-OPEN): the census
+ * above is a SNAPSHOT of one git's builtins, so on a git OLDER than the snapshot a
+ * name the census lists is NOT a builtin there — git treats it as unknown and
+ * consults the ALIAS, while the guard DROPS the definition and trusts the verb.
+ * Measured shape (git 2.30 has no `diagnose`/`bugreport`/`hook`):
+ * `git -c alias.hook='branch -fq v main' hook` reads as a trusted builtin.
+ *
+ * So builtin-ness is CENSUS ∧ RUNNING GIT: the probe is `git --list-cmds=builtins`
+ * on THIS box (the same command that regenerates the census), cached per process,
+ * and a census name the probe does not list is treated as NOT a builtin — which is
+ * the fail-CLOSED direction (its alias definition is expanded instead of dropped,
+ * and an unresolvable verb goes opaque). A name the probe ADDS is not needed: the
+ * census is a superset of this git's builtins, and an absent census name is
+ * already treated as non-builtin.
+ *
+ * When the probe cannot run, the census decides (the recorded residual: the
+ * snapshot hazard this note exists to name). The probe never THROWS into the
+ * gate and never empties the census — a broken/hung `git` costs one bounded
+ * `execFileSync` and leaves the pre-existing behaviour in place.
+ * @returns {Set<string>|null} the running git's builtins, or null when unprobeable
+ */
+let _gitBuiltinProbeCache;
+function _gitBuiltinProbe() {
+  if (_gitBuiltinProbeCache !== undefined) return _gitBuiltinProbeCache;
+  try {
+    const out = execFileSync("git", ["--list-cmds=builtins"], {
+      encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const names = new Set(String(out).split("\n").map((x) => x.trim()).filter((x) => x.length > 0));
+    // An empty answer is a BROKEN probe, not "git has no builtins" — never let it
+    // empty the census (that would flip every builtin verb to opaque at once).
+    _gitBuiltinProbeCache = names.size > 0 ? names : null;
+  } catch {
+    _gitBuiltinProbeCache = null;
+  }
+  return _gitBuiltinProbeCache;
+}
+
+/**
+ * #594: is `name` a git builtin on the git that will RUN this command?
+ * Census membership is necessary; when the runtime probe answers, it is also
+ * sufficient only if it agrees. A census name the running git does not have is
+ * NOT a builtin here → the alias definition is kept (expanded) and an
+ * unresolvable verb stays opaque, i.e. both fail-closed.
+ * @param {string} name
+ * @returns {boolean}
+ */
+function _isGitBuiltin(name) {
+  if (!GIT_BUILTIN_COMMANDS.has(name)) return false;
+  const probed = _gitBuiltinProbe();
+  if (probed === null) return true; // unprobeable → the census decides (residual)
+  return probed.has(name);
+}
+
+/**
+ * TEST SEAM ONLY — never called by the gate. Drops the cached probe so a test can
+ * present a DIFFERENT `git` on `PATH` and observe the downgrade clamp (the
+ * pre-fix module has no cache to drop and no probe to consult, so the pin that
+ * uses this reddens on the pre-fix code).
+ */
+export function resetGitBuiltinProbeCache() {
+  _gitBuiltinProbeCache = undefined;
+}
+
+/**
  * #594 review round 10: a FAITHFUL port of git's own reader for the
  * `GIT_CONFIG_PARAMETERS` channel — `parse_config_env_list` + `sq_dequote_step`
  * (`config.c:684-713`, `quote.c:121-165` at git v2.43.0) — because this is the
@@ -4657,6 +4722,43 @@ function _invEnvUnreadable(inv, name) {
   return String(v) !== String(process.env[name] ?? "");
 }
 /**
+ * The cwd the INVOCATION's git process runs in: its `cd` chain resolved against
+ * the session cwd, then its `-C` operands applied in argv order. This is the
+ * frame a RELATIVE entry in the child's `PATH`/`GIT_EXEC_PATH`/
+ * `--exec-path=<dir>` must resolve against — see `_gitSearchDirs`.
+ * @param {object} [inv]
+ * @returns {string|null} null when the frame cannot be established (fail closed)
+ */
+function _invEffectiveCwd(inv) {
+  let base;
+  try {
+    base = process.cwd();
+  } catch {
+    return null; // dead cwd → no frame → caller fails closed
+  }
+  // A `~`/`cd -`/unresolvable-`$VAR` target makes the WHOLE chain unknown (the
+  // same contract `_resolveCdChain` gives every other consumer).
+  let cwd = _resolveCdChain((inv && inv.cdChain) || [], base);
+  if (cwd === null) return null;
+  for (const c of (inv && inv.cHints) || []) {
+    if (c === null || c === undefined || c === "\u0000") return null; // unreadable `-C`
+    cwd = resolve(cwd, String(c));
+  }
+  return cwd;
+}
+/**
+ * Resolve a search directory to an ABSOLUTE path. A relative entry is relative
+ * to the GIT PROCESS's cwd, never to the guard's — see the ⛔ block below.
+ * @param {string} dir
+ * @param {string|null} cwd the invocation's effective cwd
+ * @returns {string|null} null when a relative dir has no resolvable frame
+ */
+function _absSearchDir(dir, cwd) {
+  if (dir.length === 0) return dir; // empty entry = skipped by every consumer
+  if (isAbsolute(dir)) return dir;
+  return cwd === null ? null : resolve(cwd, dir);
+}
+/**
  * The directories git would search for `git-<verb>` in THIS invocation's child
  * env: its `GIT_EXEC_PATH` (replacing) then its `PATH`.
  * @param {object} [inv]
@@ -4695,7 +4797,29 @@ function _gitSearchDirs(inv) {
   const pathDirs = prefixPath !== undefined
     ? String(prefixPath).split(":")
     : String(process.env.PATH ?? "").split(":");
-  return [...execDirs, ...pathDirs];
+  // ⛔ A RELATIVE SEARCH DIR BELONGS TO THE GIT PROCESS, NOT TO THE GUARD
+  // (review round 14, measured fail-open). `accessSync(join(dir, candidate))`
+  // resolved a relative `dir` against `process.cwd()` — the GUARD's frame — while
+  // git resolves it against ITS OWN cwd, i.e. after the invocation's `cd`/`-C`.
+  // The installed-`git-<verb>` exemption was therefore bought with an executable
+  // git never sees: measured on the pre-fix head, with `sub/git-foo` present only
+  // in the classifier's cwd, `PATH=sub git -C ../other foo` (and the
+  // `cd ../other && PATH=sub git foo` twin) answered `branchState:false,
+  // aliasOpaque:undefined`, while real git 2.43 in `../other` (no
+  // `other/sub/git-foo`) fell through to a persisted `alias.foo` and ran it.
+  // So each entry resolves against the INVOCATION's effective cwd; when that
+  // frame cannot be established the entry is unreadable and the search fails
+  // closed (the verb stays opaque) rather than borrowing the guard's cwd.
+  const needsCwd = [...execDirs, ...pathDirs].some((d) => d.length > 0 && !isAbsolute(d));
+  if (!needsCwd) return [...execDirs, ...pathDirs];
+  const cwd = _invEffectiveCwd(inv);
+  const resolvedDirs = [];
+  for (const d of [...execDirs, ...pathDirs]) {
+    const abs = _absSearchDir(d, cwd);
+    if (abs === null) return null; // relative dir, no frame → fail closed
+    resolvedDirs.push(abs);
+  }
+  return resolvedDirs;
 }
 function _gitExternalOnPath(verb, inv) {
   const name = String(verb ?? "");
@@ -4786,7 +4910,7 @@ function _expandAliasInvocations(invocations) {
     // builtin is unaffected (git's precedence is builtin > alias), so it is
     // classified as before rather than over-blocked.
     const aliasMayApply = GIT_ALIAS_PRECEDES_BUILTIN.has(verb) ||
-      (!GIT_BUILTIN_COMMANDS.has(verb) && !_gitExternalOnPath(verb, inv));
+      (!_isGitBuiltin(verb) && !_gitExternalOnPath(verb, inv));
     if (res.unreadableAliases && aliasMayApply) return { ...inv, aliasName: verb, aliasOpaque: true };
     // ⛔ THE LOOKUP IS CASE-INSENSITIVE, because git's alias lookup keys the
     // command name into the config key `alias.<cmd>`, whose name part is
@@ -4816,7 +4940,7 @@ function _expandAliasInvocations(invocations) {
     // what it was before #594 and is what `git <verb>` actually runs. The
     // persisted-alias residual below is unchanged: with no `git-<verb>` on the
     // exec path an unreadable name stays opaque and still fails closed.
-    if (!GIT_BUILTIN_COMMANDS.has(verb)) {
+    if (!_isGitBuiltin(verb)) {
       if (_gitExternalOnPath(verb, inv)) return inv;
       return { ...inv, aliasName: verb, aliasOpaque: true };
     }
@@ -4856,7 +4980,7 @@ function _expandAliasInvocations(invocations) {
       // FIRST for those (`is_deprecated_command` → handle_alias before
       // handle_builtin, v2.52.0 — `pack-redundant`, `whatchanged`), so an alias
       // DOES win there and must be expanded, not dropped.
-      if (GIT_BUILTIN_COMMANDS.has(name) && !GIT_ALIAS_PRECEDES_BUILTIN.has(name)) continue;
+      if (_isGitBuiltin(name) && !GIT_ALIAS_PRECEDES_BUILTIN.has(name)) continue;
       m.set(name, value);
     }
     return { defs: m, unreadableAliases };
@@ -5004,6 +5128,35 @@ export function symbolicRefWriteTarget(args) {
  * @param {string[]} args
  * @returns {{name: string|null, branch: string|null}|null}
  */
+/**
+ * #594 (review round 10, P2): read a ref's NAMESPACE before letting an
+ * UNRESOLVABLE leaf fail closed.
+ *
+ * `$VAR` in the LEAF cannot change the namespace: `git update-ref
+ * refs/tags/$T $SHA` writes a TAG whatever `$T` is. Treating an opaque operand
+ * as branch state in EVERY namespace made `refs/tags/**`, `refs/notes/**`,
+ * `refs/remotes/**` and `refs/wip-local/**` writes `branchState: true` →
+ * `op: "ref-write"` → an unconditional M3 block with NO carve-out — a
+ * regression against the base (which allowed them) that also refused
+ * `scripts/bg-rescue-wip.sh`'s own printed emergency instruction
+ * (`git -C <wt> update-ref refs/wip-local/<slug> <sha>`), i.e. the one command
+ * that message exists to save. The literal spellings always stayed `op:
+ * "other"`; only the opaque ones leaked, so the namespace boundary is what is
+ * restored here.
+ *
+ * `"unknown"` is everything else — a bare `$R`, a `refs/$NS/…`, a short name —
+ * where the namespace itself is unreadable: those stay fail-closed (#805).
+ * @param {string} name
+ * @returns {"heads"|"other"|"unknown"}
+ */
+function _refNamespace(name) {
+  const s = String(name ?? "");
+  if (s === "HEAD" || s.startsWith("refs/heads/")) return "heads";
+  const m = /^refs\/([A-Za-z0-9._-]+)\//.exec(s);
+  if (m) return m[1] === "heads" ? "heads" : "other";
+  return "unknown";
+}
+
 export function updateRefWriteTarget(args) {
   const a = args || [];
   if (a.some(_isStdinChannelFlag)) return { name: null, branch: null, opaque: true };
@@ -5017,6 +5170,11 @@ export function updateRefWriteTarget(args) {
   }
   // An UNRESOLVABLE spelling (`$R`, `$(…)`) names no ref the gate can read.
   const opaque = !LITERAL_REF_NAME.test(name);
+  // ⛔ THE NAMESPACE IS STATIC EVEN WHEN THE LEAF IS NOT (review round 10, P2):
+  // an unreadable leaf under a readable `refs/<ns>/` prefix cannot move out of
+  // that namespace, so it is NOT branch state unless ns is `heads`. Only an
+  // unreadable NAMESPACE fails closed.
+  if (_refNamespace(name) === "other") return null;
   if (!deleting && pos.length < 2) {
     // <ref> alone is an rc-129 no-op in git; keep the historic over-block.
     return /^refs\/heads\//.test(name) || name === "HEAD" || opaque
@@ -7615,12 +7773,22 @@ const HUB_GUARDED_VERBS = new Set([
   "branch", "tag", "stash", "submodule", "symbolic-ref", "remote", "worktree",
 ]);
 
-/** Read-only verbs — safe to run in a disordered hub (no state mutation). */
+/** Read-only verbs — safe to run in a disordered hub (no state mutation).
+ * ⛔ A NAME IN THIS SET MUST BE A GIT COMMAND (a builtin, or a `git-<name>`
+ * external that actually ships). `merge-msg` was neither: git's builtin is
+ * `fmt-merge-msg`, and no `git-merge-msg` exists anywhere — so `git merge-msg`
+ * is exactly the alias-resolvable class #594 marks `aliasOpaque`, and listing it
+ * here admitted that opaque class as "provably read-only" (review round 13).
+ * `merge-one-file`/`mergetool` stay: both ship as `git-*` externals, which
+ * outrank the alias. The `aliasOpaque` guard at the top of
+ * `_isCarveOutReadOnlyInvocation`/`isHubRecoveryInvocation` closes the general
+ * class; this set is kept honest so the allowlist stays a subset of the commands
+ * git can resolve WITHOUT consulting an alias. */
 const HUB_READONLY_VERBS = new Set([
   "status", "log", "diff", "show", "show-ref", "blame", "remote", "rev-parse",
   "rev-list", "ls-files", "ls-tree", "ls-remote", "grep", "shortlog",
   "describe", "name-rev", "cat-file", "for-each-ref", "help", "version",
-  "merge-base", "merge-tree", "merge-file", "merge-index", "merge-msg",
+  "merge-base", "merge-tree", "merge-file", "merge-index",
   "merge-one-file", "mergetool", "check-ref-format", "var", "hash-object",
   "count-objects", "verify-pack", "verify-commit", "verify-tag", "config",
   "reflog", "whatchanged", "cherry", "fsck",
@@ -7659,6 +7827,17 @@ const HUB_READONLY_VERBS = new Set([
 function _isCarveOutReadOnlyInvocation(v) {
   const verb = v.verb;
   const args = v.args || [];
+  // ⛔ #594 (review round 13, MEASURED-CLASS FAIL-OPEN): an ALIAS-OPAQUE verb is
+  // never provably read-only. The carve-out returns from index.ts for the WHOLE
+  // command at the first `reBaseline`, so any sibling this predicate wrongly
+  // admits is never seen by the M3 loop — and the verb key here was the one place
+  // the new `aliasOpaque` class was not consulted. `merge-msg` sat in
+  // HUB_READONLY_VERBS yet is NOT a git builtin and ships no `git-merge-msg`
+  // external, so `git checkout main && git merge-msg` with a persisted
+  // `alias.merge-msg='branch -fq victim …'` closed the carve-out
+  // (`stateCarveOutClean:true`) with an opaque mutation in `stateMutations` while
+  // git force-moved the branch (measured). Unprovable ⇒ not read-only.
+  if (v.aliasOpaque === true) return false;
   if (HUB_READONLY_VERBS.has(verb)) return true;
   // A refspec-less fetch cannot write refs/heads/* (cycle-2 reviewer P3).
   if (verb === "fetch") return !args.some((x) => _stripQuotes(x).includes(":"));
@@ -7809,6 +7988,12 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
   const a = args || [];
   const pos = a.filter((x) => !x.startsWith("-"));
   const flag = (f) => a.includes(f);
+  // ⛔ #594 (review round 13): an ALIAS-OPAQUE invocation cannot be sanctioned —
+  // the verb it names is not what git runs (a persisted alias, or a `git-<word>`
+  // that is not installed, decides), so every verb-keyed arm below would grade a
+  // command nobody can see. `git merge-msg` was graded "readonly" through
+  // HUB_READONLY_VERBS before this guard. Fail closed, before the switch.
+  if (inv && inv.aliasOpaque === true) return "block";
   switch (verb) {
     case "checkout":
     case "switch":
@@ -9716,7 +9901,7 @@ function _spanCarriesGit(inner, cmdVars = {}, execCwd = process.cwd()) {
     // "readonly" — mirror the special case here so the substitution surface
     // does not re-open it.
     if (gi.verb === "symbolic-ref" && !(gi.args || []).includes("HEAD")) return true;
-    if (gi.verb && isHubRecoveryInvocation(gi.verb, gi.args, null) === "block") return true;
+    if (gi.verb && isHubRecoveryInvocation(gi.verb, gi.args, null, false, gi) === "block") return true;
   }
   for (const sub of _extractSubstitutionSpans(inner)) {
     if (_spanCarriesGit(sub, cmdVars, execCwd)) return true;
@@ -9852,12 +10037,12 @@ function _unverifiableGitContent(command, execCwd = process.cwd()) {
         if (producerArgs !== piped) {
           for (const pi of allGitInvocations(producerArgs)) {
             if (pi.verb === "__unverifiable__") return true;
-            if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null) === "block") return true;
+            if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null, false, pi) === "block") return true;
           }
         }
       }
       for (const pi of pInns) {
-        if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null) === "block") return true;
+        if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null, false, pi) === "block") return true;
       }
       continue; // round-12 (second-model P1): scan EVERY pipe-to-shell segment — the
       // old `return false` after the first clean segment let `echo x | bash &&
@@ -10129,7 +10314,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           // Shared-ref/remote/unknown verb: re-classify against the WORKTREE's
           // own branch — the recovery carve-out (e.g. push origin
           // <checked-out-branch>) derives from the wt's HEAD, not the hub's.
-          const wv = isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch);
+          const wv = isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch, false, inv);
           if (wv === "block") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops as exemptions (round-3)
@@ -10204,7 +10389,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
                 `would advance the shared main ref.`),
             };
           }
-          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
+          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch, false, inv) === "block") {
             return {
               verdict: "block", exempted: false,
               reason: _mainProtectionReason(inv, hubContext,
@@ -14700,7 +14885,7 @@ function _gitInvocationsVerdict(invocations, currentBranch, executionCwd, sessio
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") return "block";
         if (!WORKTREE_LOCAL_VERBS.has(inv.verb)) {
           // shared-ref/remote/unknown verb — re-classify against the wt's branch
-          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") return "block";
+          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch, false, inv) === "block") return "block";
           continue;
         }
         continue;

@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractHeredocProgramScriptInvocations, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractHeredocProgramScriptInvocations, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets, resetGitBuiltinProbeCache } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -1367,6 +1367,147 @@ dexpect("#594-R3d a duplicated prefix handed through `env` — the LAST one wins
 dexpect("#594-R3e the SPACE form of `--config-env` keeps its argv position against a later `-c`",
   `EE=status git --config-env alias.x=EE -c alias.x='branch -fq victimSP main' x`,
   { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimSP", "main"] });
+
+// ── #594 review round 13: an ALIAS-OPAQUE sibling never makes the #376
+// carve-out CLEAN. The carve-out `return`s from the whole handler at the first
+// `reBaseline`, so any sibling the read-only test wrongly admits is never seen
+// by the M3 loop — and the verb-keyed read-only set admitted the new opaque
+// class. Measured at `d63b71a08`: `git checkout main && git merge-msg` answered
+// `stateCarveOutClean:true` with `{verb:"merge-msg", aliasOpaque:true}` in
+// `stateMutations`, while a persisted `alias.merge-msg='branch -fq victim …'`
+// force-moved the branch (git 2.43, rc 0; git ships no `git-merge-msg`).
+// `merge-msg` is no longer in HUB_READONLY_VERBS (it is not a git command at
+// all), and both predicates now refuse an opaque invocation outright — the
+// second row below creates the opaque class for a name that IS still listed, so
+// the guard, not just the set edit, is what is under test.
+{
+  const r13a = classifyGitCommandDetailed(`git checkout main && git merge-msg`);
+  const r13aOpaque = (r13a.stateMutations || []).some((m) => m.aliasOpaque === true);
+  const ok13a = r13a.stateCarveOutClean === false && r13aOpaque && r13a.stateOpCount === 2;
+  console.log(`${ok13a ? "✅" : "❌"} #594-R13a an ALIAS-OPAQUE sibling leaves the #376 carve-out NOT clean (\`checkout main && merge-msg\`): carve=${JSON.stringify(r13a.stateCarveOutClean)} opaque=${r13aOpaque} ops=${r13a.stateOpCount}`);
+  ok13a ? pass++ : fail++;
+  dexpect("#594-R13b …and the guard itself: an opaque \`mergetool\` (its exec path removed) does not close the carve-out",
+    `git checkout main && git --exec-path=/nonexistent-r13-594 mergetool`,
+    { stateCarveOutClean: false });
+  dexpect("#594-R13c control — the sanctioned return with a PROVABLE read-only sibling still closes it (\`checkout main && status\`)",
+    `git checkout main && git status`, { stateCarveOutClean: true });
+}
+// The recovery/recovery-allowlist consumers read the SAME class. `merge-msg` was
+// graded "readonly" through the verb set alone (no invocation record needed), and
+// the opaque guard covers the call sites that DO pass one.
+for (const [what, got, want] of [
+  ["merge-msg is no longer a sanctioned recovery verb (it is not a git command)", isHubRecoveryInvocation("merge-msg", [], null), "block"],
+  ["an ALIAS-OPAQUE invocation is refused before any verb-keyed arm",
+    isHubRecoveryInvocation("mergetool", [], null, false, { verb: "mergetool", aliasOpaque: true }), "block"],
+  ["control — the same verb WITHOUT the opaque record stays sanctioned", isHubRecoveryInvocation("mergetool", [], null), "readonly"],
+  ["control — a plain read-only verb stays sanctioned", isHubRecoveryInvocation("status", [], null), "recovery"],
+]) {
+  const ok = got === want;
+  console.log(`${ok ? "✅" : "❌"} #594-R13d ${what}: ${got}${ok ? "" : ` (expected ${want})`}`);
+  ok ? pass++ : fail++;
+}
+
+// ── #594 review round 10 (P2, over-block): the ref NAMESPACE is static even
+// when the LEAF is not. An unreadable `$VAR`/`$(…)` operand under a readable
+// `refs/<ns>/` prefix cannot leave that namespace, so only `heads` (or an
+// unreadable namespace) is branch state. Before this, `branchState` was true for
+// every namespace — `op: "ref-write"` → an unconditional M3 block with no
+// carve-out — which refused `scripts/bg-rescue-wip.sh`'s own printed rescue
+// command (`git -C <wt> update-ref refs/wip-local/<slug> <sha>`, the one command
+// that message exists to save) and every `refs/tags/**`/`refs/notes/**` write
+// built from a variable. Measured at the base: those are allowed.
+for (const [label, command, want] of [
+  ["refs/wip-local/$SLUG (the rescue instruction)", `git update-ref refs/wip-local/$SLUG $C`, false],
+  ["…the same from a worktree (-C $WT)", `git -C $WT update-ref refs/wip-local/$SLUG $C`, false],
+  ["refs/tags/$T", `git update-ref refs/tags/$T $SHA`, false],
+  ["refs/notes/$N", `git update-ref refs/notes/$N $SHA`, false],
+  ["refs/remotes/origin/$BR", `git update-ref refs/remotes/origin/$BR $SHA`, false],
+  ["control — refs/heads/$BR is STILL branch state", `git update-ref refs/heads/$BR $SHA`, true],
+  ["control — a bare $R leaves the namespace UNREADABLE, so it still fails closed", `git update-ref $R $SHA`, true],
+  ["control — refs/$NS/x (unreadable namespace) still fails closed", `git update-ref refs/$NS/x $SHA`, true],
+]) {
+  const got = classifyGitCommandDetailed(command).branchState;
+  const ok = got === want;
+  console.log(`${ok ? "✅" : "❌"} #594-R10n ${label} → branchState ${got}${ok ? "" : ` (expected ${want})`}`);
+  ok ? pass++ : fail++;
+}
+
+// ── #594 review round 14 (P2, measured fail-open): a RELATIVE search dir
+// belongs to the GIT process, not to the guard. `accessSync(join(dir, …))`
+// resolved a relative `PATH`/`--exec-path=<rel>` entry against the GUARD's
+// `process.cwd()`, while git resolves it against its OWN cwd (after `cd`/`-C`) —
+// so an installed `git-<verb>` that git cannot see bought the exemption and the
+// verb stopped being `aliasOpaque`, letting a persisted `alias.<verb>` run
+// unclassified. Rows below create a shim reachable ONLY from the guard's cwd.
+{
+  const FX594_REL = `fx594rel${process.pid}`;
+  const relRoot = mkdtempSync(join(tmpdir(), "mwg594rel-"));
+  const prevCwd = process.cwd();
+  try {
+    const here = join(relRoot, "here");
+    const other = join(relRoot, "other");
+    mkdirSync(join(here, "sub"), { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const relShim = join(here, "sub", `git-${FX594_REL}`);
+    writeFileSync(relShim, "#!/bin/sh\nexit 0\n");
+    chmodSync(relShim, 0o755);
+    process.chdir(here);
+    dexpect(`#594-R14a control — a RELATIVE \`PATH\` entry that resolves from the invocation's OWN cwd IS found (\`git ${FX594_REL}\`)`,
+      `PATH=sub git ${FX594_REL} --version`, { branchState: false });
+    dexpect(`#594-R14b a RELATIVE \`PATH\` entry resolves from the invocation's cwd AFTER \`-C\` — the guard-cwd shim buys NO exemption`,
+      `PATH=sub git -C ../other ${FX594_REL} --version`, { branchState: true });
+    dexpect(`#594-R14c …the same through a \`cd\` chain`,
+      `cd ../other && PATH=sub git ${FX594_REL} --version`, { branchState: true });
+    dexpect(`#594-R14d …and through \`--exec-path=<relative dir>\``,
+      `git -C ../other --exec-path=sub ${FX594_REL} --version`, { branchState: true });
+    dexpect(`#594-R14e a relative entry with NO resolvable cwd frame fails closed, never borrowing the guard's cwd`,
+      `cd $R14_UNSET_594_DIR && PATH=sub git ${FX594_REL} --version`, { branchState: true });
+  } finally {
+    process.chdir(prevCwd);
+    try { rmSync(relRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// ── #594 review round 14 (P3): the builtin census is a SNAPSHOT, and on a git
+// OLDER than it the DOWNGRADE direction is fail-OPEN — git treats a name the
+// census lists as unknown and consults the ALIAS, while the guard DROPS the
+// definition and trusts the verb. The clamp is `census ∧ git --list-cmds=builtins`
+// on the RUNNING git; the rows below install a fake `git` that does not know
+// `hook` (a 2.36+ builtin) and prove BOTH consequences of the clamp: the
+// definition is kept (expanded, so the real command is classified) and the bare
+// verb goes opaque (fail closed) instead of being trusted.
+{
+  const censusDir = mkdtempSync(join(tmpdir(), "mwg594census-"));
+  const prevPath = process.env.PATH;
+  try {
+    const realGit = execSync("command -v git", { encoding: "utf-8" }).trim();
+    const fakeGit = join(censusDir, "git");
+    writeFileSync(fakeGit, [
+      "#!/bin/sh",
+      'if [ "$1" = "--list-cmds=builtins" ]; then',
+      `  printf '%s\\n' add commit status log diff checkout branch reset hookless-sentinel`,
+      "  exit 0",
+      "fi",
+      `exec "${realGit}" "$@"`,
+      "",
+    ].join("\n"));
+    chmodSync(fakeGit, 0o755);
+    process.env.PATH = `${censusDir}:${prevPath}`;
+    resetGitBuiltinProbeCache();
+    dexpect("#594-R14f a census name the RUNNING git does not have keeps its alias definition (EXPANDED, not dropped)",
+      `git -c alias.hook='branch -fq victimR14 main' hook`,
+      { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimR14", "main"] });
+    dexpect("#594-R14g …and with no `git-<verb>` external in that git either, the bare verb is opaque rather than trusted (fail closed)",
+      `git --exec-path=/nonexistent-r14g-594 hook run pre-commit`, { branchState: true });
+  } finally {
+    process.env.PATH = prevPath;
+    resetGitBuiltinProbeCache();
+    try { rmSync(censusDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  // Control with the REAL git: the clamp must not cost a real builtin its trust.
+  dexpect("#594-R14h control — on the running git a REAL builtin is still trusted (`git status`)",
+    `git status`, { branchState: false });
+}
 
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });

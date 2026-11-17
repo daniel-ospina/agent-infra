@@ -536,6 +536,19 @@ const REF_MATRIX = [
   ["symbolic-ref", ["-qqm", "why", "refs/heads/victim", "refs/heads/main"], true],
   ["symbolic-ref", ["-md", "refs/heads/P3", "refs/heads/main"], true],
   ["update-ref", ["-dm", "why", "refs/heads/victimD", "HEAD"], true],
+  // #594 review round 10 (P2) — the NAMESPACE is STATIC even when the LEAF is
+  // not: an unreadable `$VAR`/`$(…)` under a READABLE `refs/<ns>/` prefix cannot
+  // leave that namespace, so only `heads` (or an unreadable namespace) is branch
+  // state. Before this, an opaque operand was `ref-write` in EVERY namespace —
+  // an unconditional M3 block that refused `scripts/bg-rescue-wip.sh`'s own
+  // printed rescue command (`git -C <wt> update-ref refs/wip-local/<slug> <sha>`).
+  ["update-ref", ["refs/wip-local/$SLUG", "$C"], false],
+  ["update-ref", ["refs/tags/$T", "$SHA"], false],
+  ["update-ref", ["refs/notes/$N", "$SHA"], false],
+  ["update-ref", ["refs/remotes/origin/$BR", "$SHA"], false],
+  ["update-ref", ["refs/heads/$BR", "$SHA"], true],
+  ["update-ref", ["$R", "$SHA"], true],
+  ["update-ref", ["refs/$NS/x", "$SHA"], true],
 ];
 const cliWrite = (verb, args) => (verb === "symbolic-ref"
   ? cg.symbolicRefWriteTarget(args)

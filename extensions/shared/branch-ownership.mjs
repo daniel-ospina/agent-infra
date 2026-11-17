@@ -926,7 +926,19 @@ export function classifyBranchOp(subcmd, args, opts = {}) {
       return { op: "ref-write", target: null };
     }
     const pos = _refVerbPositionals(a);
-    if (pos[0] && !LITERAL_REF_NAME.test(pos[0])) return { op: "ref-write", target: null };
+    // #594 (review round 10, P2 — mirror of the classifier's `_refNamespace`):
+    // an UNRESOLVABLE leaf under a READABLE `refs/<ns>/` prefix cannot leave that
+    // namespace, so `refs/tags/$T` / `refs/notes/$N` / `refs/remotes/o/$B` /
+    // `refs/wip-local/$SLUG` stay `op: "other"` exactly as their literal
+    // spellings do. Only an unreadable NAMESPACE (a bare `$R`, `refs/$NS/…`) is
+    // fail-closed into `ref-write`. Before this, an opaque operand became
+    // `ref-write` in every namespace — an unconditional block that refused
+    // `bg-rescue-wip.sh`'s own printed rescue command.
+    if (pos[0] && !LITERAL_REF_NAME.test(pos[0])) {
+      const m = /^refs\/([A-Za-z0-9._-]+)\//.exec(String(pos[0]));
+      if (m && m[1] !== "heads") return { op: "other" }; // the SPECIFIC namespace is known
+      return { op: "ref-write", target: null };
+    }
     if (pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD")) {
       return { op: "switch-existing" };
     }
