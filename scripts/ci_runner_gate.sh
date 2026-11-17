@@ -1908,7 +1908,7 @@ if [ "$healthy" = 3 ]; then
   blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
   blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
   # ⛔ THE CAPABILITY IS CAPTURED HERE, NOT READ AT WRITE TIME (review P2, measured). `$CAPABILITY` is a
-  # global that `set_labels` OVERWRITES when ITS read fails (`:1429`), and the repair runs BETWEEN this
+  # global that `set_labels` OVERWRITES when ITS read fails (`:1431`), and the repair runs BETWEEN this
   # point and the last verdict write — so a writer reading `${CAPABILITY:-none}` at call time published
   # the LABEL read's capability beside a `capacity=` the CENSUS measured. Measured on the
   # enumeration-failure shape: `capacity=saturated` (a certifying census verdict) next to
@@ -2001,9 +2001,40 @@ if [ "$healthy" = 3 ]; then
   repair_ok=1
   if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
   if [ "$repair_ok" = 1 ]; then
-    log "repair OK: the pool was converged to the recorded mode=$recorded (demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded)"
-    write_blind_verdict "the pool was converged to the mode the state file records ($recorded)"
-    log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed — the pool now advertises $recorded and the recorded DECISION is unchanged (the state file still says $recorded)"
+    # ⛔ THE CONVERGENCE IS RE-MEASURED, NOT INFERRED FROM THE WRITE (review P1, measured). `set_labels`
+    # writes ONLY the runners carrying this gate's pool marker (`managed_ids`, :1324), while `mode`
+    # counts EVERY runner carrying the fallback label (`current_mode`, :1586) — and this file's own
+    # vocabulary defines "the pool advertises mode=X" as that COUNT (`:2075`: "`carriers` is what the
+    # pool ADVERTISES right now"). So a write that lands on the managed set does NOT establish that the
+    # pool's count changed: a runner outside the pool can still carry `ubuntu-latest` (the suite's (i)
+    # fixture — never relabelled, by design #2327), and the line would then claim a pool-wide
+    # convergence the very next pass contradicts. Measured, on the release-repair path with one such
+    # runner present: `repair OK … the pool now advertises github` and the verdict
+    # `the pool was converged to the mode the state file records (github)`, while the next pass read
+    # `mode=local`. The same line also published `mode=`, the PRE-write reading, beside a post-write
+    # claim — one durable line disagreeing with itself. So the post-repair state is READ, and the claim
+    # is only as wide as the re-read: the managed write is what this pass performed, and the pool's
+    # advertised mode is what it measures afterwards.
+    post_mode=""
+    if post_mode="$(current_mode)"; then
+      mode="$post_mode"; MODE_SOURCE="runners"
+    else
+      # ⛔ A RE-READ THAT DID NOT ANSWER LEAVES NO CURRENT POOL-WIDE VALUE, so the durable line may not
+      # carry the pre-write one as if it were current. `unknown`/`none` is this file's vocabulary for
+      # exactly that (and the claim text below says the managed write landed).
+      post_mode=""; mode="unknown"; MODE_SOURCE="none"
+    fi
+    if [ "$post_mode" = "$recorded" ]; then
+      log "repair OK: the pool was converged to the recorded mode=$recorded — CONFIRMED by a post-repair re-read (mode=$post_mode); demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded"
+      write_blind_verdict "the pool was converged to the mode the state file records ($recorded), and a post-repair re-read of the label state AGREES (mode=$recorded)"
+      log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed — the pool now advertises $recorded and the recorded DECISION is unchanged (the state file still says $recorded)"
+    else
+      # The write landed on the managed set and the pool-wide count did NOT reach the recorded mode.
+      # Both facts are named, and neither is rounded up to "the pool was converged".
+      log "repair OK (MANAGED SET ONLY): the managed runners were converged to the recorded mode=$recorded, but the post-repair re-read does NOT agree — $(if [ -z "$post_mode" ]; then echo 'the re-read did not answer, so the pool-wide label state is UNMEASURED'; else echo "the pool-wide mode is $post_mode: a runner OUTSIDE this gate's ownership still carries the fallback label, and set_labels writes only the managed set (#2327)"; fi); the state file still says $recorded and this pass took no new decision"
+      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read does NOT confirm the pool-wide mode — $(if [ -z "$post_mode" ]; then echo 'the re-read did not answer'; else echo "mode=$post_mode, i.e. a runner outside this gate's ownership still carries the fallback label"; fi) — the recorded decision is unchanged"
+      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is $(if [ -z "$post_mode" ]; then echo 'unmeasured (the post-repair re-read did not answer)'; else echo "mode=$post_mode"; fi) — the recorded DECISION is unchanged (the state file still says $recorded)"
+    fi
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
@@ -2022,7 +2053,7 @@ if [ "$healthy" = 3 ]; then
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
     # ⛔ THE ARM'S TERMINAL LINE MAY NOT PUBLISH THE PRE-WRITE READING (review P2/P3, measured). `mode` is
-    # `current_mode` taken BEFORE the write (`:1768`), so `(leaving mode=$mode)` reported a pre-repair
+    # `current_mode` taken BEFORE the write (`:1770`), so `(leaving mode=$mode)` reported a pre-repair
     # measurement as the pool's post-repair state — after a PARTIAL write that is false, and it contradicts
     # the line above it. What the pass knows: the repair did not land, and the labels may be partly changed.
     log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land — the pool's labels may be PARTIALLY changed (see the set_labels lines above); mode=$recorded is NOT confirmed"
