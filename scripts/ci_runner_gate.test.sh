@@ -1431,7 +1431,9 @@ run_gate ledger-unreadable GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001
 KEEP_STATE=0
 assert_contains "$OUT" "ghost ledger UNREADABLE" "a malformed ledger is NAMED, not silently ignored"
 assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and its run is READ, never discounted on an entry that did not parse"
-assert_eq "$(cat "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null)" "4001" "…and the file is rewritten to the proofs that DID parse"
+assert_eq "$(awk '{print $1}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null)" "4001" "…and the file is rewritten to the proofs that DID parse, stamped with the moment they were proved"
+assert_eq "$(awk 'NF != 2' "$STATE_DIR/ci-runner-gate.ghosts" | grep -c . | tr -d ' ')" "0" \
+  "…every row carries exactly `<run id> <epoch>` (a row with no stamp is a proof nobody dated)"
 
 # ⛔ ONE PAGE IS NOT THE QUEUE (see the block above): the runs endpoint is newest-first, so a head that is
 # older than the newest QUEUE_PAGE runs is INVISIBLE to a single-page walk — measured on the live repo,
@@ -1540,6 +1542,99 @@ run_gate ledger-absent-total GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="40
   GH_QUEUE_ROWS_SPEC="4001:172800" --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
   "NO entry from an unmeasured total: absence is not zero"
+
+# ⛔ A PROOF IS NOT FOREVER (T1, agent-infra#4113 review CYCLE 2, P0). A reading is a fact about one
+# moment, and a run can gain jobs WHILE STAYING `queued` (a progressive job set finishing, a new attempt),
+# so "it never leaves the queue" does not invalidate an entry. Reproduced by the reviewer against the
+# first cut: pass 1 sees `.jobs: []`, pass 2 answers a queued job for the SAME run, and the pass logged
+# `ghost_cached=1`, `jobs reads: 0`, "nothing is waiting for a runner" → `fallback_off` strips the pool
+# over live demand. The fix is an EXPIRY: each entry carries the epoch at which it was proved, a HIT DOES
+# NOT REFRESH IT, and an entry older than GHOST_REPROVE_AFTER_S is dropped at load (re-read and re-proven).
+# The arms below are the flip itself (expired proof → demand seen), the load-bearing expiry (fresh proof →
+# demand NOT re-read, which is the whole point of the ledger), and clock skew.
+echo "── #4113: a remembered ghost that GAINS jobs is re-read once its proof expires (the flip) ──"
+run_gate ledger-flip GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "pass 1: a zero-job run is proved and remembered"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and it certifies the queue empty, which is correct AT THAT MOMENT"
+GL_FLIP_STAMP="$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts")"
+assert_eq "$(awk 'NF' "$STATE_DIR/ci-runner-gate.ghosts" | wc -l | tr -d ' ')" "1" "…with exactly one stamped entry"
+assert_eq "$(( $(date +%s) - GL_FLIP_STAMP < 300 ))" "1" "…stamped NOW (a proof is dated, not just asserted)"
+KEEP_STATE=1
+# The SAME run now answers a queued job (no GH_DEMAND_GHOST_IDS) — the flip — and its proof is BACK-DATED
+# past the interval rather than made short-lived: a 1 s TTL would need a sleep at a 1 s boundary, i.e. a
+# flake on a loaded runner, where an aged stamp is the same claim stated deterministically.
+printf '4001 %s\n' "$(( $(date +%s) - 100 ))" > "$STATE_DIR/ci-runner-gate.ghosts"
+run_gate ledger-flip GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=50 --
+KEEP_STATE=0
+assert_eq "$RC" "0" "pass 2 still reaches a verdict"
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…because the EXPIRED proof is RE-READ, not trusted"
+assert_contains "$OUT" "proof(s) EXPIRED" "…and the pass says so"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "the flipped run's demand is SEEN — the fail-open this arm exists for"
+assert_not_contains "$OUT" "ghost_cached=1" "it was not discounted from the ledger"
+# …and the negative control: a FRESH proof is trusted (that is the ledger's whole job), so the same flip
+# does NOT redden anything when the interval has not elapsed — without this pair the arm above would pass
+# on a gate that simply never remembered anything.
+run_gate ledger-fresh-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+# ⛔ THE STAMP IS BACK-DATED BY 100 s BEFORE THE HIT, AND THAT IS WHAT MAKES THE ASSERTION BITE. Two
+# passes run within the same SECOND, so a mutant that re-stamps on every hit would write the SAME epoch
+# and the arm would pass — measured: `hit-refreshes` survived this assertion when the stamp was real.
+# A back-dated stamp (still well inside the shipped 12 h interval) separates "carried forward" from
+# "refreshed" deterministically, with no sleep at a boundary.
+GL_STAMP_AGED="$(( $(date +%s) - 100 ))"
+printf '4001 %s\n' "$GL_STAMP_AGED" > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-fresh-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_not_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "a FRESH proof is trusted and the run is not re-read (the cost bound the ledger exists for)"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and the verdict is the remembered one (so the flip arm is not vacuous)"
+# ⛔ A HIT MUST CARRY THE OLD STAMP FORWARD, NOT STAMP ITSELF (review cycle 2, P0 — the subtle half). An
+# entry re-stamped on every use is IMMORTAL: it would never expire, so the flip the arm above pins would
+# be missed forever instead of for one interval. Asserted directly on the file, because a sleep-based
+# arm at a 1 s boundary is a flake waiting to happen on a loaded runner.
+assert_eq "$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts")" "$GL_STAMP_AGED" \
+  "the hit did NOT refresh the stamp (an immortal proof would never expire)"
+assert_eq "$(awk 'NF' "$STATE_DIR/ci-runner-gate.ghosts" | wc -l | tr -d ' ')" "1" \
+  "…and the hit did not append a SECOND row for the same run (the dedupe is on the id, not the pair)"
+# …and a proof stamped in the FUTURE (a clock skew no reading can date) is not trusted either.
+echo "── #4113: a proof dated in the FUTURE is not trusted ──"
+run_gate ledger-future-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+printf '4001 %s\n' "$(( $(date +%s) + 99999 ))" > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-future-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "a future-dated proof is re-read, never trusted (it would never expire)"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and, being re-proved zero-job, the verdict is still correct"
+
+# ⛔ THE TWO NEW BOUNDS ARE SHAPE-CHECKED LIKE EVERY OTHER ONE, ZERO INCLUDED WHERE ZERO IS FAIL-OPEN.
+# The gap was real (review cycle 2, P2): neither of these `case` arms was named by any assertion, so
+# deleting either reddened nothing — the same half-fixed gap as cycle 1's missing page-cap arm.
+echo "── #4113: the trust floor and the re-prove interval are bounded, not defaulted ──"
+run_gate ledger-floor-zero GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:60" \
+  CI_GATE_GHOST_TRUST_AFTER_S=0 --
+assert_eq "$RC" "2" "a ZERO trust floor → exit 2 (it would disarm the age condition, which is fail-OPEN here)"
+assert_contains "$OUT" "ghost ledger trust floor is ZERO" "…naming the misconfiguration"
+run_gate ledger-floor-huge GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_TRUST_AFTER_S=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE trust floor → exit 2"
+assert_contains "$OUT" "ghost ledger trust floor OUT OF RANGE" "…named as a range error, not a read"
+run_gate ledger-reprove-junk GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=abc --
+assert_eq "$RC" "2" "an unreadable re-prove interval → exit 2"
+assert_contains "$OUT" "ghost proof re-prove interval UNREADABLE" "…naming the read failure"
+run_gate ledger-reprove-huge GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE re-prove interval → exit 2"
+assert_contains "$OUT" "ghost proof re-prove interval OUT OF RANGE" "…named as a range error"
+run_gate pages-cap-huge GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_READ_MAX_PAGES=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE page cap → exit 2"
+assert_contains "$OUT" "queue read page cap OUT OF RANGE" "…the third unpinned bound of this change, now pinned"
 
 # ⛔ A READ VERB CHANGES NOTHING: the ledger is a cache, and `--dry-run` must leave the box as it found it
 # (the same rule the blind-streak arms pin for their own state).

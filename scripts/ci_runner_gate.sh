@@ -132,29 +132,49 @@ QUEUE_MAX_PAGES="${CI_GATE_QUEUE_READ_MAX_PAGES:-5}"
 # yet at all: GitHub creates a run's jobs progressively, and the #2344 comment in this file records
 # 8-11 h old runs whose job set was still filling in.
 # ⛔ (a) AND (b) ARE NOT REDUNDANT, AND THE DIFFERENCE IS EXACTLY THE #2344 MEASUREMENT (agent-infra#4113
-# review, P1 — an earlier draft of this block claimed the age floor alone covered it, which contradicted
-# a floor of 3600 s and would have been an unsatisfiable requirement). The 8-11 h population the #2344
-# comment names had ZERO QUEUED jobs, not zero TOTAL jobs — those runs' job sets were fully created.
-# They are excluded here by (a), which is the strict predicate, and NO age rule could separate them (the
-# #2344 comment says so). The age floor exists only for the narrower case (a) cannot express: a run
-# created minutes ago whose job set is still being created, where "zero jobs so far" really can become
-# "jobs" a moment later. One hour is far past that window (jobs appear within seconds-to-minutes of a
-# run's creation) while remaining well below the multi-day ages of the population actually measured
-# live: the ghosts on the pinned repo were created 2026-11-05…11-11, read on 2026-11-17.
+# review, P1). The 8-11 h population the #2344 comment names had ZERO QUEUED jobs, not zero TOTAL jobs —
+# those runs' job sets were fully created. They are excluded here by (a), which is the strict predicate,
+# and NO age rule could separate them (the #2344 comment says so). The age floor exists only for the
+# narrower case (a) cannot express: a run created minutes ago whose job set is still being created, where
+# "zero jobs so far" really can become "jobs" a moment later. One hour is far past that window (jobs
+# appear within seconds-to-minutes of a run's creation) while remaining well below the multi-day ages of
+# the population actually measured live: the ghosts on the pinned repo were created 2026-11-05…11-11, read
+# on 2026-11-17.
+# ⛔ AND THE PROOF EXPIRES, WHICH IS WHAT MAKES THE 8-11 h AMBIGUITY NOT LOAD-BEARING (agent-infra#4113
+# cycle 2, P1 — an earlier draft left two paragraphs that disagreed about it, one of which would have made
+# a 3600 s floor unsatisfiable). Whichever reading of that note holds, an entry is re-read within
+# GHOST_REPROVE_AFTER_S, which is set ABOVE 11 h, so a job set that is still filling in is re-read after
+# the window closes instead of being trusted for the life of the queue.
 # ⛔ THE FAIL-OPEN DIRECTION THIS MUST NEVER TAKE: discounting a run that could still become demand
 # would understate `queued_demanding` and certify "nothing is waiting" over a real stall — the exact
 # defect #2344 exists to remove, one cache layer down. Hence: an UNREADABLE ledger is discarded whole
-# (never partially trusted), an unreadable jobs read remembers nothing, and every entry is pruned the
-# moment the run leaves the queue.
-# RESIDUAL, stated: a run that is older than the floor AND has zero jobs is treated as terminal. A
-# re-run creates a NEW ATTEMPT on the same run id, and a run whose jobs were never created has nothing
-# to re-run, so the zero-job reading cannot be invalidated that way; if that ever changes, the entry is
-# still pruned as soon as the run leaves the queued list.
+# (never partially trusted), an unreadable jobs read remembers nothing, and an entry is dropped the
+# moment the run leaves the queued candidates.
+# ⛔ AND A PROOF EXPIRES (agent-infra#4113 review cycle 2, P0 — measured). A reading is a fact about ONE
+# MOMENT, and a run can gain jobs WHILE STAYING `queued` (a progressive job set finishing, a new
+# attempt), so "it never leaves the queue" does NOT invalidate the entry. Without an expiry the entry is
+# re-written on every pass, the run is never re-read, and the gate certifies "nothing is waiting" over
+# live demand and STRIPS the pool — reproduced: pass 1 sees `.jobs: []`, pass 2 answers a queued job for
+# the same run, and the pass logged `ghost_cached=1`, `jobs reads: 0`, `nothing is waiting for a runner`.
+# So every entry carries the EPOCH AT WHICH IT WAS PROVEN, a hit does NOT refresh it, and an entry older
+# than GHOST_REPROVE_AFTER_S is dropped at load — i.e. re-read and re-proven by this pass. The staleness
+# of a discount is therefore bounded by that interval instead of by GitHub's behaviour.
 GHOST_LEDGER_FILE="$STATE_DIR/ci-runner-gate.ghosts"
 # 3600 s is a floor on TRUST only: a younger ghost is re-read, which costs a read and never costs a
 # claim. It is NOT what excludes the 8-11 h population the #2344 comment cites — those runs had zero
 # QUEUED jobs, not zero TOTAL jobs, and are excluded by the zero-total predicate itself (see above).
 GHOST_TRUST_AFTER_S="${CI_GATE_GHOST_TRUST_AFTER_S:-3600}"
+# ⛔ HOW LONG A PROOF IS TRUSTED (agent-infra#4113 cycle 2, P0). 86400 s = 24 h, i.e. ABOVE the widest
+# progressive-creation reading anywhere in this file (the #2344 comment's 8-11 h runs), so under EITHER
+# reading of that measurement a re-prove happens before a job set could still be filling in — and it also
+# bounds the cost: a proven population of a few hundred ghosts costs a handful of re-reads per DAY.
+# 0 is allowed and means "never trust a remembered proof", i.e. exactly the pre-ledger behaviour
+# (every pass re-reads): safe, just expensive. It is NOT refused like the other zeros, because here the
+# zero is the fail-CLOSED end of the scale, not a disarmed bound.
+GHOST_REPROVE_AFTER_S="${CI_GATE_GHOST_REPROVE_AFTER_S:-43200}"
+#   (12 h: above the 11 h progressive-creation reading, and ~18x the 40 min a 200-deep population needs to
+#    be swept at the shipped 25-read budget and 5 min cadence — a sweep must finish well inside the
+#   interval, or expired entries would keep restarting it and the walk could never certify anything.)
 # ⛔ HOW MANY QUEUED RUNS THE HEAD SCAN MAY READ (agent-infra#2344), and why a bound is enough.
 # A run in `status=queued` is NOT evidence that anything is waiting for a runner. GitHub leaves a run
 # whose jobs were never created in that state FOREVER, and such a run cannot be cancelled (409
@@ -784,34 +804,69 @@ ts_is_old() {
 # trusted ledger could discount a run nobody proved, which understates demand and strips the pool
 # during a real stall. Discarding costs reads; trusting costs a false "nothing is waiting".
 ghost_ledger_load() {
-  local line
+  local line id stamp age fresh=0 stale=0 now bad=0
   GHOST_LEDGER=""
   [ -f "$GHOST_LEDGER_FILE" ] || return 0
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      *[!0-9]*)
-        log "ghost ledger UNREADABLE (bad line: '${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"
-        GHOST_LEDGER=""; return 1 ;;
-    esac
-    GHOST_LEDGER="$GHOST_LEDGER $line"
+  now="$(date +%s)"
+  while IFS=' ' read -r id stamp line; do
+    [ -n "$id" ] || continue
+    # ⛔ TWO FIELDS, BOTH CHECKED (agent-infra#4113 cycle 2, P1). `id` and `epoch` must each be digits and
+    # NOTHING else may follow (a third field traps a row with extra columns, which an older format or a
+    # hand edit would produce; a row with NO stamp is a proof nobody dated — exactly the shape that must
+    # not be trusted). A file that does not parse is discarded WHOLE — see the header.
+    bad=0
+    case "$id" in ''|*[!0-9]*) bad=1 ;; esac
+    case "$stamp" in ''|*[!0-9]*) bad=1 ;; esac
+    case "$line" in '') ;; *) bad=1 ;; esac
+    if [ "$bad" = 1 ]; then
+      log "ghost ledger UNREADABLE (bad line: '${id} ${stamp} ${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"
+      GHOST_LEDGER=""; return 1
+    fi
+    age=$(( now - stamp ))
+    # ⛔ A PROOF OLDER THAN GHOST_REPROVE_AFTER_S IS DROPPED HERE, not read around (cycle-2 P0): it
+    # simply is not a ghost this pass, so the run is re-read and, if still zero-job, re-proven and
+    # re-stamped. A FUTURE stamp (clock skew) is treated the same way — it is not a proof this pass can
+    # date, and trusting it would make the entry immortal.
+    if [ "$stamp" -gt "$now" ] || [ "$age" -ge "$GHOST_REPROVE_AFTER_S" ]; then
+      stale=$((stale + 1)); continue
+    fi
+    GHOST_LEDGER="$GHOST_LEDGER $id"
+    fresh=$((fresh + 1))
   done < "$GHOST_LEDGER_FILE"
   GHOST_LEDGER="$GHOST_LEDGER "
+  [ "$stale" -gt 0 ] && log "ghost ledger: $stale of $((fresh + stale)) proof(s) EXPIRED (older than ${GHOST_REPROVE_AFTER_S}s) — those runs are re-read this pass and re-proven"
   return 0
 }
 
-# ghost_ledger_write <ids> — persist the ids to keep (space-separated; deduped here).
+# ghost_ledger_stamp <id> — the epoch at which this run's proof was made, or empty.
+# A HIT WHOSE STAMP CANNOT BE READ IS NOT A HIT: the caller re-reads the run. That is the fail-closed
+# direction and it costs one read, where guessing would cost a claim.
+ghost_ledger_stamp() {
+  awk -v id="$1" '$1 == id { print $2; exit }' "$GHOST_LEDGER_FILE" 2>/dev/null
+}
+
+# ghost_ledger_write <id:stamp pairs> — persist "<id> <epoch>" rows (deduped by id, first stamp wins).
 # ⛔ WRITTEN VIA A TEMP FILE AND `mv`, so a pass killed mid-write cannot leave a half-written ledger
 # that the next pass must discard (a discard is safe, but it throws away proofs and costs reads).
 # ⛔ A READ VERB DOES NOT WRITE IT (--dry-run): the ledger is a cache of read results like the verdict
 # file, but a read-out-loud verb must leave the box exactly as it found it, and losing one pass of
 # proofs is free — the next scheduled pass re-proves them.
 ghost_ledger_write() {
-  local ids="$1" id out=""
+  local pairs="$1" pair id stamp out="" seen=""
   [ "$DRY" = 1 ] && return 0
-  for id in $ids; do
+  for pair in $pairs; do
+    id="${pair%%:*}"; stamp="${pair#*:}"
     case "$id" in ''|*[!0-9]*) continue ;; esac
-    case " $out " in *" $id "*) ;; *) out="$out $id" ;; esac
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    # ⛔ DEDUPE ON THE **ID**, NOT ON THE PAIR (agent-infra#4113 cycle 2, found while pinning the stamp
+    # rule). The first cut kept ` out ` as a list of `id:stamp` PAIRS and tested `*" $id "*` against it —
+    # which can never match "4001:1794…", so the SAME run entering twice with two different stamps (the
+    # hit path and the carry-forward path both append it) produced TWO rows. A second row is not harmless:
+    # each row is a proof claim about the same run, and the loader trusts whichever it reads, so the file
+    # would grow one row per pass and re-assert a stale stamp beside a fresh one.
+    case " $seen " in *" $id "*) continue ;; esac
+    seen="$seen $id"
+    out="$out $id:$stamp"
   done
   if [ -z "$out" ]; then
     # ⛔ THE FILE IS WRITTEN EVEN WHEN IT IS EMPTY, DELIBERATELY: "the ledger says nothing is remembered"
@@ -822,7 +877,7 @@ ghost_ledger_write() {
       || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the ledger could not be cleared; prove-or-remember is degraded for the passes that follow"
     return 0
   fi
-  { printf '%s\n' $out > "$GHOST_LEDGER_FILE.tmp" && mv -f "$GHOST_LEDGER_FILE.tmp" "$GHOST_LEDGER_FILE"; } \
+  { printf '%s\n' $out | while IFS= read -r _row; do printf '%s %s\n' "${_row%%:*}" "${_row#*:}"; done > "$GHOST_LEDGER_FILE.tmp" && mv -f "$GHOST_LEDGER_FILE.tmp" "$GHOST_LEDGER_FILE"; } \
     || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the proved ghosts are NOT remembered; every pass re-reads them (cost, not a wrong claim)"
 }
 
@@ -1022,7 +1077,7 @@ print(comp, len(inc))
   # HAS, even where the runner inventory is 403). Extra fields are optional: a two-field body still
   # parses, and an absent field leaves one question unmeasured instead of failing a pass that needs
   # nothing else from it.
-  local q1 q2 q3 q4 queue_rows all_rows _p _need _got _more _more_rows _first _cand_ids _led reads cand_raw cand_jobs_measured cand_jobs_total queue_covered queue_rows_count
+  local q1 q2 q3 q4 queue_rows all_rows _p _need _got _more _more_rows _first _cand_ids _led _led_stamp reads cand_raw cand_jobs_measured cand_jobs_total queue_covered queue_rows_count cand_stamp
   IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
   queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; queue_rows="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
@@ -1170,6 +1225,19 @@ print(comp, len(inc))
     '' | *[!0-9]*) log "ghost ledger trust floor UNREADABLE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "ghost ledger trust floor OUT OF RANGE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
+  # ⛔ THE TRUST FLOOR REFUSES ZERO BY NAME, like the two sibling bounds (cycle-2 review, P2): a zero floor
+  # disables the age condition entirely, so a run read seconds after creation with no jobs yet — the one
+  # case the condition exists for — becomes a PERMANENT ghost. That is the fail-OPEN direction, which is a
+  # stronger reason to refuse than the siblings' "could never measure".
+  case "$GHOST_TRUST_AFTER_S" in
+    0) log "ghost ledger trust floor is ZERO ('${GHOST_TRUST_AFTER_S}') — it would disarm the age condition rather than bound it, so a run read seconds after creation (no jobs yet) would be remembered forever; FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # The re-prove interval is a bound too, but its zero is the SAFE end (re-read every pass), so only its
+  # shape is checked — a non-numeric value would make the `-ge` test error and trust an entry forever.
+  case "$GHOST_REPROVE_AFTER_S" in
+    '' | *[!0-9]*) log "ghost proof re-prove interval UNREADABLE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost proof re-prove interval OUT OF RANGE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
   QUEUE_GHOSTS=0
   GHOST_CACHED=0     # how many of those ghosts were REMEMBERED (no read spent this pass)
   GHOST_KEEP=""      # ids to persist: this pass's proofs, plus prior entries still in the queue
@@ -1221,16 +1289,27 @@ print(comp, len(inc))
       esac
       case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
       # ⛔ A REMEMBERED GHOST COSTS NO READ (agent-infra#4113). It has already been proven, by a readable
-      # jobs read, to have ZERO JOBS AT ALL while older than the trust floor — a state no later pass can
-      # un-prove — so it is discounted from the ledger and the walk moves on. THIS IS THE LINE THAT
-      # MAKES THE BOUND A COST BOUND: with the proof remembered, a 200-deep ghost population is walked
-      # in ceil(200/QUEUE_HEAD_SCAN_MAX) passes instead of never, and a fully-proven population costs
-      # one read per pass (the head) however deep the queue is.
+      # jobs read, to have ZERO JOBS AT ALL while older than the trust floor — and the proof is not older
+      # than GHOST_REPROVE_AFTER_S, because `ghost_ledger_load` DROPS expired entries into a re-read
+      # (cycle-2 P0: without that, a run that gains jobs while staying `queued` was discounted forever).
+      # THIS IS THE LINE THAT MAKES THE BOUND A COST BOUND: with the proof remembered, a 200-deep ghost
+      # population is walked in ceil(200/QUEUE_HEAD_SCAN_MAX) passes instead of never, and a fully-proven
+      # population costs one read per pass (the head) however deep the queue is.
+      # ⛔ AND THE HIT CARRIES THE OLD STAMP FORWARD, IT DOES NOT REFRESH IT: stamping `now` on every hit
+      # would make the entry immortal and re-open the P0 one layer down.
       case "$GHOST_LEDGER" in
         *" $cand_id "*)
-          scanned=$((scanned + 1))
-          QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1)); GHOST_CACHED=$((GHOST_CACHED + 1)); GHOST_KEEP="$GHOST_KEEP $cand_id"
-          continue ;;
+          cand_stamp="$(ghost_ledger_stamp "$cand_id")"
+          case "$cand_stamp" in
+            ''|*[!0-9]*)
+              # NO USABLE STAMP IS NOT A HIT (fail-closed): fall through and READ the run.
+              log "ghost ledger: run $cand_id is listed but its proof stamp could not be read — treating it as UNPROVEN and reading it (one read, not a claim)" ;;
+            *)
+              scanned=$((scanned + 1))
+              QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1)); GHOST_CACHED=$((GHOST_CACHED + 1))
+              GHOST_KEEP="$GHOST_KEEP $cand_id:$cand_stamp"
+              continue ;;
+          esac ;;
       esac
       # ⛔ THE BOUND IS NOW ON READS, NOT ON CANDIDATES SKIPPED OVER (agent-infra#4113), and the
       # difference is the whole fix: `scanned` counts only candidates this pass ACTUALLY EXAMINED (a
@@ -1267,7 +1346,7 @@ print(comp, len(inc))
         # queued (concurrency-held, or executing) fails the first condition and is re-read on EVERY pass,
         # because it can become demand; that is the fail-open direction this must never take.
         if [ "$cand_jobs_measured" = 1 ] && [ "$cand_jobs_total" -eq 0 ] && ts_is_old "$cand_created"; then
-          GHOST_KEEP="$GHOST_KEEP $cand_id"
+          GHOST_KEEP="$GHOST_KEEP $cand_id:$(date +%s)"
         fi
       else
         if [ "$cand_rc" -eq 2 ]; then
@@ -1282,12 +1361,17 @@ print(comp, len(inc))
     # ⛔ THE LEDGER IS PERSISTED HERE — BEFORE BOTH REFUSALS BELOW (agent-infra#4113). The refusing pass
     # is the COMMON one while a ghost population is being walked, so persisting only on the paths that
     # reach a verdict would throw away every proof and the walk could never finish (that is the pin, with
-    # extra steps). An entry is kept when this pass proved it OR when it was already known and the run is
-    # still in the queue; anything else is dropped, so the file is bounded by the current queue depth and
-    # a ghost that leaves the queue is forgotten.
+    # extra steps). An entry is kept when this pass proved it (stamped NOW) OR when it was already known
+    # and the run is still among this pass's candidates (stamped with ITS ORIGINAL proof time, so it
+    # expires on schedule rather than on use); anything else is dropped. That bounds the file by the
+    # current queue depth, and it forgets a ghost as soon as a pass with candidates no longer lists it.
     _cand_ids=" $(printf '%s' "$candidates" | tr ';' '\n' | awk -F, 'NF {printf "%s ", $1}')"
     for _led in $GHOST_LEDGER; do
-      case "$_cand_ids" in *" $_led "*) GHOST_KEEP="$GHOST_KEEP $_led" ;; esac
+      case "$_cand_ids" in
+        *" $_led "*)
+          _led_stamp="$(ghost_ledger_stamp "$_led")"
+          case "$_led_stamp" in ''|*[!0-9]*) ;; *) GHOST_KEEP="$GHOST_KEEP $_led:$_led_stamp" ;; esac ;;
+      esac
     done
     ghost_ledger_write "$GHOST_KEEP"
     # ⛔ THE CONTRADICTION CHECK APPLIES TO BOTH OUTCOMES, AND THAT ORDER IS THE POINT (cycle-5 review,
