@@ -1967,13 +1967,37 @@ if [ "$healthy" = 3 ]; then
   # The pool is already in the recorded mode: nothing to converge, and a blind pass must not PUT labels
   # it was not asked to change (a PUT storm on the runner agent's own label set is a real cost — the
   # agent re-asserts 60-120 s later, which is why the success path compares modes rather than re-writing).
-  if [ "$mode" = "$recorded" ]; then
+  # ⛔ THE SKIP REQUIRES A LABEL READING, NOT A SUBSTITUTE — the same ruling this file already makes for
+  # the hysteresis hold (`:2085`: "key the hold on `prev` … NOT on `mode`", because a reading that
+  # resolves from the JOBS INFERENCE is not the pool's label state). `current_mode` counts the runners
+  # carrying the fallback label; `mode_from_jobs` answers "which pool is SERVING" — a NARROWED claim
+  # (#2897) — and the two are NOT interchangeable at a write decision. Measured shape: recorded mode
+  # `github`, the labels still ARMED, and ONE in-flight `ubuntu-latest` workflow makes the inference
+  # answer `github`; the equality below then held, the repair the recorded decision demands was SKIPPED,
+  # and the durable verdict told an operator the pool "ALREADY advertised" a mode this pass never read.
+  # That is the fail-open direction this whole branch exists to close — a repair skipped AND reported as
+  # unnecessary. It is reachable whenever the count read fails alone: `runner_census` RETRIES in-pass
+  # (#4085) and this read does NOT, so a 5xx/rate-limit blip on this call lands the pass here with
+  # `mode_source=jobs-inference` and a measured census. An UNREAD label state is not "already converged",
+  # so the pass converges instead: one idempotent PUT of the RECORDED mode, which is exactly what it
+  # does when the two modes differ. The cost that buys the safety is a redundant PUT against a pool that
+  # may already be in that mode; the opposite costs a strip that never happens and is reported as done.
+  if [ "$mode" = "$recorded" ] && [ "$MODE_SOURCE" = runners ]; then
     log "repair: the pool already advertises the recorded mode=$recorded (measured mode=$mode) — nothing to converge; the pass changed nothing"
     write_blind_verdict "the pool ALREADY advertised the recorded mode=$recorded, so nothing needed converging and no label was written"
     log "cannot measure DEMAND — the recorded mode was already in force (leaving mode=$mode)"
     exit 2
   fi
-  log "repair: the state file records mode=$recorded but this pass measures mode=$mode — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
+  # ⛔ THE REPAIR'S REASON IS STATED IN THIS PASS'S OWN TERMS: "measures" is only true of a LABEL read.
+  if [ "$mode" = "$recorded" ]; then
+    log "repair: mode=$mode equals the recorded mode=$recorded, but this pass could NOT read the runner labels (mode_source=$MODE_SOURCE) — a substituted reading says which pool is SERVING, not what the labels SAY, so it is not evidence the pool advertises the recorded mode and this pass does NOT skip the repair on it"
+    repair_why="the mode read did not answer, so mode=$mode is only INFERRED (mode_source=$MODE_SOURCE) and the pool's LABEL state is UNESTABLISHED"
+  elif [ "$MODE_SOURCE" = runners ]; then
+    repair_why="this pass measures mode=$mode"
+  else
+    repair_why="the label read did not answer, so mode=$mode is only INFERRED (mode_source=$MODE_SOURCE) and the pool's LABEL state is UNESTABLISHED"
+  fi
+  log "repair: the state file records mode=$recorded but $repair_why — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
   repair_ok=1
   if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
   if [ "$repair_ok" = 1 ]; then

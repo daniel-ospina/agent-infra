@@ -2924,6 +2924,40 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capabi
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capability=runner_inventory:" \
   "(d7) …and it does NOT publish the LABEL read's capability beside a measured capacity"
 
+# (d8) A SUBSTITUTED MODE MAY NOT DECIDE THAT THE POOL ALREADY MATCHES (review, measured). The
+# "already converged" skip compares `mode` against the recorded mode, but `mode` is only the pool's LABEL
+# state when `current_mode` answered: after a failed count read it comes from `mode_from_jobs`, which
+# answers "which pool is SERVING" — a narrowed claim (#2897), not what the labels say. This file already
+# rules that a jobs-inferred reading must not decide a WRITE (`:2085`, the hysteresis hold is keyed on
+# `prev`, never on `mode`). Reachable shape: recorded github, labels still ARMED, one in-flight
+# `ubuntu-latest` workflow → the inference answers github, the equality held, the repair was SKIPPED, and
+# the verdict asserted the pool "ALREADY advertised" a mode the pass never read. `GH_FALLBACK_N=null`
+# fails ONLY the count read (`current_mode`), and `GH_RUNNER_GROUP` makes the substitute answer github;
+# the census read is a different stub branch, so the pass reaches rc 3 with a MEASURED capacity.
+run_gate demandblind-inferred GH_QUEUED=0 GH_FALLBACK_N=1 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d8a) the MEASURING pass releases the pool and records mode=github"
+KEEP_STATE=1 run_gate demandblind-inferred GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=null \
+  GH_RUNNER_GROUP="GitHub Actions" GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d8) an inferred-mode demand-blind pass still exits 2"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode_source=jobs-inference" \
+  "(d8) the durable line NAMES the substitution it is working from"
+# ⛔ THE SKIP MAY NOT FIRE ON A SUBSTITUTED READING: the pool's LABEL state was not read, so the pass may
+# not say the recorded mode is already advertised, and it must reach the write path instead.
+assert_contains "$OUT" "could NOT read the runner labels" \
+  "(d8) the pass says the label state is UNESTABLISHED instead of assuming it matches"
+assert_not_contains "$OUT" "the pool already advertises" \
+  "(d8) …so it does NOT claim the pool already advertises the recorded mode"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ALREADY advertised" \
+  "(d8) …and the verdict does not report a repair as unnecessary on an unread label state"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" \
+  "(d8) …the write path IS reached (the repair is not skipped on an inferred equality)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the pool was converged to the mode the state file records (github)" \
+  "(d8) …and the verdict asserts the convergence it actually performed"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d8) …without advancing the state file (a repair is not a transition)"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
   exit 1
