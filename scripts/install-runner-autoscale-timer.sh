@@ -857,8 +857,17 @@ mode_arg_for() {
 # printed `installed:` is the false-PASS class this installer already refuses for a missing `ExecStart=`
 # and a non-parsing plist. And EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS
 # (ported from the sibling's `vet_unit`): rc 1 = a hatch was FOUND and named above; rc 2 = the judge could
-# not grade; rc 64/127 = the resolved `gate-policy.sh` predates `--unit-veto` or could not run, so the
-# artifact was never vetted. Collapsing them tells an operator to hunt a hatch no line names.
+# not grade it at all — its FILE PREFLIGHT refused the file (no file named, unreadable, or a directory),
+# ⛔ NEVER the CONTENT of a declaration, which the fold always grades; rc 64/127 = the resolved
+# `gate-policy.sh` predates `--unit-veto` or could not run, so the artifact was never vetted. Collapsing
+# them tells an operator to hunt a hatch no line names.
+# ⛔ THE rc-2 SENTENCE BELOW ONCE NAMED A THIRD CAUSE — "or a declaration it cannot fold" — AND THAT CAUSE
+# IS UNREACHABLE (agent-infra#4002). This copy was ported from the sibling before `gate-policy.sh`'s rc-2
+# contract was pinned to the file preflight (PR #4020 at `a3c13deec` fixed the drainer's and the
+# sibling's copy; this third one was missed), so an operator whose judge refused rc 2 was pointed at a
+# fold failure that the function cannot produce — the fold has no error branch by design, and a
+# continuation still pending at EOF is folded and graded. The set in the message is the reachable one, and
+# `install-runner-autoscale-timer.test.sh`'s ungradable-judge arm reddens on the wider claim.
 vet_unit() { # <rendered-artifact> <label>
     local f="$1" label="$2" rc=0
     # ⛔ `--disarm` IS EXEMPT — AND ONLY `--disarm` (same key as `refuse_adopted_provisioner`: the flag is
@@ -876,7 +885,7 @@ vet_unit() { # <rendered-artifact> <label>
     if [ "$rc" -eq 1 ]; then
         err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduled job that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
     elif [ "$rc" -eq 2 ]; then
-        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — unreadable, or a declaration it cannot fold; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
     else
         err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (agent-infra#4002) or it could not run at all, so the rendered $label was NEVER vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
     fi
