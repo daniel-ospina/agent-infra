@@ -77,6 +77,15 @@
 # census now sweeps declarations outside `templates/` too, so "EVERY shipped template" means the files
 # rather than the directory they happen to live in. The claim is therefore true by construction, not by a
 # census that happens to be complete today.
+# ⛔ ONE INLINE GENERATOR IS GRADED AND NOT VETTED, AND THAT IS A DECISION, NOT A REMAINING GAP — stated here
+# because it is the exact question the next reader will otherwise re-open. `scripts/install-lane-arm-timer.sh`
+# REFUSES NOTHING AT INSTALL TIME (§5g grades the bytes it generates, and reddens when they carry a hatch).
+# The reason is not squeamishness: that installer renders from a HEREDOC and needs NO template tree, so
+# unlike its two siblings it can legitimately run on a FARM-ONLY box — and `gate-policy.sh` is not in
+# `pi-bootstrap/setup.sh`'s `fleet_srcs`, so a "missing judge is a refusal" rule there would refuse every
+# lane-arm install on every cell while the farm looked healthy. The other two CANNOT be on such a box (their
+# templates exist only in a checkout, which always carries this file), so for them the refusal is free. If
+# you want the veto there too, farm `gate-policy.sh` first — then the sentence above stops being a limit.
 # STATED LIMIT, so no reader over-reads it: this grades the DECLARATION TEXT of the unit. `EnvironmentFile=`
 # (a file the unit names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own
 # `export` are outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so
