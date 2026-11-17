@@ -2341,26 +2341,38 @@ agent-infra#4034 took `LANE_TIMEOUT` to 36000 s the chunk count moved with it �
 120 = 247` — and an arithmetic row still reading `7 × 120` was the 7200 s clock's residue: the same
 stale-measurement defect this paragraph is otherwise about, one layer down. `lane-merge.sh:286-300`
 carries the same recomputation at the source.
-⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
-paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
-compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
-"4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
-invariant one paragraph up), so the honest row is:
+⛔ **The trade is stated, because the arithmetic does not make it small — and BOTH the first version of
+this paragraph and its first "correction" got it wrong** (review cycle 7, P2; then the #4065 re-review,
+which recomputed the base column instead of carrying it, and read the DESIGN operand as the runtime
+allowance). `WAIT_S` is **5400 on BOTH sides** — `origin/main` ships `LANE_MERGE_WAIT:-5400` too — so
+the only thing the 5× clock changes is the chunk count, `(clock − 5400 − 900) / 120`: **7** at 7200 s,
+**247** at 36000 s. ⛔ AND THAT COUNT IS A DESIGN OPERAND, NOT WHAT A LANE GETS, because EVERY `--watch`
+path clamps it to the watchdog's allowance — `_idle_fit = (2700 − 40) / 120 = 22` chunks — whenever that
+is smaller, which at 36000 s it is. The honest row, with both columns:
 
 | | `origin/main` (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
-| `WAIT_S` | 1500 | 5400 |
-| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 247 × 120 = 29640 |
-| merge phase's share of the clock | 6300 | 35040 |
-| left for implement → commit → push → open PR | 900 | 960 |
+| `WAIT_S` | 5400 | 5400 |
+| derived **design operand** (`MAX_WATCH_FIT` × `POLL`) | 7 × 120 = 840 | 247 × 120 = 29640 |
+| **operative** `--watch` allowance (the `_idle_fit` clamp, `(2700 − 40)/120`) | 7 × 120 = 840 — the WALL is the smaller bound | 22 × 120 = 2640 — the IDLE bound is |
+| merge phase's **operative** share of the clock (wait + watch) | 6240 | 8040 |
+| left on the clock for implement → commit → push → open PR (operative) | 960 | 27960 |
 
-The implementation reserve goes **up** by 60 s, so this constant does not starve implementation, and
-what the 5× clock buys is **supervision chunks, 40 → 247**: the merge phase can out-watch its own check
-wait instead of being sized out of it. That is the deliberate trade — a wait that reaches the merge phase,
-with enough clock left to supervise it — and at the pre-#4034 7200 s clock the same change bought only
-**7** chunks (840 s of `--watch` over a 5400 s wait), which is why raising `LANE_BACKSTOP_S` was the
-cheap half of it and is what #4034 did. A lane that needs longer than the reserve hands off
-(`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
+The DECLARED reserve is unchanged and is the earlier row, not this one: `IMPL_RESERVE_S` is 900 s on
+both clocks, and the invariant `5400 + 247 × 120 + 900 = 35940 ≤ 36000` holds with 60 s of slack — the
+same 60 s it had at 7200 s (`5400 + 7 × 120 + 900 = 7140`). So this constant neither starves
+implementation nor gains from the 5×.
+⛔ **WHAT THE 5× ACTUALLY BUYS, STATED AT ITS OPERATIVE SIZE — and it is NOT "the merge phase can
+out-watch its check wait":** 22 chunks is 2640 s against a 5400 s check wait, so the watch still cannot
+out-watch it and `lane-merge.test.sh` still grades chunk 23 as REFUSED. What changes is the bounding of
+the watch itself: at 7200 s the WALL clipped it to 7 chunks (**840 s**), which is below the chain it
+supervises; at 36000 s the binding constraint is the watchdog's own 22 chunks (**2640 s**), a **3.1×**
+larger `--watch` allowance (and 2640 s now covers the 1890 s merge-phase wait it has to watch). The check
+wait above is a separate mechanism with its own cap and heartbeat — `lane-merge.sh` says so, and only
+that wait can outlive the watchdog. That is the deliberate trade: a wait that reaches the merge phase,
+with enough clock left to supervise it, which is why raising `LANE_BACKSTOP_S` was the cheap half of it
+and is what #4034 did. A lane that needs longer than the reserve hands off (`WAITING_CHECKS`, exit 11)
+and the next invocation resumes the SAME counter.
 ⛔ **THE DESIGN FLOOR IS A WORST CASE, NOT WHAT A LANE GOT — and at the 7200 s clock it sat below the
 phase it supervises** (#3850 review, P2 — recomputed against the chain's own declared budgets).
 Supervision is paid AFTER the wait, out of whatever clock is left, so a lane whose checks settled early
@@ -2375,7 +2387,8 @@ re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from th
 the shipped 36000 s defaults and 1 when the wall axis is off), never beyond the
 watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
 kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
-nothing, and keeps exactly the 247 shipped chunks.
+nothing, and keeps the design operand (247 chunks) — the `_idle_fit` clamp still applies to it, so what it
+gets is **22** chunks, the same operative allowance a lane gets, not 247.
 ⛔ **AND "WALL AXIS OFF" (`LANE_TIMEOUT=0`) IS NOT READ AS A ZERO CLOCK FOR SUPERVISION EITHER** (review
 cycle 13, P2 — measured: the same arithmetic floored that lane at ONE chunk, 120 s, on a lane documented
 as unbounded, so `--watch` posted a blocker two minutes into a legitimate chain wait). With the wall axis
