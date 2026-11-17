@@ -141,6 +141,51 @@ unit_text_cat_boundaries() {
     awk '/^# \//{print "[]"} {print}'
 }
 
+# unit_text_effective <systemctl-cmd> <target> <unit-dir> <unit-file> — the text systemd will LOAD for
+# one unit, from the source that is truthful FOR THAT TARGET. One definition, both callers: the disk
+# reaper's read-back and the drainer's `--status` asked this question in two places, and only one of
+# them could answer it.
+#
+# ⛔ WHY THE FILES ARE NOT ENOUGH (this was a MEASURED false clean in the drainer, round-2 re-review P3,
+# left open by the round-3 lane and closed here). `$UNIT_DIR/<unit>.d/*.conf` is ONE directory in a
+# PRIORITY-ORDERED list. systemd also merges `/run/systemd/system/<unit>.d` and
+# `/usr/lib/systemd/system/<unit>.d` for a system unit (and `~/.config/systemd/user/.config`… plus the
+# higher-priority user dirs for a user unit) — systemd.unit(5): "drop-in files … are read from
+# `<unit>.d/` directories in all the directories searched for unit files", with earlier entries in the
+# search path winning. A drop-in in any of those is invisible to a reader that only opens `$UNIT_DIR`,
+# and `--status` then certifies a cap systemd does not use: the same false PASS as the drop-in it
+# already learned to read, one directory over. Only the manager knows the merged answer, which is why
+# this function asks it there.
+#
+#   override — the documented test seam (a scratch dir no systemd knows about): the file plus its own
+#              `<unit>.d/*.conf`, the way systemd merges them. rc 1 when the unit file is absent.
+#   user     — `systemctl --user cat` first (it merges the whole user search path); the installed file
+#              plus its `<unit>.d/*.conf` only when the manager gives no answer, which for a USER unit
+#              is still a truthful source — `$UNIT_DIR` is the user config dir it just failed to list.
+#   *        — `systemctl cat` is REQUIRED. An unreadable answer there is indistinguishable from "no
+#              drop-in", so it is rc 1 (the caller reports UNKNOWN / refuses) and never a clean grade.
+unit_text_effective() {
+    local sc="$1" target="$2" udir="$3" ufile="$4" out=""
+    case "$target" in
+        override)
+            [ -f "$udir/$ufile" ] || return 1
+            unit_text_from_files "$udir/$ufile" "$udir/$ufile.d"/*.conf ;;
+        user)
+            out="$($sc cat "$ufile" 2>/dev/null)"
+            if [ -n "$out" ]; then
+                printf '%s\n' "$out" | unit_text_cat_boundaries
+            else
+                [ -f "$udir/$ufile" ] || return 1
+                unit_text_from_files "$udir/$ufile" "$udir/$ufile.d"/*.conf
+            fi ;;
+        *)
+            out="$($sc cat "$ufile" 2>/dev/null)"
+            [ -n "$out" ] || return 1
+            printf '%s\n' "$out" | unit_text_cat_boundaries ;;
+    esac
+    return 0
+}
+
 # effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as
 # `NAME=VALUE` lines (one per variable, in first-assignment order, last assignment wins), plus one
 # `!unparseable:<rest of the line>` line per `Environment=` line whose quoting systemd would reject.

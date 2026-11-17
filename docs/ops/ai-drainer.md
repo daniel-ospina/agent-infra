@@ -356,7 +356,7 @@ would render now, and its **exit code is the contract** an automated check reads
 | 0 | armed, and the cap it dispatches at provably agrees with the seam |
 | 3 | **STALE** — the installed pin (or the no-pin unit's own `ExecStart` script) disagrees with the seam |
 | 4 | **NOT ARMED** — the service and/or the timer is MISSING, so the box dispatches nothing at any cap |
-| 5 | **UNKNOWN** — installed, but the cap cannot be determined: no pin *and* an unreadable `ExecStart`, a pin whose value is not a number of seconds, a pin line systemd would REJECT, or a directive/construct that moves the environment **behind** `Environment=` (see below) |
+| 5 | **UNKNOWN** — installed, but the cap cannot be determined: no pin *and* an unreadable `ExecStart`, a pin whose value is not a number of seconds, a pin line systemd would REJECT, a directive/construct that moves the environment **behind** `Environment=` (see below), or a **system** unit the manager could not report (`systemctl cat`) |
 
 ⛔ **rc 0 MEANS A CAP WAS ACTUALLY READ AND AGREES WITH THE SEAM — never that a pin was found in some
 spelling** (round-2 re-review, P3: this sentence used to say "rc 0 MEANS THE PIN WAS ACTUALLY READ, IN
@@ -367,7 +367,7 @@ exits 0 without any pin existing, and rc 0 can therefore mean a *script's* defau
 which four measured fixtures falsified — the paragraph below is the third answer that closes them):
 
 1. **A `LANE_TIMEOUT` pin was read** with the same parser as the disk reaper's read-back
-   (`scripts/lib/systemd-unit-parse.sh`), over the unit **and** its `<unit>.service.d/*.conf` drop-ins in
+   (`scripts/lib/systemd-unit-parse.sh`), over the unit **and** its drop-ins in
    systemd's order, in the `[Service]` section **only**, so all of these are graded, not skipped:
    `Environment="LANE_TIMEOUT=7200"` (quoted), `Environment=HOME=/x LANE_TIMEOUT=7200` (several
    assignments on one line), `Environment = LANE_TIMEOUT=7200` (whitespace around the key and the `=`), a
@@ -398,6 +398,21 @@ both installers read ONE definition. The same directives under `[Install]`/`[Uni
 to systemd and are therefore NOT a refusal (a hazard scoped to a section systemd ignores would be the
 section-blindness one over) — which is also why a stale `Environment=` left in `[Unit]` no longer reads as
 STALE.
+
+⛔ **AND THE UNIT TEXT COMES FROM THE SOURCE THAT IS TRUTHFUL FOR THE TARGET — not from
+`$UNIT_DIR` alone** (round-2 re-review, P3; left open by the round-3 lane, closed here).
+`$UNIT_DIR/<unit>.d/*.conf` is ONE directory in a PRIORITY-ORDERED list: systemd also merges
+`/run/systemd/system/<unit>.d` and `/usr/lib/systemd/system/<unit>.d` (`systemd.unit(5)`: drop-ins are
+read "from `<unit>.d/` directories in all the directories searched for unit files"), and a user unit
+adds the higher-priority user directories too. A hand-placed drop-in in any of those is invisible to a
+file read, so a file-only reader certifies a cap the box does not dispatch at — the same false PASS as
+the drop-in this verb already learned to read, one directory over. The unit text therefore comes from
+`systemctl cat` for a system unit (where an unreadable answer is **UNKNOWN, 5** — it cannot be told
+apart from "no drop-in"), from `systemctl --user cat` for a user unit with the installed file as the
+fallback (that directory *is* the one the manager failed to list), and from the files for the documented
+`SYSTEMD_UNIT_DIR` test override. One definition, both callers: `unit_text_effective` in
+`scripts/lib/systemd-unit-parse.sh`, the same resolver `install-disk-reaper-timer.sh`'s read-back uses,
+so the two readers cannot disagree about one unit.
 
 The unit is rendered ONCE, at install time, and an
 installed pin WINS over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed

@@ -54,8 +54,10 @@
 #             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
 #             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
 #             dispatches at cannot be DETERMINED — no pin and an unreadable `ExecStart` script, a pin
-#             whose value is not a number of seconds, or a pin line systemd would REJECT (an
-#             unterminated quote makes systemd abandon the line) — named as unknown rather than
+#             whose value is not a number of seconds, a pin line systemd would REJECT (an
+#             unterminated quote makes systemd abandon the line), a directive that moves the environment
+#             BEHIND `Environment=`, or a SYSTEM unit the manager could not report (`systemctl cat` — the
+#             only source that merges every drop-in directory) — named as unknown rather than
 #             silently graded clean.
 set -uo pipefail
 
@@ -104,6 +106,17 @@ command -v env_compile_hazards >/dev/null 2>&1 \
 # false PASS returns, so a farmed older lib must refuse here rather than degrade quietly.
 command -v unit_text_from_files >/dev/null 2>&1 \
     || { printf 'install-drainer-timer: ERROR — %s did not define unit_text_from_files\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ AND THE TARGET-AWARE RESOLVER IS FATAL (round-2 re-review P3, left open by round 3 and closed here).
+# `$UNIT_DIR/<unit>.d/*.conf` is ONE directory in a PRIORITY-ORDERED list: systemd also merges
+# `/run/systemd/system/<unit>.d` and `/usr/lib/systemd/system/<unit>.d` for a system unit
+# (systemd.unit(5): drop-ins are read "from `<unit>.d/` directories in all the directories searched for
+# unit files"). A hand-placed drop-in in any of those was invisible here, so `--status` certified a cap
+# systemd does not dispatch at — the same false PASS as the drop-in this round already taught the reader
+# to consult, one directory over. Only the manager knows the merged answer.
+# A farmed lib that predates `unit_text_effective` must REFUSE rather than fall back to the file-only
+# read: the fallback is exactly the false clean this guard exists to remove.
+command -v unit_text_effective >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define unit_text_effective\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -307,7 +320,30 @@ say_status() {
         # in the one file the reader is allowed to consult. `unit_text_from_files` (the shared lib) emits
         # each file behind a `[]` boundary, which no reader honours and which systemd, by construction,
         # never sees.
-        unit_text="$(unit_text_from_files "$UNIT_DIR/$svc" "$UNIT_DIR/$svc.d"/*.conf 2>/dev/null)"
+        # ⛔ THE UNIT IS READ FROM THE SOURCE THAT IS TRUTHFUL FOR THIS TARGET, NOT FROM `$UNIT_DIR`
+        # (round-2 re-review P3, left open by round 3 and closed here — MEASURED on the sibling reader).
+        # This read was `unit_text_from_files "$UNIT_DIR/$svc" "$UNIT_DIR/$svc.d"/*.conf`, which is ONE
+        # directory in a PRIORITY-ORDERED list. systemd also merges `/run/systemd/system/<unit>.d` and
+        # `/usr/lib/systemd/system/<unit>.d` (systemd.unit(5): drop-ins are read "from `<unit>.d/`
+        # directories in all the directories searched for unit files"), and for a user unit the
+        # higher-priority user dirs too — so an operator's drop-in in any of those was invisible and this
+        # verb certified a cap the box does not dispatch at. That is the false PASS the whole round is
+        # about, one directory over, and it is the same fact `install-disk-reaper-timer.sh` already
+        # resolved with `systemctl cat`: the resolver is now ONE definition in the shared lib
+        # (`unit_text_effective`), so the two readers this PR unifies cannot disagree about one unit.
+        # ⛔ A MANAGER THAT CANNOT ANSWER IS NOT "NO DROP-IN": for a system unit the fail-closed answer is
+        # UNKNOWN (5), because an unreadable merge is indistinguishable from an empty one. For a user
+        # unit the installed file plus its own `<unit>.d` is still a truthful source (that directory IS
+        # the user config dir the manager just failed to list), so it falls back there. The `override`
+        # target — the documented test seam — reads the files, exactly as before.
+        unit_text=""
+        if ! unit_text="$(unit_text_effective "$SYSTEMCTL" "$TARGET" "$UNIT_DIR" "$svc")"; then
+            printf '  ⚠️  UNREADABLE UNIT: this target (%s) needs `%s cat %s` to report the unit systemd actually loads —\n' "$TARGET" "$SYSTEMCTL" "$svc"
+            printf '      drop-ins are merged from every directory in systemd search path, so the copy under %s is\n' "$UNIT_DIR"
+            printf '      not the whole unit and an unreadable answer cannot be told from "no drop-in". The cap this box\n'
+            printf '      dispatches at is UNKNOWN, not healthy: re-run `%s cat %s` and fix the failure.\n' "$SYSTEMCTL" "$svc"
+            return 5
+        fi
         # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` MAKES THE CAP UNCERTIFIABLE, AND
         # THIS VERB USED TO GRADE IT ANYWAY (round-2 re-review, F1/F3 — both MEASURED at rc 0). The pin
         # map below is a reading of `Environment=` and of nothing else, while systemd compiles the

@@ -655,24 +655,14 @@ unit_dropins() { # <dir> — cat every drop-in, lexical order (systemd's order)
 # (`unit_text_cat_boundaries`). Both functions are guarded as fatal below: a farmed older lib must refuse,
 # not quietly certify.
 service_effective_unit() { # prints the bytes systemd will load; rc 1 when that cannot be known
-    local f="$UNIT_DIR/$UNIT_NAME.service" out=""
-    case "$TARGET" in
-        override)
-            [ -f "$f" ] || return 1
-            unit_text_from_files "$f" "$UNIT_DIR/$UNIT_NAME.service.d"/*.conf
-            return 0 ;;
-        user)
-            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
-            if [ -n "$out" ]; then printf '%s\n' "$out" | unit_text_cat_boundaries; return 0; fi
-            [ -f "$f" ] || return 1
-            unit_text_from_files "$f" "$UNIT_DIR/$UNIT_NAME.service.d"/*.conf
-            return 0 ;;
-        *)
-            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
-            [ -n "$out" ] || return 1
-            printf '%s\n' "$out" | unit_text_cat_boundaries
-            return 0 ;;
-    esac
+    # ⛔ THE THREE ARMS MOVED INTO THE SHARED LIB (round-2 re-review P3, left open until now). This
+    # function answered "what does systemd load" for THIS installer only; `install-drainer-timer.sh`
+    # `--status` asked the same question from `$UNIT_DIR` alone and could not see a drop-in in any
+    # other priority directory (`/run/systemd/system`, `/usr/lib/systemd/system`) — certifying a cap
+    # systemd does not use. One definition, both callers: `unit_text_effective` in
+    # `scripts/lib/systemd-unit-parse.sh` owns the per-target arms, so the two readers cannot disagree
+    # about the same unit. The table above still describes them; it is documented where it is enforced.
+    unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$UNIT_NAME.service"
 }
 
 # The ExecStart argv lines systemd will actually run come from `effective_execstarts` in that same
@@ -717,6 +707,11 @@ command -v env_compile_hazards >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT
 # to remove; refuse instead.
 command -v unit_text_from_files >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_from_files"; exit 1; }
 command -v unit_text_cat_boundaries >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_cat_boundaries"; exit 1; }
+# ⛔ AND THE TARGET-AWARE RESOLVER (round-2 re-review P3). `service_effective_unit` below is a one-line
+# call to it, so a farmed lib that predates it would leave this read-back with NO definition at root —
+# `set -u` would abort the install, but a shell that got past it would compare empty strings and certify
+# an artifact nothing read. Refuse by name instead.
+command -v unit_text_effective >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_effective"; exit 1; }
 
 # split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
 # group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token

@@ -2321,6 +2321,69 @@ SC_EOF
   check "installer: --status exits 4 (not 0) when NOTHING is installed — 'no drainer at all' must not read healthy" \
     '[ "$rc" -eq 4 ] && grep -q MISSING <<<"$out" && grep -q "NOT ARMED" <<<"$out" && ! grep -q STALE <<<"$out"' \
     "rc=$rc · $(grep 'MISSING\|NOT ARMED' <<<"$out" | head -1)"
+  # ⛔ THE UNIT IS READ FROM THE SOURCE THAT IS TRUTHFUL FOR THE TARGET, NOT FROM `$UNIT_DIR` ALONE
+  # (round-2 re-review, P3 — left open by the round-3 lane, closed here). `$UNIT_DIR/<unit>.d/*.conf` is
+  # ONE directory in a PRIORITY-ORDERED list: systemd also merges `/run/systemd/system/<unit>.d` and
+  # `/usr/lib/systemd/system/<unit>.d` (systemd.unit(5): drop-ins are read "from `<unit>.d/` directories
+  # in all the directories searched for unit files"), and a user unit adds the higher-priority user dirs.
+  # A drop-in in any of those was INVISIBLE here, so `--status` certified a cap the box does not dispatch
+  # at — the same false PASS this block is about, one directory over. The fix is the resolver the disk
+  # reaper already used (`systemctl cat`), now ONE definition in the shared lib (`unit_text_effective`).
+  # The fixture takes the USER target, because that is the one this suite can build without root: a
+  # private HOME (the install dir), `SUDO=false` so the system arm is not chosen, and a fake `systemctl`
+  # that answers `--user show-environment` and `--user cat`. The file on disk pins the SEAM; the manager's
+  # merged view carries a 7200 drop-in from `/run/systemd/system/…d`, which no file read can see.
+  TM="$ROOT/instmgr"; mkdir -p "$TM/home/.config/systemd/user" "$TM/bin"
+  printf '#!/bin/bash\nLANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}"\n' >"$TM/fresh.sh"
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\n' \
+    "$TM/fresh.sh" "${SEAM_T:?}" >"$TM/home/.config/systemd/user/eldato-ai-drainer.service"
+  printf '[Timer]\nOnUnitActiveSec=20min\n' >"$TM/home/.config/systemd/user/eldato-ai-drainer.timer"
+  printf '#!/bin/sh\ncase "$*" in\n  *show-environment*) echo HOME=/x ;;\n  *"cat eldato-ai-drainer.service"*) [ -f "%s/cat.txt" ] && cat "%s/cat.txt" ;;\n  *is-active*) echo active ;;\nesac\nexit 0\n' \
+    "$TM" "$TM" >"$TM/bin/systemctl"
+  chmod +x "$TM/bin/systemctl"
+  status_mgr() { ( unset LANE_TIMEOUT LANE_BACKSTOP_S SYSTEMD_UNIT_DIR; HOME="$TM/home" \
+      PATH="$TM/bin:$PATH" SUDO=false DRAINER="$TM/fresh.sh" DRAINER_STATE="$TM/state" \
+      DRAINER_O="$TM" bash "$INSTALLER" --status 2>&1 ); }
+  # The manager's answer: the installed pin, then a drop-in from the SYSTEM priority dir that systemd
+  # merges and this checkout cannot open. `# /path` separators mark each file, as `systemctl cat` emits.
+  printf '# /etc/systemd/system/eldato-ai-drainer.service\n[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\n# /run/systemd/system/eldato-ai-drainer.service.d/50-cap.conf\n[Service]\nEnvironment=LANE_TIMEOUT=7200\n' \
+    "$TM/fresh.sh" "${SEAM_T:?}" >"$TM/cat.txt"
+  out="$(status_mgr)"; rc=$?
+  check "installer: --status grades the unit the MANAGER reports, so a drop-in in /run/systemd/system (invisible to a \$UNIT_DIR read) cannot be certified away — rc 3 (pre-fix: rc 0 'clean')" \
+    '[ "$rc" -eq 3 ] && grep -q "7200 s installed" <<<"$out" && grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # …and the mirror: a manager that merges a FRESH override over a stale installed file is a box AT the
+  # seam, so grading the file instead would send an operator to re-render a right unit (the false-block
+  # direction of the same blindness).
+  printf 'LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"\n' >"$TM/stale.sh"
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=7200\n' "$TM/stale.sh" \
+    >"$TM/home/.config/systemd/user/eldato-ai-drainer.service"
+  printf '# /etc/systemd/system/eldato-ai-drainer.service\n[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=7200\n# /run/systemd/system/eldato-ai-drainer.service.d/50-cap.conf\n[Service]\nEnvironment=LANE_TIMEOUT=%s\n' \
+    "$TM/stale.sh" "${SEAM_T:?}" >"$TM/cat.txt"
+  out="$(status_mgr)"; rc=$?
+  check "installer: …and the manager's merge wins in the OTHER direction too — a fresh override over a stale install reads CLEAN (pre-fix: false STALE, rc 3)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # …and a manager that CANNOT answer for a user unit is not a reason to red a good box: the user config
+  # dir IS the dir it failed to list, so the file read is still truthful there (fail-closed stays for the
+  # SYSTEM target, where an unreadable merge is indistinguishable from an empty one — the lib arm below).
+  : >"$TM/cat.txt"
+  printf '[Service]\nExecStart=/bin/bash %s\nEnvironment=LANE_TIMEOUT=%s\n' \
+    "$TM/fresh.sh" "${SEAM_T:?}" >"$TM/home/.config/systemd/user/eldato-ai-drainer.service"
+  out="$(status_mgr)"; rc=$?
+  check "installer: a manager with no answer for a USER unit falls back to the installed file and stays CLEAN (no false block)" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ⛔ AND FOR THE SYSTEM TARGET AN UNREADABLE MERGE IS rc 1 — which `--status` maps to UNKNOWN (5), never
+  # to a clean grade. Only systemd knows `/run/systemd/system/*.d` and `/usr/lib/systemd/system/*.d`, so
+  # "systemctl cat printed nothing" cannot be told apart from "there is no drop-in": the resolver refuses
+  # instead of guessing, exactly as the disk reaper's read-back does.
+  librc="$( . "$HERE/../lib/systemd-unit-parse.sh"; unit_text_effective /bin/false system /nonexistent u.service >/dev/null 2>&1; echo $? )"
+  check "installer: the shared resolver REFUSES (rc 1) when a SYSTEM unit's merge cannot be read — an unreadable answer is never 'no drop-in'" \
+    '[ "$librc" = 1 ]' "rc=$librc"
+  libout="$( . "$HERE/../lib/systemd-unit-parse.sh"; unit_text_effective /bin/false override "$T4/units" eldato-ai-drainer.service 2>/dev/null )"
+  check "installer: …while the documented override target still resolves from the files (positive control, so the refusal above is not simply 'always rc 1')" \
+    'grep -q "^ExecStart=" <<<"$libout"' "units text: $(printf '%s' "$libout" | head -2 | tr '\n' ' ')"
   cp "$T4/svc.bak" "$T4/units/eldato-ai-drainer.service"
 else
   bad "installer missing at $INSTALLER"
