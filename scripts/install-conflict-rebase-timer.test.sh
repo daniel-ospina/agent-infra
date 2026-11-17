@@ -295,7 +295,14 @@ TPL_DIR=""
 # ── T12: …and the launchd dialect, where the mode key lands inside EnvironmentVariables ───────────────
 echo "== T12: the same veto on the launchd dialect (a <key> naming the hatch) ──"
 mkdir -p "$FX/tpl-hatch-plist"
-sed 's|<key>CONFLICT_REBASE_REPO</key>|<key>AGENT_ADMIN_MERGE_OVERRIDE</key>|' \
+# ⛔ THE INJECTED KEY CARRIES A BYPASSING VALUE, and that is not decoration: the judge is VALUE-AWARE for
+# every name whose gate tests `=== "1"` (see `GP_UNIT_VALUE1_FLAGS`), so renaming the key alone leaves
+# `<string>{{REPO}}</string>` on it — a declaration that ASSIGNS the hatch an inert value, correctly CLEAN.
+# The arm would then have been pinning a refusal the judge no longer issues (measured: it reddened until the
+# value moved), i.e. vacuous in the direction that matters — it would have passed on a judge that stopped
+# grading plists altogether as long as some other arm reddened.
+sed -e 's|<key>CONFLICT_REBASE_REPO</key>|<key>AGENT_ADMIN_MERGE_OVERRIDE</key>|' \
+    -e 's|<string>{{REPO}}</string>|<string>1</string>|' \
     "$REPO/templates/launchd/conflict-rebase/com.eldato.conflict-rebase.plist" \
     >"$FX/tpl-hatch-plist/com.eldato.conflict-rebase.plist"
 LTPL_DIR="$FX/tpl-hatch-plist"; EXTRA_ENV=("ELDATO_PLATFORM=Darwin"); RUN --dry-run
