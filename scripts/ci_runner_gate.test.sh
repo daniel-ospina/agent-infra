@@ -628,7 +628,10 @@ GHOST_TRUST_SHIPPED="$(_derive_shipped GHOST_TRUST_AFTER_S)"
 QUEUE_MAX_PAGES_SHIPPED="$(_derive_shipped QUEUE_READ_MAX_PAGES)"
 # ⛔ AND THE THIRD ONE (review cycle 3, P1 — measured, not inferred): with only the two above exported, an
 # ambient `CI_GATE_GHOST_REPROVE_AFTER_S=1` reddened 8 assertions with NO code change, including both
-# cycle-1 walk arms. A knob this suite reads has to be pinned here or the environment decides its colour.
+# cycle-1 walk arms. THIS knob has to be pinned here, or the environment decides the suite's colour —
+# and for the same reason its shipped VALUE is pinned literally below ("TWO-SIDED"), because
+# `_derive_shipped` reads ${GATE_UNDER_TEST:-$GATE}: a mutant of the gate alone would otherwise redden
+# nothing while shipping a different default (measured: 43200 → 999999999 stayed 685/685 green).
 GHOST_REPROVE_SHIPPED="$(_derive_shipped GHOST_REPROVE_AFTER_S)"
 for _v in "$CENSUS_BACKOFF_SHIPPED" "$CENSUS_ATTEMPTS_SHIPPED" "$BLIND_DEFECT_AFTER_SHIPPED" \
           "$BLIND_DEFECT_EVERY_SHIPPED" "$BLIND_STREAK_RESET_SHIPPED" \
@@ -3014,6 +3017,14 @@ assert_eq "$BLIND_DEFECT_EVERY_SHIPPED" "21600" \
   "the gate SHIPS a 6 h defect write floor — NOT the 1800 s inbox rate #4085 replaced"
 assert_eq "$BLIND_STREAK_RESET_SHIPPED" "3600" \
   "the gate SHIPS a 1 h streak window, DECOUPLED from the alarm interval"
+# …and the three #4113 bounds, for exactly the same reason (review cycle 4, P1 — measured: a mutant
+# shipping 999999999 for the re-prove interval, i.e. proofs that never expire, stayed 685/685 GREEN).
+assert_eq "$GHOST_TRUST_SHIPPED" "3600" \
+  "the gate SHIPS a 1 h ghost trust floor"
+assert_eq "$GHOST_REPROVE_SHIPPED" "43200" \
+  "the gate SHIPS a 12 h re-prove interval — a proof is re-proven, never trusted forever"
+assert_eq "$QUEUE_MAX_PAGES_SHIPPED" "5" \
+  "the gate SHIPS a 5-page queue read (the page cap is a bound, not a knob a caller widens)"
 
 # ── (r1) A TRANSIENT CENSUS FAILURE IS RETRIED, NOT LOST (agent-infra#4085) ────────────────────
 # The measured shape: `net/http: TLS handshake timeout` on the runners read. One attempt per 300 s
