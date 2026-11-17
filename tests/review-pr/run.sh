@@ -115,6 +115,17 @@
 #      MUTATION controls: drop the extraction and the compliant transcript is refused; drop the
 #      pre-post validation and the refused artifact IS posted, with the real parser confirming it.
 #
+#   §BL (#3987) WHAT THE PARSER ACCEPTS IS NOT EVIDENCE: the seam knows the text it handed out and the
+#      bytes it is about to publish, so it refuses a paste-back of the contract's worked ROW fenced or
+#      not, refuses the recorder's unconditional veto phrases BEFORE posting, and pins that veto mirror
+#      byte-for-byte against `record-review.sh`. Both preflight refusals the validator adds are driven.
+#
+#   §BM (#3987) THE OTHER HALF OF THE CONTRACT: the worked `NO NEW ASSERTIONS:` EXEMPTION line is the
+#      second paste-back door — the parser accepts a live copy of the harness's own example reason, so
+#      a `clean` record could be minted on a reason about a docs-only diff. Refused by provenance at
+#      the seam, with the mutant that records it proving the arm is what refuses and an AUTHORED
+#      reason proving the arm refuses copies, not exemptions.
+#
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
 # proof of coverage.
@@ -364,7 +375,14 @@ if [ -z "${FIXTURE_NO_MUTATION:-}" ] && [ -f "${REVIEWER_SRC:-/nonexistent}" ]; 
   _vl_no="$(grep -anE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" "$REVIEWER_SRC" 2>/dev/null | tail -1 | cut -d: -f1)"
   if [ -n "${_vl_no:-}" ]; then
     if [ "${FIXTURE_MUTATION_EXEMPT:-0}" = "1" ]; then
-      printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and adds no executable assertion.\n\n' > "$TMP/mutation-section.md"
+      # ⛔ THE EXEMPTION LINE IS THE SECOND DOOR, AND THIS FIXTURE USED TO STAND IN IT (agent-infra#3987,
+      # measured at 3d14cdab5). It read `NO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and
+      # adds no executable assertion.` — a NEAR-COPY of the contract's own worked exemption, differing by
+      # one word. That is the same defect §BK's table row had before it was fixed: the suite's
+      # "compliant reviewer" echoes the example the prompt hands out, so §BK asserted a paste-back as
+      # GREEN and the seam's provenance arm (now §BM) could not see it. It authors its own reason now,
+      # naming the files a docs-only change would actually touch in THIS repo.
+      printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: the only edits are to docs/ops/self-healing-contract.md, which carries no executable assertion — the guard itself lives in scripts/review-pr.sh and its arms are in §BK/§BL/§BM.\n\n' > "$TMP/mutation-section.md"
     else
       # ⛔ THE ROW IS THE REVIEWER'S OWN, AND DELIBERATELY NOT A COPY OF THE CONTRACT'S WORKED
       # EXAMPLE (agent-infra#3987, P1 at a8767f401). It used to be a near-copy of the canonical
@@ -3531,7 +3549,10 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a docs-only CLEAN records on the reviewer's 'NO NEW ASSERTIONS:' line alone (rc=$(rc_of))"
 _miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
 [ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "  …the artifact satisfies the parser (rc=$_miss_rc, ='${_miss:-<accepted>}')"
-grep -q '^NO NEW ASSERTIONS: docs-only' "$TMP/comment.md" 2>/dev/null; ck $? "  …at COLUMN 0, so it is a live exemption and not a quoted code block"
+grep -q '^NO NEW ASSERTIONS: the only edits are to docs/ops/self-healing-contract.md' "$TMP/comment.md" 2>/dev/null; ck $? "  …at COLUMN 0, so it is a live exemption and not a quoted code block"
+# …and it is the REVIEWER'S OWN reason, not the contract's example (the mirror of the worked-row
+# fixture fix; §BM is what refuses a copy of the example reason).
+! grep -qF 'docs/ops/*.md and no executable assertion' "$TMP/comment.md" 2>/dev/null; ck $? "  …authored for THIS diff, not the contract's example reason copied back"
 
 # ⛔ A FENCED ECHO IS QUOTED MATERIAL, NOT A CLAIM — AND THE EXTRACTOR MUST AGREE WITH THE PARSER
 # (P1, fresh review). This prompt now HANDS the reviewer a complete, copyable, already-valid row, so
@@ -3857,6 +3878,69 @@ done
 unset _kind
 reset
 # ══ end §BL ══
+
+# ── §BM THE OTHER HALF OF THE CONTRACT IS A PASTE-BACK DOOR TOO (agent-infra#3987, measured 3d14cdab5) ──
+# The contract has TWO answers: a TABLE of rows, and a single `NO NEW ASSERTIONS: <why>` line. §BL
+# closed the row. The line was left open — and it is the one the contract shows FILLED IN, so a
+# literal reviewer that "does not paraphrase the exemption line" (which the prompt literally asks)
+# retypes the harness's own example reason at COLUMN 0. The recorder's parser answers EMPTY (accepted)
+# for it, because a live `NO NEW ASSERTIONS:` line with any reason is exactly what it asks for. So a
+# `clean` record could be minted on a reason about a docs-only diff — the false-PASS class #3442
+# exists for, through the other half of the same contract. MEASURED on the pre-fix head, with no
+# table row anywhere in the transcript: rc=0, artifact posted, parser accepts, record minted.
+# The discriminator is provenance, not a fifth spelling test: this run knows the canonical text it
+# handed out, so a LIVE exemption line whose PAYLOAD is the contract's payload is a copy.
+echo; echo "§BM the contract's own EXEMPTION line is not the reviewer's claim either"
+
+# ⛔ TAKEN FROM THE REAL `--mutation-section`, not retyped: the arm is a text comparison against
+# exactly what this run hands out, so a hand-approximated fixture would prove a copy of the fixture.
+CANON_EXEMPT="$(bash "$GATE_SH" --mutation-section 2>/dev/null | grep -F 'NO NEW ASSERTIONS:' | grep -F 'docs/ops' | sed 's/^[[:space:]]*//' | head -1)"
+[ -n "$CANON_EXEMPT" ]; ck $? "the contract still carries a worked exemption line to paste back (the arm below needs one)"
+
+reset; FIXTURE_NO_MUTATION=1
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$CANON_EXEMPT" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "an UNFENCED paste-back of the contract's worked EXEMPTION is REFUSED, not minted (rc=$(rc_of), want 11)"
+no_comment; ck $? "  …nothing posted as a review artifact"
+no_record; ck $? "  …and no record minted on the harness's own example exemption"
+err_has "REPUBLISHES THE CONTRACT'S OWN WORKED"; ck $? "  …and the refusal names the provenance of the line"
+err_has "PASTE-BACK"; ck $? "  …as the reviewer-side paste it is"
+
+# ⛔ A BULLETED/BOLDED RETYPE IS STILL THE SAME LINE (the parser accepts those decorations, so the
+# copy does not have to be byte-identical in markdown to be a copy).
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n- **%s**\n\nCLEAN\n' "$CANON_EXEMPT" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "  …and a BULLETED+BOLDED retype of the same line is refused too (rc=$(rc_of), want 11)"
+no_record; ck $? "    …nothing recorded"
+
+# …and the SAME transcript proves the parser alone would have ACCEPTED it: this is the measurement the
+# arm rests on, taken on the artifact the MUTANT below actually publishes.
+PE="$TMP/mutant-no-exempt-pasteback.sh"
+cp "$SRC" "$PE"; chmod +x "$PE"
+sed 's|^  _pb_exempt=.*|  _pb_exempt=""|' "$SRC" > "$PE"
+if cmp -s "$SRC" "$PE"; then
+  fail "the exemption paste-back mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$CANON_EXEMPT" > "$TMP/reviewer-out"
+  run "$PE" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT without the exemption arm RECORDS the paste-back (rc=$(rc_of)) - so this arm is what refuses it"
+  _miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
+  [ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "  …and record-review.sh's OWN parser ACCEPTS that posted artifact (rc=$_miss_rc, ='${_miss:-<accepted>}') - the false PASS, measured"
+  grep -qF 'docs/ops/*.md' "$TMP/comment.md" 2>/dev/null; ck $? "  …carrying the contract's example files as the reviewer's evidence about THIS diff"
+fi
+
+# ⛔ THE ARM IS A PROVENANCE TEST, NOT A BAN ON EXEMPTIONS: a reviewer that writes its OWN reason still
+# records. Without this, a blanket refusal would satisfy the arms above while breaking the docs-only
+# class the contract exists to allow.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: this change only rewords docs/ops/self-healing-contract.md; every guard it describes is asserted in §BM of tests/review-pr/run.sh.\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "an AUTHORED exemption reason still records (rc=$(rc_of)) - the arm refuses copies, not exemptions"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+reset
+# ══ end §BM ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

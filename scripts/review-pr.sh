@@ -800,13 +800,17 @@ Print it AFTER your per-line findings and IMMEDIATELY BEFORE your verdict line (
 section there), and do not wrap it in a fence. ⛔ THE CONTRACT BELOW IS A SHAPE, NOT A TEMPLATE TO
 COPY BACK — it carries a FILLED worked row as an example of the columns. Write YOUR OWN rows about
 THIS diff, or your own \`NO NEW ASSERTIONS: <why>\` line, at COLUMN 0 outside any fence and outside
-any indent. A copy is refused THREE ways, all of them measured, and a refusal discards the review:
+any indent. A copy is refused FOUR ways, all of them measured, and a refusal discards the review:
   • the recorder reads a fenced block as QUOTED MATERIAL, never as your claim;
   • it reads four-or-more columns of indent as an indented code block, same thing;
   • and the caller refuses a section that REPUBLISHES the contract's own worked example row, fenced
-    or not — that row is the shape you were handed, so it can never be evidence about this diff.
-If the diff genuinely adds no assertion, the exemption line is still yours to type: the contract
-shows it indented on purpose, and an indented copy is refused as quoted material.
+    or not — that row is the shape you were handed, so it can never be evidence about this diff;
+  • and the caller ALSO refuses a `NO NEW ASSERTIONS:` line that repeats the contract's example
+    REASON — that reason names the contract's own example files, so it says nothing about THIS diff.
+If the diff genuinely adds no assertion, the exemption line is still YOURS to type: the contract
+shows it indented on purpose, and an indented copy is refused as quoted material — but an UNINDENTED
+copy of its example reason is refused too, so write why THIS diff adds none, naming the files you
+actually read.
 ⛔ WHEN THIS PROMPT ALSO ASKS FOR A \`diff-tail:\` LINE, the order is: your findings, then the
 \`diff-tail:\` line, then this section, then your verdict line — the section is the LAST thing
 before the verdict line, and \`diff-tail:\` goes BEFORE it, not between it and the verdict.
@@ -2714,6 +2718,61 @@ mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the co
   printf '%s\n' "$sec" | grep -Fxf <(printf '%s\n' "$canon") 2>/dev/null || return 0
 }
 
+# ⛔ THE EXEMPTION LINE IS THE SECOND PASTE-BACK DOOR, AND PROVENANCE HAS TO COVER IT TOO (measured
+# at head 3d14cdab5). The arm above compares TABLE rows, so the contract's OTHER answer — the
+# `NO NEW ASSERTIONS: <why>` line — was left unguarded, and it is the one the contract shows FILLED
+# IN: `NO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and no executable assertion.`
+# The contract indents it so that a pasted BLOCK cannot exempt the artifact, and the prompt tells a
+# reviewer not to paraphrase "the exemption line" — a LITERAL reviewer therefore retypes it at
+# COLUMN 0, which is a LIVE exemption carrying the harness's own example reason, and
+# `brief-gate.sh --mutation-missing` answers EMPTY (accepted) for it. MEASURED on the pre-fix head,
+# with no table row anywhere in the transcript: rc=0, artifact posted, `clean` minted — a clean
+# record on a reason about a docs-only diff, minted for a diff that adds executable assertions. That
+# is the same false-PASS class as the example row, reachable through the other half of the contract.
+# The discriminator is provenance again, not a fifth spelling test: this run KNOWS the canonical
+# text, so a LIVE exemption line whose payload IS the contract's payload is a copy, and is refused.
+# ⛔ THE CANONICAL COPY IN `$MUTATION_SECTION` IS INDENTED (the parser treats it as QUOTED), so the
+# extractor takes quoted lines from the CANON side and only LIVE ones from the REVIEWER side: the
+# question asked of the reviewer's text is "is this line a live claim at all", and the question
+# asked of the canon is "what did this run hand out" — indentation is not protection against a copy
+# that drops it. Fences are not tracked here and do not need to be: a fenced exemption is QUOTED to
+# the parser, which refuses it on its own (no live claim / MUTATION-EXEMPTION-INDENTED).
+# STATED LIMIT, identical in kind to the table-row arm's: an exact-text test. A reviewer who writes
+# its OWN reason — naming the files THIS diff touches — has authored the claim, which is what the
+# block asks for, and the prompt now says so in as many words.
+_mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTIONS:` payloads
+  local _live=""
+  [ "${2:-}" = "--live-only" ] && _live=1
+  printf '%s\n' "${1:-}" | _ME_LIVE="$_live" awk '
+    { l = $0; sub(/\r$/, "", l)
+      col = 0; ln = length(l); q = 1
+      while (q <= ln) {
+        c = substr(l, q, 1)
+        if (c == " ") { col++; q++; continue }
+        if (c == "\t") { col += 4 - (col % 4); q++; continue }
+        break
+      }
+      if (ENVIRON["_ME_LIVE"] == "1" && col >= 4) next   # indented code block: quoted, not the claim
+      rest = substr(l, q)
+      gsub(/[`*_]/, "", rest)                            # markdown decoration is not the claim
+      gsub(/[ \t]+/, " ", rest); sub(/^ /, "", rest); sub(/ $/, "", rest)
+      low = tolower(rest)
+      sub(/^[-+>]+[ \t]*/, "", low)                      # a bullet is still the line
+      if (low !~ /^no new assertions[ \t]*:/) next
+      sub(/^no new assertions[ \t]*:[ \t]*/, "", low)
+      if (low == "") next
+      print low }'
+}
+
+mutation_pasteback_exempt() { # <section-text> -> the reviewer's LIVE exemption lines that ARE the
+                              # contract's own worked exemption (empty when it authored its own)
+  local canon sec
+  canon="$(_mutation_norm_exempt "$MUTATION_SECTION")"
+  sec="$(_mutation_norm_exempt "${1:-}" --live-only)"
+  [ -n "$canon" ] && [ -n "$sec" ] || return 0
+  printf '%s\n' "$sec" | grep -Fxf <(printf '%s\n' "$canon") 2>/dev/null || return 0
+}
+
 # ── 5a4) THE RECORDER'S UNCONDITIONAL VETO ARMS ARE SCANNED HERE, BEFORE ANYTHING IS POSTED ────
 # ⛔ THE REVIEWER'S OWN PROSE NOW RIDES INSIDE THE EVIDENCE BODY (P3, fresh review at a8767f401). The
 # MUTATION ATTRIBUTION section is published VERBATIM in the comment `record-review.sh` reads, and that
@@ -2979,6 +3038,15 @@ if [ "$VERDICT" = clean ]; then
   # data rows are compared against the canonical text THIS RUN handed the reviewer, and a row that is
   # the contract's own example is a paste-back, not an attribution for this diff.
   _pb_rows="$(mutation_pasteback_rows "${MUTATION_SECTION_SEEN:-}")"
+  _pb_exempt="$(mutation_pasteback_exempt "${MUTATION_SECTION_SEEN:-}")"
+  if [ -n "$_pb_exempt" ]; then
+    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED \`NO NEW ASSERTIONS:\` LINE — the example reason this run handed it in the shape it asked it to fill in:"
+    printf '%s\n' "$_pb_exempt" | while IFS= read -r _pb_l; do err "    NO NEW ASSERTIONS: $(printf '%s' "$_pb_l" | cut -c1-200)"; done
+    err "  That reason names the contract's example files, not this diff — and it was GIVEN to the reviewer by this run, so it is a PASTE-BACK, never the reviewer's claim. The recorder's parser answers EMPTY (accepted) for a live copy, which is exactly why it cannot be left to the parser: minting \`clean\` on the harness's own example exemption is the false-PASS class agent-infra#3442 exists for."
+    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt says the exemption line is the reviewer's to write about THIS diff."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact's exemption line is the contract's own worked example, pasted back — the parser accepts that shape, so refusing it is this run's job"
+  fi
   if [ -n "$_pb_rows" ]; then
     err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED EXAMPLE ROW — the row the prompt handed it as the shape to fill in:"
     printf '%s\n' "$_pb_rows" | while IFS= read -r _pb_l; do err "    $(printf '%s' "$_pb_l" | cut -c1-200)"; done
