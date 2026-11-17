@@ -137,11 +137,36 @@ GP_AMBIENT_CLEARED=0
 # exactly how it stayed invisible: it is admitted BY VOCABULARY (`STATE_MACHINE` is in the vocabulary list),
 # not by being spelled like the others. Extend THIS list, never a second copy.
 GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS AGENT_STATE_MACHINE ELDATO_STATE_MACHINE"
+# ⛔ THE LIST IS PARTITIONED BY WHAT EACH GATE ACTUALLY HONOURS, AND THAT IS NOT A DETAIL (fresh review of
+# PR #4020 at `921aeed45`, P3 — MEASURED as a false block). Grading every name by PRESENCE alone reported
+# `Environment=AGENT_SKIP_REVIEW_GATE=0` — a unit that says the gate is ON, in the only way a declaration can
+# say it — as "carries a GATE BYPASS", and REFUSED it on the install path (`install-drainer-timer.sh`), so a
+# deliberately explicit `=0` unit could not be installed on a cell. A gate that refuses the truthful spelling
+# of "enabled" while the dishonest one is what it hunts trains the operator to delete the declaration rather
+# than read the refusal (`plugins/...`-style over-block; the false-block cost is real, the hatch is not).
+#   · `…_VALUE1_FLAGS` — the gate answers `=== "1"` (`extensions/review-enforcer/index.ts:612,8262`,
+#     `extensions/verification-gate/index.ts:4565`,
+#     `extensions/main-worktree-guard/index.ts:562`), so ONLY the value `1` disables it. `=0`, an empty
+#     value, `=false` and a bare name are all inert, and are graded as clean.
+#   · `…_EXISTS_FLAGS` — the gate decides on EXISTENCE (`isKillSwitchSet()`), so ANY non-empty value (and a
+#     bare name, which is not valid systemd and cannot be a working unit) is graded as a bypass.
+# Both are lists because a name must be in exactly ONE of them: a value-gated name graded by presence is a
+# false block, and an existence-gated name graded by value is a FAIL-OPEN (`AGENT_STATE_MACHINE=yes` would
+# answer CLEAN while every gate in every spawned lane is off). §5f asserts the partition, so a new hatch
+# cannot be added to `GP_UNIT_BYPASS_FLAGS` and silently land in neither grading class.
+GP_UNIT_VALUE1_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+GP_UNIT_EXISTS_FLAGS="AGENT_STATE_MACHINE ELDATO_STATE_MACHINE"
 
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
-#   0  clean (the declaration names none of the flags)
-#   1  VETOED (it names at least one; the names are printed on stderr)
+#   0  clean (the declaration sets none of the flags to a bypassing value)
+#   1  VETOED (it sets at least one; the names are printed on stderr)
 #   2  cannot answer — the FILE PREFLIGHT only (no file named / not readable / a directory)
+#      ⛔ "SETS", NOT "NAMES" — the value is graded for every name whose gate tests `=== "1"`, so an
+#      explicit `Environment=AGENT_SKIP_REVIEW_GATE=0` (and a bare name, and a name that only appears as SOME
+#      OTHER variable's value) is CLEAN. A name is vetoed when it is ASSIGNED a value the gate honours, when
+#      it is forwarded by `PassEnvironment=` (the value is the manager's, so the name alone decides), or when
+#      its value cannot be PROVEN inert — a value carrying a backslash is `cunescape`d by systemd, so
+#      `\x31` is `1`, and refusing the unprovable spelling is what keeps this fail-closed.
 #      ⛔ NEVER a pass: an ungradable declaration is not a clean one.
 #      ⛔ AND THAT IS THE WHOLE rc-2 SET: a declaration is never ungradable for its CONTENT. The fold has
 #      no error branch BY DESIGN (an error branch on that loop could never fire — see the note below it),
@@ -234,25 +259,78 @@ gate_policy_unit_veto() {
   # the preflight above (absent, unreadable, or a directory), which is where they are actually reachable.
   # An accumulator still pending at EOF is a logical line too (a file may end on a continuation).
   [ -n "$_acc" ] && folded="$folded$_acc"$'\n'
-  # ⛔ ONLY `Environment=` / `PassEnvironment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD
-  # inside them. `PassEnvironment=<NAME>` names a variable in the unit's OWN text (it forwards one the
+  # ⛔ ONLY `Environment=` / `PassEnvironment=` DIRECTIVES ARE GRADED, and the name must be the WHOLE
+  # ASSIGNED NAME inside them — the VALUE decides for every name whose gate tests `=== "1"` (see the two
+  # lists above). `PassEnvironment=<NAME>` names a variable in the unit's OWN text (it forwards one the
   # managing systemd instance holds), so it is a declaration that names the hatch and belongs here — it
-  # used to answer CLEAN (fresh review of #4002, round 4). `EnvironmentFile=` deliberately does NOT match:
-  # the unit names a file, not a variable, and its contents are outside what this function can read.
+  # used to answer CLEAN (fresh review of #4002, round 4) — and it is graded by NAME ALONE, because the value
+  # is not in the unit's text at all. `EnvironmentFile=` deliberately does NOT match: the unit names a file,
+  # not a variable, and its contents are outside what this function can read.
   # `-w` rather than a hand-rolled `[^A-Za-z0-9_]` boundary: GNU and BSD grep disagree about `\b` in
   # ERE (BSD has no `\b`), and a boundary that silently stops matching is the shape that lets the
   # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*` anchor
   # deliberately does not see it.
+  local passlines canon plist vlist v
   envlines="$(grep -E '^[[:space:]]*(Environment|PassEnvironment)[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
-  for flag in $GP_UNIT_BYPASS_FLAGS; do
+  passlines="$(grep -E '^[[:space:]]*PassEnvironment[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
+  # The value test reads a CANONICAL form: quotes removed (systemd splits with EXTRACT_UNQUOTE, so
+  # `Environment="NAME=1"` is the same declaration as the bare spelling) and blanks around `=` collapsed.
+  # Without it the quoted spelling of the same hatch would be graded CLEAN — a fail-open introduced by
+  # making the match value-aware, which is why the canonicalization is part of the same change, not a polish.
+  canon=""
+  [ -n "$envlines" ] && canon="$(printf '%s\n' "$envlines" | tr -d "\"'" | sed 's/[[:space:]]*=[[:space:]]*/=/g')"
+  # The launchd half reads a FLATTENED copy: a `<key>` whose name (or whose value) sits on the next line is
+  # honoured by launchd and must be honoured here. The previous match ran line-anchored against `$f`, so
+  # `<key>`+newline+`AGENT_SKIP_REVIEW_GATE`+newline+`</key>` answered CLEAN while the hatch was live (fresh
+  # code review of PR #4020 at `921aeed45`, P3 — reproduced; every in-tree producer emits the one-line form,
+  # which is why it was a hole rather than a live bypass, not why it was acceptable).
+  plist="$(printf '%s' "$_body" | tr '\n\r' '  ')"
+  for flag in $GP_UNIT_VALUE1_FLAGS; do
     # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): the recognised idiom is a producer piped into a
     # QUIET grep, where the producer can take SIGPIPE under `pipefail` and a present match reads as absent.
     # One producer and no pipe removes the shape entirely. (This file sets no `set -o pipefail` — the guard
     # flags the SHAPE, and the shape is what keeps being reintroduced elsewhere.)
+    # (a) `Environment=<NAME>=<value>` — the value decides.
+    if [ -n "$canon" ]; then
+      # The match KEEPS the single non-word character it anchored on (`=` of `Environment=`, or the space
+      # between two assignments), so exactly that one character and the name are stripped. `grep -Eo` cannot
+      # drop it itself: without an anchored boundary the pattern matches the SUFFIX of a longer name, which
+      # is the shape that lets a renamed hatch through.
+      vlist="$(printf '%s\n' "$canon" | grep -Eo "[^A-Za-z0-9_]${flag}=[^[:space:]]*" 2>/dev/null | sed 's/^.[^=]*=//' || true)"
+      while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        case "$v" in
+          1) hit="$hit $flag" ;;      # the honoured value: the gate answers `=== "1"`
+          *\\*) hit="$hit $flag" ;;  # unprovable: `cunescape` turns `\x31` into `1` — refuse what cannot be
+                                      # proven inert rather than trust the spelling
+        esac
+      done <<<"$vlist"
+    fi
+    # (b) `PassEnvironment=<NAME>` — the unit forwards a variable whose VALUE lives in the manager, so the
+    # name alone is the declaration. Not value-graded: there is no value here to grade.
+    if [ -n "$passlines" ] && grep -Fqw -- "$flag" <<<"$passlines"; then
+      hit="$hit $flag"
+    fi
+    # (c) launchd: `<key>NAME</key>` + `<string>VALUE</string>`, on one line or wrapped across lines.
+    if [ -n "$plist" ]; then
+      vlist="$(printf '%s' "$plist" | grep -Eo "<key>[[:space:]]*${flag}[[:space:]]*</key>[[:space:]]*<string>[[:space:]]*[^<]*</string>" 2>/dev/null | sed -e 's/.*<string>[[:space:]]*//' -e 's/[[:space:]]*<\/string>$//' || true)"
+      while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        case "$v" in
+          1) hit="$hit $flag" ;;
+          *\\*) hit="$hit $flag" ;;
+        esac
+      done <<<"$vlist"
+    fi
+  done
+  # ⛔ THE EXISTENCE-GRADED NAMES ARE *NOT* VALUE-GRADED, and putting them in the loop above would be a
+  # FAIL-OPEN: `isKillSwitchSet()` decides on presence, so `AGENT_STATE_MACHINE=yes` (or `=0`, or a bare
+  # name) switches off every gate in every lane the job spawns. They are graded by presence on both dialects.
+  for flag in $GP_UNIT_EXISTS_FLAGS; do
     if [ -n "$envlines" ] && grep -Fqw -- "$flag" <<<"$envlines"; then
       hit="$hit $flag"
-    elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" "$f" 2>/dev/null; then
-      hit="$hit $flag"            # launchd: the plist spells the name as its own <key>
+    elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" <<<"$plist"; then
+      hit="$hit $flag"
     fi
   done
   [ -z "$hit" ] && return 0

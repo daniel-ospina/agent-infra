@@ -705,9 +705,14 @@ bash "$POLICY" --unit-veto "$TMP/cronly-clean.service" cronly-clean >/dev/null 2
 # `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
 # "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the
 # template: the census above grades the real ones.
+# ⛔ THE MUTATION CARRIES A VALUE TOO (`<string>1</string>`), and without it the arm is VACUOUS now that the
+# grader is value-aware: renaming the key alone leaves a plist that sets
+# `AGENT_SKIP_REVIEW_GATE={{PATH}}` — inert, correctly CLEAN — and the arm would be pinning a refusal the
+# judge no longer issues (measured: it reddened against the value-aware judge until the value moved).
 PLIST_SRC="$REPO/templates/launchd/com.eldato.pi-cache-reap.plist"
 if [ -f "$PLIST_SRC" ]; then
-  sed 's|<key>PATH</key>|<key>AGENT_SKIP_REVIEW_GATE</key>|' "$PLIST_SRC" >"$TMP/mut.plist"
+  sed -e 's|<key>PATH</key>|<key>AGENT_SKIP_REVIEW_GATE</key>|' \
+      -e 's|<string>{{PATH}}</string>|<string>1</string>|' "$PLIST_SRC" >"$TMP/mut.plist"
   MUTPLIST_RC=0; bash "$POLICY" --unit-veto "$TMP/mut.plist" mutplist >/dev/null 2>&1 || MUTPLIST_RC=$?
   [ "$MUTPLIST_RC" -eq 1 ] \
     && ok "(5d) edges: a launchd plist carrying the hatch as its own <key> IS vetoed (a shipped plist mutated in \$TMP)" \
@@ -715,6 +720,64 @@ if [ -f "$PLIST_SRC" ]; then
 else
   bad "(5d) edges: $PLIST_SRC is gone, so the launchd half of the grader has no discriminating arm"
 fi
+# ⛔ A `<key>` SPLIT ACROSS LINES IS A LIVE DECLARATION TO launchd AND WAS READ AS CLEAN HERE (fresh code
+# review of PR #4020 at `921aeed45`, P3 — REPRODUCED). The launchd match ran LINE-ANCHORED against the raw
+# file, so `<key>` + newline + `AGENT_SKIP_REVIEW_GATE` + newline + `</key>` matched nothing while launchd
+# honours it. Every in-tree producer emits the one-line form, which makes this a HOLE rather than a live
+# bypass — the reason to close it is that the hole is one formatting decision wide, and the fix is a flatten.
+# It is a DISCRIMINATOR PAIR, not one arm: the split-but-inert twin must stay CLEAN, so an arm that merely
+# flattens and vetoes on the name cannot pass both halves.
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>\n      AGENT_SKIP_REVIEW_GATE\n    </key>\n    <string>1</string>\n  </dict>\n</dict></plist>\n' >"$TMP/splitkey.plist"
+SK_RC=0; bash "$POLICY" --unit-veto "$TMP/splitkey.plist" splitkey >/dev/null 2>&1 || SK_RC=$?
+[ "$SK_RC" -eq 1 ] \
+  && ok "(5d) edges: a launchd <key> split across lines STILL names the hatch — vetoed (launchd honours it, so the grader must)" \
+  || bad "(5d) edges: the split <key> plist answered rc=$SK_RC (want 1) — the launchd match is line-anchored, so a plist whose key carries a newline is invisible while launchd sets the hatch"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>\n      AGENT_SKIP_REVIEW_GATE\n    </key>\n    <string>0</string>\n  </dict>\n</dict></plist>\n' >"$TMP/splitkey-clean.plist"
+bash "$POLICY" --unit-veto "$TMP/splitkey-clean.plist" splitkey-clean >/dev/null 2>&1 \
+  && ok "(5d) edges: …and its EXPLICITLY-OFF twin (=0) is CLEAN — the flatten vetoes name-with-a-bypassing-value, not the name" \
+  || bad "(5d) edges: the split <key> plist with =0 was vetoed — the launchd half grades the name alone, which is the same false block this round removed on the systemd half"
+# ⛔ THE VALUE DECIDES FOR THE `=== "1"` GATES, AND BOTH DIRECTIONS ARE PINNED (fresh code review of PR #4020
+# at `921aeed45`, P3 — MEASURED: both presence-only arms answered rc=1, and `install-drainer-timer.sh
+# --install` REFUSED a unit that says the gate is ON). One direction is a false block — an operator deletes
+# the truthful spelling instead of reading the refusal — and the other is a FAIL-OPEN, because `=1` behind a
+# quote or behind systemd's `cunescape` must never read clean. Both are exercised: the false-block arms go
+# GREEN here and RED on the pre-fix judge, the fail-open arms stay RED and would go green if the fix were
+# done naively (value compared as raw text).
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=0\nExecStart=/bin/true\n' >"$TMP/explicit0.service"
+E0_RC=0; bash "$POLICY" --unit-veto "$TMP/explicit0.service" explicit0 >/dev/null 2>&1 || E0_RC=$?
+[ "$E0_RC" -eq 0 ] \
+  && ok "(5d) edges: an EXPLICIT `Environment=AGENT_SKIP_REVIEW_GATE=0` is CLEAN — the gate tests `=== \"1\"`, so =0 is the truthful spelling of 'enabled', not a bypass" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=0` answered rc=$E0_RC (want 0) — a presence-only match refuses the unit that declares the gate ON, and the install path refuses it too"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE\nExecStart=/bin/true\n' >"$TMP/bareflag.service"
+BF_RC=0; bash "$POLICY" --unit-veto "$TMP/bareflag.service" bareflag >/dev/null 2>&1 || BF_RC=$?
+[ "$BF_RC" -eq 0 ] \
+  && ok "(5d) edges: …and a BARE name (`Environment=AGENT_SKIP_REVIEW_GATE`, no `=`) is CLEAN — it sets nothing (and is not valid systemd), so it cannot be a false accusation either" \
+  || bad "(5d) edges: a bare `Environment=AGENT_SKIP_REVIEW_GATE` answered rc=$BF_RC (want 0) — nothing is set, so the refusal accuses the unit of a hatch it does not carry"
+printf '[Service]\nEnvironment=GREETING=AGENT_SKIP_REVIEW_GATE\nExecStart=/bin/true\n' >"$TMP/nameasvalue.service"
+NAV_RC=0; bash "$POLICY" --unit-veto "$TMP/nameasvalue.service" nameasvalue >/dev/null 2>&1 || NAV_RC=$?
+[ "$NAV_RC" -eq 0 ] \
+  && ok "(5d) edges: …and the name as SOME OTHER variable's VALUE (`GREETING=AGENT_SKIP_REVIEW_GATE`) is CLEAN — it assigns no flag" \
+  || bad "(5d) edges: the name appearing as another variable's value answered rc=$NAV_RC (want 0) — the match is on the TEXT, not on an assignment, so a config value that merely mentions the hatch is refused"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=10\nExecStart=/bin/true\n' >"$TMP/falseprefix.service"
+FP_RC=0; bash "$POLICY" --unit-veto "$TMP/falseprefix.service" falseprefix >/dev/null 2>&1 || FP_RC=$?
+[ "$FP_RC" -eq 0 ] \
+  && ok "(5d) edges: …and `=10` is CLEAN — the value is compared WHOLE, so `1` is not a prefix match on the string 10" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=10` answered rc=$FP_RC (want 0) — a prefix match on the value treats any value starting with 1 as the honoured one"
+printf '[Service]\nEnvironment="AGENT_SKIP_REVIEW_GATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted1.service"
+Q1_RC=0; bash "$POLICY" --unit-veto "$TMP/quoted1.service" quoted1 >/dev/null 2>&1 || Q1_RC=$?
+[ "$Q1_RC" -eq 1 ] \
+  && ok "(5d) edges: …but the QUOTED spelling of the honoured value (`\"AGENT_SKIP_REVIEW_GATE=1\"`) is VETOED — making the match value-aware must not open the quoting route" \
+  || bad "(5d) edges: `Environment=\"AGENT_SKIP_REVIEW_GATE=1\"` answered rc=$Q1_RC (want 1) — the value test reads raw text while systemd splits with EXTRACT_UNQUOTE, so the quoted hatch installs"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=\\x31\nExecStart=/bin/true\n' >"$TMP/cunescape.service"
+CE_RC=0; bash "$POLICY" --unit-veto "$TMP/cunescape.service" cunescape >/dev/null 2>&1 || CE_RC=$?
+[ "$CE_RC" -eq 1 ] \
+  && ok "(5d) edges: …and a value that only DECODES to 1 (`\\x31`) is VETOED — an unprovable spelling is refused rather than trusted" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=\\x31` answered rc=$CE_RC (want 1) — systemd cunescapes the value, so `\\x31` IS 1 and a value-aware match must not read it as inert"
+printf '[Service]\nEnvironment=AGENT_STATE_MACHINE=0\nExecStart=/bin/true\n' >"$TMP/killswitch0.service"
+SM0_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitch0.service" killswitch0 >/dev/null 2>&1 || SM0_RC=$?
+[ "$SM0_RC" -eq 1 ] \
+  && ok "(5d) edges: …and `AGENT_STATE_MACHINE=0` is STILL VETOED — the kill switch fires on PRESENCE, so grading it by value would be a fail-open" \
+  || bad "(5d) edges: `Environment=AGENT_STATE_MACHINE=0` answered rc=$SM0_RC (want 1) — the existence-graded kill switch was put in the value-graded class, a FAIL-OPEN in the exact direction the hatch runs"
 printf '[Service]\nEnvironment=ELDATO_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/alias.service"
 ALIAS_RC=0; bash "$POLICY" --unit-veto "$TMP/alias.service" alias >/dev/null 2>&1 || ALIAS_RC=$?
 [ "$ALIAS_RC" -eq 1 ] \
@@ -902,6 +965,22 @@ else
   only_decl="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
   only_hon="$(comm -13 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
   bad "(5f) drift: the declared list and the gates disagree — declared-but-not-honoured:[$only_decl] honoured-but-not-declared:[$only_hon]"
+fi
+# ⛔ THE FLAG LIST IS PARTITIONED, AND THE PARTITION IS ASSERTED (the two lists live in gate-policy.sh). The
+# split exists because the gates disagree about what a VALUE means: `=== "1"` for four of them, PRESENCE for
+# the kill switch. A name in NEITHER list is graded by nothing — invisible; a name in BOTH is graded by the
+# wrong rule for one of them, and each direction has its own failure mode (value-graded existence is a
+# FAIL-OPEN, presence-graded value is the false block this round removed). Neither shape is visible from the
+# equality arm above: it would pass on a correct `GP_UNIT_BYPASS_FLAGS` while both subsets were wrong.
+V1="$(sed -n 's/^GP_UNIT_VALUE1_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+EX="$(sed -n 's/^GP_UNIT_EXISTS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+BOTH="$(comm -12 <(printf '%s\n' "$V1") <(printf '%s\n' "$EX") | tr '\n' ' ')"
+GRADED_ANY="$(printf '%s\n%s\n' "$V1" "$EX" | sed '/^$/d' | LC_ALL=C sort -u)"
+NEITHER="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$GRADED_ANY") | tr '\n' ' ')"
+if [ -z "$BOTH" ] && [ -z "$NEITHER" ] && [ -n "$V1" ] && [ -n "$EX" ]; then
+  ok "(5f) drift: the flag list PARTITIONS into value-graded ($(printf '%s\n' "$V1" | grep -c .) names, gates testing `=== \"1\"`) and existence-graded ($(printf '%s\n' "$EX" | grep -c .) names, the kill switch) — every hatch is graded by the rule its own gate uses"
+else
+  bad "(5f) drift: the flag list does not partition — in BOTH:[$BOTH] in NEITHER:[$NEITHER] (a name graded by the wrong rule either refuses an inert declaration or lets a live hatch through)"
 fi
 
 # ── 5g. A DECLARATION THAT IS GENERATED INLINE IS GRADED TOO (fresh review of #4002, round 3) ──────
