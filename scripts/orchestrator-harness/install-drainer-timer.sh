@@ -366,8 +366,11 @@ say_status() {
             # fixture: base `ExecStart=/bin/bash <fresh>`, drop-in `ExecStart=` + `ExecStart=/bin/bash
             # <stale 7200>` read **rc 0** before this change and **rc 3** after it. It is the same shape
             # `install-disk-reaper-timer.sh` closed with `effective_execstarts` (a drop-in made the install
-            # print "verify: ExecStart + HOME read back", exit 0, over a unit that ran `/bin/true`), and the
-            # PR body's "closed in every spelling" claim is only true with the drop-in read.
+            # print "verify: ExecStart + HOME read back", exit 0, over a unit that ran `/bin/true`). ⛔ AND
+            # THE CLAIM IT WAS PROPPING UP IS WITHDRAWN (round-2 re-review, F4): "closed in every spelling"
+            # was false at that head — four measured spellings outside this arm still exited 0 — so what
+            # this file asserts is the narrower thing it tests: the command is read from the text systemd
+            # parses, and a cap that CANNOT be certified is 5, never 0.
             #
             # Systemd's own semantics, not a last-line guess: `ExecStart=` is read from `$unit_text` by
             # `effective_execstarts` from the SHARED parser (`scripts/lib/systemd-unit-parse.sh` — one

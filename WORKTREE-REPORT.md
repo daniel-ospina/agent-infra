@@ -53,8 +53,13 @@ resolved) — with one deliberate deviation, stated in the commit and repeated i
 **quoted pin** and a **drop-in pin** whose *value* is stale the correct grade is **3 STALE**, not 5, because
 the value DOES resolve and 3 is what `docs/ops/ai-drainer.md` publishes for "disagrees with the seam"; 5
 is reserved for the unresolvable (an unterminated-quote pin line, a non-numeric value). What finding 1 is
-about — rc 0 certifying a box that dispatches at the old cap — is closed in every spelling, and no arm
-returns 0.
+about — rc 0 certifying a box that dispatches at the old cap — is closed for every spelling an ARM tests,
+and no arm returns 0 over a cap that disagrees with the seam. ⛔ THE BROADER CLAIM THIS REPORT FIRST MADE
+("closed in every spelling") WAS FALSE AND IS WITHDRAWN (round-2 re-review, F4): four further spellings —
+`EnvironmentFile=`, a pin under `[Install]`, a backslash continuation, and a `\x4C`-style escape — each
+still exited 0 over a box at 7200, and they are closed in the shared parser (`env_compile_hazards`, section
+scope, continuation joining) with an arm per spelling. What this document can assert is what its arms
+measure; `docs/ops/ai-drainer.md` publishes the same three-answer contract.
 
 ### The item-1 probe matrix, measured through the shipped `--status`
 
