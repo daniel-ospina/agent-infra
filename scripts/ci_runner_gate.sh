@@ -99,6 +99,62 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
+# ⛔ THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113). The runs endpoint is NEWEST-FIRST, so
+# one page is the NEWEST $QUEUE_PAGE queued runs — not the queue. Measured on daniel-ospina/tortoise
+# 2026-11-17T11:16Z: 201 runs queued, the oldest row of page 1 was 2026-11-11T20:47Z, and the queue's
+# genuinely oldest demanding run (42064937107, 2026-11-05T16:29Z, 1 of its 22 jobs queued) was on
+# page 2 and therefore INVISIBLE to the walk. The walk's question is "which queued run is the
+# OLDEST with a queued job", and it cannot be answered from the newest page. Reading the extra pages
+# costs one list call per $QUEUE_PAGE runs (2 for the queue above) and the length leg's own threshold
+# bounds how much of it can ever matter, so the read is cheap; the bound below exists only so a
+# pathological queue cannot turn one pass into an unbounded walk.
+QUEUE_MAX_PAGES="${CI_GATE_QUEUE_READ_MAX_PAGES:-5}"
+# ⛔ THE GHOST LEDGER (agent-infra#4113) — WHY THE SCAN BOUND CANNOT SIMPLY BE RAISED AGAIN.
+# `QUEUE_HEAD_SCAN_MAX` bounds READS PER PASS, but the population it must walk is PERMANENT and
+# MONOTONICALLY GROWING: GitHub keeps a run whose jobs were never created in `status=queued` forever
+# (such a run cannot be cancelled — 409 — or deleted, and it can never occupy a runner, so no pass
+# will ever clear it). Measured 2026-11-17: 43 consecutive passes each proved the 25 oldest of a
+# ~190-deep queue were ghosts and then refused, so `mode=local` was pinned from 2026-11-06T01:30Z on
+# — the gate could not reach a verdict in either direction, and the pool stayed armed on a repo whose
+# hosted runners were demonstrably serving (in_progress=7). The bound was already raised once for
+# this exact reason (5 -> 25, agent-infra#3995, landed 2026-11-11) and the population outgrew it
+# within six days: a raise is an EXPIRY DATE, not a fix, because any fixed count over a growing
+# population is exceeded eventually by construction.
+# So the proof is REMEMBERED: a run that a readable jobs read showed to have ZERO JOBS AT ALL — and
+# that was already older than GHOST_TRUST_AFTER_S when it was read — is a ghost for good, and the next
+# pass discounts it without a read. The bound then bounds API cost (reads per pass) instead of bounding
+# how much of the queue the gate can ever see, and the walk completes CUMULATIVELY: a 200-deep ghost
+# population resolves in ceil(200/25) passes instead of never.
+# ⛔ THE TWO CONDITIONS ARE THE SOUNDNESS ARGUMENT, NOT DECORATION. (a) ZERO TOTAL JOBS, not merely
+# "no job in `queued` status": a run whose jobs exist but are `waiting` (concurrency group, environment
+# approval) or executing is TIME-LOCAL evidence — it can become demand later, so it is re-read on every
+# pass and never remembered. (b) AN AGE FLOOR, for the case where the run's jobs have not been created
+# yet at all: GitHub creates a run's jobs progressively, and the #2344 comment in this file records
+# 8-11 h old runs whose job set was still filling in.
+# ⛔ (a) AND (b) ARE NOT REDUNDANT, AND THE DIFFERENCE IS EXACTLY THE #2344 MEASUREMENT (agent-infra#4113
+# review, P1 — an earlier draft of this block claimed the age floor alone covered it, which contradicted
+# a floor of 3600 s and would have been an unsatisfiable requirement). The 8-11 h population the #2344
+# comment names had ZERO QUEUED jobs, not zero TOTAL jobs — those runs' job sets were fully created.
+# They are excluded here by (a), which is the strict predicate, and NO age rule could separate them (the
+# #2344 comment says so). The age floor exists only for the narrower case (a) cannot express: a run
+# created minutes ago whose job set is still being created, where "zero jobs so far" really can become
+# "jobs" a moment later. One hour is far past that window (jobs appear within seconds-to-minutes of a
+# run's creation) while remaining well below the multi-day ages of the population actually measured
+# live: the ghosts on the pinned repo were created 2026-11-05…11-11, read on 2026-11-17.
+# ⛔ THE FAIL-OPEN DIRECTION THIS MUST NEVER TAKE: discounting a run that could still become demand
+# would understate `queued_demanding` and certify "nothing is waiting" over a real stall — the exact
+# defect #2344 exists to remove, one cache layer down. Hence: an UNREADABLE ledger is discarded whole
+# (never partially trusted), an unreadable jobs read remembers nothing, and every entry is pruned the
+# moment the run leaves the queue.
+# RESIDUAL, stated: a run that is older than the floor AND has zero jobs is treated as terminal. A
+# re-run creates a NEW ATTEMPT on the same run id, and a run whose jobs were never created has nothing
+# to re-run, so the zero-job reading cannot be invalidated that way; if that ever changes, the entry is
+# still pruned as soon as the run leaves the queued list.
+GHOST_LEDGER_FILE="$STATE_DIR/ci-runner-gate.ghosts"
+# 3600 s is a floor on TRUST only: a younger ghost is re-read, which costs a read and never costs a
+# claim. It is NOT what excludes the 8-11 h population the #2344 comment cites — those runs had zero
+# QUEUED jobs, not zero TOTAL jobs, and are excluded by the zero-total predicate itself (see above).
+GHOST_TRUST_AFTER_S="${CI_GATE_GHOST_TRUST_AFTER_S:-3600}"
 # ⛔ HOW MANY QUEUED RUNS THE HEAD SCAN MAY READ (agent-infra#2344), and why a bound is enough.
 # A run in `status=queued` is NOT evidence that anything is waiting for a runner. GitHub leaves a run
 # whose jobs were never created in that state FOREVER, and such a run cannot be cancelled (409
@@ -630,7 +686,7 @@ $labels" ;;
 # ghost/not-ghost distinction (measured against the live API 2026-11-06: the ghost run 37642335832 →
 # rc 0, no output; a run with queued jobs → rc 0, `ubuntu-latest`; an unknown run id → rc 1).
 run_queued_demand() {
-  local rid="$1" out l sets=0
+  local rid="$1" out l sets=0 labels_out="" page_jobs jobs_measured=0 jobs_total=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
   # ⛔ `--paginate` IS REQUIRED, NOT TIDINESS (review P1). GitHub's list endpoints default to 30 per
   # page, and a RUN'S JOBS ARE LISTED IN CREATION ORDER — so on a run with more than 30 jobs the ones
@@ -641,19 +697,133 @@ run_queued_demand() {
   # made that shape load-bearing evidence, the under-read would silently DISCOUNT real demand and
   # strip the pool during a stall. `per_page=100` keeps the ordinary run at one call; `--paginate`
   # covers the rest, and gh applies `--jq` per page so the per-line output concatenates.
+  # ⛔ AN ABSENT `.jobs` IS NOT A MEASURED ZERO (agent-infra#4113 review, P1), which is why the page row
+  # is guarded by `type == "array"` and the queued-job selection reads `(.jobs // [])[]`: a 200 body that
+  # parses but carries no job array (a schema change, a proxy body — the #1704 class this file cites
+  # twice) must produce NO page row, so the caller's `jobs_measured` stays 0 and NOTHING is remembered.
+  # `(.jobs // []) | length` — the first cut — coerced that absence to 0, i.e. it minted the exact claim
+  # ("zero total jobs") that makes a ghost PERMANENT, from a read that measured nothing.
+  # ⛔ THE `#jobs` PAGE ROW IS THE LEDGER'S EVIDENCE (agent-infra#4113): it reports how many jobs the
+  # page carried, so the caller can tell "this run has NO jobs at all" (permanent) from "this run has
+  # jobs, none of them queued" (time-local). It is a page row rather than a return-code arm because
+  # rc carries the ghost/failed/unspellable distinction the scan already depends on, and it is emitted
+  # for EVERY page and SUMMED (a run's job set may span pages). `#` and TAB cannot appear in a
+  # job label — the label shape check below admits only `A-Za-z0-9._,+-` — so a page row can never be
+  # confused with a label set, which is the same protocol the census's page row uses.
+  # ⛔ IT IS CARRIED ON STDOUT AND REPARSED BY THE CALLER, DELIBERATELY (agent-infra#4113). A first cut
+  # set two globals here; the caller reads the demand through `$( … )`, i.e. in a SUBSHELL, so both
+  # were gone by the time the ledger decision ran and `set -u` killed the pass with "unbound variable".
+  # A side channel that a subshell silently drops is the same class of defect as a value nobody read:
+  # the output IS the channel, and the caller strips the row it recognises.
   out="$(gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --paginate \
-        --jq '[.jobs[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[]' 2>"$GH_ERR")" || return 1
+        --jq '(if ((.jobs|type) == "array") then "#jobs\t\(.jobs|length)" else empty end), ([(.jobs // [])[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[])' 2>"$GH_ERR")" || return 1
   [ -n "$out" ] || return 0
-  # Every LINE is one QUEUED JOB's set, and each must be spellable on its own: a job whose set cannot
-  # be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because a
-  # multi-job run is now several lines — see DEMAND_LABELS).
+  # Every OTHER line is one QUEUED JOB's set, and each must be spellable on its own: a job whose set
+  # cannot be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because
+  # a multi-job run is now several lines — see DEMAND_LABELS).
   while IFS= read -r l; do
     [ -n "$l" ] || continue
+    case "$l" in
+      '#jobs'$'\t'*)
+        page_jobs="${l#*$'\t'}"
+        case "$page_jobs" in ''|*[!0-9]*) return 2 ;; esac
+        jobs_measured=1
+        jobs_total=$((jobs_total + page_jobs))
+        continue ;;
+    esac
     case "$l" in *[!A-Za-z0-9._,+-]*) return 2 ;; esac
     sets=$((sets+1))
+    labels_out="$labels_out$l
+"
   done <<<"$out"
-  [ "$sets" -gt 0 ] || return 2
-  printf '%s' "$out"
+  # The measured total rides out on ONE row (never one per page: the caller compares it as a number,
+  # and a per-page row would make a multi-page run look like N readings). It is absent — not zero —
+  # when the body carried no page row at all, because an ABSENT reading must never be read as "zero
+  # jobs": zero is the claim that makes a ghost permanent.
+  [ "$jobs_measured" = 1 ] && printf '#jobs\t%s\n' "$jobs_total"
+  # ⛔ A BODY CARRYING ONLY A `#jobs` ROW IS A GHOST, NOT A FAILURE (agent-infra#4113): the pre-ledger
+  # function returned 2 here because a non-empty body always meant at least one label line. With the
+  # page row a readable zero is spelled explicitly, so rc 0 with NO label output keeps its #2344
+  # meaning — "readable, nothing queued" — while the total rides along in the page row above.
+  [ "$sets" -gt 0 ] || return 0
+  printf '%s' "${labels_out%$'\n'}"
+}
+
+# ts_age <RFC-3339 UTC stamp> — seconds since that stamp, on stdout.
+# rc 1 when the stamp does not parse or is in the FUTURE (a clock skew no reading can resolve). Pure
+# extraction of the one computation this file already did inline for the queue head, so the ghost
+# ledger's age floor and the throughput leg's age can never be measured on two different clocks.
+ts_age() {
+  [ -n "$1" ] || return 1
+  python3 -c '
+import datetime, sys
+t = sys.argv[1]
+try:
+    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except ValueError:
+    sys.exit(1)
+age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
+if age < 0:
+    sys.exit(1)
+print(age)
+' "$1" 2>/dev/null
+}
+
+# ts_is_old <stamp> — is this run OLD ENOUGH for its zero-job reading to be terminal?
+# rc 0 = yes (age >= GHOST_TRUST_AFTER_S), rc 1 = no / unparseable (so it is NEVER remembered).
+ts_is_old() {
+  local age
+  age="$(ts_age "$1")" || return 1
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$GHOST_TRUST_AFTER_S" ]
+}
+
+# ghost_ledger_load — the remembered ghost ids, SPACE-WRAPPED on GHOST_LEDGER (`" 4001 4002 "`) so a
+# membership test is one `case` glob and no per-candidate subprocess.
+# ⛔ AN UNPARSEABLE LEDGER IS DISCARDED WHOLE, AND THAT IS THE FAIL-CLOSED DIRECTION: a partially
+# trusted ledger could discount a run nobody proved, which understates demand and strips the pool
+# during a real stall. Discarding costs reads; trusting costs a false "nothing is waiting".
+ghost_ledger_load() {
+  local line
+  GHOST_LEDGER=""
+  [ -f "$GHOST_LEDGER_FILE" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      *[!0-9]*)
+        log "ghost ledger UNREADABLE (bad line: '${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"
+        GHOST_LEDGER=""; return 1 ;;
+    esac
+    GHOST_LEDGER="$GHOST_LEDGER $line"
+  done < "$GHOST_LEDGER_FILE"
+  GHOST_LEDGER="$GHOST_LEDGER "
+  return 0
+}
+
+# ghost_ledger_write <ids> — persist the ids to keep (space-separated; deduped here).
+# ⛔ WRITTEN VIA A TEMP FILE AND `mv`, so a pass killed mid-write cannot leave a half-written ledger
+# that the next pass must discard (a discard is safe, but it throws away proofs and costs reads).
+# ⛔ A READ VERB DOES NOT WRITE IT (--dry-run): the ledger is a cache of read results like the verdict
+# file, but a read-out-loud verb must leave the box exactly as it found it, and losing one pass of
+# proofs is free — the next scheduled pass re-proves them.
+ghost_ledger_write() {
+  local ids="$1" id out=""
+  [ "$DRY" = 1 ] && return 0
+  for id in $ids; do
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case " $out " in *" $id "*) ;; *) out="$out $id" ;; esac
+  done
+  if [ -z "$out" ]; then
+    # ⛔ THE FILE IS WRITTEN EVEN WHEN IT IS EMPTY, DELIBERATELY: "the ledger says nothing is remembered"
+    # and "there is no ledger" must not be the same reading to an operator (this suite asserts the first,
+    # and a `wc -l` on an absent file is an error, not a zero). It is one byte-zero write on a pass that
+    # already wrote a verdict file.
+    { : > "$GHOST_LEDGER_FILE"; } \
+      || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the ledger could not be cleared; prove-or-remember is degraded for the passes that follow"
+    return 0
+  fi
+  { printf '%s\n' $out > "$GHOST_LEDGER_FILE.tmp" && mv -f "$GHOST_LEDGER_FILE.tmp" "$GHOST_LEDGER_FILE"; } \
+    || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the proved ghosts are NOT remembered; every pass re-reads them (cost, not a wrong claim)"
 }
 
 # ⛔ `queue_demand()` IS GONE (agent-infra#2344), and with it a contract that had no caller left: the
@@ -852,7 +1022,7 @@ print(comp, len(inc))
   # HAS, even where the runner inventory is 403). Extra fields are optional: a two-field body still
   # parses, and an absent field leaves one question unmeasured instead of failing a pass that needs
   # nothing else from it.
-  local q1 q2 q3 q4 queue_rows
+  local q1 q2 q3 q4 queue_rows all_rows _p _need _got _more _more_rows _first _cand_ids _led reads cand_raw cand_jobs_measured cand_jobs_total queue_covered queue_rows_count
   IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
   queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; queue_rows="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
@@ -898,6 +1068,80 @@ print(comp, len(inc))
     ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ── THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113) ────────────────────────────────
+  # ⛔ THE WALK CANNOT FIND A HEAD IT CANNOT SEE. The runs endpoint is newest-first, so the single
+  # read above is the NEWEST $QUEUE_PAGE queued runs, and the question the scan asks ("which queued run
+  # is the OLDEST with a queued job?") is exactly the one that page cannot answer. Measured
+  # 2026-11-17T11:16Z on daniel-ospina/tortoise: 201 queued, and the queue's genuinely oldest demanding
+  # run (2026-11-05T16:29Z) sat on page 2 — so the pre-fix scan walked a newest-100 window whose oldest
+  # row was 2026-11-11T20:47Z, all ghosts, and refused on EVERY pass.
+  # The extra pages cost one list call per $QUEUE_PAGE runs (2 for that queue) and nothing is read that
+  # the legs could not use: the length leg's threshold bounds how many demanding runs can matter. The
+  # rows are assembled into ONE list of DISTINCT runs (deduped by id — the pages are separate snapshots
+  # of a live newest-first list, so a run can be served twice as the window shifts), re-sorted GLOBALLY
+  # (a per-page sort only orders within a page) and never trimmed: a count greater than the reported
+  # depth is refused as contradictory, because the alternative — slicing to fit — drops rows, and the
+  # row it drops can be the head (agent-infra#4113 review, P0).
+  # ⛔ `queue_covered` IS WHAT THE PASS LATER OWES AN ANSWER FOR (see the saturated-page refusal): it is
+  # the statement "this pass read a row for every run the count reported", and it is the ONE thing that
+  # separates a measured head from a lower bound. It is cleared at entry, so the degraded bodies (no
+  # row order) cannot inherit it.
+  queue_covered=0
+  if [ -n "$queue_rows" ] && [ "$queued" -gt "$QUEUE_PAGE" ]; then
+    case "$QUEUE_MAX_PAGES" in
+      '' | *[!0-9]*) log "queue read page cap UNREADABLE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      ??????????*)  log "queue read page cap OUT OF RANGE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      0)            log "queue read page cap is ZERO ('${QUEUE_MAX_PAGES}') — the queue could never be covered, so this would disarm the read rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
+    esac
+    all_rows="$queue_rows"
+    _got="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    _need=$(( (queued + QUEUE_PAGE - 1) / QUEUE_PAGE ))
+    if [ "$_need" -gt "$QUEUE_MAX_PAGES" ]; then
+      log "queue ($queued) needs $_need page(s) of $QUEUE_PAGE runs to be covered, beyond the ${QUEUE_MAX_PAGES}-page read cap — FAIL-CLOSED, changing nothing; raise QUEUE_MAX_PAGES' default in this file, and only with a measurement of the queue's real depth, because each page is one more list call on every pass"
+      return 2
+    fi
+    _p=1
+    while [ "$_p" -lt "$_need" ] && [ "$_got" -lt "$queued" ]; do
+      _p=$((_p + 1))
+      # ⛔ ONE SHAPE PER FIELD, AS ABOVE: this read asks only for the row order, because the count and
+      # the oldest stamp belong to the FIRST page (a later page's min is not the queue's oldest).
+      _more="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE&page=$_p" \
+          --jq '([.workflow_runs[]|sort_by(.created_at)]|map("\(.id),\(.created_at)"))|join(";")' 2>"$GH_ERR")" \
+        || { log "queue page $_p read FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
+      _more_rows="$(printf '%s' "$_more" | tr ';' '\n' | grep -c .)"
+      # A page that answers nothing ENDS the list: the truncation it implies is refused below, by the
+      # branch that already owns that diagnosis — never read as "the queue ends here".
+      [ "$_more_rows" -gt 0 ] || break
+      all_rows="$all_rows;$_more"
+      _got=$((_got + _more_rows))
+    done
+    # ⛔ DEDUPED AND COUNTED, NEVER TRIMMED (agent-infra#4113 review, P0 — this was a SLICE, and the
+    # slice was a FAIL-OPEN). Pages are fetched seconds apart from a live, newest-first list, so the
+    # window SHIFTS between calls and one run can be served twice — deduping by run id is what makes
+    # the assembled list a set of runs. The first cut instead did `awk 'NR<=queued'`, i.e. it TRIMMED the
+    # extra rows to the reported depth to keep "scanned <= queued" true. That clamp silenced the
+    # contradiction check BELOW (which can never fire on a list that cannot exceed the depth) and, far
+    # worse, it DROPPED rows — and a dropped row is exactly where the head can be: MEASURED against this
+    # very code, a queue reported 150 deep with 151 rows assembled (page 2 one row longer than it should
+    # be, that row being the one with a queued job) logged "nothing is waiting for a runner",
+    # `ghost_runs=150`, and never read that run. So the assembled list must never be trimmed, and a
+    # count GREATER than the reported depth is refused as the contradiction it is.
+    queue_rows="$(printf '%s' "$all_rows" | tr ';' '\n' | awk -F, 'NF && !seen[$1]++' | LC_ALL=C sort -t, -k2,2 -k1,1n | paste -sd';' -)"
+    queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    if [ "$queue_rows_count" -gt "$queued" ]; then
+      log "queue reading INCONSISTENT: the covered read assembled $queue_rows_count distinct run(s) for a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing; a page longer than its own depth is REFUSED here, never trimmed, because trimming drops rows and a dropped row is exactly where the head can be"
+      return 2
+    fi
+    # The oldest row of the COVERED list is the head the degraded-body fallback ages — recomputed here
+    # so fields 2/3 and field 4 cannot disagree about which run is oldest (the single-page body's
+    # `min_by` is the same statement over the same rows, so this only ever sharpens it).
+    _first="${queue_rows%%;*}"
+    case "$_first" in
+      *,*) oldest_created="${_first#*,}"; head_run_id="${_first%%,*}" ;;
+    esac
+  fi
+  queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+  [ "$queue_rows_count" -ge "$queued" ] && queue_covered=1
   # ── THE HEAD SCAN: WHICH QUEUED RUN IS THE QUEUE'S ACTUAL HEAD? (agent-infra#2344) ──────────────
   # ⛔ THE QUESTION THIS ANSWERS, and why the answer was wrong before it existed. The throughput
   # leg's age came from `min(created_at)` over `status=queued`, i.e. from the oldest run that is
@@ -918,7 +1162,18 @@ print(comp, len(inc))
     ??????????*)  log "queue head scan bound OUT OF RANGE ('${QUEUE_HEAD_SCAN_MAX}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
+  # The ledger's trust floor is an operand of a numeric test like every other bound here: a non-numeric
+  # value makes `[ "$age" -ge "$GHOST_TRUST_AFTER_S" ]` ERROR, and the `&&` chain reads that as FALSE —
+  # which would silently stop remembering anything (cost), or, if a later edit inverted the comparison,
+  # remember a run too young to be terminal (a false discount).
+  case "$GHOST_TRUST_AFTER_S" in
+    '' | *[!0-9]*) log "ghost ledger trust floor UNREADABLE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost ledger trust floor OUT OF RANGE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
   QUEUE_GHOSTS=0
+  GHOST_CACHED=0     # how many of those ghosts were REMEMBERED (no read spent this pass)
+  GHOST_KEEP=""      # ids to persist: this pass's proofs, plus prior entries still in the queue
+  reads=0            # jobs reads SPENT this pass — what QUEUE_HEAD_SCAN_MAX actually bounds
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
@@ -954,22 +1209,66 @@ print(comp, len(inc))
     # read — the same fail-open direction as the clamp, one condition over. Only running OUT OF ROWS
     # proves the scan reached the end of the page.
     scanned=0; scan_exhausted=1
+    # ⛔ THE LEDGER IS LOADED BEFORE THE WALK, AND AN UNPARSEABLE ONE IS DISCARDED BY ITS OWN FUNCTION
+    # (see `ghost_ledger_load`): the pass then re-reads every candidate, which is the pre-ledger
+    # behaviour and costs reads rather than making a claim.
+    ghost_ledger_load
     while IFS= read -r cand; do
       [ -n "$cand" ] || continue
-      scanned=$((scanned + 1))
-      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); scan_exhausted=0; break; fi
       case "$cand" in
         *,*) cand_id="${cand%%,*}"; cand_created="${cand#*,}" ;;
         *)   cand_id="$cand"; cand_created="" ;;
       esac
       case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-      cand_demand="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ A REMEMBERED GHOST COSTS NO READ (agent-infra#4113). It has already been proven, by a readable
+      # jobs read, to have ZERO JOBS AT ALL while older than the trust floor — a state no later pass can
+      # un-prove — so it is discounted from the ledger and the walk moves on. THIS IS THE LINE THAT
+      # MAKES THE BOUND A COST BOUND: with the proof remembered, a 200-deep ghost population is walked
+      # in ceil(200/QUEUE_HEAD_SCAN_MAX) passes instead of never, and a fully-proven population costs
+      # one read per pass (the head) however deep the queue is.
+      case "$GHOST_LEDGER" in
+        *" $cand_id "*)
+          scanned=$((scanned + 1))
+          QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1)); GHOST_CACHED=$((GHOST_CACHED + 1)); GHOST_KEEP="$GHOST_KEEP $cand_id"
+          continue ;;
+      esac
+      # ⛔ THE BOUND IS NOW ON READS, NOT ON CANDIDATES SKIPPED OVER (agent-infra#4113), and the
+      # difference is the whole fix: `scanned` counts only candidates this pass ACTUALLY EXAMINED (a
+      # ledger hit or a read), while a ledger hit above spends no read — so the budget cannot be eaten
+      # by runs whose answer is already known. A cap on candidates examined would re-pin the gate the
+      # moment the ghost population exceeded it, which is the defect, not a bound. ⛔ AND THE COUNT IS
+      # INCREMENTED AFTER THIS TEST, not before it (measured): counting the candidate that the budget
+      # refused to read made `scanned` exceed `queued` on a page that merely had one row more than its
+      # depth, so the pass refused INCONSISTENT — a contradiction it had not observed — instead of the
+      # bound it genuinely ran out of.
+      if [ "$reads" -ge "$QUEUE_HEAD_SCAN_MAX" ]; then scan_exhausted=0; break; fi
+      scanned=$((scanned + 1))
+      reads=$((reads + 1))
+      cand_raw="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ THE PAGE ROW IS STRIPPED HERE (see `run_queued_demand` for why it is on stdout): what is
+      # left is the label sets, so the ghost/head distinction below is unchanged, and the job total is
+      # only ever read as measured when the row was actually there.
+      cand_jobs_measured=0; cand_jobs_total=0; cand_demand="$cand_raw"
+      case "$cand_raw" in
+        '#jobs'$'\t'*)
+          cand_jobs_measured=1
+          cand_jobs_total="${cand_raw%%$'\n'*}"; cand_jobs_total="${cand_jobs_total#*$'\t'}"
+          case "$cand_raw" in *$'\n'*) cand_demand="${cand_raw#*$'\n'}" ;; *) cand_demand="" ;; esac ;;
+      esac
       if [ "$cand_rc" -eq 0 ]; then
         if [ -n "$cand_demand" ]; then
           demand_head_id="$cand_id"; demand_head_created="$cand_created"; DEMAND_LABELS="$cand_demand"
           break
         fi
         QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1))
+        # ⛔ REMEMBERED ONLY ON THE TWO CONDITIONS THAT MAKE THE READING TERMINAL (see the ledger block
+        # in the header): ZERO JOBS AT ALL — a measured zero, never an absent reading — and OLD ENOUGH
+        # that progressive job creation cannot still be filling the run in. A run with jobs but none
+        # queued (concurrency-held, or executing) fails the first condition and is re-read on EVERY pass,
+        # because it can become demand; that is the fail-open direction this must never take.
+        if [ "$cand_jobs_measured" = 1 ] && [ "$cand_jobs_total" -eq 0 ] && ts_is_old "$cand_created"; then
+          GHOST_KEEP="$GHOST_KEEP $cand_id"
+        fi
       else
         if [ "$cand_rc" -eq 2 ]; then
           log "queue candidate run $cand_id: the jobs read ANSWERED with a label set this read cannot spell — cannot prove it is a ghost, so it STAYS the queue head (no discount)"
@@ -980,6 +1279,17 @@ print(comp, len(inc))
         break
       fi
     done <<< "$(printf '%s' "$candidates" | tr ';' '\n')"
+    # ⛔ THE LEDGER IS PERSISTED HERE — BEFORE BOTH REFUSALS BELOW (agent-infra#4113). The refusing pass
+    # is the COMMON one while a ghost population is being walked, so persisting only on the paths that
+    # reach a verdict would throw away every proof and the walk could never finish (that is the pin, with
+    # extra steps). An entry is kept when this pass proved it OR when it was already known and the run is
+    # still in the queue; anything else is dropped, so the file is bounded by the current queue depth and
+    # a ghost that leaves the queue is forgotten.
+    _cand_ids=" $(printf '%s' "$candidates" | tr ';' '\n' | awk -F, 'NF {printf "%s ", $1}')"
+    for _led in $GHOST_LEDGER; do
+      case "$_cand_ids" in *" $_led "*) GHOST_KEEP="$GHOST_KEEP $_led" ;; esac
+    done
+    ghost_ledger_write "$GHOST_KEEP"
     # ⛔ THE CONTRADICTION CHECK APPLIES TO BOTH OUTCOMES, AND THAT ORDER IS THE POINT (cycle-5 review,
     # finding 1). It used to sit INSIDE the "no demand found" branch, so on the path that DID measure
     # a head the check never ran: a page one row longer than its own depth, with the extra row being
@@ -1002,9 +1312,9 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing; the walk covers up to CI_GATE_QUEUE_READ_MAX_PAGES pages of ${QUEUE_PAGE} runs, so a short read here means the list answered fewer rows than it reported depth (a truncated body, or a page that answered nothing), not that the queue is deeper than the read can ever reach"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window ($reads jobs read(s) spent, $GHOST_CACHED discounted from the ledger) — FAIL-CLOSED, changing nothing; this pass REMEMBERED what it proved, so the NEXT pass resumes where this one stopped, and a proof is never re-bought (agent-infra#4113); CI_GATE_QUEUE_HEAD_SCAN_MAX is a per-pass READ budget, not a bound on the region the scan can ever reach, so raising it buys reads, not reach"; return 2
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
@@ -1024,18 +1334,7 @@ print(comp, len(inc))
   oldest_queued_s=""
   case "$demand_head_created" in
     '') : ;;
-    *)  oldest_queued_s="$(python3 -c '
-import datetime, sys
-t = sys.argv[1]
-try:
-    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-except ValueError:
-    sys.exit(1)
-age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
-if age < 0:
-    sys.exit(1)
-print(age)
-' "$demand_head_created" 2>/dev/null)" || oldest_queued_s="" ;;
+    *)  oldest_queued_s="$(ts_age "$demand_head_created")" || oldest_queued_s="" ;;
   esac
 
   # A queue with NOTHING DEMANDING in it has no head to age — either nothing is queued (an idle repo)
@@ -1044,7 +1343,7 @@ print(age)
   # as a STRING compare so it cannot run before `queued_demanding` has been shape-checked as a number.
   if [ "$queued_demanding" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS ghost_cached=$GHOST_CACHED queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
   ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
   ABSORPTION_DEMANDING="$queued_demanding"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
 
@@ -1163,18 +1462,21 @@ print(age)
     UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw depth $queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
-  # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
-  # (review P2). Reaching here means the LENGTH leg did NOT fire (`queued_demanding < QUEUE_THRESHOLD`
-  # — the operand that leg tests since #2344; the RAW `queued` may be at or above the threshold here,
-  # which is precisely what a ghost discount does), yet the
-  # queue is deeper than one page — which can only happen when an operator has raised
-  # QUEUE_THRESHOLD above the page size. In that state `oldest_queued_s` is a LOWER BOUND on the
-  # head's age (newest-first page), so a stalled queue can read young and the gate would certify
-  # healthy and strip the pool during a full stop. Could-not-measure (2) is this script's answer for
-  # every other unread operand; it is the answer here too, and the message names BOTH values so the
-  # misconfiguration is visible instead of silent.
-  if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
+  # ⛔ A QUEUE THIS PASS COULD NOT COVER LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather
+  # than certified (review P2, amended by agent-infra#4113). Reaching here means the LENGTH leg did NOT
+  # fire (`queued_demanding < QUEUE_THRESHOLD` — the operand that leg tests since #2344; the RAW
+  # `queued` may be at or above the threshold here, which is precisely what a ghost discount does),
+  # yet the queue is deeper than one page. ⛔ THE CONDITION IS NOW "COULD NOT COVER", NOT "DEEPER THAN A
+  # PAGE": the read above walks as many pages as the depth needs, so a deep queue is normally FULLY
+  # COVERED and the head it yields is a measurement, not a lower bound — refusing those passes was how
+  # a 150-deep queue on a served repo was refused every tick. What still cannot be covered is named:
+  # a degraded body that carried no row order at all, a short page, or a queue past the read cap. There
+  # `oldest_queued_s` IS only a LOWER BOUND on the head's age (the page is newest-first), so a stalled
+  # queue could read young and the gate would certify healthy and strip the pool during a full stop.
+  # Could-not-measure (2) is this script's answer for every other unread operand; it is the answer here
+  # too, and the message names BOTH values so the misconfiguration is visible instead of silent.
+  if [ "$queued" -gt "$QUEUE_PAGE" ] && [ "$queue_covered" != 1 ]; then
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) and this pass could not cover it (${queue_rows_count:-0} run row(s) read) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
     return 2
   fi
 
