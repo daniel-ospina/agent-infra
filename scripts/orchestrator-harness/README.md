@@ -2353,26 +2353,28 @@ is smaller, which at 36000 s it is. The honest row, with both columns:
 | | `origin/main` (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
 | `WAIT_S` | 5400 | 5400 |
-| derived **design operand** (`MAX_WATCH_FIT` × `POLL`) | 7 × 120 = 840 | 247 × 120 = 29640 |
-| **operative** `--watch` allowance (the `_idle_fit` clamp, `(2700 − 40)/120`) | 7 × 120 = 840 — the WALL is the smaller bound | 22 × 120 = 2640 — the IDLE bound is |
-| merge phase's **operative** share of the clock (wait + watch) | 6240 | 8040 |
-| left on the clock for implement → commit → push → open PR (operative) | 960 | 27960 |
+| **design operand** (`MAX_WATCH_FIT` × `POLL`) — the guarantee's FLOOR, never a delivered allowance | 7 × 120 = 840 | 247 × 120 = 29640 |
+| **operative** `--watch` allowance (the watchdog's `_idle_fit` = `(2700 − 40)/120`) | **22 × 120 = 2640**, falling to **14 × 120 = 1680** once a full 5400 s check wait has been spent and only the clock's remainder is left | **22 × 120 = 2640** — the watchdog binds and the clock never does |
+| merge phase's operative share (wait + watch) | 7080 … 8040 | 8040 |
 
 The DECLARED reserve is unchanged and is the earlier row, not this one: `IMPL_RESERVE_S` is 900 s on
 both clocks, and the invariant `5400 + 247 × 120 + 900 = 35940 ≤ 36000` holds with 60 s of slack — the
 same 60 s it had at 7200 s (`5400 + 7 × 120 + 900 = 7140`). So this constant neither starves
 implementation nor gains from the 5×.
-⛔ **WHAT THE 5× ACTUALLY BUYS, STATED AT ITS OPERATIVE SIZE — and it is NOT "the merge phase can
-out-watch its check wait":** 22 chunks is 2640 s against a 5400 s check wait, so the watch still cannot
-out-watch it and `lane-merge.test.sh` still grades chunk 23 as REFUSED. What changes is the bounding of
-the watch itself: at 7200 s the WALL clipped it to 7 chunks (**840 s**), which is below the chain it
-supervises; at 36000 s the binding constraint is the watchdog's own 22 chunks (**2640 s**), a **3.1×**
-larger `--watch` allowance (and 2640 s now covers the 1890 s merge-phase wait it has to watch). The check
-wait above is a separate mechanism with its own cap and heartbeat — `lane-merge.sh` says so, and only
-that wait can outlive the watchdog. That is the deliberate trade: a wait that reaches the merge phase,
-with enough clock left to supervise it, which is why raising `LANE_BACKSTOP_S` was the cheap half of it
-and is what #4034 did. A lane that needs longer than the reserve hands off (`WAITING_CHECKS`, exit 11)
-and the next invocation resumes the SAME counter.
+⛔ **WHAT THE 5× ACTUALLY BUYS HERE IS SMALL, AND SAYING OTHERWISE WAS THIS PARAGRAPH'S LAST ERROR**
+(re-review of #4065, finding 4, P2 — the delivered benefit was overstated ~11×). The watchdog clamp is
+22 chunks on BOTH clocks, so in the ordinary case the operative `--watch` allowance is **the same
+2640 s** before and after: at 7200 s it is the clock's remainder that shrinks it (1680 s after a full
+wait), which the 5× removes. ⛔ AND THE MERGE PHASE STILL **CANNOT** OUT-WATCH ITS CHECK WAIT: 2640 s
+against 5400 s, so "the merge phase can out-watch its own check wait instead of being sized out of it" —
+which this paragraph used to say — is false, and `lane-merge.test.sh` still grades chunk 23 as REFUSED.
+The 5400 s check wait is a separate mechanism with its own cap and heartbeat; `lane-merge.sh` says so,
+and only that wait can outlive the watchdog. What #4034 buys is the LANE TERM (the wall stops ending
+lanes that are still working — the issue's own measurement), a design floor that no longer sits below
+the watchdog's allowance, and a `--watch` allowance that no longer decays with the time already spent.
+That is the deliberate trade, and it is a bound the lane itself reaches before its own kill rather than
+one only a later lane could inherit. A lane that needs longer than the reserve hands off
+(`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
 ⛔ **THE DESIGN FLOOR IS A WORST CASE, NOT WHAT A LANE GOT — and at the 7200 s clock it sat below the
 phase it supervises** (#3850 review, P2 — recomputed against the chain's own declared budgets).
 Supervision is paid AFTER the wait, out of whatever clock is left, so a lane whose checks settled early

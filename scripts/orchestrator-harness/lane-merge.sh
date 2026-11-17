@@ -537,19 +537,25 @@ MAX_WATCH="$MAX_WATCH_FIT"
 # review, P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand
 # above sizes the allowance against the WORST-CASE check wait, which is the right FLOOR — but supervision
 # is paid AFTER the wait, from whatever clock remains, so a lane whose checks settled early was granted the
-# WORST CASE's allowance while thousands of seconds still stood on its clock. ⛔ AT THE CLOCK THIS WAS
-# MEASURED ON (7200 s) that allowance was **7 chunks (840 s)** — the wall was the binding constraint then,
-# and 840 s is BELOW the chain this loop supervises: `merge-one.sh` budgets a fresh-context review at
-# `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the
-# defaults (`claims.sh:166`), and `chain-merge.sh`'s merge-phase wait is 1890 s (`claims.sh:110`). A lane
-# that finally cleared the wait could therefore hand off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was
-# STILL RUNNING` — over a chain that was legitimately still reviewing, and `WATCH_F` is only rewound by a
-# fix round or a head move, so every later `--watch` re-entered the same arm.
-# ⛔ THE 5x CLOCK CHANGED WHICH BOUND IS BINDING, NOT THE RULE: at the shipped 36000 s seam the wall no
-# longer clips the watch (the design operand is 247 chunks, 29640 s), so the operative allowance is the
-# watchdog's `_idle_fit` — **22 chunks, 2640 s** — and 2640 s DOES cover the 1890 s chain wait above. The
-# same derivation is kept because the clamp is what produces that number, and because a raised seam or a
-# lowered `LANE_BOUND_IDLE_S` moves it: one number is a floor, the other is what a lane gets.
+# WORST CASE's allowance while thousands of seconds still stood on its clock. ⛔ BEFORE THE LIFT BELOW
+# that allowance was the DESIGN OPERAND itself — **7 chunks (840 s)** at the 7200 s clock this was
+# measured on — and 840 s is BELOW the chain this loop supervises: `merge-one.sh` budgets a
+# fresh-context review at `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for
+# `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the defaults (`claims.sh:166`), and `chain-merge.sh`'s
+# merge-phase wait is 1890 s (`claims.sh:110`). A lane that finally cleared the wait could therefore hand
+# off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was STILL RUNNING` — over a chain that was
+# legitimately still reviewing, and `WATCH_F` is only rewound by a fix round or a head move, so every
+# later `--watch` re-entered the same arm.
+# ⛔ THE 5x CLOCK DID NOT RAISE THE OPERATIVE NUMBER, IT STOPPED IT DECAYING (re-review of #4065, finding
+# 4 — and the first draft of THIS note got that wrong, claiming a 3.1x gain). The watchdog's `_idle_fit`
+# clamp is **22 chunks (2640 s) on BOTH clocks**, so the ordinary allowance is the same before and after;
+# what the 5x removes is the CLOCK'S REMAINDER shrinking it (to 14 chunks, 1680 s, once a full 5400 s
+# check wait has been spent and only what is left of the lane can pay for supervision). The DESIGN operand
+# rose 7 -> 247 chunks, and that is a FLOOR a lane is guaranteed, never an allowance it is handed. And
+# 2640 s DOES cover the 1890 s chain wait above — while still being unable to out-watch the 5400 s CHECK
+# wait, which is why that wait keeps its own cap and heartbeat and is not what this allowance supervises.
+# The same derivation is kept because the clamp is what produces that number, and because a raised seam or
+# a lowered `LANE_BOUND_IDLE_S` moves it: one number is a floor, the other is what a lane actually gets.
 # The raise can never exceed the OTHER two bounds, and never lowers the design floor:
 #   · the lane's REMAINING wall clock (`lane_elapsed_s`, one chunk held back to write the verdict);
 #   · the watchdog's progress allowance — `--watch` writes NO heartbeat, so a chunk sequence longer than
