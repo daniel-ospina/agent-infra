@@ -174,6 +174,28 @@ sed -n '/# \[conflict-case:begin\]/,/# \[conflict-case:end\]/p' "$ORCH" | sed '1
   && ok "the CONFLICTING router is extracted from the shipped loop" \
   || bad "the [conflict-case] block is missing or does not parse — the conflicted-first path is untested"
 
+# ── extraction 1c: the CLASS-CACHE write (agent-infra#4120) ──────────────────────────────────────
+# ⛔ `CONFLICTED` IS AN INPUT TO THE SELECTION ORDER AND HAD NO WRITER. `lo_class_rank` ranks it 0 and
+# `lo_order` sorts it first (`live-ownership.test.sh` grades that ordering), and this sweep's own note
+# promises "conflicted first" — but the class was derived from the CHECK token only, so no row could
+# ever say CONFLICTED. The block is extracted and driven rather than grepped: a textual assertion
+# cannot tell `_cl=CONFLICTED` from a line that computes it and then overwrites it.
+sed -n '/# \[prclass:begin\]/,/# \[prclass:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/prclass.sh"
+[ -s "$TMP/prclass.sh" ] && grep -q 'CONFLICTED' "$TMP/prclass.sh" \
+  && ok "the class-cache write is extracted from the shipped loop" \
+  || bad "the [prclass] block is missing or does not parse — the ordering's CONFLICTED rank is untested"
+
+# ── extraction 1d: the PARKED guard (agent-infra#4120) ───────────────────────────────────────────
+# ⛔ A PARK IS A TERMINATOR THAT RUNS BEFORE EVERY ARM, so a conflicting head that inherits one is
+# unreachable no matter what the conflict router does — and the parks most often held on a conflicting
+# head are the REVIEW side's (`REVIEW-CAP`), written by an arm this change stops offering the PR at
+# all. The exemption is a one-line condition, so it is extracted and DRIVEN: a text pin cannot tell
+# `[ "${MSTAT:-}" != "CONFLICTING" ]` from a condition that is true either way.
+sed -n '/# \[parked-guard:begin\]/,/# \[parked-guard:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/parked.sh"
+[ -s "$TMP/parked.sh" ] && grep -q 'CONFLICTING' "$TMP/parked.sh" \
+  && ok "the parked guard is extracted from the shipped loop" \
+  || bad "the [parked-guard] block is missing or does not parse — a park can hide a conflicting head again"
+
 # ── extraction 2: the acting case ────────────────────────────────────────────────────────────────
 sed -n '/# \[acting-case:begin\]/,/# \[acting-case:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/arm.sh"
 if [ -s "$TMP/arm.sh" ] && grep -q "no acting arm for class" "$TMP/arm.sh"; then
@@ -424,6 +446,110 @@ PY
     done
   ) >/dev/null 2>&1
 }
+# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] ─────
+# THE CONTROLLER'S OWN ORDER, DRIVEN AS ONE LOOP (agent-infra#4120). The swept row runs the
+# `[conflict-case]` block and then the `[acting-case]` block inside the same `while read`, and the
+# conflict block ends in `continue` — so "did the acting case run for this PR" is a fact of the
+# shipped control flow, not an inference from a log line. This driver nests them the same way
+# (`for _once in 1`, exactly as `drive_conflict` does) and records WHICH block claimed the row in
+# `$TMP/route`: `conflict` when the router `continue`d, `arm` when it fell through to the class arms.
+# ⛔ WHAT IT EXISTS TO GRADE. The router shipped, but wrapped in `case "$V" in GREEN|PENDING:*)` — and
+# `mergeable` is ORTHOGONAL to the check surface, while the conflicting population is NOT green
+# (measured 2026-11-17: 7 of 7 open CONFLICTING PRs on `daniel-ospina/tortoise` classified
+# `FAILED:ai-review-gate`). So the drives below are the three things the change claims: the router
+# now claims the row for EVERY class, it still does not claim a non-conflicting one, and the attempt
+# cap turns a PR that stays conflicted into a PARK rather than a loop.
+drive_route() {
+  : > "$TMP/spy"; : > "$TMP/gspy"; : > "$TMP/d.log"; mkdir -p "$TMP/O/state"
+  : > "$TMP/route"
+  : > "$TMP/lanes"; _i=0
+  while [ "$_i" -lt "${4:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; echo "merge-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
+  (
+    PR=4242; BR=fix/thing; HEAD_N=abc1234; OR=daniel-ospina/agent-infra; REPO=/nonexistent
+    SPAWN_CWD="$TMP/O"; O="$TMP/O"; LOG="$TMP/d.log"
+    V="$1"; MSTAT="${2:-}"; MERGE_AUTHORITY=rail; AUTHORITY_UNKNOWN=0
+    MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
+    SPAWN_OK="${5:-1}"; WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # The conflict budget is `state/fixcount-<PR>`, seeded here so "N rounds already spent" is a
+    # fixture fact rather than something the drive has to reach by spawning N times.
+    case "${3:-0}" in ''|*[!0-9]*) : ;; *) [ "${3:-0}" -gt 0 ] && printf '%s\n' "$3" > "$O/state/fixcount-$PR" ;; esac
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh"
+    cmux() {
+      case "$1" in
+        tree) python3 - "$TMP/lanes" <<'PY'
+import json,sys
+names=[l.strip() for l in open(sys.argv[1]) if l.strip()]
+ws=[];sc=[];tb=[];tm=[]
+for i,n in enumerate(names):
+    ws.append({"id":"ws_%d"%i,"name":"wt-"+n})
+    sc.append({"id":"s_%d"%i,"workspace_id":"ws_%d"%i,"layout":{"root":{"tab_ids":["t_%d"%i]}}})
+    tb.append({"id":"t_%d"%i,"content_id":"term_%d"%i})
+    tm.append({"id":"term_%d"%i,"running":True})
+print(json.dumps({"workspaces":ws,"screens":sc,"tabs":tb,"terminals":tm}))
+PY
+              return 0 ;;
+        surface) return 1 ;;
+        layout) { printf 'CMUX %s ' "$*"; tr -d '\n' <&0; echo; } >> "$TMP/spy"
+                [ "$SPAWN_OK" = "1" ] || return 1
+                printf '{"workspace_id": "ws_x", "panes": [{"surfaces": [{"terminal_id": "term_x"}]}]}\n'
+                return 0 ;;
+      esac
+      return 0
+    }
+    # ⛔ THE STUB ANSWERS THE READ THE **OLD** CODE MADE, ON PURPOSE. The shipped router no longer calls
+    # `gh pr view --json mergeable` at all (it reads `MSTAT`, taken from the row's own `gh pr view`),
+    # but the PRE-CHANGE tree did — and this driver is pointed at BOTH trees to produce the before/
+    # after in the PR. Without the stub the pre-change run would red for a rig reason (its in-block
+    # read answers empty) and the PENDING row would read as a regression that never happened; with it,
+    # the only reds on the old tree are the semantics this change is about.
+    gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) printf '%s\n' "$MSTAT" ;; esac; return 0; }
+    gh_bounded() { gh "$@"; }
+    PATH="$TMP/bin-tmuxnone:$PATH"
+    sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
+    refund_bailed_fixer() { return 0; }; stg_lvl_start() { return 0; }
+    ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return 0; }
+    ciq_defer_note_here() { :; }
+    . "$TMP/shq.sh"
+    . "$TMP/spawntok.sh"
+    . "$TMP/isnum.sh"
+    . "$TMP/parkctrl.sh"        # the SHIPPED park: the bound is only a bound if the file lands
+    L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
+    . "$TMP/disp.sh"
+    # ⛔ THE PARKED GUARD RUNS FIRST, EXACTLY AS IT DOES IN THE SWEEP (agent-infra#4120). With
+    # <parkhead> set, `state/parked-<PR>` holds that head and `parkreason-<PR>` carries a REVIEW-side
+    # park — the state the measured population was in. The route then reads `parked` when the guard
+    # skipped the row, `conflict` when the router claimed it, and `arm` when it fell through.
+    printf 'conflict\n' > "$TMP/route"
+    if [ -n "${6:-}" ]; then
+      printf '%s\n' "$6" > "$O/state/parked-$PR"
+      printf 'REVIEW-CAP: 3/3 review re-records at head=%s — the reviewer never produced a usable verdict\n' "$6" > "$O/state/parkreason-$PR"
+    fi
+    for _once in 1; do
+      if [ -s "$TMP/parked.sh" ]; then
+        printf 'parked\n' > "$TMP/route"
+        . "$TMP/parked.sh"
+        printf 'conflict\n' > "$TMP/route"
+      fi
+      . "$TMP/conflict.sh"
+      # ⛔ REACHED ONLY IF THE ROUTER DID NOT CLAIM THE ROW: the shipped block ends in `continue`,
+      # so a conflicting PR never gets here — that IS the "rebase before review" ordering.
+      printf 'arm\n' > "$TMP/route"
+      break
+    done
+  ) >/dev/null 2>&1
+}
+# drive_class <V> <mergeable> — the shipped CLASS-CACHE write and nothing else. It answers one
+# question: what does the row's class become for this (check class, mergeable) pair?
+drive_class() {
+  mkdir -p "$TMP/O/state"; : > "$TMP/O/state/prclass.tsv"
+  (
+    PR=4242; HEAD_N=abc1234; O="$TMP/O"; V="$1"; MSTAT="${2:-}"
+    # shellcheck disable=SC1090
+    . "$TMP/prclass.sh"
+  ) >/dev/null 2>&1
+  awk -F'\t' 'NF{last=$3} END{print last}' "$TMP/O/state/prclass.tsv" 2>/dev/null
+}
 # drive_rows <rows> <merge-authority> [<spawn-ok>] — the ACTING case, driven over a POPULATION.
 # `rows` is TAB-delimited `PR<tab>HEAD` (empty string = no un-owned PR at all). This is the shape the
 # controller actually runs (`printf … | while read`), so "0 un-owned PRs dispatches nothing" is
@@ -670,6 +796,115 @@ NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFI
 [ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
   && ok "review-gate fixer with a REFUSING queue predicate: spawned, and the predicate is never consulted" \
   || bad "review-gate fixer still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no)"
+
+
+echo
+echo "=== T5b: a CONFLICTING PR is a REBASE job for EVERY CHECK CLASS, and it is BOUNDED (agent-infra#4120) ==="
+# ⛔ WHAT WAS ACTUALLY WRONG (measured 2026-11-17, before this change). The router SHIPPED, but it was
+# wrapped in `case "$V" in GREEN|PENDING:*)`, and `mergeable` is ORTHOGONAL to the check surface —
+# the conflicting population is exactly the one that is NOT green. Driving `check-class.py` over each
+# open CONFLICTING PR's live surface on `daniel-ospina/tortoise` (REQ = its seven required contexts):
+# **7 of 7 -> `FAILED:ai-review-gate`**, so not one could reach the rebase, and every one was handed
+# to the review gate's re-record chain instead — a paid review per PR per main advance, on a PR that
+# cannot merge. (The same box's live `state/prclass.tsv`: 469 RED, 86 NOCHECKS, 33 PENDING, 11 GREEN,
+# **0 CONFLICTED** — the rank `lo_order` sorts FIRST had no writer at all.)
+# ── the three claims, in order: every class reaches the router; a non-conflicting row does not; and a
+# PR that is STILL conflicting after MAX_FIX_TRIES reaches the existing terminal state.
+t5_clear
+mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/fixcount-4242" "$TMP/fixcount.t5b.$RANDOM" 2>/dev/null || true
+drive_route 'FAILED:ai-review-gate' CONFLICTING    # the measured production case, by name
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
+  && ok "CONFLICTING + FAILED:ai-review-gate: the CONFLICT router claims the row (it could not before)" \
+  || bad "CONFLICTING + FAILED:ai-review-gate fell through to the class arms (route=$(cat "$TMP/route" 2>/dev/null)) — the PR is reviewed instead of rebased"
+# ⛔ THE DISPATCH IS GRADED THROUGH THE LAUNCHER'S OWN RUN SCRIPT, not the layout argv: `wt_spawn`
+# writes `state/run-<name>.sh` and types `bash state/run-<name>.sh; exit` into the surface, so the
+# command a lane actually executes lives in that file. `fix-one.sh` there is the same call a human
+# makes by hand (`fix-one.sh <pr> <branch>`), which is the whole point of the issue.
+[ "$(spawns)" -ge 1 ] && grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…and the dispatch IS the rebase: fix-one.sh, the exact call a human makes by hand" \
+  || bad "…but the fixer lane's own run script does not run fix-one.sh: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+[ "$(rows)" = "1" ] && [ "$(awk -F'\t' '$3=="CONFLICTED" && $4=="act"' "$LEDGER" | wc -l | tr -d ' ')" = "1" ] \
+  && ! grep -q 'ai-review-gate' "$LEDGER" \
+  && ok "…its ONE disposition is a CONFLICTED act — no review-side row exists for that PR" \
+  || bad "…the ledger carries a review-side disposition for a conflicting PR: $(head -2 "$LEDGER" 2>/dev/null | tr '\n' ';')"
+[ "$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null)" = "1" ] \
+  && ok "…and the rebase consumed exactly one round of the existing MAX_FIX_TRIES counter" \
+  || bad "…the round was not booked (state/fixcount-4242=$(cat "$TMP/O/state/fixcount-4242" 2>/dev/null))"
+# ── THE CONTROL, so "no review" above is a MEASUREMENT and not a dead rig ──────────────────────────
+# The same class, NOT conflicting: the review path must be live in this suite, or the assertion above
+# would pass against an arm that cannot dispatch anything.
+t5_clear
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.t5b.$RANDOM" 2>/dev/null || true
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" -ge 1 ] && grep -q 'review-4242' "$TMP/spy"; then
+  ok "control: the SAME class without a conflict is dispatched to a REVIEW lane — 'no review' is therefore a real observation"
+else
+  bad "control DEAD: a non-conflicting FAILED:ai-review-gate PR spawned no review lane (spawns=$(spawns)) — the 'no review' assertion above would be vacuous"
+fi
+# ── the router is not class-gated any more, and it is not mergeability-blind either ──────────────
+t5_clear; drive_route 'NOCHECKS' CONFLICTING
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
+  && ok "CONFLICTING + NOCHECKS: the router claims the row (an absent check surface is not a diagnosis of the conflict)" \
+  || bad "CONFLICTING + NOCHECKS fell through (route=$(cat "$TMP/route" 2>/dev/null))"
+t5_clear; drive_route 'PENDING:docs' CONFLICTING
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
+  && ok "CONFLICTING + PENDING: still the conflict router (the pre-change behaviour is preserved, not replaced)" \
+  || bad "CONFLICTING + PENDING regressed (route=$(cat "$TMP/route" 2>/dev/null))"
+t5_clear; drive_route 'FAILED:ai-review-gate' MERGEABLE
+[ "$(cat "$TMP/route" 2>/dev/null)" = "arm" ] \
+  && ok "NOT conflicting + FAILED: the router does NOT claim the row — the class arms keep it" \
+  || bad "a mergeable FAILED PR was claimed by the conflict router (route=$(cat "$TMP/route" 2>/dev/null))"
+t5_clear; drive_route 'GREEN' MERGEABLE
+[ "$(cat "$TMP/route" 2>/dev/null)" = "arm" ] \
+  && ok "NOT conflicting + GREEN: the router does NOT claim the row" \
+  || bad "a mergeable GREEN PR was claimed by the conflict router (route=$(cat "$TMP/route" 2>/dev/null))"
+t5_clear; drive_route 'GREEN' ''
+[ "$(cat "$TMP/route" 2>/dev/null)" = "arm" ] \
+  && ok "an UNREADABLE mergeable ('') is not a conflict — allow-list polarity, the row falls through" \
+  || bad "an unreadable mergeable was treated as a conflict (route=$(cat "$TMP/route" 2>/dev/null))"
+# ── THE BOUND (acceptance #3): still conflicting after N rebases -> an EXISTING terminal state ─────
+# `lane-merge.sh`'s round-counter is the precedent: the counter is `state/fixcount-<PR>` (the SAME
+# file the review-gate and red-fixer arms book against) and the terminator is `park_ctrl`, which the
+# sweep's own parked-guard honours BEFORE any arm runs. The park is graded through the SHIPPED
+# `park_ctrl` (`$TMP/parkctrl.sh`), so "parked" means the file the guard reads actually landed.
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 3
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
+  && ok "3 of 3 rebases spent: the router still claims the row (the bound is inside it)" \
+  || bad "a PR at its cap fell through instead of being parked (route=$(cat "$TMP/route" 2>/dev/null))"
+[ "$(spawns)" = "0" ] \
+  && ok "…and NOTHING is spawned — the cap binds, it is not merely reported" \
+  || bad "…a PR at its cap was dispatched AGAIN (spawns=$(spawns)) — an unbounded rebase loop"
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "…and it is PARKED at its head: the terminal state an operator already knows" \
+  || bad "…no park landed at head abc1234 (state/parked-4242=$(cat "$TMP/O/state/parked-4242" 2>/dev/null))"
+grep -q 'still CONFLICTING after 3 fixes' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…the park NAMES the round count, so the reason is auditable" \
+  || bad "…the park reason does not name the round count: $(head -c 160 "$TMP/O/state/parkreason-4242" 2>/dev/null)"
+grep -q 'PARKED (still CONFLICTING after 3 fixes)' "$TMP/d.log" 2>/dev/null \
+  && ok "…and the log line names the same fact" \
+  || bad "…no PARKED log line: $(head -2 "$TMP/d.log" 2>/dev/null | tr '\n' ';')"
+[ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] \
+  && ok "…recorded as a WAIT, never as an act (nothing ran)" \
+  || bad "…the park was recorded as acts=$(acts) waits=$(waits)"
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 2
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] \
+  && ok "one round BELOW the cap still dispatches — the bound is the cap, not 'any attempt at all'" \
+  || bad "a PR at 2/3 rebases was NOT dispatched (acts=$(acts)): $(head -2 "$TMP/d.log" 2>/dev/null | tr '\n' ';')"
+# ── THE CLASS (acceptance #4's ORDERING half): the rank `lo_order` sorts FIRST now has a writer ────
+[ "$(drive_class 'FAILED:ai-review-gate' CONFLICTING)" = "CONFLICTED" ] \
+  && ok "the class cache records CONFLICTED for a conflicting PR — rank 0 in lo_order is now reachable" \
+  || bad "the class cache did not record CONFLICTED (got '$(drive_class 'FAILED:ai-review-gate' CONFLICTING)')"
+[ "$(drive_class 'FAILED:ai-review-gate' MERGEABLE)" = "RED" ] \
+  && ok "…and a NON-conflicting row keeps its check class (no class is invented)" \
+  || bad "a mergeable FAILED row was mis-classed as '$(drive_class 'FAILED:ai-review-gate' MERGEABLE)'"
+[ "$(drive_class 'GREEN' '')" = "GREEN" ] \
+  && ok "…and an unreadable mergeable does not downgrade a green row" \
+  || bad "an unreadable mergeable changed the class to '$(drive_class 'GREEN' '')'"
+t5_clear
+mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.end.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.t5b.end.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/fixcount-4242" "$TMP/fixcount.t5b.end.$RANDOM" 2>/dev/null || true
 
 
 echo
