@@ -3544,7 +3544,9 @@ run "$SRC" 2284
 [ "$(rc_of)" = "11" ]; ck $? "a FENCED echo of the canonical block is NOT promoted to the claim (rc=$(rc_of), want 11)"
 no_comment; ck $? "  …so no artifact carrying a quoted row is posted"
 no_record; ck $? "  …and no record is minted on the harness's own example row"
-err_has "carries NO '## MUTATION ATTRIBUTION' section"; ck $? "  …and it is reported as the reviewer omission it is"
+err_has "DID write a '## MUTATION ATTRIBUTION' heading"; ck $? "  …and the refusal NAMES the measured cause: the heading IS there, it is QUOTED — not the libel 'carries NO section'"
+err_has "PASTED BACK"; ck $? "  …naming the paste as the reviewer-side action it is"
+err_not_has "REVIEWER OMISSION"; ck $? "  …and NOT the omission wording, which would send the operator to re-run the same paste"
 
 # ⛔ AND A FENCE THAT IS NOT CLOSED BEFORE THE VERDICT SWALLOWS IT, so the whole transcript is
 # quoted: the extractor finds no LIVE heading and the seam fails CLOSED. The exact code is not pinned
@@ -3563,6 +3565,16 @@ printf '```markdown\n## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened 
 run "$SRC" 2284
 [ "$(rc_of)" = "11" ]; ck $? "a CLOSED fenced echo is quoted material, so the run refuses with 11 (rc=$(rc_of))"
 no_record; ck $? "  …recording nothing"
+# …and the OTHER quoting rule the parser enforces — a WHOLE-BLOCK four-column indent — must be named
+# the same way, because to the extractor it is the same cause (quoted), and a message that says
+# "carries NO section" is just as false here. Independently driven, so a fix that special-cases fences
+# only cannot pass this pair.
+reset; FIXTURE_NO_MUTATION=1
+printf '    ## MUTATION ATTRIBUTION\n\n    | assertion | mutant | reddened row | observed |\n    |---|---|---|---|\n    | a | b | c | d |\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a WHOLE-BLOCK indented echo is quoted too, so the run refuses with 11 (rc=$(rc_of))"
+no_record; ck $? "  …recording nothing"
+err_has "PASTED BACK"; ck $? "  …and it is reported as the quote-paste it is, not as a missing section"
 
 # ⛔ THE CUT USES THE SEAM'S OWN VERDICT GRAMMAR (P3, fresh reviews). `**Verdict:** CLEAN` is a verdict
 # to VD_LABEL but matched neither arm of the old home-made `clean|issues` prefix cut, so the "verbatim
@@ -3651,6 +3663,7 @@ err_has "MUTATION ATTRIBUTION"; ck $? "  …the refusal NAMES the missing block"
 err_has "NO NEW ASSERTIONS"; ck $? "  …and the exemption line that would have satisfied it"
 err_has "--mutation-section"; ck $? "  …and the verb that prints the exact shape"
 err_has "REVIEWER OMISSION"; ck $? "  …and says whose omission it is, so the operator does not re-read the code for it"
+err_not_has "PASTED BACK"; ck $? "  …and does NOT claim a quote-paste: the two causes of an empty extraction are distinguishable, and this one had no heading at all"
 # …and with a P3 note in hand the NOTES comment may post (it is not the verdict), but no clean
 # artifact may: the PR must not carry a comment that says `Outcome: clean` and cannot be recorded.
 reset; FIXTURE_NO_MUTATION=1

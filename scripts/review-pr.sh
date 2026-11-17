@@ -2524,8 +2524,18 @@ fi
 # ARTIFACT carries the table OR a `NO NEW ASSERTIONS: <why>` line, so the docs-only class this issue
 # measured satisfies it with that one line — and this file asks the identical question of the
 # identical text. No second opinion about what "adds an assertion" means exists here.
-mutation_section_from() { # <transcript> -> the reviewer's section on stdout (empty when absent)
-  [ -r "$1" ] || return 0
+mutation_section_from() { # <transcript> [--state] -> the reviewer's section on stdout (empty when
+                          # absent); with --state ONE token instead: none | quoted | live.
+                          # ⛔ --state EXISTS SO THE REFUSAL CAN NAME THE CAUSE IT MEASURED (P3,
+                          # same class as the MUTATION-EXEMPTION-INDENTED sentence below): an empty
+                          # extraction has TWO causes — no heading at all (the reviewer omission) and
+                          # a heading that is PRESENT BUT QUOTED (the paste this PR made one keystroke
+                          # away). They share this one quoting pass, so the classifier cannot drift
+                          # from the extractor — a second reader with a second grammar is the defect
+                          # this whole function was just repaired for.
+  if [ ! -r "$1" ]; then [ "${2:-}" = "--state" ] && printf 'none\n'; return 0; fi
+  local _ms_mode=""
+  [ "${2:-}" = "--state" ] && _ms_mode=state
   # The section is the LAST **LIVE** `## MUTATION ATTRIBUTION` heading in the transcript (a reviewer
   # that quotes the canonical shape and then writes its own claim must be read for its claim),
   # running to the line before the verdict/marker block that follows it — the caller publishes the
@@ -2573,10 +2583,12 @@ mutation_section_from() { # <transcript> -> the reviewer's section on stdout (em
   #     pattern that uses it, so a build that cannot parse it still matches the undecorated and
   #     bold forms; the hash-decorated `### CLEAN` spelling is covered by this program's own
   #     interval-free prefix arm below. Nothing here depends on an interval being understood.
+  MS_MODE="$_ms_mode" \
   VD_CLEAN="$VD_CLEAN" VD_CLEAN_URL="$VD_CLEAN_URL" VD_ISSUES="$VD_ISSUES" \
   VD_LABEL="$VD_LABEL" VD_MK_VERDICT="$VD_MK_VERDICT" VD_MK_COUNT="$VD_MK_COUNT" \
   awk '
-    BEGIN { vd_clean = ENVIRON["VD_CLEAN"]; vd_clean_url = ENVIRON["VD_CLEAN_URL"]
+    BEGIN { mode = ENVIRON["MS_MODE"]
+            vd_clean = ENVIRON["VD_CLEAN"]; vd_clean_url = ENVIRON["VD_CLEAN_URL"]
             vd_issues = ENVIRON["VD_ISSUES"]; vd_label = ENVIRON["VD_LABEL"]
             vd_mk_verdict = ENVIRON["VD_MK_VERDICT"]; vd_mk_count = ENVIRON["VD_MK_COUNT"] }
     { n++; L[n] = $0 }
@@ -2604,13 +2616,17 @@ mutation_section_from() { # <transcript> -> the reviewer's section on stdout (em
           continue
         }
       }
-      # ── PASS 2: the LAST LIVE heading ──
-      start = 0
+      # ── PASS 2: the LAST LIVE heading (and whether ANY heading exists, quoted or not) ──
+      start = 0; any = 0
       for (i = 1; i <= n; i++) {
-        if (quoted[i]) continue
         s = L[i]; sub(/^[ \t]+/, "", s)
-        if (tolower(s) ~ /^#+[ \t]*mutation[ -]attribution/) start = i
+        if (tolower(s) !~ /^#+[ \t]*mutation[ -]attribution/) continue
+        any = 1
+        if (!quoted[i]) start = i
       }
+      # The classifier reads the SAME two passes as the extraction, so "empty" and "quoted" can
+      # never disagree about this transcript.
+      if (mode == "state") { print (start ? "live" : (any ? "quoted" : "none")); exit }
       if (!start) exit
       # ── PASS 3: cut at the first LIVE verdict/marker line after it ──
       end = n
@@ -2882,10 +2898,28 @@ if [ "$VERDICT" = clean ]; then
     || die "$E_RECORD" "could not build the redacted comment body from $COMMENT_FILE, so the bytes that would be posted could not be validated — NOTHING was posted and NO record was written (transcript: $TRANSCRIPT)"
   _mv_rc=0
   _mv_miss="$(bash "$BRIEF_GATE" --mutation-missing "$MV_BODY" 2>/dev/null)" || _mv_rc=$?
+  MS_CAUSE=""   # set by the empty-extraction arm below; `set -u` means it must exist before use
   if [ "$_mv_rc" -ne 0 ] || [ -n "$_mv_miss" ]; then
     if [ -z "${MUTATION_SECTION_SEEN:-}" ]; then
-      err "$PROG: the reviewer concluded CLEAN but its output carries NO '## MUTATION ATTRIBUTION' section, so the comment this run would post could never be recorded: record-review.sh refuses a clean artifact without that block (agent-infra#3442), which is why agent-infra#3987 exists."
-      err "  This is a REVIEWER OMISSION, not a code defect — the prompt this run composed carries the canonical shape (\`bash $BRIEF_GATE --mutation-section\`), so the review is intact and a re-run is the remedy."
+      # ⛔ NAME THE CAUSE OF THE EMPTY EXTRACTION INSTEAD OF ASSERTING ONE (P3, same class as the
+      # INDENTED sentence two arms down). "Its output carries NO '## MUTATION ATTRIBUTION' section" is
+      # FALSE for the likeliest paste this PR created: a reviewer that echoes the canonical block
+      # inside a fence, or inside a whole-block indent, HAS written one — every such heading is
+      # QUOTED, so the extractor (correctly) finds no LIVE one and the statement above libels the
+      # review. Two causes, measured by the extractor's own quoting pass rather than guessed: a paste
+      # (quoted → `quoted`) and a genuine omission (`none`). The remedy differs — a paste needs the
+      # reviewer told not to fence it, an omission needs the reviewer told it is missing — so the
+      # sentence is chosen by measurement, like the INDENTED and REDACTION arms below it.
+      _ms_state="$(mutation_section_from "$LOG" --state 2>/dev/null)"
+      MS_CAUSE=""
+      if [ "$_ms_state" = "quoted" ]; then
+        MS_CAUSE="quoted-material"
+        err "$PROG: the reviewer concluded CLEAN and DID write a '## MUTATION ATTRIBUTION' heading — but it sits inside QUOTED MATERIAL (a fenced block, or four-or-more-column indent), so it is the canonical shape this run handed it PASTED BACK, not the reviewer's own claim. record-review.sh reads quoted material as quoted, never as the claim (agent-infra#3442), so the comment this run would post could never be recorded."
+        err "  This is a REVIEWER-SIDE PASTE, not a code defect and not a failure of this script's extraction: refusing it is the point — publishing a quote as the live claim is exactly the false-PASS class #3987 exists for (the harness's own worked row would be minted as the reviewer's evidence). Re-run the review, and ask for the block at COLUMN 0, OUTSIDE any fence or indent."
+      else
+        err "$PROG: the reviewer concluded CLEAN but its output carries NO '## MUTATION ATTRIBUTION' section, so the comment this run would post could never be recorded: record-review.sh refuses a clean artifact without that block (agent-infra#3442), which is why agent-infra#3987 exists."
+        err "  This is a REVIEWER OMISSION, not a code defect — the prompt this run composed carries the canonical shape (\`bash $BRIEF_GATE --mutation-section\`), so the review is intact and a re-run is the remedy."
+      fi
     else
       err "$PROG: the reviewer DID write a MUTATION ATTRIBUTION section but the composed artifact does not satisfy the recorder's parser ($(printf '%s' "$_mv_miss" | tr '\n' ' ')) — refusing to post an artifact record-review.sh would reject."
       # ⛔ NAME THE CAUSE INSTEAD OF ASSERTING ONE (P3, fresh review). This used to say, unconditionally,
@@ -2914,7 +2948,12 @@ if [ "$VERDICT" = clean ]; then
     err "  Recorded: one row per NEW assertion — assertion | mutant (the edit that reverts the fix) | reddened row | observed — or the single line 'NO NEW ASSERTIONS: <why>' at COLUMN 0 when the diff adds none. A CLEAN verdict without it is INCOMPLETE, not clean."
     err "  The exact shape: bash $BRIEF_GATE --mutation-section"
     err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-    die "$E_VACUOUS" "the CLEAN artifact carries no MUTATION ATTRIBUTION block ($(printf '%s' "${_mv_miss:-validator-unanswerable rc=$_mv_rc}" | tr '\n' ' ')) — record-review.sh would refuse it, so it was never posted; re-run the review"
+    # The summary line names the same cause the detail lines above measured — "carries no block" is a
+    # false statement of the QUOTED case, and the operator reads the die line in logs far more often
+    # than the lines above it.
+    _mv_what="the CLEAN artifact carries no MUTATION ATTRIBUTION block"
+    [ -n "$MS_CAUSE" ] && _mv_what="the CLEAN artifact carries no LIVE MUTATION ATTRIBUTION block — the heading is present but QUOTED ($MS_CAUSE), so a paste-back was never the reviewer's claim"
+    die "$E_VACUOUS" "$_mv_what ($(printf '%s' "${_mv_miss:-validator-unanswerable rc=$_mv_rc}" | tr '\n' ' ')) — record-review.sh would refuse it, so it was never posted; re-run the review"
   fi
 fi
 
