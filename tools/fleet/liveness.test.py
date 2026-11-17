@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-61 tests with 122 paired mutations: every mutation re-
+62 tests with 126 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 61 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (122)
+    python3 tools/fleet/liveness.test.py                # the 62 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (126)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3313,8 +3313,10 @@ def t58():
     backstop, 4 h at the 6 h cap) and the comparison is STRICT `>`, exactly as
     `tool_veto_expired` states it — so a 116 min open call is PENDING, never wedged.
     """
-    def hb(*samples, readable=True):
-        return liv.HeartbeatRead(readable=readable, samples=tuple(samples), source="fixture")
+    def hb(*ages, readable=True, in_flight=None):
+        return liv.HeartbeatRead(
+            readable=readable, source="fixture",
+            samples=tuple(liv.HeartbeatSample(age_ms=a, in_flight=in_flight) for a in ages))
 
     def verdict(h):
         return liv.evaluate(liv.Evidence(heartbeat=h))
@@ -3364,7 +3366,20 @@ def t58():
     v = verdict(hb(bound, bound + 1))
     check(v.state == "wedged", "one ms past the bound is wedged; got %s/%s" % (v.state, v.reason))
 
-    # (5) NO HEARTBEAT AT ALL — an abstention with a NAMED reason, never a verdict. An absent
+    # (5) THE SOURCE'S OWN IN-FLIGHT COUNT DECIDES FIRST, when it states one. The parent does NOT
+    #     reset `toolAgeMaxMs` at `tool_end` (`builtin-tools/index.ts:2765-2772`) and is safe only
+    #     because its own clause requires `toolsInFlight > 0` — so an age with NO call open is a
+    #     STALE MAX. Reading it as an open call is the same false-wedged class as #3987.
+    v = verdict(hb(14_460_001, 14_460_001, in_flight=False))
+    check(v.state == "running-quiet" and v.reason == "tool-age-no-call-open",
+          "an age with no call in flight is a stale max, never a wedge; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    # …and a stated IN-FLIGHT call keeps the pair semantics (this stays wedged, not excused).
+    v = verdict(hb(18_000_000, 18_100_000, in_flight=True))
+    check(v.state == "wedged", "an in-flight call past the bound is still wedged; got %s/%s"
+          % (v.state, v.reason))
+
+    # (6) NO HEARTBEAT AT ALL — an abstention with a NAMED reason, never a verdict. An absent
     #     reading is not a reading of zero, and silence decides nothing in either direction.
     for h in (hb(), hb(readable=False), hb(1, 2, readable=False)):
         v = verdict(h)
@@ -3386,7 +3401,8 @@ def t59():
     supplied heartbeat. Both directions are pinned here because each one alone is a silent
     masking door.
     """
-    hb = liv.HeartbeatRead(readable=True, samples=(6_961_576, 18_052), source="fixture")
+    hb = liv.HeartbeatRead(readable=True, source="fixture",
+                           samples=(liv.HeartbeatSample(6_961_576), liv.HeartbeatSample(18_052)))
     # CONTROL FIRST: alone, the axis decides (`reset` → running-quiet), otherwise "refuse every
     # query" would pass this test.
     check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "tool-age-reset",
@@ -3423,16 +3439,17 @@ def t59():
           "a heartbeat must not be masked by a log read either; got %s/%s"
           % (v.state, v.reason))
 
-    # (3) INERT WHEN ABSENT: a session query's verdict is unchanged by the axis existing. This is
-    #     the property that makes the change additive — no existing query can move.
+    # (3) INERT WHEN ABSENT: a session query's verdict is EXACTLY what it was before the axis
+    #     existed, field for field. Asserted against a LITERAL (not against the same call with
+    #     `heartbeat=None`): two field-for-field identical `Evidence` instances take the same path
+    #     by construction, so that comparison could never fail and pinned nothing.
     holder = liv.Candidate(pid=os.getpid(), observed=liv.HOLDER, kind="argv")
     session = dict(sid="sid-1", now_ms=NOW_MS, jsonl_grew=False, jsonl_age_ms=5 * M,
                    candidates=[holder])
-    check(liv.evaluate(liv.Evidence(**session)).reason == "quiet-within-bound",
-          "the session ladder is untouched by the new slot")
     check(liv.evaluate(liv.Evidence(**session)).to_dict()
-          == liv.evaluate(liv.Evidence(**session, heartbeat=None)).to_dict(),
-          "heartbeat=None is indistinguishable from the field not existing")
+          == {"state": "running-quiet", "reason": "quiet-within-bound",
+              "holder_pid": os.getpid(), "witnesses": [], "detail": ""},
+          "the session ladder's verdict is unchanged by the new slot")
 
 
 @test("T60 `tool_age_max` is READ from the three shapes the fleet really writes, in ORDER")
@@ -3442,6 +3459,8 @@ def t60():
     The same number appears in three places a reader might copy from, and all three are
     supported by ONE pattern: the child's own `[task-heartbeat] tick` marker, the `task_status`
     JSON view, and the watchdog's `Alive state:` diagnostic line (measured shapes, this repo).
+    The source's in-flight count is read from the SAME line as the age, because an age from one
+    tick and a count from another would let a stale max answer for a call that is not open.
     """
     marker = ("[task-heartbeat] tick nonce=abc tools=1 turn=1 stream_age_ms=6961576 "
               "tool_age_max_ms=6961576 tool_updates=1 cpu_ms=135910 cpu_stall_ms=0 "
@@ -3451,17 +3470,33 @@ def t60():
     alive_state = ("Alive state: toolsInFlight=1 turnActive=true streamAgeMs=18052 "
                    "toolAgeMaxMs=18052 everSawRealActivity=true lastMarkerAgeMs=9000")
     snake = "tool_age_max=18052ms"     # the reader-facing rendering of the same field
-    check(liv.parse_heartbeat_samples(marker) == [6_961_576], "the tick marker parses")
-    check(liv.parse_heartbeat_samples(as_json) == [18_052], "the task_status JSON parses")
-    check(liv.parse_heartbeat_samples(alive_state) == [18_052], "the Alive state line parses")
-    check(liv.parse_heartbeat_samples(snake) == [18_052], "the `ms`-suffixed spelling parses")
-    check(liv.parse_heartbeat_samples("[task-heartbeat] ready nonce=abc") == [],
+
+    def ages(text, **kw):
+        return [s.age_ms for s in liv.parse_heartbeat_samples(text, **kw)]
+
+    check(ages(marker) == [6_961_576], "the tick marker parses")
+    check(ages(as_json) == [18_052], "the task_status JSON parses")
+    check(ages(alive_state) == [18_052], "the Alive state line parses")
+    check(ages(snake) == [18_052], "the `ms`-suffixed spelling parses")
+    check(ages("[task-heartbeat] ready nonce=abc") == [],
           "a line with no age is NOT a reading of 0")
-    check(liv.parse_heartbeat_samples("") == [], "empty input yields no samples")
+    check(ages("") == [], "empty input yields no samples")
+    # The IN-FLIGHT count comes from the same line, in all three shapes, and `None` when absent.
+    check([s.in_flight for s in liv.parse_heartbeat_samples(marker)] == [True],
+          "`tools=1` on the marker line is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(as_json)] == [True],
+          "`tools_in_flight` in the JSON is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(alive_state)] == [True],
+          "`toolsInFlight=` on the Alive state line is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(
+        "[task-heartbeat] tick nonce=abc tools=0 tool_age_max_ms=14460001")] == [False],
+        "`tools=0` is NO call in flight — the stale-max shape")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(snake)] == [None],
+        "a source that does not state a count yields None, never a guess")
 
     # ⛔ A TOKEN LONGER THAN 10 DIGITS IS NOT A READING. `int()` accepts it happily, so a
     #    shape-drifted line would become a real AGE and could clear the 4h backstop in one step.
-    check(liv.parse_heartbeat_samples("tool_age_max_ms=99999999999999") == [],
+    check(ages("tool_age_max_ms=99999999999999") == [],
           "an over-long token is DROPPED, never truncated into a reading")
 
     # ORDER IS PRESERVED — the last pair is the decision, so a sort would destroy the signal.
@@ -3470,8 +3505,22 @@ def t60():
         "[task-heartbeat] tick nonce=abc tools=1 turn=1 tool_age_max_ms=18052",
         "[task-heartbeat] tick nonce=abc tools=0 turn=1 tool_age_max_ms=0",
     ])
-    check(liv.parse_heartbeat_samples(three) == [6_961_576, 18_052, 0],
-          "samples stay in FILE order; got %r" % (liv.parse_heartbeat_samples(three),))
+    check(ages(three) == [6_961_576, 18_052, 0],
+          "samples stay in FILE order; got %r" % (ages(three),))
+
+    # THE NONCE FENCE: another dispatch's markers are dropped when the caller names its own, and
+    # a source that carries SEVERAL is a fence the axis cannot judge — so it abstains.
+    check(ages(three + "\n[task-heartbeat] tick nonce=OTHER tools=1 tool_age_max_ms=9", nonce="abc")
+          == [6_961_576, 18_052, 0],
+          "a foreign dispatch's marker is not this child's evidence")
+    mixed = liv.heartbeat_from_text(three + "\n[task-heartbeat] tick nonce=OTHER tools=0 "
+                                            "tool_age_max_ms=0", source="fixture")
+    check(mixed.nonces == ("abc", "OTHER"), "every distinct nonce is recorded; got %r"
+          % (mixed.nonces,))
+    v = liv.evaluate(liv.Evidence(heartbeat=mixed))
+    check(v.state == "unknown" and v.reason == "heartbeat-ambiguous-nonce",
+          "a multi-dispatch source abstains instead of letting the last marker decide; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
 
     # THE FILE DOOR, end to end: two ticks of one child's log ⇒ the reset verdict.
     tmp = tempfile.mkdtemp(prefix="liv-hb-")
@@ -3480,11 +3529,17 @@ def t60():
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(three)
         hb = liv.gather_heartbeat(path)
-        check(hb.readable and hb.samples == (6_961_576, 18_052, 0),
-              "the whole file is read in order; got %r" % (hb.samples,))
+        check(hb.readable and tuple(s.age_ms for s in hb.samples) == (6_961_576, 18_052, 0),
+              "the whole file is read in order; got %r" % ([s.age_ms for s in hb.samples],))
         check(hb.source == path, "the read names its source")
-        check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "tool-age-reset",
-              "the file door feeds the same verdict")
+        check(hb.age_ms is not None and hb.age_ms < liv.HEARTBEAT_TIMEOUT_MS,
+              "a FRESH file carries a small source age; got %r" % hb.age_ms)
+        check(not hb.ended, "a live child's log carries no end marker")
+        # The child recomputes `tool_age_max_ms` from its CURRENT in-flight tools every tick, so
+        # its last tick (`tools=0`) reports no open call: the file door's verdict is
+        # `tool-age-no-call-open`, which is the same "alive" answer the reset pair gives.
+        check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "tool-age-no-call-open",
+              "the file door feeds the same verdict (no call open on the last tick)")
         # A file with no age token is UNREADABLE (fail closed), never `0 ms`.
         none_path = os.path.join(tmp, "no-age.log")
         with open(none_path, "w", encoding="utf-8") as fh:
@@ -3514,10 +3569,10 @@ def t60():
         check(rc == 3 and out.startswith("unknown tool-age-single-sample"),
               "a single sample ABSTAINS at the CLI (rc 3); got rc=%d %r" % (rc, out))
         rc, out, _ = cli("--heartbeat", path)
-        check(rc == 0 and "tool-age-reset" in out,
+        check(rc == 0 and "tool-age-no-call-open" in out,
               "`--heartbeat FILE` reads the child's own log; got rc=%d %r" % (rc, out))
         rc, out, _ = cli("--heartbeat-json", path)
-        check(rc == 0 and "tool-age-reset" in out, "`--heartbeat-json` is the same door")
+        check(rc == 0 and "tool-age-no-call-open" in out, "`--heartbeat-json` is the same door")
         # Two sources of the SAME samples is refused: the axis decides on the LAST PAIR, so a
         # silent concatenation would let flag order change the verdict.
         rc, out, err = cli("--tool-age-ms", "5", "--heartbeat", path)
@@ -3525,11 +3580,112 @@ def t60():
         # A negative age is not a reading, and clamping it would rewrite the caller's sample.
         rc, out, err = cli("--tool-age-ms", "-1", "--tool-age-ms", "5")
         check(rc == 2, "a negative age is a usage error; got rc=%d %r" % (rc, err))
+        # A two-axis query is a USAGE error (rc 2), not an abstention a caller would retry.
+        rc, out, err = cli("--sid", "abc", "--tool-age-ms", "5", "--tool-age-ms", "9")
+        check(rc == 2 and "separately" in err,
+              "`--sid` with a heartbeat source is rc 2; got rc=%d %r" % (rc, err))
+        # A nonce fence with no marker source advertises a fence that does not exist.
+        rc, out, err = cli("--nonce", "abc", "--tool-age-ms", "5", "--tool-age-ms", "9")
+        check(rc == 2, "`--nonce` without `--heartbeat` is a usage error; got rc=%d" % rc)
         # No evidence at all is still a usage error, not an abstention.
         rc, out, err = cli()
         check(rc == 2 and "usage" in err, "no evidence is a usage error; got rc=%d" % rc)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("T61 a heartbeat SOURCE must be fresh, live and single-dispatch before any age is believed")
+def t61():
+    """⛔ THE AXIS WAS READING A FILE AND BELIEVING IT ABOUT *NOW*.
+
+    Three measured false verdicts, all from the newest input on the surface (each reproduced at
+    `origin/main`+the #4106 branch, 2026-11-17, so none of them is hypothetical):
+
+      1. a **29-day-old** log of a long-gone child (mtime 2025-10-18) → `running-quiet` rc 0. The
+         heartbeat is the CHILD's liveness signal, so a source past the watchdog's own heartbeat
+         bound is a reading of something that stopped emitting: `heartbeat-stale`. Bound CITED
+         (`HEARTBEAT_TIMEOUT_MS`, 30 min — the watchdog's own), never invented here.
+      2. a **finished** run — the child's own `[task-heartbeat] session_end`, or the `task_status`
+         view's `{"status": "done", "alive": false, "session_ended": true}` — carrying a stale
+         `tool_age_max` → `wedged` for a run whose own bytes said it was over:
+         `heartbeat-session-ended`. A finished run's tool age is HISTORY.
+      3. `toolAgeMaxMs` with `toolsInFlight = 0`: the parent deliberately does not reset the max at
+         `tool_end` (`builtin-tools/index.ts:2765-2772`) and is safe only because its own clause
+         requires `toolsInFlight > 0` — so a big age with no call open is a STALE MAX, and
+         `tool-age-no-call-open` (never `wedged`).
+
+    Plus the fence: markers from SEVERAL dispatches (the forged-line case the nonce exists for)
+    abstain (`heartbeat-ambiguous-nonce`) unless the caller names its own nonce.
+    """
+    def ev_text(text, **kw):
+        return liv.evaluate(liv.Evidence(heartbeat=liv.heartbeat_from_text(text, source="t", **kw)))
+
+    # (1) THE RUN IS OVER — both shapes the fleet writes.
+    ended_marker = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                    "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                    "[task-heartbeat] session_end nonce=abc\n")
+    v = ev_text(ended_marker)
+    check(v.state == "unknown" and v.reason == "heartbeat-session-ended",
+          "a child's own end marker outranks its last tool age; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    done_dump = ('{"status": "done", "alive": false, "heartbeat": {"tools_in_flight": 0, '
+                 '"session_ended": true, "tool_age_max_ms": 14460001}}\n') * 2
+    v = ev_text(done_dump)
+    check(v.state == "unknown" and v.reason == "heartbeat-session-ended",
+          "a DONE status dump is not a wedged lane; got %s/%s" % (v.state, v.reason))
+    # …and the LIVE dump of the same shape is NOT excused (the gate is on the terminal fact only).
+    live_dump = '{"status": "alive", "heartbeat": {"tools_in_flight": 1, "tool_age_max_ms": 18000000}}\n'
+    v = ev_text(live_dump + live_dump.replace("18000000", "18010000"))
+    check(v.state == "wedged", "a live dump past the bound is still wedged; got %s/%s"
+          % (v.state, v.reason))
+
+    # (2) A STALE SOURCE DECIDES NOTHING. Driven through the FILE door so the mtime age is real.
+    tmp = tempfile.mkdtemp(prefix="liv-hb-stale-")
+    try:
+        path = os.path.join(tmp, "old.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=6961576\n"
+                     "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18052\n")
+        old = liv.time.time() - 29 * 24 * 3600
+        os.utime(path, (old, old))
+        hb = liv.gather_heartbeat(path)
+        check(hb.age_ms is not None and hb.age_ms > liv.HEARTBEAT_TIMEOUT_MS,
+              "the door reads a 29-day-old mtime age; got %r" % hb.age_ms)
+        v = liv.evaluate(liv.Evidence(heartbeat=hb))
+        check(v.state == "unknown" and v.reason == "heartbeat-stale",
+              "a 29-day-old log must not publish a live state; got %s/%s %s"
+              % (v.state, v.reason, v.detail))
+        check("heartbeat bound" in v.detail, "the abstention cites the bound; got %r" % v.detail)
+        # THE CONTROL: the same bytes, FRESH, do decide — otherwise "stale everything" passes.
+        os.utime(path, None)
+        v = liv.evaluate(liv.Evidence(heartbeat=liv.gather_heartbeat(path)))
+        check(v.reason == "tool-age-reset", "the same bytes, fresh, decide; got %s/%s"
+              % (v.state, v.reason))
+        # The caller-STATED pair has no source age, so the staleness gate cannot invent one.
+        stated = liv.HeartbeatRead(readable=True, source="flag",
+                                   samples=(liv.HeartbeatSample(6961576),
+                                            liv.HeartbeatSample(18052)))
+        check(stated.age_ms is None
+              and liv.evaluate(liv.Evidence(heartbeat=stated)).reason == "tool-age-reset",
+              "a caller-stated pair carries no file age and is not gated on one")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # (3) THE FENCE, two ways: named nonce filters; several nonces abstain.
+    mixed = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+             "[task-heartbeat] tick nonce=FORGED tools=0 tool_age_max_ms=0\n")
+    v = ev_text(mixed)
+    check(v.state == "unknown" and v.reason == "heartbeat-ambiguous-nonce",
+          "a forged marker must not flip a wedged child; got %s/%s" % (v.state, v.reason))
+    v = ev_text(mixed, nonce="abc")
+    check(v.state == "wedged", "with the dispatch's own nonce the pair still decides; got %s/%s"
+          % (v.state, v.reason))
+    # A nonce that matches NOTHING is an abstention, not a silent empty read.
+    v = ev_text(mixed, nonce="nope")
+    check(v.state == "unknown" and v.reason == "heartbeat-unreadable",
+          "a nonce matching no marker abstains; got %s/%s" % (v.state, v.reason))
+    check("nonce=nope" in v.detail, "and names the fence it could not satisfy; got %r" % v.detail)
 
 
 class Mutation:
@@ -3552,15 +3708,15 @@ MUTATIONS = [
     ),
     Mutation(
         "T58", "module",
-        '        if last < prev:',
-        '        if last > prev:',
+        '        if last.age_ms < prev.age_ms:',
+        '        if last.age_ms > prev.age_ms:',
         "the asymmetry is INVERTED: a GROWING age reads as movement (alive) and a resetting "
         "age as a stable call, so #3987's real sequence reads `pending` and a hung call reads "
         "`running-quiet` — the false-alive direction",
     ),
     Mutation(
         "T58", "module",
-        '        if _exceeds(last, bound):',
+        '        if _exceeds(last.age_ms, bound):',
         '        if False:',
         "a same-call age past the watchdog's backstop never reads `wedged` — the fail-OPEN "
         "direction: a genuinely hung tool call is unbounded again, which is the state the "
@@ -3589,6 +3745,37 @@ MUTATIONS = [
         "the LOG arm stops refusing a heartbeat, so `Evidence(log_read=…, heartbeat=…)` resolves "
         "to whichever arm runs first and DISCARDS the other axis — #1777 B7 rebuilt on a third "
         "axis, in the direction where the discarded reading is the only one about the child",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if hb.ended:',
+        '        if False:',
+        "a FINISHED run's own end marker is ignored, so the stale tool age inside it decides — "
+        "measured: a `{\"status\": \"done\", \"alive\": false}` dump reads `wedged` for a lane "
+        "whose own bytes say it is over",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if hb.age_ms is not None and _exceeds(hb.age_ms, HEARTBEAT_TIMEOUT_MS):',
+        '        if False:',
+        "the SOURCE-freshness gate is dropped, so a 29-day-old log of a long-gone child publishes "
+        "`running-quiet` with rc 0 — a reading of something that stopped emitting, read as a state",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if last.in_flight is False:',
+        '        if False:',
+        "the source's own in-flight count stops deciding, so a STALE `toolAgeMaxMs` (`tools=0`, the "
+        "value the parent deliberately does not reset at `tool_end`) reads as an open call and "
+        "convicts — the false-`wedged` class #4106 exists to remove",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if not hb.fenced_nonce and len(hb.nonces) > 1:',
+        '        if False:',
+        "the multi-dispatch fence is dropped: markers from SEVERAL nonces (what a forged line on "
+        "the child's inherited fd 2 looks like) are read, and the last one decides — measured: one "
+        "appended `nonce=FORGED … tool_age_max_ms=0` line flips `wedged` to `running-quiet`",
     ),
     Mutation(
         "T60", "module",

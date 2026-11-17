@@ -156,6 +156,7 @@ error that was made three times. So this axis (`Evidence.heartbeat`, decided in
 ``evaluate`` and nowhere else) requires **two samples**, decides on the last
 pair, and abstains otherwise:
 
+    last sample reports NO call in flight → `running-quiet` / `tool-age-no-call-open`
     some early sample, then a DROP        → `running-quiet` / `tool-age-reset`
     two samples, no drop, past the backstop → `wedged` / `tool-age-open-stable`
     two samples, no drop, under it         → `unknown` / `tool-age-open-pending`
@@ -165,6 +166,12 @@ pair, and abstains otherwise:
 The bound is the watchdog's OWN age backstop (``tool_stall_ms``, 4 h at the 6 h
 cap), never a number invented here, so a merely-long tool call reads `pending`
 and never `wedged` — quiet is not a stall until the watchdog itself would cut.
+And because the source is a FILE, three of its own facts are gated BEFORE any age
+is believed, each measured producing a wrong state first: the run's own end
+(``session_end`` / ``"alive": false``) ⇒ ``heartbeat-session-ended``; a source
+older than the watchdog's heartbeat bound (``HEARTBEAT_TIMEOUT_MS``) ⇒
+``heartbeat-stale``; markers from several dispatches with no ``--nonce`` ⇒
+``heartbeat-ambiguous-nonce``.
 
 THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
 ---------------------------------------------------------------------
@@ -254,6 +261,8 @@ __all__ = [
     "CLAIM_REASONS",
     "claim_verdict",
     "HeartbeatRead",
+    "HeartbeatSample",
+    "heartbeat_from_text",
     "gather_heartbeat",
     "parse_heartbeat_samples",
     "Evidence",
@@ -783,6 +792,25 @@ class ChildEvidence:
 
 
 @dataclass(frozen=True)
+class HeartbeatSample:
+    """ONE `tool_age_max` reading, plus the two facts that make it readable.
+
+    ``age_ms`` is how long the child's OLDEST in-flight tool call had been open.
+
+    ``in_flight`` is the source's OWN `tools=` / `tools_in_flight` count when it stated one
+    (``True`` = at least one call open, ``False`` = none, ``None`` = the source did not say).
+    ⛔ IT IS NOT DECORATION. The parent deliberately does NOT reset `toolAgeMaxMs` at `tool_end`
+    (`extensions/builtin-tools/index.ts:2765-2772`), and the only thing that makes that stale value
+    safe there is "clause 1 (tool-stall) requires ``toolsInFlight > 0``". An age with NO call open
+    is therefore a STALE MAX, never an open call — reading it as one manufactures exactly the kind
+    of false `wedged` verdict #4106 is about.
+    """
+
+    age_ms: int
+    in_flight: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class HeartbeatRead:
     """The task child's OWN `tool_age_max` readings, in order — the #4106 axis.
 
@@ -797,6 +825,8 @@ class HeartbeatRead:
     So ``samples`` is an ORDERED tuple and **two are required** before this axis may
     say anything. The decision is the LAST PAIR, and it is asymmetric on purpose:
 
+      * the last sample states NO call in flight (``in_flight is False``) ⇒ nothing is
+        open, so the age is a stale max: ``tool-age-no-call-open``, ``running-quiet``.
       * a **drop** ⇒ the call that was open ENDED and the child moved on — positive
         liveness evidence (``tool-age-reset``, → ``running-quiet``).
       * **no drop** ⇒ the same call is still open. Past the watchdog's own age
@@ -809,14 +839,39 @@ class HeartbeatRead:
     token at all. That is an ABSTENTION — never ``0 ms``, and never a verdict
     inferred from silence.
 
+    ⛔ TWO MORE FACTS THE VERDICT MUST HAVE, BECAUSE THE SOURCE IS A FILE AND AN AGE FROM A DEAD
+    RUN IS HISTORY, NOT A STATE:
+
+      * ``age_ms`` — how old the SOURCE is (its mtime age), ``None`` when the samples were stated
+        by the caller rather than read from a file. Past the watchdog's own heartbeat bound
+        (:data:`HEARTBEAT_TIMEOUT_MS`) the read abstains (``heartbeat-stale``). Without this a
+        29-day-old log of a long-gone child published ``running-quiet`` with rc 0.
+      * ``ended`` — the source carries POSITIVE terminal evidence of the run itself (the child's
+        own ``[task-heartbeat] session_end`` marker, or a `task_status` view saying
+        ``"session_ended": true`` / ``"alive": false``). A tool age inside a finished run is
+        not a live state, and reading it as one published ``wedged`` for a run that was DONE
+        (``heartbeat-session-ended``).
+
     ``hard_cap_ms`` is the cap the backstop is DERIVED from (:func:`tool_stall_ms`),
     so this axis cites the watchdog's bound instead of inventing a second one.
     """
 
     readable: bool = False
-    samples: Tuple[int, ...] = ()
+    samples: Tuple[HeartbeatSample, ...] = ()
     source: str = ""
     hard_cap_ms: int = HARD_CAP_MS
+    age_ms: Optional[int] = None
+    ended: bool = False
+    # ── the FENCE facts ────────────────────────────────────────────────────────────────────
+    # `nonces` is every DISTINCT `nonce=` value seen on a marker line, and `fenced_nonce` is the
+    # one the caller asked for ("" = no filter was applied). The module does not require a nonce —
+    # a log usually has one dispatch's markers and no sidecar to read it from — but a source that
+    # carries SEVERAL is exactly what a forged line looks like, so the verdict abstains
+    # (`heartbeat-ambiguous-nonce`) instead of letting whichever marker came last decide. Measured
+    # before this gate: one appended `nonce=FORGED … tool_age_max_ms=0` line flipped `wedged` to
+    # `running-quiet`.
+    nonces: Tuple[str, ...] = ()
+    fenced_nonce: str = ""
     detail: str = ""
 
 
@@ -2118,25 +2173,56 @@ def evaluate(ev: Evidence) -> Verdict:
         if not hb.readable or not hb.samples:
             return Verdict("unknown", "heartbeat-unreadable",
                            detail=(hb.detail or "no tool_age_max reading") + where)
+        # ⛔ THE RUN'S OWN TERMINAL FACT OUTRANKS EVERY AGE. A tool age inside a FINISHED run is
+        # history, and reading it as one published `wedged` for a run whose own bytes said
+        # `"status": "done", "alive": false` the whole time. Positive terminal evidence => abstain.
+        if hb.ended:
+            return Verdict("unknown", "heartbeat-session-ended",
+                           detail="the source carries the run's own end marker" + where)
+        # ⛔ AND A STALE SOURCE IS NOT A STATE. The heartbeat is the CHILD's liveness signal, so a
+        # source past the watchdog's own heartbeat bound is a reading of something that stopped
+        # emitting: measured, a 29-day-old log of a long-gone child published `running-quiet` with
+        # rc 0. `age_ms is None` means the caller STATED the samples (no source age to claim).
+        if hb.age_ms is not None and _exceeds(hb.age_ms, HEARTBEAT_TIMEOUT_MS):
+            return Verdict("unknown", "heartbeat-stale",
+                           detail="source age=%dms > heartbeat bound %dms%s"
+                                  % (hb.age_ms, HEARTBEAT_TIMEOUT_MS, where))
+        # ⛔ A SOURCE CARRYING SEVERAL DISPATCHES' MARKERS IS NOT ONE CHILD'S EVIDENCE. The
+        # fleet's own fence is the per-dispatch nonce (`task-heartbeat.ts`); with no nonce filter
+        # and more than one value present, the last marker wins a contest this axis cannot judge.
+        if not hb.fenced_nonce and len(hb.nonces) > 1:
+            return Verdict("unknown", "heartbeat-ambiguous-nonce",
+                           detail="%d distinct nonce values (%s); pass --nonce to fence"
+                                  % (len(hb.nonces), ",".join(hb.nonces[:4])) + where)
         if len(hb.samples) < 2:
             return Verdict(
                 "unknown", "tool-age-single-sample",
                 detail="samples=%s%s (ONE reading cannot distinguish \"still running\" from "
                        "\"just started\"; supply a second)"
-                       % (",".join(str(s) for s in hb.samples), where))
+                       % (",".join(str(s.age_ms) for s in hb.samples), where))
         prev, last = hb.samples[-2], hb.samples[-1]
         bound = tool_stall_ms(hb.hard_cap_ms)
         seen = ("samples=%s prev=%d last=%d bound=%dms%s"
-                % (",".join(str(s) for s in hb.samples), prev, last, bound, where))
+                % (",".join(str(s.age_ms) for s in hb.samples), prev.age_ms, last.age_ms,
+                   bound, where))
+        # ⛔ AN AGE WITH NO CALL OPEN IS A STALE MAX, NOT AN OPEN CALL. The parent deliberately
+        # does NOT reset `toolAgeMaxMs` at `tool_end` and is safe only because its own clause
+        # requires `toolsInFlight > 0` (`extensions/builtin-tools/index.ts:2765-2772`). Reading
+        # that stale number as an open call manufactures the false `wedged` this axis exists to
+        # remove — so the source's own in-flight count, when it states one, decides first.
+        if last.in_flight is False:
+            return Verdict("running-quiet", "tool-age-no-call-open",
+                           detail=seen + " — the source reports NO call in flight, so the age is "
+                                         "a stale maximum rather than an open call")
         # A DROP is the movement itself: the oldest open call ended and the child took the next
         # step. It is positive LIVENESS evidence, so it can never be a wedge.
-        if last < prev:
+        if last.age_ms < prev.age_ms:
             return Verdict("running-quiet", "tool-age-reset",
                            detail=seen + " — the open call ENDED and the child moved on")
         # No drop across the pair: the SAME call is still open. Only the watchdog's own age
         # backstop may turn that into a wedge — a long tool call is exactly what a working child
         # looks like, and the fleet's rule is "no proof ⇒ not wedged".
-        if _exceeds(last, bound):
+        if _exceeds(last.age_ms, bound):
             return Verdict("wedged", "tool-age-open-stable",
                            detail=seen + " — the same call is still open past its age backstop")
         return Verdict("unknown", "tool-age-open-pending",
@@ -2283,6 +2369,9 @@ def evaluate(ev: Evidence) -> Verdict:
 
 # ── the heartbeat axis (#4106): acquisition, never a second opinion ───────
 _HEARTBEAT_TOOL_AGE_RE = None
+_HEARTBEAT_IN_FLIGHT_RE = None
+_HEARTBEAT_NONCE_RE = None
+_HEARTBEAT_ENDED_RE = None
 
 
 def _heartbeat_tool_age_re():
@@ -2300,53 +2389,145 @@ def _heartbeat_tool_age_re():
     return _HEARTBEAT_TOOL_AGE_RE
 
 
-def parse_heartbeat_samples(text: str) -> List[int]:
+def _heartbeat_in_flight_re():
+    """How many calls the SAME line says are open: `tools=`, `"tools_in_flight":`, `toolsInFlight=`.
+
+    Read from the same line as the age ON PURPOSE — an age and a tool count from different ticks
+    would let a stale max answer for a call that is not open (`HeartbeatSample.in_flight`).
+    """
+    global _HEARTBEAT_IN_FLIGHT_RE
+    if _HEARTBEAT_IN_FLIGHT_RE is None:
+        import re as _re
+        _HEARTBEAT_IN_FLIGHT_RE = _re.compile(
+            r"(?:tools_in_flight|toolsInFlight|tools)[\"']?\s*[=:]\s*[\"']?(\d{1,10})(?![0-9])")
+    return _HEARTBEAT_IN_FLIGHT_RE
+
+
+def _heartbeat_nonce_re():
+    global _HEARTBEAT_NONCE_RE
+    if _HEARTBEAT_NONCE_RE is None:
+        import re as _re
+        _HEARTBEAT_NONCE_RE = _re.compile(r"\bnonce=([^\s\"']+)")
+    return _HEARTBEAT_NONCE_RE
+
+
+def _heartbeat_ended_re():
+    """POSITIVE terminal evidence of the RUN, in the shapes the fleet really writes.
+
+    The child's own end marker (`[task-heartbeat] session_end …`, ``task-heartbeat.ts:35``) and the
+    two terminal facts `task_status` publishes (``"session_ended": true``, ``"alive": false``). An
+    age read out of a finished run is HISTORY: it must never become a live state.
+    """
+    global _HEARTBEAT_ENDED_RE
+    if _HEARTBEAT_ENDED_RE is None:
+        import re as _re
+        _HEARTBEAT_ENDED_RE = _re.compile(
+            r"session_end\b|\"session_ended\"\s*:\s*true|\"alive\"\s*:\s*false")
+    return _HEARTBEAT_ENDED_RE
+
+
+def parse_heartbeat_samples(text: str, *, nonce: str = "") -> List[HeartbeatSample]:
     """Every `tool_age_max` reading in ``text``, in FILE ORDER — the #4106 acquisition door.
 
     One pattern for the three shapes that all carry the SAME number, because a reader should not
     have to know which one they copied:
 
-      ``[task-heartbeat] tick … tool_age_max_ms=6961576``   the child's own marker
-      ``… "tool_age_max_ms": 6961576 …``                   the `task_status` JSON view
-      ``Alive state: … toolAgeMaxMs=6961576 …``            the watchdog's diagnostic line
+      ``[task-heartbeat] tick … tool_age_max_ms=6961576 tools=1``   the child's own marker
+      ``… "tools_in_flight": 1, "tool_age_max_ms": 6961576 …``       the `task_status` JSON view
+      ``Alive state: toolsInFlight=1 … toolAgeMaxMs=6961576 …``      the watchdog's diagnostic line
 
-    Parsing is ACQUISITION, never a verdict: this returns numbers and nothing else, and
+    Parsing is ACQUISITION, never a verdict: this returns readings and nothing else, and
     :func:`evaluate` decides what TWO of them mean. Order is preserved because the last pair is
     the decision — sorting or de-duplicating here would destroy the only signal the axis has.
+
+    ``nonce`` is the fleet's OWN fence, honoured where it exists rather than re-invented:
+    ``extensions/task-heartbeat.ts`` puts the per-dispatch nonce on every marker because "MCP
+    servers inherit the child's fd 2 and could otherwise inject forged life signs", and the parent
+    rejects markers without the matching nonce. A ``[task-heartbeat]`` line whose ``nonce=`` does
+    not match is therefore DROPPED, not read. A line that is not a marker (the `task_status` JSON,
+    the `Alive state:` diagnostic) carries no nonce and is not fenced by it — that view is produced
+    by the parent, which already applied the fence.
     """
     if not text:
         return []
-    rx = _heartbeat_tool_age_re()
-    return [int(m) for m in rx.findall(text)]
+    age_rx = _heartbeat_tool_age_re()
+    if_rx = _heartbeat_in_flight_re()
+    nonce_rx = _heartbeat_nonce_re()
+    out: List[HeartbeatSample] = []
+    for line in text.splitlines():
+        if nonce and "[task-heartbeat]" in line:
+            m = nonce_rx.search(line)
+            if m is None or m.group(1) != nonce:
+                continue
+        m = age_rx.search(line)
+        if m is None:
+            continue
+        n = if_rx.search(line)
+        out.append(HeartbeatSample(age_ms=int(m.group(1)),
+                                   in_flight=(int(n.group(1)) > 0) if n else None))
+    return out
 
 
-def gather_heartbeat(path: str) -> HeartbeatRead:
+def _heartbeat_nonces(text: str) -> Tuple[str, ...]:
+    """Every DISTINCT `nonce=` value on a marker line, in first-seen order."""
+    rx = _heartbeat_nonce_re()
+    seen: List[str] = []
+    for line in text.splitlines():
+        if "[task-heartbeat]" not in line:
+            continue
+        m = rx.search(line)
+        if m is not None and m.group(1) not in seen:
+            seen.append(m.group(1))
+    return tuple(seen)
+
+
+def heartbeat_from_text(text: str, source: str = "", *, nonce: str = "",
+                        age_ms: Optional[int] = None) -> HeartbeatRead:
+    """Build a :class:`HeartbeatRead` from text ALREADY in hand (a file, stdin, a fixture)."""
+    samples = tuple(parse_heartbeat_samples(text, nonce=nonce))
+    ended = _heartbeat_ended_re().search(text) is not None
+    nonces = _heartbeat_nonces(text)
+    if not samples:
+        why = "no tool_age_max token"
+        if nonce:
+            why += " for nonce=%s" % nonce
+        return HeartbeatRead(readable=False, source=source, age_ms=age_ms,
+                             detail="%s in %s" % (why, source or "the source"))
+    return HeartbeatRead(readable=True, samples=samples, source=source,
+                         age_ms=age_ms, ended=ended, nonces=nonces, fenced_nonce=nonce)
+
+
+def gather_heartbeat(path: str, *, nonce: str = "", now_ms: Optional[int] = None) -> HeartbeatRead:
     """Read ``path`` (``-`` = stdin) into a :class:`HeartbeatRead` — acquisition only.
 
     A file that cannot be opened, or that carries no `tool_age` token at all, is
     ``readable=False`` — an ABSTENTION. Never ``0 ms``: an absent reading is not a reading of
     zero, and the whole axis exists to stop verdicts being inferred from silence.
+
+    For a FILE source the mtime age is carried too (``None`` for stdin: a pipe has no age this door
+    may honestly claim). A source older than the watchdog's own heartbeat bound is stale and
+    :func:`evaluate` abstains on it — a days-old log of a long-gone child must not publish a live
+    state, the same rule the log axis states for ``LogRead.age_ms``.
     """
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     if path == "-":
-        source = "stdin"
         try:
             text = sys.stdin.read()
         except (OSError, ValueError) as exc:
-            return HeartbeatRead(readable=False, source=source,
+            return HeartbeatRead(readable=False, source="stdin",
                                  detail="unreadable:stdin (%s)" % exc.__class__.__name__)
-    else:
-        source = path
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-        except (OSError, ValueError) as exc:
-            return HeartbeatRead(readable=False, source=source,
-                                 detail="unreadable:%s (%s)" % (path, exc.__class__.__name__))
-    samples = tuple(parse_heartbeat_samples(text))
-    if not samples:
-        return HeartbeatRead(readable=False, source=source,
-                             detail="no tool_age_max token in %s" % source)
-    return HeartbeatRead(readable=True, samples=samples, source=source)
+        return heartbeat_from_text(text, source="stdin", nonce=nonce)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        st = os.stat(path)
+    except (OSError, ValueError) as exc:
+        return HeartbeatRead(readable=False, source=path,
+                             detail="unreadable:%s (%s)" % (path, exc.__class__.__name__))
+    # A future mtime (clock skew, a touch) clamps to 0 — the direction `tool_from_jsonl` already
+    # takes on a future-dated entry stamp: a skew must not manufacture a stale read either.
+    age = max(0, now - int(st.st_mtime * 1000))
+    return heartbeat_from_text(text, source=path, nonce=nonce, age_ms=age)
 
 
 # ── the process boundary (scripts/lib/pid-identity.sh) ───────────────────
@@ -3842,7 +4023,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
 
 def _usage() -> str:
     return ("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
-            "       liveness.py --heartbeat FILE|- [--json]     (| --tool-age-ms N repeated)\n"
+            "       liveness.py --heartbeat FILE|- [--nonce N] [--json]   (| --tool-age-ms N repeated)\n"
             "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
             "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
             "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]")
@@ -3858,6 +4039,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     as_json = False
     tool_ages: List[int] = []
     heartbeat_path: Optional[str] = None
+    heartbeat_nonce = ""
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -3890,6 +4072,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # `parse_heartbeat_samples`) — one number, two spellings, never two code paths.
         if arg in ("--heartbeat", "--heartbeat-json") and i + 1 < len(argv):
             heartbeat_path = argv[i + 1]; i += 2; continue
+        # The child's own fence (`TASK_HEARTBEAT_NONCE`, carried as `nonce=` on every marker).
+        # Given, markers for any OTHER dispatch are dropped rather than read: a forged line on the
+        # child's inherited fd 2 could otherwise flip a `wedged` child to `running-quiet`.
+        if arg == "--nonce" and i + 1 < len(argv):
+            heartbeat_nonce = argv[i + 1]; i += 2; continue
         print(_usage(), file=sys.stderr)
         return 2
 
@@ -3901,13 +4088,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "pass one (repeat --tool-age-ms, or one file carrying both readings)",
               file=sys.stderr)
         return 2
+    if heartbeat_nonce and heartbeat_path is None:
+        # The nonce fences MARKERS. A caller-stated pair (`--tool-age-ms`) carries none, so
+        # accepting the flag there would advertise a fence that does not exist.
+        print("liveness.py: --nonce fences the `[task-heartbeat]` markers in a --heartbeat "
+              "source; it does not apply to --tool-age-ms", file=sys.stderr)
+        return 2
+    if (heartbeat_path is not None or tool_ages) and sid:
+        # ⛔ A USAGE ERROR, NOT AN ABSTENTION. `evaluate` refuses a two-axis query by name
+        # (`heartbeat-on-session-query`), but publishing that as rc 3 would tell a caller
+        # "no verdict yet, retry" about a query that can never be answered — every other misuse
+        # on this surface is rc 2, and the log lane refuses `--sid` the same way.
+        print("liveness.py: a heartbeat query answers for ONE task child; do not also pass "
+              "--sid (ask the session question separately)", file=sys.stderr)
+        return 2
     if heartbeat_path is not None or tool_ages:
-        # `sid` is passed THROUGH, not merged: `evaluate` refuses a query that carries two axes
-        # by name (`heartbeat-on-session-query`), which is this module's rule for every added
-        # axis. A caller with both questions asks them separately.
-        hb = (gather_heartbeat(heartbeat_path) if heartbeat_path is not None
-              else HeartbeatRead(readable=True, samples=tuple(tool_ages), source="flag"))
-        verdict = evaluate(Evidence(heartbeat=hb, sid=sid or ""))
+        hb = (gather_heartbeat(heartbeat_path, nonce=heartbeat_nonce)
+              if heartbeat_path is not None
+              else HeartbeatRead(readable=True, source="flag",
+                                 samples=tuple(HeartbeatSample(age_ms=a) for a in tool_ages)))
+        verdict = evaluate(Evidence(heartbeat=hb))
         if as_json:
             print(json.dumps(verdict.to_dict(), sort_keys=True))
         else:

@@ -567,6 +567,9 @@ not a stall.
 | `tool-age-open-pending` | two readings, no drop, and the same call is still UNDER the watchdog's age backstop (§15) — pending, never a stall |
 | `heartbeat-unreadable` | the heartbeat source could not be read, or carried no `tool_age` token — never read as `0 ms` |
 | `heartbeat-on-session-query` | the heartbeat axis was supplied TOGETHER with session/claim/CPU evidence; the axis is one query wide, so it refuses rather than masking (§15) |
+| `heartbeat-stale` | the heartbeat SOURCE is older than the watchdog's own heartbeat bound, so it is a reading of something that stopped emitting (§15) |
+| `heartbeat-session-ended` | the source carries the run's own end (`session_end` / `"alive": false`) — a finished run's tool age is history, not a state (§15) |
+| `heartbeat-ambiguous-nonce` | the source carries markers from several dispatches and the caller named no nonce; the axis cannot judge that contest (§15) |
 
 **The six claim reasons (#1777)** — emitted only by `liveness.claim_verdict`, from
 `tools/fleet/claim_lanes.py`'s read. Every one of them is `unknown`, so a claim can neither
@@ -930,8 +933,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 61 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (122)
+python3 tools/fleet/liveness.test.py               # 62 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (126)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -2173,16 +2176,35 @@ discriminator is the **change between two samples**.
 
 | two samples (the last pair) | verdict | why |
 |---|---|---|
+| the last sample says **no call in flight** (`tools=0` / `"tools_in_flight": 0`) | `running-quiet` / `tool-age-no-call-open` | the age is a **stale maximum**, not an open call: the parent does not reset `toolAgeMaxMs` at `tool_end` and is safe only because its own clause requires `toolsInFlight > 0` (`extensions/builtin-tools/index.ts:2765-2772`) |
 | the age **drops** (6,961,576 → 18,052) | `running-quiet` / `tool-age-reset` | the call that was open ENDED and the child moved on — positive liveness evidence |
 | no drop, and the age is **past** the watchdog's age backstop | `wedged` / `tool-age-open-stable` | the SAME call is still open past the point at which the watchdog itself would cut it |
 | no drop, still **under** the backstop | `unknown` / `tool-age-open-pending` | pending, not a stall: a long tool call is what a working child looks like |
 | **one** sample | `unknown` / `tool-age-single-sample` | "still running" and "just started" are the same number |
 | nothing readable | `unknown` / `heartbeat-unreadable` | an absent reading is not a reading of zero |
 
+⛔ **AND THE SOURCE MUST BE FRESH, LIVE AND SINGLE-DISPATCH BEFORE ANY AGE IS BELIEVED.** The axis
+reads a FILE, so believing it about *now* needs three facts the numbers themselves cannot carry —
+each of the three was measured producing a wrong state before it was gated:
+
+| the source's own fact | verdict | what it stops |
+|---|---|---|
+| it carries the run's **end** — the child's `[task-heartbeat] session_end` marker, or a `task_status` view saying `"session_ended": true` / `"alive": false` | `unknown` / `heartbeat-session-ended` | `wedged` for a run whose own bytes said it was **over** (a finished run's tool age is history) |
+| its **mtime age** is past the watchdog's own heartbeat bound (`HEARTBEAT_TIMEOUT_MS`, 30 min) | `unknown` / `heartbeat-stale` | `running-quiet` rc 0 from a **29-day-old** log of a long-gone child — a reading of something that stopped emitting |
+| it carries markers from **several** `nonce=` values and the caller named none | `unknown` / `heartbeat-ambiguous-nonce` | one appended `nonce=FORGED … tool_age_max_ms=0` line flipping `wedged` → `running-quiet` (a forged life sign on the child's inherited fd 2 — the case `task-heartbeat.ts` puts the nonce there for) |
+
+`--nonce <n>` is that fence, honoured rather than re-invented: markers for any other dispatch are
+**dropped**, not read. A source of one dispatch's markers needs no nonce (the common case), and the
+`task_status` JSON / `Alive state:` line are not fenced by it — the parent produced those and had
+already applied its own check. A nonce that matches nothing is `heartbeat-unreadable`, never an
+empty read.
+
 The bound is **cited, not invented**: `tool_stall_ms()` (the watchdog's `tool-stall` age backstop,
-4 h at the 6 h cap; `tool_veto_expired`), compared with the same strict `>`. So the #3987 readings —
-116 minutes, then 18 s, then 0 ms — produce `tool-age-open-pending` on the 116-min pair and
-`tool-age-reset` on the next, and **never** `wedged` on a single number.
+4 h at the 6 h cap; `tool_veto_expired`), compared with the same strict `>`. Both pairs in the
+#3987 sequence — `6,961,576 → 18,052` and `18,052 → 0` — are **drops**, so that lane reads
+`tool-age-reset`; the 116-minute reading alone is what was read as a stall, and one sample can only
+ever be `tool-age-single-sample`. A pair that genuinely sits open under the backstop is
+`6,961,576 → 7,100,000` ⇒ `tool-age-open-pending`.
 
 ```bash
 # the pair is the evidence, so the flag REPEATS (one flag holding one reading would make the
@@ -2195,7 +2217,13 @@ python3 tools/fleet/liveness.py --tool-age-ms 6961576          # rc 3: tool-age-
 # `task_status` JSON ("tool_age_max_ms": N), and the watchdog's `Alive state: … toolAgeMaxMs=`.
 python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
 python3 tools/fleet/liveness.py --heartbeat-json status.json     # accepted alias of --heartbeat
+
+# …and, when the source may carry more than one dispatch's markers, the fleet's own fence:
+python3 tools/fleet/liveness.py --heartbeat <run_id>.log --nonce <TASK_HEARTBEAT_NONCE>
 ```
+
+A **two-axis query is a usage error (rc `2`)**, not an abstention: `--sid` together with a heartbeat
+source can never be answered by this axis, and rc `3` would tell a caller to retry it.
 
 ⛔ **ONE AXIS PER QUERY.** The heartbeat is an evidence field of `evaluate`
 (`Evidence.heartbeat`), reached from nowhere else, and it is **refused by name**
