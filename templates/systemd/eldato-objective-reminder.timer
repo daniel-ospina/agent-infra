@@ -11,6 +11,11 @@
 # one on boot would deliver a stale objective into a box that has not yet started a lane, and the pass
 # would log UNSENT for a surface that does not exist yet. (The disk reaper sets Persistent=true for the
 # opposite reason: its work is cumulative and must not be skipped.)
+# ⛔ AND THE `OnBootSec=` BELOW DOES NOT CONTRADICT THAT — the two are different things. `Persistent=true`
+# REPLAYS the activation that was MISSED while the box was down, at once, holding a timestamp from before
+# the outage (potentially days old): that is the stale objective. `OnBootSec=10min` schedules a FRESH
+# elapse ten minutes after boot, against the box's current state, and is not a replay. Without it the
+# timer never fires at all (see the block below), so "no replay" was being implemented as "no clock".
 Description=eldato objective reminder every 10 minutes
 
 # ⛔ `OnUnitActiveSec` NEEDS A FIRST REFERENCE OR IT NEVER FIRES. It is defined as "relative to when the

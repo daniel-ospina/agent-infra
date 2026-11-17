@@ -295,6 +295,59 @@ export FX
 
 echo "activate-harness.test.sh"
 
+# t0_anchor_value_ok <directive> <value> — can the MANAGER actually ACT on this anchor value?
+# The same rule `scripts/cell-self-pin.sh`'s `timer_value_ok` already codified, kept local rather than
+# importing another script's internals:
+#   • NEVER delegate `infinity` to the parser first — it is a VALID timespan that means NEVER, so a
+#     parser-only rule certifies a timer that fires once and then stops for ever;
+#   • an empty value is a parse failure;
+#   • systemd.syntax(7): there are NO trailing comments, so `10min # why` is an unparseable value;
+#   • every real timespan carries a digit, and OnCalendar's shorthand keywords are exempt;
+#   • then, where a parser exists, ASK IT rather than re-implementing it. A host without
+#     `systemd-analyze` (macOS) has no parser at all, so the floor there is a STRICT timespan grammar
+#     (below) and an OnCalendar expression is REFUSED rather than certified — the same choice
+#     `scripts/cell-self-pin.sh` makes, for the same reason: certifying a value the manager discards is
+#     the false PASS this arm exists to prevent.
+# ⛔ THE FLOOR USED TO BE "contains a digit", WHICH WAS ITSELF A FALSE PASS (found by review of this
+# change, i.e. it never existed on main): with the parser hidden, `5minn` read GREEN on the macOS path
+# while the same value was correctly red on Linux — a defect invisible on every cell and every CI run.
+t0_anchor_value_ok() { # <directive> <value>
+    local k="$1" v="$2" rest part
+    [ -n "$v" ] || return 1
+    case " $v " in *" infinity "*) return 1 ;; esac
+    case "$v" in *'#'*) return 1 ;; esac
+    if [ "$k" = OnCalendar ]; then
+        case "$v" in
+            minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly) return 0 ;;
+        esac
+    fi
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        case "$k" in
+            OnCalendar) systemd-analyze calendar -- "$v" >/dev/null 2>&1 ;;
+            *)          systemd-analyze timespan -- "$v" >/dev/null 2>&1 ;;
+        esac
+        return $?
+    fi
+    # NO PARSER ON THIS HOST. A calendar expression cannot be verified without one, so it is refused
+    # rather than certified; a timespan is checked token by token against the manager's own unit
+    # vocabulary, which is a grammar strict enough that `5minn` and `min` both fail it.
+    # ⛔ IT IS DELIBERATELY STRICTER THAN systemd, AND SAYS SO: a compound written without a space
+    # (`1h30min`) is refused too, because the fallback cannot tell it from `5minn`. Refusing a good value
+    # on a host with no parser is recoverable (run it where systemd-analyze exists); certifying a value
+    # the manager discards is not.
+    [ "$k" = OnCalendar ] && return 1
+    rest="$v"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *" "*) part="${rest%% *}"; rest="${rest#* }" ;;
+            *)      part="$rest"; rest="" ;;
+        esac
+        [ -n "$part" ] || continue
+        printf '%s\n' "$part" | grep -Eq '^[0-9]+(\.[0-9]+)?(us|usec|ms|msec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?$' || return 1
+    done
+    return 0
+}
+
 # ── T0: EVERY REPEATING TIMER TEMPLATE CARRIES A FIRST ELAPSE, INSIDE [Timer] ────────────────
 # `OnUnitActiveSec` is defined as "relative to when the unit the timer unit is activating was LAST
 # ACTIVATED" (systemd.timer(5)). A template that declares it with NO boot/active/calendar anchor has
@@ -315,8 +368,18 @@ echo "activate-harness.test.sh"
 # 'Unit', ignoring." and the timer keeps `next_elapse=infinity`. A whole-file grep called that file
 # anchored, i.e. the gate was defeatable by exactly the edit its own author had already made once. So
 # every test below reads the `[Timer]` block only, and a cadence declared outside it is its own failure.
+# ── T0's grader, callable on ANY population ─────────────────────────────────────────────────────
+# `t0_scan <dir>` grades every template in <dir>; `T0_MODE` decides where a verdict GOES — the suite's
+# own counters for the shipped set, or one `ok<TAB>msg` / `FAIL<TAB>msg` line for a MUTANT set. The
+# mutant set is what makes this rule a test: T0m runs it over mutated copies and asserts a RED. A rule
+# that can only ever print OK cannot be told from a rule that is not there.
+T0_MODE=assert
+t0_ok()  { if [ "$T0_MODE" = probe ]; then printf 'ok>%s\n' "$1"; else ok "$1"; fi; }
+t0_bad() { if [ "$T0_MODE" = probe ]; then printf 'FAIL>%s\n' "$1"; else bad "$1"; fi; }
+t0_scan() { # <template dir>
+local dir="${1:-}" tpl TPL_SEC ANCHORS T0_A T0_ANY T0_VALS expected=0 f
 TPL_SEEN=0
-for tpl in "$REPO"/templates/systemd/*.timer; do
+for tpl in "$dir"/*.timer; do
     [ -f "$tpl" ] || continue
     grep -Eq '^[[:space:]]*OnUnitActiveSec[[:space:]]*=' "$tpl" || continue
     TPL_SEEN=$((TPL_SEEN + 1))
@@ -336,26 +399,100 @@ for tpl in "$REPO"/templates/systemd/*.timer; do
         | grep -Ev '^[[:space:]]*(#|;|$)' \
         | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/') "
     if ! printf '%s\n' "$TPL_SEC" | grep -qE '^OnUnitActiveSec='; then
-        bad "T0 $(basename "$tpl") declares OnUnitActiveSec OUTSIDE the [Timer] section — systemd IGNORES it, so the timer has no cadence at all"
+        t0_bad "T0 $(basename "$tpl") declares OnUnitActiveSec OUTSIDE the [Timer] section — systemd IGNORES it, so the timer has no cadence at all"
         continue
     fi
-    if printf '%s\n' "$TPL_SEC" | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
-        ok "T0 $(basename "$tpl") anchors its first elapse inside [Timer]"
+    ANCHORS="$(printf '%s\n' "$TPL_SEC" | grep -E '^On(Boot|Active|Startup)Sec=|^OnCalendar=')"
+    if [ -n "$ANCHORS" ]; then
+        # ⛔ PRESENCE IS NOT ENOUGH — THE MANAGER MUST BE ABLE TO ACT ON THE VALUE (review cycle 3, P2).
+        # A directive whose value systemd DISCARDS is the same inert timer with a green gate: measured,
+        # `OnBootSec=min`, `OnBootSec=5minn` and `OnBootSec=` are all refused by the parser
+        # ("Failed to parse timer value, ignoring") while `OnBootSec=infinity` parses to USEC_INFINITY —
+        # i.e. fires NEVER. And `=min` is not contrived: `install-cell-timers.sh` renders parameterised
+        # values, so an unset variable produces exactly that. `scripts/cell-self-pin.sh`'s `timer_value_ok`
+        # already codified the rule (refuse `infinity` BEFORE the parser, then delegate to the manager's
+        # own parser); this is the same rule, kept local rather than importing another script's guts.
+        # ⛔ WHY THIS IS NOT `systemd-analyze verify`: verify is unusable as the gate — 4 of the 8 shipped
+        # templates carry unrendered `{{PLACEHOLDER}}` values, so verify reports "Failed to parse timer
+        # value, ignoring: {{INTERVAL_MIN}}min" over CORRECT templates (measured on
+        # templates/systemd/*.timer, systemd 255). A gate that reds the shipped set is a false block, so
+        # the value rule lives here and T0m proves it can FAIL.
+        # ⛔ ANY ANCHOR THE MANAGER ACTS ON IS ENOUGH — not "the first one". A template may carry both
+        # `OnBootSec=` and `OnCalendar=`; systemd schedules the UNION, so one discarded value beside one
+        # live expression still fires. Grading only the first line would red a working timer (a false
+        # block), and grading presence alone is the false PASS this case exists to prevent.
+        T0_ANY=0; T0_VALS=""
+        while IFS= read -r T0_A; do
+            [ -n "$T0_A" ] || continue
+            T0_VALS="$T0_VALS ${T0_A#*=}"
+            if t0_anchor_value_ok "${T0_A%%=*}" "${T0_A#*=}"; then T0_ANY=1; break; fi
+        done <<< "$ANCHORS"
+        if [ "$T0_ANY" -eq 1 ]; then
+            t0_ok "T0 $(basename "$tpl") anchors its first elapse inside [Timer] with a value the manager ACTS ON"
+        else
+            t0_bad "T0 $(basename "$tpl") anchors inside [Timer] but the manager DISCARDS every value (${T0_VALS# }) — the directive is present and INERT, so next_elapse stays infinity and the timer can never fire"
+        fi
     elif grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" \
            | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/' \
            | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
         # Same verdict, different defect — name it, or a reader cannot tell "deleted" from "misfiled".
-        bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
+        t0_bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
     else
-        bad "T0 $(basename "$tpl") declares OnUnitActiveSec in [Timer] with NO boot/active/calendar anchor anywhere — next_elapse=infinity, it can never fire"
+        t0_bad "T0 $(basename "$tpl") declares OnUnitActiveSec in [Timer] with NO boot/active/calendar anchor anywhere — next_elapse=infinity, it can never fire"
     fi
 done
-# NON-VACUITY: a glob that matches nothing would make the loop above pass by not running.
-if [ "$TPL_SEEN" -gt 0 ]; then
-    ok "T0 checked $TPL_SEEN repeating timer template(s)"
+# NON-VACUITY, PINNED (review cycle 3, P2). `> 0` is not a coverage pin: a template the prefilter MISSES
+# gets NO ASSERTION AT ALL, so the suite stays green with one fewer template graded — measured, a
+# template written `  OnUnitActiveSec = 5min` dropped the population to 6 and printed `T0 checked 6`, and
+# nothing red. The prefilter is whitespace-tolerant now, so the two matchers agree on the shipped set;
+# this pin is the cross-check that fires if a future edit narrows the PRE-FILTER again while the
+# declaration matcher below still sees the directive.
+for f in "$dir"/*.timer; do
+    [ -f "$f" ] || continue
+    grep -Ev '^[[:space:]]*(#|;|$)' "$f" \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/' \
+        | grep -qE '^OnUnitActiveSec=' && expected=$((expected + 1))
+done
+if [ "$TPL_SEEN" -eq 0 ]; then
+    t0_bad "T0 graded NO template in $dir — a glob that matches nothing passes by not running (vacuous pass)"
+elif [ "$TPL_SEEN" -ne "$expected" ]; then
+    t0_bad "T0 graded $TPL_SEEN of $expected template(s) in $dir — a template that declares OnUnitActiveSec was SKIPPED, and a skipped template gets no verdict at all"
 else
-    bad "T0 no repeating timer template was checked (vacuous pass)"
+    t0_ok "T0 graded all $TPL_SEEN repeating timer template(s)"
 fi
+}
+T0_MODE=assert
+t0_scan "$REPO/templates/systemd"
+
+# ── T0m: NON-VACUITY, END TO END — the SAME grader REDS a mutated template ─────────────────────
+# ⛔ REVIEW CYCLE 3 (P2) measured this arm printing OK on a template that CANNOT FIRE, because a
+# directive NAME was all it checked (`OnBootSec=5min   # arm the first cycle` is discarded by the manager;
+# `OnBootSec=infinity` parses to "never"). These probes drive the REAL grader over a mutated POPULATION,
+# one mutation each, so the rule is shown to RED rather than merely shown to print OK. The CONTROL is the
+# same copy unmutated: without it, a red could be a fixture defect instead of the rule.
+T0M="$FX/t0-mutants"
+t0_probe() { # <name> <sed-expression> -> PROBE_MUT (file name), PROBE_OUT (the grader's probe lines)
+    rm -rf "$T0M"; mkdir -p "$T0M"
+    PROBE_MUT="$1.timer"
+    sed -E "$2" "$REPO/templates/systemd/eldato-controller-watchdog.timer" >"$T0M/$PROBE_MUT"
+    T0_MODE=probe; PROBE_OUT="$(t0_scan "$T0M")"; T0_MODE=assert
+}
+t0_probe control 's/^OnBootSec=5min$/OnBootSec=5min/'
+assert_contains "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m CONTROL an unmutated copy is still graded ok (so a red below is the rule, not the fixture)"
+t0_probe trailing-comment 's/^OnBootSec=.*/OnBootSec=5min   # arm the first cycle/'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m a TRAILING COMMENT on the anchor REDS (systemd.syntax(7): no trailing comments, the value is discarded)"
+assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it (the pre-fix arm printed ok here)"
+t0_probe unparseable-unit 's/^OnBootSec=.*/OnBootSec=5minn/'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m an UNPARSEABLE timespan REDS"
+assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it"
+t0_probe unset-render 's/^OnBootSec=.*/OnBootSec=min/'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m the value an UNSET render variable leaves (a bare 'min') REDS — install-cell-timers.sh renders parameterised values"
+t0_probe empty 's/^OnBootSec=.*/OnBootSec=/'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m an EMPTY assignment REDS (systemd.timer(5): the empty string RESETS the list, discarding an anchor above it)"
+t0_probe infinity 's/^OnBootSec=.*/OnBootSec=infinity/'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m 'infinity' REDS (a VALID timespan meaning NEVER — the parser alone would certify it)"
+assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it"
+rm -rf "$T0M"
 
 # ── T1: a fully armed box exits 0 and every must row reads OK ─────────────────────────────────
 arm_all
