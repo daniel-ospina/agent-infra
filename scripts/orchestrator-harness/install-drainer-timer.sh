@@ -53,12 +53,33 @@
 #             4 --status: the service and/or the timer is MISSING, so this box dispatches NOTHING
 #             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
 #             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
-#             dispatches at cannot be DETERMINED (no pin and an unreadable `ExecStart` script), which
-#             is named as unknown rather than silently graded clean.
+#             dispatches at cannot be DETERMINED — no pin and an unreadable `ExecStart` script, a pin
+#             whose value is not a number of seconds, or a pin line systemd would REJECT (an
+#             unterminated quote makes systemd abandon the line) — named as unknown rather than
+#             silently graded clean.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
+# ⛔ THE `Environment=` GRAMMAR IS A SHARED LIBRARY, NOT A COPY (re-review of #4065, finding 1). This
+# installer reads the INSTALLED unit's `Environment=LANE_TIMEOUT` pin, and the disk reaper's installer
+# already owned a parser for exactly that grammar — with the measured defeats behind it (a quoted pin,
+# several assignments on one line, whitespace around the `=`, a `<unit>.d/*.conf` drop-in). Reading the
+# pin here with a single-line `grep` made the two readers disagree about the SAME unit, and this one
+# failed OPEN (rc 0 = "provably agrees with the seam") over a box dispatching at the old cap. One
+# definition, two callers: `scripts/lib/systemd-unit-parse.sh` documents the grammar and the
+# `!unparseable:` contract, and it is farmed (`pi-bootstrap/setup.sh`'s `lib_srcs`) so a cell resolves it.
+# ⛔ A MISSING LIBRARY IS FATAL: without `effective_env` the pin would resolve as empty, and empty is the
+# "no pin" branch — the false clean this file exists to remove, recreated by a missing file.
+SYSTEMD_UNIT_PARSE_LIB="$INFRA_ROOT/scripts/lib/systemd-unit-parse.sh"
+if [ ! -f "$SYSTEMD_UNIT_PARSE_LIB" ]; then
+    printf 'install-drainer-timer: ERROR — %s is missing; --status parses the installed pin with it and cannot grade this box without it\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2
+    exit 1
+fi
+# shellcheck source=scripts/lib/systemd-unit-parse.sh
+. "$SYSTEMD_UNIT_PARSE_LIB"
+command -v effective_env >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define effective_env\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -209,12 +230,54 @@ say_status() {
     # installed/MISSING + timer state, so such a box read healthy. Print the pin beside the value this
     # checkout would render now, and WARN on a mismatch; exit 3 so an automated check can act on it.
     if [ -f "$UNIT_DIR/$svc" ]; then
-        # Last occurrence wins: systemd merges repeated `Environment=` lines and the last one is what the
-        # unit sees, so reading the first would vouch for a value the box does not use.
-        installed="$(grep '^Environment=LANE_TIMEOUT=' "$UNIT_DIR/$svc" 2>/dev/null \
-                     | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
+        # ⛔ ONE LINE SHAPE IS NOT "THE PIN" (re-review of #4065, finding 1 — verified). This reader was
+        # `grep '^Environment=LANE_TIMEOUT='`, a SPELLING match, and it was the FAIL-OPEN arm of this
+        # verb: every spelling below is LEGAL systemd and every one of them read as "the unit carries no
+        # pin", which falls through to the `ExecStart=` grading below and exits 0 — published as
+        # "provably agrees with the seam" (docs/ops/ai-drainer.md) — over a box dispatching at the old
+        # cap. The `ExecStart=` reader below fails SAFE (rc 5); this one failed OPEN, in the one verb
+        # whose whole purpose is making a stale pin visible.
+        #
+        #     Environment="LANE_TIMEOUT=7200"          (quoted — systemd.exec(5) `Environment=`)
+        #     Environment=HOME=/x LANE_TIMEOUT=7200    (several assignments on one line)
+        #     Environment = LANE_TIMEOUT=7200          (whitespace around the key and the `=`)
+        #     <unit>.service.d/*.conf                  (parsed AFTER the unit, so it WINS)
+        #
+        # ⛔ SO THE PIN IS READ WITH THE SAME PARSER THE DISK REAPER'S READ-BACK USES, not with a second
+        # one that can disagree with it about the same unit (`scripts/lib/systemd-unit-parse.sh`; a
+        # reader anchored on one line shape is exactly the "#1872 shape" of two readers of one fact). It
+        # normalises indentation, whitespace and both quote styles, takes several assignments per line,
+        # applies last-assignment-wins (`Environment=` repeats MERGE, the last wins), honours a bare
+        # `Environment=` RESET, and reports a line systemd would REJECT as `!unparseable:` instead of
+        # guessing at its value. The unit is fed in first and its drop-ins after it, in systemd's own
+        # order, so a drop-in's override is what this verb grades.
+        local unit_text envmap unparsed installed want pin_unreadable=0
+        unit_text="$( { cat "$UNIT_DIR/$svc"
+                        for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && cat "$_d"; done
+                      } 2>/dev/null )"
+        envmap="$(effective_env "$unit_text")"
+        unparsed="$(printf '%s\n' "$envmap" | sed -n 's/^!unparseable://p')"
+        case "$unparsed" in *LANE_TIMEOUT*) pin_unreadable=1 ;; esac
+        installed="$(printf '%s\n' "$envmap" | sed -n 's/^LANE_TIMEOUT=//p' | tail -1 | tr -d '\r')"
         want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
-        if [ -z "$installed" ]; then
+        case "${installed:-}" in
+        '')
+            # ⛔ A PIN NOTHING COULD RESOLVE IS ITS OWN STATE — UNKNOWN (5), NEVER "NO PIN" (re-review of
+            # #4065, finding 1). `LANE_TIMEOUT` is mentioned on an `Environment=` line that systemd would
+            # REJECT (an unterminated quote: systemd returns EINVAL, logs, and ABANDONS the whole line,
+            # so the process starts WITHOUT it) — this box's cap is therefore UNKNOWABLE from the unit,
+            # and reporting it as absent would be the false clean this exit code exists to remove, one
+            # spelling over. ⛔ NOT a text grep for the name: a bare `Environment=` RESET legitimately
+            # CLEARS an earlier pin, and the shipped template carries the name in a COMMENT — both must
+            # still read as "no pin", so only the parser's own failure signal counts.
+            if [ "$pin_unreadable" -eq 1 ]; then
+                printf '  ⚠️  UNREADABLE PIN: an `Environment=` line in this unit names LANE_TIMEOUT but is not a line systemd\n'
+                printf '      would accept (unbalanced quotes), and systemd ABANDONS such a line — so the cap this box\n'
+                printf '      dispatches at is UNKNOWN, not healthy:\n'
+                printf '%s\n' "$unparsed" | sed -n 's/.*LANE_TIMEOUT.*/        Environment=\0/p'
+                printf '      Re-run this installer (no arguments) on this cell to re-render the pin.\n'
+                return 5
+            fi
             # ⛔ "NO PIN" IS NOT "CLEAN" (agent-infra#4034 review, P3). With no pin the unit dispatches at
             # the default COMPILED INTO THE SCRIPT ITS OWN `ExecStart=` NAMES — so a box whose `$O` tree
             # predates the seam keeps the OLD cap while the checkout, the docs and the suite all say the
@@ -246,16 +309,24 @@ say_status() {
             else
                 printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$have" "$exe"
                 printf '      agrees with the %s s this checkout would render)\n' "$want"
-            fi
-        else
+            fi ;;
+        *[!0-9]*)
+            # ⛔ THE SAME RULE FOR A VALUE THAT IS NOT A NUMBER OF SECONDS (re-review of #4065, finding 1).
+            # `LANE_TIMEOUT=abc` is a box whose cap is UNKNOWN: it is not evidence of a stale cap (so not
+            # 3) and it is certainly not evidence of a fresh one (so never 0). Naming it is the whole job.
+            printf '  ⚠️  UNREADABLE PIN: this unit sets LANE_TIMEOUT to `%s`, which is not a number of seconds. The seam\n' "$installed"
+            printf '      cannot compare against it, so the cap this box dispatches at is UNKNOWN, not healthy: re-run this\n'
+            printf '      installer (no arguments) on this cell to re-render the pin.\n'
+            return 5 ;;
+        *)
             printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
-        fi
-        if [ -n "$installed" ] && [ "$installed" != "$want" ]; then
-            printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
-            printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
-            printf '      (no arguments) on this cell.\n'
-            return 3
-        fi
+            if [ "$installed" != "$want" ]; then
+                printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
+                printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
+                printf '      (no arguments) on this cell.\n'
+                return 3
+            fi ;;
+        esac
     fi
     return 0
 }

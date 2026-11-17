@@ -2035,6 +2035,78 @@ SC_EOF
   check "installer: --status WARNS and exits 3 on a STALE pin (a pre-change unit still dispatching at 7200)" \
     '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+
+  # ⛔ THE PIN IS RECOGNISED IN EVERY FORM systemd ACCEPTS, NOT IN ONE LINE SHAPE (re-review of #4065,
+  # finding 1 — the fail-open this block removes). The reader was `grep '^Environment=LANE_TIMEOUT='`,
+  # which is a SPELLING match: a quoted pin and a multi-assignment line are both LEGAL systemd
+  # (systemd.exec(5) `Environment=`), both read as "the unit carries no pin", and `--status` then graded
+  # the `ExecStart=` script instead and exited 0 — published as "provably agrees with the seam" — over a
+  # box dispatching at 7200 s. A drop-in under `<unit>.service.d/*.conf` is parsed AFTER the unit, so it
+  # WINS; reading only the base file certified a value systemd had already overridden. Every arm below
+  # was rc 0 before this change (verified on this fixture) and is 3 now.
+  for _form in '"LANE_TIMEOUT=7200"' 'HOME=/tmp/x LANE_TIMEOUT=7200' 'LANE_TIMEOUT=7200'; do
+    grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+    case "$_form" in
+      *' '*) printf 'Environment=%s\n' "$_form" >>"$T4/units/eldato-ai-drainer.service" ;;   # list form
+      *)     printf '  Environment = %s\n' "$_form" >>"$T4/units/eldato-ai-drainer.service" ;; # indented + spaces around `=`
+    esac
+    out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+          DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+    check "installer: --status READS the pin written as 'Environment=${_form}' (a legal systemd spelling, not an ABSENT pin)" \
+      '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s installed" <<<"$out" && ! grep -q "carries no pin" <<<"$out"' \
+      "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  done
+  # ...and the DROP-IN both ways, because it is the case where reading the base file alone gives a
+  # CONFIDENT WRONG answer rather than merely a missing one: stale base + fresh drop-in must read CLEAN,
+  # fresh base + stale drop-in must read STALE.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=%s\n' "${SEAM_T:?}" >>"$T4/units/eldato-ai-drainer.service"
+  mkdir -p "$T4/units/eldato-ai-drainer.service.d"
+  printf 'Environment=LANE_TIMEOUT=7200\n' >"$T4/units/eldato-ai-drainer.service.d/override.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status reads a DROP-IN's pin, which systemd applies AFTER the unit and therefore WINS" \
+    '[ "$rc" -eq 3 ] && grep -q "7200 s installed" <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment="LANE_TIMEOUT=%s"\n' "${SEAM_T:?}" >"$T4/units/eldato-ai-drainer.service.d/override.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: …and the drop-in wins in the OTHER direction too — a stale base overridden back to the seam reads CLEAN" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  rm -rf "$T4/units/eldato-ai-drainer.service.d"
+  # ⛔ A BARE `Environment=` RESET CLEARS AN EARLIER PIN (systemd.exec(5)), and the shipped template carries
+  # the name `LANE_TIMEOUT` in a COMMENT — so "some line mentions it" is NOT the test for UNKNOWN. This arm
+  # is what keeps the UNKNOWN arm below from being a text grep that reds a well-formed unit.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=7200\nEnvironment=\n' >>"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: a BARE 'Environment=' reset CLEARS the pin — it reads as no-pin (ExecStart grading), not as a stale 7200" \
+    'grep -q "carries no pin" <<<"$out" && ! grep -q STALE <<<"$out" && ! grep -q "7200 s installed" <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ⛔ AND A PIN NOTHING COULD RESOLVE IS ITS OWN STATE: UNKNOWN (5), NEVER ABSENCE (re-review of #4065,
+  # finding 1's second half). An unterminated quote makes systemd return EINVAL and ABANDON the whole
+  # line, so the cap this box dispatches at is UNKNOWABLE from the unit — reporting it as "the unit
+  # carries no pin" is the false clean this exit code exists to remove, one spelling over.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment="LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status NAMES an unparseable pin line and exits 5, never reporting it as an ABSENT pin" \
+    '[ "$rc" -eq 5 ] && grep -q "UNREADABLE PIN" <<<"$out" && ! grep -q "carries no pin" <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
+  # ...and a pin whose VALUE is not a number of seconds is the same class: a cap that cannot be compared is
+  # not a stale cap (not 3) and certainly not a fresh one (never 0).
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=abc\n' >>"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status NAMES a non-numeric pin and exits 5 (a cap that cannot be compared is UNKNOWN, not STALE and not clean)" \
+    '[ "$rc" -eq 5 ] && grep -q "UNREADABLE PIN" <<<"$out" && grep -q "abc" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep -i 'pin:' <<<"$out" | head -1)"
   printf 'ExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?

@@ -666,78 +666,27 @@ service_effective_unit() { # prints the bytes systemd will load; rc 1 when that 
 # The ExecStart argv lines systemd will actually run: everything AFTER the last bare `ExecStart=`
 # reset. ⛔ Not "the last ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a
 # pre-flight command is a healthy unit — refusing it would be a false block on a working cell.
-# effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as
-# `NAME=VALUE` lines (one per variable, last assignment wins).
+# ── THE Environment= GRAMMAR COMES FROM THE SHARED LIB, NOT FROM THIS FILE ─────────────────────
+# `normalize_unit_lines` and `effective_env` moved to `scripts/lib/systemd-unit-parse.sh` because a
+# SECOND reader of the same grammar now exists (agent-infra#4034's `install-drainer-timer.sh --status`
+# reads the installed `Environment=LANE_TIMEOUT` pin). That reader shipped as a single-line `grep`,
+# disagreed with this one about a quoted pin and about a drop-in, and reported rc 0 ("provably agrees
+# with the seam") over a box that was dispatching at the old cap. Two readers of one fact is what
+# #1872/#4034 are about; one definition, two callers, is the fix. The grammar, the measured defeats
+# and the `!unparseable:` contract are documented there.
 #
-# ⛔ A LINE-ANCHORED `^Environment=HOME=` MATCH IS DEFEATABLE, and a gate that reads one line and then
-# reports "verified" is the false PASS this whole read-back exists to remove (measured: a drop-in with
-# `Environment=PATH=/usr/bin:/bin HOME=/tmp/tmp.deadbeef/bg/home`, and another with
-# `Environment="HOME=/tmp/tmp.deadbeef/bg/home"`, both left the plain assignment intact and the install
-# printed "verify: … read back" over a unit whose HOME was the dead tree). systemd parses the whole
-# file in order, accepts several space-separated assignments per line, honours double and single
-# quotes, and lets a LATER assignment of the same name win; a bare `Environment=` RESETS the list
-# (the same reset semantics `effective_execstarts` already implements for `ExecStart=`).
-# `env -i`-style edge cases (empty values, `NAME=` with no value) are preserved verbatim, because an
-# empty HOME is not the HOME the install rendered and must be refused by the caller.
-# normalize_unit_lines — systemd's OWN reading of `Key = value`: it strips whitespace AROUND the key,
-# around the `=`, and before the value, and it accepts indented lines. A parser anchored on
-# `^ExecStart=` therefore MISSES a legal `ExecStart =` — and a drop-in that spells BOTH the reset and
-# the replacement that way is invisible to the read-back, which then certifies the BASE unit's command
-# while systemd runs the drop-in's.
-# ⛔ MEASURED (review pass): with a drop-in carrying `ExecStart =` + `ExecStart = /bin/true` and
-# `Environment = HOME=/tmp/tmp.deadbeef/bg/home`, `effective_execstarts` still reported the base
-# `/bin/bash <reaper> --apply` and `effective_env` still reported the base HOME — the install printed
-# `verify: ExecStart + HOME read back`, exited 0 and armed the timer over a unit that ran /bin/true.
-# `systemd-analyze verify` ACCEPTS these spellings (a genuinely unknown key draws "Service has no
-# ExecStart= … Refusing."), so the unit really would run the drop-in's command. The indented spelling
-# (`  ExecStart=`) reproduces identically.
-# Normalising the TEXT once, rather than teaching every parser the grammar, keeps one definition.
-normalize_unit_lines() {
-    sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
-}
-
-effective_env() {
-    printf '%s\n' "$1" | normalize_unit_lines | awk '
-        function emit(tok,   eq, name) {
-            eq = index(tok, "=")
-            if (eq <= 1) return                     # not a NAME=VALUE assignment: systemd ignores it
-            name = substr(tok, 1, eq - 1)
-            vals[name] = substr(tok, eq + 1)
-            if (!(name in seen)) { seen[name] = 1; order[++n] = name }
-        }
-        /^Environment=/ {
-            rest = substr($0, 13)
-            if (rest == "") { n = 0; split("", order); split("", vals); split("", seen); next }
-            tok = ""; inq = 0; q = ""
-            for (i = 1; i <= length(rest); i++) {
-                ch = substr(rest, i, 1)
-                # A BACKSLASH ESCAPES THE NEXT CHARACTER inside a quoted value: systemd accepts
-                # `Environment="HOME=/tmp/q\\"uo"`, so treating the escaped quote as the terminator made
-                # this parser refuse a line systemd is happy with (an over-block with a false reason).
-                if (esc) { tok = tok ch; esc = 0; continue }
-                if (inq) {
-                    if (ch == "\\") { esc = 1; continue }
-                    if (ch == q) { inq = 0; continue }
-                    tok = tok ch; continue
-                }
-                if (ch == "\"" || ch == "\047") { inq = 1; q = ch; continue }
-                if (ch == " " || ch == "\t") { if (tok != "") { emit(tok); tok = "" }; continue }
-                tok = tok ch
-            }
-            # NOTE (apostrophes are ILLEGAL here: this is a single-quoted awk program):
-            # AN UNTERMINATED QUOTE IS AN UNPARSEABLE LINE, NOT A VALUE. systemd returns EINVAL,
-            # logs, and ABANDONS the whole line — the service starts WITHOUT those variables.
-            # Emitting `HOME=<rest of line>` would certify a HOME the unit never gets (a fail-open
-            # the pre-fix line match did not have, because it compared the value with the quote
-            # still attached). systemd rule applied: discard the line, and REPORT it so the caller
-            # can refuse instead of guessing.
-            if (inq || esc) { bad[++b] = rest; next }
-            if (tok != "") emit(tok)
-            next
-        }
-        END { for (i = 1; i <= b; i++) print "!unparseable:" bad[i]
-              for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
-}
+# ⛔ A MISSING LIBRARY IS FATAL HERE, NOT A WARNING: without it `effective_env` is an undefined
+# command, the read-back would compare empty strings and CERTIFY an artifact nothing read — the exact
+# false PASS the read-back exists to remove. This file runs with `set -uo pipefail` (no `-e`), so the
+# failure is handled explicitly rather than left to the shell.
+SYSTEMD_UNIT_PARSE_LIB="${INFRA_ROOT:?}/scripts/lib/systemd-unit-parse.sh"
+if [ ! -f "$SYSTEMD_UNIT_PARSE_LIB" ]; then
+    err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB is missing — this installer's read-back parses the unit's Environment= with it, and without it every read-back would certify an artifact nothing read"
+    exit 1
+fi
+# shellcheck source=scripts/lib/systemd-unit-parse.sh
+. "$SYSTEMD_UNIT_PARSE_LIB"
+command -v effective_env >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_env"; exit 1; }
 
 effective_execstarts() {
     printf '%s\n' "$1" | normalize_unit_lines | awk '
