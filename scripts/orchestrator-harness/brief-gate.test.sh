@@ -1914,8 +1914,22 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     are EXACTLY the declared set` (measured on this branch at fbe6f636a, CI job 132995472045, and
 #     reproduced locally). The equality is read by BOTH lanes' shards (`bash-suites` on a PR,
 #     `script-validate` on main), so the red was measurable there too. Declaring it is the census's own
-#     remedy, and the census is an equality — it can only speak again once its population is stated.
-EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/adopt-fix.sh scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/gh-auth.test.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/pr-sickness.sh scripts/orchestrator-harness/pr-sickness.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/orchestrator-harness/worker-supply.sh scripts/orchestrator-harness/worker-supply.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_dispatch_path.py scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#   * ⛔ `scripts/review-pr.sh` (#3987) is a CALLER of the gate's MUTATION parser, and it is the first
+#     member that reaches the gate from the RECORDER's side rather than the dispatcher's: the seam renders
+#     the canonical `--mutation-section` block it hands the reviewer, then re-validates the artifact it is
+#     about to POST with `--mutation-missing` before publishing it (`exit 11`, nothing posted). It joins
+#     this equality because it names the gate (0 mentions before #3987, 14 after — that delta is how it
+#     was found: `bash-suites` 451 passed / 1 failed, this very arm, `ADDED: scripts/review-pr.sh`), and
+#     it joins the pairs loop below with `--mutation-missing` so the arm reddens if that pre-post check
+#     is deleted while this comment stays. It dispatches a `pi` of its own (the reviewer), but that
+#     invocation is not a lane brief and carries no `--section`; declaring it here does NOT admit it to
+#     the dispatch population. Declared rather than filtered: a filter on `*review*` would absorb the
+#     next reviewer-side gate caller, which is where the next #3442-class skew would land.
+#     ⛔ UNDECLARED IT WAS THE WHOLE CENSUS: measured on this branch at 914fc2634 (CI run 44088825696,
+#     job 134058464157) and reproduced locally — `found` was exactly `EXPECTED` + `scripts/review-pr.sh`,
+#     one ADDED member and zero MISSING, so the delta attributed itself to this change and nothing else.
+#     Declaring it is the census's own remedy.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/adopt-fix.sh scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/gh-auth.test.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/pr-sickness.sh scripts/orchestrator-harness/pr-sickness.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/orchestrator-harness/worker-supply.sh scripts/orchestrator-harness/worker-supply.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/review-pr.sh scripts/safe-send.sh scripts/test_cmux_dispatch_path.py scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
@@ -1934,7 +1948,8 @@ for pair in "scripts/orchestrator-harness/lane.sh:--section lane" \
             "scripts/orchestrator-harness/pr-sickness.sh:--section fixer" \
             "scripts/orch-send.sh:--check -" \
             "scripts/safe-send.sh:--check" \
-            "scripts/pr-doctor.py:brief-gate.sh"; do
+            "scripts/pr-doctor.py:brief-gate.sh" \
+            "scripts/review-pr.sh:--mutation-missing"; do
   f="${pair%%:*}"; needle="${pair#*:}"
   grep -qF -e "$needle" "$ROOT/$f"; ck $? "$(basename "$f") still carries its gate call ('$needle')"
 done
