@@ -39,15 +39,33 @@
 # ⛔ IDENTITY IS THE FILE'S OWN CONTENT, NOT A SIBLING. Recognising a shim by "`../gh-limit.py`
 # exists" made the identity Vanish exactly when the helper is the missing file — the fail-open state
 # this shim exists for — and the two shims then resolved into each other again, turning a
-# half-installed box into one where EVERY gh call exits 127. Keep this line in any copy.
+# half-installed box into one where EVERY gh call exits 127. Keep this line in any copy, AND KEEP IT
+# IN THE FIRST 8 KiB: that is the window every resolver reads (this file's walk and
+# `scripts/gh-shim/gh` both bound the read there — reading the whole candidate cost a full read of
+# the 41 MB real gh on every call, #3998). gh-rest.test.sh asserts the window for all shipped shims.
 set -uo pipefail
 
 # ── resolve the REAL gh, never this file ──────────────────────────────────────────────────────────
 # `command -v gh` inside a shim named gh finds the shim again — an infinite exec loop. Walk PATH and
 # skip any candidate that is this file (by device+inode, so symlinks and relative entries are safe).
+#
+# ⛔ THE PREAMBLE RUNS ON EVERY HARNESS gh CALL, SO IT MUST NOT FORK (#3998). MEASURED: this walk
+# spent one `grep` (plus one `dirname`) per PATH entry that holds an executable gh, and one full read
+# of the real gh — a 41 MB compiled binary — on every single call. On a box at load ~250 a fork/exec
+# costs ~150 ms, so the drain's `gh auth token` presence probe (20 s bound) answered too slowly and
+# reported `answer=UNKNOWN … no candidate can be judged from this box`: 220 occurrences,
+# `drain=DEADLOCK`, nothing dispatched or landed. Every step below is therefore a BASH BUILTIN
+# (`${SELF%/*}`, `[ -f ]`, `[ -x ]`, `-ef`, and the `read` builtin), so the walk costs ZERO forks.
+# ⛔ AND NOTHING IS MEMOISED ON PURPOSE: a cached `REAL_GH` has to be invalidated on a PATH change, a
+# symlink retarget and a shim reinstall, and getting any of those wrong execs a stale or a WRONG gh.
+# Re-deriving it from the (builtin) stat calls costs microseconds and cannot go stale.
 SELF="${BASH_SOURCE[0]}"
-SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
-SELF_REAL="$SELF_DIR/$(basename "$SELF")"
+SELF_DIR="${SELF%/*}"; [ "$SELF_DIR" = "$SELF" ] && SELF_DIR="."   # invoked with no slash
+SELF_BASE="${SELF##*/}"
+# Absolute SELF_DIR without the `cd … && pwd` subshell (a fork + a `dirname`), because $LIMIT_HELPER
+# is derived from it below. `$PWD` is the shell's own maintained cwd, so this costs nothing.
+case "$SELF_DIR" in /*) ;; *) [ -n "${PWD:-}" ] && SELF_DIR="$PWD/$SELF_DIR" ;; esac
+SELF_REAL="$SELF_DIR/$SELF_BASE"
 # ⛔ NEVER EXEC ANOTHER HARNESS SHIM. Two interposers that each skip only THEMSELVES resolve to EACH
 # OTHER: with both seeded dirs on PATH ($O/gh-rest from install.sh, $O/gh-limit from the cell
 # supervisor) the walk found the wrapper, whose helper found this file again — MEASURED at 1,700
@@ -62,20 +80,38 @@ if [ "${HARNESS_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
 fi
 export HARNESS_GH_SHIM_DEPTH=$(( ${HARNESS_GH_SHIM_DEPTH:-0} + 1 ))
 _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling helper (older copies)
+  # ⛔ ONE BUILTIN READ: NO FORK, AND NEVER THE WHOLE FILE (#3998). This was `grep -qa` per candidate —
+  # one fork per PATH entry, and the candidate that usually wins is the real gh, a 41 MB compiled
+  # binary, so `grep` read all 41 MB on every call. Measured on the 41 MB binary: 25 ms of `grep`,
+  # 0.75 ms for the bounded read below (33x), and the fork it also saved costs ~150 ms on a box at
+  # load ~250. `-N` makes the window a fixed 8192 BYTES regardless of any delimiter, so a script
+  # (36 KB) and a binary behave the same way.
+  # ⛔ `-N`, NOT `-d ''`: `read` DISCARDS NUL bytes, which is exactly what makes a BINARY shim
+  # identifiable — #10009's fixture is `\177ELF` + NULs + the sentinel, and a NUL-terminated read
+  # stops at the first NUL and answers "not a shim" for a file that is one. That would break
+  # resolution (the walk would then exec a binary and the whole box's gh exits 126).
   # ⛔ NO PIPE: `head | grep -q` races — grep exits at its first match, head takes SIGPIPE, and under
   # `pipefail` the pipeline reads FAILED even though the marker was found (the #841 class). A false
   # negative here would let the walk pick a shim as the real gh, i.e. recurse.
   # ⛔ NO COMMAND SUBSTITUTION EITHER — THE CANDIDATE IS USUALLY A COMPILED BINARY (#2184). Reading a
-  # binary into a variable makes bash >= 4.4 print `warning: command substitution: ignored null byte in
-  # input` on STDERR of a call that SUCCEEDS, and callers here merge stderr into the bytes they parse
-  # (`2>&1`). MEASURED on all three cloud cells: that warning became the reported OUTPUT of every PR
-  # read (`NOCHECKS:READ-FAILED:transport … ignored null byte in input`), so every acting arm found no
-  # work while the PR queue sat there — a false green that looked like an idle cell.
-  # `grep -a` so a binary candidate is matched rather than skipped as "binary file matches"; `grep -q`
-  # is ONE process, so it cannot race itself the way `head | grep -q` does. `2>/dev/null` keeps an
-  # unreadable candidate from putting the SHELL's own open error on a successful call's stderr.
-  grep -qa 'harness-gh-shim-marker' "$1" 2>/dev/null && return 0
-  [ -f "$(dirname "$1")/../gh-limit.py" ]
+  # binary INTO A VARIABLE VIA `$( )` makes bash >= 4.4 print `warning: command substitution: ignored
+  # null byte in input` on STDERR of a call that SUCCEEDS, and callers here merge stderr into the bytes
+  # they parse (`2>&1`). MEASURED on all three cloud cells: that warning became the reported OUTPUT of
+  # every PR read (`NOCHECKS:READ-FAILED:transport … ignored null byte in input`), so every acting arm
+  # found no work while the PR queue sat there — a false green that looked like an idle cell.
+  # A `read … < file` REDIRECT is not a command substitution: it drops NULs SILENTLY (verified: no
+  # bytes on stderr for the 41 MB binary), so that class cannot come back through this line.
+  # `2>/dev/null` keeps an unreadable candidate from putting the SHELL's own open error on a
+  # successful call's stderr.
+  local _f="$1" _head=""
+  # `LC_ALL=C` pins the window to BYTES (in a UTF-8 locale `-N` counts characters); it is a prefix
+  # assignment on a regular builtin, so it does not leak into the rest of the call.
+  LC_ALL=C IFS= read -r -N 8192 _head <"$_f" 2>/dev/null || :
+  case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
+  # An OLDER copy of a shim carries no marker, or carries it past the window; it is identified by the
+  # helper beside it — the deployment contract is that both shims sit beside ONE `../gh-limit.py`.
+  # `${_f%/*}` is the candidate's own directory: one more `dirname` fork removed.
+  [ -f "${_f%/*}/../gh-limit.py" ]
 }
 REAL_GH="${GH_REST_REAL_GH:-}"
 if [ -z "$REAL_GH" ]; then
