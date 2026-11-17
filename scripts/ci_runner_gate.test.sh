@@ -2601,15 +2601,21 @@ assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "capaci
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
   "(r1) the recovery is REPORTED, so a box that had a blip is distinguishable from one that did not"
 
-# ── (r1b) A RATE-LIMIT 403 IS TRANSIENT, SO IT IS RETRIED (#4085 review P1) ────────────────────
+# ── (r1b) A RATE-LIMIT 403 IS RETRIED, NOT FAST-FAILED (#4085 review P1) ───────────────────────
 # `API rate limit exceeded` was 125 of the 183 measured failures. It is a 403 that CLEARS, so the
 # fast-fail list must not swallow it — and this arm is what makes a mutant that adds it red.
+# ⛔ WHAT THIS ARM DOES *NOT* CLAIM (#4085 review P3): it pins the CLASSIFICATION and the retry PATH,
+# not a guarantee of recovery. The stub fails once and the backoff is forced to 0, so it cannot show
+# that the shipped budget (3 attempts, 2 s + 4 s = ≤6 s of sleep) outlives the window — and the measured
+# message, `API rate limit exceeded for user ID 1`, is the PRIMARY limit, whose reset window is far
+# longer than 6 s. What change #1 genuinely buys back is the timeout/transport class; a primary limit
+# is retried correctly and recovers only when its reset lands inside the budget.
 run_gate census-retry-ratelimit GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok GH_CENSUS_FAIL_N=1 \
   GH_CENSUS_FAIL_MODE=ratelimit CI_GATE_CENSUS_READ_BACKOFF_S=0 --
 assert_not_contains "$OUT" "capacity=unknown" \
   "(r1b) a rate-limit 403 is retried, NOT treated as a permanent capability failure"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
-  "(r1b) the rate-limit retry is reported"
+  "(r1b) the rate-limit retry is REPORTED (a retried path, not a guaranteed recovery — see above)"
 
 # ── (r1c) A DETERMINISTIC 403 IS NOT RETRIED, AND COSTS EXACTLY ONE CALL (#4085 review P1) ─────
 # Without this, dropping the fast-fail list retries a permission failure three times and the suite
@@ -2641,13 +2647,53 @@ assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')
   "(r2) 6 consecutive blind passes record EXACTLY ONE defect line — the file is rate-limited in TIME, not per pass (modulo would write 2)"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null)" "streak=3" \
   "(r2) the defect record names the streak, so its severity is readable without the log"
-# only the TIME floor writes a stamp; a modulo revert would leave it absent, so this is the second
-# independent way the revert is caught (the reviewer's suggested cheapest equivalent).
+# ⛔ THIS .stamp ASSERTION IS A PRESENCE CHECK, NOT AN INDEPENDENT DISCRIMINATOR (#4085 review P3,
+# correcting an earlier claim of exactly that). MEASURED: a revert to the `streak % defect_after`
+# predicate still writes the stamp when it writes a record, so this arm does NOT catch that revert —
+# the LINE-COUNT assertion above is what reddens (modulo writes at 3 and 6). It is kept because a
+# mutant that stops writing the time floor altogether (a dropped stamp write) is otherwise silent, and
+# the owner's review trail records that claim as false rather than leaving it to be trusted again.
 [ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ] \
   && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); echo "  ❌ (r2) the defect write floor keeps a .stamp (time-based rate limit)"; }
 
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "RECURRING DEFECT" \
   "(r2) the alarm wording escalates once the condition is sustained"
+
+# ── (r2b) AN OUT-OF-RANGE THRESHOLD STILL ESCALATES (#4085 review P3) ──────────────────────────
+# `BLIND_DEFECT_AFTER` was the one #4085 knob with no >=10-digit arm, and the failure is silent: an
+# out-of-intmax operand makes `[ "$streak" -ge "$defect_after" ]` ERROR, and an errored arithmetic
+# test reads as FALSE — so the DEFECT escalation this PR adds is disabled by an unvalidated override
+# (MEASURED: `[ 5 -ge 99999999999999999999 ]` -> `integer expression expected`, false). With the arm in
+# place the value falls back to the shipped 6, so six passes must leave a record.
+run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+  CI_GATE_BLIND_ALARM_EVERY_S=0 --
+for _i in 2 3 4 5 6; do
+  KEEP_STATE=1 run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+    CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+    CI_GATE_BLIND_ALARM_EVERY_S=0 --
+ done
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')" "1" \
+  "(r2b) an OUT-OF-RANGE CI_GATE_BLIND_DEFECT_AFTER falls back to the shipped 6, so the escalation FIRES instead of erroring to FALSE"
+
+# ── (r2c) A FAILED DEFECT WRITE IS REPORTED AS UNRECORDED (#4085 review P3) ────────────────────
+# The gate runs without `set -e`, so the write's status was discarded and the log asserted
+# "BLIND DEFECT recorded" unconditionally. A DIRECTORY at the record path is the cheapest portable
+# unwritable target: `>>` fails, and the log must say the condition is UNRECORDED (and the throttle
+# stamp must stay absent, or a failed write would suppress the retry for a whole BLIND_DEFECT_EVERY_S).
+mkdir -p "$T/state-census-defect-unwritable/ci-runner-gate.DEFECT"
+run_gate census-defect-unwritable GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=1 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+_GATE_LOG="$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)"
+assert_not_contains "$_GATE_LOG" "BLIND DEFECT recorded" \
+  "(r2c) a FAILED defect write does NOT log 'recorded' — the log must not assert a durable record that does not exist"
+assert_contains "$_GATE_LOG" "BLIND DEFECT WRITE FAILED" \
+  "(r2c) the failure is NAMED as UNRECORDED, so the condition is not silently dropped"
+if [ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ]; then
+  FAIL=$((FAIL + 1)); echo "  ❌ (r2c) a FAILED write leaves NO throttle stamp (otherwise the retry is suppressed for BLIND_DEFECT_EVERY_S)"
+else
+  PASS=$((PASS + 1)); echo "  ✅ (r2c) a FAILED defect write leaves NO throttle stamp, so the next pass retries the record"
+fi
 
 # ── (r3) A READ VERB DOES NOT CONSUME THE STREAK (#4085 review round 5, P2) ─────────────────────
 # The dry-run guard was real but unproven: no arm ever read the streak file, so a mutant dropping

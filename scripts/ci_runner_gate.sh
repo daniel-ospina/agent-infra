@@ -1596,7 +1596,14 @@ alarm_blind() { # $1 = the signature (what could not be measured, and why)
   # count restarts without any pass having to remember to clear it — a reset hook is a second thing
   # that can be forgotten, and the direction it fails in is the silent one. The window is deliberately
   # NOT the alarm interval: coupling them collapses it to "any gap" as soon as that interval is 0.
-  case "$defect_after" in ''|*[!0-9]*) defect_after=6 ;; esac
+  # ⛔ OUT-OF-RANGE REJECTS TOO, LIKE EVERY SIBLING KNOB (#4085 review P3). A shape check alone is not
+  # enough: an out-of-intmax value makes BOTH `[ "$defect_after" -lt 1 ]` and `[ "$streak" -ge
+  # "$defect_after" ]` error, and an errored arithmetic test reads as FALSE — so the DEFECT escalation
+  # this function exists to add would be silently disabled by an unvalidated operand (MEASURED:
+  # `[ 5 -ge 99999999999999999999 ]` -> `integer expression expected`, false). This was the one #4085
+  # knob that never got the >=10-digit arm that CENSUS_READ_ATTEMPTS, CENSUS_READ_BACKOFF_S,
+  # BLIND_STREAK_RESET_S and BLIND_DEFECT_EVERY_S all carry.
+  case "$defect_after" in ''|*[!0-9]*) defect_after=6 ;; ??????????*) defect_after=6 ;; esac
   if [ "$defect_after" -lt 1 ]; then defect_after=1; fi
   if [ -f "$streak_file" ]; then
     read -r streak prev_now < "$streak_file" 2>/dev/null || true
@@ -1612,10 +1619,15 @@ alarm_blind() { # $1 = the signature (what could not be measured, and why)
     fi
   fi
   streak=$((streak + 1))
-  printf '%s %s\n' "$streak" "$now" > "$streak_file"
+  # ⛔ AN UNWRITABLE STREAK IS NAMED, NOT ABSORBED (#4085 review P3, same class as the DEFECT write).
+  # Without `set -e` a failed write here leaves the count advancing nowhere, so the escalation silently
+  # never fires — the exact silent-disarm this change removes.
+  printf '%s %s\n' "$streak" "$now" > "$streak_file" 2>/dev/null \
+    || log "BLIND streak WRITE FAILED -> ${streak_file} (streak=${streak}) — the escalation counter is NOT being persisted; unwritable or blocked STATE_DIR=${STATE_DIR}"
   # ⛔ ESCALATION IS THE PART THAT WAS MISSING (#4085): 43 identical alarms produced no action. Past
-  # `BLIND_DEFECT_AFTER` consecutive blind passes a durable DEFECT record is appended — one line per
-  # `BLIND_DEFECT_AFTER` passes, so a month-long condition leaves a readable handful of records
+  # `BLIND_DEFECT_AFTER` consecutive blind passes a durable DEFECT record is appended — and the
+  # `BLIND_DEFECT_EVERY_S` time floor, not the threshold, decides how OFTEN it is written (one record
+  # per 6 h at the shipped values), so a month-long condition leaves a readable handful of records
   # instead of a wall of repeats. ⛔ THIS RUNS BEFORE THE ALARM WINDOW IS CONSULTED, on purpose: a
   # suppressed NOTIFICATION is not a suppressed CONDITION, and a record that depends on the notify
   # interval disappears exactly when the pass rate outruns the interval — the long outage.
@@ -1628,9 +1640,18 @@ alarm_blind() { # $1 = the signature (what could not be measured, and why)
     [ -f "$defect_stamp" ] && last_defect="$(sed -n 1p "$defect_stamp" 2>/dev/null)"
     case "$last_defect" in ''|*[!0-9]*) last_defect=0 ;; esac
     if [ "$last_defect" -eq 0 ] || [ "$((now - last_defect))" -ge "$every_s" ]; then
-      printf '%s\tstreak=%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$streak" "$sig" >> "$defect_file"
-      printf '%s\n' "$now" > "$defect_stamp"
-      log "BLIND DEFECT recorded -> ${defect_file} (streak=$streak, at most one per ${every_s}s)"
+      # ⛔ THE LOG LINE REPORTS THE WRITE'S OUTCOME (#4085 review P3). There is no `set -e` here, so an
+      # unconditional "recorded" log asserted a durable record on an unwritable STATE_DIR — a claim of
+      # a write that did not land, which is the same silence-as-reassurance shape #4085 removes. The
+      # throttle stamp is written ONLY on success: stamping a FAILED write would suppress the retry for
+      # a full `BLIND_DEFECT_EVERY_S` while nothing at all is on record.
+      if printf '%s\tstreak=%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$streak" "$sig" >> "$defect_file" 2>/dev/null; then
+        printf '%s\n' "$now" > "$defect_stamp" 2>/dev/null \
+          || log "BLIND DEFECT throttle-stamp WRITE FAILED -> ${defect_stamp} — the next pass may re-record"
+        log "BLIND DEFECT recorded -> ${defect_file} (streak=$streak, at most one per ${every_s}s)"
+      else
+        log "BLIND DEFECT WRITE FAILED -> ${defect_file} (streak=$streak) — the CONDITION IS UNRECORDED, not absent; unwritable or blocked STATE_DIR=${STATE_DIR}"
+      fi
     fi
   fi
   if [ -f "$stamp" ]; then
