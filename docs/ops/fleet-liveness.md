@@ -146,6 +146,13 @@ report now re-reads `git status --porcelain -z` / `rev-parse HEAD` /
 the probe — **withholds the verdict** (`verdictWithheld=stale-snapshot`, plus
 `commitsSinceSnapshot=`) instead of reporting "nothing happened".
 
+**And the report's `tool_age_max` is only readable as a PAIR.** The child's own age is
+what answers *"did its current action finish?"* — but one reading cannot tell "still
+running" from "just started", and `liveness.py` took no such input at all, so readers
+inferred a state from mtime and pid presence instead (#4106: one working child called
+`wedged` three times in one session). The verdict now takes the readings and requires
+two of them: **§15**.
+
 ---
 
 ## 1. The five states and what each rests on
@@ -556,6 +563,10 @@ not a stall.
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
 | `turn-unknown:<stopReason>` | on a message carrying **no** tool calls, the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
+| `tool-age-single-sample` | ONE `tool_age_max` reading was supplied; ``still running`` and ``just started`` are the same number (§15) |
+| `tool-age-open-pending` | two readings, no drop, and the same call is still UNDER the watchdog's age backstop (§15) — pending, never a stall |
+| `heartbeat-unreadable` | the heartbeat source could not be read, or carried no `tool_age` token — never read as `0 ms` |
+| `heartbeat-on-session-query` | the heartbeat axis was supplied TOGETHER with session/claim/CPU evidence; the axis is one query wide, so it refuses rather than masking (§15) |
 
 **The six claim reasons (#1777)** — emitted only by `liveness.claim_verdict`, from
 `tools/fleet/claim_lanes.py`'s read. Every one of them is `unknown`, so a claim can neither
@@ -907,6 +918,10 @@ The report is appended to a capped durable log (`~/.pi/agent/state/lane-liveness
 python3 tools/fleet/liveness.py --sid <session-id>
 python3 tools/fleet/liveness.py --sid <session-id> --json
 
+# one TASK CHILD's own action, from its heartbeat — TWO samples minimum (§15)
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052
+python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
+
 # the whole fleet; no GitHub side effects (it still appends to the durable log)
 python3 tools/fleet/lane_liveness.py --dry-run
 ```
@@ -915,8 +930,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 57 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (112)
+python3 tools/fleet/liveness.test.py               # 61 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (122)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1979,7 +1994,8 @@ The axis is an **evidence field of `evaluate`** (`Evidence.log_read`), exactly l
 `log_lane_verdict` is reached **only** from `evaluate`. It is **inert when `log_read is None`** (pinned
 by T36 and by the mutation that degenerates its `if ev.log_read is not None:` guard), and supplying
 `log_read` on a query that ALSO carries session or claim evidence (`sid`, `claim_read`, `candidates`,
-`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`, and the **failed-read flags** `ps_ok` /
+`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`, the tree's `cpu`/`child` slots, the
+heartbeat axis's `heartbeat` (§15), and the **failed-read flags** `ps_ok` /
 `store_ok`) is **refused by name** (`log-read-on-session-query`) rather than resolved by whichever axis
 is checked first — that would be the #1777 B7 defect (an added axis masking other evidence) rebuilt on
 a new axis.
@@ -2136,3 +2152,60 @@ acceptable answer; silence, and a guess, are not.
 
 Full runbook, evidence table and the six diagnostic rounds:
 [`media-devices.md`](media-devices.md).
+
+---
+
+## 15. The task child's OWN action — `tool_age_max`, two samples or nothing (#4106)
+
+§0a separates `not-started` from `wedged`; this section answers the question a reader holding a
+`task_status` row actually has: **did this child's current action finish?**
+
+Neither of the session signals can answer it. A child's `edit` tool writes files **in-process**, so
+"no child process" is the expected shape of thinking-then-writing; and a running test suite, or a
+child that has already **committed** and kept working, produces no file change at all. #3987 called
+**one** working child `wedged` **three times** on exactly those three readings, in one session.
+
+The signal that does answer it is the child's own `tool_age_max` — how long its oldest in-flight
+tool call has been open (`extensions/task-heartbeat.ts`, surfaced by `task_status` as
+`heartbeat.tool_age_max_ms`). **One reading of it is not evidence in either direction:** 116 minutes
+means *still running* if the previous reading was 90 minutes and *just started* if it was 130. The
+discriminator is the **change between two samples**.
+
+| two samples (the last pair) | verdict | why |
+|---|---|---|
+| the age **drops** (6,961,576 → 18,052) | `running-quiet` / `tool-age-reset` | the call that was open ENDED and the child moved on — positive liveness evidence |
+| no drop, and the age is **past** the watchdog's age backstop | `wedged` / `tool-age-open-stable` | the SAME call is still open past the point at which the watchdog itself would cut it |
+| no drop, still **under** the backstop | `unknown` / `tool-age-open-pending` | pending, not a stall: a long tool call is what a working child looks like |
+| **one** sample | `unknown` / `tool-age-single-sample` | "still running" and "just started" are the same number |
+| nothing readable | `unknown` / `heartbeat-unreadable` | an absent reading is not a reading of zero |
+
+The bound is **cited, not invented**: `tool_stall_ms()` (the watchdog's `tool-stall` age backstop,
+4 h at the 6 h cap; `tool_veto_expired`), compared with the same strict `>`. So the #3987 readings —
+116 minutes, then 18 s, then 0 ms — produce `tool-age-open-pending` on the 116-min pair and
+`tool-age-reset` on the next, and **never** `wedged` on a single number.
+
+```bash
+# the pair is the evidence, so the flag REPEATS (one flag holding one reading would make the
+# pre-fix error the only expressible query)
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052
+python3 tools/fleet/liveness.py --tool-age-ms 6961576          # rc 3: tool-age-single-sample
+
+# …or point it at the child's own log / a `task_status` dump. ONE pattern reads the three shapes
+# the fleet really writes: the `[task-heartbeat] tick … tool_age_max_ms=` marker, the
+# `task_status` JSON ("tool_age_max_ms": N), and the watchdog's `Alive state: … toolAgeMaxMs=`.
+python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
+python3 tools/fleet/liveness.py --heartbeat-json status.json     # accepted alias of --heartbeat
+```
+
+⛔ **ONE AXIS PER QUERY.** The heartbeat is an evidence field of `evaluate`
+(`Evidence.heartbeat`), reached from nowhere else, and it is **refused by name**
+(`heartbeat-on-session-query`) when the query also carries session, claim, CPU or child evidence —
+the same rule the log axis follows (§13.5), because an added axis that resolves such a query
+DISCARDS what the query carried (#1777 B7). The refusal is symmetric: a log query that also carries
+a heartbeat is refused by the log arm. A caller with both questions asks them separately.
+
+**What this does NOT do: change any live lane's disposition, and feed itself.** It adds the input
+and the two-sample rule; wiring a *reader* that polls `task_status` twice and hands the pair in is a
+separate change (the same boundary §13.5 states for the log axis), and `lane_liveness.py`'s
+population does not consult heartbeats today. Declared, not silently assumed: a lane is still read
+by the scheduled report exactly as it was before this input existed.

@@ -138,6 +138,34 @@ Acquisition lives in the sibling ``claim_lanes.py`` (a driver, never a second
 opinion); why a lane can be live and invisible, and the recovery procedure, are
 documented in ``docs/ops/fleet-liveness.md``.
 
+THE TASK CHILD'S OWN ACTION (#4106) — WHY ONE `tool_age_max` READING IS NONE
+---------------------------------------------------------------------------
+A `task` child reports, every tick, how long its OLDEST in-flight tool call has
+been open (`tool_age_max_ms`, ``extensions/task-heartbeat.ts``). That number is
+the only signal that separates *working* from *stuck* for a child, and it was in
+none of this module's inputs, so readers fell back to transcript mtime and pid
+presence — which answer neither question. `#3987` recorded **three** false
+`wedged` verdicts in ONE session, each derived from a different wrong signal
+(no child process; 26 min with no file change; 145 min with a clean `git status`
+— the last was the state AFTER its commit).
+
+The discriminator is not the age, it is the **change between two of them**:
+``116 min → 18 s`` means the call ENDED and a new one started. A single reading
+cannot distinguish "still running" from "just started", which is exactly the
+error that was made three times. So this axis (`Evidence.heartbeat`, decided in
+``evaluate`` and nowhere else) requires **two samples**, decides on the last
+pair, and abstains otherwise:
+
+    some early sample, then a DROP        → `running-quiet` / `tool-age-reset`
+    two samples, no drop, past the backstop → `wedged` / `tool-age-open-stable`
+    two samples, no drop, under it         → `unknown` / `tool-age-open-pending`
+    one sample                             → `unknown` / `tool-age-single-sample`
+    nothing readable                       → `unknown` / `heartbeat-unreadable`
+
+The bound is the watchdog's OWN age backstop (``tool_stall_ms``, 4 h at the 6 h
+cap), never a number invented here, so a merely-long tool call reads `pending`
+and never `wedged` — quiet is not a stall until the watchdog itself would cut.
+
 THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
 ---------------------------------------------------------------------
 * **``wedged`` requires a POSITIVELY OPEN turn** (#1254): frozen past the
@@ -225,6 +253,9 @@ __all__ = [
     "ClaimRead",
     "CLAIM_REASONS",
     "claim_verdict",
+    "HeartbeatRead",
+    "gather_heartbeat",
+    "parse_heartbeat_samples",
     "Evidence",
     "CpuSample",
     "ChildEvidence",
@@ -751,6 +782,44 @@ class ChildEvidence:
                 "grew": self.grew, "source": self.source}
 
 
+@dataclass(frozen=True)
+class HeartbeatRead:
+    """The task child's OWN `tool_age_max` readings, in order — the #4106 axis.
+
+    ``tool_age_max_ms`` is how long the child's OLDEST in-flight tool call has been
+    open (``extensions/task-heartbeat.ts``, surfaced by `task_status` as
+    ``heartbeat.tool_age_max_ms``). It is the ONE number that separates *working*
+    from *stuck*, and **one reading of it answers nothing**: 116 minutes is "still
+    running" if the previous reading was 90 minutes and "just started" if the
+    previous reading was 130. #3987 is the measured cost — three false `wedged`
+    verdicts in one session, each inferred from a single reading.
+
+    So ``samples`` is an ORDERED tuple and **two are required** before this axis may
+    say anything. The decision is the LAST PAIR, and it is asymmetric on purpose:
+
+      * a **drop** ⇒ the call that was open ENDED and the child moved on — positive
+        liveness evidence (``tool-age-reset``, → ``running-quiet``).
+      * **no drop** ⇒ the same call is still open. Past the watchdog's own age
+        backstop (:func:`tool_stall_ms`) that is ``wedged``; short of it the
+        reading is PENDING and abstains (``tool-age-open-pending``), because
+        "quiet" is not a stall until the watchdog itself would cut.
+
+    ``readable`` is the load-bearing field, exactly as in :class:`ClaimRead`:
+    ``False`` means the source could not be consulted, or carried no `tool_age`
+    token at all. That is an ABSTENTION — never ``0 ms``, and never a verdict
+    inferred from silence.
+
+    ``hard_cap_ms`` is the cap the backstop is DERIVED from (:func:`tool_stall_ms`),
+    so this axis cites the watchdog's bound instead of inventing a second one.
+    """
+
+    readable: bool = False
+    samples: Tuple[int, ...] = ()
+    source: str = ""
+    hard_cap_ms: int = HARD_CAP_MS
+    detail: str = ""
+
+
 @dataclass
 class Evidence:
     """Everything a verdict may rest on. Absent fields are ``None``/defaults.
@@ -787,6 +856,13 @@ class Evidence:
     # caller explicitly says "this is a log lane" (pinned by a test AND a
     # mutation, the same shape as the claim axis).
     log_read: Optional[LogRead] = None
+    # The task child's own `tool_age_max` readings (#4106). ``None`` for every caller that has not
+    # asked this question, so the axis is INERT unless supplied (pinned by a test AND a mutation,
+    # the same shape as the claim and log axes). Like the log axis it is a SEQUENTIAL ALTERNATIVE —
+    # one task child's own evidence, answering "did that child's current action finish?" — and a
+    # query that carries it TOGETHER with session/claim/CPU evidence is refused by name rather than
+    # resolved by whichever arm runs first (the #1777 B7 masking defect, on a third axis).
+    heartbeat: Optional["HeartbeatRead"] = None
     # ── tree STEP 2 (CPU-time delta) and STEP 3 (child in flight) ────────────────────────────────
     # ⛔ These two slots exist because the decision tree's steps 2 and 3 had NO home in this module
     # (inventory `docs/ops/orchestrator-mcp-inventory.md` §4.1, F1): they lived only in
@@ -1946,6 +2022,34 @@ def _n(v) -> str:
     return "?" if v is None else str(v)
 
 
+def axis_masking(ev: "Evidence", *, heartbeat: bool = True) -> bool:
+    """Does this query carry evidence from an axis OTHER than the one being asked?
+
+    The refusal every added axis shares (#1777 B7): an added axis that resolves a query which
+    ALSO carries session/claim/CPU evidence DISCARDS that evidence — and when the added read is a
+    convicting one (`frozen`, `wedged`), it does worse than mask: it convicts a lane on evidence
+    it threw away. So the answer is a refusal BY NAME, never "whichever arm runs first".
+
+    ⛔ AN ABSTENTION IS EVIDENCE TOO (T55). `ps_ok=False` / `store_ok=False` are the session axis
+    answering `unknown/ps-unreadable` / `unknown/store-unreadable`, so they are listed here for the
+    same reason the positive fields are.
+
+    ⛔ ONE IMPLEMENTATION, TWO CALLERS. The refusal is a rule, so it is written once and asked
+    twice; a second copy is both a second contract for one rule and a live hazard in this repo,
+    because the mutation harness keys on EXACT source text — a duplicated block makes a pinned
+    mutation's anchor ambiguous, and `str.replace(..., 1)` then retargets the FIRST arm, so the
+    mutation re-introduces its defect in the wrong place and its test goes green. `heartbeat=False`
+    is the asked-axis exemption: the heartbeat arm must not refuse the very field it was asked about.
+    """
+    if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \
+            or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \
+            or ev.tool is not None or ev.jsonl_turn is not None \
+            or ev.cpu is not None or ev.child is not None \
+            or not ev.ps_ok or not ev.store_ok:
+        return True
+    return bool(heartbeat and ev.heartbeat is not None)
+
+
 def evaluate(ev: Evidence) -> Verdict:
     """The verdict function. Pure: no I/O, no clock, no signals.
 
@@ -1981,16 +2085,63 @@ def evaluate(ev: Evidence) -> Verdict:
         # supplied CPU delta or in-flight child — the `#1777 B7` shape reconstructed
         # yet again, this time by the merge itself. A `None` slot is NOT evidence, so
         # this only fires on a caller who actually supplied one.
-        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \
-                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \
-                or ev.tool is not None or ev.jsonl_turn is not None \
-                or ev.cpu is not None or ev.child is not None \
-                or not ev.ps_ok or not ev.store_ok:
+        if axis_masking(ev):
             return Verdict(
                 "unknown", "log-read-on-session-query",
                 detail="a log-lane query carries ONLY log_read; supplying session, claim, "
                        "CPU or child evidence too would let this axis mask it (#1777 B7)")
         return log_lane_verdict(ev.log_read)
+
+    # (0b) THE HEARTBEAT AXIS (#4106) — did the TASK CHILD's current action finish?
+    #
+    #      Same shape as the log axis above, and for the same reason: this is a SEQUENTIAL
+    #      ALTERNATIVE, decided here and nowhere else, and a query carrying it TOGETHER with
+    #      another axis is REFUSED BY NAME rather than resolved by whichever arm is checked
+    #      first — that would be the #1777 B7 masking defect rebuilt on a third axis.
+    #
+    #      ⛔ THE TWO-SAMPLE REQUIREMENT IS THE WHOLE FIX. `tool_age_max` alone cannot
+    #      distinguish "still running" from "just started": #3987 read it as one number three
+    #      times and called a WORKING child wedged three times (no child process — an `edit`
+    #      writes in-process; 26 min with no file change — a test suite running; 145 min with a
+    #      clean `git status` — the state AFTER its commit). The decision is the LAST PAIR, and
+    #      a single sample is the abstention the doctrine already defines, never a verdict.
+    if ev.heartbeat is not None:
+        if axis_masking(ev, heartbeat=False):
+            return Verdict(
+                "unknown", "heartbeat-on-session-query",
+                detail="a heartbeat query carries ONLY heartbeat evidence; supplying session, "
+                       "claim, CPU or child evidence too would let this axis mask it (#1777 B7)")
+        hb = ev.heartbeat
+        where = (" source=%s" % hb.source) if hb.source else ""
+        # Absent evidence ABSTAINS — never alive, never dead. "The child said nothing about its
+        # tools" is not "the child has no tool open".
+        if not hb.readable or not hb.samples:
+            return Verdict("unknown", "heartbeat-unreadable",
+                           detail=(hb.detail or "no tool_age_max reading") + where)
+        if len(hb.samples) < 2:
+            return Verdict(
+                "unknown", "tool-age-single-sample",
+                detail="samples=%s%s (ONE reading cannot distinguish \"still running\" from "
+                       "\"just started\"; supply a second)"
+                       % (",".join(str(s) for s in hb.samples), where))
+        prev, last = hb.samples[-2], hb.samples[-1]
+        bound = tool_stall_ms(hb.hard_cap_ms)
+        seen = ("samples=%s prev=%d last=%d bound=%dms%s"
+                % (",".join(str(s) for s in hb.samples), prev, last, bound, where))
+        # A DROP is the movement itself: the oldest open call ended and the child took the next
+        # step. It is positive LIVENESS evidence, so it can never be a wedge.
+        if last < prev:
+            return Verdict("running-quiet", "tool-age-reset",
+                           detail=seen + " — the open call ENDED and the child moved on")
+        # No drop across the pair: the SAME call is still open. Only the watchdog's own age
+        # backstop may turn that into a wedge — a long tool call is exactly what a working child
+        # looks like, and the fleet's rule is "no proof ⇒ not wedged".
+        if _exceeds(last, bound):
+            return Verdict("wedged", "tool-age-open-stable",
+                           detail=seen + " — the same call is still open past its age backstop")
+        return Verdict("unknown", "tool-age-open-pending",
+                       detail=seen + " — the same call is still open, UNDER its backstop: "
+                              "pending, not yet a stall")
 
     # (1) Evidence availability. A failed read abstains with a NAMED reason —
     #     never a guessed verdict, and never `dead` (C3, T12).
@@ -2128,6 +2279,74 @@ def evaluate(ev: Evidence) -> Verdict:
     if not turn.stalled:
         return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)
     return Verdict("wedged", turn.reason, holder_pid=holder.pid, detail=turn.detail)
+
+
+# ── the heartbeat axis (#4106): acquisition, never a second opinion ───────
+_HEARTBEAT_TOOL_AGE_RE = None
+
+
+def _heartbeat_tool_age_re():
+    """The three spellings of ONE number, compiled lazily (the module imports stay cheap)."""
+    global _HEARTBEAT_TOOL_AGE_RE
+    if _HEARTBEAT_TOOL_AGE_RE is None:
+        import re as _re
+        # ⛔ A TOKEN LONGER THAN 10 DIGITS IS NOT A READING. `int()` would accept a 40-digit
+        # value happily, so a shape-drifted line would become an AGE and could clear the 4 h
+        # backstop in one step — the same rule the log census states for its numeric cells
+        # (`_opt`'s `maxdigits`). `\d{1,10}` plus a digit lookahead DROPS the over-long token
+        # rather than truncating it to its first ten digits.
+        _HEARTBEAT_TOOL_AGE_RE = _re.compile(
+            r"(?:tool_age_max_ms|tool_age_max|toolAgeMaxMs)[\"']?\s*[=:]\s*[\"']?(\d{1,10})(?![0-9])")
+    return _HEARTBEAT_TOOL_AGE_RE
+
+
+def parse_heartbeat_samples(text: str) -> List[int]:
+    """Every `tool_age_max` reading in ``text``, in FILE ORDER — the #4106 acquisition door.
+
+    One pattern for the three shapes that all carry the SAME number, because a reader should not
+    have to know which one they copied:
+
+      ``[task-heartbeat] tick … tool_age_max_ms=6961576``   the child's own marker
+      ``… "tool_age_max_ms": 6961576 …``                   the `task_status` JSON view
+      ``Alive state: … toolAgeMaxMs=6961576 …``            the watchdog's diagnostic line
+
+    Parsing is ACQUISITION, never a verdict: this returns numbers and nothing else, and
+    :func:`evaluate` decides what TWO of them mean. Order is preserved because the last pair is
+    the decision — sorting or de-duplicating here would destroy the only signal the axis has.
+    """
+    if not text:
+        return []
+    rx = _heartbeat_tool_age_re()
+    return [int(m) for m in rx.findall(text)]
+
+
+def gather_heartbeat(path: str) -> HeartbeatRead:
+    """Read ``path`` (``-`` = stdin) into a :class:`HeartbeatRead` — acquisition only.
+
+    A file that cannot be opened, or that carries no `tool_age` token at all, is
+    ``readable=False`` — an ABSTENTION. Never ``0 ms``: an absent reading is not a reading of
+    zero, and the whole axis exists to stop verdicts being inferred from silence.
+    """
+    if path == "-":
+        source = "stdin"
+        try:
+            text = sys.stdin.read()
+        except (OSError, ValueError) as exc:
+            return HeartbeatRead(readable=False, source=source,
+                                 detail="unreadable:stdin (%s)" % exc.__class__.__name__)
+    else:
+        source = path
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except (OSError, ValueError) as exc:
+            return HeartbeatRead(readable=False, source=source,
+                                 detail="unreadable:%s (%s)" % (path, exc.__class__.__name__))
+    samples = tuple(parse_heartbeat_samples(text))
+    if not samples:
+        return HeartbeatRead(readable=False, source=source,
+                             detail="no tool_age_max token in %s" % source)
+    return HeartbeatRead(readable=True, samples=samples, source=source)
 
 
 # ── the process boundary (scripts/lib/pid-identity.sh) ───────────────────
@@ -3621,6 +3840,14 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
     return 0 if verdict.state != "unknown" else 3
 
 
+def _usage() -> str:
+    return ("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
+            "       liveness.py --heartbeat FILE|- [--json]     (| --tool-age-ms N repeated)\n"
+            "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
+            "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
+            "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if any(a in ("--log", "--log-census") for a in argv):
@@ -3629,6 +3856,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     store = DEFAULT_STORE
     sessions_dir = DEFAULT_SESSIONS_DIR
     as_json = False
+    tool_ages: List[int] = []
+    heartbeat_path: Optional[str] = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -3640,14 +3869,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sessions_dir = argv[i + 1]; i += 2; continue
         if arg == "--json":
             as_json = True; i += 1; continue
-        print("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
-              "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
-              "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
-              "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]",
+        # ── #4106: the task child's own `tool_age_max`, TWO samples minimum ────────────────
+        # `--tool-age-ms` is REPEATABLE on purpose: the pair IS the evidence, so a flag that
+        # could hold only one reading would make the pre-fix error the only expressible query.
+        if arg == "--tool-age-ms" and i + 1 < len(argv):
+            try:
+                age = int(argv[i + 1])
+            except ValueError:
+                print("liveness.py: --tool-age-ms must be an integer (milliseconds)",
+                      file=sys.stderr)
+                return 2
+            # A negative age is not a reading. Clamping it to 0 would silently rewrite the
+            # caller's sample into the "no tool in flight" one.
+            if age < 0:
+                print("liveness.py: --tool-age-ms must be >= 0", file=sys.stderr)
+                return 2
+            tool_ages.append(age); i += 2; continue
+        # `--heartbeat-json` is an accepted ALIAS of `--heartbeat`: the issue that asked for
+        # this input named it that way, and both read the same shapes (see
+        # `parse_heartbeat_samples`) — one number, two spellings, never two code paths.
+        if arg in ("--heartbeat", "--heartbeat-json") and i + 1 < len(argv):
+            heartbeat_path = argv[i + 1]; i += 2; continue
+        print(_usage(), file=sys.stderr)
+        return 2
+
+    if heartbeat_path is not None and tool_ages:
+        # ⛔ REFUSE, rather than invent an order for, two sources of the SAME samples: the axis
+        # decides on the LAST PAIR, so a silent concatenation would let the flag order change
+        # the verdict.
+        print("liveness.py: --tool-age-ms and --heartbeat both supply `tool_age_max` samples; "
+              "pass one (repeat --tool-age-ms, or one file carrying both readings)",
               file=sys.stderr)
         return 2
+    if heartbeat_path is not None or tool_ages:
+        # `sid` is passed THROUGH, not merged: `evaluate` refuses a query that carries two axes
+        # by name (`heartbeat-on-session-query`), which is this module's rule for every added
+        # axis. A caller with both questions asks them separately.
+        hb = (gather_heartbeat(heartbeat_path) if heartbeat_path is not None
+              else HeartbeatRead(readable=True, samples=tuple(tool_ages), source="flag"))
+        verdict = evaluate(Evidence(heartbeat=hb, sid=sid or ""))
+        if as_json:
+            print(json.dumps(verdict.to_dict(), sort_keys=True))
+        else:
+            print("%s %s%s" % (verdict.state, verdict.reason,
+                               "" if not verdict.detail else " " + verdict.detail))
+        return 0 if verdict.state != "unknown" else 3
+
     if not sid:
-        print("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]", file=sys.stderr)
+        print(_usage(), file=sys.stderr)
         return 2
     verdict = evaluate(gather(sid, store_path=store, sessions_dir=sessions_dir))
     if as_json:
