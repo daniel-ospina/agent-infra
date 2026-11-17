@@ -366,12 +366,18 @@ if [ -z "${FIXTURE_NO_MUTATION:-}" ] && [ -f "${REVIEWER_SRC:-/nonexistent}" ]; 
     if [ "${FIXTURE_MUTATION_EXEMPT:-0}" = "1" ]; then
       printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and adds no executable assertion.\n\n' > "$TMP/mutation-section.md"
     else
+      # ⛔ THE ROW IS THE REVIEWER'S OWN, AND DELIBERATELY NOT A COPY OF THE CONTRACT'S WORKED
+      # EXAMPLE (agent-infra#3987, P1 at a8767f401). It used to be a near-copy of the canonical
+      # `scripts/x.sh:120` row — i.e. the suite's "compliant reviewer" pasted back the row the prompt
+      # hands out, and §BK asserted that as GREEN. That is the paste-back the seam now refuses, so a
+      # fixture built on it would have been asserting the false PASS. It names this suite's own new
+      # assertion instead, which is what an honest reviewer writes.
       cat > "$TMP/mutation-section.md" <<'MUT'
 ## MUTATION ATTRIBUTION
 
 | assertion | mutant (the edit that reverts the fix) | reddened row | observed |
 |---|---|---|---|
-| `scripts/x.sh:120` — the gate refuses an empty brief | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `REFUSED with 80 (got 0)`, rc=1 |
+| `tests/review-pr/run.sh:3487` — the paste-back arm refuses the contract's own row | `mv rows.txt` | `§BK paste-back` | `RED`, rc=11 |
 
 MUT
     fi
@@ -3484,8 +3490,12 @@ run "$SRC" 2284
 _miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
 [ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "…and the POSTED artifact SATISFIES record-review.sh's own parser (rc=$_miss_rc, --mutation-missing='${_miss:-<accepted>}') — so its mode-6 refusal is unreachable for this run"
 grep -q '^## MUTATION ATTRIBUTION' "$TMP/comment.md" 2>/dev/null; ck $? "…the section is in the artifact with its heading intact"
-grep -qF 'the gate refuses an empty brief' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the REVIEWER's own rows, published verbatim (the claim is its own, never re-worded by this script)"
-grep -qF 'rc=80/rc=0' "$TMP/comment.md" 2>/dev/null; ck $? "…including the mutant column that names the edit reverting the behaviour"
+grep -qF 'the paste-back arm refuses the contract' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the REVIEWER's own rows, published verbatim (the claim is its own, never re-worded by this script)"
+grep -qF 'mv rows.txt' "$TMP/comment.md" 2>/dev/null; ck $? "…including the mutant column that names the edit reverting the behaviour"
+# ⛔ AND THE FIXTURE'S OWN ROW IS NOT THE CONTRACT'S: this pins that the "compliant reviewer" below
+# authors its claim instead of echoing the worked example the prompt hands out — the shape that let
+# the pass-by-paste-back false PASS hide behind a GREEN suite (P1 at a8767f401).
+grep -qF 'the gate refuses an empty brief' "$TMP/comment.md" 2>/dev/null; [ $? -ne 0 ]; ck $? "…and the contract's own worked example row is NOT what it published (a paste-back would be refused, not recorded)"
 case "$(cat "$TMP/comment.md" 2>/dev/null)" in *"a non-blocking style nit"*) rc=1;; *) rc=0;; esac
 ck $rc "…while the reviewer's P3 prose stays OUT of the evidence body (the recorder's veto scans it)"
 
@@ -3498,6 +3508,12 @@ case "$BP" in *"NO NEW ASSERTIONS:"*) rc=0;; *) rc=1;; esac
 ck $rc "  …including the exemption line for a diff that adds no assertion (the docs-only class)"
 case "$BP" in *"reddened row"*) rc=0;; *) rc=1;; esac
 ck $rc "  …and the canonical column names, taken from brief-gate.sh --mutation-section (ONE text, no second template)"
+# ⛔ AND THE PROMPT MUST SAY THE CONTRACT IS A SHAPE (P1, fresh review at a8767f401). The producer half
+# of the paste-back: the prompt hands a LIVE, already-valid row, so unless it says the row is an
+# EXAMPLE to be replaced, the literal-minded reviewer copies it — which is what §BL now refuses. A
+# seam that refuses a copy it never warned against is the false block this assertion prevents.
+case "$BP" in *"carries a FILLED worked row as an example"*) rc=0;; *) rc=1;; esac
+ck $rc "  …and tells the reviewer the worked row is an EXAMPLE of the columns, not a template to copy back (§BL refuses the copy)"
 # The prompt must be the GATE'S OWN TEXT, not a paraphrase: render the gate and compare a sentence
 # while one that only exists in the canonical block (a paraphrase drops it, and a shape the recorder
 # does not recognise is the #3442 drift this reuses the verb to avoid).
@@ -3710,6 +3726,137 @@ else
 fi
 reset
 # ══ end §BK ══
+
+# ── §BL WHAT THE PARSER ACCEPTS IS NOT EVIDENCE (agent-infra#3987, P1+P3 at a8767f401) ──────
+# The three findings the third review left open are all the same shape: a check that asks the
+# RECORDER's parser for a yes/no cannot tell a claim from a COPY of the shape the prompt handed out,
+# and it cannot tell a clean verdict from one whose wording trips the recorder's own veto. So the
+# seam owns the parts only it can know — the text it composed, and the bytes it is about to publish —
+# and each arm below is driven against BOTH a positive and (where the arm can be switched off) the
+# mutant that shows it is what refuses.
+echo; echo "§BL provenance: the contract's own row is not the reviewer's claim, and the recorder's veto is read before posting"
+
+# (1) THE PASTE-BACK THE FORMATTING RULES CANNOT SEE. The prompt hands the reviewer a LIVE, already-
+# valid row at column 0 and the parser answers EMPTY (accepted) for it — measured above — so
+# "here is the shape I was given" is a false PASS by one keystroke. The transcript below is the
+# REAL `--mutation-section` output, byte for byte: not a hand-written approximation of it, so this
+# arm cannot go stale as the canonical block is edited.
+reset; FIXTURE_NO_MUTATION=1
+# ⛔ THE ROW ITSELF IS TAKEN FROM THE REAL `--mutation-section`, not retyped: the arm under test is a
+# text comparison against exactly what this run hands out, so a hand-approximated fixture would prove
+# a copy of the fixture. The transcript is a TABLE, which is what a reviewer actually copies — the
+# surrounding prose is a contract, the table is the answer it asks for.
+CANON_ROW="$(bash "$GATE_SH" --mutation-section 2>/dev/null | grep -F 'scripts/x.sh:120' | head -1)"
+[ -n "$CANON_ROW" ]; ck $? "the contract still carries a worked example row to paste back (the arm below needs one)"
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n%s\n\nCLEAN\n' \
+  "$CANON_ROW" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "an UNFENCED paste-back of the contract's worked row is REFUSED, not minted (rc=$(rc_of), want 11)"
+no_comment; ck $? "  …nothing posted as a review artifact"
+no_record; ck $? "  …and no record minted on the harness's own worked row"
+err_has "REPUBLISHES THE CONTRACT'S OWN WORKED EXAMPLE ROW"; ck $? "  …and the refusal names the provenance of the row"
+err_has "PASTE-BACK"; ck $? "  …as the reviewer-side paste it is"
+# …and the SAME transcript proves the parser alone would have passed it: this is the measurement the
+# arm rests on, taken on the artifact the MUTANT below actually publishes.
+PB="$TMP/mutant-no-pasteback.sh"
+cp "$SRC" "$PB"; chmod +x "$PB"
+sed 's|^  _pb_rows=.*|  _pb_rows=""|' "$SRC" > "$PB"
+if cmp -s "$SRC" "$PB"; then
+  fail "the paste-back mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n%s\n\nCLEAN\n' \
+    "$CANON_ROW" > "$TMP/reviewer-out"
+  run "$PB" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT without the provenance arm RECORDS the paste-back (rc=$(rc_of)) - so this arm is what refuses it"
+  _miss_rc=0; _miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _miss_rc=$?
+  [ "$_miss_rc" -eq 0 ] && [ -z "$_miss" ]; ck $? "  …and record-review.sh's OWN parser ACCEPTS that posted artifact (rc=$_miss_rc, ='${_miss:-<accepted>}') - the false PASS, measured"
+grep -qF 'scripts/x.sh:120' "$TMP/comment.md" 2>/dev/null; ck $? "  …carrying the contract's worked row (scripts/x.sh:120) as the reviewer's evidence"
+fi
+reset
+
+# (2) THE RECORDER'S UNCONDITIONAL VETO PHRASES. The MUTATION ATTRIBUTION section is published
+# VERBATIM in the evidence body, and `record-review.sh` arm (1) refuses a clean mint on a phrase
+# alone - so a mutation row legitimately using words like "unresolved issues" would buy a review
+# whose record step rejects it AFTER the artifact was published. The seam must refuse PRE-POST and
+# name the collision, because the recorder's arm may not be weakened and the reviewer's claim may
+# not be re-worded.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` - the guard stops a retry storm leaving unresolved issues behind | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a reviewer row carrying a recorder VETO phrase is refused BEFORE posting (rc=$(rc_of), want 11)"
+no_comment; ck $? "  …so the PR never carries an artifact the recorder rejects"
+no_record; ck $? "  …and nothing is recorded"
+err_has "UNCONDITIONAL veto phrases"; ck $? "  …naming the recorder's own arm, not the reviewer's finding"
+err_has "WORDING COLLISION"; ck $? "  …and calling it what it is: a collision, so the operator re-runs instead of re-reading the code"
+# MUTATION: without the pre-post scan the same transcript POSTS (and only the real recorder would
+# have refused it, after the money was spent - the #1964 false-diagnosis shape).
+VT="$TMP/mutant-no-veto-scan.sh"
+cp "$SRC" "$VT"; chmod +x "$VT"
+sed 's|^  _vt_hit=.*|  _vt_hit=""|' "$SRC" > "$VT"
+if cmp -s "$SRC" "$VT"; then
+  fail "the veto-scan mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` - the guard stops a retry storm leaving unresolved issues behind | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$VT" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT posts it instead (rc=$(rc_of)) - so the pre-post scan is what refuses it"
+  grep -qiE 'unresolved[[:space:]]+issues' "$TMP/comment.md" 2>/dev/null; ck $? "  …the veto phrase reaches the published evidence body, where the recorder's arm (1) would refuse it"
+fi
+reset
+
+# (3) THE MIRROR CANNOT DRIFT SILENTLY. The seam carries a COPY of record-review.sh's arm-(1) pattern
+# (there is no way to import a regexp from another script), so the copy is a tripwire: it must be
+# BYTE-IDENTICAL to the arm the recorder runs, and a token added there fails here instead of quietly
+# leaving a phrase the seam will publish and the recorder will reject.
+REC_LINE="$(grep -F "grep -qiE '" "$ROOT/scripts/record-review.sh" 2>/dev/null | grep -F 'auto-fix' | head -1)"
+REC_PAT="${REC_LINE#*grep -qiE \'}"; REC_PAT="${REC_PAT%%\'*}"
+SEAM_LINE="$(grep -E "^RECORDER_VETO_RE='" "$SRC" 2>/dev/null | head -1)"
+SEAM_PAT="${SEAM_LINE#RECORDER_VETO_RE=\'}"; SEAM_PAT="${SEAM_PAT%\'}"
+[ -n "$REC_PAT" ]; ck $? "the recorder's arm-(1) pattern is still extractable from record-review.sh (the mirror's source of truth)"
+[ -n "$SEAM_PAT" ] && [ "$SEAM_PAT" = "$REC_PAT" ]; ck $? "…and the seam's copy is BYTE-IDENTICAL to it (seam='$SEAM_PAT')"
+
+# (4) THE TWO PREFLIGHT REFUSALS THE NON-VACUITY VALIDATOR ADDS (P3, fresh review). Neither was
+# asserted, and §AY's pin made the not-found branch UNREACHABLE from this suite: every other scenario
+# either pins `AGENT_INFRA_PATH="$ROOT"` or dies earlier at the recorder check. Both refuse BEFORE a
+# reviewer is paid for - which is the whole point of resolving the validator in the preflight.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$RESOLVE/none" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  env -u AGENT_INFRA_PATH bash "$RESOLVE/sib/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "9" ]; ck $? "no brief-gate.sh in ANY ladder root: the run refuses before paying for a review (rc=$(rc_of), want 9)"
+err_has "brief-gate.sh not found"; ck $? "  …naming the missing validator and every root it looked in"
+no_reviewer; ck $? "  …and no reviewer was spawned"
+no_record; ck $? "  …nothing recorded"
+# …and the SAME ladder branch is shown reaching the recorder first when the gate IS present, so the
+# assertion above cannot be satisfied by a seam that refuses everything for the wrong reason.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$RESOLVE/none" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  AGENT_INFRA_PATH="$ROOT" bash "$RESOLVE/sib/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "0" ]; ck $? "  …while the same tree WITH the gate reachable records (rc=$(rc_of)) - the refusal is the missing gate's"
+# A PRESENT-BUT-UNUSABLE GATE: the copy that predates #3442 answers 78 for the verb, and a copy that
+# answers EMPTY is worse - every shape it renders is missing. Both are HARNESS SKEW, refused unpaid.
+SKEW="$TMP/skew"; rm -rf "$SKEW"
+for _kind in rc78 empty; do
+  mkdir -p "$SKEW/$_kind/scripts/orchestrator-harness" "$SKEW/run-$_kind"
+  if [ "$_kind" = "rc78" ]; then
+    printf '#!/usr/bin/env bash\nexit 78\n' > "$SKEW/$_kind/scripts/orchestrator-harness/brief-gate.sh"
+  else
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$SKEW/$_kind/scripts/orchestrator-harness/brief-gate.sh"
+  fi
+  chmod +x "$SKEW/$_kind/scripts/orchestrator-harness/brief-gate.sh"
+  cp "$SRC" "$SKEW/run-$_kind/review-pr.sh"; chmod +x "$SKEW/run-$_kind/review-pr.sh"
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+    REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AGENT_INFRA_PATH="$SKEW/$_kind" \
+    bash "$SKEW/run-$_kind/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+  [ "$(rc_of)" = "9" ]; ck $? "a brief-gate.sh that answers '$_kind' for --mutation-section refuses the run unpaid (rc=$(rc_of), want 9)"
+  err_has "could not render the canonical MUTATION ATTRIBUTION block"; ck $? "  …naming the verb that could not be rendered"
+  err_has "HARNESS SKEW"; ck $? "  …and classifying it as the provisioning fault it is ($_kind)"
+  no_reviewer; ck $? "  …no reviewer paid for ($_kind)"
+done
+unset _kind
+reset
+# ══ end §BL ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
