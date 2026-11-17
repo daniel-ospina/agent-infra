@@ -251,8 +251,9 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # allowance derived below costs `IMPL_RESERVE_S + MAX_WATCH x POLL_S` — at the shipped defaults
 # `900 + 247 x 120 = 30540 s` on the 36000 s clock agent-infra#4034 set — so the largest check wait this
 # clock can carry is `36000 - 30540 = 5460 s`. ⛔ THAT CEILING IS UNCHANGED BY THE 5x, and the reason is
-# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock buys supervision chunks,
-# not wait. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
+# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock raises the DESIGN
+# supervision budget and never the wait — and that budget is a FLOOR, not what a lane is handed: the
+# `_idle_fit` clamp below gives 22 chunks (2640 s) on either clock (see its own note). The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
 # run-duration p95 5612 s), so NO value of `WAIT_S` that fits this lane's clock can cover the tail — the
 # 29 runs that exceeded the OLD 7200 s clock could not have been waited out by ANY setting of this
 # constant, and raising `WAIT_S` past 5460 s would only eat the
