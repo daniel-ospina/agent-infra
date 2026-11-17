@@ -99,7 +99,8 @@ suite reports **200 passed, 8 failed** — one arm per fail-open spelling above.
 
 ⛔ `pi-bootstrap/tests/test-cell-install.sh` **exceeded a 900 s and then a 1 200 s window on this box and was
 not run to its end**: the partial run logged in `~/.pi/agent/state/4034-round2/cell-install.log` holds
-**179 `ok:` lines and 0 failures** and was still going when the window closed. It is DISCLOSED as
+**190 `ok:` lines and 0 failures** — and was STILL GROWING when the window closed, so the number is a
+floor taken at one instant, not a total (re-read the log to see where it ended). It is DISCLOSED as
 not-a-pass rather than reported green. The file I touched in `pi-bootstrap/` is one array entry in
 `setup.sh`, and the farm arm that reads that array (`test-setup-no-nesting.sh`) DID pass — but
 `test-cell-install.sh` is unmeasured by this lane and a reviewer should treat it as such.
