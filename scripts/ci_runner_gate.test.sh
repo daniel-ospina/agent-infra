@@ -275,13 +275,15 @@ case "$*" in
     # could not run at all. The same defect was fixed for the queue read one commit earlier; this is its
     # sibling, and it is the read that MINTS the ghost.
     # `GH_JOBS_BODY` may carry several page documents separated by `;` (the shape a paginated read
-    # produces), so the hook can serve a multi-page body as well as a single one. ⛔ NOT PINNED YET: the
-    # gate's per-page count rows are SUMMED (`jobs_total=$((jobs_total + page_jobs))`) and no arm kills a
-    # mutant that overwrites instead of summing — attempted here and reverted, because with two docs in
-    # one response the caller's own parse takes the FIRST `#jobs` row and reads the second as a label
-    # line, so the arm could not distinguish the two behaviours. The sum is therefore exercised (the
-    # page-2 jobs fixtures serve multi-page bodies) but not mutation-pinned; recorded on #4113 rather
-    # than covered by an arm that passes for the wrong reason.
+    # produces), so the hook can serve a multi-page body as well as a single one — the one arm that does
+    # is `ledger-jobs-sum` below, which is why the loop is exercised at all.
+    # ⛔ THE SUM IS PINNED, AND THE FIRST ATTEMPT AT THIS COMMENT WAS WRONG (review cycle 8, P1 — the
+    # claim that a multi-page body "cannot distinguish" summing from overwriting because the caller reads
+    # the second `#jobs` row as a label line is FALSE: `run_queued_demand` consumes EVERY page row in its
+    # own loop and emits exactly ONE summed row, so the caller never sees a second one. What actually made
+    # the first attempt vacuous was the FIXTURE — it wrote jq syntax (`[range(100)|{}]`) inside a JSON
+    # document, so the body did not parse and the arm passed on a read that failed. With real JSON and the
+    # jobs on the FIRST page (an empty LAST page is what separates the two behaviours) the mutant dies.
     if [ -n "${GH_JOBS_BODY:-}" ]; then
       _rest="$GH_JOBS_BODY"
       while :; do
@@ -1589,10 +1591,28 @@ run_gate ledger-null-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:1
   GH_JOBS_BODY='{"total_count":0,"jobs":null}' --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
   "a body whose .jobs is null remembers NOTHING (an absent reading is not a zero)"
+# ⛔ AND THE READ MUST HAVE BEEN *READABLE* (review cycle 8, P1 — measured). "No entry" is satisfied
+# IDENTICALLY by a correct empty reading and by a jobs read that FAILED, so this arm passed for a jq
+# program that raised on every call (`(.jobs)[]` on null → rc 5) even after the double began propagating
+# the status: propagation with no consumer is still coverage that cannot fail. The discriminating fact is
+# the VERDICT — an unmeasured-but-readable body still certifies the queue empty (nothing was remembered),
+# while a failed read refuses and says so.
+assert_contains "$OUT" "nothing is waiting for a runner" \
+  "…and the read was READABLE: an unmeasured job list still certifies empty (a RAISED program refuses instead, which is what makes this assert bite)"
 run_gate ledger-empty-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
   GH_JOBS_BODY='{"total_count":0,"jobs":[]}' --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "1" \
   "…while an EMPTY job list is the real ghost shape and IS remembered (so the arm is not vacuous)"
+# ⛔ AND THE PER-PAGE COUNT ROWS ARE SUMMED, NOT OVERWRITTEN (review cycle 8, P1). This is the arm the
+# previous commit declared impossible: jobs on page 1 + an EMPTY page 2. Sum ⇒ 2 jobs ⇒ not a ghost ⇒ no
+# entry; overwrite ⇒ the last page's 0 ⇒ a measured zero ⇒ the run is remembered as a ghost. The pages
+# must be in THIS order (the reverse is green either way: an empty first page and a busy second sum and
+# overwrite to the same number).
+echo "── #4113: the per-page job counts are SUMMED across pages, never overwritten ──"
+run_gate ledger-jobs-sum GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":2,"jobs":[{"status":"in_progress","labels":[]},{"status":"in_progress","labels":[]}]};{"total_count":0,"jobs":[]}' --
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "2 jobs on page 1 + an EMPTY page 2 is 2 jobs, NOT a zero-job ghost (overwrite would mint one)"
 
 # …and an unmeasured total from the SHAPE double behaves the same way (the shell half): no page row, no
 # entry, whatever the reason the row is missing.
