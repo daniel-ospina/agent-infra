@@ -469,10 +469,13 @@ ck "§Z no projection hands a payload VARIABLE to python as a value" \
 # to be skipped by content), so a marker that drifted past 8 KiB would let the walk exec another
 # interposer: the measured 1,700 processes in 6 s, `fork: Resource temporarily unavailable`. The
 # window is part of the contract now, so a future edit cannot silently break it.
-# ⛔ THE PAIR IS THE CONTRACT, NOT EVERY FILE CALLED gh: `gh-rest/gh` and `gh-limit/gh` are installed
-# beside ONE `../gh-limit.py`, and each must skip the other. (`scripts/gh-shim/gh` is NOT deployed and
-# is a separate layer: its marker sits at byte 31551, outside the window its own resolver reads, and
-# it carries no depth guard — recorded on #2304, the root that made this guard necessary.)
+# ⛔ THE PAIR IS THE CONTRACT, NOT EVERY FILE CALLED gh. `gh-rest/gh` and `gh-limit/gh` are installed
+# beside ONE `../gh-limit.py`, and each must skip the other. `scripts/gh-shim/gh` (the #984 argv guard)
+# carries its marker at byte 31551 — DELIBERATELY outside this window, `extensions/review-enforcer`
+# records the reason: the documented chain is `gh-limit → argv-guard → real gh`, so the QUOTA layer
+# must resolve the guard as its child, which it can only do if the guard's marker is out of the 8 KiB
+# window gh-limit reads. ⛔ DO NOT "tidy" that position into this window: it silently removes the
+# admin-merge gate from every cell's chain (a recorded decision, `docs/ops/gh-rate-limits.md`).
 for _s in gh-rest/gh gh-limit/gh; do
   _off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
   ck "§W shim marker inside the 8 KiB resolver window: $_s (byte ${_off:-none})" \
@@ -544,6 +547,20 @@ for _c in "$TMP/shimskip:identical copy of the REST adapter" \
      "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_SPAWNPROBE4242" ] && ! has 'third gh-shim hop' "$out" \
         && ! has 'cannot locate the real gh' "$out" && echo 0 || echo 1)"
 done
+# ⛔ AND A MARKER OUTSIDE THE WINDOW IS NOT SKIPPED — that is the deliberate other half (see §W). Pin
+# it, because it decides WHICH gh a cell ends up running: measured on this change, with the argv guard
+# between the adapter and the real gh, the pre-#3998 whole-file `grep` SKIPPED the guard
+# (`gh-rest → real gh`, #984 gate bypassed) and the bounded window now EXECS it
+# (`gh-rest → gh-shim → real gh`, the documented chain).
+mkdir -p "$TMP/layerguard"
+{ printf '#!/usr/bin/env bash\n'
+  head -c 9000 /dev/zero | tr '\0' '#'          # ONE long comment line: pushes the marker past 8 KiB
+  printf '\n# harness-gh-shim-marker: past the window on purpose\nprintf "%%s\\n" "gho_GUARDCHAIN"\n'; } >"$TMP/layerguard/gh"
+chmod +x "$TMP/layerguard/gh"
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/layerguard:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" auth token 2>&1)"; _rc=$?
+ck "§P a marker PAST the 8 KiB window is NOT skipped (a layered guard stays in the chain)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_GUARDCHAIN" ] && echo 0 || echo 1)"
 
 # ── §C. THE CREDENTIAL NEVER LANDS IN AN ARTIFACT ────────────────────────────────────────
 # `gh auth token`'s STDOUT IS THE CREDENTIAL. This is the one call the drain makes every cycle, and
