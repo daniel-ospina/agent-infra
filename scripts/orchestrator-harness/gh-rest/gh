@@ -58,7 +58,10 @@ set -uo pipefail
 # costs ~150 ms, so the drain's `gh auth token` presence probe (20 s bound) answered too slowly and
 # reported `answer=UNKNOWN … no candidate can be judged from this box`: 220 occurrences,
 # `drain=DEADLOCK`, nothing dispatched or landed. Every step below is therefore a BASH BUILTIN
-# (`${SELF%/*}`, `[ -f ]`, `[ -x ]`, `-ef`, and the `read` builtin), so the walk costs ZERO forks.
+# (`${SELF%/*}`, `[ -f ]`, `[ -x ]`, `-ef`, and the `read` builtin), so on bash >= 5 — what the fleet
+# runs — the walk costs ZERO forks. ⛔ THE BASH 3.2 ARM KEEPS THE PRE-EXISTING ONE-FORK `grep` (see
+# `_is_harness_shim`): 3.2 has no `read -N` and its `read` cannot pass a NUL, so a forkless read there
+# would be a SILENT regression, not an optimisation. Unchanged cost on that host, zero forks on this one.
 # ⛔ AND NOTHING IS MEMOISED ON PURPOSE: a cached `REAL_GH` has to be invalidated on a PATH change, a
 # symlink retarget and a shim reinstall, and getting any of those wrong execs a stale or a WRONG gh.
 # Re-deriving it from the (builtin) stat calls costs microseconds and cannot go stale.
@@ -85,12 +88,12 @@ if [ "${HARNESS_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
 fi
 export HARNESS_GH_SHIM_DEPTH=$(( ${HARNESS_GH_SHIM_DEPTH:-0} + 1 ))
 _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling helper (older copies)
-  # ⛔ ONE BUILTIN READ: NO FORK, AND NEVER THE WHOLE FILE (#3998). This was `grep -qa` per candidate —
-  # one fork per PATH entry, and the candidate that usually wins is the real gh, a 41 MB compiled
-  # binary, so `grep` read all 41 MB on every call. Measured on the 41 MB binary: 25 ms of `grep`,
-  # 0.75 ms for the bounded read below (33x), and the fork it also saved costs ~150 ms on a box at
-  # load ~250. `-N` makes the window a fixed 8192 BYTES regardless of any delimiter, so a script
-  # (36 KB) and a binary behave the same way.
+  # ⛔ ONE BUILTIN READ ON BASH >= 5: NO FORK, AND NEVER THE WHOLE FILE (#3998). This was `grep -qa`
+  # per candidate — one fork per PATH entry, and the candidate that usually wins is the real gh, a
+  # 41 MB compiled binary, so `grep` read all 41 MB on every call. Measured on that binary: 25 ms of
+  # `grep` vs 0.75 ms for the bounded read below (33x), and the fork it also saved costs ~150 ms on a
+  # box at load ~250. (`-N` is NOT available on bash 3.2 and its `read` stops at a NUL, so that host
+  # keeps the `grep` arm — see the gate below; this paragraph describes the arm the fleet runs.)
   # ⛔ `-N`, NOT `-d ''`: `read` DISCARDS NUL bytes, which is exactly what makes a BINARY shim
   # identifiable — #10009's fixture is `\177ELF` + NULs + the sentinel, and a NUL-terminated read
   # stops at the first NUL and answers "not a shim" for a file that is one. That would break
@@ -107,7 +110,8 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # A `read … < file` REDIRECT is not a command substitution: it drops NULs SILENTLY (verified: no
   # bytes on stderr for the 41 MB binary), so that class cannot come back through this line.
   # `2>/dev/null` keeps an unreadable candidate from putting the SHELL's own open error on a
-  # successful call's stderr.
+  # successful call's stderr — but ONLY in the order spelled below, where the stderr discard is
+  # applied BEFORE the input redirect.
   local _f="$1" _head=""
   # ⛔ THE READ IS `read -N`, AND IT IS GATED ON THE SHELL BECAUSE THAT IS THE HONEST SHAPE. Two arms,
   # each VERIFIED on the host it serves — not a compromise, and not `read -N` everywhere:
