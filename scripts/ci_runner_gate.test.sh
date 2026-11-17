@@ -3153,13 +3153,23 @@ KEEP_STATE=1 run_gate demandblind-nosource GH_QUEUED="$BLIND_QUEUE" GH_INPROGRES
   GH_FALLBACK_N=null GH_JOBS_MODE=none \
   GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
 assert_eq "$RC" "2" "(d14) a pass with no mode read and no inference still exits 2"
-assert_contains "$OUT" "mode=unknown source=none" "(d14) the pass reached `none`: nothing was read and nothing was inferred"
+# ⛔ BACKTICKS ARE NEVER PLACED INSIDE A DOUBLE-QUOTED LABEL (review P3, measured): `"... reached \`none\`"` ran
+# `none` and `unknown` as COMMANDS on every suite run ("line 3156: none: command not found") and printed the
+# diagnostic with a hole — the identical defect this suite already pinned once at (d1). Labels are text.
+assert_contains "$OUT" "mode=unknown source=none" '(d14) the pass reached `none`: nothing was read and nothing was inferred'
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ABSENCE of a reading" \
-  "(d14) the verdict calls `unknown` the ABSENCE of a reading"
+  '(d14) the verdict calls `unknown` the ABSENCE of a reading'
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "only the SERVING inference" \
   "(d14) …and does NOT describe it as an inference that was never taken"
-assert_contains "$OUT" "NEITHER the label read NOR a job inference answered" \
-  "(d14) the log names both missing reads by their real names"
+# ⛔ THE `repair_why` SITE HAS ITS OWN ASSERTION (review P2, measured): "NEITHER the label read NOR a job
+# inference answered" is ALSO carried by the zero-write claim, so a revert of `repair_why` alone reprinted
+# "mode=unknown is only INFERRED (mode_source=none)" with all 718 assertions green. Pin the CONVERGING line
+# by its own prefix, and pin the false shape itself so it cannot re-enter from EITHER site.
+assert_contains "$OUT" "state file records mode=local but NEITHER the label read NOR a job inference answered" \
+  "(d14) the CONVERGING line names both missing reads, not a substitute"
+assert_not_contains "$OUT" "mode=unknown is only" \
+  '(d14) …and no line calls `unknown` an inference (it is the absence of one)'
+
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
