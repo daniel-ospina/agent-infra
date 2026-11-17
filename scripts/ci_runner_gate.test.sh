@@ -2980,6 +2980,12 @@ assert_contains "$OUT" "mode_source=jobs-inference" \
 # not say the recorded mode is already advertised, and it must reach the write path instead.
 assert_contains "$OUT" "could NOT read the runner labels" \
   "(d8) the pass says the label state is UNESTABLISHED instead of assuming it matches"
+# ⛔ AND THE REPAIR-REASON BRANCH THIS ARM REACHES IS PINNED BY ITS OWN SENTENCE (review P2, measured):
+# `mode` equals the recorded mode here and both came from a SUBSTITUTE, so the CONVERGING line must say
+# that — replacing this branch with `this pass measures mode=…` (publishing an INFERRED reading as a
+# MEASURED one) left all 719 assertions green before this line existed.
+assert_contains "$OUT" "came from a SUBSTITUTE (mode_source=jobs-inference)" \
+  "(d8) …and the CONVERGING line says the matching mode came from a substitute, not a measurement"
 assert_not_contains "$OUT" "the pool already advertises" \
   "(d8) …so it does NOT claim the pool already advertises the recorded mode"
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ALREADY advertised" \
@@ -3169,6 +3175,23 @@ assert_contains "$OUT" "state file records mode=local but NEITHER the label read
   "(d14) the CONVERGING line names both missing reads, not a substitute"
 assert_not_contains "$OUT" "mode=unknown is only" \
   '(d14) …and no line calls `unknown` an inference (it is the absence of one)'
+
+# (d15) THE `jobs-inference` BRANCH OF `repair_why` (review P2, measured: replacing it with the `none` text
+# left all 719 assertions green). It is reached when the label read fails, the JOBS INFERENCE answers, and
+# the inference DIFFERS from the recorded mode — so the CONVERGING line must say the mode is inferred from
+# which pool is SERVING, and must not borrow the `none` sentence (neither read answered).
+run_gate demandblind-inferred-differs GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d15a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-inferred-differs GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N_FIRST=null GH_RUNNER_GROUP="GitHub Actions" \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d15) an inferred mode that differs from the recorded one still exits 2"
+assert_contains "$OUT" "is only INFERRED from which pool is SERVING (mode_source=jobs-inference)" \
+  "(d15) the CONVERGING line names the inference it actually used"
+assert_not_contains "$OUT" "NEITHER the label read NOR a job inference answered (mode_source=jobs-inference)" \
+  '(d15) …and does NOT borrow the `none` sentence, which says both reads were silent'
 
 
 if [ "$FAIL" -gt 0 ]; then
