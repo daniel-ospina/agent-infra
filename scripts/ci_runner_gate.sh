@@ -1891,10 +1891,30 @@ if [ "$healthy" = 3 ]; then
     echo "dry-run: mode=$mode demand=unmeasured recorded=$(cat "$STATE_FILE" 2>/dev/null || echo unknown) — a demand-blind pass takes no mode decision and would only converge the pool to the recorded mode"
     exit 2
   fi
-  printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; the pool was converged to the mode the state file records\n' \
-    "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
-    "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
-    > "$VERDICT_FILE" 2>/dev/null || true
+  # ⛔ ONE WRITER, AND ITS CLAIM IS THE PASS'S OUTCOME (review P1, measured). This line used to be a bare
+  # `printf` written BEFORE the recorded-mode read and BEFORE the repair, with the claim hardcoded:
+  # "the pool was converged to the mode the state file records". On the NO-RECORDED-MODE arm (nothing
+  # existed to converge to — no PUT is sent at all) and on the REPAIR-FAILED arm (the labels are
+  # unchanged) the durable verdict therefore asserted a convergence that did not happen and a state file
+  # that does not exist — the exact defect class this file's #r2c arm pins for the DEFECT write ("a
+  # FAILED defect write does NOT log 'recorded' — the log must not assert a durable record that does not
+  # exist"); and `verdict=` is the surface a scheduler/operator reads to answer the one question this
+  # branch exists to answer ("did the gate restore the pool?").
+  # ⛔ TWO WRITES, BOTH TRUE AT THEIR MOMENT. The first says the repair is IN PROGRESS and claims no
+  # outcome, so a pass killed mid-PUT cannot leave the PREVIOUS pass's answer standing (#3002); the
+  # second replaces the claim with what actually happened on every terminal arm.
+  # ⛔ FIELD PARITY WITH `write_verdict` (review P3): same keys, same order — including `held=`,
+  # `streak=` and `engagement_lost=`, which a NON-DECIDING pass reports as `unmeasured` rather than
+  # omitting. This is the #3002 P2 rule ("missing != unmeasured") applied to the three keys the success
+  # writer always carries: this pass takes no hold/disengage decision and reads no durability, so a `0`
+  # here would be a number the pass never measured.
+  write_blind_verdict() { # $1 = what happened to the pool, in this pass's own words
+    printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s held=unmeasured streak=unmeasured engagement_lost=unmeasured reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; %s\n' \
+      "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
+      "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" "$1" \
+      > "$VERDICT_FILE" 2>/dev/null || true
+  }
+  write_blind_verdict "the repair to the recorded mode is IN PROGRESS — its outcome is written here when it completes, and is in the log"
   # ⛔ THE RECORDED MODE IS READ FROM THE STATE FILE, AND ONLY A MODE IT ACTUALLY RECORDS IS ACTED ON.
   # An absent/garbled state file means no earlier pass took a decision, and `prev`'s own convention is
   # `unknown` — so there is nothing to converge TO, and labelling the pool here would be exactly the
@@ -1903,6 +1923,7 @@ if [ "$healthy" = 3 ]; then
   case "$recorded" in
     local|github) ;;
     *) log "repair SKIPPED: no recorded mode to converge to (state file says '${recorded:-absent}') — a demand-blind pass takes no new mode decision, and it will not label the pool on an unmeasured signal; nothing changed"
+       write_blind_verdict "no mode is recorded in the state file ('${recorded:-absent}'), so there was NOTHING to converge to and the pool was NOT relabelled"
        log "cannot measure DEMAND — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
        exit 2 ;;
   esac
@@ -1911,6 +1932,7 @@ if [ "$healthy" = 3 ]; then
   # agent re-asserts 60-120 s later, which is why the success path compares modes rather than re-writing).
   if [ "$mode" = "$recorded" ]; then
     log "repair: the pool already advertises the recorded mode=$recorded (measured mode=$mode) — nothing to converge; the pass changed nothing"
+    write_blind_verdict "the pool ALREADY advertised the recorded mode=$recorded, so nothing needed converging and no label was written"
     log "cannot measure DEMAND — the recorded mode was already in force (leaving mode=$mode)"
     exit 2
   fi
@@ -1919,12 +1941,17 @@ if [ "$healthy" = 3 ]; then
   if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
   if [ "$repair_ok" = 1 ]; then
     log "repair OK: the pool was converged to the recorded mode=$recorded (demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded)"
+    write_blind_verdict "the pool was converged to the mode the state file records ($recorded)"
+    log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed (leaving mode=$mode)"
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
     log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode=$mode) — the labels are unchanged; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
+    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — the labels are UNCHANGED and the pool still advertises mode=$mode"
+    # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
+    # which on this arm names an action that did not happen (same defect class, in the log this time).
+    log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land (leaving mode=$mode)"
   fi
-  log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed (leaving mode=$mode)"
   exit 2
 fi
 

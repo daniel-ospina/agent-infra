@@ -2728,7 +2728,7 @@ KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=
 assert_eq "$RC" "2" "(d1) a demand-blind pass is still could-not-measure → exit 2 (never 0)"
 assert_contains "$OUT" "DEMAND UNMEASURED for this pass" "(d1) the pass NAMES the leg it could not read"
 assert_contains "$OUT" "queued_demanding=unmeasured" \
-  "(d1) the probe publishes `unmeasured`, never a 0 this read did not measure"
+  '(d1) the probe publishes `unmeasured`, never a 0 this read did not measure'
 assert_contains "$OUT" "CONVERGING the pool to the RECORDED mode" \
   "(d1) the repair is named as a REPAIR (the recorded decision), not a new one"
 assert_contains "$OUT" "repair OK" "(d1) the repair reports its outcome"
@@ -2746,6 +2746,20 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "DEMAND
   "(d1) …it names the leg that could not be read"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=$BLIND_QUEUE" \
   "(d1) …and still publishes the depth it DID read"
+# ⛔ THE VERDICT'S CONVERGENCE CLAIM IS PINNED TO THE ARM THAT ACTUALLY CONVERGED (review P1). Before
+# this, the claim was hardcoded and written before the repair, so the arms BELOW (d3 no recorded mode,
+# d6 repair FAILED) published the same sentence without a convergence happening. This is the positive
+# control: here the repair DID land, so the claim must be present — otherwise "does not claim it" below
+# would be satisfiable by a writer that never claims anything.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the pool was converged to the mode the state file records (local)" \
+  "(d1) …and the verdict asserts the convergence that DID happen (the positive control for d3/d6)"
+# ⛔ FIELD PARITY WITH `write_verdict` (review P3): a non-deciding pass reports the three decision keys
+# as `unmeasured` instead of omitting them — "missing != unmeasured" (#3002 P2). A `0` here would be a
+# number this pass never measured, so the assertion pins the WORD, not just the key.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(d1) …and carries the decision keys write_verdict always emits, as unmeasured rather than absent"
 
 # (d2) RECORDED github + pool measured local → the repair runs the OTHER direction (a strip).
 run_gate demandblind-release GH_QUEUED=0 GH_FALLBACK_N=1 --
@@ -2771,6 +2785,15 @@ assert_contains "$OUT" "repair SKIPPED: no recorded mode" \
   "(d3) the refusal to label on an unmeasured signal is NAMED"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d3) …and nothing is PUT"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "(d3) …and no mode is recorded"
+# ⛔ THE DURABLE VERDICT MAY NOT ASSERT A CONVERGENCE THAT DID NOT HAPPEN (review P1, measured): on this
+# arm there was nothing to converge to, so no PUT is sent (asserted above) — while the writer used to
+# publish "the pool was converged to the mode the state file records" BEFORE it even read the state file,
+# naming a state file this very arm proves absent. This assertion is what reddens that contradiction.
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "was converged to the" \
+  "(d3) the verdict does NOT claim a convergence on the arm that converged nothing"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "so there was NOTHING to converge to and the pool was NOT relabelled" \
+  "(d3) …it names what actually happened (nothing recorded, nothing relabelled)"
 # ⛔ THE FAIL-OPEN DIRECTION, PINNED: a mutant that reads the refusal as DEMAND (the pre-#2344
 # behaviour, and the thing #2344's doctrine forbids) engages here on the RAW depth (40 ≥ 10) and
 # denominates the length leg. This assertion is what reddens it.
@@ -2795,6 +2818,26 @@ assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d5) …no label was written"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) …and no state advanced"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "$_DB_VERDICT_BEFORE" \
   "(d5) …and the previous verdict line is left exactly as it was (not re-written)"
+
+# (d6) A REPAIR THAT DOES NOT LAND IS NOT REPORTED AS A CONVERGENCE (review P1, measured). The write path
+# failing is the #4085 shape this whole branch exists to restore, so the ONE artifact that answers "did
+# the gate restore the pool?" must not answer "yes" when a label PUT failed. `GH_PUT_FAIL_ID` fails one
+# runner's PUT while the other lands — a PARTIAL repair, which is still a repair that did not land
+# (`set_labels` returns non-zero on ANY fail), so the honest verdict is "ATTEMPTED AND FAILED".
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" GH_PUT_FAIL_ID=101 \
+  GH_POOL_IDS="101 102" --
+assert_eq "$RC" "2" "(d6) a failed repair still exits 2"
+assert_contains "$OUT" "repair FAILED" "(d6) the log NAMES the failure rather than absorbing it"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the repair to the recorded mode=local was ATTEMPTED AND FAILED" \
+  "(d6) the verdict says the repair FAILED"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "was converged to the" \
+  "(d6) …and does NOT publish the convergence that did not happen"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(d6) …and still carries the full key set a strict parser expects"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d6) a failed repair does not advance the state file"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
