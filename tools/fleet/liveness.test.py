@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-62 tests with 132 paired mutations: every mutation re-
+63 tests with 132 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,7 +21,7 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 62 tests, green
+    python3 tools/fleet/liveness.test.py                # the 63 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (132)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -43,6 +43,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -3775,13 +3776,62 @@ def t61():
     check("nonce=nope" in v.detail, "and names the fence it could not satisfy; got %r" % v.detail)
 
 
+@test("T62 a mutation count names the HOST it was measured on, and a host-coupled mutant says so")
+def t62():
+    # ⛔ THE SAME SOURCE BYTES READ `MISSED=0` AND `MISSED=2` IN ONE ROUND (#4110 round 4). A fixer
+    # measured on Linux, a reviewer reasoned from a macOS box, and NEITHER LINE NAMED ITS HOST — so
+    # two facts about two boxes were argued as a contradiction about the code. The summary line is
+    # the artifact a reader quotes, so the line carries the box; and a mutant whose catch depends on
+    # the host DECLARES that dependency, so a miss reports it instead of implicating the source.
+    host_rx = re.compile(r"^MUTATIONS=\d+ CAUGHT=\d+ MISSED=\d+ "
+                         r"\([a-z0-9_]+/python\d+\.\d+\.\d+\)$")
+    line = mutation_summary(132, 132, 0)
+    check(host_rx.match(line) is not None,
+          "the summary names the host it was measured on; got %r" % line)
+    check(platform.system().lower() in line
+          and "python%d.%d.%d" % sys.version_info[:3] in line,
+          "…and that host is the RUNNING one, not a literal; got %r" % line)
+
+    # NON-VACUITY: this is the shape both heads printed before this gate existed
+    # (`66e9ec87c`/`4938f70cf` printed `MUTATIONS=132 CAUGHT=132 MISSED=0`; the macOS reading of
+    # the same bytes printed `MUTATIONS=132 CAUGHT=131 MISSED=1`). The gate must REJECT it.
+    pre_fix = "MUTATIONS=132 CAUGHT=131 MISSED=1"
+    check(host_rx.match(pre_fix) is None,
+          "the pre-fix line must NOT satisfy the host gate; got %r" % pre_fix)
+
+    # A HOST-COUPLED mutant declares what its catch needs, and a MISS prints it.
+    coupled = [m for m in MUTATIONS if m.requires]
+    check(bool(coupled),
+          "at least one host-coupled mutant is DECLARED — declaring none asserts every catch is "
+          "host-free, which this suite cannot (the `/proc`→`ps` fixture needs a `ps` that answers)")
+    proc_fallback = [m for m in coupled if "proc = None" in m.new]
+    check(len(proc_fallback) == 1,
+          "the `/proc` reader's `ps`-fallback mutant is the declared one — its fixture proves the "
+          "fallback by asserting pid 1 gets NO number, which only a host whose `ps` can answer "
+          "can distinguish; got %r" % [m.new for m in coupled])
+    for m in coupled:
+        note = _miss_note(m)
+        check("REQUIRES" in note and m.requires in note,
+              "a MISS names the requirement the host lacked; got %r" % note)
+    plain = [m for m in MUTATIONS if not m.requires][0]
+    check(_miss_note(plain) == "",
+          "a host-free mutant adds no host note; got %r" % _miss_note(plain))
+
+
 class Mutation:
-    def __init__(self, test_name, target, old, new, why):
+    def __init__(self, test_name, target, old, new, why, requires=""):
         self.test_name = test_name
         self.target = target          # "module" | "lib"
         self.old = old
         self.new = new
         self.why = why
+        # ⛔ THE HOST CAPABILITY this mutant needs in order to be CAUGHT — empty when the catch
+        # is a property of the source alone. A mutation count is a measurement OF A BOX, not a
+        # property of the code, and one round of this PR (#4110) produced `MISSED=0` and
+        # `MISSED=2` for the SAME source bytes from two boxes. A coupled mutant that misses is
+        # then a fact about the host, and the printed note says so instead of implicating the
+        # code. T62 holds this to the suite.
+        self.requires = requires
 
 
 MUTATIONS = [
@@ -4710,6 +4760,13 @@ MUTATIONS = [
         '    except _ProcUnreadable:\n        proc = None',
         "an unreadable `/proc` member FALLS BACK to the coarser `ps` instead of abstaining, "
         "which reads the same blind spot at whole-second resolution and returns a number",
+        # This is the mutant the #4109 reading names as "T54 (/proc fallback)", and it is the
+        # one that reads MISSED on a macOS box: t54() detects the fallback by asserting it yields
+        # NO answer for pid 1 (`…/liveness.test.py`, "(c) … AND IT ABSTAINS EVEN FOR A PID THE
+        # COARSER `ps` WOULD HAPPILY ANSWER", where a fallback that the host's `ps` cannot answer
+        # returns None either way and the mutation goes GREEN). Declared, not silently absorbed.
+        requires="a `ps` that answers for pid 1 in the Linux column/time shape the coarse reader "
+                 "parses (measured CAUGHT on Linux under both python3.12.3 and python3.9.25)",
     ),
     Mutation(
         "T54", "module",
@@ -4882,6 +4939,34 @@ def _mutation_verdict(returncode: int, body: str) -> bool:
     return False
 
 
+def mutation_summary(total, caught, missed):
+    """The ONE line a reader quotes, so it names the BOX it was measured on.
+
+    ⛔ A COUNT WITHOUT ITS HOST IS NOT REPRODUCIBLE. Measured 2026-11-17 (#4110 round 4): the
+    same source bytes reported `MUTATIONS=132 CAUGHT=132 MISSED=0` on Linux and
+    `MUTATIONS=132 CAUGHT=131 MISSED=1` on macOS, and neither line named its host, so the two
+    readings looked like a contradiction about the code. The suffix is DERIVED from the running
+    interpreter and platform, never written by hand (`platform.system()`, `sys.version_info`).
+    """
+    return ("MUTATIONS=%d CAUGHT=%d MISSED=%d (%s/python%d.%d.%d)"
+            % (total, caught, missed, platform.system().lower(),
+               sys.version_info[0], sys.version_info[1], sys.version_info[2]))
+
+
+def _miss_note(mut):
+    """The disclosure a HOST-COUPLED mutant prints when it misses; empty otherwise.
+
+    A MISSED line with no note reads as "the code lost this behaviour". For a coupled mutant it
+    is not: the fixture cannot distinguish the mutant on this host, so the count travels with
+    the host that produced it. T62 holds this to the suite.
+    """
+    if not mut.requires:
+        return ""
+    return ("      \u26a0\ufe0f  host-coupled mutant: it REQUIRES %s.\n"
+            "          Missing it here is a fact about THIS HOST, not about the code — quote\n"
+            "          the count together with the host that produced it.\n" % mut.requires)
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired test RED ──")
     print("   (the mutated file is written to a temp dir; the real source is never touched)\n")
@@ -4910,7 +4995,10 @@ def run_mutations():
                       % mut.test_name)
             else:
                 print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
-    print("MUTATIONS=%d CAUGHT=%d MISSED=%d" % (len(MUTATIONS), len(MUTATIONS) - bad, bad))
+                note = _miss_note(mut)
+                if note:
+                    print(note)
+    print(mutation_summary(len(MUTATIONS), len(MUTATIONS) - bad, bad))
     return bad == 0
 
 

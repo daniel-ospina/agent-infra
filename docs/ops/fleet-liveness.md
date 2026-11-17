@@ -933,7 +933,7 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 62 tests
+python3 tools/fleet/liveness.test.py               # 63 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (132)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
@@ -941,6 +941,16 @@ python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must g
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
+
+⛔ **QUOTE THE `--mutations` SUMMARY WITH ITS HOST: the line now carries one**
+(`MUTATIONS=132 CAUGHT=132 MISSED=0 (linux/python3.12.3)`). A mutation count is a measurement of
+**a box**, never a property of the source: measured 2026-11-17 at the same commit, Linux read
+`132/132/0` under both `python3.12.3` and `python3.9.25`, while a macOS host read `131/1`. The one
+declared **host-coupled** mutant is the `/proc`→`ps` fallback: `t54()` proves the fallback by
+asserting that pid 1 gets **no** number, which only a host whose `ps` answers in the parsed
+Linux shape can distinguish — so its miss on macOS is a fact about macOS, and it now prints that
+requirement instead of implicating the code (T62 pins both halves). Two readings of the same bytes
+were argued as a contradiction about the code once already; the host in the line is what stops it.
 
 The last suite is also the only place the fence default is pinned against
 `scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
@@ -2218,6 +2228,17 @@ append would look like (measured: `samples=18000000,18010000,3,4`, `running-quie
 `--nonce` the source is **unfenced** and trusted — which is right for a log you own and wrong for a
 file another writer can append to, so pass the nonce whenever that is possible. A nonce that matches
 nothing is `heartbeat-unreadable`, never an empty read.
+
+⛔ **The fence drops nonce-less TERMINAL facts as well, and the primary end marker is why that is
+safe.** A `task_status` line names no dispatch, so a `--nonce` read drops its `"alive": false` /
+`"session_ended": true` with the rest — on a source mixing the two shapes the JSON terminal gate can
+go dark and a finished run's frozen age can decide. That is **deliberately not relaxed**: the same
+looseness in the other direction lets one appended `"session_ended": true` turn a *wedged* lane into
+a finished one, which is the false PASS over lost work this axis exists to remove. It stays safe
+because every real capture log carries the marker that **does** show the nonce — measured over the
+1,416 logs in `~/.pi/agent/task-runs/` on this box, 1,369 carry `[task-heartbeat] session_end` and
+**all 1,369 carry `nonce=`**. Passing `--nonce` is the caller asserting "only this dispatch's markers
+count", so a different dispatch's JSON view is precisely what must not decide.
 
 The end marker is recognised only as a LINE that **is** the marker
 (`^[task-heartbeat] session_end`), because the same log carries the child's raw stdout: a child that
