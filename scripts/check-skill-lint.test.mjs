@@ -176,7 +176,14 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  const r = runLint([], os.tmpdir());
+  // Hermetic: a FRESH unique dir, never os.tmpdir() itself. The shared temp root is
+  // ambient state — on the self-hosted runner a leftover `<tmp>/skills` from another
+  // job made the implicit resolution SUCCEED, so this arm read "0 SKILL.md files
+  // checked" instead of the no-directory message and `ci / unit-test` went red at
+  // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
+  // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
+  const r = runLint([], emptyCwd);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /No skills directory found/);
 });
