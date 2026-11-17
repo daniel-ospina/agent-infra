@@ -176,9 +176,21 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  const r = runLint([], os.tmpdir());
-  assert.equal(r.status, 0);
-  assert.match(r.stdout, /No skills directory found/);
+  // ⛔ A PRIVATE, EMPTY CWD — NOT `os.tmpdir()` (this suite's own ambient red, root-caused). The
+  // implicit lookup walks `<cwd>/skills`, and `os.tmpdir()` is SHARED HOST STATE: on the self-hosted
+  // cell runner (`/opt/gh-runner-*`) any sibling job that leaves a `$TMPDIR/skills` behind turns this
+  // arm red — measured: `mkdir -p "$TMPDIR/skills"` flips it to "0 SKILL.md files checked. Clean.",
+  // 170 passed / 1 failed, exactly the log of `ci / unit-test` on PR #4103. A test whose verdict
+  // depends on what OTHER processes wrote to /tmp is a false RED generator, and a false RED on a
+  // required check blocks every lane's merge. `mkdtemp` is unique per run and empty by construction.
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-nodir-"));
+  try {
+    const r = runLint([], emptyCwd);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /No skills directory found/);
+  } finally {
+    fs.rmSync(emptyCwd, { recursive: true, force: true });
+  }
 });
 
 // ── (d) the exact O/I case ──────────────────────────────────────────────────
