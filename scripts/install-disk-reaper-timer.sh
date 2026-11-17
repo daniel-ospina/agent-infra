@@ -961,6 +961,18 @@ verify_installed_unit() {
         printf '%s\n' "$envmap" | sed -n 's/^!unparseable:/  /p' >&2
         return 1
     fi
+    # ⛔ AND A COMPILED ENVIRONMENT THIS PARSER CANNOT KNOW IS NOT A VERIFIED HOME EITHER (agent-infra#4034
+    # round 3, F1/F3 — the same class the drainer's `--status` grades UNKNOWN). `EnvironmentFile=` is the
+    # LATER source and OVERRIDES `Environment=` (systemd.exec(5)), and a backslash continuation or escape
+    # (`systemd.syntax(7)`) can hide or re-section an assignment — so `Environment=HOME=` reading back
+    # correctly proves nothing about the HOME the process gets. Refuse, naming the reason: a
+    # `!unresolvable:` line silently ignored here would be the same false PASS one spelling over.
+    if grep -q '^!unresolvable:' <<<"$envmap"; then
+        err "REFUSING: the installed unit's environment cannot be compiled from its text, so its HOME"
+        err "  cannot be verified — a directive systemd applies behind `Environment=` is present:"
+        printf '%s\n' "$envmap" | sed -n 's/^!unresolvable:/  /p' >&2
+        return 1
+    fi
     got_home="$(printf '%s\n' "$envmap" | sed -n 's/^HOME=//p')"
     if [ -z "$got_home" ]; then
         err "REFUSING: the installed unit sets no Environment=HOME= — the worktree class needs it for gh auth (exit 3 without it)"
