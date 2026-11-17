@@ -1,0 +1,38 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-stallfix-20261117T172031Z-1794936060-p1775612-f1c92208",
+  "_sha": "5d68df689208a800b40f17b0f6aa1f2a0e49df28",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/stallfix-20261117T172031Z.log"
+    },
+    {
+      "kind": "sha",
+      "value": "789e68dda15a7981f37dba4195f1857b5d64f334"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/orchestrator/state/wt-stallfix"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 2400,
+  "duration_s": 217,
+  "ended_at": 1794936277,
+  "exit_code": 0,
+  "heartbeat_at": 1794936277,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-stallfix-20261117T172031Z-1794936060-p1775612-f1c92208",
+  "lease_until": 1794938677,
+  "pid": 1775612,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794936060,
+  "state": "DONE",
+  "tag": "stallfix-20261117T172031Z",
+  "worktree": "/home/cmux/orchestrator/state/wt-stallfix"
+}
