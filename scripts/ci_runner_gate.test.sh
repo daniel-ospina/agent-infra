@@ -101,6 +101,30 @@ printf '%s\n' "$*" >> "${GH_LOG:?}"
 if [ -n "${GH_NOISE:-}" ]; then
   printf 'gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)\n' >&2
 fi
+# ⛔ THE CENSUS READ CAN BE MADE TO FAIL, BY COUNT (#4085). The measured causes are TRANSIENT —
+# `net/http: TLS handshake timeout` and `API rate limit exceeded` — and each one used to cost a whole
+# 300 s pass because the read was single-attempt. Matched on the page-row program so only the CENSUS
+# read is affected: `current_mode` reads the same endpoint with a different `--jq`, and a knob that
+# failed both could never show which of the two recovered.
+if [ -n "${GH_CENSUS_FAIL_N:-}" ]; then
+  case "$*" in
+    *actions/runners*'#page'*)
+      _cf="${GH_LOG}.censusfail"
+      _n="$(cat "$_cf" 2>/dev/null || printf 0)"
+      case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+      if [ "$_n" -lt "$GH_CENSUS_FAIL_N" ]; then
+        printf '%s\n' "$((_n + 1))" > "$_cf"
+        # ⛔ THE CLASS IS SELECTABLE (#4085 review P1). Arm (r1) alone pinned the TLS cause, so a mutant
+        # that put `rate limit` on the NON-TRANSIENT list — the plausible edit, since a rate-limit 403
+        # IS a 403 — reproduced 125 of the 183 measured failures with the suite green.
+        case "${GH_CENSUS_FAIL_MODE:-tls}" in
+          ratelimit) printf 'HTTP 403: API rate limit exceeded for user ID 1 (https://api.github.com/repos/o/r/actions/runners)\n' >&2 ;;
+          *)         printf 'Get "https://api.github.com/repos/o/r/actions/runners": net/http: TLS handshake timeout\n' >&2 ;;
+        esac
+        exit 1
+      fi ;;
+  esac
+fi
 # ⛔ EVERY `--jq` PROGRAM THE GATE SHIPS IS COMPILED HERE (#3002 review P2). This double used to answer
 # every read by pattern-matching argv and PRINTING the rows it believed the program would emit, so the
 # program itself never reached jq — and arms (7b) (7c) (7d) (m9) (m10) certified a page-row protocol
@@ -532,6 +556,27 @@ fi
 # mutant that merely changes the bound skip the arm. Fatal when unreadable — a fixture that cannot
 # restate the bound must not silently test a different number.
 QUEUE_HEAD_SCAN_SHIPPED="$(sed -n 's/^QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
+# ⛔ DERIVED, NEVER RESTATED (#4085 review round 3, P1). A fixture that restates a production constant
+# cannot fail when that constant moves — the file already records this twice (#3261, #3995). MEASURED
+# BEFORE this fix: a mutant that put the defect rate back to 1800 s (the inbox-flooding rate #4085
+# exists to remove) passed all 587 assertions.
+_derive_shipped() { # <knob-name> -> the gate's shipped default
+  # ⛔ ${GATE_UNDER_TEST:-$GATE} — NOT "$GATE" (#4085 review round 4, P1). Reading the shipped file
+  # meant the two-sided pins read 21600 no matter what the gate under test shipped, so a mutant that
+  # reverted the defect floor to the old 1800 s rate passed all 592 assertions. The file already
+  # records this same correction for GH_THRESHOLD_DEFAULT (#3261).
+  sed -n "s/.*CI_GATE_$1:-\([0-9][0-9]*\)}.*/\1/p" "${GATE_UNDER_TEST:-$GATE}" | head -1
+}
+CENSUS_BACKOFF_SHIPPED="$(_derive_shipped CENSUS_READ_BACKOFF_S)"
+CENSUS_ATTEMPTS_SHIPPED="$(_derive_shipped CENSUS_READ_ATTEMPTS)"
+BLIND_DEFECT_AFTER_SHIPPED="$(_derive_shipped BLIND_DEFECT_AFTER)"
+BLIND_DEFECT_EVERY_SHIPPED="$(_derive_shipped BLIND_DEFECT_EVERY_S)"
+BLIND_STREAK_RESET_SHIPPED="$(_derive_shipped BLIND_STREAK_RESET_S)"
+for _v in "$CENSUS_BACKOFF_SHIPPED" "$CENSUS_ATTEMPTS_SHIPPED" "$BLIND_DEFECT_AFTER_SHIPPED" \
+          "$BLIND_DEFECT_EVERY_SHIPPED" "$BLIND_STREAK_RESET_SHIPPED"; do
+  [ -n "$_v" ] || { echo "❌ fixture cannot derive a #4085 default from the gate — a fixture that cannot" \
+    "restate the bound must not silently test a different number" >&2; exit 3; }
+done
 if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
   echo "❌ FATAL: cannot read QUEUE_HEAD_SCAN_MAX's own default out of $GATE — the suite refuses to guess it" >&2
   exit 3
@@ -571,6 +616,10 @@ run_gate() {
   KEEP_STATE_NEXT=0
   if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; KEEP_STATE_NEXT=1; else mkdir -p "$STATE_DIR" "$home"; fi
   : > "$GH_LOG"
+  # ⛔ THE FAILURE COUNTER IS PER PASS (#4085): GH_LOG is truncated each run but this sidecar was not,
+  # so an arm that asked for ONE failure inherited the previous arm's count and silently stopped
+  # failing — arm (r1b) passed for the wrong reason until this line existed.
+  rm -f "$GH_LOG.censusfail"
   [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE"
   # a re-assertion pending from the PREVIOUS pass lands now: the runner agent overwrote the label set in
   # the 60-120 s between ticks, so this pass must find it gone (that is the defect being pinned).
@@ -607,6 +656,16 @@ PYDROP
     # an arm that tests the operand passes `ENV=…` afterwards and still overrides (measured: a gate
     # mutated to ignore the knob reds `ghost-bound-zero`/`ghost-bound-junk`).
     export CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_HEAD_SCAN_SHIPPED"
+    # ⛔ THE #4085 KNOBS ARE WHITELISTED FOR THE SAME REASON: the retry attempts, the retry backoff,
+    # the blind-defect threshold, the defect write interval and the streak reset are all read by the
+    # arms below, and an ambient value must not decide whether the suite is red — MEASURED: ambient
+    # `CI_GATE_CENSUS_READ_ATTEMPTS=1` reddened 4 assertions with no code change. Exported at their
+    # DERIVED values; arms that test the operand pass `ENV=...` afterwards and still override.
+    export CI_GATE_CENSUS_READ_BACKOFF_S="$CENSUS_BACKOFF_SHIPPED"
+    export CI_GATE_CENSUS_READ_ATTEMPTS="$CENSUS_ATTEMPTS_SHIPPED"
+    export CI_GATE_BLIND_DEFECT_AFTER="$BLIND_DEFECT_AFTER_SHIPPED"
+    export CI_GATE_BLIND_DEFECT_EVERY_S="$BLIND_DEFECT_EVERY_SHIPPED"
+    export CI_GATE_BLIND_STREAK_RESET_S="$BLIND_STREAK_RESET_SHIPPED"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
     # semantics, or they would all be asserting the same counter; the streak has its own section,
@@ -2522,6 +2581,131 @@ assert_eq "$(wc -l < "$CMUX_LOG" | tr -d ' ')" "1" "exactly one cmux message is 
 assert_contains "$(cat "$CMUX_LOG")" "TEST-LANE-UUID" "the cmux message names the configured lane"
 
 echo "───────────────────────────────────────────────────────────────────"
+# ── the #4085 defaults are pinned TWO-SIDED: derived for the export, literal for the verdict ─────
+assert_eq "$CENSUS_ATTEMPTS_SHIPPED" "3" "the gate SHIPS 3 census attempts"
+assert_eq "$CENSUS_BACKOFF_SHIPPED" "2" "the gate SHIPS a 2 s first backoff"
+assert_eq "$BLIND_DEFECT_AFTER_SHIPPED" "6" "the gate SHIPS escalation at 6 consecutive blind passes"
+assert_eq "$BLIND_DEFECT_EVERY_SHIPPED" "21600" \
+  "the gate SHIPS a 6 h defect write floor — NOT the 1800 s inbox rate #4085 replaced"
+assert_eq "$BLIND_STREAK_RESET_SHIPPED" "3600" \
+  "the gate SHIPS a 1 h streak window, DECOUPLED from the alarm interval"
+
+# ── (r1) A TRANSIENT CENSUS FAILURE IS RETRIED, NOT LOST (agent-infra#4085) ────────────────────
+# The measured shape: `net/http: TLS handshake timeout` on the runners read. One attempt per 300 s
+# pass meant one blip cost a whole pass — 183 failed enumerations and 245 relabel failures in a month,
+# with the pool serving 3 of 24 runners while 284 runs queued.
+run_gate census-retry GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok GH_CENSUS_FAIL_N=1 \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 --
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "capacity=unknown" \
+  "(r1) one transient census failure does not make the pass BLIND"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
+  "(r1) the recovery is REPORTED, so a box that had a blip is distinguishable from one that did not"
+
+# ── (r1b) A RATE-LIMIT 403 IS RETRIED, NOT FAST-FAILED (#4085 review P1) ───────────────────────
+# `API rate limit exceeded` was 125 of the 183 measured failures. It is a 403 that CLEARS, so the
+# fast-fail list must not swallow it — and this arm is what makes a mutant that adds it red.
+# ⛔ WHAT THIS ARM DOES *NOT* CLAIM (#4085 review P3): it pins the CLASSIFICATION and the retry PATH,
+# not a guarantee of recovery. The stub fails once and the backoff is forced to 0, so it cannot show
+# that the shipped budget (3 attempts, 2 s + 4 s = ≤6 s of sleep) outlives the window — and the measured
+# message, `API rate limit exceeded for user ID 1`, is the PRIMARY limit, whose reset window is far
+# longer than 6 s. What change #1 genuinely buys back is the timeout/transport class; a primary limit
+# is retried correctly and recovers only when its reset lands inside the budget.
+run_gate census-retry-ratelimit GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok GH_CENSUS_FAIL_N=1 \
+  GH_CENSUS_FAIL_MODE=ratelimit CI_GATE_CENSUS_READ_BACKOFF_S=0 --
+assert_not_contains "$OUT" "capacity=unknown" \
+  "(r1b) a rate-limit 403 is retried, NOT treated as a permanent capability failure"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
+  "(r1b) the rate-limit retry is REPORTED (a retried path, not a guaranteed recovery — see above)"
+
+# ── (r1c) A DETERMINISTIC 403 IS NOT RETRIED, AND COSTS EXACTLY ONE CALL (#4085 review P1) ─────
+# Without this, dropping the fast-fail list retries a permission failure three times and the suite
+# stays green — the retry budget is part of the contract, so the CALL COUNT is asserted, not the log.
+run_gate census-403-noretry GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_contains "$OUT" "NON-TRANSIENT error — NOT retried" "(r1c) a permission failure is NOT retried"
+assert_eq "$(grep -c "#page" "$GH_LOG" 2>/dev/null)" "1" \
+  "(r1c) exactly ONE census call (the page-row read) is spent on a deterministic 403 — current_mode's read is a different program"
+
+# ── (r2) SUSTAINED BLINDNESS BECOMES A DEFECT RECORD (#4085) ──────────────────────────────────
+# `orchestrator-inbox.log` held 43 identical blind alarms across a month and provoked no action.
+# Repetition is not escalation, so past `CI_GATE_BLIND_DEFECT_AFTER` consecutive blind passes the
+# condition STARTS escalation, and the record is WRITTEN at most once per CI_GATE_BLIND_DEFECT_EVERY_S
+# (time-bounded) — not once per threshold.
+# The FIRST pass must not set KEEP_STATE: KEEP_STATE=1 means "reuse the existing state dir", which
+# by its own semantics SKIPS creating it — so a first pass that sets it has nowhere to write the
+# streak and the arm would fail for a reason unrelated to the code under test.
+run_gate census-blind GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=3 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+# ⛔ SIX passes, not four (#4085 review round 5, P1). With defect_after=3, four passes cannot tell the
+# time floor from the old `streak % defect_after` rule — BOTH write exactly one line (3%3=0; 4%3=1).
+# At six they diverge: modulo writes at 3 AND 6, the time floor writes once. MEASURED BEFORE this:
+# reverting the predicate kept all 592 assertions green.
+for _i in 2 3 4 5 6; do
+  KEEP_STATE=1 run_gate census-blind GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+    CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=3 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+done
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')" "1" \
+  "(r2) 6 consecutive blind passes record EXACTLY ONE defect line — the file is rate-limited in TIME, not per pass (modulo would write 2)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null)" "streak=3" \
+  "(r2) the defect record names the streak, so its severity is readable without the log"
+# ⛔ THIS .stamp ASSERTION IS A PRESENCE CHECK, NOT AN INDEPENDENT DISCRIMINATOR (#4085 review P3,
+# correcting an earlier claim of exactly that). MEASURED: a revert to the `streak % defect_after`
+# predicate still writes the stamp when it writes a record, so this arm does NOT catch that revert —
+# the LINE-COUNT assertion above is what reddens (modulo writes at 3 and 6). It is kept because a
+# mutant that stops writing the time floor altogether (a dropped stamp write) is otherwise silent, and
+# the owner's review trail records that claim as false rather than leaving it to be trusted again.
+[ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ] \
+  && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); echo "  ❌ (r2) the defect write floor keeps a .stamp (time-based rate limit)"; }
+
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "RECURRING DEFECT" \
+  "(r2) the alarm wording escalates once the condition is sustained"
+
+# ── (r2b) AN OUT-OF-RANGE THRESHOLD STILL ESCALATES (#4085 review P3) ──────────────────────────
+# `BLIND_DEFECT_AFTER` was the one #4085 knob with no >=10-digit arm, and the failure is silent: an
+# out-of-intmax operand makes `[ "$streak" -ge "$defect_after" ]` ERROR, and an errored arithmetic
+# test reads as FALSE — so the DEFECT escalation this PR adds is disabled by an unvalidated override
+# (MEASURED: `[ 5 -ge 99999999999999999999 ]` -> `integer expression expected`, false). With the arm in
+# place the value falls back to the shipped 6, so six passes must leave a record.
+run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+  CI_GATE_BLIND_ALARM_EVERY_S=0 --
+for _i in 2 3 4 5 6; do
+  KEEP_STATE=1 run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+    CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+    CI_GATE_BLIND_ALARM_EVERY_S=0 --
+ done
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')" "1" \
+  "(r2b) an OUT-OF-RANGE CI_GATE_BLIND_DEFECT_AFTER falls back to the shipped 6, so the escalation FIRES instead of erroring to FALSE"
+
+# ── (r2c) A FAILED DEFECT WRITE IS REPORTED AS UNRECORDED (#4085 review P3) ────────────────────
+# The gate runs without `set -e`, so the write's status was discarded and the log asserted
+# "BLIND DEFECT recorded" unconditionally. A DIRECTORY at the record path is the cheapest portable
+# unwritable target: `>>` fails, and the log must say the condition is UNRECORDED (and the throttle
+# stamp must stay absent, or a failed write would suppress the retry for a whole BLIND_DEFECT_EVERY_S).
+mkdir -p "$T/state-census-defect-unwritable/ci-runner-gate.DEFECT"
+run_gate census-defect-unwritable GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=1 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+_GATE_LOG="$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)"
+assert_not_contains "$_GATE_LOG" "BLIND DEFECT recorded" \
+  "(r2c) a FAILED defect write does NOT log 'recorded' — the log must not assert a durable record that does not exist"
+assert_contains "$_GATE_LOG" "BLIND DEFECT WRITE FAILED" \
+  "(r2c) the failure is NAMED as UNRECORDED, so the condition is not silently dropped"
+if [ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ]; then
+  FAIL=$((FAIL + 1)); echo "  ❌ (r2c) a FAILED write leaves NO throttle stamp (otherwise the retry is suppressed for BLIND_DEFECT_EVERY_S)"
+else
+  PASS=$((PASS + 1)); echo "  ✅ (r2c) a FAILED defect write leaves NO throttle stamp, so the next pass retries the record"
+fi
+
+# ── (r3) A READ VERB DOES NOT CONSUME THE STREAK (#4085 review round 5, P2) ─────────────────────
+# The dry-run guard was real but unproven: no arm ever read the streak file, so a mutant dropping
+# `[ "${DRY:-0}" = 0 ]` stayed green.
+run_gate census-dryrun GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" " -f1)" "1" \
+  "(r3) a blind pass records streak=1"
+KEEP_STATE=1 run_gate census-dryrun GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok -- --dry-run
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" " -f1)" "1" \
+  "(r3) --dry-run does NOT clear the streak (a read verb changes nothing)"
+
+
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
   exit 1
