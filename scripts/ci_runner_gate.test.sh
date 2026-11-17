@@ -1614,6 +1614,26 @@ run_gate ledger-jobs-sum GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:17
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
   "2 jobs on page 1 + an EMPTY page 2 is 2 jobs, NOT a zero-job ghost (overwrite would mint one)"
 
+# ⛔ AND THE PROPAGATION ITSELF NEEDS AN ARM THAT CAN SEE IT — the arms above cannot (measured, P1
+# follow-up on review cycle 8's fix). `ledger-null-jobs`'s new fact bites on the null-guard MUTANT (a
+# PATCHED gate that raises), but nothing in this suite reddens if the DOUBLE's status propagation is
+# reverted: with `2>/dev/null; exit 0` back in the hook a raise emits nothing, which reads EXACTLY like a
+# correct unmeasured body, so every null-jobs assertion stays green while the P1 the hook fixed quietly
+# returns. A raise the FIXTURE can cause is therefore the only way to pin the hook itself: `.jobs` as a
+# string is an API shape violation, so the SHIPPED program raises with NO mutation of the gate at all
+# (`Cannot iterate over string`), and the answer must be a FAILED read — prove nothing is a ghost, keep
+# the run as the queue head, discount nothing — never a certified-empty queue. Measured: reverting
+# `|| exit $?` to the pre-fix swallow reddens the three assertions below and nothing else in the suite.
+echo "── #4113: a jobs body the shipped program cannot parse is a FAILED read, not an unmeasured one ──"
+run_gate ledger-jobs-program-raises GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":0,"jobs":"unexpected"}' --
+assert_contains "$OUT" "jobs read FAILED" \
+  "a body the shipped jq cannot parse is a FAILED read — the double PROPAGATES the program's exit status"
+assert_contains "$OUT" "STAYS the queue head" \
+  "…and the run STAYS the queue head (no discount): the fail-closed answer for an unreadable job list"
+assert_not_contains "$OUT" "nothing is waiting for a runner" \
+  "…so a raising program is NEVER certified as 'nothing is waiting'"
+
 # …and an unmeasured total from the SHAPE double behaves the same way (the shell half): no page row, no
 # entry, whatever the reason the row is missing.
 echo "── #4113: a jobs read with no page row remembers NOTHING ──"
