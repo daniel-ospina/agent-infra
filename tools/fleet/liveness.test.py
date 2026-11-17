@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-58 tests with 113 paired mutations: every mutation re-
+64 tests with 137 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 58 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (113)
+    python3 tools/fleet/liveness.test.py                # the 64 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (137)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -43,6 +43,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -3292,16 +3293,770 @@ def t52():
               "advanced=%r must not be read as progress; got %s/%s" % (adv, v.state, v.reason))
 
 
+@test("T58 `tool_age_max` decides on the LAST PAIR — the #3987 fixture: three readings from "
+      "ONE lane that was called wedged three times while working")
+def t58():
+    """⛔ ONE SAMPLE IS NOT A READING OF EITHER KIND (#4106).
+
+    `task_status` reports the child's `tool_age_max` — how long its oldest open tool call has been
+    open. A single number cannot distinguish *the same call is still open* from *a call just
+    started*: 116 min is the first in one case and the second in the other. Measured cost: a
+    WORKING `pi` task child (#3987) was called wedged **three times in one session**, each on a
+    different single-sample inference (`no child process` — an `edit` writes in-process; `26 min,
+    no file change` — it was running its test suite; `145 min, no file change` — `git status` was
+    clean because it had ALREADY COMMITTED and kept working).
+
+    The fixture is that lane's own recorded readings, `tool_age_max` 6,961,576 ms (116 min) then
+    18,052 ms then 0 ms — the call ended, the child moved on — plus the shape that is genuinely
+    hung (the same age across two samples, past the watchdog's own backstop).
+
+    ⛔ THE BOUND IS CITED, NOT INVENTED: `tool_stall_ms()` (the watchdog's `tool-stall` age
+    backstop, 4 h at the 6 h cap) and the comparison is STRICT `>`, exactly as
+    `tool_veto_expired` states it — so a 116 min open call is PENDING, never wedged.
+    """
+    def hb(*ages, readable=True, in_flight=None):
+        return liv.HeartbeatRead(
+            readable=readable, source="fixture",
+            samples=tuple(liv.HeartbeatSample(age_ms=a, in_flight=in_flight) for a in ages))
+
+    def verdict(h):
+        return liv.evaluate(liv.Evidence(heartbeat=h))
+
+    # (1) THE SINGLE SAMPLE — the abstention the doctrine defines, for ANY age. Even an age far
+    #     past the backstop is not a wedge on one reading: with nothing to compare it to, "still
+    #     running" and "just started" are indistinguishable.
+    for one in (6_961_576, 18_052, 0, 18_000_000):
+        v = verdict(hb(one))
+        check(v.state == "unknown" and v.reason == "tool-age-single-sample",
+              "ONE sample (%d) must abstain, never decide; got %s/%s %s"
+              % (one, v.state, v.reason, v.detail))
+        check("samples=%d" % one in v.detail,
+              "the abstention names the reading it could not use; got %r" % v.detail)
+
+    # (2) THE RESET — #3987's actual sequence. The last pair DROPS, so the call that was open
+    #     ENDED and the child moved on: positive liveness evidence, `running-quiet` (= alive).
+    v = verdict(hb(6_961_576, 18_052))
+    check(v.state == "running-quiet" and v.reason == "tool-age-reset",
+          "a resetting age is MOVEMENT; got %s/%s %s" % (v.state, v.reason, v.detail))
+    v = verdict(hb(6_961_576, 18_052, 0))
+    check(v.state == "running-quiet" and v.reason == "tool-age-reset",
+          "the three real readings end in a reset; got %s/%s" % (v.state, v.reason))
+
+    # (3) THE SAME CALL, UNDER ITS BACKSTOP — the 116 min reading: PENDING. Not wedged (a long
+    #     tool call is what a working child looks like), and not alive either (nothing moved).
+    bound = liv.tool_stall_ms()
+    check(bound == 4 * H, "the cited backstop is the watchdog's 4h; got %d" % bound)
+    v = verdict(hb(6_961_576, 7_100_000))
+    check(v.state == "unknown" and v.reason == "tool-age-open-pending",
+          "a growing age UNDER the backstop is pending, not wedged; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    check("bound=%dms" % bound in v.detail, "the detail states the bound; got %r" % v.detail)
+    # No observable movement at all is also NOT a wedge (two equal readings cannot show a stall).
+    v = verdict(hb(6_961_576, 6_961_576))
+    check(v.state == "unknown" and v.reason == "tool-age-open-pending",
+          "an unchanged age is pending, never wedged; got %s/%s" % (v.state, v.reason))
+
+    # (4) THE SAME CALL, PAST ITS BACKSTOP — the shape that really is stuck. Strict `>`, the same
+    #     comparison `tool_veto_expired` makes: at the bound the watchdog has not cut yet.
+    v = verdict(hb(18_000_000, 18_100_000))
+    check(v.state == "wedged" and v.reason == "tool-age-open-stable",
+          "a stable age past the backstop is wedged; got %s/%s" % (v.state, v.reason))
+    v = verdict(hb(bound, bound))
+    check(v.reason == "tool-age-open-pending",
+          "AT the bound is not past it (strict `>`); got %s/%s" % (v.state, v.reason))
+    v = verdict(hb(bound, bound + 1))
+    check(v.state == "wedged", "one ms past the bound is wedged; got %s/%s" % (v.state, v.reason))
+
+    # (5) THE SOURCE'S OWN IN-FLIGHT COUNT DECIDES FIRST, when it states one. The parent does NOT
+    #     reset `toolAgeMaxMs` at `tool_end` (`builtin-tools/index.ts:2765-2772`) and is safe only
+    #     because its own clause requires `toolsInFlight > 0` — so an age with NO call open is a
+    #     STALE MAX. Reading it as an open call is the same false-wedged class as #3987.
+    v = verdict(hb(14_460_001, 14_460_001, in_flight=False))
+    check(v.state == "running-quiet" and v.reason == "tool-age-no-call-open",
+          "an age with no call in flight is a stale max, never a wedge; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    # …and a stated IN-FLIGHT call keeps the pair semantics (this stays wedged, not excused).
+    v = verdict(hb(18_000_000, 18_100_000, in_flight=True))
+    check(v.state == "wedged", "an in-flight call past the bound is still wedged; got %s/%s"
+          % (v.state, v.reason))
+
+    # (6) NO HEARTBEAT AT ALL — an abstention with a NAMED reason, never a verdict. An absent
+    #     reading is not a reading of zero, and silence decides nothing in either direction.
+    for h in (hb(), hb(readable=False), hb(1, 2, readable=False)):
+        v = verdict(h)
+        check(v.state == "unknown" and v.reason == "heartbeat-unreadable",
+              "an unreadable/absent heartbeat abstains; got %s/%s" % (v.state, v.reason))
+    check(verdict(liv.HeartbeatRead(readable=False, detail="unreadable:/nope (FileNotFoundError)"))
+          .detail.startswith("unreadable:/nope"),
+          "the read failure's own fact is carried into the verdict")
+
+
+@test("T59 the heartbeat axis is INERT, and MASKING is refused in BOTH directions")
+def t59():
+    """⛔ ONE AXIS PER QUERY, AND THE REFUSAL MUST WORK FROM EITHER SIDE.
+
+    `heartbeat` is a third added axis, so it inherits the rule the claim axis and the log axis
+    already follow (#1777 B7): supplying it TOGETHER with session/claim/CPU evidence must be
+    refused BY NAME, never resolved by whichever arm happens to run first — a heartbeat read
+    that won would DISCARD a supplied session verdict, and a log read that won would discard a
+    supplied heartbeat. Both directions are pinned here because each one alone is a silent
+    masking door.
+    """
+    hb = liv.HeartbeatRead(readable=True, source="fixture",
+                           samples=(liv.HeartbeatSample(6_961_576), liv.HeartbeatSample(18_052)))
+    # CONTROL FIRST: alone, the axis decides (`reset` → running-quiet), otherwise "refuse every
+    # query" would pass this test.
+    check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "tool-age-reset",
+          "a clean heartbeat-only query still reaches its verdict")
+
+    # (1) ONE field of another axis at a time: the refusal fires on PRESENCE (the sentinels are
+    #     never inspected — that IS what masking means).
+    lone = [
+        ("sid", dict(sid="sid-1")),
+        ("claim_read", dict(claim_read=object())),
+        ("candidates", dict(candidates=[C(1, NOW_MS)])),
+        ("record", dict(record=object())),
+        ("jsonl_grew", dict(jsonl_grew=False)),
+        ("jsonl_age_ms", dict(jsonl_age_ms=H)),
+        ("tool", dict(tool=object())),
+        ("jsonl_turn", dict(jsonl_turn=object())),
+        ("cpu", dict(cpu=liv.CpuSample(advanced=True))),
+        ("child", dict(child=liv.ChildEvidence(in_flight=True))),
+        ("ps_ok=False", dict(ps_ok=False)),
+        ("store_ok=False", dict(store_ok=False)),
+    ]
+    for label, kw in lone:
+        v = liv.evaluate(liv.Evidence(heartbeat=hb, **kw))
+        check(v.state == "unknown" and v.reason == "heartbeat-on-session-query",
+              "%s ALONE must refuse the heartbeat axis; got %s/%s %s"
+              % (label, v.state, v.reason, v.detail))
+
+    # (2) THE OTHER DIRECTION: a LOG query that also carries a heartbeat is refused by the LOG
+    #     arm (it runs first), so neither axis can be masked by the other.
+    lr = LR(alive=True, size_delta=0, transcript_grew=False, cpu_delta_cs=0,
+            age_ms=liv.LOG_FREEZE_MS + H, window_ms=liv.LOG_WINDOW_MS)
+    v = liv.evaluate(liv.Evidence(log_read=lr, heartbeat=hb))
+    check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+          "a heartbeat must not be masked by a log read either; got %s/%s"
+          % (v.state, v.reason))
+
+    # (3) INERT WHEN ABSENT: a session query's verdict is EXACTLY what it was before the axis
+    #     existed, field for field. Asserted against a LITERAL (not against the same call with
+    #     `heartbeat=None`): two field-for-field identical `Evidence` instances take the same path
+    #     by construction, so that comparison could never fail and pinned nothing.
+    holder = liv.Candidate(pid=os.getpid(), observed=liv.HOLDER, kind="argv")
+    session = dict(sid="sid-1", now_ms=NOW_MS, jsonl_grew=False, jsonl_age_ms=5 * M,
+                   candidates=[holder])
+    check(liv.evaluate(liv.Evidence(**session)).to_dict()
+          == {"state": "running-quiet", "reason": "quiet-within-bound",
+              "holder_pid": os.getpid(), "witnesses": [], "detail": ""},
+          "the session ladder's verdict is unchanged by the new slot")
+
+
+@test("T60 `tool_age_max` is READ from the three shapes the fleet really writes, in ORDER")
+def t60():
+    """ACQUISITION IS NOT A VERDICT — and order is the signal, so nothing here may re-sort.
+
+    The same number appears in three places a reader might copy from, and all three are
+    supported by ONE pattern: the child's own `[task-heartbeat] tick` marker, the `task_status`
+    JSON view, and the watchdog's `Alive state:` diagnostic line (measured shapes, this repo).
+    The source's in-flight count is read from the SAME line as the age, because an age from one
+    tick and a count from another would let a stale max answer for a call that is not open.
+    """
+    marker = ("[task-heartbeat] tick nonce=abc tools=1 turn=1 stream_age_ms=6961576 "
+              "tool_age_max_ms=6961576 tool_updates=1 cpu_ms=135910 cpu_stall_ms=0 "
+              "cpu_advanced=1 saw_msg=1 saw_tool=1 progress=1")
+    as_json = ('{"status": "alive", "heartbeat": {"markers": 634, "ticks": 343, '
+               '"tools_in_flight": 1, "turn_active": true, "tool_age_max_ms": 18052}}')
+    alive_state = ("Alive state: toolsInFlight=1 turnActive=true streamAgeMs=18052 "
+                   "toolAgeMaxMs=18052 everSawRealActivity=true lastMarkerAgeMs=9000")
+    snake = "tool_age_max=18052ms"     # the reader-facing rendering of the same field
+
+    def ages(text, **kw):
+        return [s.age_ms for s in liv.parse_heartbeat_samples(text, **kw)]
+
+    check(ages(marker) == [6_961_576], "the tick marker parses")
+    check(ages(as_json) == [18_052], "the task_status JSON parses")
+    check(ages(alive_state) == [18_052], "the Alive state line parses")
+    check(ages(snake) == [18_052], "the `ms`-suffixed spelling parses")
+    check(ages("[task-heartbeat] ready nonce=abc") == [],
+          "a line with no age is NOT a reading of 0")
+    check(ages("") == [], "empty input yields no samples")
+    # The IN-FLIGHT count comes from the same line, in all three shapes, and `None` when absent.
+    check([s.in_flight for s in liv.parse_heartbeat_samples(marker)] == [True],
+          "`tools=1` on the marker line is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(as_json)] == [True],
+          "`tools_in_flight` in the JSON is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(alive_state)] == [True],
+          "`toolsInFlight=` on the Alive state line is an in-flight call")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(
+        "[task-heartbeat] tick nonce=abc tools=0 tool_age_max_ms=14460001")] == [False],
+        "`tools=0` is NO call in flight — the stale-max shape")
+    check([s.in_flight for s in liv.parse_heartbeat_samples(snake)] == [None],
+        "a source that does not state a count yields None, never a guess")
+
+    # ⛔ A TOKEN LONGER THAN 10 DIGITS IS NOT A READING. `int()` accepts it happily, so a
+    #    shape-drifted line would become a real AGE and could clear the 4h backstop in one step.
+    check(ages("tool_age_max_ms=99999999999999") == [],
+          "an over-long token is DROPPED, never truncated into a reading")
+
+    # ORDER IS PRESERVED — the last pair is the decision, so a sort would destroy the signal.
+    three = "\n".join([
+        marker,
+        "[task-heartbeat] tick nonce=abc tools=1 turn=1 tool_age_max_ms=18052",
+        "[task-heartbeat] tick nonce=abc tools=0 turn=1 tool_age_max_ms=0",
+    ])
+    check(ages(three) == [6_961_576, 18_052, 0],
+          "samples stay in FILE order; got %r" % (ages(three),))
+
+    # THE NONCE FENCE: another dispatch's markers are dropped when the caller names its own, and
+    # a source that carries SEVERAL is a fence the axis cannot judge — so it abstains.
+    check(ages(three + "\n[task-heartbeat] tick nonce=OTHER tools=1 tool_age_max_ms=9", nonce="abc")
+          == [6_961_576, 18_052, 0],
+          "a foreign dispatch's marker is not this child's evidence")
+    mixed = liv.heartbeat_from_text(three + "\n[task-heartbeat] tick nonce=OTHER tools=0 "
+                                            "tool_age_max_ms=0", source="fixture")
+    check(mixed.nonces == ("abc", "OTHER"), "every distinct nonce is recorded; got %r"
+          % (mixed.nonces,))
+    v = liv.evaluate(liv.Evidence(heartbeat=mixed))
+    check(v.state == "unknown" and v.reason == "heartbeat-ambiguous-nonce",
+          "a multi-dispatch source abstains instead of letting the last marker decide; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+
+    # THE FILE DOOR, end to end: two ticks of one child's log ⇒ the reset verdict.
+    tmp = tempfile.mkdtemp(prefix="liv-hb-")
+    try:
+        path = os.path.join(tmp, "child.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(three)
+        hb = liv.gather_heartbeat(path)
+        check(hb.readable and tuple(s.age_ms for s in hb.samples) == (6_961_576, 18_052, 0),
+              "the whole file is read in order; got %r" % ([s.age_ms for s in hb.samples],))
+        check(hb.source == path, "the read names its source")
+        check(hb.age_ms is not None and hb.age_ms < liv.HEARTBEAT_TIMEOUT_MS,
+              "a FRESH file carries a small source age; got %r" % hb.age_ms)
+        check(not hb.ended, "a live child's log carries no end marker")
+        # The child recomputes `tool_age_max_ms` from its CURRENT in-flight tools every tick, so
+        # its last tick (`tools=0`) reports no open call: the file door's verdict is
+        # `tool-age-no-call-open`, which is the same "alive" answer the reset pair gives.
+        check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "tool-age-no-call-open",
+              "the file door feeds the same verdict (no call open on the last tick)")
+        # A file with no age token is UNREADABLE (fail closed), never `0 ms`.
+        none_path = os.path.join(tmp, "no-age.log")
+        with open(none_path, "w", encoding="utf-8") as fh:
+            fh.write("[task-heartbeat] ready nonce=abc\n")
+        hb = liv.gather_heartbeat(none_path)
+        check(not hb.readable and hb.samples == (),
+              "a token-less file abstains; got readable=%r samples=%r" % (hb.readable, hb.samples))
+        check(liv.evaluate(liv.Evidence(heartbeat=hb)).reason == "heartbeat-unreadable",
+              "and the abstention is NAMED")
+        # A file that cannot be read at all is the same abstention, with its own fact.
+        hb = liv.gather_heartbeat(os.path.join(tmp, "absent.log"))
+        check(not hb.readable and hb.detail.startswith("unreadable:"),
+              "a missing file reports the failed read; got %r" % hb.detail)
+
+        # ── THE CLI: the pair is REPEATABLE, because one flag that holds one reading would
+        #    make the pre-fix error the only expressible query.
+        def cli(*args):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = liv.main(list(args))
+            return rc, out.getvalue().strip(), err.getvalue().strip()
+
+        rc, out, _ = cli("--tool-age-ms", "6961576", "--tool-age-ms", "18052")
+        check(rc == 0 and out.startswith("running-quiet tool-age-reset"),
+              "two samples decide at the CLI; got rc=%d %r" % (rc, out))
+        rc, out, _ = cli("--tool-age-ms", "6961576")
+        check(rc == 3 and out.startswith("unknown tool-age-single-sample"),
+              "a single sample ABSTAINS at the CLI (rc 3); got rc=%d %r" % (rc, out))
+        rc, out, _ = cli("--heartbeat", path)
+        check(rc == 0 and "tool-age-no-call-open" in out,
+              "`--heartbeat FILE` reads the child's own log; got rc=%d %r" % (rc, out))
+        rc, out, _ = cli("--heartbeat-json", path)
+        check(rc == 0 and "tool-age-no-call-open" in out, "`--heartbeat-json` is the same door")
+        # Two sources of the SAME samples is refused: the axis decides on the LAST PAIR, so a
+        # silent concatenation would let flag order change the verdict.
+        rc, out, err = cli("--tool-age-ms", "5", "--heartbeat", path)
+        check(rc == 2 and "one" in err, "two sample sources are refused; got rc=%d %r" % (rc, err))
+        # A negative age is not a reading, and clamping it would rewrite the caller's sample.
+        rc, out, err = cli("--tool-age-ms", "-1", "--tool-age-ms", "5")
+        check(rc == 2, "a negative age is a usage error; got rc=%d %r" % (rc, err))
+        # A two-axis query is a USAGE error (rc 2), not an abstention a caller would retry.
+        rc, out, err = cli("--sid", "abc", "--tool-age-ms", "5", "--tool-age-ms", "9")
+        check(rc == 2 and "separately" in err,
+              "`--sid` with a heartbeat source is rc 2; got rc=%d %r" % (rc, err))
+        # A nonce fence with no marker source advertises a fence that does not exist.
+        rc, out, err = cli("--nonce", "abc", "--tool-age-ms", "5", "--tool-age-ms", "9")
+        check(rc == 2, "`--nonce` without `--heartbeat` is a usage error; got rc=%d" % rc)
+        # ⛔ A STATED SOURCE AGE ARMS THE FRESHNESS GATE ON THE STATED-PAIR DOOR TOO. The gate is
+        #    a property of the READ, not of the door the samples came through: accepting
+        #    `--source-age-ms` here and discarding it published `running-quiet` rc 0 for readings
+        #    the caller had just said were old — the same 29-day-old-source class the FILE arm
+        #    closes, reachable through the caller's own stated evidence.
+        rc, out, _ = cli("--tool-age-ms", "6961576", "--tool-age-ms", "18052",
+                         "--source-age-ms", str(29 * 24 * 3600 * 1000))
+        check(rc == 3 and out.startswith("unknown heartbeat-stale"),
+              "a STALE stated age abstains on the flag shape (rc 3); got rc=%d %r" % (rc, out))
+        rc, out, _ = cli("--tool-age-ms", "6961576", "--tool-age-ms", "18052",
+                         "--source-age-ms", "12000")
+        check(rc == 0 and out.startswith("running-quiet tool-age-reset"),
+              "a FRESH stated age still decides — the gate is ARMED, not asserted; "
+              "got rc=%d %r" % (rc, out))
+        # …and a flag that can never apply is refused by NAME, exactly as `--nonce` is above.
+        rc, out, err = cli("--source-age-ms", "12000", "--sid", "abc")
+        check(rc == 2 and "--source-age-ms" in err,
+              "`--source-age-ms` on a session query is a usage error; got rc=%d %r" % (rc, err))
+        # No evidence at all is still a usage error, not an abstention.
+        rc, out, err = cli()
+        check(rc == 2 and "usage" in err, "no evidence is a usage error; got rc=%d" % rc)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("T61 a heartbeat SOURCE must be fresh, live and single-dispatch before any age is believed")
+def t61():
+    """⛔ THE AXIS WAS READING A FILE AND BELIEVING IT ABOUT *NOW*.
+
+    Three measured false verdicts, all from the newest input on the surface (each reproduced at
+    `origin/main`+the #4106 branch, 2026-11-17, so none of them is hypothetical):
+
+      1. a **29-day-old** log of a long-gone child (mtime 2025-10-18) → `running-quiet` rc 0. The
+         heartbeat is the CHILD's liveness signal, so a source past the watchdog's own heartbeat
+         bound is a reading of something that stopped emitting: `heartbeat-stale`. Bound CITED
+         (`HEARTBEAT_TIMEOUT_MS`, 30 min — the watchdog's own), never invented here.
+      2. a **finished** run — the child's own `[task-heartbeat] session_end`, or the `task_status`
+         view's `{"status": "done", "alive": false, "session_ended": true}` — carrying a stale
+         `tool_age_max` → `wedged` for a run whose own bytes said it was over:
+         `heartbeat-session-ended`. A finished run's tool age is HISTORY.
+      3. `toolAgeMaxMs` with `toolsInFlight = 0`: the parent deliberately does not reset the max at
+         `tool_end` (`builtin-tools/index.ts:2765-2772`) and is safe only because its own clause
+         requires `toolsInFlight > 0` — so a big age with no call open is a STALE MAX, and
+         `tool-age-no-call-open` (never `wedged`).
+
+    Plus the fence: markers from SEVERAL dispatches (the forged-line case the nonce exists for)
+    abstain (`heartbeat-ambiguous-nonce`) unless the caller names its own nonce.
+    """
+    def ev_text(text, **kw):
+        return liv.evaluate(liv.Evidence(heartbeat=liv.heartbeat_from_text(text, source="t", **kw)))
+
+    # (1) THE RUN IS OVER — both shapes the fleet writes.
+    ended_marker = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                    "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                    "[task-heartbeat] session_end nonce=abc\n")
+    v = ev_text(ended_marker)
+    check(v.state == "unknown" and v.reason == "heartbeat-session-ended",
+          "a child's own end marker outranks its last tool age; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    done_dump = ('{"status": "done", "alive": false, "heartbeat": {"tools_in_flight": 0, '
+                 '"session_ended": true, "tool_age_max_ms": 14460001}}\n') * 2
+    v = ev_text(done_dump)
+    check(v.state == "unknown" and v.reason == "heartbeat-session-ended",
+          "a DONE status dump is not a wedged lane; got %s/%s" % (v.state, v.reason))
+    # …and the LIVE dump of the same shape is NOT excused (the gate is on the terminal fact only).
+    live_dump = '{"status": "alive", "heartbeat": {"tools_in_flight": 1, "tool_age_max_ms": 18000000}}\n'
+    v = ev_text(live_dump + live_dump.replace("18000000", "18010000"))
+    check(v.state == "wedged", "a live dump past the bound is still wedged; got %s/%s"
+          % (v.state, v.reason))
+
+    # (2) A STALE SOURCE DECIDES NOTHING. Driven through the FILE door so the mtime age is real.
+    tmp = tempfile.mkdtemp(prefix="liv-hb-stale-")
+    try:
+        path = os.path.join(tmp, "old.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=6961576\n"
+                     "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18052\n")
+        old = liv.time.time() - 29 * 24 * 3600
+        os.utime(path, (old, old))
+        hb = liv.gather_heartbeat(path)
+        check(hb.age_ms is not None and hb.age_ms > liv.HEARTBEAT_TIMEOUT_MS,
+              "the door reads a 29-day-old mtime age; got %r" % hb.age_ms)
+        v = liv.evaluate(liv.Evidence(heartbeat=hb))
+        check(v.state == "unknown" and v.reason == "heartbeat-stale",
+              "a 29-day-old log must not publish a live state; got %s/%s %s"
+              % (v.state, v.reason, v.detail))
+        check("heartbeat bound" in v.detail, "the abstention cites the bound; got %r" % v.detail)
+        # THE CONTROL: the same bytes, FRESH, do decide — otherwise "stale everything" passes.
+        os.utime(path, None)
+        v = liv.evaluate(liv.Evidence(heartbeat=liv.gather_heartbeat(path)))
+        check(v.reason == "tool-age-reset", "the same bytes, fresh, decide; got %s/%s"
+              % (v.state, v.reason))
+        # The caller-STATED pair has no source age, so the staleness gate cannot invent one.
+        stated = liv.HeartbeatRead(readable=True, source="flag",
+                                   samples=(liv.HeartbeatSample(6961576),
+                                            liv.HeartbeatSample(18052)))
+        check(stated.age_ms is None
+              and liv.evaluate(liv.Evidence(heartbeat=stated)).reason == "tool-age-reset",
+              "a caller-stated pair carries no file age and is not gated on one")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # (3) THE FENCE APPLIES TO EVERY LINE ONCE IT IS GIVEN — not only to `[task-heartbeat]` ones.
+    #     The capture log is raw stdout+stderr (`extensions/shared/task-runs.ts:83`), so an
+    #     appendable file accepted a forged `task_status`-shaped line THROUGH the fence and flipped
+    #     `wedged` -> `running-quiet`. Measured before the fix:
+    #     `--heartbeat forged.log --nonce abc` printed `running-quiet tool-age-no-call-open
+    #     samples=18000000,18010000,3,4` rc 0 for a child whose own markers said `wedged`.
+    forged = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+              "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+              '{"status": "alive", "heartbeat": {"tools_in_flight": 0, "tool_age_max_ms": 3}}\n'
+              '{"status": "alive", "heartbeat": {"tools_in_flight": 0, "tool_age_max_ms": 4}}\n')
+    v = ev_text(forged, nonce="abc")
+    check(v.state == "wedged",
+          "a line that cannot show the dispatch's nonce is not its evidence; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+
+    # (4) A CHILD'S OWN OUTPUT IS NOT ITS END MARKER. The source is the capture log (raw stdout), so
+    #     a child that PRINTS the token — editing `task-heartbeat.ts`, quoting this doc — must not
+    #     abstain its own diagnosis. The marker is recognised only as a LINE that IS the marker.
+    prose = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+             "the marker is spelled [task-heartbeat] session_end nonce=abc\n")
+    v = ev_text(prose)
+    check(v.state == "wedged", "quoted prose must not read as an end marker; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    # …and printing a `nonce=` TOKEN must not turn one dispatch's log into several: the HARVEST is
+    # marker-scoped (the fence is not), so the ambiguity gate is about markers, not prose.
+    printed_nonce = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                     "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                     "every marker carries nonce=${nonce} on its line\n")
+    v = ev_text(printed_nonce)
+    check(v.state == "wedged",
+          "a PRINTED nonce token is not a second dispatch; got %s/%s %s"
+          % (v.state, v.reason, v.detail))
+    # …and another DISPATCH's end marker is fenced out with it, instead of poisoning the query.
+    other_end = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+                 "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+                 "[task-heartbeat] session_end nonce=OTHER\n")
+    check(ev_text(other_end, nonce="abc").state == "wedged",
+          "a fenced-out dispatch's session_end is dropped, not read")
+    check(ev_text(other_end).reason == "heartbeat-session-ended",
+          "…while the unfenced read still sees it and abstains")
+
+    # (5) A PIPE HAS NO AGE, SO IT MUST BE STATED. An unknown age silently skipped the staleness
+    #     gate, and `cat old.log | liveness.py --heartbeat -` published `running-quiet` rc 0 for a
+    #     29-day-old log. `--source-age-ms` is the caller's statement (it also covers a log COPIED
+    #     off another box, whose mtime is the copy's, not the child's last emission).
+    piped = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=6961576\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18052\n")
+
+    def through_pipe(text, **kw):
+        real, sys.stdin = sys.stdin, io.StringIO(text)
+        try:
+            return liv.gather_heartbeat("-", **kw)
+        finally:
+            sys.stdin = real
+
+    hb = through_pipe(piped, source_age_ms=29 * 24 * 3600 * 1000)
+    check(hb.readable, "a stated age is enough for a pipe")
+    v = liv.evaluate(liv.Evidence(heartbeat=hb))
+    check(v.state == "unknown" and v.reason == "heartbeat-stale",
+          "a pipe with a stated stale age abstains; got %s/%s" % (v.state, v.reason))
+    hb = through_pipe(piped, source_age_ms=0)
+    fresh = liv.evaluate(liv.Evidence(heartbeat=hb))
+    check(fresh.reason == "tool-age-reset",
+          "a fresh stated age decides; got %s/%s" % (fresh.state, fresh.reason))
+    hb = liv.gather_heartbeat("-")
+    check(not hb.readable and "--source-age-ms" in hb.detail,
+          "a pipe with NO stated age is an abstention naming the flag; got %r" % hb.detail)
+
+    # (3) THE FENCE, two ways: named nonce filters; several nonces abstain.
+    mixed = ("[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18000000\n"
+             "[task-heartbeat] tick nonce=abc tools=1 tool_age_max_ms=18010000\n"
+             "[task-heartbeat] tick nonce=FORGED tools=0 tool_age_max_ms=0\n")
+    v = ev_text(mixed)
+    check(v.state == "unknown" and v.reason == "heartbeat-ambiguous-nonce",
+          "a forged marker must not flip a wedged child; got %s/%s" % (v.state, v.reason))
+    v = ev_text(mixed, nonce="abc")
+    check(v.state == "wedged", "with the dispatch's own nonce the pair still decides; got %s/%s"
+          % (v.state, v.reason))
+    # A nonce that matches NOTHING is an abstention, not a silent empty read.
+    v = ev_text(mixed, nonce="nope")
+    check(v.state == "unknown" and v.reason == "heartbeat-unreadable",
+          "a nonce matching no marker abstains; got %s/%s" % (v.state, v.reason))
+    check("nonce=nope" in v.detail, "and names the fence it could not satisfy; got %r" % v.detail)
+
+
+@test("T62 a mutation count names the HOST it was measured on, and a host-coupled mutant says so")
+def t62():
+    # ⛔ THE SAME SOURCE BYTES READ `MISSED=0` AND `MISSED=2` IN ONE ROUND (#4110 round 4). A fixer
+    # measured on Linux, a reviewer reasoned from a macOS box, and NEITHER LINE NAMED ITS HOST — so
+    # two facts about two boxes were argued as a contradiction about the code. The summary line is
+    # the artifact a reader quotes, so the line carries the box; and a mutant whose catch depends on
+    # the host DECLARES that dependency, so a miss reports it instead of implicating the source.
+    host_rx = re.compile(r"^MUTATIONS=\d+ CAUGHT=\d+ MISSED=\d+ "
+                         r"\([a-z0-9_]+/python\d+\.\d+\.\d+\)$")
+    line = mutation_summary(132, 132, 0)
+    check(host_rx.match(line) is not None,
+          "the summary names the host it was measured on; got %r" % line)
+    check(platform.system().lower() in line
+          and "python%d.%d.%d" % sys.version_info[:3] in line,
+          "…and that host is the RUNNING one, not a literal; got %r" % line)
+
+    # NON-VACUITY: this is the shape both heads printed before this gate existed
+    # (`66e9ec87c`/`4938f70cf` printed `MUTATIONS=132 CAUGHT=132 MISSED=0`; the macOS reading of
+    # the same bytes printed `MUTATIONS=132 CAUGHT=131 MISSED=1`). The gate must REJECT it.
+    pre_fix = "MUTATIONS=132 CAUGHT=131 MISSED=1"
+    check(host_rx.match(pre_fix) is None,
+          "the pre-fix line must NOT satisfy the host gate; got %r" % pre_fix)
+
+    # A HOST-COUPLED mutant declares what its catch needs, and a MISS prints it.
+    coupled = [m for m in MUTATIONS if m.requires]
+    check(bool(coupled),
+          "at least one host-coupled mutant is DECLARED — declaring none asserts every catch is "
+          "host-free, which this suite cannot (the `/proc`→`ps` fixture needs a `ps` that answers)")
+    proc_fallback = [m for m in coupled if "proc = None" in m.new]
+    check(len(proc_fallback) == 1,
+          "the `/proc` reader's `ps`-fallback mutant is the declared one — its fixture proves the "
+          "fallback by asserting pid 1 gets NO number, which only a host whose `ps` can answer "
+          "can distinguish; got %r" % [m.new for m in coupled])
+    for m in coupled:
+        note = _miss_note(m)
+        check("REQUIRES" in note and m.requires in note,
+              "a MISS names the requirement the host lacked; got %r" % note)
+    plain = [m for m in MUTATIONS if not m.requires][0]
+    check(_miss_note(plain) == "",
+          "a host-free mutant adds no host note; got %r" % _miss_note(plain))
+
+
+@test("T63 every mutant run is BOUNDED: stdin is DEVNULL and the wait has a timeout")
+def t63():
+    # ⛔ THE HARNESS ITSELF WAS THE HANG (#4110 round 5). T61(5) deliberately reads the REAL stdin
+    # (that is how it proves the refusal happens BEFORE the read), so its paired mutant — the
+    # source-age gate deleted — reached `sys.stdin.read()` on whatever stdin the RUNNER inherited.
+    # CI handed it a non-tty (EOF ⇒ red); a terminal hands it a tty (blocks forever), and from a
+    # tty `--mutations` therefore could not produce the evidence this header and docs §8 quote.
+    # Both bounds are pinned here by BEHAVIOUR — a blocking fd 0 and a child that never exits — so
+    # the rows fail on what the harness DOES, not on how its source is spelled.
+    child = "import sys; sys.stdin.read(); print('PASS=0 FAIL=1'); sys.exit(1)"
+    r, w = os.pipe()               # an open pipe: read() blocks until EOF, which never arrives
+    saved = os.dup(0)
+    try:
+        os.dup2(r, 0)              # exactly what a tty (or a live pipe) hands a child
+        rc, body, timed_out = _run_mutant({}, argv=[sys.executable, "-c", child], timeout=10)
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+        os.close(r)
+        os.close(w)
+    check(not timed_out and rc == 1,
+          "a mutant that READS STDIN still finishes — it is given DEVNULL, so read() is EOF; "
+          "got rc=%r timed_out=%r" % (rc, timed_out))
+    check("PASS=0 FAIL=1" in body, "…and its own output still comes back; got %r" % body)
+
+    rc, body, timed_out = _run_mutant(
+        {}, argv=[sys.executable, "-c", "import time; time.sleep(8)"], timeout=1)
+    check(timed_out and rc is None,
+          "a mutant that never EXITS is REPORTED as a timeout instead of waited for; "
+          "got rc=%r timed_out=%r" % (rc, timed_out))
+    check(_mutation_caught(None, "PASS=0 FAIL=1\n", True) is False,
+          "…and a timed-out run is NEVER counted as caught, however red its partial output looks")
+    check(_mutation_caught(1, "PASS=0 FAIL=1\n", False) is True,
+          "…while a completed RED run still is — the bound must not eat real catches")
+
+
 class Mutation:
-    def __init__(self, test_name, target, old, new, why):
+    def __init__(self, test_name, target, old, new, why, requires=""):
         self.test_name = test_name
-        self.target = target          # "module" | "lib"
+        self.target = target          # "module" | "lib" | "harness" (a guard in THIS file)
         self.old = old
         self.new = new
         self.why = why
+        # ⛔ THE HOST CAPABILITY this mutant needs in order to be CAUGHT — empty when the catch
+        # is a property of the source alone. A mutation count is a measurement OF A BOX, not a
+        # property of the code, and one round of this PR (#4110) produced `MISSED=0` and
+        # `MISSED=2` for the SAME source bytes from two boxes. A coupled mutant that misses is
+        # then a fact about the host, and the printed note says so instead of implicating the
+        # code. T62 holds this to the suite.
+        self.requires = requires
 
 
 MUTATIONS = [
+    # ⛔ A `harness` ANCHOR IS WRITTEN AS TWO ADJACENT LITERALS ON PURPOSE. A harness mutant's
+    # anchor lives in THIS file, so a single literal would also match itself in this table: the
+    # uniqueness check would see two hits and refuse to run. Do not "tidy" these into one string.
+    #
+    # ⛔ T62's TWO GUARDS ARE THE EVIDENCE LAYER ITSELF (#4110 round 6). Everything else in this
+    # diff is mutation-attributed; these two were the exception — and they are the ones a reader
+    # TRUSTS when quoting a count, so a silent regression puts the count back to being quoted
+    # without its host and a host-coupled miss back to reading as a defect in the code.
+    Mutation(
+        "T62", "harness",
+        'missed, platform.' + 'system().lower(),',
+        'missed, "",',
+        "the summary line loses its HOST again: `MUTATIONS=… CAUGHT=… MISSED=…` is quoted as a "
+        "property of the CODE, and the same bytes then read 137/0 on Linux and 136/1 on macOS "
+        "with nothing saying which box produced which",
+    ),
+    Mutation(
+        "T62", "harness",
+        '    if not mut.requires:' + '\n        return ""',
+        '    return ""',
+        "a host-coupled MISS stops naming the requirement the host lacked, so the miss reads as "
+        "\"the code lost this behaviour\" — the misattribution T62 exists to stop",
+    ),
+    Mutation(
+        "T63", "harness",
+        '            stdin=subprocess.' + 'DEVNULL,',
+        '            stdin=None,',
+        "the mutant child inherits the CALLER's stdin again, so a mutant that reaches a READ "
+        "(T61(5)'s pipe row, on the child's own fd 0) blocks forever on a tty: neither RED nor "
+        "MISSED, and `--mutations` never returns — measured at the pre-fix head, 20s in "
+        "`sys.stdin.read()` with no exit",
+    ),
+    Mutation(
+        "T63", "harness",
+        '            timeout=' + 'bound,',
+        '            timeout=None,',
+        "the wait loses its bound, so a mutant that never exits hangs the whole run instead of "
+        "being REPORTED as a timeout — the failure the other half of this pair only bounds, not "
+        "fixes",
+    ),
+    Mutation(
+        "T63", "harness",
+        '    return (not timed_out)' + ' and _mutation_verdict(returncode, body)',
+        '    return _mutation_verdict(returncode, body)',
+        "a timed-out run is scored on its partial output, so a hang whose truncated `PASS=0 "
+        "FAIL=1` survived in the pipe reads as CAUGHT — a catch nobody observed",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if len(hb.samples) < 2:',
+        '        if not hb.samples:',
+        "the single-sample ABSTENTION is deleted, so a one-reading query falls through to the "
+        "pair comparison and raises IndexError on `samples[-2]` — the guard that turns one "
+        "reading into `tool-age-single-sample` is gone rather than weakened (an EMPTY read never "
+        "reaches this line: `not hb.samples` abstains above it), so this mutant reds by CRASH, not "
+        "by the assertion T58(1) would name. What it PROVES is that the guard is load-bearing; "
+        "the abstention's reason and rc are pinned by T58(1)/T60's rc-3 row against the INTACT "
+        "code",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if last.age_ms < prev.age_ms:',
+        '        if last.age_ms > prev.age_ms:',
+        "the asymmetry is INVERTED: a GROWING age reads as movement (alive) and a resetting "
+        "age as a stable call, so #3987's real sequence reads `pending` and a hung call reads "
+        "`running-quiet` — the false-alive direction",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if _exceeds(last.age_ms, bound):',
+        '        if False:',
+        "a same-call age past the watchdog's backstop never reads `wedged` — the fail-OPEN "
+        "direction: a genuinely hung tool call is unbounded again, which is the state the "
+        "five-state ladder exists to name",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if not hb.readable or not hb.samples:',
+        '        if not hb.samples:',
+        "an UNREADABLE source (nothing was read) is reported as a one-sample abstention — the "
+        "`claims-unreadable` vs `no-claim-visible` collapse: `readable` is the load-bearing "
+        "field, and a failed read must not wear the reason of a successful one",
+    ),
+    Mutation(
+        "T59", "module",
+        '    if ev.heartbeat is not None:\n        if axis_masking(ev, heartbeat=False):',
+        '    if False:\n        if axis_masking(ev, heartbeat=False):',
+        "the heartbeat axis is INERT — the #4106 input is accepted and silently ignored, so a "
+        "two-sample reset or a hung call falls through to `no-holder-record` (the same class "
+        "as a `--log` flag that does nothing)",
+    ),
+    Mutation(
+        "T59", "module",
+        '    return bool(heartbeat and ev.heartbeat is not None)',
+        '    return False',
+        "the LOG arm stops refusing a heartbeat, so `Evidence(log_read=…, heartbeat=…)` resolves "
+        "to whichever arm runs first and DISCARDS the other axis — #1777 B7 rebuilt on a third "
+        "axis, in the direction where the discarded reading is the only one about the child",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if hb.ended:',
+        '        if False:',
+        "a FINISHED run's own end marker is ignored, so the stale tool age inside it decides — "
+        "measured: a `{\"status\": \"done\", \"alive\": false}` dump reads `wedged` for a lane "
+        "whose own bytes say it is over",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if hb.age_ms is not None and _exceeds(hb.age_ms, HEARTBEAT_TIMEOUT_MS):',
+        '        if False:',
+        "the SOURCE-freshness gate is dropped, so a 29-day-old log of a long-gone child publishes "
+        "`running-quiet` with rc 0 — a reading of something that stopped emitting, read as a state",
+    ),
+    Mutation(
+        "T58", "module",
+        '        if last.in_flight is False:',
+        '        if False:',
+        "the source's own in-flight count stops deciding, so a STALE `toolAgeMaxMs` (`tools=0`, the "
+        "value the parent deliberately does not reset at `tool_end`) reads as an open call and "
+        "convicts — the false-`wedged` class #4106 exists to remove",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if got is not None and "[task-heartbeat]" in line and got.group(1) not in nonces:',
+        '        if got is not None and got.group(1) not in nonces:',
+        "the nonce HARVEST widens to every line, so a child that merely PRINTS a `nonce=` token in "
+        "its own output reads as several dispatches and abstains a query whose answer was never in "
+        "doubt (`heartbeat-ambiguous-nonce`)",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if nonce and (got is None or got.group(1) != nonce):',
+        '        if nonce and "[task-heartbeat]" in line and (got is None or got.group(1) != nonce):',
+        "the nonce fence stops covering every line and covers only marker-shaped ones, so a forged "
+        "`task_status` line in the run's appendable capture log flips `wedged` -> `running-quiet` "
+        "THROUGH the fence (measured: `samples=18000000,18010000,3,4`, rc 0)",
+    ),
+    Mutation(
+        "T61", "module",
+        'r"^\\s*\\[task-heartbeat\\]\\s+session_end\\b"',
+        'r"\\[task-heartbeat\\]\\s+session_end\\b"',
+        "the end marker loses its LINE anchor, so any line that merely PRINTS the words — a child's "
+        "own stdout in the capture log, this doc quoted — abstains the child's diagnosis",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if source_age_ms is None:',
+        '        if False:',
+        "a PIPE stops requiring a stated age, so `cat old.log | liveness.py --heartbeat -` decides "
+        "on an UNKNOWN source age — the freshness gate skipped exactly where it cannot be measured",
+    ),
+    Mutation(
+        "T61", "module",
+        '        if not hb.fenced_nonce and len(hb.nonces) > 1:',
+        '        if False:',
+        "the multi-dispatch fence is dropped: markers from SEVERAL nonces (what a forged line on "
+        "the child's inherited fd 2 looks like) are read, and the last one decides — measured: one "
+        "appended `nonce=FORGED … tool_age_max_ms=0` line flips `wedged` to `running-quiet`",
+    ),
+    Mutation(
+        "T60", "module",
+        '        if len(hb.samples) < 2:',
+        '        if len(hb.samples) < 1:',
+        "the single-sample ABSTENTION is deleted, so a ONE-reading query falls through to the "
+        "pair comparison and raises IndexError on `samples[-2]` — the guard that turns one reading "
+        "into `tool-age-single-sample` rc 3 is gone (an EMPTY read never reaches this line: "
+        "`not hb.samples` abstains above it), so this mutant reds by CRASH, not by the assertion "
+        "that T58(1) and T60's rc-3 row would name",
+    ),
+    Mutation(
+        "T60", "module",
+        'r"(?:tool_age_max_ms|tool_age_max|toolAgeMaxMs)[\\"\']?\\s*[=:]\\s*[\\"\']?(\\d{1,10})(?![0-9])"',
+        'r"(?:tool_age_max_ms|tool_age_max|toolAgeMaxMs)[\\"\']?\\s*[=:]\\s*[\\"\']?(\\d{1,10})"',
+        "the digit lookahead is dropped, so an over-long token is TRUNCATED to its first ten "
+        "digits and becomes a real age — a shape-drifted line could then clear the 4h backstop "
+        "in one step (`int()` accepts 40 digits happily)",
+    ),
+    Mutation(
+        "T60", "module",
+        '            tool_ages.append(age); i += 2; continue',
+        '            tool_ages[:] = [age]; i += 2; continue',
+        "`--tool-age-ms` keeps only the LAST sample instead of accumulating the pair, so the "
+        "repeatable flag silently degrades every CLI query to the single-sample abstention — "
+        "the axis becomes unusable while exiting 3 as if it had merely abstained",
+    ),
     Mutation(
         "T52", "module",
         '                               % (_n(None if ev.cpu.delta_s is None else "%.2fs" % ev.cpu.delta_s),',
@@ -3353,26 +4108,26 @@ MUTATIONS = [
     ),
     Mutation(
         "T36", "module",
-        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
-        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
-        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
-        '                or ev.cpu is not None or ev.child is not None \\\n'
-        '                or not ev.ps_ok or not ev.store_ok:\n',
-        '        if False:\n',
+        '    if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '            or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '            or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '            or ev.cpu is not None or ev.child is not None \\\n'
+        '            or not ev.ps_ok or not ev.store_ok:\n',
+        '    if False:\n',
         "the log axis accepts a query that ALSO carries session/claim evidence, so a log "
         "read can mask it (the #1777 B7 shape, reconstructed on the new axis)",
     ),
     Mutation(
         "T55", "module",
-        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
-        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
-        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
-        '                or ev.cpu is not None or ev.child is not None \\\n'
-        '                or not ev.ps_ok or not ev.store_ok:\n',
-        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
-        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
-        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
-        '                or ev.cpu is not None or ev.child is not None:\n',
+        '    if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '            or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '            or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '            or ev.cpu is not None or ev.child is not None \\\n'
+        '            or not ev.ps_ok or not ev.store_ok:\n',
+        '    if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '            or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '            or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '            or ev.cpu is not None or ev.child is not None:\n',
         "the masking refusal ignores the SESSION AXIS'S ABSTENTIONS, so a log read "
         "resolves over `unknown/ps-unreadable` — and a `frozen` log read then CONVICTS "
         "a lane on the evidence it discarded (the #1777 B7 shape on a new axis)",
@@ -4088,6 +4843,13 @@ MUTATIONS = [
         '    except _ProcUnreadable:\n        proc = None',
         "an unreadable `/proc` member FALLS BACK to the coarser `ps` instead of abstaining, "
         "which reads the same blind spot at whole-second resolution and returns a number",
+        # This is the mutant the #4109 reading names as "T54 (/proc fallback)", and it is the
+        # one that reads MISSED on a macOS box: t54() detects the fallback by asserting it yields
+        # NO answer for pid 1 (`…/liveness.test.py`, "(c) … AND IT ABSTAINS EVEN FOR A PID THE
+        # COARSER `ps` WOULD HAPPILY ANSWER", where a fallback that the host's `ps` cannot answer
+        # returns None either way and the mutation goes GREEN). Declared, not silently absorbed.
+        requires="a `ps` that answers for pid 1 in the Linux column/time shape the coarse reader "
+                 "parses (measured CAUGHT on Linux under both python3.12.3 and python3.9.25)",
     ),
     Mutation(
         "T54", "module",
@@ -4175,6 +4937,24 @@ MUTATIONS = [
         "guard was pinned only in aggregate (#1777 B7 rebuilt: a `frozen` log read then "
         "convicts a lane whose claim/candidate evidence the query carried)",
     ),
+    Mutation(
+        "T60", "module",
+        '              else HeartbeatRead(readable=True, source="flag", age_ms=source_age_ms,',
+        '              else HeartbeatRead(readable=True, source="flag",',
+        "the caller's stated source age is DROPPED on the `--tool-age-ms` door, so a freshness "
+        "gate that was asked for is never armed: readings the caller just said came from a "
+        "29-day-old copy publish `running-quiet` rc 0 instead of the `heartbeat-stale` "
+        "abstention — the flag becomes an inert advertisement, which is exactly what `--nonce` is "
+        "refused for",
+    ),
+    Mutation(
+        "T60", "module",
+        '    if source_age_ms is not None and heartbeat_path is None and not tool_ages:',
+        '    if False:',
+        "`--source-age-ms` on a `--sid` query is accepted and silently discarded rather than "
+        "refused, so the one query that can never honour the age reports success — a caller is "
+        "told their provenance was used when the session ladder never read it",
+    ),
 ]
 
 
@@ -4199,6 +4979,23 @@ def run_tests(only=None):
 
 def _mutated_env(mut):
     tmp = tempfile.mkdtemp(prefix="liv-mutant-")
+    if mut.target == "harness":
+        # ⛔ THE HARNESS IS CODE TOO (#4110 round 5). A mutant that reverts a guard living in THIS
+        # file cannot be expressed against the module, so the copy is of the suite itself. The
+        # copy's own `HERE`/`MODULE_PATH` point at the temp dir, so both are handed in explicitly:
+        # `LIVENESS_MODULE` is read first by `_load_module`, and `PI_PID_IDENTITY_LIB` is
+        # `setdefault`ed below — an explicit value wins over the copy's derived path.
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+            src = fh.read()
+        if src.count(mut.old) != 1:
+            raise SystemExit("mutation anchor not unique in %s (%d hits):\n%s"
+                             % (os.path.abspath(__file__), src.count(mut.old), mut.old))
+        out = os.path.join(tmp, "liveness.test.py")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(src.replace(mut.old, mut.new, 1))
+        env = {"LIVENESS_MODULE": MODULE_PATH, "PI_PID_IDENTITY_LIB": LIB_PATH,
+               "LIVENESS_ONLY": mut.test_name}
+        return tmp, out, env
     if mut.target == "lib":
         with open(LIB_PATH, "r", encoding="utf-8") as fh:
             src = fh.read()
@@ -4225,6 +5022,44 @@ def _mutated_env(mut):
     return tmp, out, env
 
 
+# ⛔ ONE MUTANT'S RUN IS BOUNDED, because a mutant can reach a READ (#4110 round 5). T61(5)
+# calls `gather_heartbeat("-")` on the REAL stdin — that is how the row proves the refusal happens
+# BEFORE the read — so its paired mutant (the source-age gate deleted) reaches `sys.stdin.read()`.
+# A child spawned without `stdin=` inherits the CALLER's stdin, so from a tty or a live pipe that
+# read never returns: the mutant is neither RED nor MISSED, `--mutations` never finishes, and the
+# one command this header and docs §8 both print could not produce its own evidence locally. CI
+# passed only because the runner hands the step a non-tty stdin, which reads EOF. DEVNULL makes
+# the read an EOF for every future mutant; the timeout turns "hang" into a REPORTED outcome (PIT
+# scores a timeout, it does not wait for one) instead of a silent wait.
+MUTATION_TIMEOUT_S = 60
+
+
+def _run_mutant(env, argv=None, timeout=None):
+    """Run ONE mutant's paired test; return ``(returncode, body, timed_out)``.
+
+    ``returncode`` is ``None`` when the wait was CUT OFF — a timed-out run has no exit status, and
+    it must not be read as one (see :func:`_mutation_caught`).
+    """
+    argv = [sys.executable, os.path.abspath(__file__)] if argv is None else list(argv)
+    bound = MUTATION_TIMEOUT_S if timeout is None else timeout
+    try:
+        proc = subprocess.run(
+            argv,
+            env=dict(os.environ, **env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return None, (exc.stdout or b"").decode("utf-8", "replace"), True
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), False
+
+
+def _mutation_caught(returncode, body: str, timed_out) -> bool:
+    """Is this mutant CAUGHT? Only a COMPLETED run can be — a hang is not a catch."""
+    return (not timed_out) and _mutation_verdict(returncode, body)
+
+
 def _mutation_verdict(returncode: int, body: str) -> bool:
     """Is this mutation CAUGHT? Only if the paired test RAN and FAILED.
 
@@ -4242,6 +5077,34 @@ def _mutation_verdict(returncode: int, body: str) -> bool:
     return False
 
 
+def mutation_summary(total, caught, missed):
+    """The ONE line a reader quotes, so it names the BOX it was measured on.
+
+    ⛔ A COUNT WITHOUT ITS HOST IS NOT REPRODUCIBLE. Measured 2026-11-17 (#4110 round 4): the
+    same source bytes reported `MUTATIONS=132 CAUGHT=132 MISSED=0` on Linux and
+    `MUTATIONS=132 CAUGHT=131 MISSED=1` on macOS, and neither line named its host, so the two
+    readings looked like a contradiction about the code. The suffix is DERIVED from the running
+    interpreter and platform, never written by hand (`platform.system()`, `sys.version_info`).
+    """
+    return ("MUTATIONS=%d CAUGHT=%d MISSED=%d (%s/python%d.%d.%d)"
+            % (total, caught, missed, platform.system().lower(),
+               sys.version_info[0], sys.version_info[1], sys.version_info[2]))
+
+
+def _miss_note(mut):
+    """The disclosure a HOST-COUPLED mutant prints when it misses; empty otherwise.
+
+    A MISSED line with no note reads as "the code lost this behaviour". For a coupled mutant it
+    is not: the fixture cannot distinguish the mutant on this host, so the count travels with
+    the host that produced it. T62 holds this to the suite.
+    """
+    if not mut.requires:
+        return ""
+    return ("      \u26a0\ufe0f  host-coupled mutant: it REQUIRES %s.\n"
+            "          Missing it here is a fact about THIS HOST, not about the code — quote\n"
+            "          the count together with the host that produced it.\n" % mut.requires)
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired test RED ──")
     print("   (the mutated file is written to a temp dir; the real source is never touched)\n")
@@ -4249,28 +5112,31 @@ def run_mutations():
     for mut in MUTATIONS:
         tmp, out, env = _mutated_env(mut)
         try:
-            proc = subprocess.run(
-                [sys.executable, os.path.abspath(__file__)],
-                env=dict(os.environ, **env),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            body = proc.stdout.decode("utf-8", "replace")
+            rc, body, timed_out = _run_mutant(
+                env, argv=[sys.executable, out if mut.target == "harness"
+                           else os.path.abspath(__file__)])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        red = _mutation_verdict(proc.returncode, body)
+        red = _mutation_caught(rc, body, timed_out)
         print("── %s mutation → %s ───────────────────────────────────────" % (mut.test_name, mut.why))
         for line in body.splitlines():
             print("   | %s" % line)
         if red:
-            print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % proc.returncode)
+            print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % rc)
         else:
             bad += 1
-            if "PASS=0" in body and "FAIL=0" in body:
+            if timed_out:
+                print("   ⚠️  TIMED OUT after %ds — the paired test never finished, so this "
+                      "mutant caught NOTHING (a hang is not a catch)\n" % MUTATION_TIMEOUT_S)
+            elif "PASS=0" in body and "FAIL=0" in body:
                 print("   ❌ NOT RUN — no test matched `%s`; this mutation verified NOTHING\n"
                       % mut.test_name)
             else:
                 print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
-    print("MUTATIONS=%d CAUGHT=%d MISSED=%d" % (len(MUTATIONS), len(MUTATIONS) - bad, bad))
+                note = _miss_note(mut)
+                if note:
+                    print(note)
+    print(mutation_summary(len(MUTATIONS), len(MUTATIONS) - bad, bad))
     return bad == 0
 
 

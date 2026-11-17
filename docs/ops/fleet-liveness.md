@@ -146,6 +146,13 @@ report now re-reads `git status --porcelain -z` / `rev-parse HEAD` /
 the probe — **withholds the verdict** (`verdictWithheld=stale-snapshot`, plus
 `commitsSinceSnapshot=`) instead of reporting "nothing happened".
 
+**And the report's `tool_age_max` is only readable as a PAIR.** The child's own age is
+what answers *"did its current action finish?"* — but one reading cannot tell "still
+running" from "just started", and `liveness.py` took no such input at all, so readers
+inferred a state from mtime and pid presence instead (#4106: one working child called
+`wedged` three times in one session). The verdict now takes the readings and requires
+two of them: **§15**.
+
 ---
 
 ## 1. The five states and what each rests on
@@ -556,6 +563,13 @@ not a stall.
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
 | `turn-unknown:<stopReason>` | on a message carrying **no** tool calls, the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
+| `tool-age-single-sample` | ONE `tool_age_max` reading was supplied; ``still running`` and ``just started`` are the same number (§15) |
+| `tool-age-open-pending` | two readings, no drop, and the same call is still UNDER the watchdog's age backstop (§15) — pending, never a stall |
+| `heartbeat-unreadable` | the heartbeat source could not be read, or carried no `tool_age` token — never read as `0 ms` |
+| `heartbeat-on-session-query` | the heartbeat axis was supplied TOGETHER with session/claim/CPU evidence; the axis is one query wide, so it refuses rather than masking (§15) |
+| `heartbeat-stale` | the heartbeat SOURCE is older than the watchdog's own heartbeat bound, so it is a reading of something that stopped emitting (§15) |
+| `heartbeat-session-ended` | the source carries the run's own end (`session_end` / `"alive": false`) — a finished run's tool age is history, not a state (§15) |
+| `heartbeat-ambiguous-nonce` | the source carries markers from several dispatches and the caller named no nonce; the axis cannot judge that contest (§15) |
 
 **The six claim reasons (#1777)** — emitted only by `liveness.claim_verdict`, from
 `tools/fleet/claim_lanes.py`'s read. Every one of them is `unknown`, so a claim can neither
@@ -907,6 +921,10 @@ The report is appended to a capped durable log (`~/.pi/agent/state/lane-liveness
 python3 tools/fleet/liveness.py --sid <session-id>
 python3 tools/fleet/liveness.py --sid <session-id> --json
 
+# one TASK CHILD's own action, from its heartbeat — TWO samples minimum (§15)
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052
+python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
+
 # the whole fleet; no GitHub side effects (it still appends to the durable log)
 python3 tools/fleet/lane_liveness.py --dry-run
 ```
@@ -915,14 +933,36 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 57 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (112)
+python3 tools/fleet/liveness.test.py               # 64 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (137)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
+
+⛔ **QUOTE THE `--mutations` SUMMARY WITH ITS HOST: the line now carries one**
+(`MUTATIONS=132 CAUGHT=132 MISSED=0 (linux/python3.12.3)`). A mutation count is a measurement of
+**a box**, never a property of the source: measured 2026-11-17 at the same commit, Linux read
+`132/132/0` under both `python3.12.3` and `python3.9.25`, while a macOS host read `131/1`. The one
+declared **host-coupled** mutant is the `/proc`→`ps` fallback: `t54()` proves the fallback by
+asserting that pid 1 gets **no** number, which only a host whose `ps` answers in the parsed
+Linux shape can distinguish — so its miss on macOS is a fact about macOS, and it now prints that
+requirement instead of implicating the code (T62 pins both halves). Two readings of the same bytes
+were argued as a contradiction about the code once already; the host in the line is what stops it.
+
+⛔ **EVERY MUTANT RUN IS BOUNDED — stdin is `/dev/null` and the wait has a timeout, because a
+mutant can reach a READ** (#4110 round 5). `T61(5)` deliberately calls `gather_heartbeat("-")` on
+the real stdin (that is how the row proves the refusal happens *before* the read), so its paired
+mutant — the source-age gate deleted — reaches `sys.stdin.read()`. A child spawned without `stdin=`
+inherits the CALLER's stdin, so on a tty (or any live pipe) that read never returns: the mutant is
+neither RED nor MISSED, `--mutations` never finishes, and the command above cannot produce its own
+evidence locally. CI passed only because the runner hands the step a non-tty stdin, which reads EOF.
+`_run_mutant()` now passes `stdin=subprocess.DEVNULL` and `timeout=MUTATION_TIMEOUT_S` (60 s), and a
+run cut off by that bound prints `⚠️ TIMED OUT` and counts as **not** caught — a hang is not a
+catch. `T63` pins both halves by BEHAVIOUR (a blocking fd 0, and a child that never exits), and
+three `harness` mutants revert each half, so the guarantee is mutation-proven like the rest.
 
 The last suite is also the only place the fence default is pinned against
 `scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
@@ -1979,7 +2019,8 @@ The axis is an **evidence field of `evaluate`** (`Evidence.log_read`), exactly l
 `log_lane_verdict` is reached **only** from `evaluate`. It is **inert when `log_read is None`** (pinned
 by T36 and by the mutation that degenerates its `if ev.log_read is not None:` guard), and supplying
 `log_read` on a query that ALSO carries session or claim evidence (`sid`, `claim_read`, `candidates`,
-`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`, and the **failed-read flags** `ps_ok` /
+`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`, the tree's `cpu`/`child` slots, the
+heartbeat axis's `heartbeat` (§15), and the **failed-read flags** `ps_ok` /
 `store_ok`) is **refused by name** (`log-read-on-session-query`) rather than resolved by whichever axis
 is checked first — that would be the #1777 B7 defect (an added axis masking other evidence) rebuilt on
 a new axis.
@@ -2136,3 +2177,144 @@ acceptable answer; silence, and a guess, are not.
 
 Full runbook, evidence table and the six diagnostic rounds:
 [`media-devices.md`](media-devices.md).
+
+---
+
+## 15. The task child's OWN action — `tool_age_max`, two samples or nothing (#4106)
+
+§0a separates `not-started` from `wedged`; this section answers the question a reader holding a
+`task_status` row actually has: **did this child's current action finish?**
+
+Neither of the session signals can answer it. A child's `edit` tool writes files **in-process**, so
+"no child process" is the expected shape of thinking-then-writing; and a running test suite, or a
+child that has already **committed** and kept working, produces no file change at all. #3987 called
+**one** working child `wedged` **three times** on exactly those three readings, in one session.
+
+The signal that does answer it is the child's own `tool_age_max` — how long its oldest in-flight
+tool call has been open (`extensions/task-heartbeat.ts`, surfaced by `task_status` as
+`heartbeat.tool_age_max_ms`). **One reading of it is not evidence in either direction:** 116 minutes
+means *still running* if the previous reading was 90 minutes and *just started* if it was 130. The
+discriminator is the **change between two samples**.
+
+| two samples (the last pair) | verdict | why |
+|---|---|---|
+| the last sample says **no call in flight** (`tools=0` / `"tools_in_flight": 0`) | `running-quiet` / `tool-age-no-call-open` | the age is a **stale maximum**, not an open call: the parent does not reset `toolAgeMaxMs` at `tool_end` and is safe only because its own clause requires `toolsInFlight > 0` (`extensions/builtin-tools/index.ts:2765-2772`) |
+| the age **drops** (6,961,576 → 18,052) | `running-quiet` / `tool-age-reset` | the call that was open ENDED and the child moved on — positive liveness evidence |
+| no drop, and the age is **past** the watchdog's age backstop | `wedged` / `tool-age-open-stable` | the SAME call is still open past the point at which the watchdog itself would cut it |
+| no drop, still **under** the backstop | `unknown` / `tool-age-open-pending` | pending, not a stall: a long tool call is what a working child looks like |
+| **one** sample | `unknown` / `tool-age-single-sample` | "still running" and "just started" are the same number |
+| nothing readable | `unknown` / `heartbeat-unreadable` | an absent reading is not a reading of zero |
+
+⛔ **AND THE SOURCE MUST BE FRESH, LIVE AND SINGLE-DISPATCH BEFORE ANY AGE IS BELIEVED.** The axis
+reads a FILE, so believing it about *now* needs three facts the numbers themselves cannot carry —
+each of the three was measured producing a wrong state before it was gated:
+
+| the source's own fact | verdict | what it stops |
+|---|---|---|
+| it carries the run's **end** — the child's `[task-heartbeat] session_end` marker, or a `task_status` view saying `"session_ended": true` / `"alive": false` | `unknown` / `heartbeat-session-ended` | `wedged` for a run whose own bytes said it was **over** (a finished run's tool age is history) |
+| its **mtime age** is past the watchdog's own heartbeat bound (`HEARTBEAT_TIMEOUT_MS`, 30 min) | `unknown` / `heartbeat-stale` | `running-quiet` rc 0 from a **29-day-old** log of a long-gone child — a reading of something that stopped emitting |
+| it carries markers from **several** `nonce=` values and the caller named none | `unknown` / `heartbeat-ambiguous-nonce` | one appended `nonce=FORGED … tool_age_max_ms=0` line flipping `wedged` → `running-quiet` (a forged life sign on the child's inherited fd 2 — the case `task-heartbeat.ts` puts the nonce there for) |
+
+**Every read also needs an AGE, or it does not decide.** A file's age is its mtime;
+`--source-age-ms` overrides it (a log **copied** off a cell has the copy's mtime, not the child's
+last emission), and a **pipe** has no mtime at all — so `--heartbeat -` requires `--source-age-ms`
+and is an abstention naming the flag without it. An unknown age used to skip the gate silently,
+which is how a 29-day-old log piped in published `running-quiet` rc 0.
+
+⛔ **The same flag arms the gate on the STATED-PAIR door (`--tool-age-ms`) — a number on a command
+line has no mtime, so the caller's statement is the only age that shape can carry.** Accepting it
+there and discarding it was measured: `--tool-age-ms 6961576 --tool-age-ms 18052 --source-age-ms
+2592000000` (29 days) published `running-quiet` rc 0 for readings the caller had just said were old
+— the freshness gate requestable and never armable, which is precisely the inert-flag failure
+`--nonce` is refused for. Stating the age ARMS the gate: stale ⇒ `unknown` / `heartbeat-stale` rc 3,
+fresh ⇒ the pair decides as usual. On a `--sid` query it is a **usage error** (`rc 2`), refused by
+name like `--nonce`: the session ladder never reads a heartbeat source, so honouring it there is
+impossible and accepting it would claim it was.
+
+`--nonce <n>` is that fence, honoured rather than re-invented: **every** line is fenced once a
+nonce is given, not only marker-shaped ones (the reverse does not hold: only `[task-heartbeat]`
+lines are SCANNED for the nonce, so a child that merely prints a `nonce=` token in its own output
+does not make its log look like several dispatches) — the capture log is raw stdout+stderr
+(`extensions/shared/task-runs.ts:83`), so a `task_status`-shaped line is exactly what a forged
+append would look like (measured: `samples=18000000,18010000,3,4`, `running-quiet` rc 0). Without
+`--nonce` the source is **unfenced** and trusted — which is right for a log you own and wrong for a
+file another writer can append to, so pass the nonce whenever that is possible. A nonce that matches
+nothing is `heartbeat-unreadable`, never an empty read.
+
+⛔ **The fence drops nonce-less TERMINAL facts as well, and the primary end marker is why that is
+safe.** A `task_status` line names no dispatch, so a `--nonce` read drops its `"alive": false` /
+`"session_ended": true` with the rest — on a source mixing the two shapes the JSON terminal gate can
+go dark and a finished run's frozen age can decide. That is **deliberately not relaxed**: the same
+looseness in the other direction lets one appended `"session_ended": true` turn a *wedged* lane into
+a finished one, which is the false PASS over lost work this axis exists to remove. It stays safe
+because every real capture log carries the marker that **does** show the nonce — measured over the
+1,416 logs in `~/.pi/agent/task-runs/` on this box, 1,369 carry `[task-heartbeat] session_end` and
+**all 1,369 carry `nonce=`**. Passing `--nonce` is the caller asserting "only this dispatch's markers
+count", so a different dispatch's JSON view is precisely what must not decide.
+
+The end marker is recognised only as a LINE that **is** the marker
+(`^[task-heartbeat] session_end`), because the same log carries the child's raw stdout: a child that
+prints the words (a child editing `extensions/task-heartbeat.ts`, a child quoting this document) must
+not abstain its own diagnosis.
+
+The bound is **cited, not invented**: `tool_stall_ms()` (the watchdog's `tool-stall` age backstop,
+4 h at the 6 h cap; `tool_veto_expired`), compared with the same strict `>`. Both pairs in the
+#3987 sequence — `6,961,576 → 18,052` and `18,052 → 0` — are **drops**, so that lane reads
+`tool-age-reset`; the 116-minute reading alone is what was read as a stall, and one sample can only
+ever be `tool-age-single-sample`. A pair that genuinely sits open under the backstop is
+`6,961,576 → 7,100,000` ⇒ `tool-age-open-pending`.
+
+```bash
+# the pair is the evidence, so the flag REPEATS (one flag holding one reading would make the
+# pre-fix error the only expressible query)
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052
+python3 tools/fleet/liveness.py --tool-age-ms 6961576          # rc 3: tool-age-single-sample
+
+# …or point it at the child's own log. ONE pattern reads the three shapes the fleet really writes:
+# the `[task-heartbeat] tick … tool_age_max_ms=` marker, the `task_status` JSON
+# ("tool_age_max_ms": N), and the watchdog's `Alive state: … toolAgeMaxMs=`.
+python3 tools/fleet/liveness.py --heartbeat ~/.pi/agent/task-runs/<run_id>.log
+
+# ⛔ ONE `task_status` DUMP IS ONE SAMPLE, so a single view CANNOT answer (§15's table, row 5):
+#    it reads `unknown tool-age-single-sample`, rc 3. Two polls in one file do.
+cat status1.json status2.json > both.json
+python3 tools/fleet/liveness.py --heartbeat both.json
+
+# …and, when the source may carry more than one dispatch's markers, the fleet's own fence. Given a
+# nonce, a line that cannot show it is DROPPED — marker-shaped or not.
+python3 tools/fleet/liveness.py --heartbeat <run_id>.log --nonce <TASK_HEARTBEAT_NONCE>
+
+# ⛔ THE `Alive state:` SHAPE CARRIES NO FENCE, so point it at ONE child's line (or two polls of
+#    one). Nothing on that line names the dispatch, so a parent/watchdog log holding two children's
+#    renders is read as one series and the LAST PAIR combines two children — measured 2026-11-17:
+#    two `Alive state:` lines, pids 111 and 222, 18,000,000 then 18,001,000 ⇒ `wedged /
+#    tool-age-open-stable`, a false wedge from two different children. The marker shape does not
+#    have this hole (`--nonce`), and a JSON poll carries its dispatch's fields.
+
+# A PIPE has no mtime, so it must be told its age (`--heartbeat-json` is an accepted alias):
+cat <run_id>.log | python3 tools/fleet/liveness.py --heartbeat - --source-age-ms 12000
+
+# A STATED PAIR has no mtime either — the same flag arms the freshness gate on that door (a copied
+# log's numbers are history). Stale ⇒ `unknown heartbeat-stale` rc 3; fresh ⇒ the pair decides:
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052 \
+    --source-age-ms 2592000000        # 29 days old ⇒ rc 3, NOT a published state
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052 \
+    --source-age-ms 12000             # rc 0, running-quiet/tool-age-reset
+python3 tools/fleet/liveness.py --source-age-ms 12000 --sid <session-id>   # rc 2: never applies
+```
+
+A **two-axis query is a usage error (rc `2`)**, not an abstention: `--sid` together with a heartbeat
+source can never be answered by this axis, and rc `3` would tell a caller to retry it.
+
+⛔ **ONE AXIS PER QUERY.** The heartbeat is an evidence field of `evaluate`
+(`Evidence.heartbeat`), reached from nowhere else, and it is **refused by name**
+(`heartbeat-on-session-query`) when the query also carries session, claim, CPU or child evidence —
+the same rule the log axis follows (§13.5), because an added axis that resolves such a query
+DISCARDS what the query carried (#1777 B7). The refusal is symmetric: a log query that also carries
+a heartbeat is refused by the log arm. A caller with both questions asks them separately.
+
+**What this does NOT do: change any live lane's disposition, and feed itself.** It adds the input
+and the two-sample rule; wiring a *reader* that polls `task_status` twice and hands the pair in is a
+separate change (the same boundary §13.5 states for the log axis), and `lane_liveness.py`'s
+population does not consult heartbeats today. Declared, not silently assumed: a lane is still read
+by the scheduled report exactly as it was before this input existed.

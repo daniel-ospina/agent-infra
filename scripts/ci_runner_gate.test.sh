@@ -84,8 +84,8 @@ CMUX_LOG="$T/cmux.log"
 #                  matrix run the jobs still queued are exactly the ones past page 1; a reader that
 #                  stops at page 1 sees "no queued job" on a run that has one (#2344 review P1).
 #   GH_MODE        queued-null | queued-empty | queued-twofield | queued-threefield |
-#                  queued-countonly | inprog-null | inprog-fail | oldest-junk | enum-fail |
-#                  enum-garbage | enum-badtab | ok
+#                  queued-countonly | queued-fail | inprog-null | inprog-fail | oldest-junk |
+#                  enum-fail | enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
 #   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
 #   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
@@ -414,6 +414,12 @@ case "$*" in
     # walks (agent-infra#2344): a run id alone cannot tell the scan WHICH run is older, and the age
     # has to come from the run the scan chooses.
     case "${GH_MODE:-ok}" in
+      # ⛔ THE REASON, NOT JUST THE FAILURE (#1704's class, and the arm that pins the straggler): the
+      # queue read is the gate's most important read, and it shipped `2>/dev/null` while its own
+      # sibling nine lines below captured `$GH_ERR` — so `API rate limit exceeded` (wait for the
+      # reset) and a TLS/network fault (repair the host) produced the SAME log line. This is the 403
+      # the fleet actually hit at 2026-11-17T12:25:27Z with the shared pool at `core=0/5000`.
+      queued-fail)  printf 'HTTP 403: API rate limit exceeded\n' >&2; exit 1 ;;
       queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
       # A body carrying only the count and the oldest timestamp: no run id, no row order. This is the
@@ -1288,6 +1294,21 @@ assert_contains "$OUT" "HTTP 500" "the failure carries gh's reason (not swallowe
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed in-progress read advanced no state file"
 assert_not_contains "$OUT" "TRANSITION" "a failed in-progress read sent no transition notification"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed in-progress read relabelled no runner"
+
+# ⛔ AND THE QUEUE READ ITSELF, which is the read every leg above depends on (#1704's class, caught
+# as a STRAGGLER: the suite pinned the in-progress read's reason but left this one's `2>/dev/null`
+# unobserved, so reverting it stayed green). MEASURED 2026-11-17T12:25:27Z the fleet was handed
+# `queue probe FAILED (gh api)` with no reason, on a pass that failed at this read while the shared
+# REST pool sat at `core=0/5000` — where `API rate limit exceeded` and a network fault call for
+# OPPOSITE remedies and the log distinguished neither. The failure stays FAIL-CLOSED either way;
+# what this arm pins is that the REASON reaches the operator.
+echo "── #1704 straggler: a failed QUEUE read carries gh's reason (not swallowed) ──"
+run_gate queue-probe-fail GH_MODE=queued-fail --
+assert_eq "$RC" "2" "a failed queue read → exit 2 (could-not-measure)"
+assert_contains "$OUT" "queue probe FAILED" "the failure NAMES the read that failed"
+assert_contains "$OUT" "API rate limit exceeded" "the failure carries gh's reason (not swallowed)"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed queue read advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed queue read relabelled no runner"
 
 run_gate inprog-null GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
   GH_MODE=inprog-null --
