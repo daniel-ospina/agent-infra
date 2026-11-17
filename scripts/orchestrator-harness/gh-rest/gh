@@ -123,9 +123,10 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   #     MUST_DERIVE lists THIS file): `read` has NO `-N` (bash 4.1+; VERIFIED on the pinned
   #     `bash:3.2` image: `read: -N: invalid option`, rc=2) AND it treats a NUL as end-of-input
   #     (VERIFIED: `\177ELF` + NULs → `ELF` then rc=1 with no data; a NUL-padded file → rc=0, 0 bytes,
-  #     forever). So an in-process read on 3.2 cannot see a binary shim's sentinel at ALL, and the
-  #     one-fork `grep` this file shipped before is kept VERBATIM for that arm: same correctness, same
-  #     cost as the status quo on that host, no regression.
+  #     forever). So an in-process read on 3.2 cannot see a binary shim's sentinel at ALL, and that
+  #     arm instead enforces the SAME 8 KiB BYTE window through a `head -c 8192`-fed `grep` (2
+  #     processes per candidate on that host, 0 on the fleet's bash 5). Bounded on purpose — see E-2's
+  #     note in the else-branch below: an unbounded read there bypasses the #984 admin-merge gate.
   # ⛔ WHY NOT A CHUNKED `read -n` LOOP FOR BOTH (it was written first and measured): `-n` honours a
   # newline as a delimiter, so a 36 KB script costs one builtin call PER LINE — ~1,600 `read` builtins
   # (~128k byte-at-a-time syscalls) across 20 candidates, and the call measured 85 ms against 62 ms
@@ -148,7 +149,20 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   if (( BASH_VERSINFO[0] >= 5 )); then
     LC_ALL=C IFS= read -r -N 8192 _head 2>/dev/null <"$_f" || :
   else
-    grep -qa 'harness-gh-shim-marker' "$_f" 2>/dev/null && return 0
+    # bash 3.2 (no `-N`, and its `read` stops at a NUL): the bounded BYTE window is produced by `head`
+    # and searched by `grep` — `scripts/gh-shim/gh`'s own 3.2-compatible shape (§10(a5)).
+    # ⛔ `<( … )` PROCESS SUBSTITUTION, NOT A PIPE: under `pipefail` a `head | grep -q` pipeline reads
+    # FAILED when grep exits at its first match and head takes SIGPIPE (the #841 class) — a false
+    # NEGATIVE here means the walk execs a shim, i.e. recurses. With `<(...)` grep's status IS the
+    # command's. `2>/dev/null` sits on `head`, the process that OPENS the candidate, so an unreadable
+    # candidate is silent on both streams and grep answers "not a shim" over an empty stream.
+    # ⛔ BYTE-BOUNDED — AND THAT IS A CORRECTNESS FIX, NOT ONLY COST (round-2 review finding, E-2):
+    # a WHOLE-FILE `grep` finds the #984 argv guard's marker at byte 31551 and SKIPS it, so on a
+    # bash-3.2 host a delegated `gh pr merge --admin` reached the real gh with the admin-merge gate
+    # silently out of the chain — a gate BYPASS on a declared host. `scripts/gh-shim/gh` puts its
+    # marker outside the 8 KiB window ON PURPOSE; a resolver that reads past the window drops that
+    # gate. Cost of the bound here: 2 processes per candidate on this host, 0 on the fleet's bash 5.
+    grep -qa 'harness-gh-shim-marker' <(LC_ALL=C head -c 8192 2>/dev/null <"$_f") && return 0
   fi
   case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
   # An OLDER copy of a shim carries no marker, or carries it past the window; it is identified by the

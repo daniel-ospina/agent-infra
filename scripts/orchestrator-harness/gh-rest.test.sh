@@ -479,7 +479,7 @@ ck "§Z no projection hands a payload VARIABLE to python as a value" \
 for _s in gh-rest/gh gh-limit/gh; do
   _off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
   ck "§W shim marker inside the 8 KiB resolver window: $_s (byte ${_off:-none})" \
-     "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -lt $((8192 - 22)) ] && echo 0 || echo 1)"
+     "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -le $((8192 - 22)) ] && echo 0 || echo 1)"
 done
 
 # ── §P. THE RESOLVER PREAMBLE MUST NOT FORK (#3998) ──────────────────────────────────────────────
@@ -529,8 +529,18 @@ out="$(GH_REST_LIMIT_HELPER=/nonexistent \
 _spawns="$(wc -l <"$TMP/spawn.log" | tr -d '[:space:]')"
 ck "§P the walk still reaches the real gh through PATH (zero-config resolution works)" \
    "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
-ck "§P **and the preamble forks NOTHING**: ${_spawns:-?} grep/dirname/basename subprocesses per call" \
-   "$([ "${_spawns:-1}" -eq 0 ] && echo 0 || echo 1)"
+# ⛔ THE EXPECTATION IS HOST-SHAPED, BECAUSE THE SHIM IS (round-2 review finding, E-1). On bash >= 5
+# the walk forks NOTHING. On bash 3.2 it cannot: that shell has no `read -N` and its `read` stops at a
+# NUL, so the bounded window is enforced by a `head -c 8192`-fed `grep` — 2 processes per candidate.
+# SKIPPING the row there would leave the 3.2 arm unmeasured, so it asserts the bound it actually has;
+# a regression that forks per PATH ENTRY still blows past it.
+if (( BASH_VERSINFO[0] >= 5 )); then
+  ck "§P **and the preamble forks NOTHING**: ${_spawns:-?} subprocesses per call (bash ${BASH_VERSINFO[0]})" \
+     "$([ "${_spawns:-1}" -eq 0 ] && echo 0 || echo 1)"
+else
+  ck "§P the bash-3.2 arm's bounded read costs ${_spawns:-?} processes for ONE candidate (bound: 2)" \
+     "$([ "${_spawns:-9}" -le 2 ] && echo 0 || echo 1)"
+fi
 ck "§P …and this fixture cannot reach the box's real gh, so it can never print a live credential" \
    "$([ "$(PATH="$TMP/spawnbin:$TMP/stubbin:$TMP/minbin" bash -c 'command -v gh')" = "$TMP/stubbin/gh" ] \
       && echo 0 || echo 1)"
@@ -607,8 +617,19 @@ mkdir -p "$TMP/nulpad"
 chmod +x "$TMP/nulpad/gh"
 out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/nulpad:$TMP/stubbin:$TMP/minbin" \
        bash "$SHIM" auth token 2>"$TMP/err-nul")"; _rc=$?
-ck "§P a NUL-padded sentinel past 8 KiB BYTES is still skipped (window = 8 KiB non-NUL chars)" \
-   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
+# ⛔ AND SO IS THIS ONE (E-1), because the two arms' windows are not the same SIZE of window:
+#   bash >= 5 — 8192 NON-NUL CHARACTERS, so a marker after 9000 NULs is still INSIDE it → SKIPPED;
+#   bash 3.2  — 8192 BYTES (the `head -c` arm, deliberately, see E-2), so the same marker is OUTSIDE
+#               it → NOT skipped.
+# Both are at least as strict as the documented byte window, so neither host can bypass the guard;
+# the divergence is a SUPERSET difference and is asserted per host rather than papered over.
+if (( BASH_VERSINFO[0] >= 5 )); then
+  ck "§P a NUL-padded sentinel past 8 KiB BYTES is skipped (window = 8 KiB non-NUL chars)" \
+     "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
+else
+  ck "§P …on bash 3.2 the window is 8 KiB BYTES, so that sentinel is NOT skipped (documented)" \
+     "$([ "$_rc" -ne 0 ] && echo 0 || echo 1)"
+fi
 
 # ⛔ AND THE MUTUAL SHAPE THE MEASURED INCIDENT HAD: the shims resolve to EACH OTHER when the INVOKED
 # shim's own directory is on PATH beside another one (1,700 processes in 6 s, `fork: Resource
