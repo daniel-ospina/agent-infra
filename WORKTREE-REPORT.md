@@ -309,3 +309,58 @@ pre-fix answers (`rc 0` / `rc 3`) printed in their own detail lines.
 * **Did not touch** the `%`-specifier verdict: the shipped refusal turns an unrelated `Environment=HOME=%h`
   into UNKNOWN (5). That is fail-closed, it is what `cell-self-pin.sh:855-863` rules, and an arm asserts
   it — noted here only so the next reader knows it is deliberate, not an oversight.
+
+# ROUND 4 — the last open finding: the drop-in MERGE PATH (`bbfb43e5a`)
+
+The round-3 lane closed F5 (the headerless drop-in) and **deliberately left one finding unfixed**, with its
+reason recorded on the PR: the reader still built its unit text from `$UNIT_DIR/<unit>` plus
+`$UNIT_DIR/<unit>.d/*.conf`, and `$UNIT_DIR` is ONE directory in a priority-ordered list. That reason was
+"the honest fix is `systemctl cat`, and it needs its own shim plus a decision about what `--status` answers
+when the manager does not reply." **The decision already exists in this repo** — `install-disk-reaper-
+timer.sh`'s read-back made it: system → `systemctl cat` is REQUIRED and unreadable is a REFUSAL, user →
+`systemctl --user cat` with the installed file as fallback, override (the documented test seam) → the
+files. So this lane implements that decision rather than re-deciding it, and puts it where this PR's own
+ruling says it belongs: **`unit_text_effective` in `scripts/lib/systemd-unit-parse.sh`**, one definition,
+both callers.
+
+⛔ WHY THIS IS NOT A DOC NIT. `systemd.unit(5)`: drop-ins are read "from `<unit>.d/` directories in all the
+directories searched for unit files" — so `/run/systemd/system/<unit>.d` and
+`/usr/lib/systemd/system/<unit>.d` (and a user unit's higher-priority dirs) are part of the same unit. A
+drop-in there was invisible, and `--status` certified a cap the box does not dispatch at: the same false
+PASS as the drop-in this round already taught the reader to read, one directory over, in the verb whose
+exit code is the published contract.
+
+## Measured through the shipped `--status` (pre-fix `09ec30a7a` → post-fix `bbfb43e5a`)
+
+Same fixture each row: the installed file pins the seam; the manager's merged view carries a
+`/run/systemd/system/…d` drop-in the checkout cannot open.
+
+| row | systemd hands the process | pre-fix | post-fix |
+|---|---|---|---|
+| manager merges a 7200 drop-in over a seam-pinned install | 7200 | **0** "36000 s installed · agrees" | **3** STALE "7200 s installed" |
+| mirror: manager merges a seam override over a STALE install | 36000 | **3** (false STALE) | **0** clean |
+| control: manager answers nothing for a USER unit (falls back to files) | seam | 0 | **0** (unchanged — no false block) |
+| system target, manager cannot be read | unknowable | 0 (empty text graded as "no drop-in") | **lib rc 1** → the caller's UNKNOWN (5) |
+
+## Suites, measured at `bbfb43e5a` (this worktree, this host)
+
+| command | result |
+|---|---|
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **226 passed, 0 failed** (221 before: +5 arms) |
+| `bash scripts/disk-reaper.test.sh` | **ALL PASS (727 assertions)** — across the `service_effective_unit` refactor onto the shared resolver |
+| `bash scripts/check-bash32-parse.sh` | **471 scripts parse** under bash 3.2.57 |
+
+Mutation attribution, measured: reverting only `scripts/lib/systemd-unit-parse.sh` and
+`install-drainer-timer.sh` to `09ec30a7a` gives **222 passed, 4 failed**, and the four reds are the two
+merge-path rows (printing their pre-fix rc 0 / rc 3), the lib refusal arm (`rc=127`, the function does not
+exist), and the lib positive control. The fifth arm — the user-unit fallback — stays green in both
+directions by design: it is the false-block control.
+
+## Residual, named rather than half-closed
+
+`systemctl cat` merges the drop-in path for a system and a user unit, which is the gap this closes. It does
+NOT re-read `systemd-analyze`'s full unit-loading semantics (a masked unit, a generator-written drop-in, a
+`--root=` install), and the override target still reads files by construction — that IS the test seam, and a
+git checkout cannot be the truth source for `/run`. Also unchanged and named: the `%`-specifier refusal
+turns an unrelated `Environment=HOME=%h` into UNKNOWN (5); that is fail-closed, it is what
+`cell-self-pin.sh:855-863` rules, and an arm asserts it.
