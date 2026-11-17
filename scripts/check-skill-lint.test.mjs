@@ -185,10 +185,21 @@ test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => 
   // `0 SKILL.md files checked. 0 issue(s).\nClean.\n` and this assertion failed (170 passed, 1
   // failed) while the SAME file passed 171/0 on a box whose temp dir had no such directory. An owned
   // empty dir makes the arm decide on the RESOLUTION LADDER, which is what its caption claims.
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-nodir-"));
-  const r = runLint([], empty);
-  assert.equal(r.status, 0);
-  assert.match(r.stdout, /No skills directory found/);
+  //
+  // Hermetic means BOTH halves: a FRESH unique dir, never os.tmpdir() itself (Node's documented
+  // practice for `fs.mkdtemp`), and a dir this test REMOVES. A `mkdtemp` per run that is never
+  // cleaned is a slow leak on a long-lived runner, and a temporary test dir must not become host
+  // state in the very test that exists to avoid it. Three fixes for this same flake landed
+  // independently (#4103, #4116, and this branch's c43c996c5) and all agree on the cause and the
+  // mechanism; this merge keeps the unique dir and the `try/finally` removal together.
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
+  try {
+    const r = runLint([], emptyCwd);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /No skills directory found/);
+  } finally {
+    fs.rmSync(emptyCwd, { recursive: true, force: true });
+  }
 });
 
 // ── (d) the exact O/I case ──────────────────────────────────────────────────

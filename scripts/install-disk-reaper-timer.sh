@@ -633,118 +633,77 @@ do_install() {
 #              bare `ExecStart=` resets the list).
 # macOS/launchd has no ExecStart/EnvironmentFile at all — `verify_installed_artifact_plist` asserts the
 # PROGRAM ARGUMENTS identity instead, which is the equivalent fact for that platform.
-unit_dropins() { # <dir> — cat every drop-in, lexical order (systemd's order)
-    local d
-    for d in "$1"/*.conf; do
-        [ -f "$d" ] || continue
-        printf '### %s\n' "$d"
-        cat "$d"
-    done
-}
-
+# ⛔ A FILE BOUNDARY IS LOAD-BEARING HERE, NOT COSMETIC (round-3 verification, F5 — MEASURED false CLEAN
+# on its sibling caller). This used to merge the unit and its drop-ins with a plain `cat` of each file and
+# NO boundary between them, so a drop-in whose first line is a directive (no `[Service]` header) was
+# attached to whatever section the unit file happened to end in — while systemd parses each file SEPARATELY
+# and DROPS such a line
+# (`v257 src/shared/conf-parser.c:253`: "Assignment outside of section. Ignoring."). For a read-back that
+# grades HOME, that is a false PASS in the dangerous direction: a headerless drop-in `Environment=HOME=`
+# naming the home we rendered would have certified a unit systemd gives a DIFFERENT home.
+# The two file-reading arms below therefore go through the shared lib's `unit_text_from_files` (one
+# definition, both callers, the same `[]` boundary the drainer's `--status` uses), and the two
+# `systemctl cat` arms insert the same boundary at the manager's own `# <path>` separators
+# (`unit_text_cat_boundaries`). Both functions are guarded as fatal below: a farmed older lib must refuse,
+# not quietly certify.
 service_effective_unit() { # prints the bytes systemd will load; rc 1 when that cannot be known
-    local f="$UNIT_DIR/$UNIT_NAME.service" out=""
-    case "$TARGET" in
-        override)
-            [ -f "$f" ] || return 1
-            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
-            return 0 ;;
-        user)
-            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
-            if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
-            [ -f "$f" ] || return 1
-            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
-            return 0 ;;
-        *)
-            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
-            [ -n "$out" ] || return 1
-            printf '%s\n' "$out"
-            return 0 ;;
-    esac
+    # ⛔ THE THREE ARMS MOVED INTO THE SHARED LIB (round-2 re-review P3, left open until now). This
+    # function answered "what does systemd load" for THIS installer only; `install-drainer-timer.sh`
+    # `--status` asked the same question from `$UNIT_DIR` alone and could not see a drop-in in any
+    # other priority directory (`/run/systemd/system`, `/usr/lib/systemd/system`) — certifying a cap
+    # systemd does not use. One definition, both callers: `unit_text_effective` in
+    # `scripts/lib/systemd-unit-parse.sh` owns the per-target arms, so the two readers cannot disagree
+    # about the same unit. The table above still describes them; it is documented where it is enforced.
+    unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$UNIT_NAME.service"
 }
 
-# The ExecStart argv lines systemd will actually run: everything AFTER the last bare `ExecStart=`
-# reset. ⛔ Not "the last ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a
-# pre-flight command is a healthy unit — refusing it would be a false block on a working cell.
-# effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as
-# `NAME=VALUE` lines (one per variable, last assignment wins).
+# The ExecStart argv lines systemd will actually run come from `effective_execstarts` in that same
+# shared library: everything AFTER the last bare `ExecStart=` reset, unit then drop-ins. ⛔ Not "the last
+# ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a pre-flight command is a
+# healthy unit — refusing it would be a false block on a working cell. The function MOVED there when
+# `install-drainer-timer.sh --status` became its second caller and read `ExecStart=` off the base file
+# alone, which graded a script systemd would not run (round-2 re-review, P2); the grammar and the
+# measured defeats are documented at the definition.
+# ── THE Environment= GRAMMAR COMES FROM THE SHARED LIB, NOT FROM THIS FILE ─────────────────────
+# `normalize_unit_lines` and `effective_env` moved to `scripts/lib/systemd-unit-parse.sh` because a
+# SECOND reader of the same grammar now exists (agent-infra#4034's `install-drainer-timer.sh --status`
+# reads the installed `Environment=LANE_TIMEOUT` pin). That reader shipped as a single-line `grep`,
+# disagreed with this one about a quoted pin and about a drop-in, and reported rc 0 ("provably agrees
+# with the seam") over a box that was dispatching at the old cap. Two readers of one fact is what
+# #1872/#4034 are about; one definition, two callers, is the fix. The grammar, the measured defeats
+# and the `!unparseable:` contract are documented there.
 #
-# ⛔ A LINE-ANCHORED `^Environment=HOME=` MATCH IS DEFEATABLE, and a gate that reads one line and then
-# reports "verified" is the false PASS this whole read-back exists to remove (measured: a drop-in with
-# `Environment=PATH=/usr/bin:/bin HOME=/tmp/tmp.deadbeef/bg/home`, and another with
-# `Environment="HOME=/tmp/tmp.deadbeef/bg/home"`, both left the plain assignment intact and the install
-# printed "verify: … read back" over a unit whose HOME was the dead tree). systemd parses the whole
-# file in order, accepts several space-separated assignments per line, honours double and single
-# quotes, and lets a LATER assignment of the same name win; a bare `Environment=` RESETS the list
-# (the same reset semantics `effective_execstarts` already implements for `ExecStart=`).
-# `env -i`-style edge cases (empty values, `NAME=` with no value) are preserved verbatim, because an
-# empty HOME is not the HOME the install rendered and must be refused by the caller.
-# normalize_unit_lines — systemd's OWN reading of `Key = value`: it strips whitespace AROUND the key,
-# around the `=`, and before the value, and it accepts indented lines. A parser anchored on
-# `^ExecStart=` therefore MISSES a legal `ExecStart =` — and a drop-in that spells BOTH the reset and
-# the replacement that way is invisible to the read-back, which then certifies the BASE unit's command
-# while systemd runs the drop-in's.
-# ⛔ MEASURED (review pass): with a drop-in carrying `ExecStart =` + `ExecStart = /bin/true` and
-# `Environment = HOME=/tmp/tmp.deadbeef/bg/home`, `effective_execstarts` still reported the base
-# `/bin/bash <reaper> --apply` and `effective_env` still reported the base HOME — the install printed
-# `verify: ExecStart + HOME read back`, exited 0 and armed the timer over a unit that ran /bin/true.
-# `systemd-analyze verify` ACCEPTS these spellings (a genuinely unknown key draws "Service has no
-# ExecStart= … Refusing."), so the unit really would run the drop-in's command. The indented spelling
-# (`  ExecStart=`) reproduces identically.
-# Normalising the TEXT once, rather than teaching every parser the grammar, keeps one definition.
-normalize_unit_lines() {
-    sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
-}
-
-effective_env() {
-    printf '%s\n' "$1" | normalize_unit_lines | awk '
-        function emit(tok,   eq, name) {
-            eq = index(tok, "=")
-            if (eq <= 1) return                     # not a NAME=VALUE assignment: systemd ignores it
-            name = substr(tok, 1, eq - 1)
-            vals[name] = substr(tok, eq + 1)
-            if (!(name in seen)) { seen[name] = 1; order[++n] = name }
-        }
-        /^Environment=/ {
-            rest = substr($0, 13)
-            if (rest == "") { n = 0; split("", order); split("", vals); split("", seen); next }
-            tok = ""; inq = 0; q = ""
-            for (i = 1; i <= length(rest); i++) {
-                ch = substr(rest, i, 1)
-                # A BACKSLASH ESCAPES THE NEXT CHARACTER inside a quoted value: systemd accepts
-                # `Environment="HOME=/tmp/q\\"uo"`, so treating the escaped quote as the terminator made
-                # this parser refuse a line systemd is happy with (an over-block with a false reason).
-                if (esc) { tok = tok ch; esc = 0; continue }
-                if (inq) {
-                    if (ch == "\\") { esc = 1; continue }
-                    if (ch == q) { inq = 0; continue }
-                    tok = tok ch; continue
-                }
-                if (ch == "\"" || ch == "\047") { inq = 1; q = ch; continue }
-                if (ch == " " || ch == "\t") { if (tok != "") { emit(tok); tok = "" }; continue }
-                tok = tok ch
-            }
-            # NOTE (apostrophes are ILLEGAL here: this is a single-quoted awk program):
-            # AN UNTERMINATED QUOTE IS AN UNPARSEABLE LINE, NOT A VALUE. systemd returns EINVAL,
-            # logs, and ABANDONS the whole line — the service starts WITHOUT those variables.
-            # Emitting `HOME=<rest of line>` would certify a HOME the unit never gets (a fail-open
-            # the pre-fix line match did not have, because it compared the value with the quote
-            # still attached). systemd rule applied: discard the line, and REPORT it so the caller
-            # can refuse instead of guessing.
-            if (inq || esc) { bad[++b] = rest; next }
-            if (tok != "") emit(tok)
-            next
-        }
-        END { for (i = 1; i <= b; i++) print "!unparseable:" bad[i]
-              for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
-}
-
-effective_execstarts() {
-    printf '%s\n' "$1" | normalize_unit_lines | awk '
-        /^ExecStart=$/ { n=0; next }
-        /^ExecStart=/  { L[++n] = substr($0, 11); next }
-        END            { for (i = 1; i <= n; i++) print L[i] }'
-}
+# ⛔ A MISSING LIBRARY IS FATAL HERE, NOT A WARNING: without it `effective_env` is an undefined
+# command, the read-back would compare empty strings and CERTIFY an artifact nothing read — the exact
+# false PASS the read-back exists to remove. This file runs with `set -uo pipefail` (no `-e`), so the
+# failure is handled explicitly rather than left to the shell.
+SYSTEMD_UNIT_PARSE_LIB="${INFRA_ROOT:?}/scripts/lib/systemd-unit-parse.sh"
+if [ ! -f "$SYSTEMD_UNIT_PARSE_LIB" ]; then
+    err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB is missing — this installer's read-back parses the unit's Environment= with it, and without it every read-back would certify an artifact nothing read"
+    exit 1
+fi
+# shellcheck source=scripts/lib/systemd-unit-parse.sh
+. "$SYSTEMD_UNIT_PARSE_LIB"
+command -v effective_env >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_env"; exit 1; }
+command -v effective_execstarts >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_execstarts"; exit 1; }
+# ⛔ AND THE HAZARD LIST (round-2 re-review, F1/F3). `env_compile_hazards` names the directives that move
+# the environment BEHIND `Environment=` and the raw-text constructs that can spell a variable name. It is
+# fatal for the same reason its siblings are: an undefined function would print nothing, "nothing" reads
+# as "no hazards", and this read-back would then certify a HOME a later source already replaced.
+command -v env_compile_hazards >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define env_compile_hazards"; exit 1; }
+# ⛔ AND THE FILE-BOUNDARY HELPERS (round-3 verification, F5). `service_effective_unit` merges the unit with
+# its drop-ins, and systemd parses those as SEPARATE files — an assignment before a file's first
+# `[Section]` header is DROPPED (`v257 src/shared/conf-parser.c:253`: "Assignment outside of section.
+# Ignoring."), so a merge with no boundary between files reads a HOME systemd never compiles. A farmed
+# lib without these would silently fall back to that merge, which is the false PASS this read-back exists
+# to remove; refuse instead.
+command -v unit_text_from_files >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_from_files"; exit 1; }
+command -v unit_text_cat_boundaries >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_cat_boundaries"; exit 1; }
+# ⛔ AND THE TARGET-AWARE RESOLVER (round-2 re-review P3). `service_effective_unit` below is a one-line
+# call to it, so a farmed lib that predates it would leave this read-back with NO definition at root —
+# `set -u` would abort the install, but a shell that got past it would compare empty strings and certify
+# an artifact nothing read. Refuse by name instead.
+command -v unit_text_effective >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define unit_text_effective"; exit 1; }
 
 # split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
 # group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token
@@ -946,7 +905,7 @@ argv_has_token() {
 }
 
 verify_installed_unit() {
-    local unit="" execs="" exec="" tokens="" rc=0 want_home="" got_home="" envmap="" ok=0 bad=""
+    local unit="" execs="" exec="" tokens="" rc=0 want_home="" got_home="" envmap="" hazards="" ok=0 bad=""
     if ! unit="$(service_effective_unit)"; then
         err "REFUSING to report this as installed: the installed unit could not be READ BACK from the"
         err "  $TARGET manager (\`$SC cat $UNIT_NAME.service\`). An unreadable artifact is not a"
@@ -1003,6 +962,26 @@ verify_installed_unit() {
     # HOME is what `gh` resolves its auth from; the measured exit-3 class ("gh unavailable") is exactly
     # a service whose HOME is not the cell's home.
     want_home="$HOME"
+    # ⛔ A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` IS NOT A VERIFIED HOME EITHER
+    # (round-2 re-review, F1/F3 — the drainer's --status was measured at rc 0 through both). This read-back
+    # certifies `Environment=HOME=` from `effective_env`, but systemd compiles the environment from several
+    # sources (`EnvironmentFile=` OVERRIDES `Environment=`, `UnsetEnvironment=` clears a variable as the
+    # final step, `PassEnvironment=` imports the manager's) and a `\x43`-style escape or a `%`-specifier can
+    # spell a name this reader cannot reconstruct. So a unit carrying one of those can hand `gh` a HOME
+    # this verification never saw while still printing "verify: … read back" — the same false PASS the
+    # `!unparseable:` arm below removes, one construct over. The list lives in the shared lib so both
+    # callers read ONE definition of what systemd compiles.
+    hazards="$(env_compile_hazards "$unit")"
+    if [ -n "$hazards" ]; then
+        err "REFUSING: the installed unit carries a directive that changes its environment BEHIND the"
+        err "  Environment= lines this read-back can see (EnvironmentFile= / UnsetEnvironment= /"
+        err "  PassEnvironment=, or a `%`-specifier / C-style escape that can spell a variable name)."
+        err "  systemd applies those OVER or AFTER Environment=, so HOME — which is what gh resolves its"
+        err "  auth from — cannot be verified from this file:"
+        printf '%s\n' "$hazards" | sed -n 's/^/  /p' >&2
+        err "  Remove the directive from the unit (or its drop-ins), then re-run."
+        return 1
+    fi
     envmap="$(effective_env "$unit")"
     # ⛔ A LINE SYSTEMD WOULD REJECT IS NOT A VERIFIED HOME. Refuse and name it: an unbalanced quote
     # makes systemd drop that line (the service runs without the variable), so "verified" would be a

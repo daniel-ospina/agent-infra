@@ -251,8 +251,9 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # allowance derived below costs `IMPL_RESERVE_S + MAX_WATCH x POLL_S` — at the shipped defaults
 # `900 + 247 x 120 = 30540 s` on the 36000 s clock agent-infra#4034 set — so the largest check wait this
 # clock can carry is `36000 - 30540 = 5460 s`. ⛔ THAT CEILING IS UNCHANGED BY THE 5x, and the reason is
-# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock buys supervision chunks,
-# not wait. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
+# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock raises the DESIGN
+# supervision budget and never the wait — and that budget is a FLOOR, not what a lane is handed: the
+# `_idle_fit` clamp below gives 22 chunks (2640 s) on either clock (see its own note). The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
 # run-duration p95 5612 s), so NO value of `WAIT_S` that fits this lane's clock can cover the tail — the
 # 29 runs that exceeded the OLD 7200 s clock could not have been waited out by ANY setting of this
 # constant, and raising `WAIT_S` past 5460 s would only eat the
@@ -537,20 +538,35 @@ MAX_WATCH="$MAX_WATCH_FIT"
 # review, P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand
 # above sizes the allowance against the WORST-CASE check wait, which is the right FLOOR — but supervision
 # is paid AFTER the wait, from whatever clock remains, so a lane whose checks settled early was granted the
-# worst case's 7 chunks (840 s) while thousands of seconds still stood on its clock. And 840 s is BELOW the
-# chain this loop supervises: `merge-one.sh` budgets a fresh-context review at `REVIEW_TIMEOUT` = 1800 s and
-# leases the PR claim for `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the defaults (`claims.sh:166`), and
-# `chain-merge.sh`'s merge-phase wait is 1890 s (`claims.sh:110`). A lane that finally cleared the wait
-# could therefore hand off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was STILL RUNNING` — over a
-# chain that was legitimately still reviewing, and `WATCH_F` is only rewound by a fix round or a head move,
-# so every later `--watch` re-entered the same arm.
+# WORST CASE's allowance while thousands of seconds still stood on its clock. ⛔ BEFORE THE LIFT BELOW
+# that allowance was the DESIGN OPERAND itself — **7 chunks (840 s)** at the 7200 s clock this was
+# measured on — and 840 s is BELOW the chain this loop supervises: `merge-one.sh` budgets a
+# fresh-context review at `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for
+# `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the defaults (`claims.sh:166`), and `chain-merge.sh`'s
+# merge-phase wait is 1890 s (`claims.sh:110`). A lane that finally cleared the wait could therefore hand
+# off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was STILL RUNNING` — over a chain that was
+# legitimately still reviewing, and `WATCH_F` is only rewound by a fix round or a head move, so every
+# later `--watch` re-entered the same arm.
+# ⛔ THE 5x CLOCK DID NOT RAISE THE OPERATIVE NUMBER, IT STOPPED IT DECAYING (re-review of #4065, finding
+# 4 — and the first draft of THIS note got that wrong, claiming a 3.1x gain). The watchdog's `_idle_fit`
+# clamp is **22 chunks (2640 s) on BOTH clocks**, so the ordinary allowance is the same before and after;
+# what the 5x removes is the CLOCK'S REMAINDER shrinking it (to 14 chunks, 1680 s, once a full 5400 s
+# check wait has been spent and only what is left of the lane can pay for supervision). The DESIGN operand
+# rose 7 -> 247 chunks, and that is a FLOOR a lane is guaranteed, never an allowance it is handed. And
+# 2640 s DOES cover the 1890 s chain wait above — while still being unable to out-watch the 5400 s CHECK
+# wait, which is why that wait keeps its own cap and heartbeat and is not what this allowance supervises.
+# The same derivation is kept because the clamp is what produces that number, and because a raised seam or
+# a lowered `LANE_BOUND_IDLE_S` moves it: one number is a floor, the other is what a lane actually gets.
 # The raise can never exceed the OTHER two bounds, and never lowers the design floor:
 #   · the lane's REMAINING wall clock (`lane_elapsed_s`, one chunk held back to write the verdict);
 #   · the watchdog's progress allowance — `--watch` writes NO heartbeat, so a chunk sequence longer than
 #     `IDLE_BOUND_S` is killed as `stalled`; that bound WINS when it is the smaller one (a labelled hand-off
 #     beats an unlabelled kill).
 # An UNRESOLVABLE elapsed — a controller re-run, which is not under a lane and has no lane clock at all —
-# keeps exactly the shipped design operand, so this cannot become unbounded supervision for a non-lane.
+# keeps the shipped DESIGN operand (247 chunks at the 36000 s seam), which the `_idle_fit` clamp below still
+# reduces to the watchdog's **22 chunks** (247 is what it gets only if the idle bound is 0/absent, and the
+# neither-clock case is UNBOUNDED and says so): a non-lane is not granted more supervision than a lane, so
+# this cannot become unbounded supervision for a controller re-run.
 if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
   # An explicit override is an operator's escape hatch and is HONOURED rather than silently rewritten —
   # but it is never silent about breaking the invariant above, because the next reader would take the
@@ -1635,7 +1651,8 @@ if [ "$WATCH" -eq 1 ]; then
   # block at `MAX_WATCH`'s definition for the derivation and the two bounds it is clamped by). It only ever
   # RAISES the design operand, and it is skipped entirely when an operator pins `LANE_MERGE_MAX_WATCH` (an
   # explicit ceiling is an escape hatch, not a suggestion). A lane with no resolvable clock — the controller
-  # re-run — keeps the shipped 7 chunks.
+  # re-run — keeps the DESIGN operand (247 chunks at the 36000 s seam, 29640 s), and the `_idle_fit` clamp
+  # at the bottom of this block still reduces that to the watchdog's 22 chunks (2640 s).
   if [ -z "${LANE_MERGE_MAX_WATCH:-}" ]; then
     _mw_rt="$MAX_WATCH"
     _watch_elapsed="$(lane_elapsed_s)"
