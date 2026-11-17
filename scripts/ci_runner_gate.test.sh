@@ -55,6 +55,7 @@ if [ "${CI_GATE_TEST_KEEP:-0}" = 1 ]; then trap 'echo "scratch kept: $T"' EXIT; 
 BIN="$T/bin"; mkdir -p "$BIN"
 GH_LOG="$T/gh.log"
 GH_ROWS_STATE="$T/rows-live.tsv"
+GH_FALLBACK_N_ONCE="$T/rows-count-once"
 export GH_ROWS_STATE
 CMUX_LOG="$T/cmux.log"
 
@@ -539,8 +540,15 @@ case "$*" in
     # current_mode asks for a COUNT (a --jq expression with `select(`); runner_rows asks for the
     # `<id>TAB<label>` pairs. Anything else is the pre-#2327 ids-only read.
     if [[ "$*" == *"select("* ]]; then
+      # ⛔ GH_FALLBACK_N_ONCE models the TRANSIENT failure of THIS read alone (agent-infra#4085):
+      # `runner_census` retries in-pass and `current_mode` does NOT, so a 5xx/rate-limit blip on this
+      # call leaves `mode` to the jobs inference while the census still measures. A double whose count
+      # read is broken FOREVER cannot express that (it also breaks the post-repair re-read), so the
+      # first read of a pass answers `GH_FALLBACK_N_FIRST` and every later read answers normally.
       if [ -n "${GH_FALLBACK_N+x}" ]; then
         printf '%s\n' "$GH_FALLBACK_N"     # an explicit statement of the pool's current state
+      elif [ -n "${GH_FALLBACK_N_FIRST+x}" ] && [ ! -f "${GH_FALLBACK_N_ONCE:?}" ]; then
+        : > "$GH_FALLBACK_N_ONCE"; printf '%s\n' "$GH_FALLBACK_N_FIRST"
       elif [ -f "$GH_ROWS_STATE" ]; then
         awk -F'\t' '$2=="ubuntu-latest"{n++} END{print n+0}' "$GH_ROWS_STATE"
       else
@@ -739,6 +747,9 @@ run_gate() {
   # so an arm that asked for ONE failure inherited the previous arm's count and silently stopped
   # failing — arm (r1b) passed for the wrong reason until this line existed.
   rm -f "$GH_LOG.censusfail"
+  # …and the one-shot count-read failure is PER PASS too, for the same reason: a stale marker turned the
+  # transient-failure arm into a permanent one (or silently dropped it on a repeat pass).
+  rm -f "$GH_FALLBACK_N_ONCE"
   [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE"
   # a re-assertion pending from the PREVIOUS pass lands now: the runner agent overwrote the label set in
   # the 60-120 s between ticks, so this pass must find it gone (that is the defect being pinned).
@@ -760,6 +771,10 @@ PYDROP
     export HOME="$home"
     export PATH="$BIN:$PATH"
     export GH_LOG
+    # The one-shot count-read failure marker lives in $T, like GH_LOG's sidecars: the stub needs it on its
+    # own environment (it was `<var>: parameter null or not set` before this line existed — a stub bug, not
+    # a gate read, which the arm reported as `capability=runner_inventory:unreadable`).
+    export GH_FALLBACK_N_ONCE
     export CMUX_LOG
     export CI_GATE_STATE_DIR="$STATE_DIR"
     export CI_GATE_REPO="test-org/test-repo"
@@ -936,6 +951,14 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "queued=null advanced no state f
 assert_not_contains "$OUT" "TRANSITION" "queued=null sent no transition notification"
 assert_absent "$STATE_DIR/orchestrator-inbox.log" "queued=null wrote no inbox record"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "queued=null relabelled no runner"
+# ⛔ (1b) THE OTHER could-not-measure WRITER CARRIES THE DECISION KEYS TOO (review P3, completed):
+# `write_verdict` always emits `held=`/`streak=`/`engagement_lost=`, and this leg used to omit them, so
+# a strict parser saw them ABSENT here while seeing them present on a success pass — "missing !=
+# unmeasured" (#3002 P2). This pass takes no hold decision and reads no durability, so the honest value
+# is `unmeasured`, never `0`.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(1b) an unreadable-queue pass records the decision keys as unmeasured, not as missing keys"
 
 run_gate q-empty GH_MODE=queued-empty GH_QUEUED=5 GH_FALLBACK_N=0 --
 assert_eq "$RC" "2" "an EMPTY queue count → exit 2 (could-not-measure)"
@@ -2083,7 +2106,8 @@ assert_contains "$OUT" "armed_ids=[101,102]" "(cap2) exactly two ids are armed"
 assert_not_contains "$OUT" "armed_ids=[101,102,103" "(cap2) a THIRD id is not armed — at most 2 means at most 2"
 assert_contains "$OUT" "disarming=[103,104,105]" "(cap2) the other three are disarmed"
 
-# (cap0) the DOCUMENTED OFF SWITCH (:188-190, "the fallback is DISARMED: the pool is released and the
+# (cap0) the DOCUMENTED OFF SWITCH (the FALLBACK_ARM_MAX contract in the gate's CONFIGURATION BLOCK — not its
+# header — "the fallback is DISARMED: the pool is released and the
 # engaging pass refuses"). ⛔ This is the review P1 that had shipped: the empty-arm refusal used to
 # `return 1` BEFORE the complement sweep while its message claimed "the complement was disarmed above".
 # Measured then: `rc=1` with **0** PUTs, so every pool member kept `ubuntu-latest` from an earlier pass,
@@ -2637,6 +2661,14 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand
   "(11b) …including the demand key"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "label_ambiguity=unmeasured" \
   "(11b) …and the ambiguity key: parity is a property of the surface, not of a comment"
+# ⛔ (11c) …AND SO WERE THE THREE DECISION KEYS, ON THIS WRITER AND ITS SIBLING (review P3, completed).
+# `write_verdict` always emits `held=`/`streak=`/`engagement_lost=`; the could-not-measure writers did
+# not, so a scheduler reading "is the gate holding?" saw the keys MISSING rather than explicitly
+# unmeasured — the #3002 P2 rule ("missing != unmeasured") that the eight census keys had already been
+# fixed for. The CENSUS_BLIND arm below and the `q-null` arm above are the two writers; both are pinned.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(11c) a capacity-blind pass reports the decision keys as unmeasured, never as absent keys"
 
 # ⛔ (12) `--dry-run` DOCUMENTS "change nothing" AND USED TO MUTATE. `evaluate` runs BEFORE the DRY
 # gate, so a blind dry-run sent a real alarm, wrote the stamp file and overwrote the verdict — and the
@@ -3285,6 +3317,472 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" 
 KEEP_STATE=1 run_gate census-dryrun GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok -- --dry-run
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" " -f1)" "1" \
   "(r3) --dry-run does NOT clear the streak (a read verb changes nothing)"
+
+
+# ── #4085 (second leg): a DEMAND-BLIND pass CONVERGES the pool to the RECORDED mode WHERE IT DIFFERS ──
+# THE MEASURED DEFECT (2026-11-17T04:35:15Z, issue #4085's second comment): the head scan ran out on
+# ghost runs, `evaluate` returned 2, and the pass logged `leaving mode=local` while NO runner carried the
+# label. The write path was reachable only through a read the gate may never get, so capacity came back
+# only when a human relabelled the pool BY HAND — three times (19 runners, `with_ul` 4/23 -> 23/23).
+# The refusal to read that as "no demand" is KEPT (#2344/#3995); what changes is its blast radius: the
+# census still runs, the pool is converged to `ci-runner-gate.state` (a REPAIR of an earlier pass's
+# decision), the verdict says `demand unmeasured`, and the pass still exits 2. No NEW mode decision —
+# the pool is never labelled or stripped on a signal this pass did not measure (#2327's strip intact).
+BLIND_QUEUE="$((QUEUE_HEAD_SCAN_SHIPPED + 15))"
+BLIND_GHOSTS="${GW_FIXTURE%%|*}"
+BLIND_ROWS="${GW_FIXTURE#*|}4100:120"
+
+# (d1) RECORDED local + pool measured github → the label is RE-APPLIED (the capacity-loss shape).
+# ⛔ THE LABEL EVAPORATES BETWEEN THE TWO PASSES, not "the count read lies": `GH_PUT_DROP_LABEL` models the
+# measured server-side PUT behaviour (the runner agent re-asserts its own set 60-120 s later), so the COUNT
+# is DERIVED from the inventory here and the repair's post-repair RE-READ can observe its own write. A
+# fixture that pinned the count to a constant could not express that distinction at all — which is how the
+# "the pool now advertises X" claim went unpinned in the first place (review P1, measured).
+run_gate demandblind-engage GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d1a) the MEASURING pass engages the pool and records mode=local"
+# ⛔ THE DISENGAGE STREAK IS SEEDED HERE AND PINNED BELOW, because the assertion it replaces could not
+# detect the property it named (review P3, measured): `assert_not_contains "$OUT" "hysteresis"` — the
+# word is only logged inside the HYSTERESIS BLOCK (the `holding local` arm and the `disengage confirmed`
+# arm, both below the rc 3 exit), which a demand-blind pass never reaches, so a mutant that merely
+# INCREMENTED the streak here would still pass. A blind pass must not count toward DISENGAGE_TICKS —
+# three blind passes must not release a pool nobody measured — so the file itself is the invariant,
+# seeded at 2 (one short of the shipped 3) and asserted untouched.
+printf '%s' '2' > "$STATE_DIR/ci-runner-gate.disengage-streak"
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d1) a demand-blind pass is still could-not-measure → exit 2 (never 0)"
+assert_contains "$OUT" "DEMAND UNMEASURED for this pass" "(d1) the pass NAMES the leg it could not read"
+assert_contains "$OUT" "queued_demanding=unmeasured" \
+  '(d1) the probe publishes `unmeasured`, never a 0 this read did not measure'
+assert_contains "$OUT" "CONVERGING the pool to the RECORDED mode" \
+  "(d1) the repair is named as a REPAIR (the recorded decision), not a new one"
+assert_contains "$OUT" "repair OK" "(d1) the repair reports its outcome"
+# ⛔ THE REPAIR'S CLAIM IS RE-MEASURED, NOT INFERRED FROM THE WRITE (review P1, measured): the managed set
+# is what `set_labels` writes, and the pool-wide mode is what the pass measures AFTERWARDS. Here the
+# post-repair re-read agrees — only then may the durable line say the POOL advertises the recorded mode.
+assert_contains "$OUT" "CONFIRMED by a post-repair re-read" \
+  "(d1) the convergence is confirmed by a re-read, not asserted from the write landing"
+assert_contains "$OUT" "no mode decision taken" "(d1) the pass says it took NO new mode decision"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d1) the write path IS reached on a demand-blind pass"
+assert_contains "$(put_body_for 101)" "ubuntu-latest" "(d1) …and it re-applies the fallback label (#2327's marker)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d1) a repair does NOT advance the state file — no transition was taken"
+assert_not_contains "$OUT" "TRANSITION" "(d1) …and notifies no transition"
+assert_not_contains "$OUT" "leaving mode=" \
+  "(d1) the terminal line names the mode the pool NOW advertises, not the pre-write reading"
+assert_contains "$OUT" "the pool now advertises local" \
+  "(d1) …and NAMES the mode it advertises (the positive half: not merely the absence of the old phrase)"
+# ⛔ NO `assert_not_contains "$OUT" "hysteresis"` HERE (review P3, measured — one was added in the
+# previous round and does not work): `hysteresis` is only printed in `main`'s
+# `if [ "$want" = github ] && [ "$prev" = local ]` block, and a pass that entered the rc 3 block has
+# `healthy=3`, which can never select `want=github` — so a mutant that DELETED this block's terminal
+# `exit 2` (the actual fall-through) leaves the word out of the log and the assertion green, while the
+# `(d1) exit 2` assertion reds. The streak-file pin below is the load-bearing one, and the exit-code
+# assertion above it is what covers fall-through.
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.disengage-streak" 2>/dev/null)" "2" \
+  "(d1) a blind pass does not count toward DISENGAGE_TICKS (seeded 2, still 2 — 3 blind passes must not release a pool)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
+  "(d1) the verdict file does not keep the previous pass's answer"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "DEMAND was not measured" \
+  "(d1) …it names the leg that could not be read"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=$BLIND_QUEUE" \
+  "(d1) …and still publishes the depth it DID read"
+# ⛔ THE VERDICT'S CONVERGENCE CLAIM IS PINNED TO THE ARM THAT ACTUALLY CONVERGED (review P1). Before
+# this, the claim was hardcoded and written before the repair, so the arms BELOW (d3 no recorded mode,
+# d6 repair FAILED) published the same sentence without a convergence happening. This is the positive
+# control: here the repair DID land, so the claim must be present — otherwise "does not claim it" below
+# would be satisfiable by a writer that never claims anything.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the pool was converged to the mode the state file records (local)" \
+  "(d1) …and the verdict asserts the convergence that DID happen (the positive control for d3/d6)"
+# ⛔ FIELD PARITY WITH `write_verdict` (review P3): a non-deciding pass reports the three decision keys
+# as `unmeasured` instead of omitting them — "missing != unmeasured" (#3002 P2). A `0` here would be a
+# number this pass never measured, so the assertion pins the WORD, not just the key.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(d1) …and carries the decision keys write_verdict always emits, as unmeasured rather than absent"
+
+# (d2) RECORDED github + pool measured local → the repair runs the OTHER direction (a strip).
+run_gate demandblind-release GH_QUEUED=0 GH_FALLBACK_N=1 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d2a) the MEASURING pass releases the pool and records mode=github"
+# ⛔ THE POOL RE-ACQUIRES THE LABEL OUT OF BAND (a runner agent re-asserting its own set is the measured
+# 60-120 s behaviour), so the COUNT is derived from the inventory and the STRIP direction's post-repair
+# re-read can also observe its own write. Without this the arm would pin the strip against a constant and
+# would land in the managed-set-only arm for a fixture reason rather than a pool reason.
+printf '101\tself-hosted\n101\tLinux\n101\tARM64\n101\tself-hosted-arm64\n101\tubuntu-latest\n102\tself-hosted\n102\tLinux\n102\tARM64\n102\tself-hosted-arm64\n102\tubuntu-latest\n' > "$GH_ROWS_STATE"
+KEEP_STATE=1 run_gate demandblind-release GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d2) release-repair pass → exit 2"
+assert_contains "$OUT" "CONVERGING the pool to the RECORDED mode=github" \
+  "(d2) the repair targets the RECORDED github, not the measured local"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d2) …and it writes"
+assert_not_contains "$(put_body_for 101)" "ubuntu-latest" \
+  "(d2) …stripping the fallback marker (#2327: the strip direction is never weakened)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(d2) state unchanged"
+
+# (d3) NOTHING RECORDED → nothing is labelled. This is the fail-closed direction that must survive:
+# a pass that measured no demand may not START a fallback, because that would be labelling the pool on
+# an unmeasured signal (#2327's own reason for the strip).
+run_gate demandblind-norecord GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d3) no recorded mode → exit 2"
+assert_contains "$OUT" "repair SKIPPED: no recorded mode" \
+  "(d3) the refusal to label on an unmeasured signal is NAMED"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d3) …and nothing is PUT"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(d3) …and no mode is recorded"
+# ⛔ THE DURABLE VERDICT MAY NOT ASSERT A CONVERGENCE THAT DID NOT HAPPEN (review P1, measured): on this
+# arm there was nothing to converge to, so no PUT is sent (asserted above) — while the writer used to
+# publish "the pool was converged to the mode the state file records" BEFORE it even read the state file,
+# naming a state file this very arm proves absent. This assertion is what reddens that contradiction.
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "was converged to the" \
+  "(d3) the verdict does NOT claim a convergence on the arm that converged nothing"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "so there was NOTHING to converge to and the pool was NOT relabelled" \
+  "(d3) …it names what actually happened (nothing recorded, nothing relabelled)"
+# ⛔ THE FAIL-OPEN DIRECTION, PINNED: a mutant that reads the refusal as DEMAND (the pre-#2344
+# behaviour, and the thing #2344's doctrine forbids) engages here on the RAW depth (40 ≥ 10) and
+# denominates the length leg. This assertion is what reddens it.
+assert_not_contains "$OUT" "queue/component/incident leg" \
+  "(d3) the raw depth is NOT read as demand — the queue legs are disarmed, not guessed"
+assert_not_contains "$OUT" "GitHub-hosted UNHEALTHY" "(d3) …so no engagement decision is taken"
+# ⛔ THE SCAN-TIME LINE MAY NOT ANNOUNCE THE REPAIR'S OUTCOME (review P1, measured). `queue: … and the pool
+# is converged to the mode the state file records` was written ~900 lines BEFORE the state file is read and
+# before any PUT, so it claimed a convergence on the one arm that proves nothing was converged: this arm
+# asserts `assert_absent …/ci-runner-gate.state` and no `-X PUT` above. The repair step's own lines are the
+# only place that outcome may appear, and here it says the repair was SKIPPED.
+assert_not_contains "$OUT" "and the pool is converged to the mode the state file records" \
+  "(d3) the scan-time log does NOT announce a convergence before the state file is read"
+
+# (d4) RECORDED local + pool ALREADY local → nothing to converge, and no PUT storm.
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d4) an already-converged pool still exits 2 (demand is still unmeasured)"
+assert_contains "$OUT" "nothing to converge" "(d4) the pass says the recorded mode was already in force"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d4) …and writes nothing (a blind pass is not a PUT storm)"
+
+# (d5) A READ VERB CHANGES NOTHING (#3002): --dry-run repairs nothing and leaves the verdict alone.
+_DB_VERDICT_BEFORE="$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)"
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" -- --dry-run
+assert_eq "$RC" "2" "(d5) --dry-run on a demand-blind pass → exit 2"
+assert_contains "$OUT" "NO repair applied" "(d5) the read verb names what it did NOT do"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d5) …no label was written"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) …and no state advanced"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "$_DB_VERDICT_BEFORE" \
+  "(d5) …and the previous verdict line is left exactly as it was (not re-written)"
+
+# (d6) A REPAIR THAT DOES NOT LAND IS NOT REPORTED AS A CONVERGENCE (review P1, measured). The write path
+# failing is the #4085 shape this whole branch exists to restore, so the ONE artifact that answers "did
+# the gate restore the pool?" must not answer "yes" when a label PUT failed. `GH_PUT_FAIL_ID` fails one
+# runner's PUT while the other lands — a PARTIAL repair, which is still a repair that did not land
+# (`set_labels` returns non-zero on ANY fail), so the honest verdict is "ATTEMPTED AND FAILED".
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" GH_PUT_FAIL_ID=101 \
+  GH_POOL_IDS="101 102" --
+assert_eq "$RC" "2" "(d6) a failed repair still exits 2"
+assert_contains "$OUT" "repair FAILED" "(d6) the log NAMES the failure rather than absorbing it"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the repair to the recorded mode=local was ATTEMPTED AND FAILED" \
+  "(d6) the verdict says the repair FAILED"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "was converged to the" \
+  "(d6) …and does NOT publish the convergence that did not happen"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(d6) …and still carries the full key set a strict parser expects"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d6) a failed repair does not advance the state file"
+# ⛔ A FAILED REPAIR IS NOT ALWAYS A NO-OP, AND THE LINE MAY NOT SAY IT IS (review P2, measured): this arm
+# fails ONE runner's PUT while the other lands (`set_labels ok=1 fail=1`, `accepted=1`), so the pool IS
+# partially relabelled. "the labels are UNCHANGED" sent an operator past that — and the next blind pass then
+# reads `mode=local == recorded` and logs `nothing to converge`, freezing the partial repair unnamed.
+assert_contains "$OUT" "set_labels did NOT complete" \
+  "(d6) the failure NAMES the write that did not complete instead of claiming the labels are unchanged"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "may be PARTIALLY changed" \
+  "(d6) …and the verdict says a partial relabel is possible"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UNCHANGED" \
+  "(d6) …and does NOT assert the labels are unchanged on a partial write"
+# ⛔ AND THE VERDICT'S OWN `mode=` KEY MAY NOT CARRY IT EITHER (review P2, measured): the claim beside it
+# already says the labels may be PARTIALLY changed, while the writer printed `mode=%s mode_source=%s` from
+# the PRE-write `current_mode` — measured here as `mode=github mode_source=runners`. This arm's partial
+# ENGAGE (`ok=1 fail=1`) has just armed one of the two managed runners, so the pool may now advertise
+# `local`, the OPPOSITE of the value the durable file published; a scheduler branching on `mode=` read the
+# pre-write pool as the current one (the fail-open direction #3002 removed for `verdict=`).
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode=unknown mode_source=none" \
+  "(d6) the verdict's mode= key names the ABSENCE of a post-write reading, not the pre-write one"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode_source=runners" \
+  "(d6) …so it does NOT publish the pre-write reading as the pool's current mode"
+# ⛔ AND THE ARM'S LAST LINE MAY NOT PUBLISH THE PRE-WRITE READING EITHER (review P2, measured): `mode`
+# is `current_mode` taken BEFORE the write, so `(leaving mode=github)` reported a pre-repair reading as
+# the pool's post-repair state — false after this arm's partial relabel, and it contradicted the line
+# above it. Arms that change NOTHING (d3 no-recorded-mode, d4 already-converged) may still say it — it is
+# true there — which is why this is pinned arm by arm and not as a file-wide grep.
+assert_not_contains "$OUT" "leaving mode=" \
+  "(d6) the terminal line does not publish the PRE-write mode after a repair that partly landed"
+# ⛔ AND THE SHARED CLOSING SENTENCE MAY NOT BE USED ON THIS ARM EITHER (review: unpinned, measured):
+# "pool converged to the recorded mode=… where it differed" names a convergence that did not happen, and the
+# comment above the arm names it as the defect fixed — but the assertion above pins only the OTHER phrasing.
+# A mutant restoring the shared sentence on this arm left the suite green until this line existed.
+assert_not_contains "$OUT" "pool converged to the recorded mode" \
+  "(d6) …and does not fall back to the shared 'pool converged … where it differed' sentence"
+
+# (d7) A FAILED LABEL READ MUST NOT REPLACE THE CENSUS'S CAPABILITY IN THE VERDICT (review P2, measured).
+# `$CAPABILITY` is a global that `set_labels` overwrites when ITS read fails, and the repair runs BETWEEN the
+# census and the verdict write — so a writer reading `${CAPABILITY:-none}` at call time published the LABEL
+# read's capability (`runner_inventory:upstream http=5xx`) beside a `capacity=saturated` the CENSUS
+# measured, on one durable line. `capability=` means the INVENTORY read, so it must be the census's
+# value. `GH_MODE=enum-fail` fails ONLY the `<id>TAB<label>` read — the census read is a different stub
+# branch, keyed on its `--jq` program — which is exactly this shape.
+run_gate demandblind-cap GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d7a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-cap GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" GH_MODE=enum-fail --
+assert_eq "$RC" "2" "(d7) a failed LABEL read on a demand-blind pass still exits 2"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capacity=saturated" \
+  "(d7) the census DID measure capacity (so the capability key is not being read from a failed census)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capability=none" \
+  "(d7) the verdict's capability is the CENSUS's (none read = none needed), not the label read's"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capability=runner_inventory:" \
+  "(d7) …and it does NOT publish the LABEL read's capability beside a measured capacity"
+
+# (d8) A SUBSTITUTED MODE MAY NOT DECIDE THAT THE POOL ALREADY MATCHES (review P1, measured). The
+# "already converged" skip compares `mode` against the recorded mode, but `mode` is only the pool's LABEL
+# state when `current_mode` answered: after a failed count read it comes from `mode_from_jobs`, which
+# answers "which pool is SERVING" — a narrowed claim (#2897), not what the labels say. This file already
+# rules that a jobs-inferred reading must not decide a WRITE: the hysteresis block's hold is keyed on
+# `prev`, never on `mode`, for exactly that reason. Reachable shape: recorded local, the labels stripped, a non-hosted job still
+# in flight → the inference answers local, the equality held, the repair was SKIPPED, and the verdict
+# asserted the pool "ALREADY advertised" a mode the pass never read. `GH_FALLBACK_N_FIRST=null` fails ONLY
+# the FIRST count read of the pass — the transient blip the mode read has no retry for while
+# `runner_census` retries (#4085) — so the census still measures and the post-repair re-read still works.
+run_gate demandblind-inferred GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d8a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-inferred GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N_FIRST=null GH_RUNNER_GROUP="Default" \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d8) an inferred-mode demand-blind pass still exits 2"
+assert_contains "$OUT" "mode_source=jobs-inference" \
+  "(d8) the log NAMES the substitution it is working from"
+# ⛔ THE SKIP MAY NOT FIRE ON A SUBSTITUTED READING: the pool's LABEL state was not read, so the pass may
+# not say the recorded mode is already advertised, and it must reach the write path instead.
+assert_contains "$OUT" "could NOT read the runner labels" \
+  "(d8) the pass says the label state is UNESTABLISHED instead of assuming it matches"
+# ⛔ AND THE REPAIR-REASON BRANCH THIS ARM REACHES IS PINNED BY ITS OWN SENTENCE (review P2, measured):
+# `mode` equals the recorded mode here and both came from a SUBSTITUTE, so the CONVERGING line must say
+# that — replacing this branch with `this pass measures mode=…` (publishing an INFERRED reading as a
+# MEASURED one) left all 719 assertions green before this line existed.
+assert_contains "$OUT" "came from a SUBSTITUTE (mode_source=jobs-inference)" \
+  "(d8) …and the CONVERGING line says the matching mode came from a substitute, not a measurement"
+assert_not_contains "$OUT" "the pool already advertises" \
+  "(d8) …so it does NOT claim the pool already advertises the recorded mode"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ALREADY advertised" \
+  "(d8) …and the verdict does not report a repair as unnecessary on an unread label state"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" \
+  "(d8) …the write path IS reached (the repair is not skipped on an inferred equality)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode_source=runners" \
+  "(d8) the durable line's mode= is the POST-repair label read, not the substituted pre-repair one"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the pool was converged to the mode the state file records (local)" \
+  "(d8) …and the verdict asserts the convergence the re-read then confirmed"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d8) …without advancing the state file (a repair is not a transition)"
+
+# (d9) A MANAGED WRITE IS NOT A POOL-WIDE CONVERGENCE (review P1, measured). `set_labels` PUTs only the
+# runners carrying this gate's pool marker (`managed_ids`), while `mode` counts EVERY runner carrying the
+# fallback label (`current_mode`) — and "the pool advertises mode=X" is defined as that count. So a
+# release-repair that strips the managed set can leave a runner OUTSIDE the pool carrying `ubuntu-latest`
+# (the (i) fixture: never relabelled, by design #2327), and the pass then claimed `the pool now advertises
+# github` / `the pool was converged to the mode the state file records (github)` while the NEXT pass read
+# `mode=local`. The same verdict line also published `mode=`, the PRE-write reading, beside the post-write
+# claim. Hence: re-read, and scope the claim to what the re-read proves. The stranger's own body is
+# asserted empty, so the arm cannot be satisfied by relabelling it (which would be #2327's defect back).
+STRANGER_REPAIR="$T/rows-stranger-repair.tsv"
+printf '30\tself-hosted\n30\tLinux\n30\tARM64\n30\tself-hosted-arm64\n30\tubuntu-latest\n99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$STRANGER_REPAIR"
+run_gate demandblind-stranger GH_QUEUED=0 GH_FALLBACK_N=1 GH_RUNNER_ROWS_FILE="$STRANGER_REPAIR" --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d9a) the MEASURING pass releases the pool and records mode=github"
+KEEP_STATE=1 run_gate demandblind-stranger GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d9) a release-repair with a stranger runner present still exits 2"
+assert_eq "$(put_body_for 99)" "" \
+  "(d9) the stranger is NOT relabelled — the repair is scoped to the managed set (#2327)"
+# ⛔ THE POSITIVE CONTROL THIS ARM USED TO LACK (review P3, measured): without it, a gate that writes
+# NOTHING on the release-repair path satisfied all eight assertions above (`put_body_for 99` is empty on a
+# no-write pass, and "the convergence claim is scoped" is satisfied by any string). The pre-existing (i)
+# arm pairs its stranger assertion with `put_body_for 30` for exactly this reason.
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d9) the repair DOES write — the arm is not satisfied by a no-op"
+assert_contains "$(put_body_for 30)" '"labels":["self-hosted-arm64"]' \
+  "(d9) …the MANAGED runner is stripped of the fallback label in the same pass"
+assert_not_contains "$(put_body_for 30)" "ubuntu-latest" \
+  "(d9) …and its body carries no fallback label (the positive half of the strip)"
+assert_contains "$OUT" "repair OK (MANAGED SET ONLY)" \
+  "(d9) the pass names the write it actually performed, not a pool-wide one"
+assert_contains "$OUT" "OUTSIDE this gate's managed set" \
+  "(d9) …and NAMES what the re-read proves is still carrying the label"
+assert_not_contains "$OUT" "the pool now advertises github" \
+  "(d9) …so it does NOT publish a pool-wide convergence the re-read contradicts"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode=local" \
+  "(d9) the verdict's mode= is the POST-repair reading, not the pre-write one"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "the gate's MANAGED runners were converged to the mode the state file records (github)" \
+  "(d9) …and the convergence claim is scoped to the managed set"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "the pool was converged to the" \
+  "(d9) …and it does NOT claim a pool-wide convergence the next pass contradicts"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d9) …and the state file is still not advanced by a repair"
+
+# (d10) A RE-READ THAT DID NOT ANSWER PUBLISHES NO CURRENT MODE (review P2, measured: deleting
+# `mode="unknown"; MODE_SOURCE="none"` left the PRE-write reading standing as current and the whole suite
+# stayed green). The managed write landed, so the pass may say THAT; it may not present the pre-write `mode`
+# as the pool's mode at the moment it writes. `GH_FALLBACK_N=null` fails BOTH count reads (the pre-repair
+# one and the re-read), which is the same-call failure twice — the shape a rate-limited box sees.
+run_gate demandblind-silent GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d10a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-silent GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=null \
+  GH_RUNNER_GROUP="Default" GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d10) a demand-blind pass whose re-read fails still exits 2"
+assert_contains "$OUT" "repair OK (MANAGED SET ONLY)" \
+  "(d10) the managed write is reported — the pass did DO something and does not deny it"
+assert_contains "$OUT" "did not answer" "(d10) …and the re-read's silence is NAMED"
+assert_not_contains "$OUT" "CONFIRMED by a post-repair re-read" \
+  "(d10) …so no convergence is certified from a reading that does not exist"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode=unknown mode_source=none" \
+  "(d10) the durable line says the pool-wide mode is UNKNOWN, not the pre-write reading"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "POOL-WIDE mode is unmeasured" \
+  "(d10) …and states why: the re-read did not answer"
+
+# (d11) A REPAIR THAT WROTE NOTHING IS NOT A CONVERGENCE (review P1, measured). `set_labels` returns 0 on an
+# EMPTY managed set (`ok=0 fail=0`), so `repair_ok` alone certified a convergence for a pass that PUT
+# NOTHING: measured on this exact shape the durable line read `the pool was converged … AGREES (mode=local)`
+# with zero PUTs, the label belonging to a STRANGER all along. The fixture is the pool-less inventory: the
+# only runner carrying `ubuntu-latest` (99) carries no pool marker, so `managed_ids` is empty.
+run_gate demandblind-nowrite GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d11a) the MEASURING pass engages the pool and records mode=local"
+printf '99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$GH_ROWS_STATE"
+KEEP_STATE=1 run_gate demandblind-nowrite GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N_FIRST=null GH_RUNNER_GROUP="Default" \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d11) an empty-managed-set repair still exits 2"
+assert_eq "$(grep -c -- '-X PUT' "$GH_LOG" || true)" "0" \
+  "(d11) nothing was written — the managed set is empty"
+assert_contains "$OUT" "repair WROTE NOTHING" \
+  "(d11) the pass says the write count was ZERO instead of reporting a success"
+assert_not_contains "$OUT" "CONFIRMED by a post-repair re-read" \
+  "(d11) …and does NOT publish a convergence built on the stranger's label"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "was converged to the" \
+  "(d11) the verdict asserts NO convergence (none happened)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "is NOT confirmed" \
+  "(d11) …and says the recorded mode is unconfirmed"
+# ⛔ AND THE WROTE-NOTHING ARM MAY NOT PUBLISH A SUBSTITUTED MODE AS THE POOL'S MODE (review P1, measured):
+# `mode` here comes from `mode_from_jobs` ("which pool is SERVING, not what the labels SAY"), so calling it
+# "the pool's mode is still local" re-ran the same substitution on the newest path. Measured: the same arm
+# with a stranger row carrying no fallback label still had the verdict say "the pool's mode is still local"
+# while the pool carried NO fallback label at all — a false claim, not merely an unproven one.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "LABEL state is UNMEASURED" \
+  "(d11) the verdict says the LABEL state is unmeasured, because this pass INFERRED it"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "the pool's LABEL state is still mode=" \
+  "(d11) …and does NOT publish the serving inference as the pool's label state"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d11) …with the state file untouched (a repair never advances it)"
+
+# (d12) THE ENGAGE DIRECTION'S DISAGREEMENT HAS ITS OWN CAUSE (review P2, measured: deleting the
+# `recorded = local` branch left all 698 assertions green, so the sentence round 2 was raised about could be
+# reintroduced silently). Shape: recorded local, the repair engages and its PUTs verify, and the COUNT read
+# still reports ZERO carriers (a read that has not caught up with the write). The cause must then be "the
+# write did not stick", NOT "a carrier outside the managed set", which would assert a label the re-read just
+# proved exists nowhere. `GH_FALLBACK_N=0` is the stub's explicit statement of the pool's state for BOTH
+# reads, which is exactly this shape; the engage's own verify still runs against the inventory.
+run_gate demandblind-engage-stale GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d12a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-engage-stale GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d12) an engage-repair the re-read contradicts still exits 2"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d12) the repair DID write (the arm is not a no-op)"
+assert_contains "$OUT" "no runner carries the fallback label AT ALL" \
+  "(d12) the ENGAGE direction names the write that did not stick"
+# ⛔ AND THE MECHANISM IS HEDGED, WHICH IS PINNED (review P3, measured): reverting this clause to a single
+# cause ("the runner agent re-asserts its own set 60-120 s later") left all 711 assertions green, so the
+# sentence could be narrowed back to a mechanism that CANNOT explain a disagreement observed milliseconds
+# after `set_labels`' own verify read.
+assert_contains "$OUT" "deregistered between the writes and this re-read, or a read that lags" \
+  "(d12) …and the cause is hedged, so an immediate disagreement is not attributed to the 60-120 s agent only"
+assert_not_contains "$OUT" "OUTSIDE this gate's managed set" \
+  "(d12) …and does NOT borrow the STRIP direction's cause, which would assert a carrier the re-read proved absent"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "does NOT confirm the pool-wide mode" \
+  "(d12) the verdict scopes the claim to the managed set"
+
+# (d13) THE `ok=0` ARM WITH A REAL LABEL READ (the other half of the mode_source branch, review P1). Same
+# empty managed set as (d11), but the count read ANSWERS (`GH_FALLBACK_N=0` → github), so the honest claim is
+# "the pool's LABEL state is still mode=github" — a reading, not an inference. Pinned because the two branches
+# are one `if` apart and only the inferred one was asserted before.
+run_gate demandblind-nowrite-read GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d13a) the MEASURING pass engages the pool and records mode=local"
+printf '99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$GH_ROWS_STATE"
+KEEP_STATE=1 run_gate demandblind-nowrite-read GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d13) an empty-managed-set repair with a readable count still exits 2"
+assert_contains "$OUT" "repair WROTE NOTHING" "(d13) the zero-write arm is named"
+assert_contains "$OUT" "the pool's LABEL state is still mode=github" \
+  "(d13) …and the claim is the reading this pass actually took"
+assert_not_contains "$OUT" "LABEL state is UNMEASURED" \
+  "(d13) …so it does NOT call a measured label state unmeasured (the branch discriminates)"
+
+# (d14) `MODE_SOURCE` IS THREE-VALUED, AND THE THIRD VALUE IS NOT AN INFERENCE (review P2, measured).
+# `none` means NEITHER the label read NOR a job inference answered (`main`: "mode=unknown source=none"),
+# so describing `mode=unknown` as "only the SERVING inference" states an answer that was never taken — on
+# the DURABLE verdict file. The arm reuses the shipped knobs: `GH_FALLBACK_N=null` fails the label read and
+# `GH_JOBS_MODE=none` leaves nothing executing, while the rows hold only a stranger (empty managed set, so
+# the arm is the zero-write one, whose claim carries the source).
+run_gate demandblind-nosource GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d14a) the MEASURING pass engages the pool and records mode=local"
+printf '99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$GH_ROWS_STATE"
+KEEP_STATE=1 run_gate demandblind-nosource GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N=null GH_JOBS_MODE=none \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d14) a pass with no mode read and no inference still exits 2"
+# ⛔ BACKTICKS ARE NEVER PLACED INSIDE A DOUBLE-QUOTED LABEL (review P3, measured): `"... reached \`none\`"` ran
+# `none` and `unknown` as COMMANDS on every suite run ("line 3156: none: command not found") and printed the
+# diagnostic with a hole — the identical defect this suite already pinned once at (d1). Labels are text.
+assert_contains "$OUT" "mode=unknown source=none" '(d14) the pass reached `none`: nothing was read and nothing was inferred'
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ABSENCE of a reading" \
+  '(d14) the verdict calls `unknown` the ABSENCE of a reading'
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "only the SERVING inference" \
+  "(d14) …and does NOT describe it as an inference that was never taken"
+# ⛔ THE `repair_why` SITE HAS ITS OWN ASSERTION (review P2, measured): "NEITHER the label read NOR a job
+# inference answered" is ALSO carried by the zero-write claim, so a revert of `repair_why` alone reprinted
+# "mode=unknown is only INFERRED (mode_source=none)" with all 718 assertions green. Pin the CONVERGING line
+# by its own prefix, and pin the false shape itself so it cannot re-enter from EITHER site.
+assert_contains "$OUT" "state file records mode=local but NEITHER the label read NOR a job inference answered" \
+  "(d14) the CONVERGING line names both missing reads, not a substitute"
+assert_not_contains "$OUT" "mode=unknown is only" \
+  '(d14) …and no line calls `unknown` an inference (it is the absence of one)'
+
+# (d15) THE `jobs-inference` BRANCH OF `repair_why` (review P2, measured: replacing it with the `none` text
+# left all 719 assertions green). It is reached when the label read fails, the JOBS INFERENCE answers, and
+# the inference DIFFERS from the recorded mode — so the CONVERGING line must say the mode is inferred from
+# which pool is SERVING, and must not borrow the `none` sentence (neither read answered).
+run_gate demandblind-inferred-differs GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d15a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-inferred-differs GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N_FIRST=null GH_RUNNER_GROUP="GitHub Actions" \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d15) an inferred mode that differs from the recorded one still exits 2"
+assert_contains "$OUT" "is only INFERRED from which pool is SERVING (mode_source=jobs-inference)" \
+  "(d15) the CONVERGING line names the inference it actually used"
+assert_not_contains "$OUT" "NEITHER the label read NOR a job inference answered (mode_source=jobs-inference)" \
+  '(d15) …and does NOT borrow the `none` sentence, which says both reads were silent'
 
 
 if [ "$FAIL" -gt 0 ]; then
