@@ -268,8 +268,30 @@ case "$*" in
     # one coercion that mints a permanent ghost out of a read that measured nothing) passed all 649
     # assertions, because no arm ever handed a body to the program. With this hook the double executes the
     # exact shipped program over a canned body, so the jq half is testable at all.
+    # ⛔ AND ITS EXIT STATUS IS PROPAGATED, NOT SWALLOWED (review cycle 7, P1). `2>/dev/null` + `exit 0`
+    # made a program that RAISES indistinguishable from one that correctly emitted nothing: mutating the
+    # null-guard to `(.jobs)[]` (rc 5, `Cannot iterate over null`) left all 693 assertions GREEN, so the
+    # arm that exists to prove "an absent job list is never a measured zero" passed for a program that
+    # could not run at all. The same defect was fixed for the queue read one commit earlier; this is its
+    # sibling, and it is the read that MINTS the ghost.
+    # `GH_JOBS_BODY` may carry several page documents separated by `;` (the shape a paginated read
+    # produces), so the hook can serve a multi-page body as well as a single one — the one arm that does
+    # is `ledger-jobs-sum` below, which is why the loop is exercised at all.
+    # ⛔ THE SUM IS PINNED, AND THE FIRST ATTEMPT AT THIS COMMENT WAS WRONG (review cycle 8, P1 — the
+    # claim that a multi-page body "cannot distinguish" summing from overwriting because the caller reads
+    # the second `#jobs` row as a label line is FALSE: `run_queued_demand` consumes EVERY page row in its
+    # own loop and emits exactly ONE summed row, so the caller never sees a second one. What actually made
+    # the first attempt vacuous was the FIXTURE — it wrote jq syntax (`[range(100)|{}]`) inside a JSON
+    # document, so the body did not parse and the arm passed on a read that failed. With real JSON and the
+    # jobs on the FIRST page (an empty LAST page is what separates the two behaviours) the mutant dies.
     if [ -n "${GH_JOBS_BODY:-}" ]; then
-      printf '%s' "$GH_JOBS_BODY" | jq -r "$_jq_prog" 2>/dev/null
+      _rest="$GH_JOBS_BODY"
+      while :; do
+        _doc="${_rest%%;*}"
+        case "$_rest" in *';'*) _rest="${_rest#*;}" ;; *) _rest="" ;; esac
+        printf '%s' "$_doc" | jq -r "$_jq_prog" || exit $?
+        [ -n "$_rest" ] || break
+      done
       exit 0
     fi
     case "$*" in
@@ -1395,7 +1417,10 @@ run_gate ghost-truncated GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4
 assert_eq "$RC" "2" "a page shorter than its own depth → exit 2"
 assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
 # …and at the SHIPPED bound the old page-ceiling note is NOT appended either (the read walks pages).
-assert_not_contains "$OUT" "ONE page of" "the removed page-ceiling note is never printed"
+# The removed page-ceiling note is pinned POSITIVELY (review cycle 7, P2): `"ONE page of"` exists nowhere
+# in the gate, so an `assert_not_contains` on it can never fail on any live code path. What matters is
+# that the TRUNCATED refusal names the READ cap and not the old scan bound as the reach bound.
+assert_contains "$OUT" "CI_GATE_QUEUE_READ_MAX_PAGES" "a short read names the READ CAP that bounds the walk"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
 # ⛔ THE TRUNCATED REFUSAL NAMES THE READ CAP NOW, AND THAT IS THE FACT THE OPERATOR NEEDS
 # (agent-infra#4113 — this arm replaces the #3995 ceiling arm, because the ceiling it pinned NO LONGER
@@ -1411,7 +1436,8 @@ assert_eq "$RC" "2" "a truncated page → exit 2"
 assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
 assert_contains "$OUT" "CI_GATE_QUEUE_READ_MAX_PAGES" "it names the READ CAP that now bounds the walk"
 assert_contains "$OUT" "fewer rows than it reported depth" "…and says what a short read means (not 'the queue is too deep to reach')"
-assert_not_contains "$OUT" "a deeper read is a code change" "the stale 'code change, not a knob' sentence is GONE (the read now walks pages)"
+assert_not_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" \
+  "…and NOT the scan bound (the scan window bounds COST; the page cap bounds REACH — naming the wrong one sends an operator to the wrong knob)"
 
 # ⛔ agent-infra#4113 — THE SCAN WINDOW IS A *COST* BOUND, NOT A *REACH* BOUND, AND ONE PAGE IS NOT THE
 # QUEUE. Both halves were measured on the live fleet on 2026-11-17:
@@ -1507,8 +1533,14 @@ KEEP_STATE=0
 assert_contains "$OUT" "ghost ledger UNREADABLE" "a malformed ledger is NAMED, not silently ignored"
 assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and its run is READ, never discounted on an entry that did not parse"
 assert_eq "$(awk '{print $1}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null)" "4001" "…and the file is rewritten to the proofs that DID parse, stamped with the moment they were proved"
+# ⛔ THE MESSAGE MUST NOT CARRY BARE BACKTICKS (measured). It used to read "…exactly <run id> <epoch> …"
+# with those two placeholders wrapped in BACKTICKS, which bash expands as a COMMAND SUBSTITUTION before
+# `assert_eq` ever runs: the expansion is a syntax error (`<run id>` is not a command), bash prints
+# `syntax error near unexpected token '<'` and SKIPS THE WHOLE COMMAND — the assertion never executes
+# and never prints its ✅, so this arm's only "one row is exactly <id> <epoch>" check has been a
+# no-op since it was written. Escaped, it runs (measured: 699 green before, 700 green after).
 assert_eq "$(awk 'NF != 2' "$STATE_DIR/ci-runner-gate.ghosts" | grep -c . | tr -d ' ')" "0" \
-  "…every row carries exactly `<run id> <epoch>` (a row with no stamp is a proof nobody dated)"
+  "…every row carries exactly \`<run id> <epoch>\` (a row with no stamp is a proof nobody dated)"
 
 # ⛔ ONE PAGE IS NOT THE QUEUE (see the block above): the runs endpoint is newest-first, so a head that is
 # older than the newest QUEUE_PAGE runs is INVISIBLE to a single-page walk — measured on the live repo,
@@ -1601,10 +1633,62 @@ run_gate ledger-null-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:1
   GH_JOBS_BODY='{"total_count":0,"jobs":null}' --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
   "a body whose .jobs is null remembers NOTHING (an absent reading is not a zero)"
+# ⛔ AND THE READ MUST HAVE BEEN *READABLE* (review cycle 8, P1 — measured). "No entry" is satisfied
+# IDENTICALLY by a correct empty reading and by a jobs read that FAILED, so this arm passed for a jq
+# program that raised on every call (`(.jobs)[]` on null → rc 5) even after the double began propagating
+# the status: propagation with no consumer is still coverage that cannot fail. The discriminating fact is
+# the VERDICT — an unmeasured-but-readable body still certifies the queue empty (nothing was remembered),
+# while a failed read refuses and says so.
+assert_contains "$OUT" "nothing is waiting for a runner" \
+  "…and the read was READABLE: an unmeasured job list still certifies empty (a RAISED program refuses instead, which is what makes this assert bite)"
 run_gate ledger-empty-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
   GH_JOBS_BODY='{"total_count":0,"jobs":[]}' --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "1" \
   "…while an EMPTY job list is the real ghost shape and IS remembered (so the arm is not vacuous)"
+# ⛔ AND THE PER-PAGE COUNT ROWS ARE SUMMED, NOT OVERWRITTEN (review cycle 8, P1). This is the arm the
+# previous commit declared impossible: jobs on page 1 + an EMPTY page 2. Sum ⇒ 2 jobs ⇒ not a ghost ⇒ no
+# entry; overwrite ⇒ the last page's 0 ⇒ a measured zero ⇒ the run is remembered as a ghost. The pages
+# must be in THIS order (the reverse is green either way: an empty first page and a busy second sum and
+# overwrite to the same number).
+echo "── #4113: the per-page job counts are SUMMED across pages, never overwritten ──"
+run_gate ledger-jobs-sum GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":2,"jobs":[{"status":"in_progress","labels":[]},{"status":"in_progress","labels":[]}]};{"total_count":0,"jobs":[]}' --
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "2 jobs on page 1 + an EMPTY page 2 is 2 jobs, NOT a zero-job ghost (overwrite would mint one)"
+# ⛔ AND THE SUM MUST HAVE BEEN *READ* — THE COUNT ABOVE IS SATISFIED IDENTICALLY BY A FAILED READ
+# (review cycle 10, P1 — measured). The empty ledger is reached by two different worlds: (a) the pages
+# were summed to 2, 2 != 0, so nothing was remembered and the pass logs the all-ghosts VERDICT; and
+# (b) the read FAILED, so the caller refuses with "jobs read FAILED … STAYS the queue head" and still
+# persists an empty ledger (`ghost_ledger_write` writes the file even when empty, by design). This arm
+# can only tell summing from overwriting because the double splits `GH_JOBS_BODY` into page documents,
+# and nothing above pins that mechanism: delete the `;`-split loop and keep the status propagation, and
+# one `jq` call over the whole body prints `#jobs\t2` and then raises (rc 5) — `run_queued_demand`
+# returns 1 BEFORE parsing that row (`ci_runner_gate.sh:738`), so the ledger is empty for reason (b) and
+# the count assertion PASSES while the `jobs-overwrite` mutant it exists to kill silently survives.
+# Measured before this assert: the deleted-page-loop mutant and the shipped code were BOTH green (698).
+# The discriminator is the VERDICT, exactly as `ledger-null-jobs` above pins it one arm earlier.
+assert_contains "$OUT" "nothing is waiting for a runner" \
+  "…and the read SUCCEEDED: a summed 2-job reading certifies the queue empty (a FAILED read refuses instead — an empty ledger cannot pin the sum on its own)"
+
+# ⛔ AND THE PROPAGATION ITSELF NEEDS AN ARM THAT CAN SEE IT — the arms above cannot (measured, P1
+# follow-up on review cycle 8's fix). `ledger-null-jobs`'s new fact bites on the null-guard MUTANT (a
+# PATCHED gate that raises), but nothing in this suite reddens if the DOUBLE's status propagation is
+# reverted: with `2>/dev/null; exit 0` back in the hook a raise emits nothing, which reads EXACTLY like a
+# correct unmeasured body, so every null-jobs assertion stays green while the P1 the hook fixed quietly
+# returns. A raise the FIXTURE can cause is therefore the only way to pin the hook itself: `.jobs` as a
+# string is an API shape violation, so the SHIPPED program raises with NO mutation of the gate at all
+# (`Cannot iterate over string`), and the answer must be a FAILED read — prove nothing is a ghost, keep
+# the run as the queue head, discount nothing — never a certified-empty queue. Measured: reverting
+# `|| exit $?` to the pre-fix swallow reddens the three assertions below and nothing else in the suite.
+echo "── #4113: a jobs body the shipped program cannot parse is a FAILED read, not an unmeasured one ──"
+run_gate ledger-jobs-program-raises GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":0,"jobs":"unexpected"}' --
+assert_contains "$OUT" "jobs read FAILED" \
+  "a body the shipped jq cannot parse is a FAILED read — the double PROPAGATES the program's exit status"
+assert_contains "$OUT" "STAYS the queue head" \
+  "…and the run STAYS the queue head (no discount): the fail-closed answer for an unreadable job list"
+assert_not_contains "$OUT" "nothing is waiting for a runner" \
+  "…so a raising program is NEVER certified as 'nothing is waiting'"
 
 # …and an unmeasured total from the SHAPE double behaves the same way (the shell half): no page row, no
 # entry, whatever the reason the row is missing.
