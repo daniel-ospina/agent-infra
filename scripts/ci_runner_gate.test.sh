@@ -2741,11 +2741,11 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
   "(d1a) the MEASURING pass engages the pool and records mode=local"
 # ⛔ THE DISENGAGE STREAK IS SEEDED HERE AND PINNED BELOW, because the assertion it replaces could not
 # detect the property it named (review P3, measured): `assert_not_contains "$OUT" "hysteresis"` — the
-# word is only logged in the RELEASE branch (:2054/:2057), which a demand-blind pass never reaches (it
-# exits at the rc 3 block, before `healthy=1`), so a mutant that merely INCREMENTED the streak here
-# would still pass. A blind pass must not count toward DISENGAGE_TICKS — three blind passes must not
-# release a pool nobody measured — so the file itself is the invariant, seeded at 2 (one short of the
-# shipped 3) and asserted untouched.
+# word is only logged inside the HYSTERESIS BLOCK (the `holding local` arm and the `disengage confirmed`
+# arm, both below the rc 3 exit), which a demand-blind pass never reaches, so a mutant that merely
+# INCREMENTED the streak here would still pass. A blind pass must not count toward DISENGAGE_TICKS —
+# three blind passes must not release a pool nobody measured — so the file itself is the invariant,
+# seeded at 2 (one short of the shipped 3) and asserted untouched.
 printf '%s' '2' > "$STATE_DIR/ci-runner-gate.disengage-streak"
 KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
   GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
@@ -2762,6 +2762,8 @@ assert_contains "$(put_body_for 101)" "ubuntu-latest" "(d1) …and it re-applies
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
   "(d1) a repair does NOT advance the state file — no transition was taken"
 assert_not_contains "$OUT" "TRANSITION" "(d1) …and notifies no transition"
+assert_not_contains "$OUT" "leaving mode=" \
+  "(d1) the terminal line names the mode the pool NOW advertises, not the pre-write reading"
 assert_not_contains "$OUT" "hysteresis" \
   "(d1) the blind pass does not FALL THROUGH to a normal hysteresis decision (it exits at rc 3 before that branch)"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.disengage-streak" 2>/dev/null)" "2" \
@@ -2881,6 +2883,13 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "may be
   "(d6) …and the verdict says a partial relabel is possible"
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UNCHANGED" \
   "(d6) …and does NOT assert the labels are unchanged on a partial write"
+# ⛔ AND THE ARM'S LAST LINE MAY NOT PUBLISH THE PRE-WRITE READING EITHER (review P2, measured): `mode`
+# is `current_mode` taken BEFORE the write, so `(leaving mode=github)` reported a pre-repair reading as
+# the pool's post-repair state — false after this arm's partial relabel, and it contradicted the line
+# above it. Arms that change NOTHING (d3 no-recorded-mode, d4 already-converged) may still say it — it is
+# true there — which is why this is pinned arm by arm and not as a file-wide grep.
+assert_not_contains "$OUT" "leaving mode=" \
+  "(d6) the terminal line does not publish the PRE-write mode after a repair that partly landed"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"

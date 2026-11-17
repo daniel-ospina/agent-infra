@@ -1960,7 +1960,7 @@ if [ "$healthy" = 3 ]; then
   if [ "$repair_ok" = 1 ]; then
     log "repair OK: the pool was converged to the recorded mode=$recorded (demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded)"
     write_blind_verdict "the pool was converged to the mode the state file records ($recorded)"
-    log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed (leaving mode=$mode)"
+    log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed — the pool now advertises $recorded and the recorded DECISION is unchanged (the state file still says $recorded)"
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
@@ -1972,11 +1972,15 @@ if [ "$healthy" = 3 ]; then
     # So the durable line may not say the labels are unchanged, and it may not say the pool still
     # advertises `$mode` either — the pass measured `$mode` BEFORE the write. It names what it knows:
     # the write did not complete, and the recorded mode is NOT confirmed.
-    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (its ok=/fail= line above is the count), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
-    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see its ok=/fail= line in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
+    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (see the set_labels lines above: the ok=/fail= count when runners were written, 'no labels changed' when the enumeration refused), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
+    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see the set_labels lines in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
-    log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land (leaving mode=$mode)"
+    # ⛔ THE ARM'S TERMINAL LINE MAY NOT PUBLISH THE PRE-WRITE READING (review P2/P3, measured). `mode` is
+    # `current_mode` taken BEFORE the write (`:1765`), so `(leaving mode=$mode)` reported a pre-repair
+    # measurement as the pool's post-repair state — after a PARTIAL write that is false, and it contradicts
+    # the line above it. What the pass knows: the repair did not land, and the labels may be partly changed.
+    log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land — the pool's labels may be PARTIALLY changed (see the set_labels lines above); mode=$recorded is NOT confirmed"
   fi
   exit 2
 fi
