@@ -2879,7 +2879,11 @@ mutation_pasteback_cells() { # <section-text> -> the canonical cells the section
   [ -n "$_canon" ] && [ -n "$_sec" ] || return 0
   while IFS= read -r _c; do
     [ -n "$_c" ] || continue
-    if printf '%s\n' "$_sec" | grep -Fxq -- "$_c" 2>/dev/null; then
+    # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864): under `pipefail` the quiet grep exits at
+    # its first match, the writer takes SIGPIPE, and the pipeline reports 141 — so the arm would answer
+    # "not a copy" for a copy that IS one, which is a false CLEAN in this very gate. The guard
+    # (`scripts/check-no-sigpipe-grep.sh`, the `sigpipe-grep` check) caught the piped form here.
+    if grep -Fxq -- "$_c" <<<"$_sec" 2>/dev/null; then
       _n=$((_n + 1))
       _hits="$_hits$_c"$'\n'
       # ⛔ THE FLOOR IS ENFORCED ON THE OUTPUT, NOT ON THE LOOP: `_hits` must stay EMPTY below two, or
