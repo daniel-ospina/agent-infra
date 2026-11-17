@@ -164,7 +164,7 @@ GHOST_LEDGER_FILE="$STATE_DIR/ci-runner-gate.ghosts"
 # claim. It is NOT what excludes the 8-11 h population the #2344 comment cites — those runs had zero
 # QUEUED jobs, not zero TOTAL jobs, and are excluded by the zero-total predicate itself (see above).
 GHOST_TRUST_AFTER_S="${CI_GATE_GHOST_TRUST_AFTER_S:-3600}"
-# ⛔ HOW LONG A PROOF IS TRUSTED (agent-infra#4113 cycle 2, P0). 86400 s = 24 h, i.e. ABOVE the widest
+# ⛔ HOW LONG A PROOF IS TRUSTED (agent-infra#4113 cycle 2, P0). 43200 s = 12 h — ABOVE the widest
 # progressive-creation reading anywhere in this file (the #2344 comment's 8-11 h runs), so under EITHER
 # reading of that measurement a re-prove happens before a job set could still be filling in — and it also
 # bounds the cost: a proven population of a few hundred ghosts costs a handful of re-reads per DAY.
@@ -804,7 +804,7 @@ ts_is_old() {
 # trusted ledger could discount a run nobody proved, which understates demand and strips the pool
 # during a real stall. Discarding costs reads; trusting costs a false "nothing is waiting".
 ghost_ledger_load() {
-  local line id stamp age fresh=0 stale=0 now bad=0
+  local line id stamp age fresh=0 stale=0 skewed=0 now bad=0
   GHOST_LEDGER=""
   [ -f "$GHOST_LEDGER_FILE" ] || return 0
   now="$(date +%s)"
@@ -827,14 +827,21 @@ ghost_ledger_load() {
     # simply is not a ghost this pass, so the run is re-read and, if still zero-job, re-proven and
     # re-stamped. A FUTURE stamp (clock skew) is treated the same way — it is not a proof this pass can
     # date, and trusting it would make the entry immortal.
-    if [ "$stamp" -gt "$now" ] || [ "$age" -ge "$GHOST_REPROVE_AFTER_S" ]; then
+    if [ "$stamp" -gt "$now" ]; then
+      skewed=$((skewed + 1)); continue
+    fi
+    if [ "$age" -ge "$GHOST_REPROVE_AFTER_S" ]; then
       stale=$((stale + 1)); continue
     fi
     GHOST_LEDGER="$GHOST_LEDGER $id"
     fresh=$((fresh + 1))
   done < "$GHOST_LEDGER_FILE"
   GHOST_LEDGER="$GHOST_LEDGER "
-  [ "$stale" -gt 0 ] && log "ghost ledger: $stale of $((fresh + stale)) proof(s) EXPIRED (older than ${GHOST_REPROVE_AFTER_S}s) — those runs are re-read this pass and re-proven"
+  [ "$stale" -gt 0 ] && log "ghost ledger: $stale of $((fresh + stale + skewed)) proof(s) EXPIRED (older than ${GHOST_REPROVE_AFTER_S}s) — those runs are re-read this pass and re-proven"
+  # ⛔ SKEW IS NAMED SEPARATELY (review cycle 3, P2): a future-dated stamp is dropped for a DIFFERENT
+  # reason than age, and reporting it as "older than Ns" tells an operator debugging a clock the opposite
+  # of what happened.
+  [ "$skewed" -gt 0 ] && log "ghost ledger: $skewed of $((fresh + stale + skewed)) proof(s) SKEWED (stamped in the FUTURE) — those runs are re-read this pass and re-proven"
   return 0
 }
 
@@ -1240,8 +1247,13 @@ print(comp, len(inc))
   # disables the age condition entirely, so a run read seconds after creation with no jobs yet — the one
   # case the condition exists for — becomes a PERMANENT ghost. That is the fail-OPEN direction, which is a
   # stronger reason to refuse than the siblings' "could never measure".
+  # ⛔ ALL ZEROS, NOT THE LITERAL `0` (review cycle 3, P1): `00`/`000` are the same number and passed every
+  # arm above, so the knob disarmed the age condition while the comment claimed it was refused — measured
+  # with the three arms copied verbatim: floor=0 → ZERO-REFUSED, floor=00 → ACCEPTED, and `ts_is_old` then
+  # answers OLD for a 5 s old run. The test is therefore on the VALUE, not on its spelling.
   case "$GHOST_TRUST_AFTER_S" in
-    0) log "ghost ledger trust floor is ZERO ('${GHOST_TRUST_AFTER_S}') — it would disarm the age condition rather than bound it, so a run read seconds after creation (no jobs yet) would be remembered forever; FAIL-CLOSED, changing nothing"; return 2 ;;
+    *[!0]*) ;;  # has a non-zero digit → a real floor
+    *) log "ghost ledger trust floor is ZERO ('${GHOST_TRUST_AFTER_S}') — it would disarm the age condition rather than bound it, so a run read seconds after creation (no jobs yet) would be remembered forever; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   # The re-prove interval is a bound too, but its zero is the SAFE end (re-read every pass), so only its
   # shape is checked — a non-numeric value would make the `-ge` test error and trust an entry forever.

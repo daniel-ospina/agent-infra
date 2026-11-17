@@ -626,9 +626,13 @@ BLIND_STREAK_RESET_SHIPPED="$(_derive_shipped BLIND_STREAK_RESET_S)"
 # …and the two #4113 knobs, derived the same way and for the same reason.
 GHOST_TRUST_SHIPPED="$(_derive_shipped GHOST_TRUST_AFTER_S)"
 QUEUE_MAX_PAGES_SHIPPED="$(_derive_shipped QUEUE_READ_MAX_PAGES)"
+# ⛔ AND THE THIRD ONE (review cycle 3, P1 — measured, not inferred): with only the two above exported, an
+# ambient `CI_GATE_GHOST_REPROVE_AFTER_S=1` reddened 8 assertions with NO code change, including both
+# cycle-1 walk arms. A knob this suite reads has to be pinned here or the environment decides its colour.
+GHOST_REPROVE_SHIPPED="$(_derive_shipped GHOST_REPROVE_AFTER_S)"
 for _v in "$CENSUS_BACKOFF_SHIPPED" "$CENSUS_ATTEMPTS_SHIPPED" "$BLIND_DEFECT_AFTER_SHIPPED" \
           "$BLIND_DEFECT_EVERY_SHIPPED" "$BLIND_STREAK_RESET_SHIPPED" \
-          "$GHOST_TRUST_SHIPPED" "$QUEUE_MAX_PAGES_SHIPPED"; do
+          "$GHOST_TRUST_SHIPPED" "$QUEUE_MAX_PAGES_SHIPPED" "$GHOST_REPROVE_SHIPPED"; do
   [ -n "$_v" ] || { echo "❌ fixture cannot derive a #4085 default from the gate — a fixture that cannot" \
     "restate the bound must not silently test a different number" >&2; exit 3; }
 done
@@ -730,6 +734,7 @@ PYDROP
     # operand and override it afterwards.
     export CI_GATE_GHOST_TRUST_AFTER_S="$GHOST_TRUST_SHIPPED"
     export CI_GATE_QUEUE_READ_MAX_PAGES="$QUEUE_MAX_PAGES_SHIPPED"
+    export CI_GATE_GHOST_REPROVE_AFTER_S="$GHOST_REPROVE_SHIPPED"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
     # semantics, or they would all be asserting the same counter; the streak has its own section,
@@ -1616,6 +1621,11 @@ run_gate ledger-future-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="40
 KEEP_STATE=0
 assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "a future-dated proof is re-read, never trusted (it would never expire)"
 assert_contains "$OUT" "nothing is waiting for a runner" "…and, being re-proved zero-job, the verdict is still correct"
+# ⛔ SKEW IS NOT AGE, AND THE LOG MUST NOT CALL IT AGE (review cycle 3, P2): an operator debugging a clock
+# skew was told "older than 43200s", which is the opposite of what the stamp said. Both arms exist so the
+# wording is pinned in both directions.
+assert_contains "$OUT" "proof(s) SKEWED (stamped in the FUTURE)" "a future stamp is reported as SKEW, not as age"
+assert_not_contains "$OUT" "EXPIRED" "…and NOT as an expiry (the run is 99999 s in the FUTURE)"
 
 # ⛔ THE TWO NEW BOUNDS ARE SHAPE-CHECKED LIKE EVERY OTHER ONE, ZERO INCLUDED WHERE ZERO IS FAIL-OPEN.
 # The gap was real (review cycle 2, P2): neither of these `case` arms was named by any assertion, so
@@ -1625,6 +1635,12 @@ run_gate ledger-floor-zero GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH
   CI_GATE_GHOST_TRUST_AFTER_S=0 --
 assert_eq "$RC" "2" "a ZERO trust floor → exit 2 (it would disarm the age condition, which is fail-OPEN here)"
 assert_contains "$OUT" "ghost ledger trust floor is ZERO" "…naming the misconfiguration"
+# ⛔ AND EVERY SPELLING OF ZERO (review cycle 3, P1 — measured): the first cut matched the literal `0` only,
+# so `00` passed all three arms and disarmed the age condition while the comment claimed it was refused.
+run_gate ledger-floor-zeros GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:60" \
+  CI_GATE_GHOST_TRUST_AFTER_S=00 --
+assert_eq "$RC" "2" "'00' is ZERO too → exit 2 (the refusal is on the VALUE, not on its spelling)"
+assert_contains "$OUT" "ghost ledger trust floor is ZERO" "…naming it"
 run_gate ledger-floor-huge GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
   CI_GATE_GHOST_TRUST_AFTER_S=99999999999 --
 assert_eq "$RC" "2" "an OUT-OF-RANGE trust floor → exit 2"
