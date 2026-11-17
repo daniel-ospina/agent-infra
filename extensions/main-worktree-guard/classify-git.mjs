@@ -4196,6 +4196,17 @@ function _gitBuiltinProbe() {
  * sufficient only if it agrees. A census name the running git does not have is
  * NOT a builtin here → the alias definition is kept (expanded) and an
  * unresolvable verb stays opaque, i.e. both fail-closed.
+ *
+ * ⛔ NAMED RESIDUAL (review round 16, P3): the probe resolves `git` from the
+ * GUARD's environment, not the CHILD's, so the clamp is `census ∧ probe-of-the-
+ * guard's-git`. A command-local prefix that selects a DIFFERENT git (an older one
+ * that does not know a newer census name) still gets the definition DROPPED and
+ * the verb trusted — the downgrade direction is closed only for the git the guard
+ * itself would run. Every other env-derived input (`PATH`, `GIT_EXEC_PATH`,
+ * `--exec-path`) is already taken from the child (`_gitSearchDirs`), so this is
+ * the one input still read from the wrong process. It fails CLOSED in the common
+ * case (an absent census name is already non-builtin); it is named here rather
+ * than implied to be universal.
  * @param {string} name
  * @returns {boolean}
  */

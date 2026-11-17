@@ -1386,8 +1386,19 @@ dexpect("#594-R3e the SPACE form of `--config-env` keeps its argv position again
   const ok13a = r13a.stateCarveOutClean === false && r13aOpaque && r13a.stateOpCount === 2;
   console.log(`${ok13a ? "✅" : "❌"} #594-R13a an ALIAS-OPAQUE sibling leaves the #376 carve-out NOT clean (\`checkout main && merge-msg\`): carve=${JSON.stringify(r13a.stateCarveOutClean)} opaque=${r13aOpaque} ops=${r13a.stateOpCount}`);
   ok13a ? pass++ : fail++;
-  dexpect("#594-R13b …and the guard itself: an opaque \`mergetool\` (its exec path removed) does not close the carve-out",
-    `git checkout main && git --exec-path=/nonexistent-r13-594 mergetool`,
+  // ⛔ P3 (review round 16): THIS ROW NAMED `mergetool` AND WAS THEREFORE
+  // HOST-DEPENDENT — it is unresolvable here only because `git-mergetool` lives in
+  // `<git --exec-path>` and nothing puts that directory on PATH; a box that does
+  // resolves the extension, the verb stops being opaque, and the row reads as a
+  // regression. Which extensions a box ships is not the rule, so the condition is
+  // CREATED instead of assumed: the child gets a PATH and an exec path that hold
+  // NOTHING, so the name is unresolvable on every host — the same host-independence
+  // fix R4e2/R4e3 above already apply. `mergetool` stays the verb ON PURPOSE: it is
+  // still in HUB_READONLY_VERBS, so the GUARD arm (not the set edit) is what is
+  // under test, and the row reddens if `if (v.aliasOpaque === true) return false;`
+  // is deleted (measured: carve=true under that mutant).
+  dexpect("#594-R13b …and the guard itself: an UNRESOLVABLE `mergetool` does not close the carve-out (host-independent)",
+    `git checkout main && PATH=/nonexistent-r13-594 git --exec-path=/nonexistent-r13-594 mergetool`,
     { stateCarveOutClean: false });
   dexpect("#594-R13c control — the sanctioned return with a PROVABLE read-only sibling still closes it (\`checkout main && status\`)",
     `git checkout main && git status`, { stateCarveOutClean: true });
