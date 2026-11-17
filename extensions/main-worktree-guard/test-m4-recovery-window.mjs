@@ -723,6 +723,28 @@ async function partB() {
       /MARKER does NOT lift/.test(b10?.reason ?? ""), b10?.reason);
     checkD("B10d …and it names routes a blocked session can actually take",
       /human terminal/.test(b10?.reason ?? "") && /START the/.test(b10?.reason ?? ""), b10?.reason);
+    // B10e/B10g — B10c pins the SENTENCE, not the FACT it asserts. The refusal
+    // claims "the TTL escape MARKER does NOT lift this arm (M4 stays active under
+    // it, D3)" and that the env hatch is the only one; nothing measured either.
+    // If the marker ever started lifting the arm, B10b–B10d would stay green over
+    // a refusal that names a dead end the reader can escape — the very shape
+    // #3620 exists to close, so the claim is pinned in both directions: the
+    // MARKER leaves the arm intact, the session-start ENV hatch lifts it (which
+    // is what makes the marker assertion non-vacuous — a drive that can never
+    // allow could not tell the two hatches apart).
+    setMarker(true);
+    const b10e = await drive(`bash ${evilScript}`);
+    check("B10e an ACTIVE TTL MARKER does NOT lift the #1484 script arm (the claim the refusal text makes)",
+      b10e !== null, true);
+    checkD("B10f …and the marker does not change WHICH arm answers — it is the same script-content refusal",
+      /script content contains a blocked git operation \(#1484\)/.test(b10e?.reason ?? ""), b10e?.reason);
+    setMarker(false);
+    process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+    try {
+      const b10g = await drive(`bash ${evilScript}`);
+      check("B10g control: the session-start ENV hatch DOES lift the script arm, so B10e is not vacuous",
+        b10g, null);
+    } finally { delete process.env.AGENT_ALLOW_MAIN_EDITS; }
 
     // ── B12 (#3620 review, P3) — the mint refusal must state the RIGHT direction
     //
