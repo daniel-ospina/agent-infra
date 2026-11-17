@@ -817,6 +817,17 @@ ghost_ledger_load() {
     bad=0
     case "$id" in ''|*[!0-9]*) bad=1 ;; esac
     case "$stamp" in ''|*[!0-9]*) bad=1 ;; esac
+    # ⛔ A STAMP THAT CANNOT BE AN EPOCH IS NOT A DATEABLE PROOF (review cycle 4, P2 — measured). `date +%s`
+    # writes 10 digits until 2286, so 11+ digits is already a format violation; it must be REFUSED here
+    # rather than left to the arithmetic below, because bash's `$(( ))` is 64-bit and WRAPS. Measured with
+    # now=1700000000: a 20-digit stamp gave `age = now - stamp` = -7766279629752241919, i.e. NEGATIVE, so
+    # the expiry test read FALSE; and `[ "$stamp" -gt "$now" ]` ERRORS on an operand beyond intmax, so the
+    # future-stamp arm never fired either. Both tests false is "not stale" — the entry is trusted, the run
+    # is never re-read, and the cycle-2 P0 (a run that gains jobs while staying `queued`, discounted
+    # forever, certifying "nothing is waiting") re-opens through the parse instead of through the clock.
+    # The bound is the length, not the value: 10 digits fits int64 with room to spare, so no accepted row
+    # can wrap, and the `??????????`-plus-one idiom matches the knob guards above.
+    case "$stamp" in ???????????*) bad=1 ;; esac
     case "$line" in '') ;; *) bad=1 ;; esac
     if [ "$bad" = 1 ]; then
       log "ghost ledger UNREADABLE (bad line: '${id} ${stamp} ${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"

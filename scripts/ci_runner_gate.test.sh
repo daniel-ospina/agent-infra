@@ -1626,6 +1626,28 @@ assert_contains "$OUT" "nothing is waiting for a runner" "…and, being re-prove
 # wording is pinned in both directions.
 assert_contains "$OUT" "proof(s) SKEWED (stamped in the FUTURE)" "a future stamp is reported as SKEW, not as age"
 assert_not_contains "$OUT" "EXPIRED" "…and NOT as an expiry (the run is 99999 s in the FUTURE)"
+# ⛔ A STAMP TOO LONG TO BE AN EPOCH IS A FORMAT VIOLATION, AND THE PRE-FIX LOADER TRUSTED IT (review
+# cycle 4, P2 — measured). `date +%s` writes 10 digits until 2286, so 11+ digits is corrupt state; bash's
+# 64-bit `$(( ))` then WRAPS a 20-digit stamp into a NEGATIVE age, and `[ "$stamp" -gt "$now" ]` errors on
+# an operand beyond intmax — so an over-long stamp is neither "expired" nor "future", it is TRUSTED, and
+# the run behind it is never re-read again. That is the cycle-2 P0 through the parser instead of the clock.
+# The row below is exactly the shape a garbled write produces: two fields, both all-digits, undeniable to
+# every shape test the loader had.
+echo "── #4113: a proof stamp too long to be an epoch is REFUSED, not wrapped into 'fresh' ──"
+run_gate ledger-stamp-overflow GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "the control pass resolves the queue and remembers the ghost"
+printf '4001 99999999999999999999\n' > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-stamp-overflow GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" \
+  "a 20-digit stamp WRAPS the age arithmetic negative, so it must be REFUSED — the pre-fix loader trusted it and never re-read the run"
+assert_contains "$OUT" "ghost ledger UNREADABLE" "…and the row is named as the format violation it is"
+assert_not_contains "$OUT" "ghost_cached=1" "…so it is never counted as a discounted ghost"
+assert_eq "$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | grep -cE '^[0-9]{10}$' | tr -d ' ')" "1" \
+  "…and the run is re-proved and re-stamped with a DATEABLE epoch, so the refusal costs one read and no claim"
 
 # ⛔ THE TWO NEW BOUNDS ARE SHAPE-CHECKED LIKE EVERY OTHER ONE, ZERO INCLUDED WHERE ZERO IS FAIL-OPEN.
 # The gap was real (review cycle 2, P2): neither of these `case` arms was named by any assertion, so
