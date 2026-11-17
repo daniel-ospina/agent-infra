@@ -1226,6 +1226,24 @@ SPAWN_CALL_TIMEOUT_S = 120
 # lands after the row is written; `void_refused_rows()` re-reads the same durable artifact on the
 # next pass and drops such a row, so the cooldown and the class slot are not burnt for 90 minutes.
 CONFIRM_WINDOW_S = 1.0
+# ⛔ THE DISPATCHER'S PID IS NOT THE AGENT (agent-infra#4047, MEASURED). `_confirm()` used to treat a
+# live `--status` pid as "launched, running", but the process `--status` names is the BG DISPATCHER —
+# alive through preflight and uv-env, BEFORE the load gate decides. Measured on this fleet: the gate's
+# refusal lands ~35 ms after spawn on an idle box but SECONDS later at load 100+, i.e. outside
+# CONFIRM_WINDOW_S — so a spawn the gate then refused was reported `launched, running`, and the pass
+# printed `dispatched 9 of 16 queued — VERDICT=OK` over nine `rc=75`s (checked afterwards in
+# `$O/bg/*.rc`). The line that proves an AGENT started is the one lane-exec.sh / merge-one.sh write:
+# `[agent] provider=… model=…`. That is the artifact; the pid is the errand runner.
+AGENT_CONFIRM_S = 5.0
+# ⛔ AND THAT BOUND IS A CHEAPNESS BOUND, NOT A PROOF BOUND (review of #4047 at this head, P1). The
+# marker is now written LAST — immediately before the `pi` spawn, after every gate that can refuse — so
+# the pre-marker chain is LONGER than this poll: the capability gate measures "~5-25 s on a healthy box"
+# (`LANE_PREFLIGHT_BOUND` default 45 s) and `nonblocking-dispatch.sh` has already blocked for its own
+# `NB_START_SETTLE` (5 s) before this clock starts. A real launch can therefore take ~11-50 s to leave a
+# marker, and polling that long inside a pass would stall every dispatch. So the bound does NOT decide
+# anything: an absent marker after it means UNKNOWN (`_confirm` returns the `PENDING:` verdict), never
+# "no agent". Raising this number would only move the stall; the fix is that PENDING is classified as
+# neither a launch nor a delivery failure (`dispatch_pending()` below, and the caller's own arm).
 # The box measurement is one `capacity.sh probe` (a handful of forks, measured <1 s on a quiet box)
 # and it is read ONLY on a pass the box has already refused. It is bounded because the pass runs
 # under `run_bounded`, and a probe that cannot answer must be reported as unreadable, not waited on.
@@ -4023,6 +4041,53 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
     return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
 
 
+# ⛔ THE MARKER THAT PROVES A LAUNCH IS POSITIONAL, SO IT HAS ONE NAME. Both seams write it
+# immediately before `pi` is exec'd (`spawn-gate.sh::run_agent`, `merge-one.sh`): after it, nothing in
+# those functions can still refuse. Keep this string identical to theirs.
+AGENT_LAUNCH_MARKER = "[agent] provider="
+
+
+def _agent_started(name: str) -> bool:
+    """True only when the worker's OWN log carries the agent-start line (agent-infra#4047).
+
+    ⛔ THE LINE MEANS "AN AGENT IS BEING STARTED", AND THAT IS A PROPERTY OF WHERE IT IS WRITTEN, not of
+    its text (review P1, MEASURED). This function is only as honest as the emitter: `spawn-gate.sh`'s
+    `run_agent` used to write it ABOVE the capability/harness-skew gate, so on the one gate that is slow
+    by DESIGN (a single bounded probe, 5-25 s measured on a healthy box) the 71/83 refusal always landed
+    outside `CONFIRM_WINDOW_S` (1.0 s) with the marker already in the log — and every capability refusal
+    was confirmed `launched, agent started` and recorded. It is now emitted immediately before the `pi`
+    spawn, after every gate that can still refuse, and `spawn-gate.test.sh` pins that ordering in both
+    directions (a refusal writes no marker; a real launch does). `lane-exec.sh` and `merge-one.sh` write
+    theirs at their own launch points, where nothing after them can refuse. That line is the launch
+    artifact; a live dispatcher pid is not.
+
+    ⛔ THE MARKER IS WRITTEN LAST, NOT EARLY (review of #4047 at this head, P1 — this docstring used to
+    justify the read with "the line is written early", which stopped being true the moment the previous
+    commit moved it below the refusing gates). So this function's `False` means "not visible YET", and it
+    is READ AS SUCH: `_confirm` turns it into the `PENDING:` verdict, which is neither a launch nor a
+    delivery failure, and `dispatch_pending()` keeps it out of the `undeliverable` count. A `False` here
+    is never evidence that no agent started.
+
+    BOUNDED (AGENT_CONFIRM_S) and CHEAP: only the first 64 KiB is read and the poll sleeps 100 ms — the
+    bound is how long the PASS may wait, not how long a launch may take. A worker whose log cannot be
+    read returns False -- an unreadable artifact is never evidence of a launch.
+    """
+    try:
+        log_path = bg_path(name, "log")
+    except Exception:
+        return False
+    deadline = time.monotonic() + AGENT_CONFIRM_S
+    while time.monotonic() < deadline:
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                if AGENT_LAUNCH_MARKER in f.read(65536):
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def _confirm(name: str) -> tuple[str, str]:
     """('launched' | 'refused' | 'unconfirmed', detail) for a just-spawned worker -- BOUNDED.
 
@@ -4056,7 +4121,19 @@ def _confirm(name: str) -> tuple[str, str]:
     if gate_refused(name, code):
         return "refused", "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
     if st == "running":
-        return "launched", "launched, running"
+        # ⛔ A LIVE PID IS PROOF THE DISPATCHER IS ALIVE, NOT THAT AN AGENT STARTED (agent-infra#4047).
+        # Poll for the agent-start line the worker writes only once the gates have let the agent
+        # through; if it never appears and no exit status landed, this is NOT a launch and must not
+        # be counted as one. Returning `unconfirmed` costs a re-check next pass (liveness is read
+        # before every spawn), while returning `launched` corrupts the only number an operator reads.
+        if _agent_started(name):
+            return "launched", "launched, agent started"
+        code = read_rc(rc_file)
+        if gate_refused(name, code):
+            return "refused", "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
+        return "unconfirmed", ("PENDING: the dispatcher pid is alive and no launch marker has appeared "
+                              "yet (the capability gate alone can take 5-25 s on a healthy box) and no "
+                              "exit status was recorded -- NOT a launch and NOT a refusal")
     if code is not None:
         return "launched", "worker exited rc=%d" % code
     if st in ("done", "failed"):
@@ -4064,6 +4141,28 @@ def _confirm(name: str) -> tuple[str, str]:
     if st == "lost":
         return "unconfirmed", "the worker recorded no exit status and no live pid"
     return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
+
+
+def dispatch_pending(detail: str) -> bool:
+    """True when the spawn's state is NOT YET KNOWN — the third outcome, beside launch and refusal.
+
+    ⛔ A SLOW GATE IS NOT A FAILURE TO DELIVER (review of #4047 at this head, P1 — MEASURED against the
+    chain this same change installs). `_confirm()` cannot see a launch marker until the worker reaches
+    the spawn, and the pre-marker gates are longer than any poll a pass can afford: the capability gate
+    is "~5-25 s measured on a healthy box" with `LANE_PREFLIGHT_BOUND` defaulting to 45 s, and the
+    dispatcher has already spent `NB_START_SETTLE` (5 s) before pr-doctor's clock starts. Fed into the
+    ordinary `not ok` accounting, that shape became `undeliverable += 1` → `EXIT 3 /
+    VERDICT=UNDELIVERED / next=repair-chain` — "a human must repair the dispatch chain, this does NOT
+    clear by waiting" — over N agents that were at that moment ALIVE and about to deliver. That is the
+    same mislabelling the pre-change `launched, running` produced from the other direction, and the fix
+    is not a longer poll (it would stall every dispatch) but this third class: nothing was refused,
+    nothing is counted as delivered, and liveness is re-read next pass, where a live worker is
+    `worker-running` (nothing to do) and a refusal has landed its `.rc`.
+
+    The verdict is read from the TEXT because `dispatch()`'s 3-tuple is a contract the whole suite stubs
+    against (the same reason `gate_refusal_axis` does). `_confirm()` is the only producer of `PENDING:`.
+    """
+    return (detail or "").startswith("PENDING:")
 
 
 def gate_refusal_code(detail: str) -> int:
@@ -6292,6 +6391,22 @@ def run_pass(args, rubric_note: str = "") -> int:
             continue
         ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
+            # ⛔ PENDING IS NEITHER A LAUNCH NOR A DELIVERY FAILURE (review of #4047 at this head, P1).
+            # It is separated FIRST, before every other arm, for the reason the rubric arm below is: the
+            # remedy is neither "wait for the box" nor "repair the chain" — it is "re-read liveness next
+            # pass", which is exactly what happens by itself. Counting it as `undeliverable` produced
+            # `EXIT 3 / VERDICT=UNDELIVERED / next=repair-chain` over N live agents on any box whose
+            # pre-launch gates exceed the poll (the capability gate alone is 5-25 s). ⛔ AND IT HOLDS NO
+            # CLASS SLOT: nothing was consumed and no state row exists, so the row is re-judged in full
+            # next pass, where it is either a live worker (`worker-running`, nothing to do) or a landed
+            # refusal with its own axis.
+            if dispatch_pending(detail):
+                stalled["spawn-pending"] = stalled.get("spawn-pending", 0) + 1
+                log("#%s (%s): spawn %s -- the pass is NOT told whether an agent started. This is a "
+                    "third outcome, not a failure: re-read next pass (a live worker is nothing to do, "
+                    "and a refusal has landed its exit status by then)."
+                    % (key, action, detail[:200]))
+                continue
             # ⛔ THE RUBRIC IS A THIRD KIND OF REFUSAL AND IT IS NOT THE TRANSPORT (#4009). It is
             # separated FIRST, before the gate axis and before the record arm, because it is
             # neither: nothing was consumed (so no cooldown), no box bound was hit (so no NO-CAPACITY
