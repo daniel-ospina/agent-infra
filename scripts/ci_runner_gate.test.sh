@@ -1497,8 +1497,14 @@ KEEP_STATE=0
 assert_contains "$OUT" "ghost ledger UNREADABLE" "a malformed ledger is NAMED, not silently ignored"
 assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and its run is READ, never discounted on an entry that did not parse"
 assert_eq "$(awk '{print $1}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null)" "4001" "…and the file is rewritten to the proofs that DID parse, stamped with the moment they were proved"
+# ⛔ THE MESSAGE MUST NOT CARRY BARE BACKTICKS (measured). It used to read "…exactly <run id> <epoch> …"
+# with those two placeholders wrapped in BACKTICKS, which bash expands as a COMMAND SUBSTITUTION before
+# `assert_eq` ever runs: the expansion is a syntax error (`<run id>` is not a command), bash prints
+# `syntax error near unexpected token '<'` and SKIPS THE WHOLE COMMAND — the assertion never executes
+# and never prints its ✅, so this arm's only "one row is exactly <id> <epoch>" check has been a
+# no-op since it was written. Escaped, it runs (measured: 699 green before, 700 green after).
 assert_eq "$(awk 'NF != 2' "$STATE_DIR/ci-runner-gate.ghosts" | grep -c . | tr -d ' ')" "0" \
-  "…every row carries exactly `<run id> <epoch>` (a row with no stamp is a proof nobody dated)"
+  "…every row carries exactly \`<run id> <epoch>\` (a row with no stamp is a proof nobody dated)"
 
 # ⛔ ONE PAGE IS NOT THE QUEUE (see the block above): the runs endpoint is newest-first, so a head that is
 # older than the newest QUEUE_PAGE runs is INVISIBLE to a single-page walk — measured on the live repo,
