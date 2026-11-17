@@ -2739,6 +2739,14 @@ BLIND_ROWS="${GW_FIXTURE#*|}4100:120"
 run_gate demandblind-engage GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
   "(d1a) the MEASURING pass engages the pool and records mode=local"
+# ⛔ THE DISENGAGE STREAK IS SEEDED HERE AND PINNED BELOW, because the assertion it replaces could not
+# detect the property it named (review P3, measured): `assert_not_contains "$OUT" "hysteresis"` — the
+# word is only logged in the RELEASE branch (:2054/:2057), which a demand-blind pass never reaches (it
+# exits at the rc 3 block, before `healthy=1`), so a mutant that merely INCREMENTED the streak here
+# would still pass. A blind pass must not count toward DISENGAGE_TICKS — three blind passes must not
+# release a pool nobody measured — so the file itself is the invariant, seeded at 2 (one short of the
+# shipped 3) and asserted untouched.
+printf '%s' '2' > "$STATE_DIR/ci-runner-gate.disengage-streak"
 KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
   GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
 assert_eq "$RC" "2" "(d1) a demand-blind pass is still could-not-measure → exit 2 (never 0)"
@@ -2755,7 +2763,9 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
   "(d1) a repair does NOT advance the state file — no transition was taken"
 assert_not_contains "$OUT" "TRANSITION" "(d1) …and notifies no transition"
 assert_not_contains "$OUT" "hysteresis" \
-  "(d1) a blind pass does not count toward DISENGAGE_TICKS (3 blind passes must not release a pool)"
+  "(d1) the blind pass does not FALL THROUGH to a normal hysteresis decision (it exits at rc 3 before that branch)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.disengage-streak" 2>/dev/null)" "2" \
+  "(d1) a blind pass does not count toward DISENGAGE_TICKS (seeded 2, still 2 — 3 blind passes must not release a pool)"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
   "(d1) the verdict file does not keep the previous pass's answer"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "DEMAND was not measured" \
@@ -2816,6 +2826,13 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
 assert_not_contains "$OUT" "queue/component/incident leg" \
   "(d3) the raw depth is NOT read as demand — the queue legs are disarmed, not guessed"
 assert_not_contains "$OUT" "GitHub-hosted UNHEALTHY" "(d3) …so no engagement decision is taken"
+# ⛔ THE SCAN-TIME LINE MAY NOT ANNOUNCE THE REPAIR'S OUTCOME (review P1, measured). `queue: … and the pool
+# is converged to the mode the state file records` was written ~900 lines BEFORE the state file is read and
+# before any PUT, so it claimed a convergence on the one arm that proves nothing was converged: this arm
+# asserts `assert_absent …/ci-runner-gate.state` and no `-X PUT` above. The repair step's own lines are the
+# only place that outcome may appear, and here it says the repair was SKIPPED.
+assert_not_contains "$OUT" "and the pool is converged to the mode the state file records" \
+  "(d3) the scan-time log does NOT announce a convergence before the state file is read"
 
 # (d4) RECORDED local + pool ALREADY local → nothing to converge, and no PUT storm.
 KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
@@ -2854,6 +2871,16 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=u
   "(d6) …and still carries the full key set a strict parser expects"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
   "(d6) a failed repair does not advance the state file"
+# ⛔ A FAILED REPAIR IS NOT ALWAYS A NO-OP, AND THE LINE MAY NOT SAY IT IS (review P2, measured): this arm
+# fails ONE runner's PUT while the other lands (`set_labels ok=1 fail=1`, `accepted=1`), so the pool IS
+# partially relabelled. "the labels are UNCHANGED" sent an operator past that — and the next blind pass then
+# reads `mode=local == recorded` and logs `nothing to converge`, freezing the partial repair unnamed.
+assert_contains "$OUT" "set_labels did NOT complete" \
+  "(d6) the failure NAMES the write that did not complete instead of claiming the labels are unchanged"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "may be PARTIALLY changed" \
+  "(d6) …and the verdict says a partial relabel is possible"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UNCHANGED" \
+  "(d6) …and does NOT assert the labels are unchanged on a partial write"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"

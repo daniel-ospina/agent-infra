@@ -1045,8 +1045,16 @@ print(comp, len(inc))
         # ⛔ THE TWO THINGS AN OPERATOR CAN DO ARE STILL NAMED, because the demand question itself is
         # unchanged by this fix: the bound, and a hand pass. A bound at or above ${QUEUE_PAGE} cannot
         # reach past the one page this read carries — that is a code change, not a knob.
+        # ⛔ THIS LINE PREDICTS NO OUTCOME — IT IS WRITTEN BEFORE THE STATE FILE IS READ (review P1,
+        # measured). It used to end "…and the pool is converged to the mode the state file records",
+        # the SAME sentence the verdict no longer carries: here the state file has not been read yet
+        # (`recorded="$(cat "$STATE_FILE"…)"` is ~900 lines below) and no repair has been attempted,
+        # so on the no-recorded-mode arm (no state file exists at all, no PUT is sent), on the
+        # repair-FAILED arm and on every rc 2 exit the scan can still reach, the durable LOG asserted a
+        # convergence that never happened. The repair step below logs what it actually did; this line
+        # names the disposition and the two operator levers, and nothing else.
         DEMAND_BLIND=1
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status, so the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — DEMAND UNMEASURED for this pass: the legs that need it are DISARMED (this pass takes NO new mode decision and does NOT read the refusal as 'no demand'), and the pool is converged to the mode the state file records; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status, so the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — DEMAND UNMEASURED for this pass: the legs that need it are DISARMED (this pass takes NO new mode decision and does NOT read the refusal as 'no demand'); the pass continues to the census so a mode an EARLIER pass recorded can still be repaired, and the repair step logs what it actually did — THIS line predicts no outcome; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
@@ -1956,8 +1964,16 @@ if [ "$healthy" = 3 ]; then
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
-    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode=$mode) — the labels are unchanged; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
-    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — the labels are UNCHANGED and the pool still advertises mode=$mode"
+    # ⛔ "THE LABELS ARE UNCHANGED" WAS FALSE ON THE SHAPE THIS ARM MOST OFTEN SEES (review P2,
+    # measured). `set_labels` fails a repair when ANY runner's PUT fails, and the suite's own d6 arm is
+    # a PARTIAL write (`GH_PUT_FAIL_ID` fails one runner while the other lands → `set_labels ok=1
+    # fail=1`, `accepted=1`): one managed runner IS relabelled. A second reachable shape is the
+    # arm-capped engage (`CI_GATE_FALLBACK_ARM_MAX`) which can refuse after the earlier ids were armed.
+    # So the durable line may not say the labels are unchanged, and it may not say the pool still
+    # advertises `$mode` either — the pass measured `$mode` BEFORE the write. It names what it knows:
+    # the write did not complete, and the recorded mode is NOT confirmed.
+    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (its ok=/fail= line above is the count), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
+    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see its ok=/fail= line in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
     log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land (leaving mode=$mode)"
