@@ -1613,6 +1613,20 @@ run_gate ledger-jobs-sum GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:17
   GH_JOBS_BODY='{"total_count":2,"jobs":[{"status":"in_progress","labels":[]},{"status":"in_progress","labels":[]}]};{"total_count":0,"jobs":[]}' --
 assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
   "2 jobs on page 1 + an EMPTY page 2 is 2 jobs, NOT a zero-job ghost (overwrite would mint one)"
+# ⛔ AND THE SUM MUST HAVE BEEN *READ* — THE COUNT ABOVE IS SATISFIED IDENTICALLY BY A FAILED READ
+# (review cycle 10, P1 — measured). The empty ledger is reached by two different worlds: (a) the pages
+# were summed to 2, 2 != 0, so nothing was remembered and the pass logs the all-ghosts VERDICT; and
+# (b) the read FAILED, so the caller refuses with "jobs read FAILED … STAYS the queue head" and still
+# persists an empty ledger (`ghost_ledger_write` writes the file even when empty, by design). This arm
+# can only tell summing from overwriting because the double splits `GH_JOBS_BODY` into page documents,
+# and nothing above pins that mechanism: delete the `;`-split loop and keep the status propagation, and
+# one `jq` call over the whole body prints `#jobs\t2` and then raises (rc 5) — `run_queued_demand`
+# returns 1 BEFORE parsing that row (`ci_runner_gate.sh:738`), so the ledger is empty for reason (b) and
+# the count assertion PASSES while the `jobs-overwrite` mutant it exists to kill silently survives.
+# Measured before this assert: the deleted-page-loop mutant and the shipped code were BOTH green (698).
+# The discriminator is the VERDICT, exactly as `ledger-null-jobs` above pins it one arm earlier.
+assert_contains "$OUT" "nothing is waiting for a runner" \
+  "…and the read SUCCEEDED: a summed 2-job reading certifies the queue empty (a FAILED read refuses instead — an empty ledger cannot pin the sum on its own)"
 
 # ⛔ AND THE PROPAGATION ITSELF NEEDS AN ARM THAT CAN SEE IT — the arms above cannot (measured, P1
 # follow-up on review cycle 8's fix). `ledger-null-jobs`'s new fact bites on the null-guard MUTANT (a
