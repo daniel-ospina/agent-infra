@@ -4346,6 +4346,106 @@ fi
 reset
 # ══ end §BS ══
 
+# ── §BT THE MIRROR MIRRORS ALL THREE ARMS, NOT ONE (agent-infra#3987, P3 at a8767f401) ─────────────
+# ⛔ WHY THIS SECTION EXISTS. §BL proves the seam mirrors record-review.sh's arm (1) — the Step-8
+# stalled/capped marker. The recorder scans its evidence body with TWO MORE arms that this seam would
+# still publish into: the `[ADVERSARIAL-BOUND]` trigger (`:2091`), whose arm (iii) REFUSES a marker line
+# with no `residuals=` field; and the `Outcome:` declaration arms (1a `:2216`, 1c `:1618`). A mutation
+# row that merely NAMES the disclosure token, or that quotes a blocking `Outcome:` declaration, is
+# lexically the thing those arms refuse — so the artifact was published and the RECORD step then
+# refused it, after the review was paid for. That is the same #1964 false-diagnosis shape §BL closes for
+# one arm and left open for the other two.
+echo; echo "§BT the pre-post mirror covers ALL of the recorder's body-scanning arms"
+
+# (1) THE DISCLOSURE TOKEN NAMED WITHOUT ITS MANDATORY FIELD IS REFUSED PRE-POST.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` — the bounded scan stops at the declared threat surface | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\nThe lane writes that marker [ADVERSARIAL-BOUND] into its report when it caps.\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a row that NAMES [ADVERSARIAL-BOUND] with no 'residuals=' field refuses PRE-POST (rc=$(rc_of), want 11) — the recorder's arm (iii) would refuse it AFTER it was published"
+err_has "no 'residuals=' field"; ck $? "  …naming the missing field, so the operator is not sent to read the recorder"
+no_record; ck $? "  …nothing recorded"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in *ADVERSARIAL-BOUND*) rc=1;; *) rc=0;; esac
+ck $rc "  …and NOTHING was posted: the artifact record-review.sh would reject is not on the PR"
+
+# (2) ARM (1a)/(1c): THE `Outcome:` DECLARATIONS. ⛔ DRIVEN AS A UNIT, DELIBERATELY. Any end-to-end
+# fixture carrying a blocking declaration of the shape the recorder reads also carries a COUNT of
+# "blocking findings", which the seam's OWN prose findings-scanner sees several hundred lines upstream —
+# the verdict flips to `issues` (rc=7) and the pre-post scan never runs, so the end-to-end arm would
+# measure the WRONG GATE. `recorder_veto2_hit` is the exact function the seam calls, extracted from the
+# script under test, so this asserts the mirror's decision and (3) below asserts the wiring is
+# load-bearing. On the pre-fix script the function does not exist, so the extraction fails here.
+V2="$TMP/veto2-unit.sh"
+{
+  grep -E '^_RECORDER_(OC_NBSP|OC_DECL_RE|VETO2_(NONCLEAN|BLOCKING|FIXED)_RE|AB_TOKEN_RE|AB_FIELD_RE)=' "$SRC"
+  sed -n '/^recorder_veto2_hit() {/,/^}$/p' "$SRC"
+} > "$V2" 2>/dev/null
+grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; ck $? "the mirror is a callable unit in the script under test (on the pre-fix script there is none)"
+if grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; then
+  # shellcheck disable=SC1090
+  . "$V2"
+  v2hit() { printf '%s\n' "$1" > "$TMP/v2case.txt"; recorder_veto2_hit "$TMP/v2case.txt"; }
+  [ -n "$(v2hit '**Outcome: 2 blocking findings remain open.**')" ]; ck $? "arm (1c): a blocking-noun Outcome: declaration is REFUSED"
+  [ -n "$(v2hit '**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**')" ]; ck $? "arm (1c): a live P1 count is REFUSED too (the severity spelling, measured ADMITTED before #3902's fix)"
+  [ -n "$(v2hit '**Outcome: not-clean**')" ]; ck $? "arm (1a): a non-clean Outcome: declaration is REFUSED"
+  [ -z "$(v2hit '**Outcome: clean**')" ]; ck $? "NO FALSE BLOCK: the artifact's own '**Outcome: clean**' passes — the mirror cannot refuse every review"
+  [ -z "$(v2hit '**Outcome: CLEAN — 2 blocking findings were fixed**')" ]; ck $? "NO FALSE BLOCK: the recorder's ESCAPE — a count followed by 'fixed' is admitted — is carried by the mirror"
+  # ⛔ THIS ONE IS AN AGREEMENT TEST, NOT A BARE "REFUSE": prose carrying an `outcome:` label is read as a
+  # declaration BY THE RECORDER (its anchor is `(^|[^[:alnum:]])outcome`, which `an outcome:` satisfies),
+  # so the mirror refusing it is faithful rather than a widening. Asserting the two AGREE is the property
+  # — a bare `-n` would also pass if the mirror refused everything.
+  _v2_prose='the review discussed an outcome: it was blocking, 2 P1 remain open'
+  printf '%s' "$_v2_prose" | grep -qiE "$_RECORDER_OC_DECL_RE"; _v2_rec=$?
+  { [ -n "$(v2hit "$_v2_prose")" ] && [ "$_v2_rec" -eq 0 ]; }; ck $? "the mirror AGREES with the recorder's own anchor on prose carrying an 'outcome:' label (recorder matches: $([ "$_v2_rec" -eq 0 ] && echo yes || echo no)) — not a widening"
+  unset -f v2hit
+fi
+reset
+
+# (3) ⛔ THE OTHER DIRECTION: THE MIRROR MUST NOT FALSE-BLOCK. Three artifacts the recorder ACCEPTS
+# must still record. A false refusal here costs a paid review, which is the direction this file
+# protects against everywhere else — so the escape and the well-formed disclosure are PINNED, not
+# assumed.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` — the bounded scan stops at the declared threat surface | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\n[ADVERSARIAL-BOUND] cycles=2 threats=3 covered=3 residuals=none\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a WELL-FORMED disclosure (with 'residuals=') still RECORDS (rc=$(rc_of)) — a legitimate capped review is not refused by the new mirror"
+
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` — the guard reads the declaration literally | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\n**Outcome: CLEAN — 2 blocking findings were fixed, 0 remain.**\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and the recorder's ESCAPE still records: a count followed by 'fixed' is admitted, so mirroring arm (1c) does not over-block it (rc=$(rc_of))"
+
+# (4) NON-VACUITY: the arms above are the MIRROR's doing, not something else refusing first.
+BT="$TMP/mutant-no-veto2-scan.sh"
+cp "$SRC" "$BT"; chmod +x "$BT"
+sed 's|^  _vt2_line=.*|  _vt2_line=""|' "$SRC" > "$BT"
+if cmp -s "$SRC" "$BT"; then
+  fail "the veto2-scan mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` — the bounded scan stops at the declared threat surface | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\nThe lane writes that marker [ADVERSARIAL-BOUND] into its report when it caps.\n\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$BT" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT without the mirror POSTS it (rc=$(rc_of)) - so the pre-post scan is what refuses it, not an earlier gate"
+  grep -qiE '\[ADVERSARIAL-BOUND\]' "$TMP/comment.md" 2>/dev/null; ck $? "  …the disclosure token reaches the published evidence body, where the recorder's arm (iii) would refuse it"
+fi
+reset
+
+# (5) THE MIRROR CANNOT DRIFT SILENTLY. There is no way to import a regexp from another script, so the
+# copy is pinned: the seam's `Outcome:` recogniser must be the recorder's OWN regex after variable
+# expansion (the strongest form of the §BL(3) tripwire), and the two literals the other arm reads must
+# still be present in the recorder.
+REC_OCL="$(grep -E '^OC_DECL_RE="' "$ROOT/scripts/record-review.sh" 2>/dev/null | head -1)"
+REC_OC_PAT="$(OC_NBSP=$'\xc2\xa0'; eval "$REC_OCL"; printf '%s' "${OC_DECL_RE:-}")"
+SEAM_OCL="$(grep -E '^_RECORDER_OC_DECL_RE="' "$SRC" 2>/dev/null | head -1)"
+# ⛔ THE SEAM'S REGEX REFERENCES ITS OWN NBSP VARIABLE, so it must be defined before the eval or
+# `set -u` aborts the comparison and the tripwire silently reports a DIFFER from an unset variable.
+_RECORDER_OC_NBSP=$'\xc2\xa0'
+SEAM_OC_PAT="$(eval "$SEAM_OCL"; printf '%s' "${_RECORDER_OC_DECL_RE:-}")"
+[ -n "$REC_OC_PAT" ]; ck $? "the recorder's OC_DECL_RE is still extractable from record-review.sh (the mirror's source of truth)"
+[ -n "$SEAM_OC_PAT" ] && [ "$SEAM_OC_PAT" = "$REC_OC_PAT" ]; ck $? "…and the seam's expanded copy is IDENTICAL to it (seam='$SEAM_OC_PAT')"
+grep -qF '\[ADVERSARIAL-BOUND\]' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…the adversarial-bound token the mirror refuses is still one the recorder triggers on"
+grep -qF 'residuals=[[:space:]]*' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…and 'residuals=' is still the field its arm (iii) demands (the recorder still extracts `residuals=[[:space:]]*…`), so the mirror's refusal condition still matches"
+# ══ end §BT ══
+
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

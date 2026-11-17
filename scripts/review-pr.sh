@@ -815,8 +815,11 @@ actually read.
 \`diff-tail:\` line, then this section, then your verdict line — the section is the LAST thing
 before the verdict line, and \`diff-tail:\` goes BEFORE it, not between it and the verdict.
 The contract below is the recorder's OWN text, printed by
-\`brief-gate.sh --mutation-section\` — it is not a paraphrase, so do not paraphrase its heading,
-its column names, or the exemption line:
+\`brief-gate.sh --mutation-section\` — the parser it feeds reads those labels literally, so keep them
+EXACT: do not re-word its heading, its column names, or the \`NO NEW ASSERTIONS:\` label. ⛔ THAT IS A
+RULE ABOUT LABELS ONLY — the row PAYLOAD is always YOURS. Never reproduce its worked example row or
+its example reason; write your own rows about THIS diff, or type your own reason naming the files you
+actually read (see the two refusals above):
 
 $MUTATION_SECTION
 
@@ -3003,6 +3006,69 @@ mutation_pasteback_exempt() { # <section-text> -> the reviewer's LIVE exemption 
 # drift is the only acceptable second copy.
 RECORDER_VETO_RE='auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[NO-LOOP-BUDGET\]'
 
+# ── 5a4b) THE RECORDER'S TWO OTHER BODY-SCANNING ARMS, MIRRORED PRE-POST ─────────────────────────
+# ⛔ THE 5a4 MIRROR COPIES ONE ARM AND THE RECORDER SCANS WITH THREE (P3, fresh review at a8767f401).
+# `record-review.sh` also triggers on, and can then REFUSE, two shapes this seam would still publish:
+#
+#   (a) `[ADVERSARIAL-BOUND]` — `record-review.sh:2091` fires on the token ALONE and then demands a
+#       parseable disclosure; its arm (iii) REFUSES a marker line carrying no `residuals=` field. A
+#       reviewer's mutation row that merely NAMES the token (very natural: a row about a disclosure
+#       guard) is then refused AFTER the review was paid for and AFTER the artifact was posted.
+#   (b) an `Outcome:` declaration that is non-clean, or that names blocking findings. `record-review.sh`
+#       reads these with `OC_DECL_RE` (`:1069`) in arm (1a) (`:2216`) and arm (1c) (`:1618`). A row
+#       quoting such a declaration is lexically identical to a declaration — the recorder's own F5
+#       residual says so — so IT refuses, and the seam's job is to refuse PRE-POST instead.
+#
+# ⛔ WHY THIS IS A SECOND MIRROR AND NOT A WIDENING OF `RECORDER_VETO_RE`. That variable is pinned
+# BYTE-IDENTICAL to the recorder's arm-(1) regex by a tripwire in tests/review-pr/run.sh, which is what
+# makes the copy unfalsifiable. Widening it would either break that pin or force the tripwire to compare
+# a substring — trading a live drift check for one saved variable. Each arm keeps its own copy, and each
+# copy gets its own pin.
+#
+# ⛔ THE MIRROR MUST NOT FALSE-BLOCK, and that is why it is not the naive `outcome.*blocking`. The
+# recorder's arm (1c) evaluates ESCAPE (a): a count that is zeroed or negated, and a count followed by
+# `fixed`/`resolved`/`closed`/`addressed`, is ADMITTED (`Outcome: CLEAN — 2 blocking findings were
+# fixed` records). A mirror blind to that escape would refuse an artifact the recorder ACCEPTS — the
+# over-block direction this file protects against everywhere else, and here it costs a paid review.
+# `_RECORDER_VETO2_FIXED_RE` carries the escape. The residue that remains is stated, not hidden: a
+# declaration naming a LIVE count in wording this escape does not recognise is refused pre-post where
+# the recorder might have parsed it as zeroed — the safe polarity, and it costs a re-worded re-run
+# rather than a false `clean`.
+#
+# ⛔ AND IT CANNOT FIRE ON A WELL-FORMED ARTIFACT. A CLEAN artifact's own outcome line is the seam's
+# `**Outcome: clean**` (no blocking noun, no P0/P1 tag), and a legitimate capped review discloses
+# `[ADVERSARIAL-BOUND] cycles=N threats=K covered=K residuals=…` WITH the `residuals=` field. Both pass.
+# Only a collision in the reviewer's own verbatim text is caught, which is the whole point.
+_RECORDER_OC_NBSP=$'\xc2\xa0'                                                    # record-review.sh's OCR_NBSP
+_RECORDER_OC_DECL_RE="(^|[^[:alnum:]])outcome[[:space:]${_RECORDER_OC_NBSP}]*[*_[:space:]${_RECORDER_OC_NBSP}]*([:]|[：])" # = record-review.sh's OC_DECL_RE, byte-for-byte
+_RECORDER_VETO2_NONCLEAN_RE='(not|non|no)[[:space:]_-]*clean'                        # arm (1a)
+_RECORDER_VETO2_BLOCKING_RE='block(ing|ers?)|[pP][01]([^0-9]|$)'                     # arm (1c), noun or severity
+_RECORDER_VETO2_FIXED_RE='(were|was|been|already|is|are)?[[:space:]]*(fixed|resolved|closed|addressed)'
+_RECORDER_AB_TOKEN_RE='\[ADVERSARIAL-BOUND\]'                                       # record-review.sh:2091
+_RECORDER_AB_FIELD_RE='residuals='                                                    # arm (iii)'s mandatory field (record-review.sh extracts `residuals=[[:space:]]*…`)
+
+# recorder_veto2_hit <file> -> the colliding LINE on stdout (empty = nothing the recorder refuses)
+recorder_veto2_hit() { # <file>
+  local _f="${1:-}" _l
+  [ -n "$_f" ] && [ -f "$_f" ] || return 0
+  # (b) an `Outcome:` DECLARATION that is non-clean or names blocking findings. Anchored on the
+  # declaration label the way the recorder anchors it, so prose ABOUT an outcome stays untouched.
+  while IFS= read -r _l; do
+    grep -qiE "$_RECORDER_OC_DECL_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_VETO2_NONCLEAN_RE" <<<"$_l" && { printf '%s\n' "$_l"; return 0; }
+    grep -qiE "$_RECORDER_VETO2_BLOCKING_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_VETO2_FIXED_RE" <<<"$_l" && continue
+    printf '%s\n' "$_l"; return 0
+  done < "$_f"
+  # (a) the adversarial-bound token with NO `residuals=` field — arm (iii)'s unconditional refusal.
+  while IFS= read -r _l; do
+    grep -qiE "$_RECORDER_AB_TOKEN_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_AB_FIELD_RE" <<<"$_l" && continue
+    printf '%s\n' "$_l"; return 0
+  done < "$_f"
+  return 0
+}
+
 # ── 5b) clean => CONFIRM THE HEAD HAS NOT MOVED, **BEFORE** ANY ARTIFACT EXISTS ──
 # ⛔ THIS RUNS BEFORE THE COMMENT (P2, seventh fresh review). It used to run after the
 # `Outcome: clean` comment was posted, so on a moved head the PR was left carrying an
@@ -3349,6 +3415,20 @@ if [ "$VERDICT" = clean ]; then
     err "  The phrase is inside the reviewer's OWN text — the MUTATION ATTRIBUTION section is published verbatim, and a mutation row legitimately uses words like 'unresolved issues' or 'N issues remain'. This is a WORDING COLLISION, not a code defect and not a finding: the recorder's arm is right to be unconditional (that is what stops a lane minting `clean` off its own aborted Step-8 comment), and this run may not weaken it or re-word the reviewer's claim."
     err "  Nothing is posted and NOTHING was recorded. Re-run the review; if the same phrase comes back, the reviewer has to state the row without it."
     die "$E_VACUOUS" "the CLEAN artifact carries the recorder's unconditional veto phrase '$_vt_hit' in the reviewer's own text — record-review.sh would refuse it, so it was never posted"
+  fi
+  # ⛔ THE RECORDER'S TWO REMAINING BODY-SCANNING ARMS (P3, fresh review at a8767f401 — see 5a4b for
+  # the whole rationale and for the escape this mirror carries). The 5a4 scan above copies ONE arm; a
+  # reviewer row that merely NAMES `[ADVERSARIAL-BOUND]`, or that quotes an `Outcome:` declaration
+  # naming blocking findings, is refused by the recorder AFTER the money is spent and AFTER the
+  # artifact is published — which is the exact failure 5a4 exists to move in front of the post.
+  _vt2_line=""
+  _vt2_line="$(recorder_veto2_hit "$MV_BODY" 2>/dev/null | head -1)" || true
+  if [ -n "$_vt2_line" ]; then
+    err "$PROG: the CLEAN artifact carries a shape record-review.sh's OTHER body-scanning arms refuse — one of (i) an [ADVERSARIAL-BOUND] marker line with no 'residuals=' field, or (ii) an 'Outcome:' declaration that is non-clean or names blocking findings:"
+    err "    $(printf '%s' "$_vt2_line" | cut -c1-220)"
+    err "  It is inside the reviewer's OWN text — the MUTATION ATTRIBUTION section is published verbatim, so a row that NAMES the disclosure token, or quotes a blocking Outcome: declaration, is lexically the thing those arms refuse. This is a WORDING COLLISION, not a code defect: the recorder is right to read a declaration literally, and this run may not weaken it or re-word the reviewer's claim."
+    err "  Nothing is posted and NOTHING was recorded. Re-run the review; if the same wording comes back, the row has to describe the shape without reproducing it."
+    die "$E_VACUOUS" "the CLEAN artifact carries a shape record-review.sh's adversarial-bound or Outcome: arm would refuse — record-review.sh would refuse it, so it was never posted"
   fi
 fi
 
