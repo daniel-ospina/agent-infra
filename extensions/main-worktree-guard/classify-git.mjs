@@ -8786,22 +8786,6 @@ function _collectSubstSpans(src) {
 const BRANCH_STATE_VERBS = new Set(["branch", "checkout", "switch", "symbolic-ref", "update-ref"]);
 
 /**
- * #607: is this invocation a BRANCH-STATE MUTATION? Argument-aware, because the
- * verb alone is not the effect (measured on git 2.50.1):
- *   `git symbolic-ref --short HEAD`        -> PRINTS the branch, rc 0 (a READ —
- *                                             git-symbolic-ref(1): one argument
- *                                             reads, two create/update)
- *   `git symbolic-ref HEAD refs/heads/x`   -> rewrites HEAD (a WRITE)
- *   `git update-ref refs/heads/x`          -> USAGE ERROR rc 129, moves nothing
- *   `git update-ref --stdin` / `-d <ref>`  -> writes / deletes
- *   `git update-ref <ref> <new>`           -> writes
- * Before this, `symbolic-ref` and `update-ref` were unconditional, which made
- * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` a "hidden
- * branch-state mutation" (agent-infra#607 review finding 1: a false block on a
- * documented READ, admitted on main, with an unusable remedy).
- * @param {{verb?: string, args?: string[]}} inv
- */
-/**
  * #594 (review round 16, MEASURED-CLASS FAIL-OPEN): the ONE `symbolic-ref`
  * branch-state reading, shared by the DIRECT surface (`_isStateMutating`) and the
  * SUBSTITUTION surface (`_argAwareBranchStateMutation`) so the same spelling can
@@ -8820,6 +8804,22 @@ function _symbolicRefBranchStateMutation(args) {
   return !!w && (w.opaque === true || w.name === "HEAD" || w.branch !== null);
 }
 
+/**
+ * #607: is this invocation a BRANCH-STATE MUTATION? Argument-aware, because the
+ * verb alone is not the effect (measured on git 2.50.1):
+ *   `git symbolic-ref --short HEAD`        -> PRINTS the branch, rc 0 (a READ —
+ *                                             git-symbolic-ref(1): one argument
+ *                                             reads, two create/update)
+ *   `git symbolic-ref HEAD refs/heads/x`   -> rewrites HEAD (a WRITE)
+ *   `git update-ref refs/heads/x`          -> USAGE ERROR rc 129, moves nothing
+ *   `git update-ref --stdin` / `-d <ref>`  -> writes / deletes
+ *   `git update-ref <ref> <new>`           -> writes
+ * Before this, `symbolic-ref` and `update-ref` were unconditional, which made
+ * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` a "hidden
+ * branch-state mutation" (agent-infra#607 review finding 1: a false block on a
+ * documented READ, admitted on main, with an unusable remedy).
+ * @param {{verb?: string, args?: string[]}} inv
+ */
 function _argAwareBranchStateMutation(inv) {
   const args = inv.args || [];
   if (inv.verb === "checkout" || inv.verb === "switch") return true;
