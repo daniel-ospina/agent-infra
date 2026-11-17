@@ -462,13 +462,13 @@ _argv_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'python3.*"[$](cs|ru
 ck "§Z no projection hands a payload VARIABLE to python as a value" \
    "$([ "${_argv_sites:-0}" -eq 0 ] && echo 0 || echo 1)"
 
-# ── §W. THE SHIM MARKER STAYS INSIDE THE RESOLVER'S 8 KiB WINDOW (#3998) ─────────────────────────
-# `_is_harness_shim` reads at most 8 KiB of a candidate — the same window `scripts/gh-shim/gh` uses —
-# because reading the WHOLE candidate meant a full read of the 41 MB real gh on every single call.
+# ── §W. THE SHIM MARKERS STAY INSIDE THE LIMITER'S 8192-BYTE WINDOW (#3998) ─────────────────────
+# `gh-limit.py` reads at most 8192 bytes of a candidate (`fh.read(8192)`, `is_harness_shim`), and this
+# suite's §P pins that THIS adapter reads 32 KiB — so the two windows are pinned separately, on purpose.
 # The marker IS the recursion guard (`-ef` only recognises the identical file, so a COPY of a shim had
-# to be skipped by content), so a marker that drifted past 8 KiB would let the walk exec another
-# interposer: the measured 1,700 processes in 6 s, `fork: Resource temporarily unavailable`. The
-# window is part of the contract now, so a future edit cannot silently break it.
+# to be skipped by content), so a marker that drifted past the LIMITER's window would let the limiter
+# exec another interposer: the measured 1,700 processes in 6 s, `fork: Resource temporarily unavailable`.
+# The window is part of the contract now, so a future edit cannot silently break it.
 # ⛔ THE PAIR IS THE CONTRACT, NOT EVERY FILE CALLED gh. `gh-rest/gh` and `gh-limit/gh` are installed
 # beside ONE `../gh-limit.py`, and each must skip the other. `scripts/gh-shim/gh` (the #984 argv guard)
 # carries its marker at byte 31551 — DELIBERATELY outside this window, `extensions/review-enforcer`
@@ -476,18 +476,25 @@ ck "§Z no projection hands a payload VARIABLE to python as a value" \
 # must resolve the guard as its child, which it can only do if the guard's marker is out of the 8 KiB
 # window gh-limit reads. ⛔ DO NOT "tidy" that position into this window: it silently removes the
 # admin-merge gate from every cell's chain (a recorded decision, `docs/ops/gh-rate-limits.md`).
+# ⛔ THE BOUND IS DERIVED, NOT A LITERAL (#3442 rule-3 class; recorded by the fixer lane). `grep -b`
+# gives a 0-BASED offset, so a marker of ${#_mk} bytes is FULLY inside the limiter's 8192-byte read
+# exactly when `offset + ${#_mk} <= 8192`. The previous `-lt $((8192 - 22))` spelled the marker length
+# as an unattributed constant AND required `offset <= 8169`: MEASURED, a marker at offset 8170 (ending
+# at byte 8191, i.e. demonstrably inside the window the resolver skips) reddened this row — a pin one
+# byte STRICTER than the window it claims to pin. Deriving both ends removes both defects.
+_mk='harness-gh-shim-marker'
 for _s in gh-rest/gh gh-limit/gh; do
-  _off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
-  ck "§W shim marker inside the LIMITER's 8 KiB window: $_s (byte ${_off:-none})" \
-     "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -le $((8192 - 22)) ] && echo 0 || echo 1)"
+  _off="$(grep -b -o -m1 "$_mk" "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
+  ck "§W shim marker FULLY inside the LIMITER's 8192-byte window: $_s (offset ${_off:-none} + ${#_mk})" \
+     "$([ -n "${_off:-}" ] && [ "$(( ${_off:-99999} + ${#_mk} ))" -le 8192 ] && echo 0 || echo 1)"
 done
 # ⛔ AND THE THIRD LAYER'S MARKER MUST SIT INSIDE THE **ADAPTER'S** 32 KiB WINDOW while staying OUTSIDE
 # the limiter's 8 KiB one — that pair of facts IS the chain (`gh-limit → argv-guard → real gh`): the
 # limiter must resolve the guard as its child, and the adapter must skip it rather than insert it a
 # second time. A future edit that moves the guard's marker breaks one end or the other, silently.
-_g_off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/../gh-shim/gh" 2>/dev/null | cut -d: -f1)"
-ck "§W the #984 guard's marker is OUTSIDE 8 KiB and INSIDE the adapter's 32 KiB window (byte ${_g_off:-none})" \
-   "$([ -n "${_g_off:-}" ] && [ "${_g_off:-0}" -gt 8192 ] && [ "${_g_off:-99999}" -lt 32768 ] && echo 0 || echo 1)"
+_g_off="$(grep -b -o -m1 "$_mk" "$HERE/../gh-shim/gh" 2>/dev/null | cut -d: -f1)"
+ck "§W the #984 guard's marker is FULLY outside the limiter's 8192-byte window and inside the adapter's 32768 (offset ${_g_off:-none} + ${#_mk})" \
+   "$([ -n "${_g_off:-}" ] && [ "$(( ${_g_off:-0} + ${#_mk} ))" -gt 8192 ] && [ "$(( ${_g_off:-99999} + ${#_mk} ))" -le 32768 ] && echo 0 || echo 1)"
 
 # ── §P. THE RESOLVER PREAMBLE MUST NOT FORK (#3998) ──────────────────────────────────────────────
 # The wrapper walks PATH on EVERY harness call to find the real gh, and it used to run one `grep`
@@ -538,7 +545,7 @@ ck "§P the walk still reaches the real gh through PATH (zero-config resolution 
    "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
 # ⛔ THE EXPECTATION IS HOST-SHAPED, BECAUSE THE SHIM IS (round-2 review finding, E-1). On bash >= 5
 # the walk forks NOTHING. On bash 3.2 it cannot: that shell has no `read -N` and its `read` stops at a
-# NUL, so the bounded window is enforced by a `head -c 8192`-fed `grep` — 2 processes per candidate.
+# NUL, so the bounded window is enforced by a `head -c 32768`-fed `grep` — 2 processes per candidate.
 # SKIPPING the row there would leave the 3.2 arm unmeasured, so it asserts the bound it actually has;
 # a regression that forks per PATH ENTRY still blows past it.
 if (( BASH_VERSINFO[0] >= 5 )); then
@@ -657,17 +664,15 @@ mkdir -p "$TMP/nulpad"
 chmod +x "$TMP/nulpad/gh"
 out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/nulpad:$TMP/stubbin:$TMP/minbin" \
        bash "$SHIM" auth token 2>"$TMP/err-nul")"; _rc=$?
-# ⛔ AND SO IS THIS ONE (E-1), because the two arms' windows are not the same SIZE of window:
-#   bash >= 5 — 8192 NON-NUL CHARACTERS, so a marker after 9000 NULs is still INSIDE it → SKIPPED;
-#   bash 3.2  — 32768 BYTES (the `head -c` arm), so the same marker is INSIDE it here (9 KB < 32 KB) —
-#               the two arms differ only past 32 KiB of NULs, which is why the assertion below is the
-#               same on both hosts and the past-the-window arm uses a 40 KB fixture.
-# Both are at least as strict as the documented byte window, so neither host can bypass the guard;
-# the divergence is a SUPERSET difference and is asserted per host rather than papered over.
-# Both hosts now answer the same here (9 KB is inside 8 KiB? no — inside 32 KiB either way), so the row
-# is NOT host-gated any more: the divergence that remains is only past 32 KiB of NULs, covered by the
-# `far` fixture above on 3.2 and by the past-the-window arm on bash 5.
-ck "§P a NUL-padded sentinel past 8 KiB BYTES is still skipped (window counts NON-NUL chars on bash >= 5)" \
+# ⛔ AND SO IS THIS ONE (E-1), because the two arms' windows are not the same KIND of window (they are
+# the same SIZE — 32 KiB — on both hosts now):
+#   bash >= 5 — 32768 NON-NUL CHARACTERS, so a marker after 9000 NULs is INSIDE it → SKIPPED;
+#   bash 3.2  — 32768 BYTES (the `head -c` arm), so the same marker is INSIDE it here (9 KB < 32 KB).
+# Both hosts therefore answer the same here, so the row is NOT host-gated: the divergence that remains
+# is only past 32 KiB of NULs — a NUL-padded fixture there is skipped on bash >= 5 (NULs are not
+# counted) and NOT skipped on 3.2 (they are byte-counted), which is a SUPERSET difference that can only
+# make this resolver STRICTER than the documented bound, never laxer.
+ck "§P a NUL-padded sentinel past 8 KiB of BYTES is still skipped (the window counts NON-NUL chars on bash >= 5)" \
    "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
 
 # ⛔ AND THE MUTUAL SHAPE THE MEASURED INCIDENT HAD: the shims resolve to EACH OTHER when the INVOKED
@@ -687,8 +692,8 @@ ck "§P the MUTUAL shape resolves in one hop (gh-limit dir + invoked gh-rest cop
 # or file beside the shim (no memo, no ETag entry, no events.log line, no leftover temp file).
 _TOK='gho_TESTTOKEN_secret_9311'
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$_TOK" >"$TMP/token-gh"; chmod +x "$TMP/token-gh"
-mkdir -p "$TMP/tmpspool" "$TMP/leak"
-touch "$TMP/stamp"; sleep 1
+mkdir -p "$TMP/tmpspool" "$TMP/leak" "$TMP/tokbin"
+cp "$TMP/token-gh" "$TMP/tokbin/gh"; chmod +x "$TMP/tokbin/gh"
 out="$(TMPDIR="$TMP/tmpspool" GH_LIMIT_DIR="$TMP/leak" GH_REST_REAL_GH="$TMP/token-gh" \
        GH_REST_LIMIT_HELPER="$HERE/gh-limit.py" bash "$SHIM" auth token 2>&1)"; _rc=$?
 ck "§C gh auth token through the wrapper returns the credential unchanged" \
@@ -696,9 +701,32 @@ ck "§C gh auth token through the wrapper returns the credential unchanged" \
 _leaks="$(grep -rl -- "$_TOK" "$TMP/leak" "$TMP/tmpspool" "$HERE/gh-rest" 2>/dev/null || true)"
 ck "§C …and it is in NO log, cache, spool file or file beside the shim (asserted, not assumed)" \
    "$([ -z "$_leaks" ] && echo 0 || echo 1)"
-_scratch="$(find "$HERE/gh-rest" -newer "$TMP/stamp" 2>/dev/null || true)"
+# ⛔ AND THE WALK ITSELF MUST RUN, OR THIS ROW PROVES NOTHING (review finding: #3442 rule 3).
+# `GH_REST_REAL_GH` SHORT-CIRCUITS the walk, and the call above SETS it — so a
+# `printf '%s' "$REAL_GH" > "$SELF_DIR/.real-gh"` inserted into the walk (the memoisation this PR
+# rejected, and #3998's own candidate fix 1) executed in NO arm here: a `printf` builtin forks nothing,
+# so the spawn counters cannot see it either, and `find -newer` over the repo dir could not attribute a
+# file written during the §P arms. MEASURED before this fix: the mutant left the row GREEN.
+# So: the variable is UNSET (the walk runs), the only `gh` on PATH is the token stub, and the shim
+# under test is a COPY in a directory of its own — any cache written beside it is unambiguous, cannot
+# be confused with an earlier arm's debris, and leaves the repo clean. The listing is compared as a
+# SET (not by mtime), so a created OR a renamed artifact reddens it, and `out` is asserted too, so a
+# row that never reached the walk cannot pass for a row that proved there is no cache.
+# ⛔ §P's tool stubs STAY ON THIS PATH: on bash 3.2 the walk itself is a `head -c 32768`-fed `grep`, so
+# a `minbin`-only PATH would make the resolver report `command not found` into the merged stream and
+# redden this row for a reason it does not assert (CI never sees it — every CI job is bash 5).
+# ⛔ AND THE STREAMS STAY SPLIT FOR THE SAME REASON: this row asserts the CACHE, not stream hygiene
+# (§C's row above and §P's unreadable-candidate row own that), so a diagnostic from an arm-specific tool
+# must not be able to decide it — measured in the pinned `bash:3.2` image, where a stubbed `grep` that
+# cannot `exec /usr/bin/grep` failed this row on `2>&1` alone.
+mkdir -p "$TMP/cachedir"
+cp "$SHIM" "$TMP/cachedir/gh"; chmod +x "$TMP/cachedir/gh"
+_before="$(ls -A "$TMP/cachedir")"
+out="$(TMPDIR="$TMP/tmpspool" GH_LIMIT_DIR="$TMP/leak" GH_REST_LIMIT_HELPER=/nonexistent \
+       PATH="$TMP/spawnbin:$TMP/tokbin:$TMP/minbin" bash "$TMP/cachedir/gh" auth token 2>"$TMP/err-cache")"; _rc=$?
+_after="$(ls -A "$TMP/cachedir")"
 ck "§C …and the resolver writes NO cache beside the shim, so it has nothing that can go stale" \
-   "$([ -z "$_scratch" ] && echo 0 || echo 1)"
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$_TOK" ] && [ "$_before" = "$_after" ] && echo 0 || echo 1)"
 
 # ── §GQL. A GRAPHQL REFUSAL STILL ANSWERS FROM REST (#1959 — the reason this file exists) ────────
 # #1959 measured GitHub refusing EVERY GraphQL call — including the trivial `{viewer{login}}` — while
