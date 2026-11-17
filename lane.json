@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13274-1794944308-p3192185-5621a041",
+  "_sha": "c3ec9beff6c72f8b26928dc79ba695837e80d658",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13274.log"
+    },
+    {
+      "kind": "branch",
+      "value": "docs/13083-audit-gaps"
+    },
+    {
+      "kind": "sha",
+      "value": "df48e1e996954615c60d6f69136e4d003990cafe"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-13274"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 5801,
+  "ended_at": 1794950109,
+  "exit_code": 0,
+  "heartbeat_at": 1794950109,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13274-1794944308-p3192185-5621a041",
+  "lease_until": 1794986709,
+  "pid": 3192185,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794944308,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13274",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-13274"
+}
