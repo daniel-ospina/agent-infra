@@ -121,16 +121,29 @@ esac
 #   `45390 + _gw` and the merge-one term at a NON-default gate wait is `1800 + _gw + 300`.
 #   ⛔ THE ARITHMETIC IS RE-DONE HERE BECAUSE THE PREVIOUS SENTENCE GOT IT WRONG: it said "on a box
 #   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s", substituting the
-#   gate wait for the WHOLE merge term and losing the 1800 + 300 either side of it. At `_gw` = 3900 the
-#   merge term is 6000 s and the sum is 49290 s — OVER the 48000 s default below by 1290 s, exactly as
-#   it was OVER the old 18000 s default by 2490 s. ⚠️ THAT RESIDUAL IS PRE-EXISTING AND IS NOT CLOSED
-#   HERE: the shipped default gate wait (`_gw` = 900) gives 46290 s, which 48000 s covers with 1710 s to
-#   spare, and an operator who RAISES the gate wait must raise this default with it (`CLAIM_ISSUE_TTL`
-#   is the override). At the defaults the margin is 1710 s. ⛔ THE NUMBER THAT STOOD HERE WAS 810, WHICH
-#   IS NOT THAT SUBTRACTION: 48000 − 46290 = 1710, and 810 is not a residual of any pair in the table
-#   above (the 49290 s over-read is 1290 OVER, not 810 under). Recount it off the four rows, never off
-#   this sentence — the block exists because the earlier sentence mis-summed, so a third mis-sum here is
-#   the exact failure mode it was written to end.
+#   gate wait for the WHOLE merge term and losing the 1800 + 300 either side of it.
+#   ⛔ AND THE CORRECTION THAT REPLACED IT WAS WRONG IN THE OTHER DIRECTION (re-review of #4065, finding 2):
+#   it read 3900 — which IS that box's merge TERM — as `_gw`, concluded 49290 s was the `GATE_POLL_SECS=60`
+#   sum, and so told an operator that a 60 s-poll box is 1290 s OVER the ceiling when it is **810 s UNDER**.
+#   The residual is therefore stated as THREE ROWS, one per gate wait, each with its own merge TERM —
+#   because a sum quoted without the term it was built from is how both errors got in:
+#
+#     `_gw` (GATE_POLL_TRIES x GATE_POLL_SECS)  merge TERM (1800 + _gw + 300)  sum (45390 + _gw)  vs 48000
+#     ----------------------------------------  ----------------------------  -----------------  -----------
+#      900  (`GATE_POLL_SECS=30`, the default)    3000                          46290              1710 spare
+#     1800  (`GATE_POLL_SECS=60`)                 3900                          47190               810 spare
+#     3900  (`GATE_POLL_SECS=130` at 30 tries)    6000                          49290              1290 OVER
+#
+#   So the default covers the sum, and it STOPS covering it above `_gw` = 48000 - 45390 = 2610 s
+#   (`GATE_POLL_SECS` > 87 at 30 tries) — that is the threshold, and an operator who raises the gate wait
+#   past it must raise this default with it (`CLAIM_ISSUE_TTL` is the override). ⚠️ THE ROW ABOVE THE
+#   THRESHOLD IS A PRE-EXISTING RESIDUAL, NOT ONE THIS CHANGE OPENS: at the pre-#4034 pair the same three
+#   rows were 17490 (`_gw` 900, 510 spare), 18390 (`_gw` 1800, **390 s OVER**) and 20490 (`_gw` 3900,
+#   2490 over) against an 18000 s default — so the 5x TURNED THAT BOX FROM OVER TO UNDER, and moved the
+#   crossing point from `_gw` = 1710 s to 2610 s.
+#   ⛔ RECOUNT IT OFF THESE ROWS, NEVER OFF A SENTENCE. Every wrong version of this block was a sentence
+#   derived by hand from another sentence; the rows are the invariant, and `claim-orphan.test.sh` O7
+#   re-derives the default row from `spawn-gate.sh`/`merge-one.sh` so the two cannot part company.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
