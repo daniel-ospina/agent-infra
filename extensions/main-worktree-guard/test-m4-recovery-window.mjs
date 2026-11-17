@@ -749,6 +749,35 @@ async function partB() {
       try { unlinkSync(agentDir); } catch { /* best-effort */ }
       mkdirSync(agentDir, { recursive: true });
     }
+
+    // ── B12e/B12f — the OTHER direction of the same sentence.
+    //
+    // `written` was inferred from the CAUSE the read side reports, not from the
+    // stamp itself. Those are not the same fact: when the WRITE fails while a
+    // path already exists at the marker location, the cause describes what the
+    // read side saw (`unreadable`), so the refusal said "the file exists at … and
+    // a `gate_bypass` audit row was appended" although `_stampMarker` threw and
+    // NO row was appended. That is a false claim about the audit trail — the
+    // artifact a reader trusts when auditing why an escape window existed.
+    //
+    // Construction: the marker path is a DIRECTORY. `writeFileSync` raises
+    // EISDIR inside the fail-silent stamp (no row), and
+    // `diagnoseAllowMarkerState` sees an existing, realpath-clean path whose
+    // `readFileSync` throws → cause `unreadable` — the exact shape the inference
+    // mislabelled as a landed stamp. No operator file is touched: HOME is
+    // repointed at the fixture.
+    mkdirSync(agentDir, { recursive: true });
+    rmSync(markerPath, { recursive: true, force: true });
+    mkdirSync(markerPath, { recursive: true });
+    try {
+      const b12e = await drive(`touch ${markerPath}  # recovery: unwritable marker path`);
+      check("B12e a stamp that CANNOT land (an unreadable path exists at the marker) is REFUSED",
+        b12e !== null, true);
+      checkD("B12f …and the refusal reports that the stamp did NOT take, without claiming an audit row the failed write never appended",
+        /did not take/.test(b12e?.reason ?? "") && !/gate_bypass/.test(b12e?.reason ?? ""), b12e?.reason);
+    } finally {
+      rmSync(markerPath, { recursive: true, force: true });
+    }
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

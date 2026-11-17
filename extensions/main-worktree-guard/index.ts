@@ -605,7 +605,16 @@ function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => strin
 // stamp exists, so the shell `touch` then leaves an EMPTY (unparseable →
 // inert) marker: readAllowMarkerState stays false → blocked. A failed stamp
 // never weakens the gate (and a later guard-observed touch re-stamps over it).
-function _stampMarker(path: string, sessionId: string | null, reason: string | null): void {
+//
+// ⛔ IT RETURNS WHETHER IT LANDED (#3620 follow-up), because the refusal built
+// from the post-stamp diagnosis must not INFER that. A cause describing an
+// EXISTING file (`unreadable`, `expired`, `session-mismatch`, …) can accompany a
+// stamp that threw before writing anything — e.g. the marker path is a
+// directory, or the file is not writable — and inferring "written" from the
+// cause then claims a `gate_bypass` row was appended when none was. That is a
+// false claim about the audit trail, which is the artifact a reader trusts when
+// auditing why an escape window existed.
+function _stampMarker(path: string, sessionId: string | null, reason: string | null): boolean {
   try {
     // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
     // (and thus the whole touch path) silently dead.
@@ -630,8 +639,10 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
     console.log(
       `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
     );
+    return true;
   } catch (e) {
     console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
+    return false;
   }
 }
 
@@ -719,8 +730,10 @@ function _inertMarkerLines(): string[] {
 }
 
 /** Refusal for a marker `touch` that provably cannot open a window.
- *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check. */
-function _markerTouchBlockReason(cause: string | null, sessionId: string | null): string {
+ *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check;
+ *  `stampLanded` is `_stampMarker`'s own answer (false when no stamp was
+ *  attempted at all, i.e. the pre-stamp id check). */
+function _markerTouchBlockReason(cause: string | null, sessionId: string | null, stampLanded: boolean): string {
   // `no-session-id` after a stamp means the same thing as before it (an empty
   // PI_SESSION_ID normalizes to null here), and the remedy is identical: a
   // re-touch cannot help. Route it to the same text rather than prescribing one.
@@ -745,15 +758,13 @@ function _markerTouchBlockReason(cause: string | null, sessionId: string | null)
     ].join("\n");
   }
   const why = _MARKER_CAUSE_TEXT[cause] ?? cause;
-  // ⛔ WHICH DIRECTION (#3620 review, P3): `_stampMarker` has ALREADY run when
-  // this builder is called, and it is fail-silent. "The stamp did not take" is
-  // therefore true only when NO file resulted — `absent`, or the marker rules
-  // never loaded. For every other cause the write DID land (a `gate_bypass` row
-  // was appended and the guard logged `🔓 Escape marker active`) and it is the
-  // READ side that refuses that file, so telling the reader it was never created
-  // sends them to re-check permissions on a file they can see: the same dead end
-  // this issue is about, one level down.
-  const written = cause !== "absent" && cause !== "unavailable";
+  // ⛔ WHICH DIRECTION (#3620 review, P3) — answered by the STAMP, not inferred
+  // from the cause. `_stampMarker` is fail-silent, so a cause that describes an
+  // EXISTING file can accompany a write that threw before landing anything:
+  // inferring "written" from `cause !== "absent"` claimed a `gate_bypass` audit
+  // row (and a file "exists at …") for a stamp that never took. The landed flag
+  // is the only evidence that the write actually happened.
+  const written = stampLanded && cause !== "absent" && cause !== "unavailable";
   return [
     ...(written
       ? [
@@ -6471,9 +6482,9 @@ export default function (pi: ExtensionAPI) {
         // claim a window it cannot have.
         const markerSid = _currentSessionId(_ctx) || null;
         if (markerSid === null) {
-          return { block: true, reason: _markerTouchBlockReason(null, null) };
+          return { block: true, reason: _markerTouchBlockReason(null, null, false) };
         }
-        _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
+        const stampLanded = _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
         // (b) read back what we just minted, with the same id the read side will
         // use. A stamp that did not land (unwritable/symlinked ~/.pi/agent, a
         // disk error) leaves an empty or absent file: the touch is refused with
@@ -6482,7 +6493,7 @@ export default function (pi: ExtensionAPI) {
         const minted = diagnoseAllowMarkerState(_markerPath(), markerSid);
         if (!minted.active) {
           _currentMarkerDiagnosis = minted;
-          return { block: true, reason: _markerTouchBlockReason(minted.cause, markerSid) };
+          return { block: true, reason: _markerTouchBlockReason(minted.cause, markerSid, stampLanded) };
         }
         _currentMarkerDiagnosis = minted;
         return undefined;
