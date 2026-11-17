@@ -2694,7 +2694,8 @@ fi
 # ⛔ THE HEADER AND THE `|---|` RULE ARE EXEMPT FROM THE COMPARISON: the contract TELLS the reviewer
 # the column names, so every honest table reproduces them, and matching those would refuse every
 # review that did its job. Only DATA rows are compared.
-# STATED LIMIT, in kind with the parser's own: this is an exact-text test, so a reviewer who rewrites
+# STATED LIMIT, in kind with the parser's own: this is an exact-text test MODULO DECORATION (see the
+# projection note above `MUT_DEC_AWK`), so a reviewer who REWRITES
 # the example row's wording into a different row has authored a row — at which point the row is
 # theirs to defend, which is what the block asks for.
 # ⛔ THE DECORATION IS NOT THE DEFENCE — THE CLAIM IS READ THROUGH THE RECORDER'S OWN DECORATION
@@ -2719,9 +2720,27 @@ fi
 # grammar. Fenced and indented material is marked QUOTED here for the same reason: the parser refuses
 # it on its own, and refusing an honest reviewer that quotes the SHAPE in a fence and then writes its
 # own row would be a false block.
-# STATED LIMIT, unchanged in kind: this mirrors the parser's decoration grammar, not its cell
-# arithmetic. `tests/review-pr/run.sh` §BO drives a decoration MATRIX through both and fails if any
-# form the parser ACCEPTS is missed here, so a future spelling of this bug cannot land silently.
+# STATED LIMIT, narrowed by measurement: this mirrors the parser's decoration grammar, and then
+# compares on the CLAIM'S LETTERS AND DIGITS ONLY. `tests/review-pr/run.sh` §BO drives a decoration
+# MATRIX through both and fails if any form the parser ACCEPTS is missed here, so a future spelling
+# of this bug cannot land silently.
+# ⛔ MIRRORING THE GRAMMAR WAS STILL SPELLING-LIMITED, AND THE GAP WAS OUTSIDE IT (measured at
+# head d04490cca, the FIFTH and SIXTH spelling of this false PASS). The parser's test is a SHAPE test,
+# so it accepts decorations it has no rule for — a QUOTE-WRAPPED copy is the ordinary one ("here is
+# the answer, quoted"):
+#   • `NO NEW ASSERTIONS: "<the contract's worked reason>"` — the parser reads the label, strips one
+#     layer of quotes for its slot test, and ACCEPTS (rc=0, empty);
+#   • `"| <the contract's worked row> |"` under a live header — the `"` characters become leading and
+#     trailing CELLS, which do not stop `hdr`/`row` being set, so the parser ACCEPTS (rc=0, empty).
+# Both are copies of the harness's own example text, and BOTH were MISSED by the arms, because a
+# mirror of the parser's grammar strips only what the parser strips while the copy added something it
+# does not: the `"` cell was part of the compared value, so the row never equalled its canonical
+# original, and the quoted reason carried `"` on both ends. So the comparison is taken one step
+# further than the grammar, on both sides of it, symmetrically: every character that is not a letter
+# or a digit is dropped before the two are compared. Decoration cannot launder a copy, and REWORDING
+# still does — a reviewer that writes its own claim in its own words is authored, which is what the
+# block asks for. The two arms below apply the projection at the END, after the shape decisions
+# (header, `|---|` rule, the `NO NEW ASSERTIONS:` label) that must still read the decorated line.
 MUT_DEC_AWK='
 BEGIN { _fence = 0; _fencec = ""; _fencelen = 0 }
 # leading whitespace -> text after it; indent in COLUMNS (a TAB is the next 4-column stop)
@@ -2786,6 +2805,11 @@ _mutation_norm_rows() { # <text> -> normalised table DATA rows (header/rule drop
       if (sep == "") next                     # the |---| rule is never a data row
       # the COLUMN-NAMING header is shared by every honest table (the contract teaches those names)
       if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
+      # …and the COMPARISON is decoration-agnostic (see the measured note above `MUT_DEC_AWK`): a
+      # quoted copy adds cells the parser does not count as cells, so the projection is what makes
+      # `" <row> "` and `<row>` the same claim. Applied AFTER the shape decisions above.
+      gsub(/[^a-z0-9]+/, "", t)
+      if (t == "") next
       print t }'
 }
 mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the contract's worked row
@@ -2815,7 +2839,8 @@ mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the co
 # asked of the canon is "what did this run hand out" — indentation is not protection against a copy
 # that drops it. Fences are not tracked here and do not need to be: a fenced exemption is QUOTED to
 # the parser, which refuses it on its own (no live claim / MUTATION-EXEMPTION-INDENTED).
-# STATED LIMIT, identical in kind to the table-row arm's: an exact-text test. A reviewer who writes
+# STATED LIMIT, identical in kind to the table-row arm's: an exact-text test modulo decoration (a
+# quoted or emphasised retype is still a copy). A reviewer who writes
 # its OWN reason — naming the files THIS diff touches — has authored the claim, which is what the
 # block asks for, and the prompt now says so in as many words.
 _mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTIONS:` payloads
@@ -2835,6 +2860,10 @@ _mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTION
       # order. The one-shot form this replaces is what let `> - <the contract’s reason>` through.
       if (low !~ /^no new assertions[ \t]*:/) next
       sub(/^no new assertions[ \t]*:[ \t]*/, "", low)
+      if (low == "") next
+      # the same decoration-agnostic projection as the row arm: a QUOTE-wrapped retype of the
+      # contract reason is a copy, and the parser accepts it (measured at head d04490cca)
+      gsub(/[^a-z0-9]+/, "", low)
       if (low == "") next
       print low }'
 }

@@ -3999,6 +3999,86 @@ done
 reset
 # ══ end §BO ══
 
+# ── §BP THE DECORATION OUTSIDE THE PARSER'S GRAMMAR: A QUOTED COPY IS STILL A COPY ───────────────
+# ⛔ MEASURED AT HEAD d04490cca — the FIFTH and SIXTH spelling of the same false PASS, and the reason
+# §BO's property was still spelling-limited. §BO asks "whatever decoration the PARSER's grammar
+# strips, does the arm refuse?" — but the parser's test is a SHAPE test, so it also accepts
+# decorations its grammar has NO rule for, and the arm (which mirrors that grammar) then compares a
+# value the copy changed:
+#   • `NO NEW ASSERTIONS: "<the contract's worked reason>"` — the parser reads the label, strips ONE
+#     layer of quotes for its slot test and ACCEPTS (rc=0, empty); the arm compared the payload WITH
+#     its quotes, which is never equal to the canonical payload.
+#   • `"| <the contract's worked row> |"` under a live header and rule — the `"`s become leading and
+#     trailing CELLS, which do not stop `hdr`/`row` being set, so the parser ACCEPTS (rc=0, empty);
+#     the arm's cell list carried that `"` cell, so the row never equalled its canonical original.
+# Both are copies of the HARNESS'S OWN example text — the exact false-PASS class #3442 exists for, one
+# keystroke from "here is the answer I was given, quoted". The fix is not a seventh spelling rule: the
+# comparison is projected to letters+digits ON BOTH SIDES (`scripts/review-pr.sh` 5a3), so no
+# decoration can launder a copy. Each arm below FIRST asks the recorder's own parser what it answers
+# (the copy is only a defect when the parser accepts it), then requires the seam to refuse; the
+# internal mutant proves the projection is what refuses it, and the authored controls prove the arm is
+# a provenance test rather than a ban on quotations.
+echo; echo "§BP a QUOTED copy is still a copy — decoration outside the parser's grammar cannot launder it"
+# The copied text is BUILT FROM THE REAL `--mutation-section` output (never retyped), so this section
+# cannot go stale as the contract is edited: only the ONE decoration the parser has no rule for (the
+# quotes) is added by this file.
+_bp_payload="${CANON_EXEMPT#NO NEW ASSERTIONS: }"
+_bp_exempt="NO NEW ASSERTIONS: \"${_bp_payload}\""
+_bp_qrow="\"${CANON_ROW}\""
+printf '## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bp_exempt" > "$TMP/bp-exempt.md"
+_bp_rc=0; _bp_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bp-exempt.md" 2>/dev/null)" || _bp_rc=$?
+[ "$_bp_rc" -eq 0 ] && [ -z "$_bp_miss" ]; ck $? "the parser ACCEPTS a QUOTE-wrapped retype of the worked exemption (rc=$_bp_rc, ='${_bp_miss:-<accepted>}') — measured, so this is a live hole, not a hypothetical"
+reset; FIXTURE_NO_MUTATION=1
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bp_exempt" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a QUOTE-wrapped paste-back of the worked exemption is REFUSED (rc=$(rc_of), want 11)"
+no_comment; ck $? "  …nothing posted as a review artifact (a quote is not a defence)"
+no_record; ck $? "  …and no record minted on the harness's own reason"
+err_has "REPUBLISHES THE CONTRACT'S OWN WORKED"; ck $? "  …and the refusal still names the provenance"
+
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n%s\n\nCLEAN\n' \
+  "$_bp_qrow" > "$TMP/bp-row.md"
+_bp_rc=0; _bp_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/bp-row.md" 2>/dev/null)" || _bp_rc=$?
+[ "$_bp_rc" -eq 0 ] && [ -z "$_bp_miss" ]; ck $? "the parser ACCEPTS a QUOTE-wrapped retype of the worked ROW (rc=$_bp_rc, ='${_bp_miss:-<accepted>}')"
+reset; FIXTURE_NO_MUTATION=1
+printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n%s\n\nCLEAN\n' \
+  "$_bp_qrow" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a QUOTE-wrapped paste-back of the worked ROW is REFUSED (rc=$(rc_of), want 11)"
+no_record; ck $? "  …nothing recorded on the harness's own row"
+
+# The internal mutant: drop ONLY the projection. If the refusal above came from the projection, this
+# copy must RECORD the quoted paste-back while the parser still accepts the artifact it publishes —
+# i.e. the false PASS measured end to end, on the bytes this seam would have posted.
+BP="$TMP/mutant-no-projection.sh"
+sed 's|gsub(/\[\^a-z0-9\][+]/, "", t)|t = t|; s|gsub(/\[\^a-z0-9\][+]/, "", low)|low = low|' "$SRC" > "$BP"
+if cmp -s "$SRC" "$BP"; then
+  fail "the projection mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n\nCLEAN\n' "$_bp_exempt" > "$TMP/reviewer-out"
+  run "$BP" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT without the projection RECORDS the quote-wrapped paste-back (rc=$(rc_of)) - so the projection is what refuses it"
+  _bp_rc=0; _bp_miss=""; _bp_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _bp_rc=$?
+  [ "$_bp_rc" -eq 0 ] && [ -z "$_bp_miss" ]; ck $? "  …and the recorder's OWN parser ACCEPTS that posted artifact (rc=$_bp_rc, ='${_bp_miss:-<accepted>}') - the false PASS, measured"
+  grep -qF 'docs/ops/*.md' "$TMP/comment.md" 2>/dev/null; ck $? "  …carrying the contract's example files as the reviewer's evidence about THIS diff"
+fi
+
+# ⛔ THE ARM IS A PROVENANCE TEST, NOT A BAN ON QUOTES. A reviewer that WRITES ITS OWN claim still
+# records, however it decorates it — otherwise the projection would trade one false PASS for a false
+# BLOCK on every honest reviewer that quotes its own tool output.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: "this change only rewords docs/ops/self-healing-contract.md, and the seam it describes is asserted by §BP of tests/review-pr/run.sh"\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a QUOTED reason that is the reviewer's OWN still records (rc=$(rc_of)) - the arm refuses copies, not quotations"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| "`tests/review-pr/run.sh` §BP — a quoted copy is refused" | `_pb_rows=` emptied | §BP (mutant) | `❌ got rc=0` |\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a QUOTED row that is the reviewer's OWN still records (rc=$(rc_of)) - decoration does not make an authored row a copy"
+reset
+# ══ end §BP ══
+
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
