@@ -7331,7 +7331,10 @@ while true; do
         # something" (#1825). That deleted the marker the rail fall-through had just written and made
         # the stale-evidence count structurally 0 on agent-infra itself. Two separate lines, and the
         # authority test stays the ONLY needsreview sweep on this arm.
-        rm -f "$O/state/fixspend-$PR-"* 2>/dev/null || true
+        # ⛔ AND THE CONFLICT ARM'S OWN SPEND RECORD, for the same reason (it is only written on the
+        # conflict path, so a rebased PR that now reads GREEN would otherwise carry one stale
+        # `conflictspend-<PR>-<oldhead>` per pushed head until the PR terminates).
+        rm -f "$O/state/fixspend-$PR-"* "$O/state/conflictspend-$PR-"* 2>/dev/null || true
         [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
