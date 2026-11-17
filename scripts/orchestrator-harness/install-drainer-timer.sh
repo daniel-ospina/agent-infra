@@ -80,6 +80,13 @@ fi
 . "$SYSTEMD_UNIT_PARSE_LIB"
 command -v effective_env >/dev/null 2>&1 \
     || { printf 'install-drainer-timer: ERROR — %s did not define effective_env\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
+# ⛔ THE `ExecStart=` GRAMMAR IS THE SAME LIBRARY (round-2 re-review, P2). This verb's no-pin arm graded
+# the script named by the BASE unit file, so a drop-in that replaces `ExecStart=` was invisible and the
+# arm returned 0 over a unit systemd runs differently. A missing definition here would silently grade
+# NOTHING (the loop would see no ExecStart at all and report UNKNOWN), so it is fatal for the same reason
+# the `Environment=` reader's is: an unreadable grammar must not become a verdict.
+command -v effective_execstarts >/dev/null 2>&1 \
+    || { printf 'install-drainer-timer: ERROR — %s did not define effective_execstarts\n' "$SYSTEMD_UNIT_PARSE_LIB" >&2; exit 1; }
 UNIT_SRC_SERVICE="eldato-ai-drainer.service"
 UNIT_SRC_TIMER="eldato-ai-drainer.timer"
 
@@ -200,6 +207,26 @@ render() { # <template> <dest>
     mv -f "$tmp" "$2"
 }
 
+# execstart_script <one effective ExecStart command line> — the SCRIPT an interpreter invocation runs
+# (`/bin/bash <script> [args…]`), or empty when the line is not that shape.
+#
+# ⛔ EMPTY IS NOT "NO SCRIPT" — it is "this verb cannot read the script from the artifact", and every
+# caller here turns it into UNKNOWN (5), never into a clean. Deliberately narrow: the first word must be
+# a shell (`bash`, `/bin/bash`, `/usr/bin/bash`, `sh`, …), the second must be a literal path. A `bash -c
+# '…'` form puts the script INSIDE a string and a quoted path is not resolvable here, so both read as
+# unreadable rather than being guessed at — the fail-closed direction, and named as such in the output.
+execstart_script() {
+    printf '%s\n' "$1" | awk '
+        { line = $0
+          sub(/^[ \t]+/, "", line)
+          n = split(line, w, /[ \t]+/)
+          if (n < 2) exit
+          if (w[1] !~ /(^|\/)(ba)?sh$/) exit      # not a shell in program position
+          if (w[2] ~ /^-/) exit                   # `bash -c …`: the script is inside the string
+          if (w[2] ~ /^["\047]/) exit            # quoted path: not readable as a literal here
+          print w[2] }'
+}
+
 say_status() {
     local svc="$1" tmr="$2" installed want missing=0
     printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
@@ -286,28 +313,58 @@ say_status() {
             # the copy this checkout happens to hold), and decide on ITS literal. An ExecStart that is not
             # an ai-drainer.sh at all is named as UNKNOWN rather than being called clean — it is not
             # evidence of a stale cap, and it is not evidence of a fresh one either.
-            local exe have
-            exe="$(sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc" 2>/dev/null | tail -1 | tr -d '\r')"
-            have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
-                      "${exe:-/nonexistent}" 2>/dev/null | head -1)"
-            case "${have:-}" in ''|*[!0-9]*) have="" ;; esac
-            if [ -z "${exe:-}" ] || [ ! -f "${exe:-/nonexistent}" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
-                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
-                return 5
-            elif [ -z "$have" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s declares no readable default, so the cap this\n' "$exe"
-                printf '      box dispatches at is UNKNOWN; re-run this installer to pin it)\n'
-                return 5
-            elif [ "$have" != "$want" ]; then
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "$have"
-                printf '      %s)\n' "$exe"
-                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "$have" "$want"
+            #
+            # ⛔ "THE UNIT" MEANS UNIT **+ DROP-INS**, IN SYSTEMD'S ORDER (round-2 re-review, P2 — verified).
+            # This read was `sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc"` — THE BASE FILE ALONE, on
+            # one spelling — while the `Environment=` reader three arms above already used the drop-in-aware
+            # `$unit_text`. So a `<unit>.service.d/*.conf` carrying `ExecStart=` + `ExecStart=/bin/bash
+            # <other script>` was INVISIBLE here: the arm graded the base file's script, printed "agrees with
+            # the … s this checkout would render" at :310 and returned 0 — a false clean in the verb whose
+            # exit code is the published contract, over a unit systemd runs differently. MEASURED on this
+            # fixture: base `ExecStart=/bin/bash <fresh>`, drop-in `ExecStart=` + `ExecStart=/bin/bash
+            # <stale 7200>` read **rc 0** before this change and **rc 3** after it. It is the same shape
+            # `install-disk-reaper-timer.sh` closed with `effective_execstarts` (a drop-in made the install
+            # print "verify: ExecStart + HOME read back", exit 0, over a unit that ran `/bin/true`), and the
+            # PR body's "closed in every spelling" claim is only true with the drop-in read.
+            #
+            # Systemd's own semantics, not a last-line guess: `ExecStart=` is read from `$unit_text` by
+            # `effective_execstarts` from the SHARED parser (`scripts/lib/systemd-unit-parse.sh` — one
+            # definition, both callers), so a bare `ExecStart=` RESET (which is how a drop-in MASKS a unit)
+            # drops every earlier assignment, `ExecStart = /bin/bash …` normalises, and `Type=oneshot`'s
+            # several commands are ALL graded: a oneshot runs every one of them, so a stale cap in any of
+            # them is this box's stale cap. UNKNOWN (5) outranks clean but not stale: a script we cannot
+            # resolve is not evidence of a fresh cap, and a stale one among them is a definite finding.
+            local execs line exe have stale="" unknown="" fresh=""
+            execs="$(effective_execstarts "$unit_text")"
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                exe="$(execstart_script "$line")"
+                if [ -z "$exe" ] || [ ! -f "$exe" ]; then
+                    unknown="${exe:-$line}"; continue
+                fi
+                have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
+                          "$exe" 2>/dev/null | head -1)"
+                case "${have:-}" in ''|*[!0-9]*) unknown="$exe"; continue ;; esac
+                if [ "$have" != "$want" ]; then stale="$have $exe"; else fresh="$have"; fi
+            done <<<"$execs"
+            if [ -n "$stale" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "${stale%% *}"
+                printf '      %s)\n' "${stale#* }"
+                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "${stale%% *}" "$want"
                 printf '      the box keeps the old cap until this unit is re-rendered: re-run this installer\n'
                 printf '      (no arguments) on this cell.\n'
                 return 3
+            elif [ -z "$execs" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
+                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
+            elif [ -n "$unknown" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s names no script this verb can read (an\n' "$unknown"
+                printf '      ExecStart that is not `bash <script>`, or one whose script is missing), so the cap this box\n'
+                printf '      dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
             else
-                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$have" "$exe"
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$fresh" "${exe}"
                 printf '      agrees with the %s s this checkout would render)\n' "$want"
             fi ;;
         *[!0-9]*)

@@ -14,7 +14,7 @@
 # file that defines the safe one is where a second implementation must NOT be born. One definition,
 # both callers, and a unit a caller cannot parse is REPORTED (`!unparseable:`) rather than guessed at.
 #
-# ── THE GRAMMAR (systemd.exec(5), `Environment=`) ───────────────────────────────────────────────
+# ── THE GRAMMAR (systemd.exec(5) `Environment=`; systemd.service(5) + systemd.unit(5) `ExecStart=`) ──
 # * `Environment=` may appear many times; the assignments MERGE, and a LATER assignment of the SAME
 #   name wins. A bare `Environment=` (no value) RESETS the list to empty.
 # * One line may carry SEVERAL space-separated assignments: `Environment=HOME=/x LANE_TIMEOUT=7200`.
@@ -38,7 +38,7 @@
 # exists to remove. Normalising the TEXT once, rather than teaching every parser the grammar, keeps
 # ONE definition of "what systemd will read".
 #
-# ⛔ NOTHING HERE EXECUTES ANYTHING. Both functions take unit TEXT on stdin/argv and print text, so a
+# ⛔ NOTHING HERE EXECUTES ANYTHING. Every function takes unit TEXT on stdin/argv and prints text, so a
 # caller can feed them the installed file plus its drop-ins without running a unit, a systemctl or a
 # `git` — this file is safe to source inside a test's subshell.
 
@@ -99,4 +99,31 @@ effective_env() {
         }
         END { for (i = 1; i <= b; i++) print "!unparseable:" bad[i]
               for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
+}
+
+# effective_execstarts <unit text> — the `ExecStart=` command lines systemd will ACTUALLY run, one per
+# line, applying systemd's own list semantics:
+#
+# * `ExecStart=` may appear once (and, for `Type=oneshot`, several times — the commands then run in the
+#   order they appear). systemd.service(5): "Unless Type= is oneshot, exactly one command must be given."
+# * A bare `ExecStart=` RESETS the list — systemd.service(5): "If the empty string is assigned to this
+#   option, the list of commands to start is reset, prior assignments of this option will have no
+#   effect." That is how a drop-in MASK replaces a unit's command.
+# * Drop-ins are parsed AFTER the unit file (systemd.unit(5): "All files with the suffix `.conf` from
+#   this directory will be merged in the alphanumeric order and parsed after the main unit file itself
+#   has been parsed"), so a caller that feeds the unit first and its drop-ins after it gets systemd's
+#   order — and a drop-in's `ExecStart=` therefore applies LAST.
+#
+# ⛔ WHY THIS LIVES HERE AND NOT IN ITS ONE CALLER (this file's own rule, one definition, both callers).
+# It was written inside `install-disk-reaper-timer.sh`'s read-back, and `install-drainer-timer.sh`'s
+# no-pin arm then read `ExecStart=` with a `sed` spelling match on the BASE FILE ALONE — so a drop-in
+# override was invisible and the arm graded a script systemd would not run. MEASURED (round-2
+# re-review, P2): base `ExecStart=/bin/bash <fresh>`, drop-in `ExecStart=` + `ExecStart=/bin/bash
+# <stale>` read rc 0 "agrees with what this checkout would render" over a unit that runs the STALE
+# script. A second reader that can disagree with the first about the same unit is the #1872 shape.
+effective_execstarts() {
+    printf '%s\n' "$1" | normalize_unit_lines | awk '
+        /^ExecStart=$/ { n = 0; next }                  # a bare assignment RESETS the list
+        /^ExecStart=/  { L[++n] = substr($0, 11); next } # 10 chars + 1: everything after `ExecStart=`
+        END            { for (i = 1; i <= n; i++) print L[i] }'
 }

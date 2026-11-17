@@ -2346,11 +2346,16 @@ this paragraph and its first "correction" got it wrong** (review cycle 7, P2; th
 which recomputed the base column instead of carrying it, and read the DESIGN operand as the runtime
 allowance). `WAIT_S` is **5400 on BOTH sides** — `origin/main` ships `LANE_MERGE_WAIT:-5400` too — so
 the only thing the 5× clock changes is the chunk count, `(clock − 5400 − 900) / 120`: **7** at 7200 s,
-**247** at 36000 s. ⛔ AND THAT COUNT IS A DESIGN OPERAND, NOT WHAT A LANE GETS, because EVERY `--watch`
+**247** at 36000 s. ⛔ THE LEFT COLUMN IS THE PRE-#4034 TREE, NOT `origin/main` (round-2 re-review, P3):
+`origin/main` has shipped `LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-36000}"` (`spawn-gate.sh:3566`, since #4065
+merged), so labelling it `origin/main` pointed a reader at a revision that no longer carries the 7200 s
+clock — in the block this PR rewrites. The numbers are right for the tree they were measured on; the
+label now names that tree.
+⛔ AND THAT COUNT IS A DESIGN OPERAND, NOT WHAT A LANE GETS, because EVERY `--watch`
 path clamps it to the watchdog's allowance — `_idle_fit = (2700 − 40) / 120 = 22` chunks — whenever that
 is smaller, which at 36000 s it is. The honest row, with both columns:
 
-| | `origin/main` (7200 s clock) | this tree (36000 s clock) |
+| | pre-#4034 tree (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
 | `WAIT_S` | 5400 | 5400 |
 | **design operand** (`MAX_WATCH_FIT` × `POLL`) — the guarantee's FLOOR, never a delivered allowance | 7 × 120 = 840 | 247 × 120 = 29640 |

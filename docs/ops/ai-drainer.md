@@ -358,16 +358,29 @@ would render now, and its **exit code is the contract** an automated check reads
 | 4 | **NOT ARMED** — the service and/or the timer is MISSING, so the box dispatches nothing at any cap |
 | 5 | **UNKNOWN** — installed, but the cap cannot be determined: no pin *and* an unreadable `ExecStart`, a pin whose value is not a number of seconds, or a pin line systemd would REJECT |
 
-⛔ **rc 0 MEANS THE PIN WAS ACTUALLY READ, IN WHATEVER SPELLING systemd ACCEPTS** (re-review of #4065,
-finding 1 — the fail-open this table used to publish). The pin is read with the same parser as the disk
-reaper's read-back (`scripts/lib/systemd-unit-parse.sh`), over the unit **and** its
-`<unit>.service.d/*.conf` drop-ins in systemd's order, so all of these are graded, not skipped:
+⛔ **rc 0 MEANS A CAP WAS ACTUALLY READ AND AGREES WITH THE SEAM — never that a pin was found in some
+spelling** (round-2 re-review, P3: this sentence used to say "rc 0 MEANS THE PIN WAS ACTUALLY READ, IN
+WHATEVER SPELLING systemd ACCEPTS", which the table three lines above contradicts — its own no-pin row
+exits 0 without any pin existing, and rc 0 can therefore mean a *script's* default was read, not a pin).
+There are exactly two rc-0 shapes, and the output names which one you got. **Either** a `LANE_TIMEOUT`
+pin was read with the same parser as the disk reaper's read-back (`scripts/lib/systemd-unit-parse.sh`),
+over the unit **and** its `<unit>.service.d/*.conf` drop-ins in systemd's order, so all of these are
+graded, not skipped:
 `Environment="LANE_TIMEOUT=7200"` (quoted), `Environment=HOME=/x LANE_TIMEOUT=7200` (several
 assignments on one line), `Environment = LANE_TIMEOUT=7200` (whitespace around the key and the `=`), and
 a drop-in that overrides the base file (a drop-in is parsed last, so it WINS — in both directions: a
 stale base overridden back to the seam reads clean). A bare `Environment=` RESET clears an earlier pin
-and reads as no-pin. Before this change each of the first three read as **"the unit carries no pin"**
+and reads as no-pin. Before that change each of the first three read as **"the unit carries no pin"**
 and exited **0**, i.e. a box dispatching at the old cap was certified as agreeing with the seam.
+
+**Or** — the no-pin shape — the unit carries no `LANE_TIMEOUT` at all, and the cap is graded against the
+`ExecStart=` script systemd would ACTUALLY run, i.e. the unit **plus its drop-ins**, with systemd's own
+list semantics (`ExecStart=` may be reset by a drop-in, which is how a unit is masked, and `Type=oneshot`
+may carry several commands — every one of them is graded, because a oneshot runs them all). That script's
+own compiled `LANE_TIMEOUT` default must agree with the seam, or the answer is 3; if it cannot be read,
+the answer is 5. ⛔ A drop-in `ExecStart=` override used to be INVISIBLE here (the base file was read
+alone), so a unit systemd runs with a stale script was certified clean — the same false PASS as the quoted
+pin, one directive over.
 
 The unit is rendered ONCE, at install time, and an
 installed pin WINS over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed

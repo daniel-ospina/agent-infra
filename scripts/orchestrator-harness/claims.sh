@@ -140,7 +140,14 @@ esac
 #   THRESHOLD IS A PRE-EXISTING RESIDUAL, NOT ONE THIS CHANGE OPENS: at the pre-#4034 pair the same three
 #   rows were 17490 (`_gw` 900, 510 spare), 18390 (`_gw` 1800, **390 s OVER**) and 20490 (`_gw` 3900,
 #   2490 over) against an 18000 s default — so the 5x TURNED THAT BOX FROM OVER TO UNDER, and moved the
-#   crossing point from `_gw` = 1710 s to 2610 s.
+#   crossing point from `_gw` = 1410 s to 2610 s.
+#   ⛔ THAT 1410 IS RECOUNTED, NOT CARRIED (round-2 re-review, P3). The sentence above read **1710**
+#   until then: the pre-#4034 base is 45390 − (36000 − 7200) = 16590 against 18000, so the crossing is
+#   18000 − 16590 = **1410** s (and 1410 + 1200 = 2610, the post-change threshold — the 5x moved the whole
+#   crossing by exactly the 1200 s it added to the base). 1710 is the `_gw` = 900 row's SPARE figure three
+#   lines up, which is what a crossing quoted from neighbouring prose looks like. Doc-only: no operator
+#   action and no gate reads the historical figure, and the operative threshold (2610 s,
+#   `GATE_POLL_SECS` > 87) was already right.
 #   ⛔ RECOUNT IT OFF THESE ROWS, NEVER OFF A SENTENCE. Every wrong version of this block was a sentence
 #   derived by hand from another sentence; the rows are the invariant, and `claim-orphan.test.sh` O7
 #   re-derives the default row from `spawn-gate.sh`/`merge-one.sh` so the two cannot part company.

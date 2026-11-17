@@ -663,9 +663,13 @@ service_effective_unit() { # prints the bytes systemd will load; rc 1 when that 
     esac
 }
 
-# The ExecStart argv lines systemd will actually run: everything AFTER the last bare `ExecStart=`
-# reset. ⛔ Not "the last ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a
-# pre-flight command is a healthy unit — refusing it would be a false block on a working cell.
+# The ExecStart argv lines systemd will actually run come from `effective_execstarts` in that same
+# shared library: everything AFTER the last bare `ExecStart=` reset, unit then drop-ins. ⛔ Not "the last
+# ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a pre-flight command is a
+# healthy unit — refusing it would be a false block on a working cell. The function MOVED there when
+# `install-drainer-timer.sh --status` became its second caller and read `ExecStart=` off the base file
+# alone, which graded a script systemd would not run (round-2 re-review, P2); the grammar and the
+# measured defeats are documented at the definition.
 # ── THE Environment= GRAMMAR COMES FROM THE SHARED LIB, NOT FROM THIS FILE ─────────────────────
 # `normalize_unit_lines` and `effective_env` moved to `scripts/lib/systemd-unit-parse.sh` because a
 # SECOND reader of the same grammar now exists (agent-infra#4034's `install-drainer-timer.sh --status`
@@ -687,13 +691,7 @@ fi
 # shellcheck source=scripts/lib/systemd-unit-parse.sh
 . "$SYSTEMD_UNIT_PARSE_LIB"
 command -v effective_env >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_env"; exit 1; }
-
-effective_execstarts() {
-    printf '%s\n' "$1" | normalize_unit_lines | awk '
-        /^ExecStart=$/ { n=0; next }
-        /^ExecStart=/  { L[++n] = substr($0, 11); next }
-        END            { for (i = 1; i <= n; i++) print L[i] }'
-}
+command -v effective_execstarts >/dev/null 2>&1 || { err "REFUSING: $SYSTEMD_UNIT_PARSE_LIB did not define effective_execstarts"; exit 1; }
 
 # split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
 # group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token

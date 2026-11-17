@@ -2142,6 +2142,43 @@ SC_EOF
   check "installer: --status WARNS and exits 3 when a NO-PIN unit's ExecStart script still carries the OLD compiled default" \
     '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out" && grep -q "carries no pin" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # ⛔ THE NO-PIN ARM READS `ExecStart=` FROM THE UNIT **+ ITS DROP-INS** (round-2 re-review, P2 — verified).
+  # It read the BASE file alone with a `^ExecStart=/bin/bash ` spelling match, while the `Environment=`
+  # reader two arms above already used the drop-in-aware `$unit_text`. systemd.unit(5): a `<unit>.d/*.conf`
+  # is "parsed after the main unit file itself has been parsed", and systemd.service(5) makes a bare
+  # `ExecStart=` a RESET — so a drop-in that masks the command is what systemd RUNS. The arm graded the
+  # base file's script instead, printed "agrees with the … s this checkout would render" and returned 0.
+  # MEASURED pre-fix on the fixture below: **rc 0** (the false clean this block removes); post-fix rc 3.
+  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
+  mkdir -p "$T4/units/eldato-ai-drainer.service.d"
+  printf 'ExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" \
+    >"$T4/units/eldato-ai-drainer.service.d/mask.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status grades the ExecStart a DROP-IN actually installs, not the base file's (pre-fix: rc 0 'agrees')" \
+    '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "drainer-stale.sh" <<<"$out" && ! grep -q "agrees" <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # ...and in the OTHER direction, so the arm is not simply 'a drop-in always reds': a drop-in that
+  # overrides a stale base back to the seam is what systemd runs, and that box IS at the seam.
+  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  printf 'ExecStart=\nExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" \
+    >"$T4/units/eldato-ai-drainer.service.d/mask.conf"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: …and a drop-in that overrides a STALE base back to the seam reads CLEAN (the graded script is the one systemd runs)" \
+    '[ "$rc" -eq 0 ] && grep -q "agrees" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  rm -rf "$T4/units/eldato-ai-drainer.service.d"
+  # ⛔ AND THE SPELLING: systemd accepts whitespace around the `=` (systemd.exec(5)/systemd.unit(5) key
+  # syntax), so `ExecStart = /bin/bash <script>` is the SAME directive. The old reader matched only the
+  # literal `^ExecStart=/bin/bash `, so this legal unit read as "names no readable script" — UNKNOWN (5)
+  # — instead of being graded at all (measured pre-fix: rc 5, post-fix rc 3).
+  printf 'ExecStart = /bin/bash %s\n' "$T4/drainer-stale.sh" >"$T4/units/eldato-ai-drainer.service"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status READS 'ExecStart = /bin/bash <script>' (whitespace around the '=' is legal systemd) and grades it" \
+    '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
   # ⛔ AND A BOX WITH NO UNIT AT ALL IS NOT HEALTHY (agent-infra#4034 review, P3 — verified). The whole
   # grading block is inside `if [ -f "$UNIT_DIR/$svc" ]`, so an empty unit dir printed `… MISSING` and
   # exited 0 — indistinguishable, to an automated check reading the published contract, from "the drainer
