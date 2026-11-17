@@ -304,7 +304,7 @@ ABSORPTION_QUEUED=""
 ABSORPTION_DEMANDING=""
 ABSORPTION_GHOSTS=""
 # ⛔ THE DEMAND READ CAN BE UNMEASURED WITHOUT THE PASS BEING UNMEASURABLE (agent-infra#4085, second
-# leg). `DEMAND_BLIND` is the FIFTH evaluate answer (rc 3): the queue's DEPTH was read, the census was
+# leg). `DEMAND_BLIND` is the FOURTH evaluate answer (rc 3, after 0 ok / 1 unhealthy / 2 cannot-measure): the queue's DEPTH was read, the census was
 # read, and the ONE thing that could not be measured is which label set the head of real demand asks
 # for — because the head scan's window ran out on ghost runs (see the scan).
 #   * It is NOT `queued_demanding=0` and NOT "no demand": treating a refusal as no demand is the
@@ -377,6 +377,12 @@ DEMAND_SHOWN=""        # the same sets on ONE line (`;`-joined), for the key=val
 # ever match it, so a run nobody is stranded for read as `stranded` while both arch runners sat ONLINE
 # AND IDLE. The union is a fine THING TO REPORT and a wrong thing to MATCH.
 CAPABILITY=""          # which permission the inventory read needed, when it could not be read
+# ⛔ HOW MANY RUNNERS THE LAST `set_labels` ACTUALLY WROTE (agent-infra#4085 review P1, measured). Its exit
+# status means "no failures", NOT "something was written": an EMPTY managed set (no runner carries the
+# pool marker — an empty pool, or a pool whose registrations lost the marker) leaves `WANTED_BODY` empty,
+# so `ok=0 fail=0 unverified=0` and the function returns 0. A caller that reads only the exit code then
+# reports a convergence NO PUT PERFORMED. Never infer a write from the status; read this.
+SET_LABELS_OK=0
 MODE_SOURCE="runners"  # runners | jobs-inference | none — how `mode` was obtained
 CAP_DENY=0             # set by capacity_verdict: 1 = this pass may not certify capacity
 
@@ -1068,7 +1074,8 @@ print(comp, len(inc))
     # excluded from every numeric test below, so it cannot be read as 0 and cannot be read as demand.
     # ⛔ AND IT MUST BE CLEARED, NOT MERELY SKIPPED (measured while writing this, and again under
     # review — the mechanism is NOT the seed): leaving the assignment to the `else` would leave
-    # `queued_demanding` as the value the queue parse RE-SEEDS (`:951`), i.e. the RAW depth, so a pass
+    # `queued_demanding` as the value the queue parse RE-SEEDS (its `local` declaration + the raw-depth
+    # assignment), i.e. the RAW depth, so a pass
     # whose scan window never reached the runs behind the ghosts would publish the WHOLE tail as
     # demand and the LENGTH LEG would arm the pool on it. That is the fail-open direction — the refusal
     # read as demand, the one thing #2344/#3995 forbid — and it is why the clear is explicit. Arm (d1)
@@ -1426,6 +1433,7 @@ labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
 set_labels() { # $1 = on|off
   local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
   local WANTED_BODY="" verified=0 unverified=0
+  SET_LABELS_OK=0
   if ! rows="$(runner_rows 2>"$GH_ERR")"; then
     rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$rows")"
@@ -1564,6 +1572,9 @@ set_labels() { # $1 = on|off
     fi
   fi
   log "set_labels accepted=$verified rejected=$unverified engagement=$eng (SYNCHRONOUS: what the API took on this call — durability is checked on the NEXT pass, because the runner agent re-asserts its own set 60-120s later)"
+  # ⛔ PUBLISH WHAT WAS WRITTEN (#4085 review P1, measured): `ok=0 fail=0` is a SUCCESSFUL no-op (an empty
+  # managed set), and a caller told only the exit status cannot tell it from a pool that was relabelled.
+  SET_LABELS_OK="$ok"
   # Unverified writes are a FAILURE for the caller: recording the transition on them is what produced
   # a state file claiming `local` with no carrier.
   [ "$fail" -eq 0 ] && [ "$unverified" -eq 0 ]
@@ -1908,12 +1919,12 @@ if [ "$healthy" = 3 ]; then
   blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
   blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
   # ⛔ THE CAPABILITY IS CAPTURED HERE, NOT READ AT WRITE TIME (review P2, measured). `$CAPABILITY` is a
-  # global that `set_labels` OVERWRITES when ITS read fails (`:1431`), and the repair runs BETWEEN this
+  # global that `set_labels` OVERWRITES when ITS OWN enumeration fails, and the repair runs BETWEEN this
   # point and the last verdict write — so a writer reading `${CAPABILITY:-none}` at call time published
   # the LABEL read's capability beside a `capacity=` the CENSUS measured. Measured on the
   # enumeration-failure shape: `capacity=saturated` (a certifying census verdict) next to
   # `capability=runner_inventory:upstream http=5xx` (the label read) on one durable line. `capability=`
-  # is defined as the INVENTORY read's capability (`:379`), so the census value is the honest one; the
+  # is defined as the INVENTORY read's capability (the `CAPABILITY` declaration at the top), so the census value is the honest one; the
   # label read's failure is already named by `set_labels`' own log lines.
   blind_capability="${CAPABILITY:-none}"
   if [ "$DRY" = 1 ]; then
@@ -1968,7 +1979,7 @@ if [ "$healthy" = 3 ]; then
   # it was not asked to change (a PUT storm on the runner agent's own label set is a real cost — the
   # agent re-asserts 60-120 s later, which is why the success path compares modes rather than re-writing).
   # ⛔ THE SKIP REQUIRES A LABEL READING, NOT A SUBSTITUTE — the same ruling this file already makes for
-  # the hysteresis hold (`:2085`: "key the hold on `prev` … NOT on `mode`", because a reading that
+  # the hysteresis hold in `main` ("key the hold on `prev` … NOT on `mode`"), because a reading that
   # resolves from the JOBS INFERENCE is not the pool's label state). `current_mode` counts the runners
   # carrying the fallback label; `mode_from_jobs` answers "which pool is SERVING" — a NARROWED claim
   # (#2897) — and the two are NOT interchangeable at a write decision. Measured shape: recorded mode
@@ -2000,21 +2011,27 @@ if [ "$healthy" = 3 ]; then
   log "repair: the state file records mode=$recorded but $repair_why — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
   repair_ok=1
   if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
-  if [ "$repair_ok" = 1 ]; then
+  # ⛔ TWO PRECONDITIONS, NOT ONE (review P1, measured): `repair_ok` records that `set_labels` reported NO
+  # FAILURE, which an EMPTY managed set also does (`set_labels` returns success on `fail=0` and leaves
+  # `ok=0`) — so a
+  # pass that wrote NOTHING and one that relabelled the pool were indistinguishable, and this arm
+  # published a convergence for both. `SET_LABELS_OK` is the write COUNT the function now publishes; the
+  # convergence verb requires ok>0, and the empty-set arm below claims no convergence at all.
+  if [ "$repair_ok" = 1 ] && [ "${SET_LABELS_OK:-0}" -gt 0 ]; then
     # ⛔ THE CONVERGENCE IS RE-MEASURED, NOT INFERRED FROM THE WRITE (review P1, measured). `set_labels`
     # writes ONLY the runners carrying this gate's pool marker (`managed_ids`, :1324), while `mode`
-    # counts EVERY runner carrying the fallback label (`current_mode`, :1586) — and this file's own
-    # vocabulary defines "the pool advertises mode=X" as that COUNT (`:2075`: "`carriers` is what the
-    # pool ADVERTISES right now"). So a write that lands on the managed set does NOT establish that the
-    # pool's count changed: a runner outside the pool can still carry `ubuntu-latest` (the suite's (i)
-    # fixture — never relabelled, by design #2327), and the line would then claim a pool-wide
-    # convergence the very next pass contradicts. Measured, on the release-repair path with one such
-    # runner present: `repair OK … the pool now advertises github` and the verdict
-    # `the pool was converged to the mode the state file records (github)`, while the next pass read
-    # `mode=local`. The same line also published `mode=`, the PRE-write reading, beside a post-write
-    # claim — one durable line disagreeing with itself. So the post-repair state is READ, and the claim
-    # is only as wide as the re-read: the managed write is what this pass performed, and the pool's
-    # advertised mode is what it measures afterwards.
+    # counts EVERY runner carrying the fallback label (`current_mode`'s count read) — and this file's own
+    # vocabulary defines "the pool advertises mode=X" as that COUNT (see the `carriers` line above
+    # `write_verdict`: mode=local means AT LEAST ONE runner carries the fallback label). So a write that
+    # lands on the managed set does NOT establish that the pool's count changed: a runner outside the
+    # pool can still carry `ubuntu-latest` (the suite's (i) fixture — never relabelled, by design #2327),
+    # and the line would then claim a pool-wide convergence the very next pass contradicts. Measured, on
+    # the release-repair path with one such runner present: `repair OK … the pool now advertises github`
+    # and the verdict `the pool was converged to the mode the state file records (github)`, while the
+    # next pass read `mode=local`. The same line also published `mode=`, the PRE-write reading, beside a
+    # post-write claim — one durable line disagreeing with itself. So the post-repair state is READ, and
+    # the claim is only as wide as the re-read: the managed write is what this pass performed, and the
+    # pool's advertised mode is what it measures afterwards.
     post_mode=""
     if post_mode="$(current_mode)"; then
       mode="$post_mode"; MODE_SOURCE="runners"
@@ -2025,16 +2042,37 @@ if [ "$healthy" = 3 ]; then
       post_mode=""; mode="unknown"; MODE_SOURCE="none"
     fi
     if [ "$post_mode" = "$recorded" ]; then
-      log "repair OK: the pool was converged to the recorded mode=$recorded — CONFIRMED by a post-repair re-read (mode=$post_mode); demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded"
+      log "repair OK: the pool was converged to the recorded mode=$recorded — CONFIRMED by a post-repair re-read (mode=$post_mode); ${SET_LABELS_OK} runner(s) were written, demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded"
       write_blind_verdict "the pool was converged to the mode the state file records ($recorded), and a post-repair re-read of the label state AGREES (mode=$recorded)"
       log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed — the pool now advertises $recorded and the recorded DECISION is unchanged (the state file still says $recorded)"
+    elif [ -z "$post_mode" ]; then
+      # The write landed on the managed set; the pool-wide question was not answerable afterwards.
+      log "repair OK (MANAGED SET ONLY): ${SET_LABELS_OK} managed runner(s) were converged to the recorded mode=$recorded, but the post-repair re-read did not answer — the POOL-WIDE label state is UNMEASURED (mode=unknown on this line is the absence of a reading, not a pool state); the state file still says $recorded and this pass took no new decision"
+      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read did NOT answer — the POOL-WIDE mode is unmeasured and $recorded is NOT confirmed — the recorded decision is unchanged"
+      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is unmeasured (the post-repair re-read did not answer) — the recorded DECISION is unchanged (the state file still says $recorded)"
     else
-      # The write landed on the managed set and the pool-wide count did NOT reach the recorded mode.
-      # Both facts are named, and neither is rounded up to "the pool was converged".
-      log "repair OK (MANAGED SET ONLY): the managed runners were converged to the recorded mode=$recorded, but the post-repair re-read does NOT agree — $(if [ -z "$post_mode" ]; then echo 'the re-read did not answer, so the pool-wide label state is UNMEASURED'; else echo "the pool-wide mode is $post_mode: a runner OUTSIDE this gate's ownership still carries the fallback label, and set_labels writes only the managed set (#2327)"; fi); the state file still says $recorded and this pass took no new decision"
-      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read does NOT confirm the pool-wide mode — $(if [ -z "$post_mode" ]; then echo 'the re-read did not answer'; else echo "mode=$post_mode, i.e. a runner outside this gate's ownership still carries the fallback label"; fi) — the recorded decision is unchanged"
-      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is $(if [ -z "$post_mode" ]; then echo 'unmeasured (the post-repair re-read did not answer)'; else echo "mode=$post_mode"; fi) — the recorded DECISION is unchanged (the state file still says $recorded)"
+      # ⛔ THE CAUSE IS DIRECTION-DEPENDENT (review P1, measured). "A runner outside this gate's ownership
+      # still carries the label" is only TRUE when a carrier exists; `mode=github` means ZERO carriers by
+      # this file's own definition, so on the ENGAGE direction that sentence asserted the opposite of what
+      # the re-read had just proved — one durable line contradicting itself (measured: recorded=local, an
+      # EMPTY managed set, re-read github). So the cause names what THIS direction's disagreement means.
+      if [ "$recorded" = local ]; then
+        post_cause="no runner carries the fallback label AT ALL, so the write did NOT stick — the PUTs were accepted when they ran, and the runner agent re-asserts its own label set 60-120 s later"
+      else
+        post_cause="at least one runner still carries the fallback label: a carrier OUTSIDE this gate's managed set (set_labels writes only the managed set, #2327), or a PUT the runner agent has since re-asserted"
+      fi
+      log "repair OK (MANAGED SET ONLY): ${SET_LABELS_OK} managed runner(s) were converged to the recorded mode=$recorded, but the post-repair re-read does NOT agree — the pool-wide mode is $post_mode: ${post_cause}; the state file still says $recorded and this pass took no new decision"
+      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read does NOT confirm the pool-wide mode — mode=$post_mode, i.e. ${post_cause} — the recorded decision is unchanged"
+      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is mode=$post_mode — the recorded DECISION is unchanged (the state file still says $recorded)"
     fi
+  elif [ "$repair_ok" = 1 ]; then
+    # ⛔ A REPAIR THAT WROTE NOTHING IS NOT A CONVERGENCE (review P1, measured). `ok=0` with `fail=0` means the
+    # managed set is EMPTY: no runner carries this gate's pool marker, so `set_labels` had nothing to PUT and
+    # its exit status still says success. Nothing was relabelled and `mode` — measured THIS pass and unchanged
+    # by it — is what the pool still advertises. No re-read: nothing was written to observe.
+    log "repair WROTE NOTHING: set_labels reported no failure but wrote NO runner (ok=0) — the managed set is EMPTY (no runner carries this gate's pool marker), so nothing was relabelled; mode=$mode is this pass's own measurement and the recorded mode=$recorded is NOT confirmed"
+    write_blind_verdict "the repair wrote NOTHING — no runner carries this gate's pool marker, so there was nothing to relabel; the pool's mode is still $mode and the recorded mode ($recorded) is NOT confirmed"
+    log "cannot measure DEMAND — no mode decision taken, and NO repair was performed: the managed set is EMPTY (nothing carries this gate's pool marker), the pool's mode is mode=$mode, the recorded DECISION is unchanged (the state file still says $recorded)"
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
@@ -2053,7 +2091,7 @@ if [ "$healthy" = 3 ]; then
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
     # ⛔ THE ARM'S TERMINAL LINE MAY NOT PUBLISH THE PRE-WRITE READING (review P2/P3, measured). `mode` is
-    # `current_mode` taken BEFORE the write (`:1770`), so `(leaving mode=$mode)` reported a pre-repair
+    # `current_mode` taken BEFORE the write (up in `main`), so `(leaving mode=$mode)` reported a pre-repair
     # measurement as the pool's post-repair state — after a PARTIAL write that is false, and it contradicts
     # the line above it. What the pass knows: the repair did not land, and the labels may be partly changed.
     log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land — the pool's labels may be PARTIALLY changed (see the set_labels lines above); mode=$recorded is NOT confirmed"
