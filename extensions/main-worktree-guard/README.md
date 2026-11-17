@@ -338,8 +338,12 @@ Three consequences are deliberate and pinned by tests:
    is where a `pi -p` child actually runs.
 2. The arm stays **conservative past what it can prove**, in the fail-closed
    direction only: a target it cannot resolve (a `$VAR` the command never
-   assigns) is anchored at the command's directory and probed there, an
-   unreadable `git status` blocks, and a hardlink sink blocks unread.
+   assigns) keeps the literal component and is anchored by
+   `resolve(writeCwd, spelling)` — so a **relative** spelling is anchored at the
+   command's directory and probed there, while an **absolute** one is not
+   re-rooted by that `resolve` and anchors at its OWN outermost existing
+   directory (`/tmp/$X/f` → the ancestor walk stops at `/tmp`). An unreadable
+   `git status` blocks, and a hardlink sink blocks unread.
 3. The reason line names the **redirect** — what is discarded — never the
    source pathspec: `git show HEAD:clean > <dirty-target>` used to report
    `clean`.

@@ -317,7 +317,7 @@ async function partB() {
   // uses), so this suite never touches the operator's file at all. The sibling
   // suite in this directory does the same (test-discard-gate.mjs).
   const { homedir } = await import("node:os");
-  const { readFileSync, existsSync, unlinkSync, mkdirSync, utimesSync } = await import("node:fs");
+  const { readFileSync, existsSync, unlinkSync, mkdirSync, utimesSync, symlinkSync } = await import("node:fs");
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "m4-recovery-window-")));
   const savedHomedir = process.env.HOME;
   process.env.HOME = tmp;
@@ -690,6 +690,65 @@ async function partB() {
     const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
     checkD("B9b the caveat names session START and says an inline/export CANNOT set it",
       /session START/.test(caveat?.[1] ?? "") && /CANNOT/.test(caveat?.[1] ?? ""), caveat?.[1]);
+    // B9c (#3620 review, P3) — the `unavailable` cause is the DEGRADED-IMPORT stub:
+    // nothing was stat'ed, so "A marker file EXISTS at …" would assert a fact this
+    // process does not have. Behavioural reproduction needs a half-loaded
+    // classifier, which the fail-safe defaults make all-or-nothing, so the
+    // property is pinned at the source: the special case must EXIST and must
+    // precede the wording that claims a file was seen.
+    const inertSrc = (srcLines.join("\n").match(/function _inertMarkerLines\(\)[\s\S]*?\n}/) ?? [""])[0];
+    check("B9c the INERT paragraph handles `unavailable` WITHOUT claiming a file exists",
+      inertSrc.indexOf('d.cause === "unavailable"') !== -1 &&
+      inertSrc.indexOf("A marker file EXISTS") > inertSrc.indexOf('d.cause === "unavailable"'), true);
+
+    // ── B10 (#3620 review, P2) — the #1484 SCRIPT-CONTENT arm's refusal ──────
+    //
+    // The report this issue came from measured TWO dead ends, and this arm — the
+    // one the plan comment named as in-scope for the message commit — still
+    // printed only `set the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a
+    // solo session`: no session-start caveat (an inline prefix or an `export`
+    // cannot set it, #1239), no reachable route, and no mention that the TTL
+    // MARKER does not lift this arm at all (M4 stays active under it, D3) — so a
+    // reader who reached for the marker hit a silent second dead end. The B9
+    // sweep could not see the site either (it keys on the literal `Or set
+    // AGENT_ALLOW_MAIN_EDITS`), which is why this is asserted end-to-end.
+    setMarker(false);
+    const evilScript = join(tmp, "evil-4101.sh");
+    writeFileSync(evilScript, "#!/bin/bash\ngit reset --hard\n");
+    const b10 = await drive(`bash ${evilScript}`);
+    check("B10 a script whose CONTENT holds a non-sanctioned git op is BLOCKED (#1484)", b10 !== null, true);
+    checkD("B10b …and the refusal carries the session-START caveat (#1239)",
+      /read at session START/.test(b10?.reason ?? "") && /CANNOT set it/.test(b10?.reason ?? ""), b10?.reason);
+    checkD("B10c …and it says the TTL MARKER does not lift THIS arm (D3), instead of leaving the marker as a silent second dead end",
+      /MARKER does NOT lift/.test(b10?.reason ?? ""), b10?.reason);
+    checkD("B10d …and it names routes a blocked session can actually take",
+      /human terminal/.test(b10?.reason ?? "") && /START the/.test(b10?.reason ?? ""), b10?.reason);
+
+    // ── B12 (#3620 review, P3) — the mint refusal must state the RIGHT direction
+    //
+    // `_stampMarker` has already run when the refusal is built, so "the escape
+    // marker was NOT created" is only true when no file resulted. A marker path
+    // reached through a SYMLINKED `~/.pi/agent` is written (and audited) and then
+    // refused by the read side — telling that reader "the stamp did not take"
+    // sends them to re-check permissions on a file they can see.
+    const agentDir = join(tmp, ".pi", "agent");
+    rmSync(agentDir, { recursive: true, force: true });
+    mkdirSync(join(tmp, "real-agent"), { recursive: true });
+    symlinkSync(join(tmp, "real-agent"), agentDir);
+    try {
+      const b12 = await drive(`touch ${markerPath}  # recovery: symlinked agent dir`);
+      check("B12 a marker touch behind a SYMLINKED ~/.pi/agent is REFUSED (the read side never trusts a link)",
+        b12 !== null, true);
+      checkD("B12b …and the refusal names the SYMLINK cause", /\[?symlinked/.test(b12?.reason ?? ""), b12?.reason);
+      checkD("B12c …and it says the file WAS written instead of claiming the stamp did not take",
+        /was WRITTEN but cannot open a window/.test(b12?.reason ?? "") &&
+        !/was NOT created/.test(b12?.reason ?? ""), b12?.reason);
+      checkD("B12d …and it states the audit row was appended (the write really happened)",
+        /gate_bypass/.test(b12?.reason ?? ""), b12?.reason);
+    } finally {
+      try { unlinkSync(agentDir); } catch { /* best-effort */ }
+      mkdirSync(agentDir, { recursive: true });
+    }
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

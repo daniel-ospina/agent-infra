@@ -450,6 +450,7 @@ async function partB() {
     };
     const allowed = (r) => r === undefined || r === null;
     const blocked = (r) => !!r && r.block === true;
+    const reason = (r) => String(r?.reason ?? "");
 
     // ── B5: clean targets / read-only / index-only → ALLOW ──
     expectTrue("B5a: worktree, clean target → `git checkout -- clean.txt` ALLOWED",
@@ -1410,6 +1411,28 @@ async function partB() {
     expectTrue("B9: worktree session + HUB dirty target → BLOCKED (M5 resolves the invocation target)",
       blocked(hubHit), JSON.stringify(hubHit)?.slice(0, 200));
     execSync("git checkout -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
+    // ── B9d/B9e (#3620 review, P2) — M5's own refusal must carry the INERT
+    // diagnosis. `_inertMarkerLines()` rode only on M4's disorder surface, so
+    // THIS arm — the one that actually prints "stamp the ~/.pi/agent/…MARKER" —
+    // re-prescribed the stamp to a session whose marker was already on disk and
+    // inert, the exact recurrence the README claims is impossible. Reached from a
+    // worktree session (M4 exempt) against the HUB's dirt: the geometry in which
+    // M5's hatch-INACTIVE text is the only answer.
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", ".allow-main-edits"),
+      JSON.stringify({ session_id: "some-other-session", reason: "elsewhere", ts: new Date().toISOString() }) + "\n");
+    try {
+      write(join(hub, "dirty.txt"), "MUTANT\n");
+      const inertHit = await bash(`git -C "${hub}" checkout -- dirty.txt`, wt);
+      expectTrue("B9d: an INERT marker + hub-targeted discard from a worktree is BLOCKED",
+        blocked(inertHit), JSON.stringify(inertHit)?.slice(0, 200));
+      expectTrue("B9e …and the M5 refusal DIAGNOSES the inert marker instead of re-prescribing the stamp",
+        /Deliberate discard: set AGENT_ALLOW/.test(reason(inertHit)) && /INERT \[/.test(reason(inertHit)),
+        `reason=${reason(inertHit).slice(0, 300)}`);
+    } finally {
+      execSync("git checkout -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
+      rmSync(join(home, ".pi", "agent", ".allow-main-edits"), { force: true });
+    }
 
     // ── B10: unverifiable targets fail CLOSED ──
     expectTrue("B10a: unresolvable pathspec (`$FILE`) fails closed",
@@ -2761,6 +2784,13 @@ async function partD() {
       const hardSink = await bash(`git show HEAD:dirty.txt > ${linkOut}/hard.txt`, wt);
       expectTrue("D10c a HARDLINK sink (nlink>1, landing checkout unknowable) is BLOCKED — fail closed",
         blocked(hardSink), `was allowed: ${JSON.stringify(reason(hardSink)).slice(0, 200)}`);
+      // D10c2 (#3620 review, P3) — the Review Scope Contract's R3 evidence says
+      // the reason names the LINK COUNT and why the landing checkout cannot be
+      // determined. Unasserted, a mutant that blocks with the generic dirty-checkout
+      // message passed this case: the verdict was pinned, the ATTRIBUTION was not.
+      expectTrue("D10c2 …and the reason names the link count and why the landing checkout cannot be determined",
+        /hardlink \(link count > 1\)/.test(reason(hardSink)) && /cannot be determined/.test(reason(hardSink)),
+        `reason=${JSON.stringify(reason(hardSink)).slice(0, 300)}`);
     } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
     // Control: the same symlink shape onto CLEAN content is a read-and-export
     // that destroys nothing — the link resolution must not become a blanket rule.

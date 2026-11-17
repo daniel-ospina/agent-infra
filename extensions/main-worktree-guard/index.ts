@@ -680,6 +680,19 @@ function _inertMarkerLines(): string[] {
   const d = _currentMarkerDiagnosis;
   if (d.active || d.cause === "absent") return [];
   const why = _MARKER_CAUSE_TEXT[d.cause] ?? d.cause;
+  // ⛔ `unavailable` is NOT an observation about the file (#3620 review, P3): it
+  // is the stub `diagnoseAllowMarkerState` that stands in when the marker rules
+  // never loaded, so NOTHING was stat'ed and "a marker file EXISTS at …" would
+  // assert a fact this process does not have. It is the degraded-import cause,
+  // and it says so instead of pointing at a file.
+  if (d.cause === "unavailable") {
+    return [
+      `     ⚠️ The escape marker's state is UNKNOWN [unavailable] — ${why}.`,
+      `        Nothing was read, so no marker can be claimed active here and none`,
+      `        can be claimed absent either. Recovery does not need the marker:`,
+      `          git -C <repo> restore <path>   # from a human terminal`,
+    ];
+  }
   const lines = [
     `     ⚠️ A marker file EXISTS at ${_markerPath()} but is INERT [${d.cause}] — ${why}.`,
   ];
@@ -732,13 +745,34 @@ function _markerTouchBlockReason(cause: string | null, sessionId: string | null)
     ].join("\n");
   }
   const why = _MARKER_CAUSE_TEXT[cause] ?? cause;
+  // ⛔ WHICH DIRECTION (#3620 review, P3): `_stampMarker` has ALREADY run when
+  // this builder is called, and it is fail-silent. "The stamp did not take" is
+  // therefore true only when NO file resulted — `absent`, or the marker rules
+  // never loaded. For every other cause the write DID land (a `gate_bypass` row
+  // was appended and the guard logged `🔓 Escape marker active`) and it is the
+  // READ side that refuses that file, so telling the reader it was never created
+  // sends them to re-check permissions on a file they can see: the same dead end
+  // this issue is about, one level down.
+  const written = cause !== "absent" && cause !== "unavailable";
   return [
-    `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
-    `   Diagnosis: ${why}.`,
-    `   Allowing the \`touch\` would leave a file that cannot open the recovery`,
-    `   window and a log line claiming it did, so it is refused instead.`,
-    `   → Check that ${dirname(_markerPath())} is writable and is not a symlink,`,
-    `     then run the touch again as its own bash call:`,
+    ...(written
+      ? [
+          `⛔ The escape marker was WRITTEN but cannot open a window (#3620).`,
+          `   Diagnosis: ${why}.`,
+          `   The stamp landed — the file exists at ${_markerPath()} and a \`gate_bypass\``,
+          `   audit row was appended — but the READ side refuses THAT file, so this`,
+          `   \`touch\` is refused rather than reported as an open window (no false PASS).`,
+        ]
+      : [
+          `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
+          `   Diagnosis: ${why}.`,
+          `   Allowing the \`touch\` would leave a file that cannot open the recovery`,
+          `   window and a log line claiming it did, so it is refused instead.`,
+          `   → Check that ${dirname(_markerPath())} is writable and is not a symlink.`,
+        ]),
+    `   → Fix the cause named above, then run the touch again as its own bash call`,
+    `     (an \`expired\` / \`session-mismatch\` / \`unscoped\` marker re-stamps; for`,
+    `     \`symlinked\`, ~/.pi/agent must stop being a link first):`,
     `       touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
     `   → Or recover from a human terminal (terminals are never intercepted):`,
     `     git -C <repo> restore <path>`,
@@ -1992,14 +2026,18 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * from untracked-only dirt (nothing tracked is destroyed), so the arm neither
  * blocks on `??` scratch output nor conflates the two in its message. Unlike
  * the comparison it replaces, one wrong ALLOW here is unrecoverable, which is
- * why the arm is conservative: an unresolvable target is anchored at
- * `writeCwd` by the `resolve` below and probed at its nearest existing
- * ancestor, and an unreadable status FAILS CLOSED.
+ * why the arm is conservative: an unresolvable target keeps its literal
+ * component and is anchored by `resolve(writeCwd, …)` below, then probed at its
+ * nearest existing ancestor — which is `writeCwd` for a RELATIVE spelling and
+ * the spelling's OWN outermost existing directory for an absolute one
+ * (`resolve(writeCwd, "/tmp/$X/f")` stays `/tmp/$X/f`, so the walk stops at
+ * `/tmp`) — and an unreadable status FAILS CLOSED.
  *
  * Declared residual: a target anchored to a name this command never assigns
  * (`> "$SOME_ENV_VAR/f"`) keeps the literal `$SOME_ENV_VAR` component and is
- * therefore anchored at the command's own directory — the same conservative
- * answer the old arm gave by failing closed. A target anchored to a name the
+ * therefore anchored as above — the same conservative answer the old arm gave
+ * by failing closed, and NOT "always the command's own directory": that is only
+ * true of the relative spelling. A target anchored to a name the
  * command DOES assign is resolved here (`_wtCommandVars`), which is the fail-open
  * this predicate exists to close.
  */
@@ -2116,8 +2154,11 @@ function _catFileRevertStateBlock(
   // "inside a checkout", never "outside the cwd of this invocation".
   //
   // The #1060 residual is preserved rather than special-cased: an UNRESOLVABLE
-  // component (`> "$SOME_ENV_VAR/f"`) is anchored by `resolve(writeCwd, rel)`
-  // above, so its ancestor walk lands on `writeCwd` and it is still probed there.
+  // component (`> "$SOME_ENV_VAR/f"`) keeps its literal segment through
+  // `resolve(writeCwd, rel)` above — which anchors a RELATIVE spelling at
+  // `writeCwd` (its ancestor walk lands there and it is still probed) and an
+  // ABSOLUTE one at its own outermost existing directory (`resolve` does not
+  // re-root an absolute path: `/tmp/$X/f` walks to `/tmp`).
   const candidates = new Set<string>();
   let hardlinked: string | null = null;
   // A link chain longer than the kernel would follow: the landing site could not
@@ -3261,6 +3302,14 @@ function _worktreeDiscardBlockReason(
                 `     a whole-tree discard (\`.\`, \`./\`, pathspec magic, a glob, a brace) — and`,
                 `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
                 `     entire subtree, so name a FILE when that is what you mean.`,
+                // #3620 review (P2) — the INERT-marker diagnosis rides along HERE
+                // too, not only on M4's disorder surface. This arm is the one that
+                // prints "stamp the … MARKER" to a session that may have already
+                // stamped it: without this, a reader whose marker is inert (no
+                // session id, another session's id, past the TTL, behind a symlink)
+                // is told to do the thing they just did — the exact recurrence the
+                // README now claims is impossible.
+                ..._inertMarkerLines(),
               ]),
         ]),
   ].join("\n");
@@ -5544,8 +5593,13 @@ function _gateScriptPathContent(command: string, scriptPath: string, execCwd: st
         `   → Run the underlying git commands directly (each is gated on its own), or do`,
         `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
         `   → cd-ing into a worktree from a HUB-ROOTED session does not lift this — the`,
-        `     gate keys on the session cwd. Start the session in the worktree, or set`,
-        `     the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a solo session.`,
+        `     gate keys on the session cwd. The reachable routes are to START the`,
+        `     session in the worktree, or to run the work from a human terminal`,
+        `     (terminals are never intercepted).`,
+        `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for a`,
+        `     deliberate solo session — the TTL escape MARKER does NOT lift this arm`,
+        `     (M4 stays active under it, D3), so the env hatch is the only one.`,
+        ..._ENV_HATCH_CAVEAT,
       ].join("\n");
     }
     return null;
