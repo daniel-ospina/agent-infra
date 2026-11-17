@@ -115,8 +115,10 @@ _is_harness_shim() {  # a harness shim: its OWN sentinel line, and nothing else 
   local _f="$1" _head="" _chunk=""
   # ⛔ THE READ IS `read -N`, AND IT IS GATED ON THE SHELL BECAUSE THAT IS THE HONEST SHAPE. Two arms,
   # each VERIFIED on the host it serves — not a compromise, and not `read -N` everywhere:
-  #   * bash 5.x (the cloud cells, and the Mac's Homebrew bash — what the fleet runs): ONE
-  #     `read -r -N 8192`, no fork, ~0.75 ms on the 41 MB binary vs 25 ms for `grep` (33x), and NULs are
+  #   * bash 5.x (the cloud cells, and the Mac's Homebrew bash — what the fleet runs): `read -r -N`
+  #     builtins only, no fork — ONE 8 KiB read when the candidate is identified by it (the common
+  #     case), a second +24 KiB read only for a candidate it could not identify (`_is_harness_shim`
+  #     below). ~0.75 ms per 8 KiB stage on the 41 MB binary vs 25 ms for `grep` (33x), and NULs are
   #     discarded WITHOUT being counted, so a BINARY shim's sentinel (#10009's fixture: ELF magic +
   #     NULs + the marker) is still found. VERIFIED on 5.2.21.
   #   * bash 3.2.57 (macOS `/bin/bash`, a declared runtime — `scripts/check-bash32-parse.sh`
@@ -124,7 +126,7 @@ _is_harness_shim() {  # a harness shim: its OWN sentinel line, and nothing else 
   #     `bash:3.2` image: `read: -N: invalid option`, rc=2) AND it treats a NUL as end-of-input
   #     (VERIFIED: `\177ELF` + NULs → `ELF` then rc=1 with no data; a NUL-padded file → rc=0, 0 bytes,
   #     forever). So an in-process read on 3.2 cannot see a binary shim's sentinel at ALL, and that
-  #     arm instead enforces the SAME 8 KiB BYTE window through a `head -c 8192`-fed `grep` (2
+  #     arm instead enforces the SAME 32 KiB BYTE window through a `head -c 32768`-fed `grep` (2
   #     processes per candidate on that host, 0 on the fleet's bash 5). Bounded on purpose — see E-2's
   #     note in the else-branch below: an unbounded read there bypasses the #984 admin-merge gate.
   # ⛔ WHY NOT A CHUNKED `read -n` LOOP FOR BOTH (it was written first and measured): `-n` honours a
@@ -140,13 +142,18 @@ _is_harness_shim() {  # a harness shim: its OWN sentinel line, and nothing else 
   # `scripts/gh-shim/gh` states this ordering rule verbatim (§10(a5)); the pre-#3998
   # `grep -qa … 2>/dev/null` was immune only because grep opened the file itself. Reproduced by review
   # at rc=0 with the diagnostic on the merged stream; §P's unreadable-candidate arm pins it now.
-  # ⛔ AND THE WINDOW IS 32768 NON-NUL CHARACTERS ON BASH >= 5 (measured, stated as the number it
-  # is) / 32768 BYTES on 3.2:
-  # `read` DISCARDS NUL bytes without counting them, so the real 41 MB gh costs ~12–19 KB of reads to
-  # collect 8192 characters, and a pathological mostly-NUL candidate is read to EOF. That residual is
-  # accepted (still ~2000x cheaper than the full read it replaced) and `scripts/gh-shim/gh` bounds by
-  # BYTES (`head -c 8192`), so the two resolvers can disagree about what falls inside their window on
-  # a NUL-bearing candidate — recorded here, pinned by §P's NUL-padded arm, never implied away.
+  # ⛔ AND THE WINDOW IS 32768 ON BOTH HOSTS — 32768 NON-NUL CHARACTERS on bash >= 5, 32768 BYTES on
+  # 3.2. `read` DISCARDS NUL bytes without counting them, so the real 41 MB gh costs ~48–76 KB of reads
+  # to collect 32768 characters, and a pathological mostly-NUL candidate is read to EOF. That residual
+  # is accepted (still ~500x cheaper than the full read it replaced), and because one arm counts
+  # NON-NUL CHARACTERS while the other counts BYTES the two can disagree about what falls inside their
+  # window on a NUL-bearing candidate — recorded here, pinned by §P's NUL-padded arm, never implied
+  # away.
+  # ⛔ WIDER THAN THE LIMITER ON PURPOSE — 32 KiB vs `gh-limit.py`'s 8192 BYTES. The two windows answer
+  # two different questions and the CHAIN depends on them differing: the limiter must NOT skip the #984
+  # argv guard (its sentinel sits at byte 31551) because it INSERTS that guard as its child, while this
+  # adapter MUST skip it (or the guard is inserted twice and every gh call pays for both). §W pins both
+  # ends of that pair, so a future edit cannot move either one silently.
   if (( BASH_VERSINFO[0] >= 5 )); then
     # ⛔ TWO STAGES, 8 KiB THEN +24 KiB. The window is 32 KiB because a harness LAYER's sentinel can sit
     # well past the 8 KiB the LIMITER reads: `scripts/gh-shim/gh` (the #984 argv guard) puts its marker
@@ -173,12 +180,13 @@ _is_harness_shim() {  # a harness shim: its OWN sentinel line, and nothing else 
     # NEGATIVE here means the walk execs a shim, i.e. recurses. With `<(...)` grep's status IS the
     # command's. `2>/dev/null` sits on `head`, the process that OPENS the candidate, so an unreadable
     # candidate is silent on both streams and grep answers "not a shim" over an empty stream.
-    # ⛔ BYTE-BOUNDED — AND THAT IS A CORRECTNESS FIX, NOT ONLY COST (round-2 review finding, E-2):
-    # a WHOLE-FILE `grep` finds the #984 argv guard's marker at byte 31551 and SKIPS it, so on a
-    # bash-3.2 host a delegated `gh pr merge --admin` reached the real gh with the admin-merge gate
-    # silently out of the chain — a gate BYPASS on a declared host. `scripts/gh-shim/gh` puts its
-    # marker outside the 8 KiB window ON PURPOSE; a resolver that reads past the window drops that
-    # gate. Cost of the bound here: 2 processes per candidate on this host, 0 on the fleet's bash 5.
+    # ⛔ SAME 32 KiB WINDOW AS THE BASH-5 ARM, IN BYTES — the two hosts must agree on WHICH candidates
+    # are harness layers, or the chain differs by shell. That means this arm ALSO finds the #984 argv
+    # guard's sentinel at byte 31551 and SKIPS it, which is correct and deliberate: the documented chain
+    # is `gh-limit → argv-guard → real gh`, i.e. the LIMITER inserts the guard as its child. An arm that
+    # read only 8 KiB here would exec the guard, and then BOTH layers insert it (measured: 11 children /
+    # 1 guard exec / 110 ms → 39 / 8 / 240 ms — round-2 finding F1). Cost of the bound: 2 processes per
+    # candidate on this host, 0 on the fleet's bash 5.
     grep -qa 'harness-gh-shim-marker' <(LC_ALL=C head -c 32768 2>/dev/null <"$_f") && return 0
   fi
   case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
