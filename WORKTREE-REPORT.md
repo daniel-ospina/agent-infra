@@ -213,7 +213,7 @@ findings above.
 |---|---|
 | `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **211 passed, 0 failed** |
 | `bash scripts/disk-reaper.test.sh` (the `effective_execstarts` move) | **ALL PASS (720 assertions)** |
-| `bash scripts/orchestrator-harness/claim-orphan.test.sh` | **145 passed, 0 failed** |
+| `bash scripts/orchestrator-harness/claim-orphan.test.sh` | **150 passed, 0 failed** (re-measured twice at this head; the `145` first written here does NOT reproduce — the count is the run's own tail line, never carried) |
 | `bash scripts/orchestrator-harness/lane-bound.test.sh` | **83 passed, 0 failed** — including arm (i0), which reads `DRAINER_LANE_TIMEOUT` out of the installer file this addendum edits |
 | `node scripts/check-skill-lint.test.mjs` (with `/tmp/skills` present) | **171 passed, 0 failed** |
 | `node scripts/check-pi-pin-lockstep.mjs` | **132 passed, 0 failed** |
