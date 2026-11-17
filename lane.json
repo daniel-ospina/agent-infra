@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13126-1794885081-p1408234-a45e0462",
+  "_sha": "99355bb21704a066c78d2e82f4fa37634326986e",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13126.log"
+    },
+    {
+      "kind": "branch",
+      "value": "research/12186-m2-windowed-quality"
+    },
+    {
+      "kind": "sha",
+      "value": "23cb01aa3470566ac3cf88f0d2c9c7afe299485b"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-13126"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 10268,
+  "ended_at": 1794895349,
+  "exit_code": 0,
+  "heartbeat_at": 1794895349,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13126-1794885081-p1408234-a45e0462",
+  "lease_until": 1794931949,
+  "pid": 1408234,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794885081,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13126",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-13126"
+}
