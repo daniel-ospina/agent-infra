@@ -46,8 +46,8 @@ Sources cross-referenced: `templates/systemd/*.{service,timer}`, `templates/laun
 | 3 | **cell self-pin** `cell-self-pin.timer` | `scripts/cell-self-pin.sh --install [--takeover]` | cells | unit state only | **not auto-installed**; MUTUALLY EXCLUSIVE with #2 (one actuator per pin) | **yes** |
 | 4 | **disk reaper** `eldato-disk-reaper.timer` | `scripts/install-disk-reaper-timer.sh` ← `templates/{systemd,launchd/reaper}`; bring-up `check_disk_reaper` | both | `state/disk-reaper.status` + `.log` | **armed** (`--apply` rendered; owner-instructed) | **yes** — the disk floor arrives as a threshold and every dispatch starts failing |
 | 5 | **ai drainer** `eldato-ai-drainer.timer` | `scripts/orchestrator-harness/install-drainer-timer.sh` | cells | `state/ai-drainer.beat` | **armed** | **yes** |
-| 6 | **controller watchdog** `eldato-controller-watchdog.timer` | `scripts/install-cell-timers.sh`; bring-up `check_cell_timers` | cells | `LastTriggerUSec` | armed **and INERT — see §3** | **yes** |
-| 7 | **objective reminder** `eldato-objective-reminder.timer` | `scripts/install-cell-timers.sh`; bring-up `check_cell_timers` | cells | `LastTriggerUSec` | armed **and INERT — see §3** | **yes** |
+| 6 | **controller watchdog** `eldato-controller-watchdog.timer` | `scripts/install-cell-timers.sh`; bring-up `check_cell_timers` | cells | `LastTriggerUSec` | armed; **was INERT — FIXED in #3714** (anchor added, `T0` pins it — §3) | **yes** |
+| 7 | **objective reminder** `eldato-objective-reminder.timer` | `scripts/install-cell-timers.sh`; bring-up `check_cell_timers` | cells | `LastTriggerUSec` | armed; **was INERT — FIXED in #3714** (anchor added, `T0` pins it — §3) | **yes** |
 | 8 | **runner autoscale** `eldato-runner-autoscale.timer` | `scripts/install-runner-autoscale-timer.sh` | both | `state/ci-runner-gate.state` | **DISARMED by design** (`--dry-run`), `--arm` is a dated owner step (#2403) | yes — but deliberate |
 | 9 | **conflict rebase** `eldato-conflict-rebase.timer` | **`scripts/install-conflict-rebase-timer.sh` (NEW, this PR)** ← `templates/systemd/eldato-conflict-rebase.{service,timer}` + `templates/launchd/conflict-rebase/` | both | `state/conflict-rebase/timer.beat` + `last-failure` | **armed 2026-11-07** (owner instruction) | **yes — and it was: 0 boxes scheduled it** |
 | 10 | **PR repair** `eldato-pr-repair.service` | `scripts/install-repair-service.sh` | cells | unit `ActiveState` **+ the loop's own last pass** (`$O/state/pr-repair.status.json` `decision`, agent-infra#4010) | **armed** (bring-up does not install it — see §6) | **yes** |
@@ -113,9 +113,9 @@ bash <checkout>/scripts/activate-harness.sh --check
    carries **`OnUnitActiveSec=` with no `OnBootSec=`/`OnCalendar=`/`OnStartupSec=`** — systemd has no
    first elapse to be relative to, so nothing ever arms the monotonic cycle. This is an **inert
    enforcer**: the unit exists, is enabled, prints green, and can never fire. (`templates/systemd/eldato-objective-reminder.timer`,
-   `eldato-controller-watchdog.timer`.) **Not fixed in this PR** — it changes behaviour for two
-   capabilities and deserves its own change with its own test. Filed as **#3714** — the arming
-   directive (`OnBootSec=`) is the remedy, and a template-wide gate is the non-vacuity proof.
+   `eldato-controller-watchdog.timer`.) **FIXED in #3714**: both templates now carry `OnBootSec=`, and the
+   `T0` arm (§6) pins the invariant template-wide — so this cannot recur by a template edit, and the
+   "`OnUnitActiveSec`-only" write-up above is kept as the measured evidence of what it looked like.
 2. **The controller and the PR-repair service were `failed` for 14 hours** (`eldato-orchestrator.service`
    since 04:25 UTC, "Start request repeated too quickly"; `eldato-pr-repair.service` `status=203/EXEC`,
    a missing executable). Nothing read either. On that box the harness had **no dispatcher and no PR
@@ -473,9 +473,9 @@ reconciliation would ship silently; the mutant is the defence, and this paragrap
 1. **The other five boxes are unmeasured** (§2). The launcher is the instrument; running it there is
    the follow-up; the peer-exec failure is recorded as evidence on **#2345** (the existing root for
    "cross-cell work is impossible from a cell"), not as a new issue.
-2. **The two inert timers are reported, not fixed** (§2.1). Changing `OnUnitActiveSec`-only templates
-   to carry an arming trigger changes behaviour for two capabilities; it gets its own change + test —
-   **#3714**.
+2. **The two inert timers are reported, not fixed** (§2.1) — **CLOSED**: the anchor + the template-wide
+   `T0` gate landed for **#3714**. The residual that remains is DEPLOYMENT, not code: the rendered
+   units on a box stay inert until an installer re-renders them.
 3. **`cloud-cell-bringup.sh` does not call the launcher yet.** It installs four of the capabilities
    directly, and calling the launcher's `--install` from it would (a) re-run those installers and
    (b) pass no `DISK_REAPER_REPOS`, which that installer correctly refuses on. The wiring is a

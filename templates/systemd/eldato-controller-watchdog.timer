@@ -22,8 +22,10 @@ Description=eldato controller watchdog every 5 minutes
 #   eldato-objective-reminder.timer   NextElapseUSecMonotonic=infinity  LastTriggerUSec=  service NEVER started
 #   eldato-harness-apply.timer        CONTROL: `list-timers` LAST 15:40:33Z, NEXT 15:50:53Z (~10 min cadence)
 # ⛔ THE CONTROL IS NOT "IDENTICAL EXCEPT FOR ITS ANCHOR" — it is a different unit with a different Unit=,
-# cadence and RandomizedDelaySec. What is true and load-bearing is narrower: it is the only member of the
-# set that HAS an initial-elapse directive, it visibly fires, and the only setting that can produce
+# cadence and RandomizedDelaySec. What is true and load-bearing is narrower, and qualified so a reader who
+# lists the directory does not find it falsified: OF THE THREE TIMERS COMPARED ON THIS BOX, this control is
+# the one carrying an initial-elapse directive; across the shipped set 5 of the 7 repeating templates
+# already had one and exactly these 2 did not. It visibly fires, and the only setting that can produce
 # `infinity` is that directive (`AccuracySec`/`Persistent`/`RandomizedDelaySec` cannot — they shape WHEN a
 # scheduled pass lands, not whether one is ever scheduled). Quote its `list-timers` LAST/NEXT, never its
 # `NextElapseUSecMonotonic`: that field is monotonic-since-BOOT (18h33m here) and reads like "fires every

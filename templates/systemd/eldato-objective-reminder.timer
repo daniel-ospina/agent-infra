@@ -18,9 +18,10 @@ Description=eldato objective reminder every 10 minutes
 # been activated there is nothing to measure from, so `next_elapse=infinity` and the timer sits `active
 # (elapsed)` forever without ever running. Measured on cmux 2026-11-17: this timer's service had NEVER
 # started (`ExecMainStartTimestamp=` empty, zero journal entries, `NextElapseUSecMonotonic=infinity`),
-# while `eldato-harness-apply.timer` — a different unit that is the only member of the set carrying an
-# initial-elapse directive — was visibly firing (`list-timers` LAST 15:40:33Z, NEXT 15:50:53Z, ~10 min
-# cadence). So boot anchors the FIRST elapse and
+# while `eldato-harness-apply.timer` — a different unit, and of the three timers compared on this box the
+# one carrying an initial-elapse directive (across the shipped set, 5 of 7 already had one; exactly these
+# 2 did not) — was visibly firing (`list-timers` LAST 15:40:33Z, NEXT 15:50:53Z, ~10 min cadence). So boot
+# anchors the FIRST elapse and
 # `OnUnitActiveSec` carries the cadence from each pass (still not wall-clock aligned, per the note above).
 [Timer]
 OnBootSec=10min

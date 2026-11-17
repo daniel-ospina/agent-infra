@@ -318,22 +318,32 @@ echo "activate-harness.test.sh"
 TPL_SEEN=0
 for tpl in "$REPO"/templates/systemd/*.timer; do
     [ -f "$tpl" ] || continue
-    grep -qE '^OnUnitActiveSec=' "$tpl" || continue
+    grep -Eq '^[[:space:]]*OnUnitActiveSec[[:space:]]*=' "$tpl" || continue
     TPL_SEEN=$((TPL_SEEN + 1))
-    # ⛔ DIRECTIVES ONLY, ANCHORED. Two separate ways to be blind, both measured:
+    # ⛔ DIRECTIVES ONLY, ANCHORED, WHITESPACE-TOLERANT. Three separate ways to be blind, all measured:
     #   • a directive in the WRONG SECTION is parsed and IGNORED ("Unknown key name ... ignoring");
     #   • a COMMENT that merely MENTIONS an anchor satisfies a substring match while systemd ignores it —
     #     `eldato-runner-autoscale.timer`'s [Timer] block carries comment lines naming `OnCalendar=`, so a
-    #     substring match printed OK after its real `OnBootSec` was deleted. That regression was introduced
-    #     by this arm's own first rewrite and caught in review; the anchored `^` greps below are what close it.
-    TPL_SEC="$(awk '/^\[Timer\]/{f=1; next} /^\[/{f=0} f' "$tpl" | grep -Ev '^[[:space:]]*(#|;|$)')"
+    #     substring match printed OK after its real `OnBootSec` was deleted (a regression this arm's own
+    #     first rewrite introduced, caught in review);
+    #   • a COLUMN-0 `=` assumption SILENTLY SKIPS a template systemd accepts. `systemd-analyze verify`
+    #     reports no diagnostic for `  OnUnitActiveSec=5min` or `OnUnitActiveSec = 5min`, so such a file
+    #     matched neither the prefilter nor the in-section test and produced NO ASSERTION AT ALL (the
+    #     count stayed unchanged) — the same "the gate passes it" shape, one spelling over.
+    # So: strip comments/blank lines, strip leading whitespace, normalise `key = value` to `key=value`,
+    # THEN match anchored `^` keys. Normalising first is what makes the `^` anchors safe to use.
+    TPL_SEC="$(awk '/^[[:space:]]*\[Timer\]/{f=1; next} /^[[:space:]]*\[/{f=0} f' "$tpl" \
+        | grep -Ev '^[[:space:]]*(#|;|$)' \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/') "
     if ! printf '%s\n' "$TPL_SEC" | grep -qE '^OnUnitActiveSec='; then
         bad "T0 $(basename "$tpl") declares OnUnitActiveSec OUTSIDE the [Timer] section — systemd IGNORES it, so the timer has no cadence at all"
         continue
     fi
     if printf '%s\n' "$TPL_SEC" | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
         ok "T0 $(basename "$tpl") anchors its first elapse inside [Timer]"
-    elif grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
+    elif grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" \
+           | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/' \
+           | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
         # Same verdict, different defect — name it, or a reader cannot tell "deleted" from "misfiled".
         bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
     else
