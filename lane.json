@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13289-1794939483-p1656954-d3234f97",
+  "_sha": "83460c6a535f8aeb084a8daa926219bef95df34c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13289.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11824-fold-guards"
+    },
+    {
+      "kind": "sha",
+      "value": "cd4247b7ad93162b65be7eb5897d5a36bb23f8b3"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-13289"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 10872,
+  "ended_at": 1794950355,
+  "exit_code": 0,
+  "heartbeat_at": 1794950355,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13289-1794939483-p1656954-d3234f97",
+  "lease_until": 1794986955,
+  "pid": 1656954,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794939483,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13289",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-13289"
+}
