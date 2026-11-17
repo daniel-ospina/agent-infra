@@ -633,19 +633,11 @@ do_install() {
 #              bare `ExecStart=` resets the list).
 # macOS/launchd has no ExecStart/EnvironmentFile at all — `verify_installed_artifact_plist` asserts the
 # PROGRAM ARGUMENTS identity instead, which is the equivalent fact for that platform.
-unit_dropins() { # <dir> — cat every drop-in, lexical order (systemd's order)
-    local d
-    for d in "$1"/*.conf; do
-        [ -f "$d" ] || continue
-        printf '### %s\n' "$d"
-        cat "$d"
-    done
-}
-
 # ⛔ A FILE BOUNDARY IS LOAD-BEARING HERE, NOT COSMETIC (round-3 verification, F5 — MEASURED false CLEAN
-# on its sibling caller). `unit_dropins` above prints each file's text but NO boundary between files, so
-# a drop-in whose first line is a directive (no `[Service]` header) was attached to whatever section the
-# unit file happened to end in — while systemd parses each file SEPARATELY and DROPS such a line
+# on its sibling caller). This used to merge the unit and its drop-ins with a plain `cat` of each file and
+# NO boundary between them, so a drop-in whose first line is a directive (no `[Service]` header) was
+# attached to whatever section the unit file happened to end in — while systemd parses each file SEPARATELY
+# and DROPS such a line
 # (`v257 src/shared/conf-parser.c:253`: "Assignment outside of section. Ignoring."). For a read-back that
 # grades HOME, that is a false PASS in the dangerous direction: a headerless drop-in `Environment=HOME=`
 # naming the home we rendered would have certified a unit systemd gives a DIFFERENT home.
