@@ -1,0 +1,29 @@
+{
+  "base_sha": "6ae4777fc3e2ea1a1d897dcf5302c79ede018230",
+  "branch": "fix/4085-gate-blind-cache",
+  "head_at_write": "489562f08e21318daa2472952c9884bbd4cc08c0",
+  "issue": "4085",
+  "not_done": [
+    "LIVE verification is OWED: the mechanism is proven against stubs only. On a box whose queue head is all ghosts, a pass must now converge the pool to ci-runner-gate.state and publish verdict=unknown (reason names DEMAND). Not claimed here.",
+    "The ENGAGE/RELEASE DECISION is still unreachable when demand cannot be measured \u2014 deliberately: a pass may not arm or strip the pool on a value it did not read (#2327). Direction 2 (scaling the scan window with queue depth) was NOT taken; the bound stays 25 (#3995) and the reach question stays open.",
+    "The gate's fallback footprint is bounded by FALLBACK_ARM_MAX=3 (#3261), so the 4/23 -> 23/23 hand-relabel in #4085 is an OPERATOR action beyond the gate's arm cap and is NOT restored by this change. The repair restores the RECORDED MODE, not an operator's wider label union.",
+    "The two comment-only P2s from #4104 round 6 needed no change: both are already corrected on main (ci_runner_gate.sh:228-238 states the time-bounded DEFECT rate, and ci_runner_gate.test.sh:2650 marks the .stamp assertion as a presence check, not an independent discriminator). Verified by reading, not assumed."
+  ],
+  "started_at": "2026-11-17T05:42:47Z",
+  "suites": [
+    {
+      "command": "bash scripts/ci_runner_gate.test.sh",
+      "counts": null,
+      "duration_s": 62.8,
+      "exit": 0,
+      "finished_at": "2026-11-17T05:43:50Z",
+      "label": "ci_runner_gate suite",
+      "log": ".worktree-report/logs/01-bash-scripts-ci-runner-gate-test-sh.log",
+      "log_sha256": "21b5abcfeec30f88c8da30402b6b8bd70c5dd3ddd1a56d38235d8c64a8b55f61",
+      "n": 1,
+      "started_at": "2026-11-17T05:42:47Z"
+    }
+  ],
+  "version": 1,
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4085"
+}
