@@ -321,7 +321,14 @@ t0_anchor_value_ok() { # <directive> <value>
             minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly) return 0 ;;
         esac
     fi
-    if command -v systemd-analyze >/dev/null 2>&1; then
+    # ⛔ THE PARSER PATH IS SEAMED (`T0_PARSER`), BECAUSE OTHERWISE THE FLOOR BELOW IS UNREACHABLE ON
+    # EVERY RUNNER (review P2, F2). `T0_PARSER=none` forces the NO-PARSER branch; unset/`auto` keeps the
+    # ordinary `command -v` probe. Measured why a PATH shim is NOT the seam: prepending an
+    # always-failing `systemd-analyze` to PATH makes `command -v` SUCCEED, so every value is then refused
+    # and all 7 correct shipped templates red — the tool must be ABSENT, which no shim can express.
+    # Without a seam that reaches the branch, the pre-fix floor is invisible: restore `grep -Eq '[0-9]'`
+    # and the suite stays green here (systemd-analyze still reds `5minn`), while a macOS host certifies it.
+    if [ "${T0_PARSER:-auto}" != none ] && command -v systemd-analyze >/dev/null 2>&1; then
         case "$k" in
             OnCalendar) systemd-analyze calendar -- "$v" >/dev/null 2>&1 ;;
             *)          systemd-analyze timespan -- "$v" >/dev/null 2>&1 ;;
@@ -419,7 +426,7 @@ for tpl in "$dir"/*.timer; do
         # values, so an unset variable produces exactly that. `scripts/cell-self-pin.sh`'s `timer_value_ok`
         # already codified the rule (refuse `infinity` BEFORE the parser, then delegate to the manager's
         # own parser); this is the same rule, kept local rather than importing another script's guts.
-        # ⛔ WHY THIS IS NOT `systemd-analyze verify`: verify is unusable as the gate — 4 of the 8 shipped
+        # ⛔ WHY THIS IS NOT `systemd-analyze verify`: verify is unusable as the gate — 3 of the 8 shipped
         # templates carry unrendered `{{PLACEHOLDER}}` values, so verify reports "Failed to parse timer
         # value, ignoring: {{INTERVAL_MIN}}min" over CORRECT templates (measured on
         # templates/systemd/*.timer, systemd 255). A gate that reds the shipped set is a false block, so
@@ -482,11 +489,14 @@ t0_scan "$REPO/templates/systemd"
 # one mutation each, so the rule is shown to RED rather than merely shown to print OK. The CONTROL is the
 # same copy unmutated: without it, a red could be a fixture defect instead of the rule.
 T0M="$FX/t0-mutants"
-t0_probe() { # <name> <sed-expression> -> PROBE_MUT (file name), PROBE_OUT (the grader's probe lines)
+t0_probe() { # <name> <sed-expression> [none|auto] -> PROBE_MUT (file name), PROBE_OUT (the grader's lines)
     rm -rf "$T0M"; mkdir -p "$T0M"
     PROBE_MUT="$1.timer"
     sed -E "$2" "$REPO/templates/systemd/eldato-controller-watchdog.timer" >"$T0M/$PROBE_MUT"
-    T0_MODE=probe; PROBE_OUT="$(t0_scan "$T0M")"; T0_MODE=assert
+    # The third argument drives the `T0_PARSER` seam (F2): `none` HIDES the manager so the no-parser
+    # floor is reachable on a runner that has one. Reset to `auto` so no probe leaks into the next.
+    T0_PARSER="${3:-auto}"
+    T0_MODE=probe; PROBE_OUT="$(t0_scan "$T0M")"; T0_MODE=assert; T0_PARSER=auto
 }
 t0_probe control 's/^OnBootSec=5min$/OnBootSec=5min/'
 assert_contains "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m CONTROL an unmutated copy is still graded ok (so a red below is the rule, not the fixture)"
@@ -513,6 +523,43 @@ t0_probe misfiled 's/^\[Unit\]$/[Unit]\nOnBootSec=5min/;s/^OnBootSec=5min$//'
 assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m an anchor filed under [Unit] REDS — systemd parses it and IGNORES it, so the file reads anchored and can never fire"
 assert_contains "$PROBE_OUT" "declares its initial-elapse anchor OUTSIDE" "T0m and the verdict NAMES the misfiling — a reader must be able to tell it from an anchor that was deleted"
 assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it"
+# ⛔ THE WHITESPACE TOLERANCE HAD NO MUTANT EITHER (review P2, F1). The normalisation at the `[Timer]`
+# block and in the POPULATION pin is the fix for this change's third documented blindness — "a COLUMN-0
+# `=` assumption SILENTLY SKIPS a template systemd accepts … such a file produced NO ASSERTION AT ALL".
+# Measured: deleting both `sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/'` clauses left the
+# suite UNCHANGED at 171/0, because all seven probes above are column-0 mutations — so the regression
+# could re-land green. This probe is the refutation, and it is the only one that can produce it: the
+# mutant is a spelling `systemd-analyze verify` accepts silently (`  OnBootSec = 5min`), so a grader that
+# stops normalising must red it rather than skip it.
+t0_probe whitespace 's/^OnBootSec=5min$/  OnBootSec = 5min/'
+assert_contains "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m a WHITESPACE-SPELLED anchor is still graded ok — systemd accepts '  key = value', and a column-0 assumption would SKIP the template instead of grading it"
+assert_absent  "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m and it is GRADED, not dropped — no verdict at all is the fail-open this spelling produced before"
+# ⛔ THE CADENCE SIDE IS A SEPARATE PROBE ON PURPOSE. A whitespace-spelled `OnBootSec` still leaves an
+# `OnUnitActiveSec=` the POPULATION PRE-FILTER finds, so it cannot refute a NARROWED pre-filter: the pin at
+# the end of `t0_scan` only fires when the pre-filter matches a template the normalised matcher would have
+# graded. Indenting the CADENCE is what puts those two matchers on opposite sides — measured, a pre-filter
+# narrowed back to `^OnUnitActiveSec=` reads `T0 graded NO template … (vacuous pass)` on this copy, while the
+# shipped templates stay green (their cadence is at column 0).
+t0_probe whitespace-cadence 's/^OnUnitActiveSec=5min$/  OnUnitActiveSec = 5min/'
+assert_contains "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m a WHITESPACE-SPELLED cadence is graded ok — systemd accepts '  OnUnitActiveSec = 5min' with no diagnostic, so skipping it is a silent loss of coverage"
+assert_contains "$PROBE_OUT" "T0 graded all 1 repeating timer template(s)" "T0m and the POPULATION pin COUNTS it — a column-0 pre-filter would skip this template and grade none at all"
+# ⛔ AND THE NO-PARSER FLOOR IS UNREACHABLE ON EVERY RUNNER WITHOUT THE SEAM (review P2, F2). All 24
+# `runs-on` entries in .github/workflows/ci.yml + ci-main.yml are ubuntu-latest, where `systemd-analyze`
+# exists, so the macOS floor below is executed by nothing: measured, restoring the pre-fix floor
+# (`grep -Eq '[0-9]'`) kept the whole suite green. These probes hide the manager on purpose, so the floor
+# is graded on the surface that actually runs it (a Mac) rather than only on the surface that cannot.
+t0_probe no-parser-unparseable 's/^OnBootSec=.*/OnBootSec=5minn/' none
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0p with NO parser, an UNPARSEABLE timespan still REDS — the floor must not be 'contains a digit'"
+assert_contains "$PROBE_OUT" "DISCARDS every value (5minn)" "T0p and the verdict NAMES the discarded value that systemd would ignore"
+assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0p and no ok verdict is emitted for it (the pre-fix floor printed ok HERE, on macOS, while Linux was correctly red)"
+t0_probe no-parser-unset-render 's/^OnBootSec=.*/OnBootSec=min/' none
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0p with NO parser, the value an UNSET render variable leaves (a bare 'min') REDS"
+t0_probe no-parser-valid 's/^OnBootSec=5min$/OnBootSec=5min/' none
+assert_contains "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0p CONTROL with NO parser, a good timespan is still graded ok — the floor refuses bad values, it does not refuse everything"
+# ⛔ AND THE PARSER PATH IS UNCHANGED BY THE SEAM: the same unparseable value reds with the manager
+# PRESENT, so the two arms are known to agree rather than one being assumed to cover the other.
+t0_probe parser-unparseable 's/^OnBootSec=.*/OnBootSec=5minn/' auto
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0p CONTROL with the parser PRESENT, the same value REDS — the seam changes which rule runs, never the verdict"
 rm -rf "$T0M"
 
 # ── T1: a fully armed box exits 0 and every must row reads OK ─────────────────────────────────
