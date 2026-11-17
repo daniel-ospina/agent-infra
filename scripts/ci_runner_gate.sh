@@ -81,6 +81,15 @@ STATE_DIR="${CI_GATE_STATE_DIR:-$HOME/.pi/agent/state}"
 STATE_FILE="$STATE_DIR/ci-runner-gate.state"
 VERDICT_FILE="$STATE_DIR/ci-runner-gate.verdict"
 LOG_FILE="$STATE_DIR/ci-runner-gate.log"
+# ⛔ THE THREE DECISION KEYS A NON-DECIDING PASS REPORTS AS `unmeasured` (review P3, #3002 P2's rule:
+# `missing != unmeasured`). `write_verdict` always emits `held=`/`streak=`/`engagement_lost=` — they are
+# the ones a scheduler reads to answer "is the gate holding, and has engagement been lost?" — so a
+# strict parser must never see them ABSENT on a pass that took no hold decision and read no durability.
+# `0` would be a number that pass never measured. ONE literal, referenced by every non-deciding writer:
+# the blind writer was fixed first and the two `could not measure` writers still omitted these keys
+# while their own comment claimed "same keys, same order, in both writers" — duplication is how a key
+# set drifts, so the text lives here and nowhere else.
+VERDICT_NO_DECISION_KV="held=unmeasured streak=unmeasured engagement_lost=unmeasured"
 # ⛔ gh ITSELF WRITES DIAGNOSTICS TO STDERR, AND THIS SCRIPT READS gh's OUTPUT AS VALUES (agent-infra#2897,
 # measured on this box). A wrapper on PATH printed
 #   `gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)`
@@ -1831,8 +1840,8 @@ if [ "$healthy" = 2 ]; then
       # reason` while the success line also carried `runners online_idle online_busy offline
       # demanding_idle demanding_busy label_ambiguity demand`). A census that was not read is
       # `unmeasured` — recorded, never assumed, and never absent.
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
-        "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — capacity was not read\n' \
+        "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" "$VERDICT_NO_DECISION_KV" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   else
@@ -1848,9 +1857,9 @@ if [ "$healthy" = 2 ]; then
     if [ "$DRY" = 1 ]; then
       log "verdict NOT updated: --dry-run reports and changes nothing (the previous verdict file is left untouched; this pass measured nothing it could stand behind)"
     else
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
         "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
-        "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
+        "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" "$VERDICT_NO_DECISION_KV" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   fi
@@ -1905,13 +1914,14 @@ if [ "$healthy" = 3 ]; then
   # second replaces the claim with what actually happened on every terminal arm.
   # ⛔ FIELD PARITY WITH `write_verdict` (review P3): same keys, same order — including `held=`,
   # `streak=` and `engagement_lost=`, which a NON-DECIDING pass reports as `unmeasured` rather than
-  # omitting. This is the #3002 P2 rule ("missing != unmeasured") applied to the three keys the success
-  # writer always carries: this pass takes no hold/disengage decision and reads no durability, so a `0`
-  # here would be a number the pass never measured.
+  # omitting (`$VERDICT_NO_DECISION_KV`, defined once at the top and used by every non-deciding writer).
+  # This is the #3002 P2 rule ("missing != unmeasured") applied to the three keys the success writer
+  # always carries: this pass takes no hold/disengage decision and reads no durability, so a `0` here
+  # would be a number the pass never measured.
   write_blind_verdict() { # $1 = what happened to the pool, in this pass's own words
-    printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s held=unmeasured streak=unmeasured engagement_lost=unmeasured reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; %s\n' \
+    printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; %s\n' \
       "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
-      "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" "$1" \
+      "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" "$VERDICT_NO_DECISION_KV" "$1" \
       > "$VERDICT_FILE" 2>/dev/null || true
   }
   write_blind_verdict "the repair to the recorded mode is IN PROGRESS — its outcome is written here when it completes, and is in the log"

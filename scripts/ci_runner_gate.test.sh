@@ -788,6 +788,14 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "queued=null advanced no state f
 assert_not_contains "$OUT" "TRANSITION" "queued=null sent no transition notification"
 assert_absent "$STATE_DIR/orchestrator-inbox.log" "queued=null wrote no inbox record"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "queued=null relabelled no runner"
+# ⛔ (1b) THE OTHER could-not-measure WRITER CARRIES THE DECISION KEYS TOO (review P3, completed):
+# `write_verdict` always emits `held=`/`streak=`/`engagement_lost=`, and this leg used to omit them, so
+# a strict parser saw them ABSENT here while seeing them present on a success pass — "missing !=
+# unmeasured" (#3002 P2). This pass takes no hold decision and reads no durability, so the honest value
+# is `unmeasured`, never `0`.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(1b) an unreadable-queue pass records the decision keys as unmeasured, not as missing keys"
 
 run_gate q-empty GH_MODE=queued-empty GH_QUEUED=5 GH_FALLBACK_N=0 --
 assert_eq "$RC" "2" "an EMPTY queue count → exit 2 (could-not-measure)"
@@ -2064,6 +2072,14 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand
   "(11b) …including the demand key"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "label_ambiguity=unmeasured" \
   "(11b) …and the ambiguity key: parity is a property of the surface, not of a comment"
+# ⛔ (11c) …AND SO WERE THE THREE DECISION KEYS, ON THIS WRITER AND ITS SIBLING (review P3, completed).
+# `write_verdict` always emits `held=`/`streak=`/`engagement_lost=`; the could-not-measure writers did
+# not, so a scheduler reading "is the gate holding?" saw the keys MISSING rather than explicitly
+# unmeasured — the #3002 P2 rule ("missing != unmeasured") that the eight census keys had already been
+# fixed for. The CENSUS_BLIND arm below and the `q-null` arm above are the two writers; both are pinned.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" \
+  "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(11c) a capacity-blind pass reports the decision keys as unmeasured, never as absent keys"
 
 # ⛔ (12) `--dry-run` DOCUMENTS "change nothing" AND USED TO MUTATE. `evaluate` runs BEFORE the DRY
 # gate, so a blind dry-run sent a real alarm, wrote the stamp file and overwrote the verdict — and the
