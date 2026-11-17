@@ -1210,6 +1210,12 @@ print(age)
   # deliberately narrower than a decision: converge the pool to the RECORDED mode (repair), report
   # `verdict=unknown` naming this leg, and exit 2. Not 0 — "could not measure demand" is never
   # "healthy" (#2344/#3995: never treat the refusal as no demand).
+  # ⛔ THE COMPONENT/INCIDENT DISJUNCTS OF THE LENGTH LEG ARE SKIPPED TOO, AND THAT IS A CHOICE, NOT AN
+  # OVERSIGHT (a reviewer will ask). They do not need demand: an Actions outage is a conclusive, MEASURED
+  # signal, and the normal path denies on it unconditionally. Arming the pool on it during a demand-blind
+  # pass would still be a NEW mode decision taken on a box that cannot subsequently RELEASE — the release
+  # needs the same measurement — so it would trade one indefinite label for another on evidence that says
+  # nothing about whether this pool can serve the queue. The outlier is left to the measuring path.
   if [ "$DEMAND_BLIND" = 1 ]; then return 3; fi
 
   # ⛔ THE LENGTH LEG COUNTS RUNS THAT COULD OCCUPY A RUNNER (#2344): `queued_demanding`, i.e. the
