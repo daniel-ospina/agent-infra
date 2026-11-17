@@ -289,6 +289,21 @@ ABSORPTION_QUEUED=""
 # dead state with a comment claiming a consumer (cycle-6 review, finding 2).
 ABSORPTION_DEMANDING=""
 ABSORPTION_GHOSTS=""
+# ⛔ THE DEMAND READ CAN BE UNMEASURED WITHOUT THE PASS BEING UNMEASURABLE (agent-infra#4085, second
+# leg). `DEMAND_BLIND` is the FIFTH evaluate answer (rc 3): the queue's DEPTH was read, the census was
+# read, and the ONE thing that could not be measured is which label set the head of real demand asks
+# for — because the head scan's window ran out on ghost runs (see the scan).
+#   * It is NOT `queued_demanding=0` and NOT "no demand": treating a refusal as no demand is the
+#     fail-open the #2344 scan exists to prevent (`queued_demanding` is left EMPTY, and every surface
+#     renders it `unmeasured`, never `0`).
+#   * It is NOT a licence to decide: a pass that could not measure demand takes NO new mode decision
+#     (the length and throughput legs are DISARMED, so it can neither engage nor release on a value it
+#     did not read). What it CAN do is honour the decision an EARLIER pass took and recorded — the
+#     pool is converged to `ci-runner-gate.state`, which is a repair, not a decision (see `main`).
+#   * It is NOT a silent exit: `main` writes `verdict=unknown` naming the unmeasured leg and the log
+#     line names what stopped the scan. It does NOT notify/alarm — the alarm set is scoped to the
+#     CAPACITY read on purpose (#2897), and that scope is a recorded decision this change keeps.
+DEMAND_BLIND=0
 
 # ── capacity census state (agent-infra#2904 · #2897 · #2931) ───────────────────────────────────
 # CENSUS_VERDICT is the CAPACITY question's answer, kept separate from the MODE answer on purpose:
@@ -1004,13 +1019,37 @@ print(comp, len(inc))
         # candidate synthesised from a body that carried only a head id.
         log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
+        # ⛔ THE WINDOW RAN OUT ON GHOSTS: DEMAND IS UNMEASURED, NOT ZERO AND NOT A DEAD PASS
+        # (agent-infra#4085, second leg — measured 2026-11-17T04:35:15Z: `the 25 oldest of 184 queued
+        # run(s) ALL report ZERO jobs in 'queued' status … FAIL-CLOSED, changing nothing`, for days).
+        # The refusal to treat this as "no demand" is CORRECT and is kept (#2344/#3995): the scan proved
+        # the 25 runs in front of it have nothing schedulable, and proved NOTHING about the 159 behind
+        # them. What was WRONG is the blast radius of the refusal: `return 2` here also threw away the
+        # CENSUS and the repair below, so a pool whose recorded mode was `local` stayed stripped until a
+        # human relabelled it by hand — three times (2026-11-14, -16, -17). A measurement the pass may
+        # never get must not decide whether the pass can keep a promise an earlier pass already made.
+        # So: the queue legs that need demand are DISARMED (no new mode decision either way), the pass
+        # continues to the census, and `main` converges the pool to the RECORDED mode. rc 3.
+        # ⛔ THE TWO THINGS AN OPERATOR CAN DO ARE STILL NAMED, because the demand question itself is
+        # unchanged by this fix: the bound, and a hand pass. A bound at or above ${QUEUE_PAGE} cannot
+        # reach past the one page this read carries — that is a code change, not a knob.
+        DEMAND_BLIND=1
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status, so the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — DEMAND UNMEASURED for this pass: the legs that need it are DISARMED (this pass takes NO new mode decision and does NOT read the refusal as 'no demand'), and the pool is converged to the mode the state file records; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
     # arithmetic below cannot go negative once it has been (a head found ⇒ ghosts ≤ scanned-1 <
     # queued; no head ⇒ ghosts == queued exactly).
-    queued_demanding=$((queued - QUEUE_GHOSTS))
+    # ⛔ LEFT EMPTY WHEN DEMAND IS BLIND (#4085): `queued - ghosts` is NOT a demanding count when the
+    # window never reached the runs behind the ghosts — it would book the WHOLE tail as demand, which
+    # is a number this read never measured. Empty is rendered `unmeasured` on every surface and is
+    # excluded from every numeric test below, so it cannot be read as 0 and cannot be read as demand.
+    # ⛔ AND IT MUST BE CLEARED, NOT MERELY SKIPPED (measured while writing this): the declaration at
+    # the top of `evaluate` seeds `queued_demanding=${queued:-0}` — and `queued` is not parsed yet at
+    # that point, so a skipped assignment leaves the seed `0` in place and the probe line publishes
+    # `queued_demanding=0` for a queue nobody measured. That is literally "the refusal read as no
+    # demand", the one thing #2344/#3995 forbid; arm (d1) reddens on it.
+    if [ "$DEMAND_BLIND" = 0 ]; then queued_demanding=$((queued - QUEUE_GHOSTS)); else queued_demanding=""; fi
     fi
   fi
 
@@ -1044,9 +1083,13 @@ print(age)
   # as a STRING compare so it cannot run before `queued_demanding` has been shape-checked as a number.
   if [ "$queued_demanding" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
-  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
-  ABSORPTION_DEMANDING="$queued_demanding"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
+  # ⛔ `${x:-unmeasured}`, NEVER `$x`, ON BOTH VALUES (#4085). On a demand-blind pass both are empty by
+  # construction, and printing `queued_demanding=` / `oldest_queued_s=` would put an EMPTY value on the
+  # line a scheduler splits on — indistinguishable from a key that was never written, and one `-eq`
+  # test away from being read as zero. `unmeasured` is the vocabulary the census KV already uses.
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=${queued_demanding:-unmeasured} ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=${oldest_queued_s:-unmeasured} in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  ABSORPTION_OLDEST_S="${oldest_queued_s:-unmeasured}"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
+  ABSORPTION_DEMANDING="${queued_demanding:-unmeasured}"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
 
   # ⛔ THE THROUGHPUT LEG'S OPERANDS ARE SHAPE-CHECKED EXACTLY AS THE EXISTING ONES ARE, for the
   # same reason (agent-infra#1704): an unreadable number makes `[ … -gt … ]` ERROR, and the `||`
@@ -1061,13 +1104,20 @@ print(age)
   # A run WITH A QUEUED JOB exists, so its age MUST be a measurement: empty here means the timestamp
   # did not parse (or was in the future), which is a failed read of the queue head, not "young
   # queue".
-  if [ "$queued_demanding" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
-    log "oldest queued timestamp UNREADABLE ('${demand_head_created}') — FAIL-CLOSED, changing nothing"; return 2
+  # ⛔ BOTH AGE CHECKS ARE SKIPPED WHEN DEMAND IS BLIND (#4085) — and `[ "" -gt 0 ]` is exactly why the
+  # guard is explicit rather than left to the arithmetic: an empty operand ERRORS, and an errored test
+  # in this file reads as FALSE, which here would silently accept an age that was never read. The age is
+  # empty because there is no head to age, which is already asserted by `DEMAND_BLIND`; rc 3 is
+  # returned below, before any leg could use it.
+  if [ "$DEMAND_BLIND" = 0 ]; then
+    if [ "$queued_demanding" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
+      log "oldest queued timestamp UNREADABLE ('${demand_head_created}') — FAIL-CLOSED, changing nothing"; return 2
+    fi
+    case "$oldest_queued_s" in
+      '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    esac
   fi
-  case "$oldest_queued_s" in
-    '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
-    ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
-  esac
   case "$QUEUE_STUCK_AFTER_S" in
     '' | *[!0-9]*) log "queue stuck-after floor UNREADABLE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "queue stuck-after floor OUT OF RANGE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
@@ -1148,6 +1198,16 @@ print(age)
   CAP_DENY=0
   capacity_verdict "${mode:-unknown}" || CAP_DENY=1
   log "capacity: verdict=${CENSUS_VERDICT} ${CENSUS_KV} (${CENSUS_DETAIL})"
+  # ⛔ DEMAND-BLIND IS ITS OWN ANSWER (agent-infra#4085, rc 3), AND IT IS RETURNED HERE — AFTER the
+  # census and the capacity reading (so the pass still publishes what it COULD see) and BEFORE every leg
+  # that would turn an unmeasured demand into a mode DECISION (the length leg, the saturated-page
+  # refusal, the throughput leg, the capacity deny). ⛔ THE RULE THIS ENCODES: a pass may not ENGAGE or
+  # RELEASE the pool on a value it did not read — the direction that must never happen is arming the
+  # pool for a queue nobody measured (#2327's strip stays intact). What `main` does with rc 3 is
+  # deliberately narrower than a decision: converge the pool to the RECORDED mode (repair), report
+  # `verdict=unknown` naming this leg, and exit 2. Not 0 — "could not measure demand" is never
+  # "healthy" (#2344/#3995: never treat the refusal as no demand).
+  if [ "$DEMAND_BLIND" = 1 ]; then return 3; fi
 
   # ⛔ THE LENGTH LEG COUNTS RUNS THAT COULD OCCUPY A RUNNER (#2344): `queued_demanding`, i.e. the
   # queue minus the runs a READABLE read proved have no job in `queued` status. A ghost run will never
@@ -1724,7 +1784,7 @@ if [ "$STATUS_ONLY" = 1 ]; then
   exit "$status_rc"
 fi
 
-evaluate; healthy=$?          # 0 = github, 1 = unhealthy, 2 = cannot measure
+evaluate; healthy=$?          # 0 = github, 1 = unhealthy, 2 = cannot measure, 3 = demand unmeasured
 if [ "$healthy" = 2 ]; then
   # ⛔ A BLIND PASS ALARMS (#2897): the fail-closed exit is right and it is also INVISIBLE, so the
   # one thing that must not happen again is a gate that spends a morning at exit 2 while the fleet
@@ -1786,6 +1846,76 @@ if [ "$healthy" = 2 ]; then
     fi
   fi
   log "cannot measure — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
+  exit 2
+fi
+
+# ⛔ DEMAND UNMEASURED — HONOUR THE DECISION AN EARLIER PASS RECORDED (agent-infra#4085, rc 3).
+# THE MEASURED DEFECT THIS CLOSES: 2026-11-17T04:35:15Z, "./ci_runner_gate.sh": the queue's head scan
+# ran out on ghost runs, `evaluate` returned 2, and the pass said `leaving mode=local` while **no runner
+# carried the label** — three separate times capacity came back only when a human relabelled the pool by
+# hand (19 runners, `with_ul` 4/23 -> 23/23). A gate whose WRITE PATH is reachable only through a READ it
+# may never get is the same defect as the single-attempt census (#4104), one leg over: the instrument can
+# see what it should do and cannot do it.
+# ⛔ WHAT THIS PASS DOES, AND WHAT IT REFUSES TO DO. It takes NO new mode decision — not engage, not
+# release — because demand was not measured and #2327's strip is not weakened by guessing. What it does is
+# REPAIR: the pool is converged to the mode `ci-runner-gate.state` records, which is the decision an
+# EARLIER pass took when it COULD measure. That is idempotent (`set_labels` is arm-capped on engage and
+# uncapped on release, and both are plain PUTs of the derived per-runner body), it never advances the state
+# file, it never sends a transition, and it never touches the hysteresis streak — a blind pass must not
+# count toward DISENGAGE_TICKS, or three blind passes could release a pool nobody measured.
+# ⛔ IT ALSO PUBLISHES, WHICH THE OLD PATH DID NOT: `verdict=unknown` naming the leg that could not be read,
+# so the file says `demand unmeasured` instead of the previous pass's answer standing.
+# ⛔ IT DOES NOT ALARM, ON PURPOSE: the alarm set is scoped to the CAPACITY read (#2897's scope is a
+# recorded decision — see the rc 2 block above), and widening it here would make `alarm_blind`'s streak and
+# DEFECT records mean two different conditions at once.
+if [ "$healthy" = 3 ]; then
+  # ⛔ THE MEASURED FIGURES COME FROM THE ABSORPTION GLOBALS, NEVER FROM `$queued` (#3002 review P1 — the
+  # same correction the rc 2 block carries): `queued` is `local` to `evaluate`, so out here it is unset and
+  # a `${queued:-unmeasured}` would structurally ALWAYS take the default. These three are what the probe
+  # actually read on this pass, and `unmeasured` is a fact, not a default.
+  blind_queued="${ABSORPTION_QUEUED:-unmeasured}"
+  blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
+  blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
+  if [ "$DRY" = 1 ]; then
+    # A READ VERB CHANGES NOTHING (#3002): no relabel, no verdict file, no state.
+    log "verdict NOT updated and NO repair applied: --dry-run reports and changes nothing (demand is unmeasured: the head scan could not reach the head of real demand; the pool was NOT converged to $(cat "$STATE_FILE" 2>/dev/null || echo 'the recorded mode — none recorded'))"
+    echo "dry-run: mode=$mode demand=unmeasured recorded=$(cat "$STATE_FILE" 2>/dev/null || echo unknown) — a demand-blind pass takes no mode decision and would only converge the pool to the recorded mode"
+    exit 2
+  fi
+  printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; the pool was converged to the mode the state file records\n' \
+    "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
+    "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
+    > "$VERDICT_FILE" 2>/dev/null || true
+  # ⛔ THE RECORDED MODE IS READ FROM THE STATE FILE, AND ONLY A MODE IT ACTUALLY RECORDS IS ACTED ON.
+  # An absent/garbled state file means no earlier pass took a decision, and `prev`'s own convention is
+  # `unknown` — so there is nothing to converge TO, and labelling the pool here would be exactly the
+  # "label on an unmeasured signal" this direction refuses. Nothing is written and nothing is PUT.
+  recorded="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  case "$recorded" in
+    local|github) ;;
+    *) log "repair SKIPPED: no recorded mode to converge to (state file says '${recorded:-absent}') — a demand-blind pass takes no new mode decision, and it will not label the pool on an unmeasured signal; nothing changed"
+       log "cannot measure DEMAND — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
+       exit 2 ;;
+  esac
+  # The pool is already in the recorded mode: nothing to converge, and a blind pass must not PUT labels
+  # it was not asked to change (a PUT storm on the runner agent's own label set is a real cost — the
+  # agent re-asserts 60-120 s later, which is why the success path compares modes rather than re-writing).
+  if [ "$mode" = "$recorded" ]; then
+    log "repair: the pool already advertises the recorded mode=$recorded (measured mode=$mode) — nothing to converge; the pass changed nothing"
+    log "cannot measure DEMAND — the recorded mode was already in force (leaving mode=$mode)"
+    exit 2
+  fi
+  log "repair: the state file records mode=$recorded but this pass measures mode=$mode — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
+  repair_ok=1
+  if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
+  if [ "$repair_ok" = 1 ]; then
+    log "repair OK: the pool was converged to the recorded mode=$recorded (demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded)"
+  else
+    # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
+    # indistinguishable from success in the state file (which is not written here either way).
+    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode=$mode) — the labels are unchanged; this is the #4085 write path failing, not a decision (see the set_labels lines above)"
+  fi
+  log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed (leaving mode=$mode)"
   exit 2
 fi
 

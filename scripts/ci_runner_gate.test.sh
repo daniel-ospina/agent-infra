@@ -2706,6 +2706,96 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" 
   "(r3) --dry-run does NOT clear the streak (a read verb changes nothing)"
 
 
+# ── #4085 (second leg): a DEMAND-BLIND pass CONVERGES the pool to the RECORDED mode ─────────────
+# THE MEASURED DEFECT (2026-11-17T04:35:15Z, issue #4085's second comment): the head scan ran out on
+# ghost runs, `evaluate` returned 2, and the pass logged `leaving mode=local` while NO runner carried the
+# label. The write path was reachable only through a read the gate may never get, so capacity came back
+# only when a human relabelled the pool BY HAND — three times (19 runners, `with_ul` 4/23 -> 23/23).
+# The refusal to read that as "no demand" is KEPT (#2344/#3995); what changes is its blast radius: the
+# census still runs, the pool is converged to `ci-runner-gate.state` (a REPAIR of an earlier pass's
+# decision), the verdict says `demand unmeasured`, and the pass still exits 2. No NEW mode decision —
+# the pool is never labelled or stripped on a signal this pass did not measure (#2327's strip intact).
+BLIND_QUEUE="$((QUEUE_HEAD_SCAN_SHIPPED + 15))"
+BLIND_GHOSTS="${GW_FIXTURE%%|*}"
+BLIND_ROWS="${GW_FIXTURE#*|}4100:120"
+
+# (d1) RECORDED local + pool measured github → the label is RE-APPLIED (the capacity-loss shape).
+run_gate demandblind-engage GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d1a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d1) a demand-blind pass is still could-not-measure → exit 2 (never 0)"
+assert_contains "$OUT" "DEMAND UNMEASURED for this pass" "(d1) the pass NAMES the leg it could not read"
+assert_contains "$OUT" "queued_demanding=unmeasured" \
+  "(d1) the probe publishes `unmeasured`, never a 0 this read did not measure"
+assert_contains "$OUT" "CONVERGING the pool to the RECORDED mode" \
+  "(d1) the repair is named as a REPAIR (the recorded decision), not a new one"
+assert_contains "$OUT" "repair OK" "(d1) the repair reports its outcome"
+assert_contains "$OUT" "no mode decision taken" "(d1) the pass says it took NO new mode decision"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d1) the write path IS reached on a demand-blind pass"
+assert_contains "$(put_body_for 101)" "ubuntu-latest" "(d1) …and it re-applies the fallback label (#2327's marker)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d1) a repair does NOT advance the state file — no transition was taken"
+assert_not_contains "$OUT" "TRANSITION" "(d1) …and notifies no transition"
+assert_not_contains "$OUT" "hysteresis" \
+  "(d1) a blind pass does not count toward DISENGAGE_TICKS (3 blind passes must not release a pool)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
+  "(d1) the verdict file does not keep the previous pass's answer"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "DEMAND was not measured" \
+  "(d1) …it names the leg that could not be read"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=$BLIND_QUEUE" \
+  "(d1) …and still publishes the depth it DID read"
+
+# (d2) RECORDED github + pool measured local → the repair runs the OTHER direction (a strip).
+run_gate demandblind-release GH_QUEUED=0 GH_FALLBACK_N=1 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" \
+  "(d2a) the MEASURING pass releases the pool and records mode=github"
+KEEP_STATE=1 run_gate demandblind-release GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d2) release-repair pass → exit 2"
+assert_contains "$OUT" "CONVERGING the pool to the RECORDED mode=github" \
+  "(d2) the repair targets the RECORDED github, not the measured local"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d2) …and it writes"
+assert_not_contains "$(put_body_for 101)" "ubuntu-latest" \
+  "(d2) …stripping the fallback marker (#2327: the strip direction is never weakened)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(d2) state unchanged"
+
+# (d3) NOTHING RECORDED → nothing is labelled. This is the fail-closed direction that must survive:
+# a pass that measured no demand may not START a fallback, because that would be labelling the pool on
+# an unmeasured signal (#2327's own reason for the strip).
+run_gate demandblind-norecord GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d3) no recorded mode → exit 2"
+assert_contains "$OUT" "repair SKIPPED: no recorded mode" \
+  "(d3) the refusal to label on an unmeasured signal is NAMED"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d3) …and nothing is PUT"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(d3) …and no mode is recorded"
+# ⛔ THE FAIL-OPEN DIRECTION, PINNED: a mutant that reads the refusal as DEMAND (the pre-#2344
+# behaviour, and the thing #2344's doctrine forbids) engages here on the RAW depth (40 ≥ 10) and
+# denominates the length leg. This assertion is what reddens it.
+assert_not_contains "$OUT" "queue/component/incident leg" \
+  "(d3) the raw depth is NOT read as demand — the queue legs are disarmed, not guessed"
+assert_not_contains "$OUT" "GitHub-hosted UNHEALTHY" "(d3) …so no engagement decision is taken"
+
+# (d4) RECORDED local + pool ALREADY local → nothing to converge, and no PUT storm.
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=1 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d4) an already-converged pool still exits 2 (demand is still unmeasured)"
+assert_contains "$OUT" "nothing to converge" "(d4) the pass says the recorded mode was already in force"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d4) …and writes nothing (a blind pass is not a PUT storm)"
+
+# (d5) A READ VERB CHANGES NOTHING (#3002): --dry-run repairs nothing and leaves the verdict alone.
+_DB_VERDICT_BEFORE="$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)"
+KEEP_STATE=1 run_gate demandblind-engage GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" -- --dry-run
+assert_eq "$RC" "2" "(d5) --dry-run on a demand-blind pass → exit 2"
+assert_contains "$OUT" "NO repair applied" "(d5) the read verb names what it did NOT do"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(d5) …no label was written"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) …and no state advanced"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "$_DB_VERDICT_BEFORE" \
+  "(d5) …and the previous verdict line is left exactly as it was (not re-written)"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
   exit 1
