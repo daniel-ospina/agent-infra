@@ -356,7 +356,63 @@ would render now, and its **exit code is the contract** an automated check reads
 | 0 | armed, and the cap it dispatches at provably agrees with the seam |
 | 3 | **STALE** — the installed pin (or the no-pin unit's own `ExecStart` script) disagrees with the seam |
 | 4 | **NOT ARMED** — the service and/or the timer is MISSING, so the box dispatches nothing at any cap |
-| 5 | **UNKNOWN** — installed, but the cap cannot be determined (no pin and an unreadable `ExecStart`) |
+| 5 | **UNKNOWN** — installed, but the cap cannot be determined: no pin *and* an unreadable `ExecStart`, a pin whose value is not a number of seconds, a pin line systemd would REJECT, a directive/construct that moves the environment **behind** `Environment=` (see below), or a **system** unit the manager could not report (`systemctl cat`) |
+
+⛔ **rc 0 MEANS A CAP WAS ACTUALLY READ AND AGREES WITH THE SEAM — never that a pin was found in some
+spelling** (round-2 re-review, P3: this sentence used to say "rc 0 MEANS THE PIN WAS ACTUALLY READ, IN
+WHATEVER SPELLING systemd ACCEPTS", which the table three lines above contradicts — its own no-pin row
+exits 0 without any pin existing, and rc 0 can therefore mean a *script's* default was read, not a pin).
+**rc 0 has exactly two shapes, and BOTH of them were measured against a box systemd dispatches at 7200**
+(round-2 re-review, F4: this paragraph used to claim the two shapes were *all* the ways to a clean exit,
+which four measured fixtures falsified — the paragraph below is the third answer that closes them):
+
+1. **A `LANE_TIMEOUT` pin was read** with the same parser as the disk reaper's read-back
+   (`scripts/lib/systemd-unit-parse.sh`), over the unit **and** its drop-ins in
+   systemd's order, in the `[Service]` section **only**, so all of these are graded, not skipped:
+   `Environment="LANE_TIMEOUT=7200"` (quoted), `Environment=HOME=/x LANE_TIMEOUT=7200` (several
+   assignments on one line), `Environment = LANE_TIMEOUT=7200` (whitespace around the key and the `=`), a
+   pin written after a **backslash continuation** (systemd.syntax(7) joins those lines into ONE
+   directive), and a drop-in that overrides the base file (a drop-in is parsed last, so it WINS — in both
+   directions: a stale base overridden back to the seam reads clean). A bare `Environment=` RESET clears
+   an earlier pin and reads as no-pin. Before that change each of the first three read as **"the unit
+   carries no pin"** and exited **0**.
+2. **No pin at all** — the unit carries no `LANE_TIMEOUT`, and the cap is graded against the
+   `ExecStart=` script systemd would ACTUALLY run, i.e. the unit **plus its drop-ins**, in `[Service]`,
+   with systemd's own list semantics (`ExecStart=` may be reset by a drop-in, which is how a unit is
+   masked, and `Type=oneshot` may carry several commands — every one of them is graded, because a oneshot
+   runs them all). That script's own compiled `LANE_TIMEOUT` default must agree with the seam, or the
+   answer is 3; if it cannot be read, the answer is 5.
+
+⛔ **AND A THIRD ANSWER, WHICH IS NEITHER: rc 5 when the environment moves BEHIND `Environment=`**
+(round-2 re-review, F1/F2/F3 — four measured fixtures returned **rc 0** over a box at 7200, which is why
+this page no longer claims total coverage). `systemd.exec(5)` compiles the environment from several
+sources and *"the later source … wins"*: `Environment=`, then `EnvironmentFile=`, then
+`PassEnvironment=`, with `UnsetEnvironment=` applied *"as the final step"*; a C-style escape
+(`systemd.syntax(7)`: `\x4C` is `L`) or a `%`-specifier rewrites a NAME, not just a value. A unit that
+carries one of those in `[Service]` is graded **UNKNOWN (5) and NAMED** (`UNREADABLE CAP`, quoting the
+directive), because no value taken from the `Environment=` map can be certified — in *either* direction:
+reporting STALE there would send an operator to re-render a unit that may already be right, and reporting
+CLEAN is the false PASS this verb exists to remove. The list is the same family
+`scripts/cell-self-pin.sh` refuses by name (`ENV_MUTATING_DIRECTIVES`), and it lives in the shared lib so
+both installers read ONE definition. The same directives under `[Install]`/`[Unit]` are a **silent skip**
+to systemd and are therefore NOT a refusal (a hazard scoped to a section systemd ignores would be the
+section-blindness one over) — which is also why a stale `Environment=` left in `[Unit]` no longer reads as
+STALE.
+
+⛔ **AND THE UNIT TEXT COMES FROM THE SOURCE THAT IS TRUTHFUL FOR THE TARGET — not from
+`$UNIT_DIR` alone** (round-2 re-review, P3; left open by the round-3 lane, closed here).
+`$UNIT_DIR/<unit>.d/*.conf` is ONE directory in a PRIORITY-ORDERED list: systemd also merges
+`/run/systemd/system/<unit>.d` and `/usr/lib/systemd/system/<unit>.d` (`systemd.unit(5)`: drop-ins are
+read "from `<unit>.d/` directories in all the directories searched for unit files"), and a user unit
+adds the higher-priority user directories too. A hand-placed drop-in in any of those is invisible to a
+file read, so a file-only reader certifies a cap the box does not dispatch at — the same false PASS as
+the drop-in this verb already learned to read, one directory over. The unit text therefore comes from
+`systemctl cat` for a system unit (where an unreadable answer is **UNKNOWN, 5** — it cannot be told
+apart from "no drop-in"), from `systemctl --user cat` for a user unit with the installed file as the
+fallback (that directory *is* the one the manager failed to list), and from the files for the documented
+`SYSTEMD_UNIT_DIR` test override. One definition, both callers: `unit_text_effective` in
+`scripts/lib/systemd-unit-parse.sh`, the same resolver `install-disk-reaper-timer.sh`'s read-back uses,
+so the two readers cannot disagree about one unit.
 
 The unit is rendered ONCE, at install time, and an
 installed pin WINS over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed

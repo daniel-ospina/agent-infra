@@ -182,10 +182,19 @@ test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => 
   // checked" instead of the no-directory message and `ci / unit-test` went red at
   // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
   // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  //
+  // The two fixes for this landed independently (#4103, #4116) and agree on the cause and the
+  // mechanism; this merge keeps main's wording and adds #4103's `try/finally` so the unique dir is
+  // also REMOVED — one `mkdtemp` per run that is never cleaned is a slow leak on a long-lived runner,
+  // and a temporary test dir must not become host state in the very test that exists to avoid it.
   const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
-  const r = runLint([], emptyCwd);
-  assert.equal(r.status, 0);
-  assert.match(r.stdout, /No skills directory found/);
+  try {
+    const r = runLint([], emptyCwd);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /No skills directory found/);
+  } finally {
+    fs.rmSync(emptyCwd, { recursive: true, force: true });
+  }
 });
 
 // ── (d) the exact O/I case ──────────────────────────────────────────────────
