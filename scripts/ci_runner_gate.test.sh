@@ -2764,8 +2764,15 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
 assert_not_contains "$OUT" "TRANSITION" "(d1) …and notifies no transition"
 assert_not_contains "$OUT" "leaving mode=" \
   "(d1) the terminal line names the mode the pool NOW advertises, not the pre-write reading"
-assert_not_contains "$OUT" "hysteresis" \
-  "(d1) the blind pass does not FALL THROUGH to a normal hysteresis decision (it exits at rc 3 before that branch)"
+assert_contains "$OUT" "the pool now advertises local" \
+  "(d1) …and NAMES the mode it advertises (the positive half: not merely the absence of the old phrase)"
+# ⛔ NO `assert_not_contains "$OUT" "hysteresis"` HERE (review P3, measured — one was added in the
+# previous round and does not work): `hysteresis` is only printed in `main`'s
+# `if [ "$want" = github ] && [ "$prev" = local ]` block, and a pass that entered the rc 3 block has
+# `healthy=3`, which can never select `want=github` — so a mutant that DELETED this block's terminal
+# `exit 2` (the actual fall-through) leaves the word out of the log and the assertion green, while the
+# `(d1) exit 2` assertion reds. The streak-file pin below is the load-bearing one, and the exit-code
+# assertion above it is what covers fall-through.
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.disengage-streak" 2>/dev/null)" "2" \
   "(d1) a blind pass does not count toward DISENGAGE_TICKS (seeded 2, still 2 — 3 blind passes must not release a pool)"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
@@ -2890,6 +2897,26 @@ assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UN
 # true there — which is why this is pinned arm by arm and not as a file-wide grep.
 assert_not_contains "$OUT" "leaving mode=" \
   "(d6) the terminal line does not publish the PRE-write mode after a repair that partly landed"
+
+# (d7) A FAILED LABEL READ MUST NOT REPLACE THE CENSUS'S CAPABILITY IN THE VERDICT (review P2, measured).
+# `$CAPABILITY` is a global that `set_labels` overwrites when ITS read fails, and the repair runs BETWEEN the
+# census and the verdict write — so a writer reading `${CAPABILITY:-none}` at call time published the LABEL
+# read's capability (`runner_inventory:upstream http=5xx`) beside a `capacity=saturated` the CENSUS
+# measured, on one durable line. `capability=` means the INVENTORY read (`:377`), so it must be the census's
+# value. `GH_MODE=enum-fail` fails ONLY the `<id>TAB<label>` read — the census read is a different stub
+# branch, keyed on its `--jq` program — which is exactly this shape.
+run_gate demandblind-cap GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d7a) the MEASURING pass engages the pool and records mode=local"
+KEEP_STATE=1 run_gate demandblind-cap GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 GH_FALLBACK_N=0 \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" GH_MODE=enum-fail --
+assert_eq "$RC" "2" "(d7) a failed LABEL read on a demand-blind pass still exits 2"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capacity=saturated" \
+  "(d7) the census DID measure capacity (so the capability key is not being read from a failed census)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capability=none" \
+  "(d7) the verdict's capability is the CENSUS's (none read = none needed), not the label read's"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capability=runner_inventory:" \
+  "(d7) …and it does NOT publish the LABEL read's capability beside a measured capacity"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
