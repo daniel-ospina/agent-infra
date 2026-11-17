@@ -40,9 +40,12 @@
 # exists" made the identity Vanish exactly when the helper is the missing file — the fail-open state
 # this shim exists for — and the two shims then resolved into each other again, turning a
 # half-installed box into one where EVERY gh call exits 127. Keep this line in any copy, AND KEEP IT
-# IN THE FIRST 8 KiB: that is the window every resolver reads (this file's walk and
-# `scripts/gh-shim/gh` both bound the read there — reading the whole candidate cost a full read of
-# the 41 MB real gh on every call, #3998). gh-rest.test.sh asserts the window for all shipped shims.
+# IN THE FIRST 8 KiB. gh-rest.test.sh §W pins the window for THIS shim and for `gh-limit/gh` — the
+# pair the deployment installs beside ONE `../gh-limit.py`, which must skip each other. ⛔ THE THIRD
+# SHIPPED SHIM IS THE OPPOSITE CASE AND MUST NOT BE "TIDIED" INTO THIS WINDOW: `scripts/gh-shim/gh`
+# (the #984 argv guard) carries its marker at byte 31551 ON PURPOSE, so the quota layer resolves the
+# guard as its CHILD (`extensions/review-enforcer`: "ORDER IS THE WHOLE CORRECTNESS ARGUMENT"); its pin
+# is `tests/gh-shim/run.sh` §15(d), not this file.
 set -uo pipefail
 
 # ── resolve the REAL gh, never this file ──────────────────────────────────────────────────────────
@@ -60,7 +63,9 @@ set -uo pipefail
 # symlink retarget and a shim reinstall, and getting any of those wrong execs a stale or a WRONG gh.
 # Re-deriving it from the (builtin) stat calls costs microseconds and cannot go stale.
 SELF="${BASH_SOURCE[0]}"
-SELF_DIR="${SELF%/*}"; [ "$SELF_DIR" = "$SELF" ] && SELF_DIR="."   # invoked with no slash
+SELF_DIR="${SELF%/*}"
+[ -z "$SELF_DIR" ] && SELF_DIR="/"                                  # invoked as `/gh` (PATH entry `/`)
+[ "$SELF_DIR" = "$SELF" ] && SELF_DIR="."                           # invoked with no slash at all
 SELF_BASE="${SELF##*/}"
 # Absolute SELF_DIR without the `cd … && pwd` subshell (a fork + a `dirname`), because $LIMIT_HELPER
 # is derived from it below. `$PWD` is the shell's own maintained cwd, so this costs nothing.
@@ -104,9 +109,43 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # `2>/dev/null` keeps an unreadable candidate from putting the SHELL's own open error on a
   # successful call's stderr.
   local _f="$1" _head=""
-  # `LC_ALL=C` pins the window to BYTES (in a UTF-8 locale `-N` counts characters); it is a prefix
-  # assignment on a regular builtin, so it does not leak into the rest of the call.
-  LC_ALL=C IFS= read -r -N 8192 _head <"$_f" 2>/dev/null || :
+  # ⛔ THE READ IS `read -N`, AND IT IS GATED ON THE SHELL BECAUSE THAT IS THE HONEST SHAPE. Two arms,
+  # each VERIFIED on the host it serves — not a compromise, and not `read -N` everywhere:
+  #   * bash 5.x (the cloud cells, and the Mac's Homebrew bash — what the fleet runs): ONE
+  #     `read -r -N 8192`, no fork, ~0.75 ms on the 41 MB binary vs 25 ms for `grep` (33x), and NULs are
+  #     discarded WITHOUT being counted, so a BINARY shim's sentinel (#10009's fixture: ELF magic +
+  #     NULs + the marker) is still found. VERIFIED on 5.2.21.
+  #   * bash 3.2.57 (macOS `/bin/bash`, a declared runtime — `scripts/check-bash32-parse.sh`
+  #     MUST_DERIVE lists THIS file): `read` has NO `-N` (bash 4.1+; VERIFIED on the pinned
+  #     `bash:3.2` image: `read: -N: invalid option`, rc=2) AND it treats a NUL as end-of-input
+  #     (VERIFIED: `\177ELF` + NULs → `ELF` then rc=1 with no data; a NUL-padded file → rc=0, 0 bytes,
+  #     forever). So an in-process read on 3.2 cannot see a binary shim's sentinel at ALL, and the
+  #     one-fork `grep` this file shipped before is kept VERBATIM for that arm: same correctness, same
+  #     cost as the status quo on that host, no regression.
+  # ⛔ WHY NOT A CHUNKED `read -n` LOOP FOR BOTH (it was written first and measured): `-n` honours a
+  # newline as a delimiter, so a 36 KB script costs one builtin call PER LINE — ~1,600 `read` builtins
+  # (~128k byte-at-a-time syscalls) across 20 candidates, and the call measured 85 ms against 62 ms
+  # before the change. A slow zero-fork read is not the fix the issue asks for.
+  # ⛔ A bash 4.0/4.1–4.3 in between is not a target host and takes the `grep` arm, which is always
+  # correct; nothing relies on 4.x NUL behaviour either way.
+  # ⛔ `2>/dev/null` BEFORE `<"$_f"`, NOT AFTER. Redirections apply LEFT TO RIGHT: with the input
+  # redirect first, the SHELL reports a failed open (`Permission denied` on an execute-only or
+  # ACL/FUSE-denied candidate) on the CALLER's stderr while the call itself SUCCEEDS — the
+  # `… 2>&1`-then-parse-JSON class of #2184/#10009, which turns a good read into a JSON parse error.
+  # `scripts/gh-shim/gh` states this ordering rule verbatim (§10(a5)); the pre-#3998
+  # `grep -qa … 2>/dev/null` was immune only because grep opened the file itself. Reproduced by review
+  # at rc=0 with the diagnostic on the merged stream; §P's unreadable-candidate arm pins it now.
+  # ⛔ AND THE WINDOW IS 8192 NON-NUL CHARACTERS, NOT BYTES (measured, stated as the number it is):
+  # `read` DISCARDS NUL bytes without counting them, so the real 41 MB gh costs ~12–19 KB of reads to
+  # collect 8192 characters, and a pathological mostly-NUL candidate is read to EOF. That residual is
+  # accepted (still ~2000x cheaper than the full read it replaced) and `scripts/gh-shim/gh` bounds by
+  # BYTES (`head -c 8192`), so the two resolvers can disagree about what falls inside their window on
+  # a NUL-bearing candidate — recorded here, pinned by §P's NUL-padded arm, never implied away.
+  if (( BASH_VERSINFO[0] >= 5 )); then
+    LC_ALL=C IFS= read -r -N 8192 _head 2>/dev/null <"$_f" || :
+  else
+    grep -qa 'harness-gh-shim-marker' "$_f" 2>/dev/null && return 0
+  fi
   case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
   # An OLDER copy of a shim carries no marker, or carries it past the window; it is identified by the
   # helper beside it — the deployment contract is that both shims sit beside ONE `../gh-limit.py`.

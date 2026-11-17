@@ -479,7 +479,7 @@ ck "§Z no projection hands a payload VARIABLE to python as a value" \
 for _s in gh-rest/gh gh-limit/gh; do
   _off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
   ck "§W shim marker inside the 8 KiB resolver window: $_s (byte ${_off:-none})" \
-     "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -lt 8192 ] && echo 0 || echo 1)"
+     "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -lt $((8192 - 22)) ] && echo 0 || echo 1)"
 done
 
 # ── §P. THE RESOLVER PREAMBLE MUST NOT FORK (#3998) ──────────────────────────────────────────────
@@ -498,21 +498,37 @@ done
 # falls through the walk would otherwise exec the box's AUTHENTICATED gh, and `auth token` would print
 # a real credential into the suite's output. A fallthrough must end at `cannot locate the real gh`.
 mkdir -p "$TMP/spawnbin" "$TMP/stubbin" "$TMP/minbin"
-for _t in grep dirname basename; do
+# ⛔ THE COUNTED TOOL SET IS EVERY REALISTIC READER OF A CANDIDATE, not just the three the old walk
+# used: the assertion is named "forks NOTHING", so a revert to `_head="$(head -c 8192 "$_f")"` — one fork
+# per candidate, the alternative this PR records as rejected — must redden it too (review finding).
+for _t in grep dirname basename head cut sed awk stat wc; do
   { printf '#!/usr/bin/env bash\n'
     printf 'printf "%%s\\n" %s >>"$SPAWN_LOG"\n' "$_t"
     printf 'exec /usr/bin/%s "$@"\n' "$_t"; } >"$TMP/spawnbin/$_t"
   chmod +x "$TMP/spawnbin/$_t"
 done
 for _t in bash mktemp rm cat; do ln -sfn "$(command -v $_t)" "$TMP/minbin/$_t"; done
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "gho_SPAWNPROBE4242"\n' >"$TMP/stubbin/gh"
+# ⛔ THE STUB REPORTS THE HOP DEPTH, BECAUSE "SKIPPED" MUST BE OBSERVABLE. `HARNESS_GH_SHIM_DEPTH` is
+# incremented by every shim hop and exported to the child, so the stub sees 1 when the walk landed on it
+# DIRECTLY and 2 when it exec'd another interposer first. Without this the four skip arms below were
+# VACUOUS (found by review, reproduced): with `_is_harness_shim() { return 1; }` every arm still went
+# green, because an exec'd copy of the adapter simply resolves again and prints the same token — the row
+# proved "some gh eventually ran", not "this candidate was skipped".
+printf '#!/usr/bin/env bash\nprintf "%%s %%s\\n" "gho_SPAWNPROBE4242" "${HARNESS_GH_SHIM_DEPTH:-0}"\n' >"$TMP/stubbin/gh"
 chmod +x "$TMP/stubbin/gh"
+WANT_PROBE="gho_SPAWNPROBE4242 1"
 : >"$TMP/spawn.log"        # empty BEFORE the call, so no earlier arm can mask a spawn
-out="$(GH_REST_LIMIT_HELPER=/nonexistent SPAWN_LOG="$TMP/spawn.log" \
+# ⛔ EXPORTED, NOT SET PER CALL: the counters write to `$SPAWN_LOG`, and a call that leaves it
+# unset makes the STUB ITSELF fail (`>>""` is an error), so a forked tool returns empty and every
+# §P arm downstream reddens for a reason that has nothing to do with what it asserts — measured
+# with the `dirname` mutant, which reddened 6 rows instead of the 1 it should (mutation
+# attribution found it; a mutant that reddens everything attributes nothing).
+export SPAWN_LOG="$TMP/spawn.log"
+out="$(GH_REST_LIMIT_HELPER=/nonexistent \
        PATH="$TMP/spawnbin:$TMP/stubbin:$TMP/minbin" bash "$SHIM" auth token 2>"$TMP/err-sp")"; _rc=$?
 _spawns="$(wc -l <"$TMP/spawn.log" | tr -d '[:space:]')"
 ck "§P the walk still reaches the real gh through PATH (zero-config resolution works)" \
-   "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_SPAWNPROBE4242" ] && echo 0 || echo 1)"
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
 ck "§P **and the preamble forks NOTHING**: ${_spawns:-?} grep/dirname/basename subprocesses per call" \
    "$([ "${_spawns:-1}" -eq 0 ] && echo 0 || echo 1)"
 ck "§P …and this fixture cannot reach the box's real gh, so it can never print a live credential" \
@@ -520,7 +536,7 @@ ck "§P …and this fixture cannot reach the box's real gh, so it can never prin
       && echo 0 || echo 1)"
 # NON-VACUITY: the same counters MUST fire when those tools really run, or the arm above is inert.
 : >"$TMP/spawn.log"
-SPAWN_LOG="$TMP/spawn.log" PATH="$TMP/spawnbin:$TMP/minbin" bash -c \
+PATH="$TMP/spawnbin:$TMP/minbin" bash -c \
   'dirname /a/b >/dev/null; basename /a/b >/dev/null; grep -q . /dev/null || true' 2>/dev/null
 _spawned="$(wc -l <"$TMP/spawn.log" | tr -d '[:space:]')"
 ck "§P …and those counters are NOT inert ($_spawned of 3 direct invocations recorded)" \
@@ -541,11 +557,17 @@ for _c in "$TMP/shimskip:identical copy of the REST adapter" \
           "$TMP/shims/gh-limit:deployed contract copy of gh-limit"; do
   _d="${_c%%:*}"; _what="${_c#*:}"
   chmod +x "$_d/gh"
-  out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$_d:$TMP/stubbin:$TMP/minbin" \
-         bash "$SHIM" auth token 2>&1)"; _rc=$?
+  # ⛔ STDOUT AND STDERR ARE ASSERTED SEPARATELY, and `$TMP/spawnbin` is ON THE PATH. Merging the two
+  # (`2>&1`) let an unrelated stderr line decide the row: with the `dirname` and window mutants the
+  # shim printed `dirname: command not found` (the stubs were not on this PATH and minbin has no such
+  # tool), so the row read as a failure of the identity check when it was the FIXTURE talking —
+  # mutation attribution caught it, and an arm that reddens for the wrong reason attributes nothing.
+  out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$_d:$TMP/stubbin:$TMP/minbin" \
+         bash "$SHIM" auth token 2>"$TMP/err-arm")"; _rc=$?
+  _arm_said="$(cat "$TMP/err-arm" 2>/dev/null)"
   ck "§P a shim on PATH is SKIPPED, never exec'd — $_what" \
-     "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_SPAWNPROBE4242" ] && ! has 'third gh-shim hop' "$out" \
-        && ! has 'cannot locate the real gh' "$out" && echo 0 || echo 1)"
+     "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && ! has 'third gh-shim hop' "$_arm_said" \
+        && ! has 'cannot locate the real gh' "$_arm_said" && echo 0 || echo 1)"
 done
 # ⛔ AND A MARKER OUTSIDE THE WINDOW IS NOT SKIPPED — that is the deliberate other half (see §W). Pin
 # it, because it decides WHICH gh a cell ends up running: measured on this change, with the argv guard
@@ -557,11 +579,47 @@ mkdir -p "$TMP/layerguard"
   head -c 9000 /dev/zero | tr '\0' '#'          # ONE long comment line: pushes the marker past 8 KiB
   printf '\n# harness-gh-shim-marker: past the window on purpose\nprintf "%%s\\n" "gho_GUARDCHAIN"\n'; } >"$TMP/layerguard/gh"
 chmod +x "$TMP/layerguard/gh"
-out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/layerguard:$TMP/stubbin:$TMP/minbin" \
-       bash "$SHIM" auth token 2>&1)"; _rc=$?
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/layerguard:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" auth token 2>"$TMP/err-guard")"; _rc=$?
 ck "§P a marker PAST the 8 KiB window is NOT skipped (a layered guard stays in the chain)" \
    "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_GUARDCHAIN" ] && echo 0 || echo 1)"
+# ⛔ AN UNREADABLE CANDIDATE MUST NOT TOUCH A SUCCESSFUL CALL'S STREAMS (#10009/#2305, re-introduced by
+# this PR's first form and caught by review). Redirections apply LEFT TO RIGHT: with `<"$_f"` written
+# BEFORE `2>/dev/null`, the SHELL reports the failed open on the CALLER's stderr while the call itself
+# exits 0 — and every caller here does `… 2>&1` and parses the merged bytes as JSON, so a good read
+# becomes `JSONDecodeError` (NOCHECKS / no PR merges). The candidate is execute-only, so `[ -f -x ]`
+# admits it and the READ is what fails. Asserted on BOTH streams: rc 0, the token, and EMPTY stderr.
+mkdir -p "$TMP/unreadable"
+cp /bin/true "$TMP/unreadable/gh" 2>/dev/null || cp /usr/bin/true "$TMP/unreadable/gh"
+chmod 0111 "$TMP/unreadable/gh"
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/unreadable:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" --version 2>"$TMP/err-unread")"; _rc=$?
+ck "§P an UNREADABLE candidate adds NOTHING to a successful call's stderr (the 2>/dev/null order)" \
+   "$([ -z "$(cat "$TMP/err-unread" 2>/dev/null)" ] && echo 0 || echo 1)"
+chmod 0755 "$TMP/unreadable/gh"
 
+# ⛔ A NUL-PADDED SENTINEL: the window is 8192 NON-NUL CHARACTERS, not bytes (recorded divergence with
+# `scripts/gh-shim/gh`, which bounds by BYTES via `head -c 8192`). `read` discards NULs WITHOUT counting
+# them, so a marker 9000 NULs into a candidate is still inside THIS resolver's window and the candidate
+# is skipped. Pinned so the difference is a recorded fact rather than an implied one.
+mkdir -p "$TMP/nulpad"
+{ head -c 9000 /dev/zero; printf '# harness-gh-shim-marker\nprintf "%%s\\n" "gho_NULPAD"\n'; } >"$TMP/nulpad/gh"
+chmod +x "$TMP/nulpad/gh"
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/nulpad:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" auth token 2>"$TMP/err-nul")"; _rc=$?
+ck "§P a NUL-padded sentinel past 8 KiB BYTES is still skipped (window = 8 KiB non-NUL chars)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE MUTUAL SHAPE THE MEASURED INCIDENT HAD: the shims resolve to EACH OTHER when the INVOKED
+# shim's own directory is on PATH beside another one (1,700 processes in 6 s, `fork: Resource
+# temporarily unavailable`). Every arm above invokes the repo copy and skips a FOREIGN candidate; this
+# one invokes the `gh-rest` deployment copy with the `gh-limit` copy first on PATH, so both interposers
+# are in the walk at once. `depth == 1` proves the invoked shim exec'd the stub, not another shim.
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/shims/gh-limit:$TMP/shims/gh-rest:$TMP/stubbin:$TMP/minbin" \
+       bash "$TMP/shims/gh-rest/gh" auth token 2>"$TMP/err-mutual")"; _rc=$?
+ck "§P the MUTUAL shape resolves in one hop (gh-limit dir + invoked gh-rest copy on one PATH)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && ! has 'third gh-shim hop' "$(cat "$TMP/err-mutual" 2>/dev/null)" \
+      && echo 0 || echo 1)"
 # ── §C. THE CREDENTIAL NEVER LANDS IN AN ARTIFACT ────────────────────────────────────────
 # `gh auth token`'s STDOUT IS THE CREDENTIAL. This is the one call the drain makes every cycle, and
 # it now also passes through the resolver changed by #3998 — so the guarantee is ASSERTED, not
