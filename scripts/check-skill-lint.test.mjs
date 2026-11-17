@@ -176,14 +176,18 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  // ⛔ A PRIVATE, EMPTY CWD — NOT `os.tmpdir()` (this suite's own ambient red, root-caused). The
-  // implicit lookup walks `<cwd>/skills`, and `os.tmpdir()` is SHARED HOST STATE: on the self-hosted
-  // cell runner (`/opt/gh-runner-*`) any sibling job that leaves a `$TMPDIR/skills` behind turns this
-  // arm red — measured: `mkdir -p "$TMPDIR/skills"` flips it to "0 SKILL.md files checked. Clean.",
-  // 170 passed / 1 failed, exactly the log of `ci / unit-test` on PR #4103. A test whose verdict
-  // depends on what OTHER processes wrote to /tmp is a false RED generator, and a false RED on a
-  // required check blocks every lane's merge. `mkdtemp` is unique per run and empty by construction.
-  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-nodir-"));
+  // Hermetic: a FRESH unique dir, never os.tmpdir() itself. The shared temp root is
+  // ambient state — on the self-hosted runner a leftover `<tmp>/skills` from another
+  // job made the implicit resolution SUCCEED, so this arm read "0 SKILL.md files
+  // checked" instead of the no-directory message and `ci / unit-test` went red at
+  // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
+  // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  //
+  // The two fixes for this landed independently (#4103, #4116) and agree on the cause and the
+  // mechanism; this merge keeps main's wording and adds #4103's `try/finally` so the unique dir is
+  // also REMOVED — one `mkdtemp` per run that is never cleaned is a slow leak on a long-lived runner,
+  // and a temporary test dir must not become host state in the very test that exists to avoid it.
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
   try {
     const r = runLint([], emptyCwd);
     assert.equal(r.status, 0);
