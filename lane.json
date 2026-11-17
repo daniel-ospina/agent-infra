@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13251-1794936344-p3518392-002dc47a",
+  "_sha": "0b7843a54ee2eaf4e5598a88ae897f209958639e",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13251.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13108-dense-leg-under-load"
+    },
+    {
+      "kind": "sha",
+      "value": "ef418197bd42033a6579d5cc39c995caeaf55157"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13121"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 9963,
+  "ended_at": 1794946307,
+  "exit_code": 0,
+  "heartbeat_at": 1794946307,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13251-1794936344-p3518392-002dc47a",
+  "lease_until": 1794982907,
+  "pid": 3518392,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794936344,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13251",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13121"
+}
