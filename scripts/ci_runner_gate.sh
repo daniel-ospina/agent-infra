@@ -2113,6 +2113,20 @@ if [ "$healthy" = 3 ]; then
     # advertises `$mode` either — the pass measured `$mode` BEFORE the write. It names what it knows:
     # the write did not complete, and the recorded mode is NOT confirmed.
     log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (see the set_labels lines above: the ok=/fail= count when runners were written, 'no labels changed' when the enumeration refused, 'fallback arm resolved EMPTY' when the engage arm carried nothing), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision"
+    # ⛔ AND THE VERDICT'S OWN `mode=` KEY MAY NOT CARRY THAT READING EITHER (review P2, measured). The
+    # sentence above forbids publishing "the pool still advertises $mode" because `mode` was read BEFORE a
+    # write that may have PARTLY landed — but `write_blind_verdict` prints `mode=%s mode_source=%s` from
+    # exactly that reading, so the durable line contradicted the claim sitting next to it. Measured on
+    # (d6): `mode=github mode_source=runners` beside "the pool's labels may be PARTIALLY changed", while
+    # that arm's partial ENGAGE (`set_labels ok=1 fail=1`) has just armed one of the two managed runners —
+    # i.e. the pool may now advertise `local`, the OPPOSITE of the value the file published. A scheduler
+    # branching on `mode=` read the pre-write pool as the current one, which is the fail-open direction
+    # for the same reason a stale `verdict=` is (#3002). After an incomplete write this pass holds NO
+    # pool-wide label reading, so the key carries this file's vocabulary for exactly that — `unknown`/
+    # `none`, the same pair the "re-read did not answer" arm above uses. (Stated, not implied: the log line
+    # above still NAMES the pre-write reading, in the past tense and labelled as such, which is a true
+    # statement about what this pass measured; the durable key is not.)
+    mode="unknown"; MODE_SOURCE="none"
     write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see the set_labels lines in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).

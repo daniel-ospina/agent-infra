@@ -2922,6 +2922,16 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "may be
   "(d6) …and the verdict says a partial relabel is possible"
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "UNCHANGED" \
   "(d6) …and does NOT assert the labels are unchanged on a partial write"
+# ⛔ AND THE VERDICT'S OWN `mode=` KEY MAY NOT CARRY IT EITHER (review P2, measured): the claim beside it
+# already says the labels may be PARTIALLY changed, while the writer printed `mode=%s mode_source=%s` from
+# the PRE-write `current_mode` — measured here as `mode=github mode_source=runners`. This arm's partial
+# ENGAGE (`ok=1 fail=1`) has just armed one of the two managed runners, so the pool may now advertise
+# `local`, the OPPOSITE of the value the durable file published; a scheduler branching on `mode=` read the
+# pre-write pool as the current one (the fail-open direction #3002 removed for `verdict=`).
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode=unknown mode_source=none" \
+  "(d6) the verdict's mode= key names the ABSENCE of a post-write reading, not the pre-write one"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "mode_source=runners" \
+  "(d6) …so it does NOT publish the pre-write reading as the pool's current mode"
 # ⛔ AND THE ARM'S LAST LINE MAY NOT PUBLISH THE PRE-WRITE READING EITHER (review P2, measured): `mode`
 # is `current_mode` taken BEFORE the write, so `(leaving mode=github)` reported a pre-repair reading as
 # the pool's post-repair state — false after this arm's partial relabel, and it contradicted the line
