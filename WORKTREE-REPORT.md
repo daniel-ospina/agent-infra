@@ -93,9 +93,19 @@ suite reports **200 passed, 8 failed** — one arm per fail-open spelling above.
 | `bash scripts/disk-reaper.test.sh` | `ALL PASS (720 assertions)` (the extracted `Environment=` lib is behaviour-identical for its original caller) |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `OK: no nesting, active files refreshed, farm links preserved` (the new lib is declared in `lib_srcs`) |
 | `bash scripts/orchestrator-harness/check-single-source.sh` | `ok: one source of truth — 11 shared file(s) …` |
+| `bash scripts/orchestrator-harness/selftest.sh` (this branch) | `677 passed, 25 failed`, then **`678 passed, 24 failed`** on a re-run — see the baseline row |
+| `bash scripts/orchestrator-harness/selftest.sh` (`origin/main` @ `8f90074fe`, scratch worktree, removed after) | `678 passed, 24 failed` |
+| the two FAIL lists compared (`comm`) | **0 new failures, 0 fixed** — the 24 are pre-existing on `origin/main`; the 25th was a re-run flake, and the unique FAIL-name sets are identical |
 | `bash scripts/check-false-pass-shapes.sh` | `PASS: no finding in the SCANNED SET (362 file(s)) … 0 finding(s)` |
 | `bash pi-bootstrap/tests/test-cell-install.sh` | **NOT A PASS — not run to its end** (see below) |
 | `bash -n` on every touched shell file | clean |
+
+⛔ **CI STATE IS NOT RECORDED HERE, ON PURPOSE.** Every push produces a new head and a new check set, so a
+green line in this file would describe a commit nobody is merging. At the head this file was last
+written for, the PR's whole check set passed (`ci / lint`, `typecheck`, `unit-test`, `script-validate`,
+`skill-lint`, `test`, `verify`, `drift-check`, `vendor-drift`, `sigpipe-grep`, `pi-sdk-parity`,
+`harness-single-source`, `http-pool-hygiene`, `pi-config-extensions`, `cost-config`, `search-cost`,
+`sanctioned-pin`, `verdict-pin`, `workflow-lock`, `workflow-drift`) — read the PR for the current one.
 
 ⛔ `pi-bootstrap/tests/test-cell-install.sh` **exceeded a 900 s and then a 1 200 s window on this box and was
 not run to its end**: the partial run logged in `~/.pi/agent/state/4034-round2/cell-install.log` holds
