@@ -11408,7 +11408,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // caller can classify same-checkout vs deliberate cross-checkout writes
     // (a candidate whose resolved target sits in a DIFFERENT checkout than
     // its site cwd is a hub write the session shell is not rooted in).
-    out.push({ resolvedPath: resolved, via, site, cwd: resolve(cwd) });
+    //
+    // ⛔ `raw` IS THE DE-QUOTED SPELLING, AND IT IS NOT REDUNDANT (#4101).
+    // `resolvedPath` is `resolve(cwd, raw)` — an answer — while a caller that
+    // must substitute a same-command `NAME=<literal>` assignment (#1060's
+    // `$MAIN_REPO`) needs the OPERAND, because substituting INTO a resolved
+    // absolute path would re-anchor it. Carrying both lets such a caller ask
+    // `resolve(site.cwd, substitute(raw))` and get the shell's own answer,
+    // instead of re-anchoring a `relative(...)` string at whatever cwd it
+    // happens to hold (the #4101 P0: a plain `cd` chain yielded no execution
+    // cwd, so `../f` was measured against the SESSION checkout).
+    out.push({ resolvedPath: resolved, raw: t, via, site, cwd: resolve(cwd) });
   };
   // Bash cwd semantics (probe-verified):
   //  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),

@@ -267,7 +267,7 @@ let _HUB_NEW_FILE_BLOCK_CAP = 25;
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
-let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
+let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; raw?: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
 // #709: the working-tree-discard family + its effect decision. Fail-safe
 // defaults: [] / false → M5 is inert when the classifier fails to load (the
 // gate must never false-block on a degraded import; test-module-load.mjs is
@@ -2038,10 +2038,11 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * blocks on `??` scratch output nor conflates the two in its message. Unlike
  * the comparison it replaces, one wrong ALLOW here is unrecoverable, which is
  * why the arm is conservative: an unresolvable target keeps its literal
- * component and is anchored by `resolve(writeCwd, …)` below, then probed at its
- * nearest existing ancestor — which is `writeCwd` for a RELATIVE spelling and
- * the spelling's OWN outermost existing directory for an absolute one
- * (`resolve(writeCwd, "/tmp/$X/f")` stays `/tmp/$X/f`, so the walk stops at
+ * component and is anchored at ITS OWN SITE (the cwd the `cd`/pushd chain in
+ * the command had reached — `bashWriteTargetsResolved`'s `cwd`), then probed at
+ * its nearest existing ancestor — which is that site for a RELATIVE spelling
+ * and the spelling's OWN outermost existing directory for an absolute one
+ * (`resolve(site, "/tmp/$X/f")` stays `/tmp/$X/f`, so the walk stops at
  * `/tmp`) — and an unreadable status FAILS CLOSED.
  *
  * Declared residual: a target anchored to a name this command never assigns
@@ -2123,7 +2124,7 @@ function _resolveThroughDanglingLinks(p: string): string | null {
 
 function _catFileRevertStateBlock(
   d: { form: string; scope: string; pathspecs: string[] },
-  writeTargetsRel: string[],
+  writeTargets: { raw: string; cwd: string }[],
   writeCwd: string,
   command: string,
   scriptDir: string | null,
@@ -2134,10 +2135,22 @@ function _catFileRevertStateBlock(
   // (`git cat-file -e "origin/$BRANCH:$f"`) is allowed instead of fail-closed
   // on the unresolvable source: the hint has no LANDING SITE, so there is no
   // discard. The decision is ordered by EFFECT, not by the pathspec's spelling.
-  if (writeTargetsRel.length === 0) return null;
+  if (writeTargets.length === 0) return null;
 
   const vars = _wtCommandVars(command);
-  const targets = writeTargetsRel.map((rel) => resolve(writeCwd, _wtSubstituteVars(rel, vars)));
+  // ⛔ EACH TARGET RESOLVES FROM ITS **OWN** SITE CWD (#4101 P0-1/P0-2).
+  // This used to be `resolve(writeCwd, rel)` over `relative(writeCwd, …)` from
+  // `extractBashWriteTargets` — which does NOT walk a `cd` chain, and was fed
+  // `commandExecutionCwd(...) ?? sessionCwd`, which is `null` for a plain `cd`
+  // (that function reports a cwd at a SCRIPT token only). So every `cd`-relative
+  // redirect was re-anchored at the SESSION checkout: `cd <wt> && git show
+  // HEAD:f > f` probed `<session>/f` instead of `<wt>/f` and was ALLOWED while
+  // it destroyed the worktree's uncommitted content (§ declared residual below).
+  // `bashWriteTargetsResolved` answers the same question correctly — it is the
+  // walker the discard-verb arm already trusts (`classify-git.mjs` cdChain) —
+  // so the pair (site cwd, raw operand) comes from IT, and the substitution
+  // still happens on the OPERAND, never on a resolved absolute path.
+  const targets = writeTargets.map((t) => resolve(t.cwd, _wtSubstituteVars(t.raw, vars)));
 
   // Candidate checkouts: each target's nearest EXISTING ancestor (the landing
   // site), then the checkout the discard was READ FROM when it came from a
@@ -4855,16 +4868,26 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
 
   for (const set of gatedSets) {
     // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
-    // bash WRITE targets (pure string walk) to find where the content lands.
-    // #1060 — they are kept in their WRITE-CWD-RELATIVE spelling: the state
-    // predicate substitutes a same-command `NAME=<literal>` assignment BEFORE
-    // resolving, so an ABSOLUTE `$MAIN_REPO` is not re-anchored under the write
-    // cwd (which is how the fail-open was measured).
-    let writeTargetsRel: string[] = [];
+    // bash WRITE targets to find where the content lands. #1060 — each target is
+    // carried as its OPERAND plus the SITE cwd the shell's own `cd`/pushd chain
+    // had reached, so the state predicate resolves it exactly as bash does and
+    // still substitutes a same-command `NAME=<literal>` before resolving (so an
+    // ABSOLUTE `$MAIN_REPO` is not re-anchored under any cwd — that re-anchor is
+    // how the #1060 fail-open was measured).
+    //
+    // ⛔ THE SEED IS `set.baseCwd`, NOT `set.writeCwd` (#4101 P0-1/P0-2):
+    // `baseCwd` is the cwd the walked shell STARTS in — the session cwd for
+    // direct argv, the script's exec cwd for a script set — which is what
+    // `bashWriteTargetsResolved` expects, because it applies the command's cd
+    // chain itself. `writeCwd` is the EXECUTION cwd (`commandExecutionCwd`, null
+    // for a plain `cd`), and anchoring relative targets there is precisely the
+    // mis-resolution this arm had.
+    let writeTargets: { raw: string; cwd: string }[] = [];
     if (set.discs.some((d) => d.form === "cat-file-revert")) {
       try {
         const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
-        writeTargetsRel = extractBashWriteTargets(src, set.writeCwd).map((t) => relative(set.writeCwd, t.resolvedPath) || ".");
+        writeTargets = bashWriteTargetsResolved(src, set.baseCwd)
+          .map((t) => ({ raw: t.raw ?? t.resolvedPath, cwd: t.cwd }));
       } catch { /* best-effort — a miss only means no extra block */ }
     }
 
@@ -4900,7 +4923,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         if (set.script !== null && !/[$`]/.test(set.script)) {
           try { scriptDir = dirname(resolve(execCwd, set.script)); } catch { scriptDir = null; }
         }
-        const stateReason = _catFileRevertStateBlock(d, writeTargetsRel, set.writeCwd, command, scriptDir);
+        const stateReason = _catFileRevertStateBlock(d, writeTargets, set.writeCwd, command, scriptDir);
         if (stateReason !== null) return stateReason;
         continue;
       }
