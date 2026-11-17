@@ -343,7 +343,14 @@ t0_anchor_value_ok() { # <directive> <value>
             *)      part="$rest"; rest="" ;;
         esac
         [ -n "$part" ] || continue
-        printf '%s\n' "$part" | grep -Eq '^[0-9]+(\.[0-9]+)?(us|usec|ms|msec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?$' || return 1
+        # ⛔ A HERE-STRING, NEVER A PIPE INTO A QUIET grep (#841/#864, red as `sigpipe-grep` on this PR's
+        # first head). Under `pipefail` a `grep -q` exits at its first match while the writer is still
+        # pushing bytes, the writer takes SIGPIPE (141), and the PIPELINE status becomes non-zero — so
+        # `|| return 1` would refuse a value the manager accepts, i.e. a FALSE RED in a grammar whose
+        # whole job is to refuse only what systemd discards. `scripts/check-no-sigpipe-grep.sh` reds the
+        # piped shape; bash backs a here-string with a temp file, so there is no live writer to kill and
+        # every grep flag still applies.
+        grep -Eq '^[0-9]+(\.[0-9]+)?(us|usec|ms|msec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?$' <<<"$part" || return 1
     done
     return 0
 }
@@ -377,7 +384,7 @@ T0_MODE=assert
 t0_ok()  { if [ "$T0_MODE" = probe ]; then printf 'ok>%s\n' "$1"; else ok "$1"; fi; }
 t0_bad() { if [ "$T0_MODE" = probe ]; then printf 'FAIL>%s\n' "$1"; else bad "$1"; fi; }
 t0_scan() { # <template dir>
-local dir="${1:-}" tpl TPL_SEC ANCHORS T0_A T0_ANY T0_VALS expected=0 f
+local dir="${1:-}" tpl TPL_SEC TPL_WHOLE ANCHORS T0_A T0_ANY T0_VALS expected=0 f f_whole
 TPL_SEEN=0
 for tpl in "$dir"/*.timer; do
     [ -f "$tpl" ] || continue
@@ -398,7 +405,7 @@ for tpl in "$dir"/*.timer; do
     TPL_SEC="$(awk '/^[[:space:]]*\[Timer\]/{f=1; next} /^[[:space:]]*\[/{f=0} f' "$tpl" \
         | grep -Ev '^[[:space:]]*(#|;|$)' \
         | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/') "
-    if ! printf '%s\n' "$TPL_SEC" | grep -qE '^OnUnitActiveSec='; then
+    if ! grep -qE '^OnUnitActiveSec=' <<<"$TPL_SEC"; then
         t0_bad "T0 $(basename "$tpl") declares OnUnitActiveSec OUTSIDE the [Timer] section — systemd IGNORES it, so the timer has no cadence at all"
         continue
     fi
@@ -432,13 +439,18 @@ for tpl in "$dir"/*.timer; do
         else
             t0_bad "T0 $(basename "$tpl") anchors inside [Timer] but the manager DISCARDS every value (${T0_VALS# }) — the directive is present and INERT, so next_elapse stays infinity and the timer can never fire"
         fi
-    elif grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" \
-           | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/' \
-           | grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar='; then
-        # Same verdict, different defect — name it, or a reader cannot tell "deleted" from "misfiled".
-        t0_bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
     else
-        t0_bad "T0 $(basename "$tpl") declares OnUnitActiveSec in [Timer] with NO boot/active/calendar anchor anywhere — next_elapse=infinity, it can never fire"
+        # Capture FIRST, then test in the shell — the same #841/#864 race, one producer further out: the
+        # quiet grep's early exit SIGPIPEs `sed`, and under `pipefail` that non-zero status would be read
+        # as "no anchor anywhere" when the anchor IS there under `[Unit]` — the two verdicts below are
+        # deliberately different messages, so a misgraded one sends the reader after the wrong defect.
+        TPL_WHOLE="$(grep -Ev '^[[:space:]]*(#|;|$)' "$tpl" | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/')"
+        if grep -qE '^On(Boot|Active|Startup)Sec=|^OnCalendar=' <<<"$TPL_WHOLE"; then
+            # Same verdict, different defect — name it, or a reader cannot tell "deleted" from "misfiled".
+            t0_bad "T0 $(basename "$tpl") declares its initial-elapse anchor OUTSIDE the [Timer] section — systemd IGNORES it (\"Unknown key name ... ignoring\"), so next_elapse stays infinity and the timer can never fire"
+        else
+            t0_bad "T0 $(basename "$tpl") declares OnUnitActiveSec in [Timer] with NO boot/active/calendar anchor anywhere — next_elapse=infinity, it can never fire"
+        fi
     fi
 done
 # NON-VACUITY, PINNED (review cycle 3, P2). `> 0` is not a coverage pin: a template the prefilter MISSES
@@ -449,9 +461,8 @@ done
 # declaration matcher below still sees the directive.
 for f in "$dir"/*.timer; do
     [ -f "$f" ] || continue
-    grep -Ev '^[[:space:]]*(#|;|$)' "$f" \
-        | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/' \
-        | grep -qE '^OnUnitActiveSec=' && expected=$((expected + 1))
+    f_whole="$(grep -Ev '^[[:space:]]*(#|;|$)' "$f" | sed -E 's/^[[:space:]]+//; s/[[:space:]]*=[[:space:]]*/=/')"
+    grep -qE '^OnUnitActiveSec=' <<<"$f_whole" && expected=$((expected + 1))
 done
 if [ "$TPL_SEEN" -eq 0 ]; then
     t0_bad "T0 graded NO template in $dir — a glob that matches nothing passes by not running (vacuous pass)"
@@ -491,6 +502,16 @@ t0_probe empty 's/^OnBootSec=.*/OnBootSec=/'
 assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m an EMPTY assignment REDS (systemd.timer(5): the empty string RESETS the list, discarding an anchor above it)"
 t0_probe infinity 's/^OnBootSec=.*/OnBootSec=infinity/'
 assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m 'infinity' REDS (a VALID timespan meaning NEVER — the parser alone would certify it)"
+assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it"
+# ⛔ THE SECTION-AWARENESS ARM HAD NO MUTANT, so the one verdict that distinguishes "misfiled" from
+# "deleted" was pinned by nothing: the branch below was restructured to drop a `grep | sed | grep -q`
+# pipeline (#841/#864 — a SIGPIPE there reads as "no anchor anywhere" for a file whose anchor is present
+# but MISFILED), and a restructure of an unexercised branch is a change nothing can refute. Measured on
+# systemd 255: `OnBootSec=5min` under `[Unit]` verifies with "Unknown key name 'OnBootSec' in section
+# 'Unit', ignoring." and the timer keeps `next_elapse=infinity` — present, and INERT (#4117).
+t0_probe misfiled 's/^\[Unit\]$/[Unit]\nOnBootSec=5min/;s/^OnBootSec=5min$//'
+assert_contains "$PROBE_OUT" "FAIL>T0 $PROBE_MUT" "T0m an anchor filed under [Unit] REDS — systemd parses it and IGNORES it, so the file reads anchored and can never fire"
+assert_contains "$PROBE_OUT" "declares its initial-elapse anchor OUTSIDE" "T0m and the verdict NAMES the misfiling — a reader must be able to tell it from an anchor that was deleted"
 assert_absent  "$PROBE_OUT" "ok>T0 $PROBE_MUT" "T0m and no ok verdict is emitted for it"
 rm -rf "$T0M"
 
