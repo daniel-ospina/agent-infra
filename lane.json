@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-13209-1794954205-p823038-90046df7",
+  "_sha": "0400baaf44ab77473de40d02e961f4ea5c0e6a82",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-13209.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13209-fly-secret-provenance"
+    },
+    {
+      "kind": "sha",
+      "value": "659ec4c571e5ce615ef8c8c4c22dba8de552531a"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13209"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 5604,
+  "ended_at": 1794959809,
+  "exit_code": 0,
+  "heartbeat_at": 1794959809,
+  "host": "cmux",
+  "issue": 13209,
+  "kind": "lane",
+  "lane_id": "cmux.klane-13209-1794954205-p823038-90046df7",
+  "lease_until": 1794996409,
+  "pid": 823038,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794954205,
+  "state": "DONE",
+  "tag": "13209",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13209"
+}
