@@ -1533,7 +1533,8 @@ assert_contains "$OUT" "armed_ids=[101,102]" "(cap2) exactly two ids are armed"
 assert_not_contains "$OUT" "armed_ids=[101,102,103" "(cap2) a THIRD id is not armed — at most 2 means at most 2"
 assert_contains "$OUT" "disarming=[103,104,105]" "(cap2) the other three are disarmed"
 
-# (cap0) the DOCUMENTED OFF SWITCH (the gate's own header, "the fallback is DISARMED: the pool is released and the
+# (cap0) the DOCUMENTED OFF SWITCH (the FALLBACK_ARM_MAX contract in the gate's CONFIGURATION BLOCK — not its
+# header — "the fallback is DISARMED: the pool is released and the
 # engaging pass refuses"). ⛔ This is the review P1 that had shipped: the empty-arm refusal used to
 # `return 1` BEFORE the complement sweep while its message claimed "the complement was disarmed above".
 # Measured then: `rc=1` with **0** PUTs, so every pool member kept `ubuntu-latest` from an earlier pass,
@@ -3110,6 +3111,12 @@ assert_eq "$RC" "2" "(d12) an engage-repair the re-read contradicts still exits 
 assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d12) the repair DID write (the arm is not a no-op)"
 assert_contains "$OUT" "no runner carries the fallback label AT ALL" \
   "(d12) the ENGAGE direction names the write that did not stick"
+# ⛔ AND THE MECHANISM IS HEDGED, WHICH IS PINNED (review P3, measured): reverting this clause to a single
+# cause ("the runner agent re-asserts its own set 60-120 s later") left all 711 assertions green, so the
+# sentence could be narrowed back to a mechanism that CANNOT explain a disagreement observed milliseconds
+# after `set_labels`' own verify read.
+assert_contains "$OUT" "deregistered between the writes and this re-read, or a read that lags" \
+  "(d12) …and the cause is hedged, so an immediate disagreement is not attributed to the 60-120 s agent only"
 assert_not_contains "$OUT" "OUTSIDE this gate's managed set" \
   "(d12) …and does NOT borrow the STRIP direction's cause, which would assert a carrier the re-read proved absent"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "does NOT confirm the pool-wide mode" \
@@ -3131,6 +3138,28 @@ assert_contains "$OUT" "the pool's LABEL state is still mode=github" \
   "(d13) …and the claim is the reading this pass actually took"
 assert_not_contains "$OUT" "LABEL state is UNMEASURED" \
   "(d13) …so it does NOT call a measured label state unmeasured (the branch discriminates)"
+
+# (d14) `MODE_SOURCE` IS THREE-VALUED, AND THE THIRD VALUE IS NOT AN INFERENCE (review P2, measured).
+# `none` means NEITHER the label read NOR a job inference answered (`main`: "mode=unknown source=none"),
+# so describing `mode=unknown` as "only the SERVING inference" states an answer that was never taken — on
+# the DURABLE verdict file. The arm reuses the shipped knobs: `GH_FALLBACK_N=null` fails the label read and
+# `GH_JOBS_MODE=none` leaves nothing executing, while the rows hold only a stranger (empty managed set, so
+# the arm is the zero-write one, whose claim carries the source).
+run_gate demandblind-nosource GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" \
+  "(d14a) the MEASURING pass engages the pool and records mode=local"
+printf '99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$GH_ROWS_STATE"
+KEEP_STATE=1 run_gate demandblind-nosource GH_QUEUED="$BLIND_QUEUE" GH_INPROGRESS=0 \
+  GH_FALLBACK_N=null GH_JOBS_MODE=none \
+  GH_DEMAND_GHOST_IDS="$BLIND_GHOSTS" GH_QUEUE_ROWS_SPEC="$BLIND_ROWS" --
+assert_eq "$RC" "2" "(d14) a pass with no mode read and no inference still exits 2"
+assert_contains "$OUT" "mode=unknown source=none" "(d14) the pass reached `none`: nothing was read and nothing was inferred"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ABSENCE of a reading" \
+  "(d14) the verdict calls `unknown` the ABSENCE of a reading"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "only the SERVING inference" \
+  "(d14) …and does NOT describe it as an inference that was never taken"
+assert_contains "$OUT" "NEITHER the label read NOR a job inference answered" \
+  "(d14) the log names both missing reads by their real names"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"

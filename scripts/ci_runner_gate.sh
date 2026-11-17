@@ -2003,14 +2003,20 @@ if [ "$healthy" = 3 ]; then
     log "cannot measure DEMAND — the recorded mode was already in force (leaving mode=$mode)"
     exit 2
   fi
-  # ⛔ THE REPAIR'S REASON IS STATED IN THIS PASS'S OWN TERMS: "measures" is only true of a LABEL read.
+  # ⛔ THE REPAIR'S REASON IS STATED IN THIS PASS'S OWN TERMS — and `MODE_SOURCE` is THREE-valued
+  # ("runners | jobs-inference | none"), not two (review P2, measured). Collapsing `none` into
+  # `jobs-inference` asserted "mode is only INFERRED" on a pass where NO inference was taken either
+  # (`main` logs `mode=unknown … no in-progress job to infer from`), i.e. an absent answer described as a
+  # present one. `unknown` there is the ABSENCE of a reading, and that is what the sentence must say.
   if [ "$mode" = "$recorded" ]; then
     log "repair: mode=$mode equals the recorded mode=$recorded, but this pass could NOT read the runner labels (mode_source=$MODE_SOURCE) — a substituted reading says which pool is SERVING, not what the labels SAY, so it is not evidence the pool advertises the recorded mode and this pass does NOT skip the repair on it"
-    repair_why="the mode read did not answer, so mode=$mode is only INFERRED (mode_source=$MODE_SOURCE) and the pool's LABEL state is UNESTABLISHED"
+    repair_why="a reading equal to the recorded mode came from a SUBSTITUTE (mode_source=$MODE_SOURCE), and the pool's LABEL state is UNESTABLISHED"
   elif [ "$MODE_SOURCE" = runners ]; then
     repair_why="this pass measures mode=$mode"
+  elif [ "$MODE_SOURCE" = jobs-inference ]; then
+    repair_why="the label read did not answer, so mode=$mode is only INFERRED from which pool is SERVING (mode_source=jobs-inference) and the pool's LABEL state is UNESTABLISHED"
   else
-    repair_why="the label read did not answer, so mode=$mode is only INFERRED (mode_source=$MODE_SOURCE) and the pool's LABEL state is UNESTABLISHED"
+    repair_why="NEITHER the label read NOR a job inference answered (mode_source=$MODE_SOURCE), so mode=$mode is the ABSENCE of a reading rather than a mode — the pool's LABEL state is UNESTABLISHED"
   fi
   log "repair: the state file records mode=$recorded but $repair_why — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
   repair_ok=1
@@ -2080,10 +2086,15 @@ if [ "$healthy" = 3 ]; then
     # mode" reintroduced exactly that substitution on the newest path. Measured: the (d11) fixture's own
     # verdict read `mode=local mode_source=jobs-inference … the pool's mode is still local` while the pool
     # carried NO fallback label at all. So the claim follows the source, as the skip arm above does.
+    # ⛔ THREE-VALUED, LIKE `repair_why` ABOVE (review P2, measured): `jobs-inference` is "only the SERVING
+    # inference", but `none` is NO inference at all, and calling `mode=unknown` an inference there described
+    # an absent answer as a present one — on the durable verdict file.
     if [ "$MODE_SOURCE" = runners ]; then
       no_write_mode="the pool's LABEL state is still mode=$mode (read on this pass, and no write changed it)"
+    elif [ "$MODE_SOURCE" = jobs-inference ]; then
+      no_write_mode="the pool's LABEL state is UNMEASURED — this pass never read it (mode_source=jobs-inference), and mode=$mode is only the SERVING inference, not what the labels say"
     else
-      no_write_mode="the pool's LABEL state is UNMEASURED — this pass never read it (mode_source=$MODE_SOURCE), and mode=$mode is only the SERVING inference, not what the labels say"
+      no_write_mode="the pool's LABEL state is UNMEASURED — NEITHER the label read NOR a job inference answered (mode_source=$MODE_SOURCE), so mode=$mode is the ABSENCE of a reading, not a mode"
     fi
     log "repair WROTE NOTHING: set_labels reported no failure but wrote NO runner (ok=0) — the managed set is EMPTY (no runner carries this gate's pool marker), so nothing was relabelled; ${no_write_mode}; the recorded mode=$recorded is NOT confirmed"
     write_blind_verdict "the repair wrote NOTHING — no runner carries this gate's pool marker, so there was nothing to relabel; ${no_write_mode} — the recorded mode ($recorded) is NOT confirmed"
