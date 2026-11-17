@@ -7,9 +7,9 @@
 - **Issue:** #4085
 - **Worktree:** `/home/cmux/agent-infra/.worktrees/fix-4085`
 - **Branch:** `fix/4085-gate-blind-cache`
-- **Base:** `6ae4777fc3e2` → **head at write:** `489562f08e21`
-- **Started:** 2026-11-17T05:42:47Z · **Written:** 2026-11-17T05:43:57Z
-- **1 suite(s) recorded** · **0 failed** · **4 noted as not done**
+- **Base:** `6ae4777fc3e2` → **head at write:** `d1e4cda6d73a`
+- **Started:** 2026-11-17T05:42:47Z · **Written:** 2026-11-17T06:04:55Z
+- **2 suite(s) recorded** · **0 failed** · **5 noted as not done**
 
 ## Files changed
 
@@ -23,10 +23,41 @@
 | # | exit | passed | failed | skipped | other | duration | command | log (sha256) |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 0 | — | — | — | — | 62.8s | bash scripts/ci_runner_gate.test.sh | `.worktree-report/logs/01-bash-scripts-ci-runner-gate-test-sh.log` (21b5abcfeec3) |
+| 2 | 0 | — | — | — | — | 66.7s | bash scripts/ci_runner_gate.test.sh | `.worktree-report/logs/02-bash-scripts-ci-runner-gate-test-sh.log` (21b5abcfeec3) |
 
 ### Suite 1 — ci_runner_gate suite
 
 - **exit 0** · log `.worktree-report/logs/01-bash-scripts-ci-runner-gate-test-sh.log`
+
+Command, verbatim as executed:
+
+````text
+bash scripts/ci_runner_gate.test.sh
+````
+
+Output, last 15 lines:
+
+````text
+  ✅ (d3) no recorded mode → exit 2
+  ✅ (d3) the refusal to label on an unmeasured signal is NAMED
+  ✅ (d3) …and nothing is PUT
+  ✅ (d3) …and no mode is recorded
+  ✅ (d3) the raw depth is NOT read as demand — the queue legs are disarmed, not guessed
+  ✅ (d3) …so no engagement decision is taken
+  ✅ (d4) an already-converged pool still exits 2 (demand is still unmeasured)
+  ✅ (d4) the pass says the recorded mode was already in force
+  ✅ (d4) …and writes nothing (a blind pass is not a PUT storm)
+  ✅ (d5) --dry-run on a demand-blind pass → exit 2
+  ✅ (d5) the read verb names what it did NOT do
+  ✅ (d5) …no label was written
+  ✅ (d5) …and no state advanced
+  ✅ (d5) …and the previous verdict line is left exactly as it was (not re-written)
+✅ ci_runner_gate suite: all 634 assertions passed
+````
+
+### Suite 2 — ci_runner_gate suite (final head)
+
+- **exit 0** · log `.worktree-report/logs/02-bash-scripts-ci-runner-gate-test-sh.log`
 
 Command, verbatim as executed:
 
@@ -60,10 +91,11 @@ Output, last 15 lines:
 - The ENGAGE/RELEASE DECISION is still unreachable when demand cannot be measured — deliberately: a pass may not arm or strip the pool on a value it did not read (#2327). Direction 2 (scaling the scan window with queue depth) was NOT taken; the bound stays 25 (#3995) and the reach question stays open.
 - The gate's fallback footprint is bounded by FALLBACK_ARM_MAX=3 (#3261), so the 4/23 -> 23/23 hand-relabel in #4085 is an OPERATOR action beyond the gate's arm cap and is NOT restored by this change. The repair restores the RECORDED MODE, not an operator's wider label union.
 - The two comment-only P2s from #4104 round 6 needed no change: both are already corrected on main (ci_runner_gate.sh:228-238 states the time-bounded DEFECT rate, and ci_runner_gate.test.sh:2650 marks the .stamp assertion as a presence check, not an independent discriminator). Verified by reading, not assumed.
+- MUTANT PROOFS (reproduction, run from this worktree): each new arm was proven load-bearing by mutating this branch's OWN change and re-running the suite with GATE_UNDER_TEST=<mutant>. m1b-true-revert (the window-exhausted branch returns 2 again, message intact) reddens 13 assertions, all in the new d1-d5 section, with every pre-existing arm green. m6-no-rc3 (fall through to the legs) reddens the pre-existing ghost-window arms (exit 0, state written, a runner relabelled) plus d1/d2. m2-raw-demand / m2b-raw-demand redden d1 (queued_demanding=unmeasured / a false engagement). m3-always-engage reddens d2 (#2327 strip direction weakened). m3b-default-local reddens d3 (labelling with no recorded mode). m4b-dry-ignored reddens d5 (a read verb repairing). m5-seed-zero reddens d1 — that one was a real defect in the first draft. m7-always-put reddens d4 (a PUT storm on an already-converged pool).
 
 ## How to verify this report
 
 ```bash
 uv run python tools/worktree_report.py check
 ```
-<!-- report-digest: 30e226279c13682aa68b6a95560d6a88c26eb53a59ff134a680a61dd63f5d0d6 -->
+<!-- report-digest: 338f916f57b1d3e26792bd6da597cac2feb1fc7f37334aabc8a7f0aa077eba0d -->
