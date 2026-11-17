@@ -478,9 +478,16 @@ ck "§Z no projection hands a payload VARIABLE to python as a value" \
 # admin-merge gate from every cell's chain (a recorded decision, `docs/ops/gh-rate-limits.md`).
 for _s in gh-rest/gh gh-limit/gh; do
   _off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/$_s" 2>/dev/null | cut -d: -f1)"
-  ck "§W shim marker inside the 8 KiB resolver window: $_s (byte ${_off:-none})" \
+  ck "§W shim marker inside the LIMITER's 8 KiB window: $_s (byte ${_off:-none})" \
      "$([ -n "${_off:-}" ] && [ "${_off:-99999}" -le $((8192 - 22)) ] && echo 0 || echo 1)"
 done
+# ⛔ AND THE THIRD LAYER'S MARKER MUST SIT INSIDE THE **ADAPTER'S** 32 KiB WINDOW while staying OUTSIDE
+# the limiter's 8 KiB one — that pair of facts IS the chain (`gh-limit → argv-guard → real gh`): the
+# limiter must resolve the guard as its child, and the adapter must skip it rather than insert it a
+# second time. A future edit that moves the guard's marker breaks one end or the other, silently.
+_g_off="$(grep -b -o -m1 'harness-gh-shim-marker' "$HERE/../gh-shim/gh" 2>/dev/null | cut -d: -f1)"
+ck "§W the #984 guard's marker is OUTSIDE 8 KiB and INSIDE the adapter's 32 KiB window (byte ${_g_off:-none})" \
+   "$([ -n "${_g_off:-}" ] && [ "${_g_off:-0}" -gt 8192 ] && [ "${_g_off:-99999}" -lt 32768 ] && echo 0 || echo 1)"
 
 # ── §P. THE RESOLVER PREAMBLE MUST NOT FORK (#3998) ──────────────────────────────────────────────
 # The wrapper walks PATH on EVERY harness call to find the real gh, and it used to run one `grep`
@@ -557,12 +564,22 @@ ck "§P …and those counters are NOT inert ($_spawned of 3 direct invocations r
 mkdir -p "$TMP/shimskip" "$TMP/oldcopy/shim" "$TMP/shims/gh-rest" "$TMP/shims/gh-limit"
 cp "$HERE/gh-rest/gh" "$TMP/shims/gh-rest/gh"; cp "$HERE/gh-limit/gh" "$TMP/shims/gh-limit/gh"
 cp "$HERE/gh-rest/gh" "$TMP/shimskip/gh"
-# an OLDER copy: the marker LINE removed, identified only by the helper beside it
-# ($TMP/oldcopy/gh-limit.py = $TMP/oldcopy/shim/../gh-limit.py).
-{ grep -v '^# harness-gh-shim-marker' "$HERE/gh-rest/gh"; } >"$TMP/oldcopy/shim/gh"
+# ⛔ A SIBLING `../gh-limit.py` MUST NOT MAKE A CANDIDATE A SHIM — THAT PREDICATE SILENTLY DISARMS THE
+# #984 ADMIN-MERGE GUARD (round-2 review, F2, reproduced). With the guard deployed at `<d>/gh-shim/gh`
+# beside `<d>/gh-limit.py`, the adapter skipped the guard and handed `gh pr merge --admin` to the real
+# gh; `gh-limit.py` deleted this exact predicate in its own review round 10 for this reason
+# ("a bypass of a gate is worse than the 127 it was guarding against") and `scripts/gh-shim/gh` never
+# had it. So the arm below is the INVERSE of the one it replaces: a marker-less `gh` beside a helper is
+# EXEC'd (one hop, `depth == 2`), because identity is the file's own sentinel.
+# The fixture is a PLAIN `gh` — not a shim — sitting in a directory whose parent holds `gh-limit.py`.
+# ⛔ IT CANNOT BE A MARKER-STRIPPED COPY OF THE ADAPTER: the adapter's own resolver SOURCE carries the
+# sentinel literal, so a stripped copy is still identified by it (measured — an earlier version of this
+# arm expected `depth 2` and got `1`). A plain script is what F2's bypass actually used: any non-shim
+# `gh` beside a `../gh-limit.py` was silently skipped, which is how the #984 guard was disarmed.
+printf '#!/usr/bin/env bash\nprintf "%%s %%s\\n" "gho_NOTASHIM" "${HARNESS_GH_SHIM_DEPTH:-0}"\n' >"$TMP/oldcopy/shim/gh"
+chmod +x "$TMP/oldcopy/shim/gh"
 printf '' >"$TMP/oldcopy/gh-limit.py"
 for _c in "$TMP/shimskip:identical copy of the REST adapter" \
-          "$TMP/oldcopy/shim:older copy, marker line removed" \
           "$TMP/shims/gh-rest:deployed contract copy of gh-rest" \
           "$TMP/shims/gh-limit:deployed contract copy of gh-limit"; do
   _d="${_c%%:*}"; _what="${_c#*:}"
@@ -586,13 +603,36 @@ done
 # (`gh-rest → gh-shim → real gh`, the documented chain).
 mkdir -p "$TMP/layerguard"
 { printf '#!/usr/bin/env bash\n'
-  head -c 9000 /dev/zero | tr '\0' '#'          # ONE long comment line: pushes the marker past 8 KiB
+  head -c 40000 /dev/zero | tr '\0' '#'         # ONE long comment line: pushes the marker past 32 KiB
   printf '\n# harness-gh-shim-marker: past the window on purpose\nprintf "%%s\\n" "gho_GUARDCHAIN"\n'; } >"$TMP/layerguard/gh"
 chmod +x "$TMP/layerguard/gh"
 out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/layerguard:$TMP/stubbin:$TMP/minbin" \
        bash "$SHIM" auth token 2>"$TMP/err-guard")"; _rc=$?
-ck "§P a marker PAST the 8 KiB window is NOT skipped (a layered guard stays in the chain)" \
+ck "§P a marker PAST the 32 KiB window is NOT skipped (the window is bounded, not unbounded)" \
    "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_GUARDCHAIN" ] && echo 0 || echo 1)"
+out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/oldcopy/shim:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" auth token 2>"$TMP/err-sib")"; _rc=$?
+ck "§P a sibling ../gh-limit.py does NOT make a candidate a shim (a plain gh beside one is EXEC'd)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "gho_NOTASHIM 1" ] && echo 0 || echo 1)"
+# ⛔ AND WITH THE **REAL** #984 GUARD ON PATH (not a fixture): the adapter must NOT skip it. This is the
+# arm that would have caught F2 as a behaviour rather than as a predicate, and it uses the shipped
+# guard, so the "does the admin-merge gate stay in the chain" question is answered by the guard's own
+# output. `--admin` with no evidence makes the guard REFUSE — a refusal PROVES it ran.
+mkdir -p "$TMP/realguard"
+cp "$HERE/../gh-shim/gh" "$TMP/realguard/gh"; chmod +x "$TMP/realguard/gh"
+printf '' >"$TMP/gh-limit.py"          # the sibling F2 turned into a bypass; it must make no difference
+out="$(HOME="$TMP/home-rg" GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/realguard:$TMP/stubbin:$TMP/minbin" \
+       bash "$SHIM" auth token 2>&1)"; _rc=$?
+rm -f "$TMP/gh-limit.py"
+# ⛔ THE ADAPTER SKIPS THE ARGV GUARD, AND THAT IS THE RECORDED CHAIN: the documented order is
+# `gh-limit → argv-guard → real gh`, i.e. the LIMITER resolves the guard as its child. Measured with
+# the real guard on PATH: the adapter skipping it = 5 child processes / 1 guard exec (via the limiter);
+# the adapter ALSO inserting it = 39 children / 8 guard execs / 240 ms — the guard's own nested `gh`
+# calls re-enter the adapter (round-2 review F1). What this PR fixes is different and narrower: a
+# NON-shim `gh` is no longer trusted just because a `../gh-limit.py` sits beside it (the arm above).
+ck "§P the REAL #984 guard is skipped BY THE ADAPTER (the limiter owns its insertion)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
+
 # ⛔ AN UNREADABLE CANDIDATE MUST NOT TOUCH A SUCCESSFUL CALL'S STREAMS (#10009/#2305, re-introduced by
 # this PR's first form and caught by review). Redirections apply LEFT TO RIGHT: with `<"$_f"` written
 # BEFORE `2>/dev/null`, the SHELL reports the failed open on the CALLER's stderr while the call itself
@@ -608,10 +648,10 @@ ck "§P an UNREADABLE candidate adds NOTHING to a successful call's stderr (the 
    "$([ -z "$(cat "$TMP/err-unread" 2>/dev/null)" ] && echo 0 || echo 1)"
 chmod 0755 "$TMP/unreadable/gh"
 
-# ⛔ A NUL-PADDED SENTINEL: the window is 8192 NON-NUL CHARACTERS, not bytes (recorded divergence with
-# `scripts/gh-shim/gh`, which bounds by BYTES via `head -c 8192`). `read` discards NULs WITHOUT counting
-# them, so a marker 9000 NULs into a candidate is still inside THIS resolver's window and the candidate
-# is skipped. Pinned so the difference is a recorded fact rather than an implied one.
+# ⛔ A NUL-PADDED SENTINEL: on bash >= 5 the window is 32768 NON-NUL CHARACTERS, not bytes (recorded
+# divergence with `scripts/gh-shim/gh`, whose limiter-side window is 8192 BYTES via `head -c`). `read`
+# discards NULs WITHOUT counting them, so a marker 9000 NULs into a candidate is still inside the
+# ADAPTER's window and the candidate is skipped. Pinned so the difference is a recorded fact.
 mkdir -p "$TMP/nulpad"
 { head -c 9000 /dev/zero; printf '# harness-gh-shim-marker\nprintf "%%s\\n" "gho_NULPAD"\n'; } >"$TMP/nulpad/gh"
 chmod +x "$TMP/nulpad/gh"
@@ -619,17 +659,16 @@ out="$(GH_REST_LIMIT_HELPER=/nonexistent PATH="$TMP/spawnbin:$TMP/nulpad:$TMP/st
        bash "$SHIM" auth token 2>"$TMP/err-nul")"; _rc=$?
 # ⛔ AND SO IS THIS ONE (E-1), because the two arms' windows are not the same SIZE of window:
 #   bash >= 5 — 8192 NON-NUL CHARACTERS, so a marker after 9000 NULs is still INSIDE it → SKIPPED;
-#   bash 3.2  — 8192 BYTES (the `head -c` arm, deliberately, see E-2), so the same marker is OUTSIDE
-#               it → NOT skipped.
+#   bash 3.2  — 32768 BYTES (the `head -c` arm), so the same marker is INSIDE it here (9 KB < 32 KB) —
+#               the two arms differ only past 32 KiB of NULs, which is why the assertion below is the
+#               same on both hosts and the past-the-window arm uses a 40 KB fixture.
 # Both are at least as strict as the documented byte window, so neither host can bypass the guard;
 # the divergence is a SUPERSET difference and is asserted per host rather than papered over.
-if (( BASH_VERSINFO[0] >= 5 )); then
-  ck "§P a NUL-padded sentinel past 8 KiB BYTES is skipped (window = 8 KiB non-NUL chars)" \
-     "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
-else
-  ck "§P …on bash 3.2 the window is 8 KiB BYTES, so that sentinel is NOT skipped (documented)" \
-     "$([ "$_rc" -ne 0 ] && echo 0 || echo 1)"
-fi
+# Both hosts now answer the same here (9 KB is inside 8 KiB? no — inside 32 KiB either way), so the row
+# is NOT host-gated any more: the divergence that remains is only past 32 KiB of NULs, covered by the
+# `far` fixture above on 3.2 and by the past-the-window arm on bash 5.
+ck "§P a NUL-padded sentinel past 8 KiB BYTES is still skipped (window counts NON-NUL chars on bash >= 5)" \
+   "$([ "$_rc" -eq 0 ] && [ "$out" = "$WANT_PROBE" ] && echo 0 || echo 1)"
 
 # ⛔ AND THE MUTUAL SHAPE THE MEASURED INCIDENT HAD: the shims resolve to EACH OTHER when the INVOKED
 # shim's own directory is on PATH beside another one (1,700 processes in 6 s, `fork: Resource

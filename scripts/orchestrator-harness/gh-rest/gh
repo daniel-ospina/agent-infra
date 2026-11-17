@@ -87,7 +87,7 @@ if [ "${HARNESS_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
   exit 127
 fi
 export HARNESS_GH_SHIM_DEPTH=$(( ${HARNESS_GH_SHIM_DEPTH:-0} + 1 ))
-_is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling helper (older copies)
+_is_harness_shim() {  # a harness shim: its OWN sentinel line, and nothing else (see the tail)
   # ⛔ ONE BUILTIN READ ON BASH >= 5: NO FORK, AND NEVER THE WHOLE FILE (#3998). This was `grep -qa`
   # per candidate — one fork per PATH entry, and the candidate that usually wins is the real gh, a
   # 41 MB compiled binary, so `grep` read all 41 MB on every call. Measured on that binary: 25 ms of
@@ -112,7 +112,7 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # `2>/dev/null` keeps an unreadable candidate from putting the SHELL's own open error on a
   # successful call's stderr — but ONLY in the order spelled below, where the stderr discard is
   # applied BEFORE the input redirect.
-  local _f="$1" _head=""
+  local _f="$1" _head="" _chunk=""
   # ⛔ THE READ IS `read -N`, AND IT IS GATED ON THE SHELL BECAUSE THAT IS THE HONEST SHAPE. Two arms,
   # each VERIFIED on the host it serves — not a compromise, and not `read -N` everywhere:
   #   * bash 5.x (the cloud cells, and the Mac's Homebrew bash — what the fleet runs): ONE
@@ -140,14 +140,31 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # `scripts/gh-shim/gh` states this ordering rule verbatim (§10(a5)); the pre-#3998
   # `grep -qa … 2>/dev/null` was immune only because grep opened the file itself. Reproduced by review
   # at rc=0 with the diagnostic on the merged stream; §P's unreadable-candidate arm pins it now.
-  # ⛔ AND THE WINDOW IS 8192 NON-NUL CHARACTERS, NOT BYTES (measured, stated as the number it is):
+  # ⛔ AND THE WINDOW IS 32768 NON-NUL CHARACTERS ON BASH >= 5 (measured, stated as the number it
+  # is) / 32768 BYTES on 3.2:
   # `read` DISCARDS NUL bytes without counting them, so the real 41 MB gh costs ~12–19 KB of reads to
   # collect 8192 characters, and a pathological mostly-NUL candidate is read to EOF. That residual is
   # accepted (still ~2000x cheaper than the full read it replaced) and `scripts/gh-shim/gh` bounds by
   # BYTES (`head -c 8192`), so the two resolvers can disagree about what falls inside their window on
   # a NUL-bearing candidate — recorded here, pinned by §P's NUL-padded arm, never implied away.
   if (( BASH_VERSINFO[0] >= 5 )); then
-    LC_ALL=C IFS= read -r -N 8192 _head 2>/dev/null <"$_f" || :
+    # ⛔ TWO STAGES, 8 KiB THEN +24 KiB. The window is 32 KiB because a harness LAYER's sentinel can sit
+    # well past the 8 KiB the LIMITER reads: `scripts/gh-shim/gh` (the #984 argv guard) puts its marker
+    # at byte 31551 ON PURPOSE, so the limiter resolves it as its CHILD (the documented chain is
+    # `gh-limit → argv-guard → real gh`). The ADAPTER must skip it, or the guard is inserted TWICE and
+    # every gh call pays for both — MEASURED on this box with the real guard on PATH: 11 child
+    # processes / 1 guard exec / 111 ms when the adapter skips it, versus 39 / 8 / 240 ms when it does
+    # not (round-2 review F1). Stage 1 is the cheap common case (the two shims' markers are at 2602 and
+    # 1297); stage 2 runs only for a candidate stage 1 could not identify, so the real 41 MB gh costs
+    # 32 KiB of reads and the whole walk stays fork-free. ⛔ Stage 2 must continue on the SAME fd, so
+    # both reads share one `{ … } < "$_f"` group — a second `read … < "$_f"` would restart at byte 0.
+    {
+      IFS= read -r -N 8192 _head || :
+      case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
+      _chunk=""
+      IFS= read -r -N 24576 _chunk || :
+      _head="$_head$_chunk"
+    } 2>/dev/null <"$_f"
   else
     # bash 3.2 (no `-N`, and its `read` stops at a NUL): the bounded BYTE window is produced by `head`
     # and searched by `grep` — `scripts/gh-shim/gh`'s own 3.2-compatible shape (§10(a5)).
@@ -162,13 +179,24 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
     # silently out of the chain — a gate BYPASS on a declared host. `scripts/gh-shim/gh` puts its
     # marker outside the 8 KiB window ON PURPOSE; a resolver that reads past the window drops that
     # gate. Cost of the bound here: 2 processes per candidate on this host, 0 on the fleet's bash 5.
-    grep -qa 'harness-gh-shim-marker' <(LC_ALL=C head -c 8192 2>/dev/null <"$_f") && return 0
+    grep -qa 'harness-gh-shim-marker' <(LC_ALL=C head -c 32768 2>/dev/null <"$_f") && return 0
   fi
   case "$_head" in *harness-gh-shim-marker*) return 0 ;; esac
-  # An OLDER copy of a shim carries no marker, or carries it past the window; it is identified by the
-  # helper beside it — the deployment contract is that both shims sit beside ONE `../gh-limit.py`.
-  # `${_f%/*}` is the candidate's own directory: one more `dirname` fork removed.
-  [ -f "${_f%/*}/../gh-limit.py" ]
+  # ⛔ AND NO SIBLING-HELPER ARM. A `gh` in a directory whose PARENT happens to hold `gh-limit.py` is
+  # NOT a harness shim, and trusting that layout SILENTLY DISARMS THE #984 ADMIN-MERGE GUARD: with the
+  # guard deployed at `<d>/gh-shim/gh` beside `<d>/gh-limit.py`, this adapter SKIPPED the guard and
+  # handed `gh pr merge --admin` to the real gh. REPRODUCED by round-2 review (the guard REFUSES with
+  # no sibling file present, and the merge REACHES the real gh with one), and settled in the sibling
+  # resolver: `gh-limit.py::is_harness_shim` deleted this exact predicate in ITS review round 10 —
+  # "a sibling `../gh-limit.py` was accepted too, which SILENTLY SKIPPED any other `gh` sitting in such
+  # a directory … a bypass of a gate is worse than the 127 it was guarding against" — and
+  # `scripts/gh-shim/gh` never had it. THIS FILE WAS THE LAST HOLDER. Identity is the file's OWN
+  # sentinel, and nothing else.
+  # ⛔ WHAT HAPPENS TO A COPY THAT PREDATES THE SENTINEL: it is exec'd — ONE extra hop — and resolves
+  # the real gh itself, i.e. it is a working shim, not a dead box; two such copies hit the depth guard
+  # above, which is the loud backstop built for precisely that. The alternative (this arm) is a silent
+  # gate bypass, which no amount of saved hops justifies.
+  return 1
 }
 REAL_GH="${GH_REST_REAL_GH:-}"
 if [ -z "$REAL_GH" ]; then
