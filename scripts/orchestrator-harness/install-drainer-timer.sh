@@ -54,9 +54,11 @@
 #             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
 #             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
 #             dispatches at cannot be DETERMINED — no pin and an unreadable `ExecStart` script, a pin
-#             whose value is not a number of seconds, or a pin line systemd would REJECT (an
-#             unterminated quote makes systemd abandon the line) — named as unknown rather than
-#             silently graded clean.
+#             whose value is not a number of seconds, a pin line systemd would REJECT (an unterminated
+#             quote makes systemd abandon the line), or a `[Service]` directive that compiles the
+#             environment BEHIND `Environment=` (`EnvironmentFile=`, `PassEnvironment=` — the later
+#             source wins, systemd.exec(5)) or expands the text (`\` continuation/escape, `%`
+#             specifier) — named as unknown rather than silently graded clean.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -278,11 +280,39 @@ say_status() {
         # `Environment=` RESET, and reports a line systemd would REJECT as `!unparseable:` instead of
         # guessing at its value. The unit is fed in first and its drop-ins after it, in systemd's own
         # order, so a drop-in's override is what this verb grades.
-        local unit_text envmap unparsed installed want pin_unreadable=0
-        unit_text="$( { cat "$UNIT_DIR/$svc"
-                        for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && cat "$_d"; done
+        local unit_text envmap unparsed unresolved installed want pin_unreadable=0
+        # ⛔ EACH FILE IS PRECEDED BY `[Unit]` BECAUSE THE CONCATENATION IS NOT THE UNIT. systemd parses
+        # the unit and EVERY drop-in as SEPARATE files, and an assignment appearing before any
+        # `[Section]` header in one of them is dropped ("Assignment outside of section. Ignoring") —
+        # while a bare `cat` of unit-then-drop-ins leaves such a line attached to whatever section the
+        # file before it happened to end in. `[Unit]` is the truthful stand-in: no reader here honours a
+        # `[Unit]` directive, exactly as systemd honours nothing pre-header, and a drop-in that DOES
+        # open with `[Service]` switches immediately. (Declared residual: a drop-in with no header at
+        # all reads as `[Unit]` here and would be a false STALE if the base file ended in `[Service]` —
+        # the safe direction, never a false CLEAN; `systemd-analyze verify` names such a file.)
+        unit_text="$( { printf '[Unit]\n'; cat "$UNIT_DIR/$svc"
+                        for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && { printf '[Unit]\n'; cat "$_d"; }; done
                       } 2>/dev/null )"
         envmap="$(effective_env "$unit_text")"
+        # ⛔ A COMPILED ENVIRONMENT THIS PARSER CANNOT KNOW IS UNKNOWN (5), NEVER A VERDICT (round-3
+        # re-review, F1 — MEASURED). `EnvironmentFile=` is the LATER source and OVERRIDES `Environment=`,
+        # so a drop-in carrying one moved this box's cap to 7200 while `--status` printed "36000 s
+        # installed · 36000 s would be rendered now" and exited **0**. `PassEnvironment=` is the same
+        # hole (it imports names from the manager's block). Both are refused BY NAME in one list, the
+        # shape `cell-self-pin.sh:807` records (`ENV_MUTATING_DIRECTIVES`), and the lib reports them as
+        # `!unresolvable:` — an `Environment=`-shaped scan cannot see them at all, because the value is
+        # not in this text. Checked BEFORE any grading: a stale `Environment=` that an `EnvironmentFile=`
+        # sets back to the seam is NOT a stale pin, and calling it one would be a wrong answer in place
+        # of an honest "unknown".
+        unresolved="$(printf '%s\n' "$envmap" | sed -n 's/^!unresolvable://p')"
+        if [ -n "$unresolved" ]; then
+            printf '  ⚠️  UNRESOLVABLE ENVIRONMENT: the [Service] of this unit carries a directive that changes\n'
+            printf '      the environment BEHIND `Environment=`, so the cap this box dispatches at cannot be\n'
+            printf '      text and is UNKNOWN — not healthy, and not guessed at:\n'
+            printf '%s\n' "$unresolved" | sed 's/^/        /'
+            printf '      Re-run this installer (no arguments) on this cell to re-render the pin, or drop the directive.\n'
+            return 5
+        fi
         unparsed="$(printf '%s\n' "$envmap" | sed -n 's/^!unparseable://p')"
         case "$unparsed" in *LANE_TIMEOUT*) pin_unreadable=1 ;; esac
         installed="$(printf '%s\n' "$envmap" | sed -n 's/^LANE_TIMEOUT=//p' | tail -1 | tr -d '\r')"
