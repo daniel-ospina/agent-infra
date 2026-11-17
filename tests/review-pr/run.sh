@@ -3786,13 +3786,15 @@ err_has "REPUBLISHES THE CONTRACT'S OWN WORKED EXAMPLE ROW"; ck $? "  …and the
 err_has "PASTE-BACK"; ck $? "  …as the reviewer-side paste it is"
 # …and the SAME transcript proves the parser alone would have passed it: this is the measurement the
 # arm rests on, taken on the artifact the MUTANT below actually publishes.
-# ⛔ THE MUTANT REVERTS THE WHOLE PROVENANCE CAPABILITY, NOT ONE VARIABLE (the arm is two granularities
-# — the row verbatim, and the canonical CELLS — so bypassing only `_pb_rows` would leave §BQ's cell arm
-# refusing the same copy and the control would prove nothing). That is what this section claims: with
-# provenance gone, the parser accepts the paste-back and the record is minted.
+# ⛔ THE MUTANT REVERTS THE WHOLE PROVENANCE CAPABILITY, NOT ONE VARIABLE (the arm is THREE
+# granularities — the row verbatim, the canonical CELLS, and the reflow-proof PAYLOAD — so bypassing
+# only `_pb_rows` would leave the others refusing the same copy and the control would prove nothing).
+# That is what this section claims: with provenance gone, the parser accepts the paste-back and the
+# record is minted.
 PB="$TMP/mutant-no-pasteback.sh"
 cp "$SRC" "$PB"; chmod +x "$PB"
-sed -e 's|^  _pb_rows=.*|  _pb_rows=""|' -e 's|^  _pb_cells=.*|  _pb_cells=""|' "$SRC" > "$PB"
+sed -e 's|^  _pb_rows=.*|  _pb_rows=""|' -e 's|^  _pb_cells=.*|  _pb_cells=""|' \
+    -e 's|^  _pb_payload=.*|  _pb_payload=""|' "$SRC" > "$PB"
 if cmp -s "$SRC" "$PB"; then
   fail "the paste-back mutation did not apply - this control proves NOTHING"
 else
@@ -4068,7 +4070,9 @@ no_record; ck $? "  …nothing recorded on the harness's own row"
 BP="$TMP/mutant-no-projection.sh"
 sed -e 's|gsub(/\[\^a-z0-9\][+]/, "", t)|t = t|' \
     -e 's|gsub(/\[\^a-z0-9\][+]/, "", low)|low = low|' \
+    -e 's|^  _pb_rows=.*|  _pb_rows=""|' \
     -e 's|^  _pb_cells=.*|  _pb_cells=""|' \
+    -e 's|^  _pb_payload=.*|  _pb_payload=""|' \
     -e 's|grep -F -- "$_ec"|grep -Fx -- "$_ec"|' \
     "$SRC" > "$BP"
 if cmp -s "$SRC" "$BP"; then
@@ -4176,11 +4180,13 @@ unset _bq_cell4
 # The internal mutant: WIDEN the cell arm's floor in a COPY, leaving everything else intact (the
 # comparison, the projection and both other provenance arms). If the refusals above came from this arm,
 # the copy must RECORD the cell-edited paste-back while the recorder's parser still accepts the artifact
-# it publishes — the false PASS, measured end to end. The mutant is a FLOOR change and not a deleted
-# arm because a deleted arm would also remove the message, while the floor is what the arm's own
-# docstring promises: two canonical cells is a copy, one is not.
+# it publishes — the false PASS, measured end to end. The mutant reverts the FLOOR **and** the reflow
+# granularity (the payload arm refuses this same `extra` copy on its own), which is the capability-mutant
+# convention §BP and §BL already apply for the same reason; the floor itself stays pinned by the authored
+# ONE-cell control above, which must still record on the UNMUTATED script.
 BQ="$TMP/mutant-cell-arm.sh"
-sed 's/\[ "$_n" -ge 2 \] \&\& { printf/\[ "$_n" -ge 99 \] \&\& { printf/' "$SRC" > "$BQ"
+sed -e 's/\[ "$_n" -ge 2 \] \&\& { printf/\[ "$_n" -ge 99 \] \&\& { printf/' \
+    -e 's|^  _pb_payload=.*|  _pb_payload=""|' "$SRC" > "$BQ"
 if cmp -s "$SRC" "$BQ"; then
   fail "the cell-arm mutation did not apply - this control proves NOTHING"
 else
@@ -4194,6 +4200,84 @@ else
 fi
 reset
 # ══ end §BQ ══
+
+# ── §BR THE COPY THAT MOVES THE CELL BOUNDARIES: PROVENANCE AT THE PAYLOAD ────────────────────────
+# ⛔ MEASURED AT f237d39fa — the TENTH spelling of the same false PASS, and the one the CELL arm
+# structurally CANNOT see: it counts the example's DISTINCTIVE CELLS inside the reviewer's cells, so a
+# copy that keeps the claim and REFLOWS it across more (or fewer) cells has no cell in common with the
+# example. Reflow is the ordinary thing a table editor does: GFM keeps the table when a body row carries
+# more cells than its header (header and delimiter must match; body rows may differ), so pasting a
+# 4-cell example into a 5-column table of one's own is the NORMALISING behaviour, exactly as `drop` was
+# in §BQ. Measured on that head: the worked row with its FIRST and LAST cells split is ACCEPTED by
+# `brief-gate.sh --mutation-missing` (rc=0, empty = accepted) and MISSED by all three arms (no output) —
+# a `clean` record minted on the harness's own example, for a diff the example says nothing about.
+# Every copy below is BUILT FROM THE REAL `--mutation-section` row (never retyped); this file makes only
+# the ONE boundary change each, so the section cannot go stale as the contract is edited. Each assertion
+# FIRST asks the recorder's own parser (a copy is only a defect when the parser ACCEPTS it), then
+# requires the seam to REFUSE, and the authored control keeps this a provenance test rather than a ban
+# on citing the contract. And the mutant below empties ONLY the payload arm — the other three stay — so
+# this section proves that arm is what refuses these copies, not its neighbours.
+echo; echo "§BR a copy that MOVES the cell boundaries is still a copy — provenance at the payload"
+# The row's cells, taken from the real contract row by FIELD, so nothing here is a retyped example.
+_br_c1="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ print $2 }')"
+_br_c2="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ print $3 }')"
+_br_c3="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ print $4 }')"
+_br_c4="$(printf '%s' "$CANON_ROW" | awk -F'|' '{ print $5 }')"
+# (a) SPLIT: the first and last cells each become two. Built by splitting on text the cell CONTAINS, so
+# the concatenation is unchanged by construction; if that text is ever reworded the section fails loudly
+# (the copy stops being a copy) instead of silently passing.
+_br_s1a="${_br_c1%%—*}"; _br_s1b="${_br_c1#*—}"
+_br_s4a="${_br_c4%% (got 0)*}"; _br_s4b=" (got 0)${_br_c4#* (got 0)}"
+_br_split="|${_br_s1a}|${_br_s1b}|${_br_c2}|${_br_c3}|${_br_s4a}|${_br_s4b}|"
+# (b) MERGE: cells 1 and 2 become one — the same reflow in the other direction, and the shape a reviewer
+# produces when its own table has fewer columns than the example.
+_br_merge="|${_br_c1} ${_br_c2}|${_br_c3}|${_br_c4}|"
+for _k in split merge; do
+  _br_ref="_br_$_k"; _br_row="${!_br_ref}"
+  printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_br_row" > "$TMP/br-$_k.md"
+  _br_rc=0; _br_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/br-$_k.md" 2>/dev/null)" || _br_rc=$?
+  [ "$_br_rc" -eq 0 ] && [ -z "$_br_miss" ]; ck $? "the parser ACCEPTS the worked row with its cell boundaries '$_k' (rc=$_br_rc, ='${_br_miss:-<accepted>}') - measured, so this is a live hole, not a hypothetical"
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_br_row" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "11" ]; ck $? "  …and that '$_k'-reflowed copy is REFUSED before anything is posted (rc=$(rc_of), want 11)"
+  no_comment; ck $? "    …nothing posted as a review artifact ('$_k')"
+  no_record; ck $? "    …and no record minted on the harness's own row ('$_k')"
+  err_has "REPRODUCES THE CONTRACT'S OWN WORKED EXAMPLE ROW"; ck $? "    …with the refusal naming the provenance ('$_k')"
+done
+unset _k _br_row
+# ⛔ THE FALSE-BLOCK DIRECTION. A row that merely NAMES the contract's file, or reuses ONE of its cells,
+# is a reviewer writing its OWN claim about THIS diff and must still record — the payload arm asks for
+# the whole claim in order, so a citation cannot satisfy it. This is the same floor §BQ pins at the cell
+# granularity, restated at the payload's so a future widening here is caught by a test and not by a
+# blocked reviewer.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n| `tests/review-pr/run.sh` §BR — a reflowed copy is refused | `_pb_payload=` emptied | §BR (authored) |%s|\n\nCLEAN\n' \
+  "$_bq_hdr" "$_bq_rule" "$_br_c4" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "an AUTHORED row citing the contract's file and ONE of its cells still records (rc=$(rc_of)) - the payload arm refuses copies, not citations"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+# The internal mutant: empty the PAYLOAD arm ONLY (`_pb` rows, cells and exemption all stay), so if the
+# refusals above came from this granularity the copy must RECORD while the recorder's parser still
+# accepts the artifact it publishes — the false PASS, measured end to end on the bytes this seam would
+# have posted. The other three arms are deliberately left live: they MISS these copies (measured), so a
+# green here is attributable to this arm alone rather than to the capability as a whole.
+BR="$TMP/mutant-no-payload-arm.sh"
+sed 's|^  _pb_payload=.*|  _pb_payload=""|' "$SRC" > "$BR"
+if cmp -s "$SRC" "$BR"; then
+  fail "the payload-arm mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf 'Here is the shape I was given:\n\n## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_br_split" > "$TMP/reviewer-out"
+  run "$BR" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT without the payload arm RECORDS the reflowed paste-back (rc=$(rc_of)) - so the payload granularity is what refuses it"
+  _br_rc=0; _br_miss=""
+  _br_miss="$(bash "$GATE_SH" --mutation-missing "$TMP/comment.md" 2>/dev/null)" || _br_rc=$?
+  [ "$_br_rc" -eq 0 ] && [ -z "$_br_miss" ]; ck $? "  …and the recorder's OWN parser ACCEPTS that posted artifact (rc=$_br_rc, ='${_br_miss:-<accepted>}') - the false PASS, measured"
+fi
+unset _br_c1 _br_c2 _br_c3 _br_c4 _br_split _br_merge _br_s1a _br_s1b _br_s4a _br_s4b
+reset
+# ══ end §BR ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
