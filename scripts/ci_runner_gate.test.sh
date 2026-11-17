@@ -168,21 +168,30 @@ now = datetime.datetime.now(datetime.timezone.utc)
 print((now - datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))
 ' "$1"
 }
-# queue_rows_field — the 4th field of the queue read: the page's `id,created_at` pairs, OLDEST
-# FIRST, `;`-joined. Derived from GH_QUEUE_ROWS_SPEC when set, else the single head row.
-queue_rows_field() {
+# queue_rows_body — the API's OWN queued-runs body: `{"total_count":N,"workflow_runs":[…]}`.
+# The stub pipes this through the GATE'S OWN `--jq` program, so what the gate reads is that program's
+# OUTPUT on a body shaped like the real endpoint's — a program that cannot run on a real body is a red
+# HERE, at the call that ships it, instead of on the box it was written for. The rows come from the same
+# fixtures every arm already passes (`GH_QUEUE_ROWS_SPEC`, else the single head row at
+# `GH_HEAD_RUN_ID`/`GH_QUEUE_OLDEST_AT`), and every stamp is rendered at CALL time.
+# ⛔ THIS REPLACED A `queue_rows_field` HELPER THAT PRINTED THE 4TH FIELD ITSELF (#4116 review, P2). A
+# double that prints the rows it BELIEVES a program would emit certifies a protocol the shipped program
+# does not have — which is how a `--jq` that raised on EVERY non-empty page stayed green behind every
+# arm here, and how the same class was measured on the census read (#3002 review P2). The helper is
+# deleted rather than kept beside this one: a shape-answer with no caller is an invitation to return.
+queue_rows_body() { # <total_count>
   if [ -n "${GH_QUEUE_ROWS_SPEC:-}" ]; then
-    _out=""; _rest="${GH_QUEUE_ROWS_SPEC}"
-    while [ -n "$_rest" ]; do
-      _pair="${_rest%%;*}"
-      case "$_rest" in *';'*) _rest="${_rest#*;}" ;; *) _rest="" ;; esac
-      [ -n "$_pair" ] || continue
-      _out="${_out:+$_out;}$(printf '%s' "${_pair%%:*}"),$(ts_ago "${_pair#*:}")"
+    _qb_rows=""; _qb_rest="$GH_QUEUE_ROWS_SPEC"
+    while [ -n "$_qb_rest" ]; do
+      _qb_pair="${_qb_rest%%;*}"
+      case "$_qb_rest" in *';'*) _qb_rest="${_qb_rest#*;}" ;; *) _qb_rest="" ;; esac
+      [ -n "$_qb_pair" ] || continue
+      _qb_rows="${_qb_rows:+$_qb_rows,}{\"id\":${_qb_pair%%:*},\"created_at\":\"$(ts_ago "${_qb_pair#*:}")\"}"
     done
-    printf '%s' "$_out"
-    return
+  else
+    _qb_rows="{\"id\":${GH_HEAD_RUN_ID-4001},\"created_at\":\"$(queue_oldest_at)\"}"
   fi
-  printf '%s,%s' "${GH_HEAD_RUN_ID-4001}" "$(queue_oldest_at)"
+  printf '{"total_count":%s,"workflow_runs":[%s]}' "$1" "$_qb_rows"
 }
 # ⛔ CONSUME `--input -` (the label PUT body), because the REAL gh does. The gate calls
 # `printf '%s' "$body" | gh api -X PUT … --input -` under `set -o pipefail`, so a double that
@@ -442,14 +451,25 @@ case "$*" in
     case "$*" in
       *"page="[2-9]*)
         [ -n "${GH_QUEUE_ROWS_PAGE2:-}" ] || exit 0
-        _p2=""; _rest2="$GH_QUEUE_ROWS_PAGE2"
+        # ⛔ A REAL BODY, THROUGH THE SHIPPED PROGRAM (#4116 review, P2). This used to print the
+        # `id,created_at` pairs itself — so NO assertion in this suite ever handed a body to the page
+        # 2+ `--jq`, and a program that raises on every non-empty page passed all of them. Now the
+        # body is served the way the endpoint serves it and the gate's own program produces the rows;
+        # if that program cannot run on a real body, `jq` exits non-zero and so does this stub — which
+        # is what `gh` does, and what turns the gate's `read FAILED` arm into a red assertion.
+        _p2=""; _rest2="$GH_QUEUE_ROWS_PAGE2"; _n2=0
         while [ -n "$_rest2" ]; do
           _pair2="${_rest2%%;*}"
           case "$_rest2" in *';'*) _rest2="${_rest2#*;}" ;; *) _rest2="" ;; esac
           [ -n "$_pair2" ] || continue
-          _p2="${_p2:+$_p2;}$(printf '%s' "${_pair2%%:*}"),$(ts_ago "${_pair2#*:}")"
+          _n2=$((_n2 + 1))
+          _p2="${_p2:+$_p2,}{\"id\":${_pair2%%:*},\"created_at\":\"$(ts_ago "${_pair2#*:}")\"}"
         done
-        printf '%s\n' "$_p2"
+        # ⛔ THE PROGRAM'S EXIT STATUS IS THE READ'S EXIT STATUS, exactly as `gh` reports it. Without
+        # this the stub would print nothing on a program that raises and still exit 0, i.e. it would
+        # answer "an empty page" — the one reading the gate must never take as "the queue ends here".
+        _out2="$(printf '{"total_count":%d,"workflow_runs":[%s]}\n' "$_n2" "$_p2" | jq -r "$_jq_prog")" || exit $?
+        printf '%s\n' "$_out2"
         exit 0 ;;
     esac
     # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at> TAB <oldest run id> TAB
@@ -481,18 +501,16 @@ case "$*" in
       # leave the arm green for the wrong reason.
       oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\t%s\t%s,Wed Oct 27 13:00:00 2026\n' "${GH_QUEUED:-5}" "${GH_HEAD_RUN_ID-4001}" "${GH_HEAD_RUN_ID-4001}" ;;
       *)
+        # ⛔ THE DEFAULT ANSWER IS THE SHIPPED PROGRAM'S OUTPUT ON A REAL BODY (#4116 review, P2).
+        # Printing the fields by shape certified a protocol the program did not have; the program is
+        # handed the endpoint's own document instead, so a `--jq` that cannot run on one is a red here.
         if [ "${GH_QUEUED:-5}" = 0 ]; then
-          printf '0\t\t\t\n'
+          _out0="$(printf '{"total_count":0,"workflow_runs":[]}\n' | jq -r "$_jq_prog")" || exit $?
         else
-          # ⛔ FIELD 2 IS THE HEAD OF THE SPEC, NOT A SEPARATE FIXTURE (agent-infra#2344). The pre-fix
-          # gate computed its age from `min(created_at)` i.e. from field 2 alone; a stub whose field 2
-          # disagreed with the row order would let the OLD gate compute a healthy 30 s age over a page
-          # whose real head is a 30-day ghost — and every #2344 arm would stay green against it, which
-          # is exactly the vacuity this suite exists to prevent.
-          _rows="$(queue_rows_field)"
-          _head="${_rows%%;*}"
-          printf '%s\t%s\t%s\t%s\n' "${GH_QUEUED:-5}" "${_head#*,}" "${_head%%,*}" "$_rows"
-        fi ;;
+          _out0="$(printf '%s\n' "$(queue_rows_body "${GH_QUEUED:-5}")" | jq -r "$_jq_prog")" || exit $?
+        fi
+        printf '%s\n' "$_out0"
+        exit 0 ;;
     esac
     exit 0 ;;
   *"--paginate"*)
@@ -1315,10 +1333,17 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction ad
 # the leg exists to catch, certified `github` with `oldest_queued_s=0`. The fixture is the shipped
 # bound's worth of ghosts (derived, never the literal 5 — agent-infra#3995), and one more row that HAS
 # demand.
+# ⛔ THE DEMANDING ROW IS THE 26TH OLDEST, AND THAT IS NOW EXPRESSED BY ITS AGE (#4116 review, P2). The
+# page used to be hand-ordered by the stub, so "just past the window" could be written as ANY fixture
+# order. It cannot any more: the stub serves a real API body and the GATE'S OWN `--jq` program sorts it
+# oldest-first, which is what the real endpoint + program produce. So "past the 25-run window" has to
+# be true after that sort, i.e. the demanding row must be YOUNGER than the 25 ghosts — a 30-day age
+# sorts it to the FRONT (the scan then finds demand on row 1 and the arm would pin nothing). Its age
+# was never what this arm asserts; its POSITION past the window is.
 echo "── #2344: a bound-limited scan is never mistaken for a complete one ──"
 run_gate ghost-bound-truncated GH_QUEUED="$QUEUE_HEAD_SCAN_SHIPPED" GH_INPROGRESS=0 \
   GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:2592000" --
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:120" --
 assert_eq "$RC" "2" "a bound break over a deeper page → exit 2 (could-not-measure), not 'no demand'"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound that stopped it"
 assert_not_contains "$OUT" "nothing is waiting for a runner" "it is NOT read as a complete measurement"

@@ -1189,8 +1189,17 @@ print(comp, len(inc))
       _p=$((_p + 1))
       # ⛔ ONE SHAPE PER FIELD, AS ABOVE: this read asks only for the row order, because the count and
       # the oldest stamp belong to the FIRST page (a later page's min is not the queue's oldest).
+      # ⛔ THE SORT IS OVER THE ARRAY, NOT INSIDE IT (#4116 review, P0 — a one-token edit that made
+      # the ENTIRE multi-page read impossible). `sort_by` is `map([f])|sort` over its INPUT, so
+      # `[.workflow_runs[] | sort_by(.created_at)]` sorts EACH RUN — and a run object indexed by a
+      # string field of a NUMBER is a RUNTIME error, so `gh` exited non-zero on EVERY non-empty page.
+      # On any queue deeper than $QUEUE_PAGE (tortoise's measured 178-216 is exactly the case this leg
+      # exists for) that fired the `read FAILED` arm below and the gate refused every pass — the
+      # pinned state of #4113 re-worded, not fixed. The bracket closes BEFORE `sort_by`, exactly as
+      # the first page's program above does it. Verified against jq itself: the pre-fix program exits
+      # 5 with `Cannot index number with string "created_at"` on a real two-row body, this one exits 0.
       _more="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE&page=$_p" \
-          --jq '([.workflow_runs[]|sort_by(.created_at)]|map("\(.id),\(.created_at)"))|join(";")' 2>"$GH_ERR")" \
+          --jq '([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";")' 2>"$GH_ERR")" \
         || { log "queue page $_p read FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
       _more_rows="$(printf '%s' "$_more" | tr ';' '\n' | grep -c .)"
       # A page that answers nothing ENDS the list: the truncation it implies is refused below, by the
