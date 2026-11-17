@@ -2915,6 +2915,18 @@ mutation_pasteback_cells() { # <section-text> -> the canonical cells the section
 # quoted or emphasised retype is still a copy). A reviewer who writes
 # its OWN reason — naming the files THIS diff touches — has authored the claim, which is what the
 # block asks for, and the prompt now says so in as many words.
+# ⛔ AND THE LIMIT HAS A MEASURED EDGE THAT THIS ARM DOES NOT CROSS, ON PURPOSE (measured through THIS
+# SEAM at f4a345126, not through one helper): an exemption reason that is the worked example with an
+# INTERIOR edit — a word deleted, the first word changed, a word substituted, its opening dropped — or
+# TRUNCATED RECORDS (exit 0, `clean` minted), because every rule that would refuse those also refuses
+# the natural way an honest docs-only reviewer writes the SAME claim
+# (`docs-only — the diff touches docs/ops/<this diff's file>.md and no executable assertion.`), and a
+# word-run rule ("six contiguous canonical words is a copy") refuses exactly that sentence. The
+# residual is narrower than it looks: the exemption names NO assertion, so an edited copy still claims
+# only "this diff adds no assertion" — the reviewer's judgement either way — while a pasted ROW mints a
+# SPECIFIC false claim about an assertion this diff does not contain. The boundary is PINNED BOTH WAYS
+# by `tests/review-pr/run.sh` §BS (the four edits record, the two honest phrasings record, the verbatim
+# line refuses), so a future round can neither close it silently nor close it into a false block.
 _mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTIONS:` payloads
   local _live=""
   [ "${2:-}" = "--live-only" ] && _live=1
