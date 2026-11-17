@@ -1226,9 +1226,10 @@ print(age)
   # refusal, the throughput leg, the capacity deny). ⛔ THE RULE THIS ENCODES: a pass may not ENGAGE or
   # RELEASE the pool on a value it did not read — the direction that must never happen is arming the
   # pool for a queue nobody measured (#2327's strip stays intact). What `main` does with rc 3 is
-  # deliberately narrower than a decision: converge the pool to the RECORDED mode (repair), report
-  # `verdict=unknown` naming this leg, and exit 2. Not 0 — "could not measure demand" is never
-  # "healthy" (#2344/#3995: never treat the refusal as no demand).
+  # deliberately narrower than a decision: converge the pool to the RECORDED mode WHERE IT DIFFERS
+  # (repair) — or change nothing, naming why, when nothing is recorded, the pool is already in that mode,
+  # or the write does not land — report `verdict=unknown` naming this leg, and exit 2. Not 0 —
+  # "could not measure demand" is never "healthy" (#2344/#3995: never treat the refusal as no demand).
   # ⛔ THE COMPONENT/INCIDENT DISJUNCTS OF THE LENGTH LEG ARE SKIPPED TOO, AND THAT IS A CHOICE, NOT AN
   # OVERSIGHT (a reviewer will ask). They do not need demand: an Actions outage is a conclusive, MEASURED
   # signal, and the normal path denies on it unconditionally. Arming the pool on it during a demand-blind
@@ -1905,12 +1906,12 @@ if [ "$healthy" = 3 ]; then
   blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
   blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
   # ⛔ THE CAPABILITY IS CAPTURED HERE, NOT READ AT WRITE TIME (review P2, measured). `$CAPABILITY` is a
-  # global that `set_labels` OVERWRITES when ITS read fails (`:1426`), and the repair runs BETWEEN this
+  # global that `set_labels` OVERWRITES when ITS read fails (`:1429`), and the repair runs BETWEEN this
   # point and the last verdict write — so a writer reading `${CAPABILITY:-none}` at call time published
   # the LABEL read's capability beside a `capacity=` the CENSUS measured. Measured on the
   # enumeration-failure shape: `capacity=saturated` (a certifying census verdict) next to
   # `capability=runner_inventory:upstream http=5xx` (the label read) on one durable line. `capability=`
-  # is defined as the INVENTORY read's capability (`:377`), so the census value is the honest one; the
+  # is defined as the INVENTORY read's capability (`:379`), so the census value is the honest one; the
   # label read's failure is already named by `set_labels`' own log lines.
   blind_capability="${CAPABILITY:-none}"
   if [ "$DRY" = 1 ]; then
@@ -1995,7 +1996,7 @@ if [ "$healthy" = 3 ]; then
     # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
     # which on this arm names an action that did not happen (same defect class, in the log this time).
     # ⛔ THE ARM'S TERMINAL LINE MAY NOT PUBLISH THE PRE-WRITE READING (review P2/P3, measured). `mode` is
-    # `current_mode` taken BEFORE the write (`:1765`), so `(leaving mode=$mode)` reported a pre-repair
+    # `current_mode` taken BEFORE the write (`:1768`), so `(leaving mode=$mode)` reported a pre-repair
     # measurement as the pool's post-repair state — after a PARTIAL write that is false, and it contradicts
     # the line above it. What the pass knows: the repair did not land, and the labels may be partly changed.
     log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land — the pool's labels may be PARTIALLY changed (see the set_labels lines above); mode=$recorded is NOT confirmed"

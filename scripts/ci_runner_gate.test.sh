@@ -2722,7 +2722,7 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" 
   "(r3) --dry-run does NOT clear the streak (a read verb changes nothing)"
 
 
-# ── #4085 (second leg): a DEMAND-BLIND pass CONVERGES the pool to the RECORDED mode ─────────────
+# ── #4085 (second leg): a DEMAND-BLIND pass CONVERGES the pool to the RECORDED mode WHERE IT DIFFERS ──
 # THE MEASURED DEFECT (2026-11-17T04:35:15Z, issue #4085's second comment): the head scan ran out on
 # ghost runs, `evaluate` returned 2, and the pass logged `leaving mode=local` while NO runner carried the
 # label. The write path was reachable only through a read the gate may never get, so capacity came back
@@ -2902,7 +2902,7 @@ assert_not_contains "$OUT" "leaving mode=" \
 # `$CAPABILITY` is a global that `set_labels` overwrites when ITS read fails, and the repair runs BETWEEN the
 # census and the verdict write — so a writer reading `${CAPABILITY:-none}` at call time published the LABEL
 # read's capability (`runner_inventory:upstream http=5xx`) beside a `capacity=saturated` the CENSUS
-# measured, on one durable line. `capability=` means the INVENTORY read (`:377`), so it must be the census's
+# measured, on one durable line. `capability=` means the INVENTORY read (`:379`), so it must be the census's
 # value. `GH_MODE=enum-fail` fails ONLY the `<id>TAB<label>` read — the census read is a different stub
 # branch, keyed on its `--jq` program — which is exactly this shape.
 run_gate demandblind-cap GH_QUEUED=12 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=10 --
