@@ -176,7 +176,17 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  const r = runLint([], os.tmpdir());
+  // ⛔ THE cwd MUST BE A DIRECTORY THIS TEST OWNS. `os.tmpdir()` is AMBIENT state, and on a
+  // self-hosted runner it is SHARED: `resolveSkillsDir` falls back to cwd-relative
+  // `operations/skills`, `.agents/skills`, `skills`, so a leftover `skills/` in the runner's temp dir
+  // makes implicit resolution SUCCEED — the CLI then lints that tree instead of printing "No skills
+  // directory found", and this arm reds for a reason that has nothing to do with the code under
+  // test. MEASURED on ci-main `ci / unit-test` at head 75b90a908: the CLI printed
+  // `0 SKILL.md files checked. 0 issue(s).\nClean.\n` and this assertion failed (170 passed, 1
+  // failed) while the SAME file passed 171/0 on a box whose temp dir had no such directory. An owned
+  // empty dir makes the arm decide on the RESOLUTION LADDER, which is what its caption claims.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-nodir-"));
+  const r = runLint([], empty);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /No skills directory found/);
 });
