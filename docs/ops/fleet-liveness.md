@@ -2239,6 +2239,13 @@ python3 tools/fleet/liveness.py --heartbeat both.json
 # nonce, a line that cannot show it is DROPPED — marker-shaped or not.
 python3 tools/fleet/liveness.py --heartbeat <run_id>.log --nonce <TASK_HEARTBEAT_NONCE>
 
+# ⛔ THE `Alive state:` SHAPE CARRIES NO FENCE, so point it at ONE child's line (or two polls of
+#    one). Nothing on that line names the dispatch, so a parent/watchdog log holding two children's
+#    renders is read as one series and the LAST PAIR combines two children — measured 2026-11-17:
+#    two `Alive state:` lines, pids 111 and 222, 18,000,000 then 18,001,000 ⇒ `wedged /
+#    tool-age-open-stable`, a false wedge from two different children. The marker shape does not
+#    have this hole (`--nonce`), and a JSON poll carries its dispatch's fields.
+
 # A PIPE has no mtime, so it must be told its age (`--heartbeat-json` is an accepted alias):
 cat <run_id>.log | python3 tools/fleet/liveness.py --heartbeat - --source-age-ms 12000
 ```
