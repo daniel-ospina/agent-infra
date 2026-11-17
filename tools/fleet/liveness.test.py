@@ -3863,8 +3863,11 @@ MUTATIONS = [
         "T60", "module",
         '        if len(hb.samples) < 2:',
         '        if len(hb.samples) < 1:',
-        "the sample count is off by one, so an EMPTY read falls into the single-sample arm and "
-        "`samples=` renders an empty list beside a reason that says a reading existed",
+        "the single-sample ABSTENTION is deleted, so a ONE-reading query falls through to the "
+        "pair comparison and raises IndexError on `samples[-2]` — the guard that turns one reading "
+        "into `tool-age-single-sample` rc 3 is gone (an EMPTY read never reaches this line: "
+        "`not hb.samples` abstains above it), so this mutant reds by CRASH, not by the assertion "
+        "that T58(1) and T60's rc-3 row would name",
     ),
     Mutation(
         "T60", "module",

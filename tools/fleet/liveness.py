@@ -181,6 +181,14 @@ THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
   long it rests (short of the retirement proof); a turn that cannot be
   classified is ``unknown``. This gates ``wedged`` ONLY — ``dead`` is decided
   from fenced-holder identity BEFORE the ladder and no turn state may reach it.
+  ⛔ **THIS IS THE TRANSCRIPT AXIS'S RULE, NOT A SECOND ``wedged`` RULE.** The
+  heartbeat axis (#4106) returns ``wedged`` / ``tool-age-open-stable`` with NO
+  turn evidence at all — there is no transcript in a ``--heartbeat`` query — so
+  its ``wedged`` rests on the TOOL AGE passing ``tool_stall_ms`` (the watchdog's
+  own age backstop, 4 h at the 6 h cap) and on nothing else. Said out loud per
+  axis, the way §13.5 sets the precedent (§15), because ``wedged`` is the state
+  consumers switch a kill on: a contract that names only one of its two
+  derivations reads as if the other cannot exist.
 * **dead** ⟺ the candidate set is NON-EMPTY **and** every candidate was
   positively OBSERVED absent or a zombie in a fresh ``ps`` read **and** the
   session JSONL did not grow inside the window. An empty candidate set is
