@@ -59,7 +59,13 @@
 #   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
 #   SUDO               sudo probe           default: `sudo -n`
 #
-# Exit codes: 0 ok · 1 failure (named) · 2 usage.
+# Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 --status: installed unit carries a STALE
+#             `Environment=LANE_TIMEOUT` pin (re-run the installer on this cell to re-render it) ·
+#             4 --status: the service and/or the timer is MISSING, so this box dispatches NOTHING
+#             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
+#             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
+#             dispatches at cannot be DETERMINED (no pin and an unreadable `ExecStart` script), which
+#             is named as unknown rather than silently graded clean.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -164,7 +170,7 @@ resolve_target || {
 # ⛔ THE LANE'S BOUND IS RENDERED FROM THE SEAM, NOT FROM A LOCAL LITERAL (agent-infra#2888 review,
 # P2 — verified). This used to render `${LANE_TIMEOUT:-3000}` at INSTALL time into an `Environment=` PIN,
 # and a pin WINS over the script's own default — so on every box this installer touched,
-# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` could never take effect and drainer
+# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}` could never take effect and drainer
 # lanes stayed killed at 50 min: 300 s above the 2700 s progress allowance, i.e. the censoring survived
 # on the box whose job is to drain the backlog, and raising `LANE_BACKSTOP_S` changed nothing there.
 # Resolved ONCE here, from the harness copy being installed, so the two cannot drift.
@@ -173,7 +179,7 @@ if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
     DRAINER_LANE_TIMEOUT="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
                               "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
 fi
-case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=7200 ;; esac
+case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=36000 ;; esac
 
 # vet_unit <rendered-artifact> <label> — does the DECLARATION that would be installed hand the hatch
 # to everything the job spawns? (agent-infra#4002)
@@ -243,19 +249,90 @@ render() { # <template> <dest>
 }
 
 say_status() {
-    local svc="$1" tmr="$2"
+    local svc="$1" tmr="$2" installed want missing=0
     printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
     for u in "$svc" "$tmr"; do
-        if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; fi
+        if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; missing=1; fi
     done
     if [ -f "$UNIT_DIR/$tmr" ]; then
         printf '  timer state: %s\n' "$($SYSTEMCTL is-active "$tmr" 2>/dev/null || true)"
         printf '  next run:    %s\n' "$($SYSTEMCTL list-timers --all "$tmr" 2>/dev/null | sed -n '2p' | sed 's/  */ /g' || true)"
     fi
+    # ⛔ "NO DRAINER AT ALL" IS NOT A CLEAN STATUS (agent-infra#4034 review, P3 — verified). The grading
+    # block below lives inside `if [ -f "$UNIT_DIR/$svc" ]` and the function ended `return 0`, so a box
+    # with NO unit printed `… MISSING` and exited 0. Once the exit code is the contract an automated
+    # check reads, that is the same false PASS the exit-3 change exists to remove, one row up its own
+    # output: "the drainer is armed at the right cap" and "this box dispatches nothing" were
+    # indistinguishable. MISSING gets its own code (4) and a named line, so the two are separable
+    # without parsing prose.
+    if [ "$missing" -eq 1 ]; then
+        printf '  ⛔ NOT ARMED: this box dispatches NOTHING at any cap — the missing unit(s) above are not\n'
+        printf '      installed. Run this installer (no arguments) on this cell to arm them.\n'
+        return 4
+    fi
+    # ⛔ A STALE `Environment=LANE_TIMEOUT` PIN IS THE #4034 DEFECT ONE LAYER OUT, AND --status COULD NOT SEE
+    # IT. The unit is rendered ONCE, at install time (see the seam block above), and an installed pin WINS
+    # over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed straight to the
+    # dispatcher). So a cell whose unit predates a seam change keeps dispatching at the OLD cap forever
+    # while the checkout, the docs and the tests all say the new one — and this verb reported only
+    # installed/MISSING + timer state, so such a box read healthy. Print the pin beside the value this
+    # checkout would render now, and WARN on a mismatch; exit 3 so an automated check can act on it.
+    if [ -f "$UNIT_DIR/$svc" ]; then
+        # Last occurrence wins: systemd merges repeated `Environment=` lines and the last one is what the
+        # unit sees, so reading the first would vouch for a value the box does not use.
+        installed="$(grep '^Environment=LANE_TIMEOUT=' "$UNIT_DIR/$svc" 2>/dev/null \
+                     | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
+        want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
+        if [ -z "$installed" ]; then
+            # ⛔ "NO PIN" IS NOT "CLEAN" (agent-infra#4034 review, P3). With no pin the unit dispatches at
+            # the default COMPILED INTO THE SCRIPT ITS OWN `ExecStart=` NAMES — so a box whose `$O` tree
+            # predates the seam keeps the OLD cap while the checkout, the docs and the suite all say the
+            # new one. That is the same state this exit code exists to make automatable, arriving through
+            # the other door, so grade it the same way: read the script the unit would ACTUALLY run (never
+            # the copy this checkout happens to hold), and decide on ITS literal. An ExecStart that is not
+            # an ai-drainer.sh at all is named as UNKNOWN rather than being called clean — it is not
+            # evidence of a stale cap, and it is not evidence of a fresh one either.
+            local exe have
+            exe="$(sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT_DIR/$svc" 2>/dev/null | tail -1 | tr -d '\r')"
+            have="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' \
+                      "${exe:-/nonexistent}" 2>/dev/null | head -1)"
+            case "${have:-}" in ''|*[!0-9]*) have="" ;; esac
+            if [ -z "${exe:-}" ] || [ ! -f "${exe:-/nonexistent}" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
+                printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
+            elif [ -z "$have" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s declares no readable default, so the cap this\n' "$exe"
+                printf '      box dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
+            elif [ "$have" != "$want" ]; then
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "$have"
+                printf '      %s)\n' "$exe"
+                printf '  ⚠️  STALE CAP: this no-pin unit runs a script whose own default is %s s, but the seam now says %s s —\n' "$have" "$want"
+                printf '      the box keeps the old cap until this unit is re-rendered: re-run this installer\n'
+                printf '      (no arguments) on this cell.\n'
+                return 3
+            else
+                printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and the %s s compiled into %s\n' "$have" "$exe"
+                printf '      agrees with the %s s this checkout would render)\n' "$want"
+            fi
+        else
+            printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
+        fi
+        if [ -n "$installed" ] && [ "$installed" != "$want" ]; then
+            printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
+            printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
+            printf '      (no arguments) on this cell.\n'
+            return 3
+        fi
+    fi
+    return 0
 }
 
 case "$MODE" in
-    --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit 0 ;;
+    # exit 3 on a stale pin: distinct from 1 (failure) and 2 (usage), so `--status` is scriptable — a
+    # warning that can only be read by eye is the invisibility this verb was changed to remove.
+    --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit $? ;;
     --uninstall)
         $SYSTEMCTL disable --now "$UNIT_SRC_TIMER" >/dev/null 2>&1 || true
         # ⛔ A REMOVAL THAT DID NOT HAPPEN IS NOT AN UNINSTALL. `rm -f` returning non-zero printed the

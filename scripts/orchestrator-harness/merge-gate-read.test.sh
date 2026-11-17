@@ -118,6 +118,17 @@ MRG="$TMP/mrg"
 mkmrg() { # mkmrg — a fresh fixture: a repo dir, a HOME with the recorder, stubs, the state dirs
   rm -rf "$MRG"
   mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/repo" "$MRG/o/logs" "$MRG/o/state"
+  # ⛔ THE FIXTURE'S `repo` MUST BE A GIT WORK TREE, BECAUSE THE GATE SAYS SO. `lane-report-gate.sh`
+  # refuses an unusable `repo` argument as UNMEASURABLE (7) rather than abstaining with 6 — a plain
+  # directory, a nonexistent path and a FILE all used to fall through to the code the carriers treat
+  # as "this box cannot carry the check" and MERGE ON (agent-infra#3771 added that guard). This
+  # fixture created a bare `mkdir` directory, so after #3771 EVERY arm below was refused at the gate
+  # with `reason=repo-is-not-a-usable-git-work-tree` before the behaviour under test was reached:
+  # the suite has been red on `main` since that merge, reporting §0/§1/§2/§4c failures whose logs all
+  # carried that one reason. The guard is correct and stays; the fixture supplies what the gate
+  # documents it requires (an empty repo is enough — nothing below needs a commit, and `git init`
+  # writes no identity).
+  git -C "$MRG/repo" init -q
   mkstubs "$MRG/stubs"
   : > "$MRG/pr-body"
   : > "$MRG/checks.log"

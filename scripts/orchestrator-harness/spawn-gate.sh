@@ -3541,17 +3541,31 @@ terminal_wip_rescue() {
 # absolute ceiling for a lane that creeps forward for ever, so it must sit ABOVE the allowance or it
 # pre-empts it and the progress rule can never fire (shipped: 2400 < 2700 — that WAS the defect).
 #
-#   LANE_BACKSTOP_S — the ONE default, in seconds. 7200 (2 h) PROVISIONAL, per #2888: today's prfix
-#   distribution is censored by the value being replaced, so the ceiling cannot be sized from it.
-#   Landing the seam first is what makes the real distribution observable; #2888 owns the re-measure
-#   and the re-size. Env-overridable, and a typo must never silently disarm it — the `0`-means-off
+#   LANE_BACKSTOP_S — the ONE default, in seconds. 36000 (10 h), MEASURED 2026-11-12 on `pi-cell-4`
+#   over 2,033 lane logs, and NOT provisional any more (agent-infra#4034). What it was measured
+#   against: 20 `verdict=exceeded-wallclock` vs 2 `stalled` — the backstop was ending TEN TIMES more
+#   lanes than the progress bound it exists to back up, the inverse of the intent above. Of those 20
+#   wall kills 12 carried `silent=0s` and 12 `cpu_delta_cs > 0`, i.e. the watchdog's own idle
+#   detector said the lane was NOT idle when the clock ended it, so the 2700 s progress allowance
+#   never got its window; one was killed mid-`git push` holding 12 commits and four review rounds.
+#   5x is the top of #4034's 3-5x range, and it puts the wall ~13x above the allowance so a lane that
+#   is still advancing cannot be pre-empted by elapsed time before the progress rule has fired. The
+#   earlier 7200 was PROVISIONAL for a reason that no longer holds: the `prfix` distribution it sat on
+#   was CENSORED by the value being replaced (every row reported the cap), so the ceiling could not be
+#   sized from it; #2888 landed the seam to make the real distribution observable, and the number
+#   above is sized from that re-measurement. ⛔ RE-DERIVE IT FROM THE LOGS, DO NOT INHERIT THE ROUND
+#   NUMBER: the cost of the raise is stated where it bites — a lane that creeps forward for ever is
+#   bounded at 10 h instead of 2, and every lease derived from this bound moves with it (`fix-one.sh`
+#   takes it + 1200 → 37200 s), which is why `CLAIM_TTL_MAX` and `CLAIM_ISSUE_TTL` in claims.sh moved
+#   in the SAME commit (#2888's refusal at `lane_wall_bound`). Env-overridable, and a typo must never
+#   silently disarm it — the `0`-means-off
 #   convention of the `task` family is NOT applied here, because this is the default for every lane on
 #   the box and an unbounded default is indistinguishable from a typo'd one. A caller that genuinely
 #   wants no backstop passes `0` EXPLICITLY as its own argument (lane-bound treats `--wall 0` as the
 #   documented off switch, loudly).
-LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-7200}"
+LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-36000}"
 case "$LANE_BACKSTOP_S" in
-  ''|*[!0-9]*|0) LANE_BACKSTOP_S=7200 ;;
+  ''|*[!0-9]*|0) LANE_BACKSTOP_S=36000 ;;
 esac
 # ⛔ AND IT IS EXPORTED, because the lane's wall clock is a fact its CHILDREN have to be able to
 # agree with (agent-infra#2888). Two consumers outlive the lane and read this duration for themselves —
@@ -4499,8 +4513,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # changes it for every lane with no log line, no ledger field and no `walltime.tsv` column; the
   # provider half also moves the cost tier (flash vs pro) and which credential the lane needs
   # (#1852). Resolve ONCE into locals so the log and the argv cannot disagree.
+  # ⛔ AND THE LINE THAT CARRIES IT IS THE LAUNCH ARTIFACT, SO IT IS WRITTEN AT THE LAUNCH (agent-infra#4047
+  # review, P1). It used to be emitted HERE — before the capability gate below — and that made it a LIE
+  # about a refusal: a box whose probe answers and never returns refuses 71 five to twenty-five seconds
+  # later, i.e. long outside `pr-doctor.py`'s CONFIRM_WINDOW_S (1.0 s), so a caller polling for this line
+  # read a capability REFUSAL as a launch. Measured shape: `dispatched 9 of 16 queued — VERDICT=OK` over
+  # nine workers whose `.rc` read 71 (pr-doctor#4047). The line is a claim that an agent STARTED, so it is
+  # written immediately before the `pi` spawn, after every gate that can still refuse — see
+  # `lane_registry_begin`'s neighbouring comment. `lane-exec.sh` and `merge-one.sh` emit theirs at their
+  # own launch points, where nothing after them can refuse.
   local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
-  echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
   # ⛔ THE AGENT GETS ITS OWN PROCESS GROUP AND NONE OF ITS CHILDREN OUTLIVE THE TURN (#2163).
   # A `pi` that has finished its turn can leave tool children behind, and a wrapper that merely
   # `wait`s for pi then exits lets those children be reparented to init where nothing owns them —
@@ -4694,7 +4716,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
             # an announced admission is the price of not refusing it: silence here would be a readiness
             # field that fired and nobody saw, the same defect (g2c) names on the unmeasurable path.
             *stale_base=1*)
-              echo "[capability-gate] NOTE $label: ADMITTED, and the staleness reading is on the line above (`stale_base=1`): the checkout the probe measured is a BRANCH more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main. It is not refused ON PURPOSE (#3932, review of 38f24c074) — on a branch that count is mostly main's own unmerged commits, and integrating them IS the assigned work; refusing it would be a deadlock the refused process can never clear. The generated brief already orders the integration ('merge origin/main' into the branch). This is NOT a refusal and nothing was consumed. A BASE checkout in this state WOULD have been refused (85)." >> "$log" ;;
+              echo "[capability-gate] NOTE $label: ADMITTED, and the staleness reading is on the line above (\`stale_base=1\`): the checkout the probe measured is a BRANCH more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main. It is not refused ON PURPOSE (#3932, review of 38f24c074) — on a branch that count is mostly main's own unmerged commits, and integrating them IS the assigned work; refusing it would be a deadlock the refused process can never clear. The generated brief already orders the integration ('merge origin/main' into the branch). This is NOT a refusal and nothing was consumed. A BASE checkout in this state WOULD have been refused (85)." >> "$log" ;;
             *behind=unknown*)
               echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — export CELL_PREFLIGHT_REPO=<the checkout this lane builds on> to name it explicitly), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
             # ⛔ AN OLD PROBE IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS SILENT (this change's review,
@@ -4707,7 +4729,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
             # reported as its own reason, never folded into "measured".
             *behind=*) : ;;
             *)
-              echo "[capability-gate] WARN $label: the probe produced a LANE_CAPABILITY=ok line with NO staleness field at all (reason=no-reading-field), so this spawn is admitted with NO evidence its base is current (#3932). That is HELPER/CONSUMER SKEW — the deployed cell-lane-preflight.sh predates the `repo=`/`behind=` fields (`$O` is seeded file by file, so a caller can be newer than the probe it runs), or the line was truncated. Nothing was consumed and this is not a refusal. Sync the deployed copies with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log" ;;
+              echo "[capability-gate] WARN $label: the probe produced a LANE_CAPABILITY=ok line with NO staleness field at all (reason=no-reading-field), so this spawn is admitted with NO evidence its base is current (#3932). That is HELPER/CONSUMER SKEW — the deployed cell-lane-preflight.sh predates the \`repo=\`/\`behind=\` fields (\`$O\` is seeded file by file, so a caller can be newer than the probe it runs), or the line was truncated. Nothing was consumed and this is not a refusal. Sync the deployed copies with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log" ;;
           esac ;;
         *)
           # ⛔ `rc=2` IS A VERDICT, AND IT IS THE ONE THE PROBE'S OWN EXIT TABLE SAYS EVERY CALLER MUST
@@ -4898,6 +4920,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # Not earlier: the gates above can still refuse, and a refusal has its own record (FAILED,
   # `agent-never-started`) rather than a RUNNING record that would read EXPIRED two hours later.
   lane_registry_begin "$label" "${KIND:-lane}" "$log" "$t"
+  # ⛔ THE AGENT-START MARKER IS WRITTEN HERE, AND ONLY HERE (agent-infra#4047 review, P1). Every gate that
+  # can refuse — brief, load, land-backlog, disk, capability/harness-skew — has already returned by this
+  # line, so `[agent] provider=… model=…` now means what a reader with no other evidence takes it to mean:
+  # an agent is being started. Callers that read it as proof of a launch (`pr-doctor.py`'s
+  # `_agent_started`) otherwise counted a 71/83 refusal — whose probe takes 5-25 s by design — as a
+  # dispatch, which is the false PASS #4047 exists to remove, in the one gate that is slow on purpose.
+  echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # …and the lease starts renewing as soon as there is a pid to watch. The beat loop exits on its own

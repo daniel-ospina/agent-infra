@@ -63,9 +63,23 @@ set -uo pipefail
 # resolution and then fails on a sibling nobody ships. Every case `$0` could help (`bash script`,
 # `./script`) already sets `BASH_SOURCE`, so the arm buys nothing and costs the one thing this
 # resolver exists to prevent. When nothing resolves the file REFUSES, naming the mechanism.
-_resolve_self_dir() {
+# ⛔ THE CANDIDATES ARE READ AT TOP LEVEL, BY THE CALLER, AND PASSED IN AS ARGUMENTS. Reading
+# `${BASH_SOURCE[0]}` INSIDE this function body brought back the exact `$0` guess the note above
+# forbids, on every bash >= 5 — and only there, which is why it shipped green on a macOS host:
+#
+#   bash -s -- status <conflict-rebase-timer.sh        bash 3.2 (this host)   bash 5.3.9 (CI)
+#   ${BASH_SOURCE[0]} at TOP LEVEL                     (unset)                (unset)
+#   ${BASH_SOURCE[0]} inside a FUNCTION                (unset)                $0 = /bin/bash
+#
+# A function defined in a stdin script has no file of its own, so bash 5 fills its BASH_SOURCE entry
+# from `$0` — the INTERPRETER. The resolver then resolved `/bin`, found no `/bin/lib/bounded.sh`, and
+# refused with the vague "bounded.sh is missing" message that #4012 replaced; the refusal named no
+# mechanism at all. `$0` was never read; it walked back in through a function-scoped BASH_SOURCE.
+# F9a-style textual pins cannot see this (the expression is IDENTICAL — only the SCOPE changed), so
+# the datum is taken where it is trustworthy: at top level.
+_resolve_self_dir() { # <candidate>... — every candidate is read at TOP LEVEL by the caller
   local cand="" dir=""
-  for cand in "${HARNESS_SCRIPT_PATH:-}" "${BASH_SOURCE[0]:-}"; do
+  for cand in "$@"; do
     [ -n "$cand" ] || continue
     case "$cand" in */*) ;; *) continue ;; esac  # a bare name has no directory
     [ -f "$cand" ] || continue
@@ -74,15 +88,26 @@ _resolve_self_dir() {
   done
   return 1
 }
-SELF_DIR="$(_resolve_self_dir)" || SELF_DIR=""
-if [ -z "$SELF_DIR" ]; then
+# ⛔ SPELLED `SCRIPT_DIR`, NOT `SELF_DIR`, AND THAT IS A DELIVERY CONTRACT, NOT A STYLE CHOICE. This
+# timer is FARMED (`fleet_srcs`) and it EXECS its sibling `conflict-rebase.py`, which is also farmed;
+# `pi-bootstrap/tests/test-setup-no-nesting.sh::_producer_scan` derives that dependency from the exec
+# site so a fresh farmed install cannot receive the timer without the bot it calls (#1552/#1899). Its
+# F1 form knows `$SCRIPTS` / `$SCRIPT_DIR` / `$SCRIPTDIR`; `$SELF_DIR` is not a form it reads, so
+# #4012 — which renamed this variable — silently removed `script:conflict-rebase.py` from the derived
+# population and reddened the producer-set arm. The broader `$SELF_DIR` blindness (38 files) is
+# agent-infra#3911: it needs a deliberate scanner redesign, because two of its sites are `pgrep`
+# PATTERNS matched against a running command line, not exec sites, and would enter the population as
+# false producers. This file needs no such redesign — it just has to spell its own directory the way
+# the farm's own derivation reads it.
+SCRIPT_DIR="$(_resolve_self_dir "${HARNESS_SCRIPT_PATH:-}" "${BASH_SOURCE[0]:-}")" || SCRIPT_DIR=""
+if [ -z "$SCRIPT_DIR" ]; then
   echo "conflict-rebase-timer: cannot resolve my own directory — HARNESS_SCRIPT_PATH is unset and" >&2
   echo "  BASH_SOURCE[0] names no readable file, so the sibling lib/bounded.sh cannot be located." >&2
   echo "  Under the launchd launcher this means the launcher predates agent-infra#3778 (it must" >&2
   echo "  export HARNESS_SCRIPT_PATH); otherwise run this file from its own path." >&2
   exit 2
 fi
-BOUNDED="$SELF_DIR/lib/bounded.sh"
+BOUNDED="$SCRIPT_DIR/lib/bounded.sh"
 if [ ! -r "$BOUNDED" ]; then
   echo "conflict-rebase-timer: $BOUNDED is missing — refusing to schedule a pass I cannot bound" >&2
   exit 2
@@ -126,8 +151,8 @@ _iso() { # <epoch> -> ISO-8601Z on stdout, or the raw epoch when no mechanism co
   printf '%s\n' "${out:-$e}"
 }
 
-SELF="$SELF_DIR/$(basename "${HARNESS_SCRIPT_PATH:-${BASH_SOURCE[0]:-conflict-rebase-timer.sh}}")"
-BOT="$SELF_DIR/conflict-rebase.py"
+SELF="$SCRIPT_DIR/$(basename "${HARNESS_SCRIPT_PATH:-${BASH_SOURCE[0]:-conflict-rebase-timer.sh}}")"
+BOT="$SCRIPT_DIR/conflict-rebase.py"
 # ⛔ THE STATE DIR IS A SEAM, NOT A CONSTANT. The systemd unit and the launchd plist both EXPORT
 # CONFLICT_REBASE_STATE (so the scheduled pass, `status`, and activate-harness.sh read one directory),
 # and before this line the wrapper ignored it: the artifact said one path while the beacon, log, brake

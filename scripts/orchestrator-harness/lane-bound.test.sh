@@ -283,6 +283,51 @@ PRD="$HERE/../pr-doctor.py"
 PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
 [ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
 ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (${SEAM:-?}s) — a python/branch literal pair that CANNOT drift" $rc
+# ⛔ AND THE REGISTRY'S COPY IS A THIRD ONE, PINNED BY NOTHING UNTIL NOW (agent-infra#4034 review, P2).
+# `lane_registry.py`'s `DEFAULT_BUDGET_S` is not a display constant: `_record_problem`/`start` derive
+# `lease_until = heartbeat_at + budget_s` from it and `lane_registry.py:437` ENFORCES that invariant on
+# every read, so a stale copy computes a FALSE `EXPIRED` for a live lane — and `docs/ops/lane-registry.md:193`
+# states what that costs (the lane is re-dispatched). Measured before this arm existed: `grep -rn
+# DEFAULT_BUDGET_S` returned only the definition and its two use sites, `scripts/test_lane_registry.py`
+# always passes an explicit `budget=`, and this suite pinned pr-doctor's copy and ai-drainer's but never
+# this one — the single listed file in the sweep whose literal could drift silently. Read from the entry
+# that OWNS it, and fail (not fall back) when it is unreadable: a default here would be the same defect
+# wearing a default's clothes.
+REG="$HERE/lane_registry.py"
+REG_DEF="$(sed -n 's/^DEFAULT_BUDGET_S = \([0-9][0-9]*\).*/\1/p' "$REG" | head -1)"
+case "${REG_DEF:-}" in ''|*[!0-9]*) REG_DEF="" ;; esac
+[ -n "${REG_DEF:-}" ] && [ "$REG_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) lane_registry's DEFAULT_BUDGET_S (${REG_DEF:-UNREADABLE — the arm cannot assert a lease it cannot derive}s) is the harness BACKSTOP (${SEAM:-?}s), not a stale copy that would read a live lane EXPIRED" $rc
+# ⛔ THE OTHER THREE COPIES OF THE SEAM, EACH READ FROM THE FILE THAT OWNS IT (agent-infra#4034 review,
+# P2 — verified). The PR body claimed `(i0)` pins all eight listed files; measured at `c90e1878ab84`, three
+# of them were pinned by NOTHING and the claim was therefore false:
+#   * `fix-one.sh`'s `_FIX_BOUND_FALLBACK` — BOTH of its literals (the `${LANE_BACKSTOP_S:-…}` seed and the
+#     `|| _FIX_BOUND_FALLBACK=…` coercion). This is the only path that sets `FIX_BOUND` outside a lane shell,
+#     and `FIX_LEASE` is derived from it, so a drifted fallback shortens the run AND the lease while the
+#     lease arm above (which derives from `$SEAM`) stays green.
+#   * `lane-bound.sh`'s `LANE_BOUND_WALL_S` default — the wall for every launcher that runs `lane-bound.sh`
+#     directly (`mac-lane.sh`). The ordering arm above is satisfied by 7201 as well as by 36000, so the OLD
+#     default passed it: only equality with the seam pins it.
+#   * `install-drainer-timer.sh`'s `DRAINER_LANE_TIMEOUT` fallback — the value `--status`'s
+#     `want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"` resolves through when the seam is unreadable, so a
+#     drifted value renders a STALE cap and prints CLEAN, which is the false PASS exit 3 exists to remove.
+# Each arm FAILS when its literal is unreadable (never falls back to a number here: a default in the test
+# is the same defect wearing a default's clothes).
+FIX_SEED="$(sed -n 's/^[[:space:]]*_FIX_BOUND_FALLBACK="\${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_SEED:-}" in ''|*[!0-9]*) FIX_SEED="" ;; esac
+[ -n "${FIX_SEED:-}" ] && [ "$FIX_SEED" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) fix-one.sh's _FIX_BOUND_FALLBACK seed (${FIX_SEED:-UNREADABLE}s) is the harness BACKSTOP (${SEAM:-?}s) — the run AND the lease derived from it cannot be shortened by a stale copy" $rc
+FIX_COERCE="$(sed -n 's/^[[:space:]]*is_limit "\$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=\([0-9][0-9]*\).*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_COERCE:-}" in ''|*[!0-9]*) FIX_COERCE="" ;; esac
+[ -n "${FIX_COERCE:-}" ] && [ "$FIX_COERCE" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) …and its malformed-value coercion (${FIX_COERCE:-UNREADABLE}s) is the same number, so an unparseable FIX_TIMEOUT cannot shorten the lease either" $rc
+# `WALL_DEF` is read above; this is the EQUALITY the ordering arm cannot express (7201 > 2700 too).
+[ -n "${WALL_DEF:-}" ] && [ "$WALL_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) lane-bound.sh's WALL default (${WALL_DEF:-?}s) IS the harness BACKSTOP (${SEAM:-?}s), not merely above the allowance — a launcher that runs lane-bound.sh directly takes its wall from here" $rc
+INSTALL_FB="$(sed -n 's/.*DRAINER_LANE_TIMEOUT=\([0-9][0-9]*\) ;;.*/\1/p' "$HERE/install-drainer-timer.sh" | head -1)"
+case "${INSTALL_FB:-}" in ''|*[!0-9]*) INSTALL_FB="" ;; esac
+[ -n "${INSTALL_FB:-}" ] && [ "$INSTALL_FB" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) install-drainer-timer.sh's DRAINER_LANE_TIMEOUT fallback (${INSTALL_FB:-UNREADABLE}s) is the harness BACKSTOP (${SEAM:-?}s) — a drifted value would render a stale pin AND print --status clean" $rc
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
@@ -306,6 +351,45 @@ ck "(i0) chain-merge's stale-marker fallback (${CHAIN_FB:-?}s) is the harness BA
 # The seam itself must REACH those children: an unexported variable leaves an operator's override at
 # home while the child reads the compiled default (the "knob that does nothing" shape again).
 grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_BACKSTOP_S, so a lane's children agree with the clock it runs under" $?
+# ⛔ THE DERIVED LEASE MUST STILL FIT UNDER ITS CEILING (agent-infra#4034). `fix-one.sh` leases a PR
+# claim for `FIX_BOUND + 1200` (`FIX_LEASE`, and that addend is READ from `fix-one.sh` below, not restated
+# here) and `claims.sh` clamps at `CLAIM_TTL_MAX`. A clamp is
+# not a cosmetic truncation: it expires the claim UNDER a worker still inside its own bound, a peer
+# reads the head as free and runs a SECOND fixer on the same branch — the duplicate-paid-work class
+# #2888 exists to close. So the two files are asserted against each other as ARITHMETIC: raise the
+# backstop without raising the ceiling and this arm reds. ⛔ THIS IS THE ARM THAT WAS MISSING when
+# 7200 s sat behind a 9600 s ceiling (37200 vs 9600 is a 7 h 40 m gap); the strict `-lt` is deliberate,
+# because `_claim_acquire_at` clamps at the ceiling value and a lease AT the ceiling spends the whole
+# post-review headroom.
+# ⛔ AND THE ADDEND IS READ FROM THE FILE THAT OWNS THE LEASE, NEVER RESTATED HERE (agent-infra#4034
+# review). This arm used to read `FIX_LEASE_S=$(( ${SEAM:-0} + 1200 ))` while its comment claimed the two
+# files were "asserted against each other as ARITHMETIC" — but the ONE file that computes the lease is
+# `fix-one.sh` (`FIX_LEASE=$(( FIX_BOUND + 1200 ))`) and it was never read, so changing that addend moved the
+# REAL lease and left this arm green. A test that re-implements the derivation it claims to assert can only
+# ever agree with itself. ⛔ AND AN UNREADABLE ADDEND FAILS the arm rather than falling back to a number:
+# a default here is the same defect wearing a default's clothes. The literal is matched as `FIX_BOUND + N`
+# so a re-ordered or renamed derivation reads as UNREADABLE (red) instead of being silently accepted.
+FIX_ADD="$(sed -n 's/^[[:space:]]*FIX_LEASE=\$(([[:space:]]*FIX_BOUND[[:space:]]*+[[:space:]]*\([0-9][0-9]*\)[[:space:]]*)).*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_ADD:-}" in ''|*[!0-9]*|0) FIX_ADD="" ;; esac
+[ -n "${FIX_ADD:-}" ]; rc=$?
+FIX_ADD_DESC="${FIX_ADD:+FIX_BOUND + ${FIX_ADD}}"
+FIX_ADD_DESC="${FIX_ADD_DESC:-UNREADABLE — the arm cannot assert a lease it cannot derive}"
+ck "(i0) fix-one.sh's FIX_LEASE addend is READ out of fix-one.sh (${FIX_ADD_DESC}) — the lease is not restated in this suite" $rc
+FIX_LEASE_S=$(( ${SEAM:-0} + ${FIX_ADD:-0} ))
+CTM="$(sed -n 's/^CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/claims.sh" | head -1)"
+# The readability result is folded into this arm as well, so an unreadable addend cannot leave a
+# `${SEAM} + 0` lease passing the strict `-lt` and reporting a green ceiling check.
+[ -n "${FIX_ADD:-}" ] && [ -n "${CTM:-}" ] && [ "$FIX_LEASE_S" -lt "$CTM" ]; rc=$?
+ck "(i0) the derived fix-one lease (LANE_BACKSTOP_S ${SEAM:-?} + ${FIX_ADD:-?} = ${FIX_LEASE_S}s) sits UNDER CLAIM_TTL_MAX (${CTM:-?}s), so it is never CLAMPED under a live worker (#4034/#2888)" $rc
+# ⛔ AND THE VALUE MUST BE IN #4034's TARGET RANGE, NOT MERELY ABOVE THE ALLOWANCE (agent-infra#4034).
+# The ordering arm above is satisfied by 7201 as well as by 36000 — and 7201 pre-empts the progress rule
+# on every lane that is slow rather than stuck, which is exactly what was measured: 20 `exceeded-wallclock`
+# against 2 `stalled`, 12 of the 20 with `silent=0s` (i.e. NOT idle when the clock ended them). #4034's
+# target is "3-5x today's" 7200 s, so the FLOOR is 21600 s and this arm reds on the old default (7200).
+# ⚠️ 36000/2700 is 13.3x the allowance and 5x the OLD backstop: #4034's "5x" is 5x 7200, NOT 5x the
+# allowance. Both ratios are true and they are different numbers — do not "correct" one into the other.
+[ "${SEAM:-0}" -ge 21600 ]; rc=$?
+ck "(i0) the backstop (${SEAM:-?}s) is at least the LOW END of #4034's 3-5x target (21600 s = 3 x the 7200 it replaced; shipped ${SEAM:-?}s = $(( ${SEAM:-0} / ${DOC_ALLOW_S:-1} ))x the allowance) — 'above the allowance' is not enough, or the wall pre-empts the rule it backs up" $rc
 
 # A literal-substring replacement, so no regex/`$` quoting can silently no-op the mutation, and the
 # replacement is ASSERTED to have landed: a mutant identical to the original would make every
@@ -484,7 +568,8 @@ ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and
 
 # ── (l) THE OVERRIDE MAY SHORTEN A RUN, NEVER LENGTHEN IT (review P1) ──────────────────────────
 # ⛔ THE DEFECT THIS CLOSES. `run_agent` honoured `LANE_BOUND_WALL_S` for EVERY caller, so setting the
-# documented knob to the documented backstop (7200) let a caller that had declared a short bound run
+# documented knob to the documented backstop (7200 at the time; 36000 since agent-infra#4034) let a
+# caller that had declared a short bound run
 # PAST the cross-box claim lease derived from that bound — `fix-one.sh` leases `FIX_BOUND + 1200`, and
 # `merge-one.sh` `REVIEW_TIMEOUT + gate-wait + 300` — and a peer would read the claim as expired and
 # start a SECOND fixer/reviewer on the same head. That is the duplicate-paid-work class this PR's own
