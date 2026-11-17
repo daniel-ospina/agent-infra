@@ -268,8 +268,28 @@ case "$*" in
     # one coercion that mints a permanent ghost out of a read that measured nothing) passed all 649
     # assertions, because no arm ever handed a body to the program. With this hook the double executes the
     # exact shipped program over a canned body, so the jq half is testable at all.
+    # ⛔ AND ITS EXIT STATUS IS PROPAGATED, NOT SWALLOWED (review cycle 7, P1). `2>/dev/null` + `exit 0`
+    # made a program that RAISES indistinguishable from one that correctly emitted nothing: mutating the
+    # null-guard to `(.jobs)[]` (rc 5, `Cannot iterate over null`) left all 693 assertions GREEN, so the
+    # arm that exists to prove "an absent job list is never a measured zero" passed for a program that
+    # could not run at all. The same defect was fixed for the queue read one commit earlier; this is its
+    # sibling, and it is the read that MINTS the ghost.
+    # `GH_JOBS_BODY` may carry several page documents separated by `;` (the shape a paginated read
+    # produces), so the hook can serve a multi-page body as well as a single one. ⛔ NOT PINNED YET: the
+    # gate's per-page count rows are SUMMED (`jobs_total=$((jobs_total + page_jobs))`) and no arm kills a
+    # mutant that overwrites instead of summing — attempted here and reverted, because with two docs in
+    # one response the caller's own parse takes the FIRST `#jobs` row and reads the second as a label
+    # line, so the arm could not distinguish the two behaviours. The sum is therefore exercised (the
+    # page-2 jobs fixtures serve multi-page bodies) but not mutation-pinned; recorded on #4113 rather
+    # than covered by an arm that passes for the wrong reason.
     if [ -n "${GH_JOBS_BODY:-}" ]; then
-      printf '%s' "$GH_JOBS_BODY" | jq -r "$_jq_prog" 2>/dev/null
+      _rest="$GH_JOBS_BODY"
+      while :; do
+        _doc="${_rest%%;*}"
+        case "$_rest" in *';'*) _rest="${_rest#*;}" ;; *) _rest="" ;; esac
+        printf '%s' "$_doc" | jq -r "$_jq_prog" || exit $?
+        [ -n "$_rest" ] || break
+      done
       exit 0
     fi
     case "$*" in
@@ -1359,7 +1379,10 @@ run_gate ghost-truncated GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4
 assert_eq "$RC" "2" "a page shorter than its own depth → exit 2"
 assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
 # …and at the SHIPPED bound the old page-ceiling note is NOT appended either (the read walks pages).
-assert_not_contains "$OUT" "ONE page of" "the removed page-ceiling note is never printed"
+# The removed page-ceiling note is pinned POSITIVELY (review cycle 7, P2): `"ONE page of"` exists nowhere
+# in the gate, so an `assert_not_contains` on it can never fail on any live code path. What matters is
+# that the TRUNCATED refusal names the READ cap and not the old scan bound as the reach bound.
+assert_contains "$OUT" "CI_GATE_QUEUE_READ_MAX_PAGES" "a short read names the READ CAP that bounds the walk"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
 # ⛔ THE TRUNCATED REFUSAL NAMES THE READ CAP NOW, AND THAT IS THE FACT THE OPERATOR NEEDS
 # (agent-infra#4113 — this arm replaces the #3995 ceiling arm, because the ceiling it pinned NO LONGER
@@ -1375,7 +1398,8 @@ assert_eq "$RC" "2" "a truncated page → exit 2"
 assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
 assert_contains "$OUT" "CI_GATE_QUEUE_READ_MAX_PAGES" "it names the READ CAP that now bounds the walk"
 assert_contains "$OUT" "fewer rows than it reported depth" "…and says what a short read means (not 'the queue is too deep to reach')"
-assert_not_contains "$OUT" "a deeper read is a code change" "the stale 'code change, not a knob' sentence is GONE (the read now walks pages)"
+assert_not_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" \
+  "…and NOT the scan bound (the scan window bounds COST; the page cap bounds REACH — naming the wrong one sends an operator to the wrong knob)"
 
 # ⛔ agent-infra#4113 — THE SCAN WINDOW IS A *COST* BOUND, NOT A *REACH* BOUND, AND ONE PAGE IS NOT THE
 # QUEUE. Both halves were measured on the live fleet on 2026-11-17:
