@@ -850,10 +850,13 @@ class HeartbeatRead:
     ⛔ TWO MORE FACTS THE VERDICT MUST HAVE, BECAUSE THE SOURCE IS A FILE AND AN AGE FROM A DEAD
     RUN IS HISTORY, NOT A STATE:
 
-      * ``age_ms`` — how old the SOURCE is (its mtime age), ``None`` when the samples were stated
-        by the caller rather than read from a file. Past the watchdog's own heartbeat bound
-        (:data:`HEARTBEAT_TIMEOUT_MS`) the read abstains (``heartbeat-stale``). Without this a
-        29-day-old log of a long-gone child published ``running-quiet`` with rc 0.
+      * ``age_ms`` — how old the SOURCE is: a file's mtime age, or the caller's own
+        ``--source-age-ms`` statement (which covers a pipe, a log COPIED off another box, and a
+        STATED pair from ``--tool-age-ms``, whose numbers carry no mtime at all). Past the
+        watchdog's own heartbeat bound (:data:`HEARTBEAT_TIMEOUT_MS`) the read abstains
+        (``heartbeat-stale``). ``None`` means the caller stated the samples and claimed NO age —
+        a stated pair with no age is trusted about its numbers and about nothing else. Without
+        this a 29-day-old log of a long-gone child published ``running-quiet`` with rc 0.
       * ``ended`` — the source carries POSITIVE terminal evidence of the run itself (the child's
         own ``[task-heartbeat] session_end`` marker, or a `task_status` view saying
         ``"session_ended": true`` / ``"alive": false``). A tool age inside a finished run is
@@ -4042,7 +4045,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
 def _usage() -> str:
     return ("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
             "       liveness.py --heartbeat FILE|- [--nonce N] [--source-age-ms N] [--json]\n"
-            "                                        (| --tool-age-ms N repeated)\n"
+            "                                        (| --tool-age-ms N repeated [--source-age-ms N])\n"
             "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
             "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
             "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]")
@@ -4097,9 +4100,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # child's inherited fd 2 could otherwise flip a `wedged` child to `running-quiet`.
         if arg == "--nonce" and i + 1 < len(argv):
             heartbeat_nonce = argv[i + 1]; i += 2; continue
-        # The SOURCE's own age, for the two cases a file mtime cannot answer for: a pipe (no
+        # The SOURCE's own age, for the two cases a FILE's mtime cannot answer for: a pipe (no
         # mtime at all, so `--heartbeat -` refuses without this) and a log COPIED off another box
-        # (whose mtime is the copy's, not the child's last emission).
+        # (whose mtime is the copy's, not the child's last emission). It is also the only age a
+        # stated pair (`--tool-age-ms`) can have — a number on a command line has no mtime — so
+        # this flag ARMS the freshness gate for that door instead of being dropped on the floor.
         if arg == "--source-age-ms" and i + 1 < len(argv):
             try:
                 source_age_ms = int(argv[i + 1])
@@ -4128,6 +4133,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("liveness.py: --nonce fences the `[task-heartbeat]` markers in a --heartbeat "
               "source; it does not apply to --tool-age-ms", file=sys.stderr)
         return 2
+    if source_age_ms is not None and heartbeat_path is None and not tool_ages:
+        # The flag states the age of a HEARTBEAT source. A session query (`--sid`) reads the
+        # store, never a heartbeat file, so accepting the flag there would advertise a freshness
+        # gate that does not exist — the same refusal `--nonce` gets one branch above, for the
+        # same reason. (Measured before this: `--source-age-ms 12000 --sid abc` parsed the number
+        # and then ran the session ladder, silently discarding the caller's only provenance.)
+        print("liveness.py: --source-age-ms states the age of a heartbeat source; it applies to "
+              "--heartbeat or --tool-age-ms, not to a --sid query", file=sys.stderr)
+        return 2
     if (heartbeat_path is not None or tool_ages) and sid:
         # ⛔ A USAGE ERROR, NOT AN ABSTENTION. `evaluate` refuses a two-axis query by name
         # (`heartbeat-on-session-query`), but publishing that as rc 3 would tell a caller
@@ -4140,7 +4154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hb = (gather_heartbeat(heartbeat_path, nonce=heartbeat_nonce,
                                source_age_ms=source_age_ms)
               if heartbeat_path is not None
-              else HeartbeatRead(readable=True, source="flag",
+              else HeartbeatRead(readable=True, source="flag", age_ms=source_age_ms,
                                  samples=tuple(HeartbeatSample(age_ms=a) for a in tool_ages)))
         verdict = evaluate(Evidence(heartbeat=hb))
         if as_json:

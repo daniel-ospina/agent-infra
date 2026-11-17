@@ -934,7 +934,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 62 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (129)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (131)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -2199,6 +2199,16 @@ last emission), and a **pipe** has no mtime at all — so `--heartbeat -` requir
 and is an abstention naming the flag without it. An unknown age used to skip the gate silently,
 which is how a 29-day-old log piped in published `running-quiet` rc 0.
 
+⛔ **The same flag arms the gate on the STATED-PAIR door (`--tool-age-ms`) — a number on a command
+line has no mtime, so the caller's statement is the only age that shape can carry.** Accepting it
+there and discarding it was measured: `--tool-age-ms 6961576 --tool-age-ms 18052 --source-age-ms
+2592000000` (29 days) published `running-quiet` rc 0 for readings the caller had just said were old
+— the freshness gate requestable and never armable, which is precisely the inert-flag failure
+`--nonce` is refused for. Stating the age ARMS the gate: stale ⇒ `unknown` / `heartbeat-stale` rc 3,
+fresh ⇒ the pair decides as usual. On a `--sid` query it is a **usage error** (`rc 2`), refused by
+name like `--nonce`: the session ladder never reads a heartbeat source, so honouring it there is
+impossible and accepting it would claim it was.
+
 `--nonce <n>` is that fence, honoured rather than re-invented: **every** line is fenced once a
 nonce is given, not only marker-shaped ones — the capture log is raw stdout+stderr
 (`extensions/shared/task-runs.ts:83`), so a `task_status`-shaped line is exactly what a forged
@@ -2248,6 +2258,14 @@ python3 tools/fleet/liveness.py --heartbeat <run_id>.log --nonce <TASK_HEARTBEAT
 
 # A PIPE has no mtime, so it must be told its age (`--heartbeat-json` is an accepted alias):
 cat <run_id>.log | python3 tools/fleet/liveness.py --heartbeat - --source-age-ms 12000
+
+# A STATED PAIR has no mtime either — the same flag arms the freshness gate on that door (a copied
+# log's numbers are history). Stale ⇒ `unknown heartbeat-stale` rc 3; fresh ⇒ the pair decides:
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052 \
+    --source-age-ms 2592000000        # 29 days old ⇒ rc 3, NOT a published state
+python3 tools/fleet/liveness.py --tool-age-ms 6961576 --tool-age-ms 18052 \
+    --source-age-ms 12000             # rc 0, running-quiet/tool-age-reset
+python3 tools/fleet/liveness.py --source-age-ms 12000 --sid <session-id>   # rc 2: never applies
 ```
 
 A **two-axis query is a usage error (rc `2`)**, not an abstention: `--sid` together with a heartbeat

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-62 tests with 129 paired mutations: every mutation re-
+62 tests with 131 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 62 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (129)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (131)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3587,6 +3587,24 @@ def t60():
         # A nonce fence with no marker source advertises a fence that does not exist.
         rc, out, err = cli("--nonce", "abc", "--tool-age-ms", "5", "--tool-age-ms", "9")
         check(rc == 2, "`--nonce` without `--heartbeat` is a usage error; got rc=%d" % rc)
+        # ⛔ A STATED SOURCE AGE ARMS THE FRESHNESS GATE ON THE STATED-PAIR DOOR TOO. The gate is
+        #    a property of the READ, not of the door the samples came through: accepting
+        #    `--source-age-ms` here and discarding it published `running-quiet` rc 0 for readings
+        #    the caller had just said were old — the same 29-day-old-source class the FILE arm
+        #    closes, reachable through the caller's own stated evidence.
+        rc, out, _ = cli("--tool-age-ms", "6961576", "--tool-age-ms", "18052",
+                         "--source-age-ms", str(29 * 24 * 3600 * 1000))
+        check(rc == 3 and out.startswith("unknown heartbeat-stale"),
+              "a STALE stated age abstains on the flag shape (rc 3); got rc=%d %r" % (rc, out))
+        rc, out, _ = cli("--tool-age-ms", "6961576", "--tool-age-ms", "18052",
+                         "--source-age-ms", "12000")
+        check(rc == 0 and out.startswith("running-quiet tool-age-reset"),
+              "a FRESH stated age still decides — the gate is ARMED, not asserted; "
+              "got rc=%d %r" % (rc, out))
+        # …and a flag that can never apply is refused by NAME, exactly as `--nonce` is above.
+        rc, out, err = cli("--source-age-ms", "12000", "--sid", "abc")
+        check(rc == 2 and "--source-age-ms" in err,
+              "`--source-age-ms` on a session query is a usage error; got rc=%d %r" % (rc, err))
         # No evidence at all is still a usage error, not an abstention.
         rc, out, err = cli()
         check(rc == 2 and "usage" in err, "no evidence is a usage error; got rc=%d" % rc)
@@ -3762,9 +3780,13 @@ MUTATIONS = [
         "T58", "module",
         '        if len(hb.samples) < 2:',
         '        if not hb.samples:',
-        "the TWO-SAMPLE requirement is dropped, so ONE reading decides — the exact inference "
-        "that called a WORKING child wedged three times in #3987 (`still running` and `just "
-        "started` are the same number)",
+        "the single-sample ABSTENTION is deleted, so a one-reading query falls through to the "
+        "pair comparison and raises IndexError on `samples[-2]` — the guard that turns one "
+        "reading into `tool-age-single-sample` is gone rather than weakened (an EMPTY read never "
+        "reaches this line: `not hb.samples` abstains above it), so this mutant reds by CRASH, not "
+        "by the assertion T58(1) would name. What it PROVES is that the guard is load-bearing; "
+        "the abstention's reason and rc are pinned by T58(1)/T60's rc-3 row against the INTACT "
+        "code",
     ),
     Mutation(
         "T58", "module",
@@ -4757,6 +4779,24 @@ MUTATIONS = [
         "ONE conjunct of the masking refusal is dropped — invisible before T57 because the "
         "guard was pinned only in aggregate (#1777 B7 rebuilt: a `frozen` log read then "
         "convicts a lane whose claim/candidate evidence the query carried)",
+    ),
+    Mutation(
+        "T60", "module",
+        '              else HeartbeatRead(readable=True, source="flag", age_ms=source_age_ms,',
+        '              else HeartbeatRead(readable=True, source="flag",',
+        "the caller's stated source age is DROPPED on the `--tool-age-ms` door, so a freshness "
+        "gate that was asked for is never armed: readings the caller just said came from a "
+        "29-day-old copy publish `running-quiet` rc 0 instead of the `heartbeat-stale` "
+        "abstention — the flag becomes an inert advertisement, which is exactly what `--nonce` is "
+        "refused for",
+    ),
+    Mutation(
+        "T60", "module",
+        '    if source_age_ms is not None and heartbeat_path is None and not tool_ages:',
+        '    if False:',
+        "`--source-age-ms` on a `--sid` query is accepted and silently discarded rather than "
+        "refused, so the one query that can never honour the age reports success — a caller is "
+        "told their provenance was used when the session ladder never read it",
     ),
 ]
 
