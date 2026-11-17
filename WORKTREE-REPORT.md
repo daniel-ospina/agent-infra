@@ -224,3 +224,88 @@ findings above.
 | `node scripts/check-pi-pin-lockstep.mjs` | **132 passed, 0 failed** |
 | `bash scripts/check-bash32-parse.sh` | **471 scripts parse under bash 3.2.57** |
 | `bash scripts/check-pipeline-compliance.sh` (local, `PR_NUMBER=4103`) | (a) ✅ · (c) awaiting the harness reviewer's head-bound record |
+
+---
+
+# ROUND 3 — the round-2 fix, verified independently on this host, and the FIFTH spelling it still let through
+
+This section is written by the round-3 lane. It arrived with a brief naming `5372a4f9d` as the head, found
+`origin/fix/4034-round2-findings` already advanced to `00a95d1f0` + `c4edfd1fd` (the round-2 fix, pushed
+by a predecessor lane that had also corrected F4's doc claim), and **verified that work rather than
+re-implementing it**. It had independently built its own version of the same fix before discovering the
+pushed one; that version is preserved at commit `55b949723` (unpushed, superseded) and is NOT part of this
+branch — two implementations of one fix is the shape this repo calls a duplicate, so the pushed one stands.
+
+## Every round-3 row, re-measured through the shipped verb (not carried from the commit message)
+
+Harness: a temp `infra/` tree laid out as a checkout, `$SYSTEMCTL=/bin/true`, both units present, a
+`[Service]`-headed `ExecStart=`, and the pin/override written per row (the reproduction script is in the
+lane log; each row is one `--status` invocation).
+
+| row | fixture | systemd hands the process | `--status` at `c4edfd1fd` | rc |
+|---|---|---|---|---|
+| F1 | drop-in `[Service] EnvironmentFile=` (file says 7200) over `Environment=LANE_TIMEOUT=36000` | 7200 | `⚠️ UNREADABLE CAP … EnvironmentFile=` | **5** |
+| F2 | `Environment=LANE_TIMEOUT=36000` under `[Install]`, `[Service]` runs a 7200-default script | 7200 | `carries no pin … ⚠️ STALE CAP` | **3** |
+| F3 | `Environment=HOME=/x \` + `LANE_TIMEOUT=7200` | 7200 | `7200 s installed … ⚠️ STALE PIN` | **3** |
+| F3b | `Environment=\x4CA\x4EE_TIMEOUT=7200` | 7200 | `⚠️ UNREADABLE CAP` | **5** |
+| control | `[Service] Environment=LANE_TIMEOUT=7200` | 7200 | `7200 s installed … STALE` | **3** |
+
+No row returns 0 over a cap that disagrees with the seam, and the continuation row is read *precisely*
+(7200, not "unknown") because the lib joins the continuation the way `systemd.syntax(7)` says — a better
+answer than refusing it, which is what this lane's superseded version did.
+
+## F5 — a HEADERLESS drop-in was still an rc-0 false clean (`c4edfd1fd`), fixed here
+
+Verifying the fix, one more spelling of the same class returned **0**:
+
+```
+unit:    [Service] … Environment=LANE_TIMEOUT=7200        ← the box dispatches at 7200
+drop-in: eldato-ai-drainer.service.d/x.conf:  Environment=LANE_TIMEOUT=36000   ← NO [Service] header
+--status: LANE_TIMEOUT pin: 36000 s installed · 36000 s would be rendered now          rc 0
+```
+
+systemd **drops** that drop-in line — `v257 src/shared/conf-parser.c:253`, "Assignment outside of section.
+Ignoring." — because the unit and each drop-in are parsed as SEPARATE files and an assignment before a
+file's first `[Section]` header belongs to no section. The reader `cat`s unit-then-drop-ins into ONE text,
+so the ignored line was attached to whatever section the unit file ended in and graded as the effective
+pin. The mirror is a false STALE (a headerless drop-in naming a stale cap cannot redden a seam-pinned
+unit). Both directions are now arms.
+
+| | before (mutant: bare `cat`) | after |
+|---|---|---|
+| stale base + headerless drop-in naming the seam | **rc 0** `36000 s installed` | **rc 3** STALE `7200 s installed` |
+| seam base + headerless drop-in naming 7200 | **rc 3** (false STALE) | **rc 0** clean |
+
+Fix, in the shared lib (one definition, both callers): `unit_text_from_files` emits a `[]` boundary before
+each file — the header of a section that does not exist, so no reader honours anything under it, exactly
+as systemd honours nothing before the first real header — and `normalize_unit_lines` treats that boundary
+as a CONTINUATION BARRIER, so a trailing `\` at one file's EOF cannot swallow the next file's first line
+(and an EOF-dangling continuation keeps its backslash, i.e. it stays a hazard). `unit_text_cat_boundaries`
+does the same at the manager's own `# <path>` separators for the disk reaper's `systemctl cat` arms, where
+the checkout cannot be the truth source. Both callers guard the helpers as FATAL when a farmed lib
+predates them, because a missing boundary silently restores the false PASS.
+
+## Suites, re-measured at `a5ae388ed` (this worktree, this host)
+
+| command | result |
+|---|---|
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **221 passed, 0 failed** (219 before the two F5 arms; a `(g)` worktree-reap arm flaked twice on timing and passed on every re-run — it kills a `sleep` and races the reap; it touches nothing here) |
+| `bash scripts/disk-reaper.test.sh` | **ALL PASS (727 assertions)** |
+| `bash scripts/check-bash32-parse.sh` | **471 scripts parse** under bash 3.2.57 |
+
+Mutation attribution for the two new arms is measured, not asserted: restoring the bare `cat` in
+`install-drainer-timer.sh` gives **219 passed, 2 failed**, and the two reds are exactly those arms, with the
+pre-fix answers (`rc 0` / `rc 3`) printed in their own detail lines.
+
+## What this lane did NOT do
+
+* **Did not attest a review** and **did not merge** — the head-bound record is the harness reviewer's
+  (`merge-one.sh`), per #2148.
+* **Did not re-litigate round 1/2** and did not "correct" the finding the round-2 review FALSIFIED (the
+  whitespace-only `Environment=` reset — `normalize_unit_lines` strips whitespace after the `=`, so the
+  reset IS honoured; measured again here as "no pin", never as a stale value).
+* **Did not change** the 45-minute progress allowance, `CLAIM_TTL_MAX` (still a ceiling), or any MCP/SDK
+  surface, and wrote to no Tortoise graph.
+* **Did not touch** the `%`-specifier verdict: the shipped refusal turns an unrelated `Environment=HOME=%h`
+  into UNKNOWN (5). That is fail-closed, it is what `cell-self-pin.sh:855-863` rules, and an arm asserts
+  it — noted here only so the next reader knows it is deliberate, not an oversight.
