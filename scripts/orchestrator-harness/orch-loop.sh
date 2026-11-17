@@ -6628,7 +6628,27 @@ while true; do
       rm -f "$O/state/redfix-$PR" 2>/dev/null || true
       rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
       disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
-    HEAD_N="$(gh_bounded pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # ⛔ ONE CALL, TWO FACTS — AND `mergeable` IS THE SECOND ON PURPOSE (agent-infra#4120). The head
+    # used to be read alone, and `mergeable` was re-read LATER, inside the conflict arm and only for a
+    # `GREEN|PENDING` class. That gate made the arm unreachable for the population it exists for: a
+    # conflicted PR is usually NOT green, because a required check cannot be satisfied while GitHub
+    # refuses to run workflows on a conflicted PR. MEASURED 2026-11-17 (`check-class.py` over each
+    # conflicting PR's live surface, REQ = the repo's seven required contexts): 7 of 7 open
+    # CONFLICTING PRs on `daniel-ospina/tortoise` classified `FAILED:ai-review-gate` — not one could
+    # reach the conflict router, and each was handed to the review gate's re-record chain instead,
+    # spending a paid run per PR per main advance on a review whose PR cannot merge.
+    # Folding the field into the query this row ALREADY makes costs no extra GitHub call: it replaces
+    # the separate `gh pr view --json mergeable` that used to run for every green PR. `mergeable` is
+    # `UNKNOWN` while GitHub computes it lazily, and that reads as "not conflicting THIS cycle" — the
+    # same allow-list polarity the old arm had (only the literal `CONFLICTING` ever fires).
+    _pr_row="$(gh_bounded pr view "$PR" --repo "$OR" --json headRefOid,mergeable \
+                 --jq '"\(.headRefOid) \(.mergeable // "")"' 2>/dev/null)"
+    HEAD_N=""; MSTAT=""
+    case "${_pr_row:-}" in
+      '') : ;;                                  # unreadable: the arms below already handle an empty head
+      *' '*) HEAD_N="${_pr_row%% *}"; MSTAT="${_pr_row#* }" ;;
+      *)     HEAD_N="$_pr_row" ;;                # a one-field answer is the head, never a mergeable
+    esac
     # ── THE DURABLE CLAIM DECIDES BEFORE ANY ARM ACTS (agent-infra#2466) ──────────────────────
     # ⛔ THIS IS THE SELECTION POINT, and it is the one place where a second controller's work is
     # invisible: everything below (`redfix`, the parked guard, the spawn guards, the GREEN arm that
@@ -7140,10 +7160,23 @@ while true; do
   # can hold a stale class and drive `UPN_WORK` to 0 early) and is NOT fixed here. The contract above
   # is the pre-change one and no longer holds as written; it is left in place, named, rather than
   # silently deleted, because the next reader must be able to see what changed and why.
+    # [prclass:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     case "${V:-}" in
       GREEN)   _cl=GREEN ;; PENDING:*) _cl=PENDING ;; FAILED:*) _cl=RED ;; *) _cl=NOCHECKS ;;
     esac
+    # ⛔ `CONFLICTED` IS A CLASS OF ITS OWN, AND IT IS THE ONE THE ORDERING ALREADY RANKS FIRST
+    # (agent-infra#4120). `lo_class_rank` returns 0 for CONFLICTED, `lo_order` sorts it ahead of RED,
+    # PENDING and GREEN — and the sweep's own note above promises "conflicted first" — but NOTHING
+    # could ever write the row: the class was derived from the CHECK token, and a conflict is not a
+    # check state. MEASURED on this box's live `state/prclass.tsv`: 469 RED, 86 NOCHECKS, 33 PENDING,
+    # 11 GREEN and **0 CONFLICTED**, while the same box counted 7 open conflicting PRs — so rank 0 was
+    # unreachable and a conflicting PR competed for a scarce fixer slot as whatever its checks
+    # happened to say. Written HERE, before the conflict arm acts, so the NEXT cycle's `lo_order` puts
+    # the rebase ahead of every review: that is the ordering agent-infra#4120 asks for, because a
+    # conflicting PR cannot be meaningfully reviewed and its clean-ever evidence survives a rebase.
+    [ "${MSTAT:-}" = "CONFLICTING" ] && _cl=CONFLICTED
     printf '%s\t%s\t%s\n' "$PR" "${HEAD_N:-}" "$_cl" >> "$O/state/prclass.tsv" 2>/dev/null || true
+    # [prclass:end]
     # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
     # while nothing changes. Route it to the fixer, which integrates origin/main and resolves the
     # conflict, then re-runs the review chain. Capped and parkable like any other fix loop.
@@ -7153,12 +7186,18 @@ while true; do
     # `PENDING:*` arm, which opened no level of its own: a cycle whose only PR work was merge-side then
     # read `l3_fix:<n>, l2_merge:ns` — answering the field's own headline question (merging, fixing,
     # reviewing, or none of the above) WRONGLY in the most common state on a rail repo. The `mergeable`
-    # read below is a CLASSIFICATION, so it is honestly charged to no level (the same rationale as the
+    # read is a CLASSIFICATION, so it is honestly charged to no level (the same rationale as the
     # `[redfix:end]` close); only the actual conflict repair is level 3.
-    case "$V" in
-      GREEN|PENDING:*)
-        MSTAT="$(gh_bounded pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
-        if [ "${MSTAT:-}" = "CONFLICTING" ]; then
+    # ⛔ NO CHECK-CLASS GATE ON THIS ROUTER (agent-infra#4120). It used to run only inside
+    # `case "$V" in GREEN|PENDING:*)`, which is backwards: `mergeable` is ORTHOGONAL to the check
+    # surface, and the conflicting population is exactly the one that is NOT green (see the
+    # measurement at `MSTAT` above: 7 of 7 -> `FAILED:ai-review-gate`). Routing on the mergeable state
+    # alone also puts the rebase BEFORE the review for the same PR — a conflicted PR dispatched to the
+    # review gate's re-record chain gets a review it cannot possibly pass, while its clean-ever
+    # evidence would have survived the rebase. `MSTAT` is read once, in the row's own `gh pr view`,
+    # so reaching every class costs no extra call.
+    case "${MSTAT:-}" in
+      CONFLICTING)
           stg_lvl_start l3_fix || :   # a conflicting PR is repaired: cascade level 3
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
@@ -7204,7 +7243,7 @@ while true; do
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
           continue
-        fi ;;
+        ;;
     esac
     # [conflict-case:end]
     # [acting-case:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
