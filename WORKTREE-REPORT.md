@@ -1,151 +1,131 @@
-# WORKTREE REPORT — agent-infra #4046 · `fix/4046-lane-triage`
+# WORKTREE REPORT — agent-infra #4034 round-2 fixer · `fix/4034-round2-findings`
 
-Worktree: `/home/cmux/agent-infra/.worktrees/4046-triage`
-Branch: `fix/4046-lane-triage`
-Base at branch point: `c42b1ba04` — `fix(harness): grade the review stage on its own last pass… (#4037)`
+Worktree: `/home/cmux/agent-infra/.worktrees/4034-backstop`
+Branch: `fix/4034-round2-findings` (base `origin/main` @ `8f90074fe`)
+Follow-up to PR **#4065** (`fix/4034-backstop-5x`, **MERGED** at `52784ccdda`, merge commit `6893e7910`)
 
-⛔ **`tools/worktree_report.py` DOES NOT EXIST IN THIS REPO.** The brief says to use it "if it does not
-exist here, say so in the report rather than inventing counts" — so this file is written by hand and
-every number below is a MEASURED tail of a command run in this worktree, never an assertion. Each
-command is quoted verbatim so it can be re-run.
+⛔ **`tools/worktree_report.py` DOES NOT EXIST IN THIS REPO** (checked: `ls tools/` has only `fleet/`,
+`install-ci-runner-x64.sh`; `lane-report-gate.sh` returns **5 NO-CONSUMER** for agent-infra for exactly
+this reason). So this file is written by hand and every number below is a MEASURED tail of a command run
+in this worktree, quoted verbatim so it can be re-run. No count here is asserted from memory.
+
+## The state I found, because it changes the assignment
+
+The brief said "#4065 open, MERGEABLE, head `52784ccdda`; update PR #4065, not a new PR". Measured:
+
+```
+$ gh pr view 4065 --repo daniel-ospina/agent-infra --json state,headRefOid,mergedAt,mergeCommit
+state MERGED · headRefOid 52784ccdda663015a4d30917dc30f8f537f91819
+mergedAt 2026-11-16T13:48:25Z · mergeCommit 6893e79107dc0f36309adf1dd7be033d89547883
+$ git ls-remote origin refs/heads/fix/4034-backstop-5x        → (nothing: the branch is deleted)
+$ git diff HEAD origin/main --stat                            → 76 files, 20957 insertions
+```
+
+So #4065 was merged **with the seven-finding re-review outstanding**, its branch is gone, and this
+worktree's base was 76 files behind `origin/main`. Updating #4065 is not possible (GitHub does not accept
+commits onto a merged PR, and the branch no longer exists), so the seven fixes land as a **follow-up PR
+against `origin/main`** — the same work, continued, not a second PR for it. That is the one deviation
+from the brief and it is stated rather than papered over.
+
+**Uncommitted predecessor work was found in the tree** (8 files, 301 diff lines: a stale-pin rewrite, the
+residual table, two test blocks, prose tweaks) — a lane killed mid-flight. Per agent-infra#2981 it is
+**never discarded**: it is preserved two ways before the base moved —
+`git switch -c wip/4034-round2-predecessor` → commit `c376aabc8`, and a patch file at
+`~/.pi/agent/state/4034-round2/predecessor-wip-*.patch` (25 391 bytes). It was **not** shipped as-is: it
+was written against the pre-merge text of those files and it left finding 4's overstatement in place, so
+its content was re-implemented against `origin/main` and this report records which finding each edit
+serves.
+
+## The seven findings, each with the file:line it changed
+
+| # | file:line | what changed |
+|---|---|---|
+| 1 (P2, fail-open) | `scripts/orchestrator-harness/install-drainer-timer.sh:233-329` (+ `scripts/lib/systemd-unit-parse.sh`, `scripts/install-disk-reaper-timer.sh:669-691`, `pi-bootstrap/setup.sh:941`, `docs/ops/ai-drainer.md:355-372`) | the pin is read with systemd's GRAMMAR, not a `^Environment=LANE_TIMEOUT=` spelling match: unit + `<unit>.d/*.conf` in systemd's order, quoted values, several assignments per line, whitespace around `=`, last-wins, bare `Environment=` reset. A pin nothing can resolve is **UNKNOWN (5)**, never "no pin" (0) |
+| 2 (P2) | `scripts/orchestrator-harness/claims.sh:125-146`, `merge-one.sh:1970-1972` | the residual is THREE rows (`_gw` 900 → 46290 / 1710 spare · 1800 → 47190 / **810 spare** · 3900 → 49290 / 1290 over) plus the threshold (`_gw` > 2610, `GATE_POLL_SECS` > 87); `3900` is named as the merge TERM, not `_gw`; `39000` → `41100` |
+| 3 (P3) | `scripts/orchestrator-harness/lane-reap.test.sh:48-56` | `unset LANE_REAP_LIVE_MIN LANE_REAP_IDLE_MIN` at suite entry, so the shipped-window arms cannot grade the ambient window |
+| 4 (P2) | `scripts/orchestrator-harness/README.md:2352-2378`, `lane-merge.sh:254-256,536-559` | design operand (247 × 120 = 29640) split from the OPERATIVE allowance (the watchdog's 22 × 120 = 2640 s, on BOTH clocks); the merge phase still cannot out-watch its 5400 s check wait; `:534-535`'s stale `7 × 120` corrected |
+| 5 (P3) | `scripts/orchestrator-harness/ARCHITECTURE.md:184` | the `claims.sh` table row is one line again (it was split mid-cell, leaving `raised the lane term 5x), and orphaned host \|` as its own paragraph) |
+| 6 (P3) | `scripts/orchestrator-harness/dispatch-merge.sh:42-45` | `(CLAIM_ISSUE_TTL, 4 h since #2029, 5 h since #2999, 13 h 20 m since agent-infra#4034)` |
+| 7 (P3) | `scripts/orchestrator-harness/README.md:3099,4844-4845,5100-5101,5877-5879`, `ai-drainer.test.sh:1748-1750` | `wall_bound=7200s` sample → 36000 s; three "3 h" `CLAIM_ISSUE_TTL` statements → 13 h 20 m; "3000s ≈ 2.5 ticks" → 36000 s ≈ 30 ticks |
+
+Item 1 was proven the way the brief asked (`--status` returns 5 **not 0** where the pin cannot be
+resolved) — with one deliberate deviation, stated in the commit and repeated in the PR body: for a
+**quoted pin** and a **drop-in pin** whose *value* is stale the correct grade is **3 STALE**, not 5, because
+the value DOES resolve and 3 is what `docs/ops/ai-drainer.md` publishes for "disagrees with the seam"; 5
+is reserved for the unresolvable (an unterminated-quote pin line, a non-numeric value). What finding 1 is
+about — rc 0 certifying a box that dispatches at the old cap — is closed in every spelling, and no arm
+returns 0.
+
+### The item-1 probe matrix, measured through the shipped `--status`
+
+Fake `systemctl`, temp unit dir, seam read from `spawn-gate.sh` (36000), drop-ins moved out of the way
+between arms. Every row is a real run of `install-drainer-timer.sh --status` in this worktree:
+
+| fixture | rc | note |
+|---|---|---|
+| shipped unquoted pin = seam | **0** | unchanged |
+| plain stale 7200 | **3** | unchanged |
+| quoted stale `"LANE_TIMEOUT=7200"` | **3** | was **0** (fail-open) |
+| list form `HOME=/x LANE_TIMEOUT=7200` | **3** | was **0** |
+| indented `  Environment = LANE_TIMEOUT=7200` | **3** | was **0** |
+| base=fresh + drop-in stale 7200 | **3** | was **0** |
+| base=stale + drop-in fresh | **0** | the drop-in WINS, both directions |
+| unterminated quote naming the pin | **5** | was **0** |
+| non-numeric pin (`abc`) | **5** | cap unresolvable |
+| pin then bare `Environment=` reset | **0** | the reset CLEARS the pin (no pin) |
+| no pin at all | **0** | `ExecStart=` grading, unchanged |
+
+Non-vacuity: with `INSTALLER` pointed at `origin/main`'s installer (temp copy, then restored) the same
+suite reports **200 passed, 8 failed** — one arm per fail-open spelling above.
 
 ## Suites, verbatim, as measured
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=475 FAIL=0` |
-| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (21 RED controls, all fired) |
-| `uv run --quiet --with pytest --with pytest-timeout python -m pytest scripts/ -q --timeout=180` | `1436 passed, 3 skipped, 1 xpassed in 216.96s` |
-| `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
-| `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `FAILURES: 1` — **PRE-EXISTING, base-owned** (see below) |
-| `bash scripts/check-farm-drift.sh` | `UNKNOWN — COMPARING AGAINST THE WRONG TREE` (rc 0): the box is pinned at `d5c6dc7530` and this worktree is at `330ac09c0`. Not a red, and not a green — it refuses to compare across a pin, which is the behaviour it documents. |
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | `ai-drainer.test: 208 passed, 0 failed` |
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` (pre-fix installer) | `200 passed, 8 failed` — the 8 new arms, the non-vacuity control |
+| `bash scripts/orchestrator-harness/lane-merge.test.sh` | `ALL 207 lane-merge checks passed` |
+| `bash scripts/orchestrator-harness/lane-reap.test.sh` | `lane-reap.test: 235 passed, 0 failed` (also with `LANE_REAP_LIVE_MIN=125`, and with `LANE_REAP_IDLE_MIN=60`) |
+| `bash scripts/orchestrator-harness/lane-reap.test.sh` (pre-fix suite, ambient `LANE_REAP_LIVE_MIN=125`) | `❌ LIVE-WINDOW: at the shipped 601 min … (got: lanes=0/1 zombie=0, want: lanes=1/1 zombie=0)` — the item-3 defect, reproduced |
+| `bash scripts/orchestrator-harness/lane-bound.test.sh` | `RESULT: 83 passed, 0 failed` |
+| `bash scripts/orchestrator-harness/claim-orphan.test.sh` | `150 passed, 0 failed` |
+| `bash scripts/orchestrator-harness/test-claims.sh` | `RESULT: 301 passed, 0 failed` |
+| `bash scripts/disk-reaper.test.sh` | `ALL PASS (720 assertions)` (the extracted `Environment=` lib is behaviour-identical for its original caller) |
+| `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `OK: no nesting, active files refreshed, farm links preserved` (the new lib is declared in `lib_srcs`) |
+| `bash scripts/orchestrator-harness/check-single-source.sh` | `ok: one source of truth — 11 shared file(s) …` |
+| `bash scripts/check-false-pass-shapes.sh` | `PASS: no finding in the SCANNED SET (362 file(s)) … 0 finding(s)` |
+| `bash pi-bootstrap/tests/test-cell-install.sh` | **NOT A PASS — not run to its end** (see below) |
+| `bash -n` on every touched shell file | clean |
 
-**pytest was not installed on this box** (`python3.12 -m pip install pytest` → `Errno 13: Permission
-denied: /opt/freestyle/python/lib/python3.12/site-packages/iniconfig`; a `--user` install is refused
-because the interpreter is already a virtualenv). The suites above run through `uv run --with pytest`,
-which needs no install and no repo change. (An earlier version of this table used a throwaway venv at
-`/tmp/pyenv4046`; that path was swept — a `/tmp` interpreter is not a durable way to state a result, so
-the command was replaced with one that can be re-run.)
+⛔ `pi-bootstrap/tests/test-cell-install.sh` **exceeded a 900 s and then a 1 200 s window on this box and was
+not run to its end**: the partial run logged in `~/.pi/agent/state/4034-round2/cell-install.log` holds
+**179 `ok:` lines and 0 failures** and was still going when the window closed. It is DISCLOSED as
+not-a-pass rather than reported green. The file I touched in `pi-bootstrap/` is one array entry in
+`setup.sh`, and the farm arm that reads that array (`test-setup-no-nesting.sh`) DID pass — but
+`test-cell-install.sh` is unmeasured by this lane and a reviewer should treat it as such.
 
-## The one red, and why it is not this branch's
+## Residuals, stated
 
-`pi-bootstrap/tests/test-setup-no-nesting.sh` reports:
+1. **A quoted / drop-in stale pin grades 3, not 5.** Deliberate, explained above and in the PR body.
+2. **`CLAIM_BRANCH_TTL` (14400) still sits below one lane's backstop (36000)** and nothing renews it —
+   unchanged by this lane, pre-existing from #4065, stated in `claims.sh:175-190` and in the PR body.
+   The escape is the single knob; the pre-push guard refuses fail-closed in the meantime.
+3. **`GATE_POLL_SECS` > 87 puts `CLAIM_ISSUE_TTL` over its own sum** (row 3 of the claims table). Closed
+   for the two shipped configurations (`_gw` 900 and 1800); an operator override past 2610 s must raise
+   the default with it — now stated as a threshold instead of an example.
+4. **The `--watch` allowance is 22 chunks (2640 s) on both clocks**, so the 5× buys the LANE TERM and a
+   non-decaying allowance, not 11× more supervision. Stated in both `README.md` and `lane-merge.sh`; the
+   number that a reader will find in each place is now the same number.
+5. **`lane-reap`'s 601-minute window still counts a ghost tree LIVE for up to 10 h** (the second
+   direction of that trade). Unchanged here; recorded in `lane-reap.sh:190-200` and in #4065's body.
+6. `merge-one.sh`'s edit is **comment-only** (a number in a prose block), so no `merge-one` suite was
+   re-run for it; every executable change is covered by the suites above.
 
-```
-FAIL: producer-set: the DERIVED producer population is not the pinned set — a producer moved.
-ADDED: none | REMOVED: script:conflict-rebase.py .
-```
+## What this lane did NOT do
 
-Reproduced with `pi-bootstrap/setup.sh` checked out UNMODIFIED (`git checkout pi-bootstrap/setup.sh`,
-run, then restored), so it is base-owned. Per AGENTS.md it is recorded rather than fixed here (its
-category is the pin/marker class), and it is disclosed in the PR.
-
-## Round 3 — an independent reviewer's findings, verified before applying
-
-A second fresh-context review (dispatched by the second lane on this worktree) returned at
-`228699917`; every finding was re-verified against the CURRENT head before anything was applied, and
-two were falsified and dropped. Measured on the final head:
-
-| finding | verdict | evidence |
-|---|---|---|
-| **[P0]** `retry_signature`'s bare `429` + an ungated `model-retry` branch → a WORKING lane routed `rerun` (a relaunch) | **CONFIRMED, FIXED** | `retry_signature("Merged PR #14290 and verified all checks.")` was `True`; a `WORKING` lane routed `wedged/model-retry` → `rerun`. Now `\b429\b`, last-paragraph-scoped, and gated on `_turn_open(ev)` + not in `WORKING_VERDICTS`. |
-| **[P1]** `arm_child` read keys the producer never emits, and synthesised a child name from a state word | **CONFIRMED, FIXED** | producer (`lane-status.py:1586-1590`) emits `call_id/ts/age/abandoned/cwd/task/agent`; a real record gave `verified=False`, and `child_state`-only gave `verified=True` off `{'name': 'stuck'}`. Now reads the producer's key set; the synthesis is deleted. |
-| **[P1]** question followed by ≥2 status sentences still reached `send-continue` | **already fixed** by the round-2 commit (`798e987fc`) — the paragraph window is gone | re-measured: 8 must-ask shapes × → 0 leaks |
-| **[P1]** the question arm's mandate read-back was vacuous (`CmuxSurface` had no `last_sent`) | **already fixed** in `798e987fc` | `scripts/lane-route.py:99,137` record the flattened payload; the arm reads it at `triage_arms.py:245` |
-| **[P2]** `arm_boot_prompt` hardcoded `sent=True` | **already fixed** in `798e987fc` | no `sent=True` literal remains; `sent=rc in (0, 4)` |
-| **[P2]** `confirm`/`approve` matched as bare substrings | **already fixed** in `798e987fc` | `_ASK_FRAME`/`_HANDOFF` split; `"Confirmed the fix and merged it."` → `not-asked` |
-| **[P2]** R6 was a fixed-string assertion that could not fail | **⛔ FALSIFIED — NOT APPLIED** | measured: disabling the fence stripper makes the same input answer `asked`, so R6 does discriminate. It was still STRENGTHENED into a mutation control (disables `_FENCE_RE`, requires the answer to change). |
-| **[P2]** the wiring leg cannot catch wrong arguments to `steerable()` | **CONFIRMED, FIXED** | the leg only checked the `if not _may:` window; the P0 in `228699917` was wrong ARGUMENTS at that call site. Now pins `sid`/`ws=`/`session_path=` in the `_triage.steerable(` call. |
-| **[P2]** CI comment said "seven ways", the suite runs twelve controls | **CONFIRMED, FIXED** | `.github/workflows/ci.yml:620` |
-
-Behaviour re-measured after the fixes (`python3.12`, importing the real modules):
-`#14290` → `retry_signature=False`; `WORKING`/`UNATTRIBUTED-WORKING`/`LONG-TOOL`/`WAITING-CHILD` + an
-open turn + a retry tail → `route=none`; a closed turn + retry tail → `wedged-unverified`/`inspect`; an
-open turn + retry tail → `model-retry`/`rerun` (the positive control, still reachable); a real
-`lane-status` child record → `verified=True`; `child_state` alone → `verified=False`, no fabricated child.
-
-## Round 7 — the confirmation review, and two P0s it found in the shipped fixes
-
-A seventh fresh-context reviewer (`71de0a7e2`) was asked to FALSIFY five claims with its own inputs
-rather than re-read the suite. Four claims held; it reproduced two P0s, both in code the earlier rounds
-had written, both re-verified here before anything was applied:
-
-| finding | verdict | evidence |
-|---|---|---|
-| **[P0]** `question-lane-ack` verified off a **stale pane**: the question lane is persistent at index 0, so its tail still showed the PREVIOUS question's brief, and every brief carries the same six mandate tokens by construction. The dedupe honours only a prior `verified: true`, so the non-delivery was then permanent. | **CONFIRMED, FIXED** | measured through `lane-route.py --apply` with a transport that returns rc 0 and never paints: tick 1 `verified: true` off the prior brief, ticks 2–3 `already-routed, verified: true`, and the new question never on the pane. Now `question_qid(lane, question)` emits `qid=<8 hex>` in the brief and `mandate_missing(pane, qid)` requires THAT token, so the retry loop actually waits for this paint. |
-| **[P0]** `_PAST_HARD`'s temporal anchors disarmed a **live** approval ask whose object merely dates → `not-asked` → `send-continue` into a lane waiting on its owner | **CONFIRMED, FIXED** | 7 of 7 measured: "Please approve yesterday's expense report.", "Please sign off on the invoice from last week.", "Please confirm the plan from Monday.", "I need your approval for the migration we discussed this morning.", "Awaiting your approval on the vendor quote from last month.", "Please confirm we ship at 14:02.", "Your call on the schema we reviewed last week." — all `not-asked`, all `may_continue=True`. The anchor now disarms only with a COMPLETION verb in the same clause and no future cue; a denial stays unconditional; a past-decision frame (`per your decision`, `as you decided`, `approved by`, `already approved`) is a report on its own. The cue list also gained the addressed `sign off` (it had only `for sign-off`). |
-| **[P2]** the `rerun`→`inspect` post-pass was keyed on `ASKED` only, so an **UNREAD** tail still reached the destructive action | **CONFIRMED, FIXED** | `Evidence(turn=open, last_text="", lane_verdict="WEDGED")` → `rerun`. Now `inspect`, and the reason names `ask=unread`. `lane-relaunch.py` refused it downstream, which is why it is P2 — but a router may not outsource its own stated safety property. |
-| **[P2]** `execute()` (the documented fixture entry point) raised `TypeError` for `rerun` with its default `relaunch=None` | **CONFIRMED, FIXED** | `arm_rerun` already had the right answer for a box with no tool (`None` → UNAVAILABLE, verified False); `execute()` now supplies it instead of crashing. |
-| **[P2]** `test-setup-no-nesting.sh` exits 1 at this head | **PRE-EXISTING, base-owned** | the reviewer reproduced it against `git archive origin/main` (`MAIN_EXIT=1`, same single `REMOVED: script:conflict-rebase.py`); this branch's two farm entries are on the right side of the pin and appear as neither `ADDED` nor `REMOVED`. |
-
-Claims that HELD under the reviewer's own inputs: `send-continue` unreachable for every ask shape it
-invented (approval ask with no `?`, question + several status paragraphs, `?` inside a URL/path token
-correctly NOT counted, and every turn state); the other three arms' proofs (`child-handoff-record`
-written-then-re-read, `transcript-growth` with no baseline, order-based `pane-ready`); no kill/terminate
-call site anywhere in the three files; the consumer non-inert (router absence logged every tick, and
-three consecutive ticks produced exactly ONE send, then `already-routed`); and the farm decision
-(`lane-relaunch.py` correctly withheld — it hard-requires `lane-status.py`, itself withheld by #1553).
-
-Both P0 fixes are pinned by RED controls that prove them load-bearing: **R11** restores the
-unconditional date anchor and requires the same input's answer to change to `not-asked`; **R12** removes
-the nonce and requires the stale pane to certify the new question (`verified: true`). With the fixes in
-place both mutants are caught.
-
-## Rounds 8–10 — three more fresh-context reviewers, all against the guard
-
-Rounds 8, 9 and 10 each falsified the PREVIOUS round's fix with inputs that round's corpus did not
-contain. Every finding was reproduced against the shipped code before anything was applied; the two
-items that could not be reproduced were dropped rather than re-worded.
-
-| round | the finding that mattered | outcome |
-|---|---|---|
-| 8 (`78ce2098f`) | **[P0]** the completion gate was defeated by the ask's own OBJECT — a relative clause supplies the completion verb (*"…the invoice I **sent** last week"*), 7 of 7 read `not-asked`; **[P0]** `question-lane-ack` passed on a paint **truncated** after the mandate (the qid at char ~89 and the mandate after ~200 merely co-existed, so a cut of 118 or 400 chars was certified by the PREVIOUS brief's tokens); **[P1]** the mirror — a closed `_COMPLETION` list made 9 of 10 plausible completion reports read `asked`, pausing finished lanes | a completion that starts AFTER the clause's addressed cue does not disarm; the qid became a **high-water mark** (`verified` judges only what follows it) and is matched with optional whitespace so a wrap inside it still verifies; `_COMPLETION` broadened |
-| 9 (`f19ce64f7`) | **[P0]** the position rule consulted its OWN 25-phrase cue list while the module has 59 hand-off phrases, so asks phrased outside it (*"Awaiting approval on the hotfix we released yesterday."*) had no offset at all — 14 of 14 read `not-asked`; **[P0]** the proof still passed on a paint cut at **1061 of 1409 chars** (after `recommendation`, before the question): the question was gone and the record said *"the full mandate visible on the pane"*; **[P1]** applying the position rule to denials and possessives made 11 of 11 finished reports read `asked` | `asks_owner()` passes the offset of the phrase that ADMITTED the clause, so the rule cannot drift from the vocabulary; the brief ends with `end=<8>` and the artifact requires that sentinel after the qid — it is the payload's last bytes, so truncation anywhere fails; denials unconditional again, position rule scoped to the anchor branch |
-| 10 (`158724eb9`) | **[P0]** the now-unconditional denial silenced an ask whose OBJECT is a negative (*"Please confirm nothing needs your attention on the staging config before I promote."* → `send-continue`); **[P1]** *"I can't proceed without sign-off."* had no cue at all; **[P1]** a completion and its hold joined by `and` in one clause (*"Checks passed at 14:02 and I'm blocked on your approval."*) disarmed the ask; **[P2]** a past-decision frame followed by a deferral (*"Per your decision last week I'll wait for your go-ahead."*, no comma) disarmed it | a denial is gated on an addressed hold before it; the negative-dependency forms joined `_HANDOFF`; a `_DEPENDENCY` predicate after the completion keeps the clause an ask; the frame branch gained a scoped future veto (`_FUTURE_CUE` cannot be reused — it carries `your call on`). The pane read window is now sized from the payload (`_pane_lines`), because requiring the first AND last bytes of the brief within a fixed 60 rows would make a long question's proof unreachable — and therefore re-send it every tick forever |
-
-The shape is consistent enough to be worth recording: **every finding from round 5 onward was in the
-guard, never in the router** — a detector read one paragraph of the tail, a signature that matched a
-ticket number, a pane read that never happened, a proof satisfied by the previous question, a
-completion list that named the wrong subject. Each fix is pinned by a RED control that MUTATES the
-shipped mechanism and requires the answer to change, and the corpora are rebuilt from inputs the fix
-was not written from — twice a fixture that already contained the answer was the only reason a
-non-gating gate looked green.
-
-Named residuals, stated rather than absorbed: a single clause that reports a completion and
-then a hold (*"Checks passed at 14:02 and I'm blocked on your approval."*) is now an ask via
-`_DEPENDENCY`, but a clause where the completion and the possessive are the SAME phrase
-(*"It was blocked on your approval yesterday, then it went through."*) still reads as an ask — the
-consequence is a paused finished lane and a bogus question, which is the cheap direction.
-
-| 11 (`123dc6cf7`) | **[P1]** the round-10 `_FRAME_FUTURE` was a second, hand-listed regex beside `_HOLD_CUE`: it fired on past-tense prose (*"Already approved by legal **before** your approval window closed, so I merged it."* read `asked`, suppressing a finished lane's nudge) and MISSED the deferral that matters most, `pending your word`, which routed `send-continue` into a lane waiting on its owner; **[P1]** `_DEPENDENCY` fired on position alone, so a REPORTED dependency (*"…had been blocked on your approval since Tuesday"*) re-armed the ask; **[P1]** the denial carve-out keyed on any hold, so *"Waiting on your approval held the release for a day and nothing needs your input now."* read `asked`; **[P2]** `_pane_lines` sized the read once, so a narrow pane or a >24k brief made the proof permanently unreachable (re-send every tick) | one deferral list decides both orders (a frame is a report unless the clause defers, and `pending your word` is now a cue); the denial carve-out is scoped to an IMPERATIVE (`please …`), which is what the two P0 asks actually were; a `_PAST_STATE` marker between the completion and the dependency means a clause reporting a finished block is not an ask; the pane window doubles on each retry (cap 2000 rows) instead of being sized once |
-
-| 12 (`d914e06c7`) | **[P1]** round 11's `_PAST_STATE` matched a BAG OF WORDS between the completion and the dependency, including `has been`/`since`/`yesterday` — which mark a block that is STILL RUNNING, so *"…the release **has been** blocked on your approval since Tuesday."* read `not-asked` → `send-continue`; **[P1]** the deferral vocabulary was still enumerated **per noun** despite the commit saying otherwise (*"pending your blessing"*, *"waits for your OK"*, and 4 of 4 invented SPANISH declarative asks all missed); **[P1]** `please` was broad where it suppressed asks and narrow where it would admit them (*"Please review the vendor invoice."* read `not-asked`); **[P2]** the `_pane_lines` doubling was pinned by NOTHING — reverting it left the suite at its exact baseline; **[P2]** `is/stays parked` in `_HOLD_CUE` made *"Per your decision last week the release is parked."* an ask | `_PAST_STATE` now tests the PREDICATE's own auxiliary (`had|was|were` immediately before it); the deferral **construction** replaced the noun list (`pending your \w+`, `awaiting your \w+`, `need your \w+`, plus the Spanish `necesito tu`, `quedo pendiente`, `a la espera de tu`); ONE `_IMPERATIVE` request-verb list both admits a clause and gates the denial carve-out; `parked` removed; **R20** pins the pane-window doubling with a fake that records the window and shows that the first window alone could not verify |
-
-| 13 (`66250f215`) | **[P1]** every deferral construction the previous round added was anchored on the possessive `your`, so a deferral that ENDS ON the owner had no member at all — *"The schema change is written and the suite is green.\n\n**Blocked on you.**"* read `not-asked` and `turn-end.py` typed "continue" into a lane waiting on its owner; the inconsistency was already inside the list (`waiting on you` present, `blocked on you` absent). Same position: *"I need a decision from you."*, *"Holding here until you weigh in."*, *"Pending approval."*, *"Blocked until approval."* | `_HANDOFF` gained the pronoun-object constructions and `_HANDOFF_SHAPE` the same forms, so the shape catcher stops missing the position the closed list missed |
-
-## What changed
-
-```
-tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
-tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 475 assertions, 21 RED controls
-scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
-scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
-                                    user-question route (batched, capped, bounded, logged)
-pi-bootstrap/setup.sh          MOD  farms triage.py + triage_arms.py into $DEST/scripts/fleet,
-                                    and lane-route.py (the only caller of the arms) into $DEST/scripts
-.github/workflows/ci.yml       MOD  two steps: the suite, and its RED controls alone
-docs/ops/fleet-liveness.md     MOD  §0z: a verdict is not a route; `wedged` means two things
-```
-
-## Measured on the real fleet (routing-only, no arms executed)
-
-`python3.12 scripts/lane-route.py` on this box routed 7 rows, every one `none` — the box's cmux
-terminals have all exited (`lifecycle: exited` in `cmux tree --json`), so no lane earned an arm. That is
-a truthful reading of an idle box, not a demonstration; the arm demonstrations are the suite's fixture
-legs.
-
-The first version of the CLI routed **nothing at all** and reported success, because it looked for
-`lane-status.py` only in `$HOME/.pi/agent/scripts` — where it **does not exist on this box**, and whose
-absence is a recorded decision (#1553 withholds it from the farm). Fixed to resolve repo-first and to
-say which path it used; a reader that only looked in `$SCRIPTS` reads "no lane-status" as an idle fleet.
+- No Tortoise graph write, no deletion, no MCP/SDK surface change.
+- No change to the 45-minute progress allowance (`DEFAULT_PROGRESS_AGE_MS = 2_700_000`), to the seam
+  (`LANE_BACKSTOP_S` 36000), to `CLAIM_TTL_MAX` (43200, still a CEILING with floor
+  `max(48000, 14400, 43200)`), or to any assertion (every new arm is additional; none replaced a weaker one).
+- No review attestation recorded and no merge attempted — the review gate belongs to the parent, and the
+  harness reviewer mints the record at the final head.
