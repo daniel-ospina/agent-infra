@@ -842,8 +842,19 @@ print(comp, len(inc))
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
-      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), (([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";"))]|@tsv' 2>/dev/null)" \
-    || { log "queue probe FAILED (gh api)"; return 2; }
+      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), (([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";"))]|@tsv' 2>"$GH_ERR")" \
+    || { log "queue probe FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
+  # ⛔ gh's stderr IS CAPTURED HERE, for the reason the in-progress read nine lines below states and
+  # this read was the STRAGGLER on (agent-infra#1704's class, which fixed the sibling and left this
+  # one): "a failure reported without what the API said is a failure nobody can act on". This read
+  # shipped `2>/dev/null` and logged exactly `queue probe FAILED (gh api)` — no reason — while being
+  # the gate's SINGLE MOST IMPORTANT read, the one every leg below depends on. MEASURED
+  # 2026-11-17T12:25:27Z: the fleet was handed that reasonless line on a pass that failed at the queue
+  # read while the shared REST pool sat at `core=0/5000`. `API rate limit exceeded` (wait for the
+  # reset, change nothing) and a TLS/network fault (repair the host) call for OPPOSITE actions, and
+  # the log could not tell an operator which one it was looking at. The failure is FAIL-CLOSED either
+  # way (`return 2`, changing nothing); only its REASON is now published, so the next pass that cannot
+  # measure says why. Bounded to 300 bytes like every other captured reason in this file.
   # FOUR fields from one read: the count the length leg uses, the oldest run's `created_at`, the
   # oldest run's id, and the whole page ORDERED OLDEST-FIRST (`id,created_at` pairs). The order is
   # what the head scan walks (agent-infra#2344), and the id/age are what it falls back to when a
