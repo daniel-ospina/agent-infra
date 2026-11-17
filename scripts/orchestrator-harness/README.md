@@ -420,7 +420,7 @@ a killed worker cannot take the controller down with it.
 
 | file | written by | lifetime |
 |---|---|---|
-| `state/prclass.tsv` | the sweep's classifier, one row per PR per cycle | folded at the top of the next cycle by `lo_class_compact` (it decides the ORDER only) |
+| `state/prclass.tsv` | the sweep's classifier, one row per PR per cycle | folded at the top of the next cycle by `lo_class_compact` (it decides the ORDER only). Five classes: `GREEN`, `PENDING`, `RED`, `NOCHECKS` (all from the CHECK surface) and — since **agent-infra#4120** — `CONFLICTED`, which comes from `mergeable` and is **not** a check state. It is the rank `lo_class_rank`/`lo_order` sorts FIRST, and until #4120 nothing could write it (measured: 469 `RED`, 86 `NOCHECKS`, 33 `PENDING`, 11 `GREEN`, **0 `CONFLICTED`** on a box carrying 7 open conflicting PRs), so the rebase never won a scarce fixer slot against a review. |
 | `state/pr-meta.tsv` | the 200 listing, PR → `created_at` | rewritten on every 200 (never appended) |
 | `state/last-open-prs` | `open_pr_count`, `number:headOid:headRefName` | rewritten per read; DELETED on a failed read (so "no rows" means "not known to be owned") |
 | `state/prdisp.tsv` | the sweep + the parent, `pr \t head \t token \t act\|wait \t reason` (**agent-infra#2126**) | **truncated by the parent before the sweep**, at most one row per PR per cycle. It is a RECORD of what the drain acted on or why it did not — never an input to the count or the gate (pinned by `test-gates.sh` and `pr-dispatch.test.sh`). `act` means an action the cycle ACTUALLY took — a worker spawned, a merge issued, an auto-merge armed, a draft readied, or a CI rerun — and `wait` means a row with a printed reason; both count ROWS (the line prints `row(s)`), and the swept set also carries owned PRs, so neither number is ever printed as a count of un-owned PRs. `first #N` and the funnel's "dispatching"/"NO UNIT SPAWNED" wording are both derived from it, so a printed claim has an action or a named wait behind it — and a cycle that recorded nothing says so instead. Two degraded states are named instead of guessed: an **unwritable** `state/` reads `record UNWRITABLE … UNKNOWN, not zero`, and a cycle with **no recorded rows** reads `NO ROWS … either the listing returned no rows, or the record could not be written … UNKNOWN, not zero` (a truncate succeeds with no allocation, so a full `state/` passes the writability probe and then fails every write — the row count cannot tell those two causes apart, so the line names both). The funnel is handed the same third fact, so it cannot print a measured zero for a cycle that measured nothing. On a population that is not enumerable (the count came from the listing while the ledger only holds the swept set) the line carries an explicit `NOT enumerable this cycle` caveat — the two numbers have different denominators and are never printed as if they shared one. |
@@ -4389,11 +4389,28 @@ them. Foreign drafts are excluded exactly as before — #4212 (`scope/w6b-graph-
 another box's draft and is correctly left alone. (Note the two exclusions are independent: a PR on
 `design/`, `scope/` or `dependabot/` is never swept even when it is not a draft — see §5.)
 
-### 7.2c Conflicted PRs — **FIXED in this PR**
+### 7.2c Conflicted PRs — **FIXED, and then RE-FIXED because the fix could not fire on the population it was for** (agent-infra#4120)
 
 A CONFLICTING PR can never merge, but the sweep classified it GREEN/PENDING and called `gh pr merge`
 on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193, #8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict, and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
 fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
+
+**The router was then unreachable for the real population, and that is the #4120 defect.** It was
+wrapped in `case "$V" in GREEN|PENDING:*)`, but `mergeable` is ORTHOGONAL to the check surface and a
+conflicting PR is usually **not** green — a required check cannot be satisfied while GitHub refuses to
+run workflows on a conflicted PR. Measured 2026-11-17 by driving `check-class.py` over each open
+CONFLICTING PR's live surface on `daniel-ospina/tortoise` (REQ = its seven required
+contexts): **7 of 7 conflicting PRs classified `FAILED:ai-review-gate`**, so not one could reach the
+rebase and each was dispatched into the review gate's **re-record** chain — a paid review, per PR per
+`main` advance, of a PR that could not merge. Three things changed: the `mergeable` field rides along
+in the row's **existing** `gh pr view` (so no extra GitHub call — it replaces a separate read that
+only green PRs paid for), the router routes on the mergeable state alone (rebase BEFORE review for the
+same PR, as the issue's acceptance #4 requires), and the observation is written to `state/prclass.tsv`
+as `CONFLICTED` so `lo_order`'s rank-0 is reachable. The bound is unchanged and now graded
+(`pr-dispatch.test.sh` T5b): still conflicting after `MAX_FIX_TRIES` → `park_ctrl` at that head, a
+`wait` row, and no further spawn. **A conflicting PR on a box whose spawn gate is refusing still gets
+no rebase** — that is the capacity policy (`docs/ops/load-policy.md`), recorded as a residual rather
+than bypassed.
 
 ### 7.2b Cross-box duplicate work — **FIXED in this PR**
 
