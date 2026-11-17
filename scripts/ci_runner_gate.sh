@@ -69,9 +69,13 @@
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act. On exit 2 NO mode DECISION is taken
 # (the pool is neither engaged nor released on a value that was not read), and since #4085's second leg
 # a pass that could not measure the QUEUE'S DEMAND CONVERGES the pool to the mode the state file records
-# WHERE THE POOL DIFFERS FROM IT — a repair of an earlier pass's decision, never a new one. It is one arm
-# among five: with nothing recorded, with the pool already in that mode, and when the repair does not
-# land, the pass changes nothing and says so in the log and in the verdict (see the rc 3 block in `main`).
+# WHERE THE POOL DIFFERS FROM IT — a repair of an earlier pass's decision, never a new one. That is ONE
+# narrow arm of several: with nothing recorded, with the pool already in that mode, with an empty managed
+# set, when the write does not land, and on a re-read that does not answer, the pass changes nothing (or
+# says exactly what it did change) and names it in BOTH the log and the verdict. No count is stated here
+# on purpose — the arm list is the rc 3 block in `main`, and a number in this header has already drifted
+# once (#4085 review P3).
+
 #
 # OUTPUT A SCHEDULER CAN BRANCH ON: `$STATE_DIR/ci-runner-gate.verdict`, one `key=value` line per
 # run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `reason=` (last). The mode
@@ -404,7 +408,7 @@ need gh; need curl; need python3
 # ── runner capacity census ──────────────────────────────────────────────────────
 # ONE paginated read of the runner inventory, reduced to the three fields that carry the answer.
 # `<status> TAB <busy> TAB <labels,comma>`. ⛔ THE COMMA IS NOT ASSERTED SAFE (#3002 review P2): labels
-# are no longer character-policed (:197-206 — policing them froze the fleet on somebody else's label
+# are no longer character-policed (policing them froze the fleet on somebody else's label
 # name), so one CAN contain the delimiter, and the split is then untrustworthy. That is not ignored: it
 # is DETECTED (`CENSUS_LABEL_AMBIGUOUS`) and it narrows every demand claim below. Do not restore a
 # "can never contain one" claim here — it would re-justify deleting the only guard against a false
@@ -430,7 +434,7 @@ runner_census() {
   # has no runners" and "the response body contained nothing at all" used to be BYTE-IDENTICAL output
   # (empty stdout, rc 0) — and this script resolved that ambiguity toward "measured zero". A blank 200
   # then read as `runners=0`, which in mode=local with a measured demand is a `stranded` DENY, i.e. a
-  # relabel taken on a read with no value in it — while `current_mode` (:800) refuses the identical
+  # relabel taken on a read with no value in it — while `current_mode` refuses the identical
   # body. A page row is emitted by JQ ITSELF the moment it parses a body whose `.runners` is an array,
   # so its presence distinguishes "answered, with N runners" (N may be 0) from "produced nothing"
   # without a second read. `.runners|type` is carried rather than assumed: a body that answers with
@@ -565,7 +569,7 @@ census_classify() {
     [ -n "$row" ] || continue
     # ⛔ A PAGE ROW IS THE PROOF THE BODY ANSWERED (#3002 review P1) — see runner_census. It is
     # consumed here and never counted as a registration; without at least one of them the stream is a
-    # read that produced nothing, and "nothing" is NOT "no runners" (:391 below).
+    # read that produced nothing, and "nothing" is NOT "no runners" (the row shape check below).
     case "$row" in
       '#'*)
         case "$row" in '#page'$'\t'*$'\t'*) ;; *) return 1 ;; esac
@@ -617,7 +621,7 @@ $labels" ;;
     else
       # ⛔ `offline` IS THE FACT; "never online" IS NOT (#3002 review P2). The runner object carries
       # `id os status busy labels` and NOTHING that says a registration has EVER connected — `status`
-      # is validated to be `online|offline` (:302). Measured 2026-10-28 on this repo: 5 of 8 offline,
+      # is validated to be `online|offline`. Measured 2026-10-28 on this repo: 5 of 8 offline,
       # and they are long-standing pool members (cell3-x64-4, cell4-1), i.e. runners that were online
       # earlier and dropped. Reporting those as "never came online" states a fact the read cannot
       # establish, and it was used as the operational diagnosis in the PR body.
@@ -785,7 +789,7 @@ capacity_verdict() {
   # pool's own state.
   # ⛔ IDLE IS TESTED BEFORE BUSY (#3002 review P1, and again in round 3). `saturated` means EVERY
   # ONLINE runner is busy, so a pool with idle runners must never be labelled with it — and `saturated`
-  # is a CERTIFYING word (:1049 routes it to "GitHub Actions healthy"), so the mislabel is not
+  # is a CERTIFYING word (the success writer routes it to "GitHub Actions healthy"), so the mislabel is not
   # cosmetic: it restores the very "9 busy while 7 idle" reading this instrument exists to remove.
   # ⛔ THE TWO ARMS USED TO READ THE STATES SEPARATELY, and that divergence produced the same defect
   # twice: the demand arm returned `saturated` whenever no DEMAND-matching runner was idle, even with
@@ -871,7 +875,7 @@ print(comp, len(inc))
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
-  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (`:97` now ships 10 on the
+  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (the `QUEUE_THRESHOLD` declaration now ships 10 on the
   # 2026-11-02 owner ruling), FALSE whenever an operator raises QUEUE_THRESHOLD above the page size,
   # and the operator-invisible result was a gate that read a 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
@@ -1477,7 +1481,7 @@ set_labels() { # $1 = on|off
     # ⛔ THE REFUSAL IS DEFERRED TO BELOW THE COMPLEMENT SWEEP (agent-infra#3261 review P1). It used
     # to `return 1` HERE, before the loop at "The complement is disarmed FIRST", while the message
     # claimed "the complement was disarmed above" — a log line asserting an action that had not run.
-    # The `FALLBACK_ARM_MAX=0` contract (:188-190) is exactly "the pool is RELEASED and the engaging
+    # The `FALLBACK_ARM_MAX=0` contract (stated in this script's own configuration block) is exactly "the pool is RELEASED and the engaging
     # pass refuses", so the release is the part that must happen first; measured before this fix,
     # cap=0 produced `rc=1` with **0** PUTs, stranding `ubuntu-latest` on every pool member where it
     # keeps accepting CI and is never swept, because every later pass refuses for the same reason.
@@ -2019,7 +2023,7 @@ if [ "$healthy" = 3 ]; then
   # convergence verb requires ok>0, and the empty-set arm below claims no convergence at all.
   if [ "$repair_ok" = 1 ] && [ "${SET_LABELS_OK:-0}" -gt 0 ]; then
     # ⛔ THE CONVERGENCE IS RE-MEASURED, NOT INFERRED FROM THE WRITE (review P1, measured). `set_labels`
-    # writes ONLY the runners carrying this gate's pool marker (`managed_ids`, :1324), while `mode`
+    # writes ONLY the runners carrying this gate's pool marker (`managed_ids`), while `mode`
     # counts EVERY runner carrying the fallback label (`current_mode`'s count read) — and this file's own
     # vocabulary defines "the pool advertises mode=X" as that COUNT (see the `carriers` line above
     # `write_verdict`: mode=local means AT LEAST ONE runner carries the fallback label). So a write that
@@ -2057,7 +2061,7 @@ if [ "$healthy" = 3 ]; then
       # the re-read had just proved — one durable line contradicting itself (measured: recorded=local, an
       # EMPTY managed set, re-read github). So the cause names what THIS direction's disagreement means.
       if [ "$recorded" = local ]; then
-        post_cause="no runner carries the fallback label AT ALL, so the write did NOT stick — the PUTs were accepted when they ran, and the runner agent re-asserts its own label set 60-120 s later"
+        post_cause="no runner carries the fallback label AT ALL, so the write did NOT stick — the PUTs were accepted when they ran, and either the runner agent re-asserts its own label set 60-120 s later, or no runner the API reports still carries it (deregistered between the writes and this re-read, or a read that lags)"
       else
         post_cause="at least one runner still carries the fallback label: a carrier OUTSIDE this gate's managed set (set_labels writes only the managed set, #2327), or a PUT the runner agent has since re-asserted"
       fi
@@ -2068,11 +2072,22 @@ if [ "$healthy" = 3 ]; then
   elif [ "$repair_ok" = 1 ]; then
     # ⛔ A REPAIR THAT WROTE NOTHING IS NOT A CONVERGENCE (review P1, measured). `ok=0` with `fail=0` means the
     # managed set is EMPTY: no runner carries this gate's pool marker, so `set_labels` had nothing to PUT and
-    # its exit status still says success. Nothing was relabelled and `mode` — measured THIS pass and unchanged
-    # by it — is what the pool still advertises. No re-read: nothing was written to observe.
-    log "repair WROTE NOTHING: set_labels reported no failure but wrote NO runner (ok=0) — the managed set is EMPTY (no runner carries this gate's pool marker), so nothing was relabelled; mode=$mode is this pass's own measurement and the recorded mode=$recorded is NOT confirmed"
-    write_blind_verdict "the repair wrote NOTHING — no runner carries this gate's pool marker, so there was nothing to relabel; the pool's mode is still $mode and the recorded mode ($recorded) is NOT confirmed"
-    log "cannot measure DEMAND — no mode decision taken, and NO repair was performed: the managed set is EMPTY (nothing carries this gate's pool marker), the pool's mode is mode=$mode, the recorded DECISION is unchanged (the state file still says $recorded)"
+    # its exit status still says success. Nothing was relabelled, so — unlike the arms above — there is no
+    # write to observe and `mode` is still this pass's reading. No re-read.
+    # ⛔ AND THAT READING IS ONLY A LABEL READING WHEN `mode_source=runners` (review P1, measured). `mode`
+    # can be `mode_from_jobs`' answer ("which pool is SERVING, not what the labels SAY"), which the repair
+    # reason three lines above already refused to call a label state — publishing it here as "the pool's
+    # mode" reintroduced exactly that substitution on the newest path. Measured: the (d11) fixture's own
+    # verdict read `mode=local mode_source=jobs-inference … the pool's mode is still local` while the pool
+    # carried NO fallback label at all. So the claim follows the source, as the skip arm above does.
+    if [ "$MODE_SOURCE" = runners ]; then
+      no_write_mode="the pool's LABEL state is still mode=$mode (read on this pass, and no write changed it)"
+    else
+      no_write_mode="the pool's LABEL state is UNMEASURED — this pass never read it (mode_source=$MODE_SOURCE), and mode=$mode is only the SERVING inference, not what the labels say"
+    fi
+    log "repair WROTE NOTHING: set_labels reported no failure but wrote NO runner (ok=0) — the managed set is EMPTY (no runner carries this gate's pool marker), so nothing was relabelled; ${no_write_mode}; the recorded mode=$recorded is NOT confirmed"
+    write_blind_verdict "the repair wrote NOTHING — no runner carries this gate's pool marker, so there was nothing to relabel; ${no_write_mode} — the recorded mode ($recorded) is NOT confirmed"
+    log "cannot measure DEMAND — no mode decision taken, and NO repair was performed: the managed set is EMPTY (nothing carries this gate's pool marker); ${no_write_mode}; the recorded DECISION is unchanged (the state file still says $recorded)"
   else
     # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
     # indistinguishable from success in the state file (which is not written here either way).
