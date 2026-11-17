@@ -674,8 +674,8 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "${_FIX_MOD_DIR:-$O}/claims.sh"
   # The fallback used when a malformed FIX_TIMEOUT is refused: the SAME value the run would take.
-  _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-7200}"
-  is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=7200
+  _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-36000}"
+  is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=36000
   FIX_BOUND="${FIX_TIMEOUT:-$_FIX_BOUND_FALLBACK}"
   if ! is_limit "$FIX_BOUND"; then
     echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' (resolved to '$FIX_BOUND') is not an integer in range (at most 9 digits) — using ${_FIX_BOUND_FALLBACK} (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
@@ -683,7 +683,7 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   fi
   # ⛔ ONE RESOLVED BOUND DRIVES BOTH THE LEASE AND THE RUN (agent-infra#2888 review, P1 — verified).
   # They were two independent literals: the run moved to the `${FIX_TIMEOUT:-$LANE_BACKSTOP_S}` backstop
-  # (7200 s) while this lease stayed `FIX_TIMEOUT:-2400 + 1200` = 3600 s. With `FIX_TIMEOUT` unset — the
+  # (36000 s since agent-infra#4034; 7200 s when this was written) while this lease stayed `FIX_TIMEOUT:-2400 + 1200` = 3600 s. With `FIX_TIMEOUT` unset — the
   # shipped default; nothing outside the test suite sets it — the claim then expired an HOUR before the
   # fixer's own bound, a peer read the head as free and ran a SECOND fixer on the same branch: exactly
   # the duplicate dispatch `claims.sh`'s lease/ceiling block says the lease exists to prevent. Resolving
@@ -767,11 +767,126 @@ if [ -n "$checks_unknown" ]; then
   echo "=== NOTE: $checks_unknown — this file does NOT establish that CI is green. Treat the required checks as UNKNOWN and read them yourself before concluding the build is clean ===" >> "$L-failing.txt"
   echo "[fix $PR] required-check read UNKNOWN ($checks_unknown) — proceeding (fail-open on purpose, and recorded in $L-failing.txt so the fixer sees it)" >> "$L.log"
 fi
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# ── FIX-ONE-REQ-SPLIT:BEGIN ────────────────────────────────────────────────────────────────────────
+# WHICH REDS A FIX COULD ACTUALLY UNBLOCK (agent-infra#3461).
+#
+# THE DEFECT. `FAILING_CHECKS` above answers ONE question — "which checks are red" — and its polarity
+# (the #1714 allow-list) is right. It says NOTHING about "does this red block the rail", yet every
+# survivor was written under the heading `=== failing required check: <c> ===` and the brief below
+# ASSERTED "REQUIRED CI CHECKS ARE ALSO FAILING". The word "required" was ASSERTED, never COMPUTED:
+# nothing in this file read branch protection at all. MEASURED (tortoise PR #10726, head
+# 6bbd1f2742ea, 2026-11-05): the only red group was `github-actions/redis-guard`, which is absent
+# from main's required set — and the job had died in `Set up job` (0 steps, an action-archive
+# download timeout), so it carried NO verdict on the tree either. A capped fix lane was dispatched on
+# a premise that is false for every PR, and fixing that check could not have satisfied the rail; the
+# repo had already corrected the same false claim in its own workflow header. Two labels answer the
+# two questions, and the brief must carry both.
+#
+# ONE CONTRACT HOME, ONE READ PER DISPATCH. The required set is resolved by the same module
+# `merge-one.sh` and `orch-loop.sh` source (`repo-authority.sh::resolve_required_checks`), so a third
+# opinion cannot appear here. It is read ONCE, before the render below — never once per failing check,
+# and never per poll: 22 workers share one rate-limited account.
+#
+# ⛔ FAIL CLOSED, AND THE DIRECTION IS THE OPPOSITE OF lane-merge.sh's. There, an unreadable contract
+# makes every check REQUIRED (the loop must not merge). Here the harm to prevent is DROPPING a red, so
+# an unreadable contract must not become "nothing is required" — that would silently demote a blocking
+# red to an advisory one. It is also NOT widened to "all required" (that is the bug being fixed, and
+# it invents a claim the repo does not make). It is recorded as `checks_required_unknown`, every
+# heading is labelled `required-status UNKNOWN`, and the fixer is told to read protection itself.
+FIX_REQ_RA=""; FIX_REQ_SRC=""; FIX_REQ=""; checks_required_unknown=""
+if [ -n "$FAILING_CHECKS" ]; then
+  for _rc in "$SELF" "${_FIX_MOD_DIR:-$O}" "$O"; do
+    [ -n "$_rc" ] || continue
+    if [ -f "$_rc/repo-authority.sh" ]; then FIX_REQ_RA="$_rc/repo-authority.sh"; break; fi
+  done
+  if [ -z "$FIX_REQ_RA" ]; then
+    checks_required_unknown="no repo-authority.sh beside this script, in \${O_WORK:-} or in \$O"
+  # shellcheck source=/dev/null
+  elif ! . "$FIX_REQ_RA" 2>/dev/null; then
+    checks_required_unknown="$FIX_REQ_RA did not source"
+  elif ! command -v resolve_required_checks >/dev/null 2>&1; then
+    checks_required_unknown="$FIX_REQ_RA is stale (no resolve_required_checks)"
+  else
+    # `REQ` in the environment is the operator override the other consumers honour; capture it ONCE
+    # because the resolver overwrites `REQ` with the resolved value IN THIS SHELL — that in-place
+    # contract is the only reason `REQ_SOURCE` is readable at all (a command substitution would
+    # subshell it away, which is the trap repo-authority.sh documents at its own resolver).
+    REQ_OVERRIDE="${REQ:-}"; REQ=""
+    resolve_required_checks "$OR" >/dev/null 2>&1 || true
+    FIX_REQ="${REQ:-}"; FIX_REQ_SRC="${REQ_SOURCE:-}"
+    case "$FIX_REQ_SRC" in
+      protection|env)
+        [ -n "$FIX_REQ" ] || checks_required_unknown="the $OR required-check read returned NO NAMES (source=$FIX_REQ_SRC)" ;;
+      *)
+        checks_required_unknown="the $OR required-check read FAILED (source=${FIX_REQ_SRC:-none})" ;;
+    esac
+    # ⛔ THE RESOLVED SET MUST NOT REACH THE CHILD AS AN OPERATOR OVERRIDE. `REQ` is documented as an
+    # INPUT override, the fleet launcher EXPORTS it, and in bash an ASSIGNMENT DOES NOT CLEAR THE
+    # EXPORT ATTRIBUTE — so a resolved FALLBACK left in `REQ` would be re-read by merge-one.sh (run
+    # from this file as a CHILD process holding this environment) as the operator's own input, its
+    # `REQ_SOURCE` would read `env`, and its UNKNOWN-contract refusal could never fire. Hand the child
+    # what the OPERATOR supplied, never what we resolved — the discipline lane-merge.sh applies before
+    # it spawns its chain, and for the same measured reason.
+    case "$FIX_REQ_SRC" in
+      env) REQ="${REQ_OVERRIDE:-}" ;;
+      *)   REQ="" ;;
+    esac
+    REQ_OVERRIDE=""
+  fi
+fi
+
+# Is THIS surface check one of the repo's required contexts?
+# ⛔ THE RULE IS lane-merge.sh's `_bare_is`, DELIBERATELY, because the brief and the loop that
+# dispatched it must not disagree about one head: GitHub renders a reusable workflow's job as
+# `<caller> / <job>`, while the required CONTEXT is the bare name branch protection declares — so a
+# suffixed name must still match its required parent. The direction makes MORE names required, never
+# fewer, so a red can be promoted to "required" but never demoted to "advisory" by this matcher.
+fix_req_is() {
+  local n="${1:-}" r
+  if [ -n "${checks_required_unknown:-}" ]; then return 0; fi
+  [ -n "${FIX_REQ:-}" ] || return 1
+  for r in $FIX_REQ; do
+    [ "$n" = "$r" ] && return 0
+    case "$n" in *" / $r") return 0 ;; esac
+  done
+  return 1
+}
+
+# ONE section per check: its heading, then its failing log. The heading is the ONLY thing the fixer
+# reads to tell "this red blocks the merge" from "this red is informational", so it is decided ONCE.
+_fix_check_section() { # <check-name>
+  local c="${1:-}" rid=""
+  if [ -n "${checks_required_unknown:-}" ]; then
+    printf '=== failing check (required-status UNKNOWN): %s ===\n' "$c" >> "$L-failing.txt"
+  elif fix_req_is "$c"; then
+    printf '=== failing required check: %s ===\n' "$c" >> "$L-failing.txt"
+  else
+    printf '=== failing NON-required check (not one of %s required contexts — fixing it cannot unblock the merge): %s ===\n' "$OR" "$c" >> "$L-failing.txt"
+  fi
+  rid="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
+  if [ -n "${rid:-}" ]; then gh run view "$rid" --repo "$OR" --log-failed 2>/dev/null | tail -80 >> "$L-failing.txt"; fi
+}
+
+FIX_REQ_FAIL=""; FIX_ADV_FAIL=""
 for c in $FAILING_CHECKS; do
-  echo "=== failing required check: $c ===" >> "$L-failing.txt"
-  RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
-  if [ -n "${RID:-}" ]; then gh run view "$RID" --repo "$OR" --log-failed 2>/dev/null | tail -80 >> "$L-failing.txt"; fi
+  if fix_req_is "$c"; then
+    FIX_REQ_FAIL="${FIX_REQ_FAIL:+$FIX_REQ_FAIL }$c"
+  else
+    FIX_ADV_FAIL="${FIX_ADV_FAIL:+$FIX_ADV_FAIL }$c"
+  fi
 done
+if [ -n "$checks_required_unknown" ]; then
+  echo "=== NOTE: the required-check contract for $OR could not be read ($checks_required_unknown) — EVERY heading below is 'required-status UNKNOWN' and is NOT a claim that the check blocks the merge. Treat every failing check as possibly blocking, and read this repo's branch protection yourself before concluding that any of its reds are informational ===" >> "$L-failing.txt"
+  echo "[fix $PR] required-check contract UNKNOWN ($checks_required_unknown) — every failing check is labelled 'required-status UNKNOWN' in $L-failing.txt (neither widened to 'all required' nor demoted to 'advisory')" >> "$L.log"
+fi
+if [ -n "$FIX_ADV_FAIL" ]; then
+  echo "[fix $PR] ALSO RED and NOT required by $OR (reported here so it is never silently dropped — it is not the reason for this dispatch, and fixing it cannot unblock the merge): $FIX_ADV_FAIL" >> "$L.log"
+fi
+# REQUIRED FIRST: the fixer's budget should meet the blocking reds first, and that ordering is a fact
+# about the repo's contract rather than a preference.
+for c in $FIX_REQ_FAIL $FIX_ADV_FAIL; do _fix_check_section "$c"; done
+# ── FIX-ONE-REQ-SPLIT:END ─────────────────────────────────────────────────────────────────────────
 
 # capture the reviewer's findings (the latest code-review comment on the PR)
 gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
@@ -791,7 +906,7 @@ If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from TH
 
 If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
 
-If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If $L-failing.txt is non-empty it carries THIS PR's failing checks and their logs, and EVERY heading in it says which kind of red each one is: \`=== failing required check:\` — it is in $OR's own required set, so it BLOCKS the merge and fixing it is your job; \`=== failing NON-required check (…):\` — it is RED but it is NOT a required context of $OR, so it does NOT block the merge and fixing it will NOT unblock this PR: fix it only if the cause is real and cheap inside this same change, otherwise say plainly in your final message that you left it alone and why — never spend the attempt on it and never report it as the reason the PR cannot merge; \`=== failing check (required-status UNKNOWN):\` — the required set could NOT be read, so no heading in the file claims anything about blocking, the build state is UNKNOWN rather than green, and you must read the PR's checks AND this repo's branch protection yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
@@ -895,6 +1010,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
     # other box runs the same pair, so both remedies send them to an event that cannot arrive.
     why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991), OR the spawn gate could not resolve `capacity.sh` at all (its `nodeploy` arm, #2293 follow-up). Both are harness defects, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
+  elif [ "$ar" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+    # ⛔ A STALE CHECKOUT IS ITS OWN REMEDY, AND IT IS NOT ON A PEER (agent-infra#3932, this change's
+    # review, P1-2). Before this arm the refusal landed on the CAPABILITY text below — "repair the box
+    # (installed pi/extension set, provider credential) or dispatch the PR elsewhere" — and all three are
+    # wrong: the model call SUCCEEDED (that is how the reading was taken), and the measured wave had every
+    # cell hundreds of commits behind, so the peer refuses identically. The fix is on THIS box's checkout.
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THIS PATH MEASURED, WHICH IS NOT A BASE (this change's review,
+    # P2-4, source-certain). `run_agent` is given `WIP_PATH="$WT"` above, so the probe measures the
+    # FIXER'S WORKTREE — a worktree on the PR BRANCH. The base-path sentence ("git fetch, then cut the
+    # worktree from origin/main") is DESTRUCTIVE here: it discards the PR's own commits, and a PR branch
+    # >MAX_BEHIND behind is exactly the state a fixer gets dispatched to repair. So the remedy is MERGE
+    # INTO the branch, and it says explicitly that re-cutting is not the action.
+    why="STALE-CODE gate: this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932) — work done from it produces a plausible log and a WRONG diff. On THIS path the measured artifact is the FIXER's worktree, which is the PR BRANCH: bring the branch up to date (git -C $WT merge origin/main, resolve, push) and re-run; do NOT re-cut that worktree from origin/main, which would discard the PR's own commits. Do NOT dispatch the PR elsewhere — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. Waiting cannot clear it. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting

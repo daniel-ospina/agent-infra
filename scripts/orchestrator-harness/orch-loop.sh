@@ -6658,7 +6658,11 @@ while true; do
          # — a peer's declared window", asserting the one fact this reader has just said it cannot
          # know. Name the class, print the reason, and never invent a deadline.
          if [ "$CLAIM_SEL_VERDICT" = "claim-lease-unreadable" ]; then
-           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}s)" >>"$LOG"
+           # ⛔ THE FALLBACK LITERAL IS THE SEAM'S OWN VALUE (agent-infra#4034). `claims.sh` always sets
+           # `CLAIM_UNREADABLE_LEASE_MAX_AGE`, so this `:-` arm only fires when the library was not sourced —
+           # and a stale 18000 here would then NAME a bound the reaper does not use. It was the one literal in
+           # the loop the 5x sweep missed.
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-48000}s)" >>"$LOG"
            disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} lease unreadable — abstaining (bounded reap, not a window)"
          else
            echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
@@ -9415,6 +9419,15 @@ PY
         Y=$((Y+1))
         if [ "${CAPACITY_YIELD_GATE:-}" = "land" ]; then
           echo "[dispatch] #$ISS stood down — this box refused it at the LAND-BACKLOG gate (the repo's open-PR backlog is over its own landing ceiling; repo-wide, so NO peer can clear it by waiting — the remedy is to land an open PR) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        elif [ "${CAPACITY_YIELD_GATE:-}" = "stale" ]; then
+          # ⛔ A STALE CHECKOUT IS NOT A PEER'S TO TAKE (agent-infra#3932, this change's review, P1-2).
+          # The generic line below says "refused it for capacity", and for a stale checkout that is the
+          # opposite of the truth: the box ANSWERED the probe, nothing was consumed, and the measured
+          # wave had EVERY cell 496-7093 commits behind — so handing the item to a peer moves it to a
+          # box that refuses identically. The stand-down is still worth having (this box must not
+          # re-claim while its checkout is advanced), so the record stays and only the words change,
+          # exactly as they do for `land`.
+          echo "[dispatch] #$ISS stood down — this box refused it at the STALE-CODE gate (its checkout is behind origin/main; the box is otherwise fine, so NO peer clears it by taking the item — a peer is likely stale too; the remedy is to advance THAT checkout) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         else
           echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         fi

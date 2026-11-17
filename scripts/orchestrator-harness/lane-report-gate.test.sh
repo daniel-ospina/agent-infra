@@ -1179,5 +1179,45 @@ esac
 git -C "$WT" reset --hard -q HEAD~1 2>/dev/null || true
 rm -f "$WT/f2" "$WT/.worktree-report/state.json"
 
+# ── 12. THIS REPO MUST NOT TRACK A LANE REPORT (the #4048 shape) ───────────────────────────────
+# A lane report is PER-LANE state: it names ONE worktree and ONE branch. The ruling that makes it
+# mandatory (#10220, owner ruling 2026-10-28) also says its files "are gitignored and never
+# committed" (`docs/ops/disk-reaper.md`; `IGNORED_LANE_EVIDENCE` in `scripts/pi-reap-worktrees.sh`).
+# ⛔ WHY A TRACKED ONE IS A REPO-WIDE OUTAGE AND NOT UNTIDINESS: the repo ships no
+# `tools/worktree_report.py`, so the gate's verdict for it is the audited NO-CONSUMER abstention (rc 5)
+# — UNLESS a report is PRESENT, which it upgrades to `UNMEASURABLE reason=report-present-but-
+# repo-ships-no-consumer` (rc 7). `lane-merge.sh` classifies THAT reason as a BOX fault: NO fix round
+# is spent and nothing a lane can push clears it, so every PR in the repo refuses forever. Measured:
+# #4048 committed a `WORKTREE-REPORT.md` for #4046 (branch `fix/4046-lane-triage`, a worktree that no
+# longer exists) to main on 2026-11-12; from then on EVERY worktree of this repo carried it, and
+# PR #4110 refused at rc=7 with no remedy. Asserting on the REAL tree here, because a fixture repo
+# cannot reproduce the condition: it is a property of THIS repo's `.gitignore` + index.
+ROOT="$(cd "$HERE/../.." && pwd)"
+if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  skip "repo-root lane-report hygiene — $ROOT is not a git work tree (a copied/detached tree cannot answer it)"
+else
+  _tracked="$(git -C "$ROOT" ls-files -z 2>/dev/null \
+    | tr '\0' '\n' \
+    | grep -E '(^|/)(WORKTREE-REPORT\.md|\.worktree-report/)' || true)"
+  if [ -z "$_tracked" ]; then
+    ok "no lane report is TRACKED in this repo (a tracked one turns every merge into an unfixable rc=7)"
+  else
+    bad "this repo TRACKS a lane report: $(printf '%s ' $_tracked)— it refuses every PR's merge with reason=report-present-but-repo-ships-no-consumer, an arm no lane can push out of"
+  fi
+  # ⛔ THE IGNORE IS THE HALF THAT STOPS THE RECURRENCE: the reaper writes this report into every lane's
+  # worktree, so an unignored name sits one `git add` from being committed again — which is exactly how
+  # #4048 did it. Both names are asserted because the fleet writes both (the file, and `state.json`
+  # inside the report dir), and the DIR form must be probed by a path INSIDE it: `.worktree-report/`
+  # is a directory-only pattern, so `check-ignore .worktree-report` on a path that is not (yet) a
+  # directory answers "not ignored" and would red this row on a correct `.gitignore`.
+  for _n in WORKTREE-REPORT.md .worktree-report/state.json; do
+    if git -C "$ROOT" check-ignore -q -- "$_n" 2>/dev/null; then
+      ok ".gitignore ignores '$_n' (a lane report can no longer be committed by accident)"
+    else
+      bad ".gitignore does NOT ignore '$_n' — the mandatory per-lane report is one 'git add' from reddening every merge in this repo (#10220 says gitignored, never committed)"
+    fi
+  done
+fi
+
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1

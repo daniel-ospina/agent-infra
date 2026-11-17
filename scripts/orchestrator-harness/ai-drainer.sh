@@ -97,9 +97,15 @@
 #     N DISJOINT windows. Rotation is capped at the number of distinct slices
 #     (`SLICE_TOTAL/SLICE_WIDTH`), because a 13th lane on 7 windows would land on lane 6's: fewer
 #     lanes is the correct answer, not overlapping ones. ⛔ AND ACROSS TICKS: a lane keeps its window
-#     for up to LANE_TIMEOUT (the 2 h backstop, ~6 ticks at the shipped cadence), so the windows LIVE
-#     lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
-#     nothing and says so.
+#     for up to LANE_TIMEOUT (the 10 h backstop, ~30 ticks at the shipped 20 m cadence), so the windows
+#     LIVE lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
+#     nothing and says so. ⛔ THE RING IS ONLY `SLICE_TOTAL/SLICE_WIDTH` = 7 WINDOWS WIDE, SO THE HOLD
+#     WINDOW IS THE RING'S WHOLE CAPACITY: raising the lane term 2 h → 10 h lets 7 long-running lanes
+#     hold every window for up to 10 h, and on a box whose measured `target` exceeds 7 every tick in that
+#     span logs `SKIP: nothing to add — … free_windows=0/7 …` and adds nothing. That is the correct action (fewer
+#     lanes, never overlapping ones) arriving as a long SILENT-IN-EFFECT stall: it surfaces only as a
+#     repeating SKIP line, so watch for it on a box that stops topping up with lanes still alive. The
+#     single knobs are `SLICE_TOTAL`/`SLICE_WIDTH` (more windows) or the lane term itself.
 #   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
 #     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
 #
@@ -131,7 +137,7 @@
 #                     An unusable value warns and falls back to 2, never silently.
 #   LPC_CEILING       load-per-cpu at which no lane is added          default: 8
 #   LANE_TIMEOUT      the lane's BACKSTOP (seconds) — the absolute ceiling, not the primary bound
-#                                                            default: $LANE_BACKSTOP_S (7200)
+#                                                            default: $LANE_BACKSTOP_S (36000)
 #   RC_GRACE_S        grace after a lane's pid dies for its status file (s)  default: 30
 #   PR_BUDGET         PRs one lane may process                        default: 6
 #   SLICE_WIDTH       PRs per slice                                   default: 10
@@ -194,8 +200,9 @@ LPC_CEILING="${LPC_CEILING:-8}"
 #   * it is the window a LIVE lane holds its rotation window for (§ rotation), so a lane allowed to run
 #     past it gets its slice re-dispatched to a second lane — duplicate work on the same PRs.
 # `LANE_BACKSTOP_S` is spawn-gate.sh's one default; it is not sourced here, so the literal fallback is
-# pinned to that seam by `lane-bound.test.sh` (i0).
-LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
+# pinned to that seam by `lane-bound.test.sh` (i0) — both here and in the coercion below, because
+# agent-infra#4034 raised the seam 5x and a stale literal here would re-shorten the window it moved.
+LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}"
 PR_BUDGET="${PR_BUDGET:-6}"
 SLICE_WIDTH="${SLICE_WIDTH:-10}"
 SLICE_TOTAL="${SLICE_TOTAL:-70}"
@@ -323,7 +330,7 @@ MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
 [ "$MEM_BUDGET_PCT" -le 100 ] || { log_line "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
 LPC_CEILING="$(_num LPC_CEILING "$LPC_CEILING" 8)"
 [ "$LPC_CEILING" -ge 1 ] || { log_line "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
-LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 7200)"
+LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 36000)"
 # (No LANE_WAIT_MAX any more — but `LANE_TIMEOUT` still feeds the dispatcher, so it still gets the
 # validation that `30m` used to defeat: an unvalidated value made bash print "value too great for
 # base" and left a variable UNSET, which under `set -u` killed the tick mid-lock.)
@@ -1576,7 +1583,7 @@ _census_launcher() { # <dispatcher-overlap> — prints the count, or nothing whe
 # ── WHICH SLICES ARE ALREADY BEING WORKED ────────────────────────────────────────────────────
 # ⛔ THE RING CLAMP ALONE DOES NOT PREVENT A DOUBLE-DISPATCH ACROSS TICKS. `n` is capped at the
 # number of distinct windows (SLICE_TOTAL/SLICE_WIDTH = 7 at the shipped defaults), but a LIVE lane
-# keeps its window for up to LANE_TIMEOUT (~2 backstop-hours ≈ 6 ticks at the shipped 20 m cadence):
+# keeps its window for up to LANE_TIMEOUT (~10 backstop-hours ≈ 30 ticks at the shipped 20 m cadence):
 # tick 1 takes offsets 0…60, tick 2
 # walks the ring from cursor=7 back to 0 and hands 0/10/20 to NEW lanes while the first lanes are
 # still on them — two lanes per window, two reviews per head, two merge attempts per PR. So the
@@ -1814,7 +1821,12 @@ fi
 
 # ⛔ HOW MANY LANES MAY BE ADDED, and the one clamp that stops two lanes sharing a slice. With
 # `SLICE_TOTAL/SLICE_WIDTH` = 7 distinct windows, a 13th lane would land on lane 6's: fewer lanes is
-# the answer, never overlapping ones.
+# the answer, never overlapping ones. ⛔ AND BECAUSE A LIVE LANE HOLDS ITS WINDOW FOR UP TO `LANE_TIMEOUT`
+# (10 h since agent-infra#4034, 2 h before it), 7 long lanes can hold the WHOLE ring for 10 h: every tick
+# in that span logs `SKIP: nothing to add — … free_windows=0/7 …` and adds nothing, which is right (a
+# window is never shared) but reads as a
+# stall. Raise `SLICE_TOTAL`/`SLICE_WIDTH` for a box whose target exceeds 7, or accept the narrower add
+# rate — see the SLICE guard's note at the top of this file.
 slices=$((SLICE_TOTAL / SLICE_WIDTH))
 [ "$slices" -ge 1 ] || slices=1
 # ⛔ BOUND THE LOOP'S OWN RANGE. Every other derived number here is clamped; `slices` was not, and

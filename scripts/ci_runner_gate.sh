@@ -99,6 +99,82 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
+# ⛔ THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113). The runs endpoint is NEWEST-FIRST, so
+# one page is the NEWEST $QUEUE_PAGE queued runs — not the queue. Measured on daniel-ospina/tortoise
+# 2026-11-17T11:16Z: 201 runs queued, the oldest row of page 1 was 2026-11-11T20:47Z, and the queue's
+# genuinely oldest demanding run (42064937107, 2026-11-05T16:29Z, 1 of its 22 jobs queued) was on
+# page 2 and therefore INVISIBLE to the walk. The walk's question is "which queued run is the
+# OLDEST with a queued job", and it cannot be answered from the newest page. Reading the extra pages
+# costs one list call per $QUEUE_PAGE runs (2 for the queue above) and the length leg's own threshold
+# bounds how much of it can ever matter, so the read is cheap; the bound below exists only so a
+# pathological queue cannot turn one pass into an unbounded walk.
+QUEUE_MAX_PAGES="${CI_GATE_QUEUE_READ_MAX_PAGES:-5}"
+# ⛔ THE GHOST LEDGER (agent-infra#4113) — WHY THE SCAN BOUND CANNOT SIMPLY BE RAISED AGAIN.
+# `QUEUE_HEAD_SCAN_MAX` bounds READS PER PASS, but the population it must walk is PERMANENT and
+# MONOTONICALLY GROWING: GitHub keeps a run whose jobs were never created in `status=queued` forever
+# (such a run cannot be cancelled — 409 — or deleted, and it can never occupy a runner, so no pass
+# will ever clear it). Measured 2026-11-17: 43 consecutive passes each proved the 25 oldest of a
+# ~190-deep queue were ghosts and then refused, so `mode=local` was pinned from 2026-11-06T01:30Z on
+# — the gate could not reach a verdict in either direction, and the pool stayed armed on a repo whose
+# hosted runners were demonstrably serving (in_progress=7). The bound was already raised once for
+# this exact reason (5 -> 25, agent-infra#3995, landed 2026-11-11) and the population outgrew it
+# within six days: a raise is an EXPIRY DATE, not a fix, because any fixed count over a growing
+# population is exceeded eventually by construction.
+# So the proof is REMEMBERED: a run that a readable jobs read showed to have ZERO JOBS AT ALL — and
+# that was already older than GHOST_TRUST_AFTER_S when it was read — is a ghost for good, and the next
+# pass discounts it without a read. The bound then bounds API cost (reads per pass) instead of bounding
+# how much of the queue the gate can ever see, and the walk completes CUMULATIVELY: a 200-deep ghost
+# population resolves in ceil(200/25) passes instead of never.
+# ⛔ THE TWO CONDITIONS ARE THE SOUNDNESS ARGUMENT, NOT DECORATION. (a) ZERO TOTAL JOBS, not merely
+# "no job in `queued` status": a run whose jobs exist but are `waiting` (concurrency group, environment
+# approval) or executing is TIME-LOCAL evidence — it can become demand later, so it is re-read on every
+# pass and never remembered. (b) AN AGE FLOOR, for the case where the run's jobs have not been created
+# yet at all: GitHub creates a run's jobs progressively, and the #2344 comment in this file records
+# 8-11 h old runs whose job set was still filling in.
+# ⛔ (a) AND (b) ARE NOT REDUNDANT, AND THE DIFFERENCE IS EXACTLY THE #2344 MEASUREMENT (agent-infra#4113
+# review, P1). The 8-11 h population the #2344 comment names had ZERO QUEUED jobs, not zero TOTAL jobs —
+# those runs' job sets were fully created. They are excluded here by (a), which is the strict predicate,
+# and NO age rule could separate them (the #2344 comment says so). The age floor exists only for the
+# narrower case (a) cannot express: a run created minutes ago whose job set is still being created, where
+# "zero jobs so far" really can become "jobs" a moment later. One hour is far past that window (jobs
+# appear within seconds-to-minutes of a run's creation) while remaining well below the multi-day ages of
+# the population actually measured live: the ghosts on the pinned repo were created 2026-11-05…11-11, read
+# on 2026-11-17.
+# ⛔ AND THE PROOF EXPIRES, WHICH IS WHAT MAKES THE 8-11 h AMBIGUITY NOT LOAD-BEARING (agent-infra#4113
+# cycle 2, P1 — an earlier draft left two paragraphs that disagreed about it, one of which would have made
+# a 3600 s floor unsatisfiable). Whichever reading of that note holds, an entry is re-read within
+# GHOST_REPROVE_AFTER_S, which is set ABOVE 11 h, so a job set that is still filling in is re-read after
+# the window closes instead of being trusted for the life of the queue.
+# ⛔ THE FAIL-OPEN DIRECTION THIS MUST NEVER TAKE: discounting a run that could still become demand
+# would understate `queued_demanding` and certify "nothing is waiting" over a real stall — the exact
+# defect #2344 exists to remove, one cache layer down. Hence: an UNREADABLE ledger is discarded whole
+# (never partially trusted), an unreadable jobs read remembers nothing, and an entry is dropped the
+# moment the run leaves the queued candidates.
+# ⛔ AND A PROOF EXPIRES (agent-infra#4113 review cycle 2, P0 — measured). A reading is a fact about ONE
+# MOMENT, and a run can gain jobs WHILE STAYING `queued` (a progressive job set finishing, a new
+# attempt), so "it never leaves the queue" does NOT invalidate the entry. Without an expiry the entry is
+# re-written on every pass, the run is never re-read, and the gate certifies "nothing is waiting" over
+# live demand and STRIPS the pool — reproduced: pass 1 sees `.jobs: []`, pass 2 answers a queued job for
+# the same run, and the pass logged `ghost_cached=1`, `jobs reads: 0`, `nothing is waiting for a runner`.
+# So every entry carries the EPOCH AT WHICH IT WAS PROVEN, a hit does NOT refresh it, and an entry older
+# than GHOST_REPROVE_AFTER_S is dropped at load — i.e. re-read and re-proven by this pass. The staleness
+# of a discount is therefore bounded by that interval instead of by GitHub's behaviour.
+GHOST_LEDGER_FILE="$STATE_DIR/ci-runner-gate.ghosts"
+# 3600 s is a floor on TRUST only: a younger ghost is re-read, which costs a read and never costs a
+# claim. It is NOT what excludes the 8-11 h population the #2344 comment cites — those runs had zero
+# QUEUED jobs, not zero TOTAL jobs, and are excluded by the zero-total predicate itself (see above).
+GHOST_TRUST_AFTER_S="${CI_GATE_GHOST_TRUST_AFTER_S:-3600}"
+# ⛔ HOW LONG A PROOF IS TRUSTED (agent-infra#4113 cycle 2, P0). 43200 s = 12 h — ABOVE the widest
+# progressive-creation reading anywhere in this file (the #2344 comment's 8-11 h runs), so under EITHER
+# reading of that measurement a re-prove happens before a job set could still be filling in — and it also
+# bounds the cost: a proven population of a few hundred ghosts costs a handful of re-reads per DAY.
+# 0 is allowed and means "never trust a remembered proof", i.e. exactly the pre-ledger behaviour
+# (every pass re-reads): safe, just expensive. It is NOT refused like the other zeros, because here the
+# zero is the fail-CLOSED end of the scale, not a disarmed bound.
+GHOST_REPROVE_AFTER_S="${CI_GATE_GHOST_REPROVE_AFTER_S:-43200}"
+#   (12 h: above the 11 h progressive-creation reading, and ~18x the 40 min a 200-deep population needs to
+#    be swept at the shipped 25-read budget and 5 min cadence — a sweep must finish well inside the
+#   interval, or expired entries would keep restarting it and the walk could never certify anything.)
 # ⛔ HOW MANY QUEUED RUNS THE HEAD SCAN MAY READ (agent-infra#2344), and why a bound is enough.
 # A run in `status=queued` is NOT evidence that anything is waiting for a runner. GitHub leaves a run
 # whose jobs were never created in that state FOREVER, and such a run cannot be cancelled (409
@@ -226,6 +302,31 @@ QUEUE_STUCK_AFTER_S="${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}"   # seconds of queue 
 # again is the failure #2897 measured (`launchctl list` showed last exit status 2, silently, for as
 # long as the state existed). 1800 s = at most one alarm per half hour, and it REPEATS.
 BLIND_ALARM_EVERY_S="${CI_GATE_BLIND_ALARM_EVERY_S:-1800}"
+# ⛔ A RECURRING ALARM IS NOT AN ALARM (agent-infra#4085). The blind alarm repeats every
+# BLIND_ALARM_EVERY_S by design, and on 2026-11-16 the inbox held 43 identical records spanning a
+# month while the pool served 3 of 24 runners. Repetition created no action, so past this many
+# CONSECUTIVE blind passes the condition stops being reported as a blip and is recorded as a DEFECT
+# at most once per BLIND_DEFECT_EVERY_S (default 21600 s): the threshold decides WHEN escalation
+# starts, the time bound decides how often it is WRITTEN. 6 x 300 s = 30 min of continuous blindness.
+BLIND_DEFECT_AFTER="${CI_GATE_BLIND_DEFECT_AFTER:-6}"
+# ⛔ THE STREAK'S EXPIRY IS ITS OWN BOUND, NOT THE ALARM'S (agent-infra#4085, caught by arm r2). The
+# first draft expired the streak after 2 x BLIND_ALARM_EVERY_S, which collapses to "any gap at all"
+# the moment an operator (or a test) sets the alarm interval to 0 to stop the suppression — so the
+# streak could never grow and the escalation this issue exists for would never fire. Coupling two
+# independent intervals is how a guard silently disables itself: 3600 s = 12 x the 300 s tick, i.e. a
+# blind episode an hour apart is a NEW episode, and one that keeps ticking is the same one.
+BLIND_STREAK_RESET_S="${CI_GATE_BLIND_STREAK_RESET_S:-3600}"
+# ⛔ THE DEFECT FILE IS RATE-LIMITED IN TIME, NOT IN PASSES (#4085 review P2). One record per
+# `BLIND_DEFECT_AFTER` passes is one record per 1800 s at the shipped cadence — exactly the inbox rate
+# this replaced, i.e. ~48/day and unbounded growth with no rotation. One record per 6 h states the
+# volume claim the comment makes, and the streak keeps the severity in the wording.
+BLIND_DEFECT_EVERY_S="${CI_GATE_BLIND_DEFECT_EVERY_S:-21600}"
+# ⛔ THE CAPACITY READ IS THE ONE READ THAT CANCELS THE WRITE IT GATES (agent-infra#4085). Measured:
+# 183 failed enumerations and 245 relabel failures between 2026-10-18 and 2026-11-14, with
+# `API rate limit exceeded` (125) and `net/http: TLS handshake timeout` as the causes — both
+# TRANSIENT. One attempt per 300 s pass threw the whole pass away on a blip, so retry in-pass.
+CENSUS_READ_ATTEMPTS="${CI_GATE_CENSUS_READ_ATTEMPTS:-3}"
+CENSUS_READ_BACKOFF_S="${CI_GATE_CENSUS_READ_BACKOFF_S:-2}"
 # How many in-progress runs the mode substitute inspects. Bounded, and the bound is stated: an
 # idle repo has none, which is the hole this substitute cannot fill — it says `unknown` there.
 MODE_INFER_RUNS="${CI_GATE_MODE_INFER_RUNS:-3}"
@@ -392,8 +493,62 @@ runner_census() {
   # `runner_inventory:unreadable` alarm that blamed the token for our own grammar. Any edit here must
   # be COMPILED, not eyeballed: `scripts/ci_runner_gate.test.sh` now runs every `--jq` this script ships
   # through real `jq` (stub, "does not COMPILE"), so a recurrence reddens the suite instead of production.
-  gh api --paginate "$RUNNER_LIST_PATH" \
-    --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
+  # ⛔ RETRY IN-PASS, ON THE EXIT CODE ONLY (agent-infra#4085). A SUCCESSFUL read emits at least the
+  # page row, so on rc 0 the output is ours to classify — emptiness included, and classification (not
+  # a retry) is what decides it. The jq program below is byte-identical to the one the
+  # suite compiles; any edit to it must still compile (`scripts/ci_runner_gate.test.sh` runs every
+  # shipped `--jq` through real jq).
+  local attempt=1 out rc wait_s="$CENSUS_READ_BACKOFF_S"
+  # ⛔ OUT-OF-RANGE VALUES ARE BOUNDED, LIKE EVERY OTHER BOUND IN THIS FILE (#4085, review P2). A
+  # shape check alone is not enough: `CI_GATE_CENSUS_READ_ATTEMPTS=99999999999999999999` makes both the
+  # floor test and the `-ge $max` terminate test fail on an integer-expression error, so the loop never
+  # returns — MEASURED: 81 census calls in 8 s. The backoff is clamped for the same class of reason: a
+  # doubling chain is unbounded, and a 10-attempt value would sleep ~17 min inside a pass whose
+  # `StartInterval` is 300 s.
+  case "$CENSUS_READ_ATTEMPTS" in ''|*[!0-9]*) local max=3 ;; ??????????*) local max=3; log "census read attempts OUT OF RANGE (${#CENSUS_READ_ATTEMPTS} digits) — using 3" ;; *) local max="$CENSUS_READ_ATTEMPTS" ;; esac
+  [ "$max" -lt 1 ] && max=1
+  [ "$max" -gt 5 ] && max=5
+  # …and the backoff gets the same out-of-range branch: a 20-digit value passes the shape check, the
+  # `-gt 30` clamp then errors on the integer comparison and `sleep` fires with no delay at all.
+  case "$wait_s" in ''|*[!0-9]*) wait_s=2 ;; ??????????*) wait_s=2 ;; esac
+  [ "$wait_s" -gt 30 ] && wait_s=30
+  while : ; do
+    out="$(gh api --paginate "$RUNNER_LIST_PATH" \
+      --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR")"
+    rc=$?
+    # ⛔ RETRY ON THE EXIT CODE, NOT ON AN EMPTY BODY (agent-infra#4085; caught by this suite's 7b/m9).
+    # A blank 200 is a MEASURED schema failure that `census_classify` must name as UNREADABLE — folding
+    # it into "transport failed" would retry it, then report it as a transport failure and skip the
+    # schema verdict entirely, which is how a blank body starts reading as a zero pool. The transient
+    # causes are `TLS handshake timeout` and rate-limit 403s, and both exit NON-ZERO.
+    if [ "$rc" -eq 0 ]; then
+      [ "$attempt" -gt 1 ] && log "runner census READ RECOVERED on attempt $attempt/$max — a transient failure is no longer a lost pass"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    # ⛔ RETRY TRANSIENT CLASSES ONLY (#4085, and #2931's "name the missing capability"). A permission
+    # or auth failure is DETERMINISTIC: retrying it spends the pass's budget to learn the same answer,
+    # and the capability it names is the actionable part. `API rate limit exceeded` is deliberately NOT
+    # in this list — a rate-limit 403 IS transient, and it is 125 of the measured failures.
+    _gerr="$(head -c 400 "$GH_ERR" 2>/dev/null)"
+    case "$_gerr" in
+      *"Resource not accessible"*|*"needs-admin"*|*"Bad credentials"*|*"HTTP 401"*|*"HTTP 404"*|*"Not Found"*)
+        log "runner census READ FAILED (rc=$rc) with a NON-TRANSIENT error — NOT retried, capability=$(census_capability "$_gerr"): ${_gerr:0:200}"
+        return 1 ;;
+    esac
+    if [ "$attempt" -ge "$max" ]; then
+      [ "$attempt" -gt 1 ] && log "runner census READ FAILED after $attempt attempt(s) — reporting the LAST error (earlier attempts discarded)"
+      return 1
+    fi
+    log "runner census READ attempt $attempt/$max failed (rc=$rc) — retrying in ${wait_s}s; gh said: $(head -c 200 "$GH_ERR" 2>/dev/null)"
+    sleep "$wait_s"
+    attempt=$((attempt + 1))
+    # ⛔ THE CLAMP IS INSIDE THE CHAIN, not only on the first wait (#4085 review round 4). Clamping the
+    # initial value alone leaves 30+60+120+240 = 450 s of sleep inside a pass whose StartInterval is
+    # 300 s — the overrun the clamp claims to prevent.
+    wait_s=$((wait_s * 2))
+    [ "$wait_s" -gt 30 ] && wait_s=30
+  done
 }
 
 # census_capability <body> — WHICH permission the read needed, named from the response itself.
@@ -561,7 +716,7 @@ $labels" ;;
 # ghost/not-ghost distinction (measured against the live API 2026-11-06: the ghost run 37642335832 →
 # rc 0, no output; a run with queued jobs → rc 0, `ubuntu-latest`; an unknown run id → rc 1).
 run_queued_demand() {
-  local rid="$1" out l sets=0
+  local rid="$1" out l sets=0 labels_out="" page_jobs jobs_measured=0 jobs_total=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
   # ⛔ `--paginate` IS REQUIRED, NOT TIDINESS (review P1). GitHub's list endpoints default to 30 per
   # page, and a RUN'S JOBS ARE LISTED IN CREATION ORDER — so on a run with more than 30 jobs the ones
@@ -572,19 +727,186 @@ run_queued_demand() {
   # made that shape load-bearing evidence, the under-read would silently DISCOUNT real demand and
   # strip the pool during a stall. `per_page=100` keeps the ordinary run at one call; `--paginate`
   # covers the rest, and gh applies `--jq` per page so the per-line output concatenates.
+  # ⛔ AN ABSENT `.jobs` IS NOT A MEASURED ZERO (agent-infra#4113 review, P1), which is why the page row
+  # is guarded by `type == "array"` and the queued-job selection reads `(.jobs // [])[]`: a 200 body that
+  # parses but carries no job array (a schema change, a proxy body — the #1704 class this file cites
+  # twice) must produce NO page row, so the caller's `jobs_measured` stays 0 and NOTHING is remembered.
+  # `(.jobs // []) | length` — the first cut — coerced that absence to 0, i.e. it minted the exact claim
+  # ("zero total jobs") that makes a ghost PERMANENT, from a read that measured nothing.
+  # ⛔ THE `#jobs` PAGE ROW IS THE LEDGER'S EVIDENCE (agent-infra#4113): it reports how many jobs the
+  # page carried, so the caller can tell "this run has NO jobs at all" (permanent) from "this run has
+  # jobs, none of them queued" (time-local). It is a page row rather than a return-code arm because
+  # rc carries the ghost/failed/unspellable distinction the scan already depends on, and it is emitted
+  # for EVERY page and SUMMED (a run's job set may span pages). `#` and TAB cannot appear in a
+  # job label — the label shape check below admits only `A-Za-z0-9._,+-` — so a page row can never be
+  # confused with a label set, which is the same protocol the census's page row uses.
+  # ⛔ IT IS CARRIED ON STDOUT AND REPARSED BY THE CALLER, DELIBERATELY (agent-infra#4113). A first cut
+  # set two globals here; the caller reads the demand through `$( … )`, i.e. in a SUBSHELL, so both
+  # were gone by the time the ledger decision ran and `set -u` killed the pass with "unbound variable".
+  # A side channel that a subshell silently drops is the same class of defect as a value nobody read:
+  # the output IS the channel, and the caller strips the row it recognises.
   out="$(gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --paginate \
-        --jq '[.jobs[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[]' 2>"$GH_ERR")" || return 1
+        --jq '(if ((.jobs|type) == "array") then "#jobs\t\(.jobs|length)" else empty end), ([(.jobs // [])[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[])' 2>"$GH_ERR")" || return 1
   [ -n "$out" ] || return 0
-  # Every LINE is one QUEUED JOB's set, and each must be spellable on its own: a job whose set cannot
-  # be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because a
-  # multi-job run is now several lines — see DEMAND_LABELS).
+  # Every OTHER line is one QUEUED JOB's set, and each must be spellable on its own: a job whose set
+  # cannot be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because
+  # a multi-job run is now several lines — see DEMAND_LABELS).
   while IFS= read -r l; do
     [ -n "$l" ] || continue
+    case "$l" in
+      '#jobs'$'\t'*)
+        page_jobs="${l#*$'\t'}"
+        case "$page_jobs" in ''|*[!0-9]*) return 2 ;; esac
+        jobs_measured=1
+        jobs_total=$((jobs_total + page_jobs))
+        continue ;;
+    esac
     case "$l" in *[!A-Za-z0-9._,+-]*) return 2 ;; esac
     sets=$((sets+1))
+    labels_out="$labels_out$l
+"
   done <<<"$out"
-  [ "$sets" -gt 0 ] || return 2
-  printf '%s' "$out"
+  # The measured total rides out on ONE row (never one per page: the caller compares it as a number,
+  # and a per-page row would make a multi-page run look like N readings). It is absent — not zero —
+  # when the body carried no page row at all, because an ABSENT reading must never be read as "zero
+  # jobs": zero is the claim that makes a ghost permanent.
+  [ "$jobs_measured" = 1 ] && printf '#jobs\t%s\n' "$jobs_total"
+  # ⛔ A BODY CARRYING ONLY A `#jobs` ROW IS A GHOST, NOT A FAILURE (agent-infra#4113): the pre-ledger
+  # function returned 2 here because a non-empty body always meant at least one label line. With the
+  # page row a readable zero is spelled explicitly, so rc 0 with NO label output keeps its #2344
+  # meaning — "readable, nothing queued" — while the total rides along in the page row above.
+  [ "$sets" -gt 0 ] || return 0
+  printf '%s' "${labels_out%$'\n'}"
+}
+
+# ts_age <RFC-3339 UTC stamp> — seconds since that stamp, on stdout.
+# rc 1 when the stamp does not parse or is in the FUTURE (a clock skew no reading can resolve). Pure
+# extraction of the one computation this file already did inline for the queue head, so the ghost
+# ledger's age floor and the throughput leg's age can never be measured on two different clocks.
+ts_age() {
+  [ -n "$1" ] || return 1
+  python3 -c '
+import datetime, sys
+t = sys.argv[1]
+try:
+    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except ValueError:
+    sys.exit(1)
+age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
+if age < 0:
+    sys.exit(1)
+print(age)
+' "$1" 2>/dev/null
+}
+
+# ts_is_old <stamp> — is this run OLD ENOUGH for its zero-job reading to be terminal?
+# rc 0 = yes (age >= GHOST_TRUST_AFTER_S), rc 1 = no / unparseable (so it is NEVER remembered).
+ts_is_old() {
+  local age
+  age="$(ts_age "$1")" || return 1
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$GHOST_TRUST_AFTER_S" ]
+}
+
+# ghost_ledger_load — the remembered ghost ids, SPACE-WRAPPED on GHOST_LEDGER (`" 4001 4002 "`) so a
+# membership test is one `case` glob and no per-candidate subprocess.
+# ⛔ AN UNPARSEABLE LEDGER IS DISCARDED WHOLE, AND THAT IS THE FAIL-CLOSED DIRECTION: a partially
+# trusted ledger could discount a run nobody proved, which understates demand and strips the pool
+# during a real stall. Discarding costs reads; trusting costs a false "nothing is waiting".
+ghost_ledger_load() {
+  local line id stamp age fresh=0 stale=0 skewed=0 now bad=0
+  GHOST_LEDGER=""
+  [ -f "$GHOST_LEDGER_FILE" ] || return 0
+  now="$(date +%s)"
+  while IFS=' ' read -r id stamp line; do
+    [ -n "$id" ] || continue
+    # ⛔ TWO FIELDS, BOTH CHECKED (agent-infra#4113 cycle 2, P1). `id` and `epoch` must each be digits and
+    # NOTHING else may follow (a third field traps a row with extra columns, which an older format or a
+    # hand edit would produce; a row with NO stamp is a proof nobody dated — exactly the shape that must
+    # not be trusted). A file that does not parse is discarded WHOLE — see the header.
+    bad=0
+    case "$id" in ''|*[!0-9]*) bad=1 ;; esac
+    case "$stamp" in ''|*[!0-9]*) bad=1 ;; esac
+    # ⛔ A STAMP THAT CANNOT BE AN EPOCH IS NOT A DATEABLE PROOF (review cycle 4, P2 — measured). `date +%s`
+    # writes 10 digits until 2286, so 11+ digits is already a format violation; it must be REFUSED here
+    # rather than left to the arithmetic below, because bash's `$(( ))` is 64-bit and WRAPS. Measured with
+    # now=1700000000: a 20-digit stamp gave `age = now - stamp` = -7766279629752241919, i.e. NEGATIVE, so
+    # the expiry test read FALSE; and `[ "$stamp" -gt "$now" ]` ERRORS on an operand beyond intmax, so the
+    # future-stamp arm never fired either. Both tests false is "not stale" — the entry is trusted, the run
+    # is never re-read, and the cycle-2 P0 (a run that gains jobs while staying `queued`, discounted
+    # forever, certifying "nothing is waiting") re-opens through the parse instead of through the clock.
+    # The bound is the length, not the value: 10 digits fits int64 with room to spare, so no accepted row
+    # can wrap, and the `??????????`-plus-one idiom matches the knob guards above.
+    case "$stamp" in ???????????*) bad=1 ;; esac
+    case "$line" in '') ;; *) bad=1 ;; esac
+    if [ "$bad" = 1 ]; then
+      log "ghost ledger UNREADABLE (bad line: '${id} ${stamp} ${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"
+      GHOST_LEDGER=""; return 1
+    fi
+    age=$(( now - stamp ))
+    # ⛔ A PROOF OLDER THAN GHOST_REPROVE_AFTER_S IS DROPPED HERE, not read around (cycle-2 P0): it
+    # simply is not a ghost this pass, so the run is re-read and, if still zero-job, re-proven and
+    # re-stamped. A FUTURE stamp (clock skew) is treated the same way — it is not a proof this pass can
+    # date, and trusting it would make the entry immortal.
+    if [ "$stamp" -gt "$now" ]; then
+      skewed=$((skewed + 1)); continue
+    fi
+    if [ "$age" -ge "$GHOST_REPROVE_AFTER_S" ]; then
+      stale=$((stale + 1)); continue
+    fi
+    GHOST_LEDGER="$GHOST_LEDGER $id"
+    fresh=$((fresh + 1))
+  done < "$GHOST_LEDGER_FILE"
+  GHOST_LEDGER="$GHOST_LEDGER "
+  [ "$stale" -gt 0 ] && log "ghost ledger: $stale of $((fresh + stale + skewed)) proof(s) EXPIRED (older than ${GHOST_REPROVE_AFTER_S}s) — those runs are re-read this pass and re-proven"
+  # ⛔ SKEW IS NAMED SEPARATELY (review cycle 3, P2): a future-dated stamp is dropped for a DIFFERENT
+  # reason than age, and reporting it as "older than Ns" tells an operator debugging a clock the opposite
+  # of what happened.
+  [ "$skewed" -gt 0 ] && log "ghost ledger: $skewed of $((fresh + stale + skewed)) proof(s) SKEWED (stamped in the FUTURE) — those runs are re-read this pass and re-proven"
+  return 0
+}
+
+# ghost_ledger_stamp <id> — the epoch at which this run's proof was made, or empty.
+# A HIT WHOSE STAMP CANNOT BE READ IS NOT A HIT: the caller re-reads the run. That is the fail-closed
+# direction and it costs one read, where guessing would cost a claim.
+ghost_ledger_stamp() {
+  awk -v id="$1" '$1 == id { print $2; exit }' "$GHOST_LEDGER_FILE" 2>/dev/null
+}
+
+# ghost_ledger_write <id:stamp pairs> — persist "<id> <epoch>" rows (deduped by id, first stamp wins).
+# ⛔ WRITTEN VIA A TEMP FILE AND `mv`, so a pass killed mid-write cannot leave a half-written ledger
+# that the next pass must discard (a discard is safe, but it throws away proofs and costs reads).
+# ⛔ A READ VERB DOES NOT WRITE IT (--dry-run): the ledger is a cache of read results like the verdict
+# file, but a read-out-loud verb must leave the box exactly as it found it, and losing one pass of
+# proofs is free — the next scheduled pass re-proves them.
+ghost_ledger_write() {
+  local pairs="$1" pair id stamp out="" seen=""
+  [ "$DRY" = 1 ] && return 0
+  for pair in $pairs; do
+    id="${pair%%:*}"; stamp="${pair#*:}"
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    # ⛔ DEDUPE ON THE **ID**, NOT ON THE PAIR (agent-infra#4113 cycle 2, found while pinning the stamp
+    # rule). The first cut kept ` out ` as a list of `id:stamp` PAIRS and tested `*" $id "*` against it —
+    # which can never match "4001:1794…", so the SAME run entering twice with two different stamps (the
+    # hit path and the carry-forward path both append it) produced TWO rows. A second row is not harmless:
+    # each row is a proof claim about the same run, and the loader trusts whichever it reads, so the file
+    # would grow one row per pass and re-assert a stale stamp beside a fresh one.
+    case " $seen " in *" $id "*) continue ;; esac
+    seen="$seen $id"
+    out="$out $id:$stamp"
+  done
+  if [ -z "$out" ]; then
+    # ⛔ THE FILE IS WRITTEN EVEN WHEN IT IS EMPTY, DELIBERATELY: "the ledger says nothing is remembered"
+    # and "there is no ledger" must not be the same reading to an operator (this suite asserts the first,
+    # and a `wc -l` on an absent file is an error, not a zero). It is one byte-zero write on a pass that
+    # already wrote a verdict file.
+    { : > "$GHOST_LEDGER_FILE"; } \
+      || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the ledger could not be cleared; prove-or-remember is degraded for the passes that follow"
+    return 0
+  fi
+  { printf '%s\n' $out | while IFS= read -r _row; do printf '%s %s\n' "${_row%%:*}" "${_row#*:}"; done > "$GHOST_LEDGER_FILE.tmp" && mv -f "$GHOST_LEDGER_FILE.tmp" "$GHOST_LEDGER_FILE"; } \
+    || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the proved ghosts are NOT remembered; every pass re-reads them (cost, not a wrong claim)"
 }
 
 # ⛔ `queue_demand()` IS GONE (agent-infra#2344), and with it a contract that had no caller left: the
@@ -773,8 +1095,19 @@ print(comp, len(inc))
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
-      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), (([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";"))]|@tsv' 2>/dev/null)" \
-    || { log "queue probe FAILED (gh api)"; return 2; }
+      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), (([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";"))]|@tsv' 2>"$GH_ERR")" \
+    || { log "queue probe FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
+  # ⛔ gh's stderr IS CAPTURED HERE, for the reason the in-progress read nine lines below states and
+  # this read was the STRAGGLER on (agent-infra#1704's class, which fixed the sibling and left this
+  # one): "a failure reported without what the API said is a failure nobody can act on". This read
+  # shipped `2>/dev/null` and logged exactly `queue probe FAILED (gh api)` — no reason — while being
+  # the gate's SINGLE MOST IMPORTANT read, the one every leg below depends on. MEASURED
+  # 2026-11-17T12:25:27Z: the fleet was handed that reasonless line on a pass that failed at the queue
+  # read while the shared REST pool sat at `core=0/5000`. `API rate limit exceeded` (wait for the
+  # reset, change nothing) and a TLS/network fault (repair the host) call for OPPOSITE actions, and
+  # the log could not tell an operator which one it was looking at. The failure is FAIL-CLOSED either
+  # way (`return 2`, changing nothing); only its REASON is now published, so the next pass that cannot
+  # measure says why. Bounded to 300 bytes like every other captured reason in this file.
   # FOUR fields from one read: the count the length leg uses, the oldest run's `created_at`, the
   # oldest run's id, and the whole page ORDERED OLDEST-FIRST (`id,created_at` pairs). The order is
   # what the head scan walks (agent-infra#2344), and the id/age are what it falls back to when a
@@ -783,7 +1116,7 @@ print(comp, len(inc))
   # HAS, even where the runner inventory is 403). Extra fields are optional: a two-field body still
   # parses, and an absent field leaves one question unmeasured instead of failing a pass that needs
   # nothing else from it.
-  local q1 q2 q3 q4 queue_rows
+  local q1 q2 q3 q4 queue_rows all_rows _p _need _got _more _more_rows _first _cand_ids _led _led_stamp reads cand_raw cand_jobs_measured cand_jobs_total queue_covered queue_rows_count cand_stamp
   IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
   queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; queue_rows="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
@@ -829,6 +1162,89 @@ print(comp, len(inc))
     ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ── THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113) ────────────────────────────────
+  # ⛔ THE WALK CANNOT FIND A HEAD IT CANNOT SEE. The runs endpoint is newest-first, so the single
+  # read above is the NEWEST $QUEUE_PAGE queued runs, and the question the scan asks ("which queued run
+  # is the OLDEST with a queued job?") is exactly the one that page cannot answer. Measured
+  # 2026-11-17T11:16Z on daniel-ospina/tortoise: 201 queued, and the queue's genuinely oldest demanding
+  # run (2026-11-05T16:29Z) sat on page 2 — so the pre-fix scan walked a newest-100 window whose oldest
+  # row was 2026-11-11T20:47Z, all ghosts, and refused on EVERY pass.
+  # The extra pages cost one list call per $QUEUE_PAGE runs (2 for that queue) and nothing is read that
+  # the legs could not use: the length leg's threshold bounds how many demanding runs can matter. The
+  # rows are assembled into ONE list of DISTINCT runs (deduped by id — the pages are separate snapshots
+  # of a live newest-first list, so a run can be served twice as the window shifts), re-sorted GLOBALLY
+  # (a per-page sort only orders within a page) and never trimmed: a count greater than the reported
+  # depth is refused as contradictory, because the alternative — slicing to fit — drops rows, and the
+  # row it drops can be the head (agent-infra#4113 review, P0).
+  # ⛔ `queue_covered` IS WHAT THE PASS LATER OWES AN ANSWER FOR (see the saturated-page refusal): it is
+  # the statement "this pass read a row for every run the count reported", and it is the ONE thing that
+  # separates a measured head from a lower bound. It is cleared at entry, so the degraded bodies (no
+  # row order) cannot inherit it.
+  queue_covered=0
+  if [ -n "$queue_rows" ] && [ "$queued" -gt "$QUEUE_PAGE" ]; then
+    case "$QUEUE_MAX_PAGES" in
+      '' | *[!0-9]*) log "queue read page cap UNREADABLE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      ??????????*)  log "queue read page cap OUT OF RANGE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      0)            log "queue read page cap is ZERO ('${QUEUE_MAX_PAGES}') — the queue could never be covered, so this would disarm the read rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
+    esac
+    all_rows="$queue_rows"
+    _got="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    _need=$(( (queued + QUEUE_PAGE - 1) / QUEUE_PAGE ))
+    if [ "$_need" -gt "$QUEUE_MAX_PAGES" ]; then
+      log "queue ($queued) needs $_need page(s) of $QUEUE_PAGE runs to be covered, beyond the ${QUEUE_MAX_PAGES}-page read cap — FAIL-CLOSED, changing nothing; raise QUEUE_MAX_PAGES' default in this file, and only with a measurement of the queue's real depth, because each page is one more list call on every pass"
+      return 2
+    fi
+    _p=1
+    while [ "$_p" -lt "$_need" ] && [ "$_got" -lt "$queued" ]; do
+      _p=$((_p + 1))
+      # ⛔ ONE SHAPE PER FIELD, AS ABOVE: this read asks only for the row order, because the count and
+      # the oldest stamp belong to the FIRST page (a later page's min is not the queue's oldest).
+      # ⛔ THE SORT IS OVER THE ARRAY, NOT INSIDE IT (#4116 review, P0 — a one-token edit that made
+      # the ENTIRE multi-page read impossible). `sort_by` is `map([f])|sort` over its INPUT, so
+      # `[.workflow_runs[] | sort_by(.created_at)]` sorts EACH RUN — and a run object indexed by a
+      # string field of a NUMBER is a RUNTIME error, so `gh` exited non-zero on EVERY non-empty page.
+      # On any queue deeper than $QUEUE_PAGE (tortoise's measured 178-216 is exactly the case this leg
+      # exists for) that fired the `read FAILED` arm below and the gate refused every pass — the
+      # pinned state of #4113 re-worded, not fixed. The bracket closes BEFORE `sort_by`, exactly as
+      # the first page's program above does it. Verified against jq itself: the pre-fix program exits
+      # 5 with `Cannot index number with string "created_at"` on a real two-row body, this one exits 0.
+      _more="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE&page=$_p" \
+          --jq '([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";")' 2>"$GH_ERR")" \
+        || { log "queue page $_p read FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
+      _more_rows="$(printf '%s' "$_more" | tr ';' '\n' | grep -c .)"
+      # A page that answers nothing ENDS the list: the truncation it implies is refused below, by the
+      # branch that already owns that diagnosis — never read as "the queue ends here".
+      [ "$_more_rows" -gt 0 ] || break
+      all_rows="$all_rows;$_more"
+      _got=$((_got + _more_rows))
+    done
+    # ⛔ DEDUPED AND COUNTED, NEVER TRIMMED (agent-infra#4113 review, P0 — this was a SLICE, and the
+    # slice was a FAIL-OPEN). Pages are fetched seconds apart from a live, newest-first list, so the
+    # window SHIFTS between calls and one run can be served twice — deduping by run id is what makes
+    # the assembled list a set of runs. The first cut instead did `awk 'NR<=queued'`, i.e. it TRIMMED the
+    # extra rows to the reported depth to keep "scanned <= queued" true. That clamp silenced the
+    # contradiction check BELOW (which can never fire on a list that cannot exceed the depth) and, far
+    # worse, it DROPPED rows — and a dropped row is exactly where the head can be: MEASURED against this
+    # very code, a queue reported 150 deep with 151 rows assembled (page 2 one row longer than it should
+    # be, that row being the one with a queued job) logged "nothing is waiting for a runner",
+    # `ghost_runs=150`, and never read that run. So the assembled list must never be trimmed, and a
+    # count GREATER than the reported depth is refused as the contradiction it is.
+    queue_rows="$(printf '%s' "$all_rows" | tr ';' '\n' | awk -F, 'NF && !seen[$1]++' | LC_ALL=C sort -t, -k2,2 -k1,1n | paste -sd';' -)"
+    queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    if [ "$queue_rows_count" -gt "$queued" ]; then
+      log "queue reading INCONSISTENT: the covered read assembled $queue_rows_count distinct run(s) for a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing; a page longer than its own depth is REFUSED here, never trimmed, because trimming drops rows and a dropped row is exactly where the head can be"
+      return 2
+    fi
+    # The oldest row of the COVERED list is the head the degraded-body fallback ages — recomputed here
+    # so fields 2/3 and field 4 cannot disagree about which run is oldest (the single-page body's
+    # `min_by` is the same statement over the same rows, so this only ever sharpens it).
+    _first="${queue_rows%%;*}"
+    case "$_first" in
+      *,*) oldest_created="${_first#*,}"; head_run_id="${_first%%,*}" ;;
+    esac
+  fi
+  queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+  [ "$queue_rows_count" -ge "$queued" ] && queue_covered=1
   # ── THE HEAD SCAN: WHICH QUEUED RUN IS THE QUEUE'S ACTUAL HEAD? (agent-infra#2344) ──────────────
   # ⛔ THE QUESTION THIS ANSWERS, and why the answer was wrong before it existed. The throughput
   # leg's age came from `min(created_at)` over `status=queued`, i.e. from the oldest run that is
@@ -849,14 +1265,47 @@ print(comp, len(inc))
     ??????????*)  log "queue head scan bound OUT OF RANGE ('${QUEUE_HEAD_SCAN_MAX}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
+  # The ledger's trust floor is an operand of a numeric test like every other bound here: a non-numeric
+  # value makes `[ "$age" -ge "$GHOST_TRUST_AFTER_S" ]` ERROR, and the `&&` chain reads that as FALSE —
+  # which would silently stop remembering anything (cost), or, if a later edit inverted the comparison,
+  # remember a run too young to be terminal (a false discount).
+  case "$GHOST_TRUST_AFTER_S" in
+    '' | *[!0-9]*) log "ghost ledger trust floor UNREADABLE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost ledger trust floor OUT OF RANGE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # ⛔ THE TRUST FLOOR REFUSES ZERO BY NAME, like the two sibling bounds (cycle-2 review, P2): a zero floor
+  # disables the age condition entirely, so a run read seconds after creation with no jobs yet — the one
+  # case the condition exists for — becomes a PERMANENT ghost. That is the fail-OPEN direction, which is a
+  # stronger reason to refuse than the siblings' "could never measure".
+  # ⛔ ALL ZEROS, NOT THE LITERAL `0` (review cycle 3, P1): `00`/`000` are the same number and passed every
+  # arm above, so the knob disarmed the age condition while the comment claimed it was refused — measured
+  # with the three arms copied verbatim: floor=0 → ZERO-REFUSED, floor=00 → ACCEPTED, and `ts_is_old` then
+  # answers OLD for a 5 s old run. The test is therefore on the VALUE, not on its spelling.
+  case "$GHOST_TRUST_AFTER_S" in
+    *[!0]*) ;;  # has a non-zero digit → a real floor
+    *) log "ghost ledger trust floor is ZERO ('${GHOST_TRUST_AFTER_S}') — it would disarm the age condition rather than bound it, so a run read seconds after creation (no jobs yet) would be remembered forever; FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # The re-prove interval is a bound too, but its zero is the SAFE end (re-read every pass), so only its
+  # shape is checked — a non-numeric value would make the `-ge` test error and trust an entry forever.
+  case "$GHOST_REPROVE_AFTER_S" in
+    '' | *[!0-9]*) log "ghost proof re-prove interval UNREADABLE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost proof re-prove interval OUT OF RANGE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
   QUEUE_GHOSTS=0
   # ⛔ `scanned` IS INITIALISED BESIDE THE SCAN, NOT HERE (agent-infra#3995 review, F3 — the line that
   # sat here is gone, removed by 4304f70c4). It was DEAD: every read of `$scanned` is inside the `else`
   # block below, which assigns it (`scanned=0; scan_exhausted=1`) before its first use, and the degraded
   # no-candidate path never expands it. The reason recorded for ADDING it — "so the degraded
-  # no-candidate path cannot hit `set -u`" — was false on both counts (it is `local`-declared at the top
-  # of `evaluate`, and nothing reads it on that path), so the durable record is corrected HERE, where
-  # the next reader looks, because that commit message is append-only.
+  # no-candidate path cannot hit `set -u`" — was false, and the half of that reason a reader is most
+  # likely to carry away is the DANGEROUS half: a `local` declaration gives a name no VALUE, so it is
+  # no defence against `set -u` at all (measured on bash 5.2: `set -u; f(){ local b; echo "${b}"; }`
+  # aborts with `b: unbound variable`, rc 1 — an exit code this gate never emits deliberately). What
+  # actually protects the path is that NOTHING READS IT THERE, and that `scanned=0` below precedes the
+  # first read. The durable record is corrected HERE, where the next reader looks, because that commit
+  # message is append-only.
+  GHOST_CACHED=0     # how many of those ghosts were REMEMBERED (no read spent this pass)
+  GHOST_KEEP=""      # ids to persist: this pass's proofs, plus prior entries still in the queue
+  reads=0            # jobs reads SPENT this pass — what QUEUE_HEAD_SCAN_MAX actually bounds
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
@@ -892,22 +1341,77 @@ print(comp, len(inc))
     # read — the same fail-open direction as the clamp, one condition over. Only running OUT OF ROWS
     # proves the scan reached the end of the page.
     scanned=0; scan_exhausted=1
+    # ⛔ THE LEDGER IS LOADED BEFORE THE WALK, AND AN UNPARSEABLE ONE IS DISCARDED BY ITS OWN FUNCTION
+    # (see `ghost_ledger_load`): the pass then re-reads every candidate, which is the pre-ledger
+    # behaviour and costs reads rather than making a claim.
+    ghost_ledger_load
     while IFS= read -r cand; do
       [ -n "$cand" ] || continue
-      scanned=$((scanned + 1))
-      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); scan_exhausted=0; break; fi
       case "$cand" in
         *,*) cand_id="${cand%%,*}"; cand_created="${cand#*,}" ;;
         *)   cand_id="$cand"; cand_created="" ;;
       esac
       case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-      cand_demand="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ A REMEMBERED GHOST COSTS NO READ (agent-infra#4113). It has already been proven, by a readable
+      # jobs read, to have ZERO JOBS AT ALL while older than the trust floor — and the proof is not older
+      # than GHOST_REPROVE_AFTER_S, because `ghost_ledger_load` DROPS expired entries into a re-read
+      # (cycle-2 P0: without that, a run that gains jobs while staying `queued` was discounted forever).
+      # THIS IS THE LINE THAT MAKES THE BOUND A COST BOUND: with the proof remembered, a 200-deep ghost
+      # population is walked in ceil(200/QUEUE_HEAD_SCAN_MAX) passes instead of never, and a fully-proven
+      # population costs one read per pass (the head) however deep the queue is.
+      # ⛔ AND THE HIT CARRIES THE OLD STAMP FORWARD, IT DOES NOT REFRESH IT: stamping `now` on every hit
+      # would make the entry immortal and re-open the P0 one layer down.
+      case "$GHOST_LEDGER" in
+        *" $cand_id "*)
+          cand_stamp="$(ghost_ledger_stamp "$cand_id")"
+          case "$cand_stamp" in
+            ''|*[!0-9]*)
+              # NO USABLE STAMP IS NOT A HIT (fail-closed): fall through and READ the run.
+              log "ghost ledger: run $cand_id is listed but its proof stamp could not be read — treating it as UNPROVEN and reading it (one read, not a claim)" ;;
+            *)
+              scanned=$((scanned + 1))
+              QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1)); GHOST_CACHED=$((GHOST_CACHED + 1))
+              GHOST_KEEP="$GHOST_KEEP $cand_id:$cand_stamp"
+              continue ;;
+          esac ;;
+      esac
+      # ⛔ THE BOUND IS NOW ON READS, NOT ON CANDIDATES SKIPPED OVER (agent-infra#4113), and the
+      # difference is the whole fix: `scanned` counts only candidates this pass ACTUALLY EXAMINED (a
+      # ledger hit or a read), while a ledger hit above spends no read — so the budget cannot be eaten
+      # by runs whose answer is already known. A cap on candidates examined would re-pin the gate the
+      # moment the ghost population exceeded it, which is the defect, not a bound. ⛔ AND THE COUNT IS
+      # INCREMENTED AFTER THIS TEST, not before it (measured): counting the candidate that the budget
+      # refused to read made `scanned` exceed `queued` on a page that merely had one row more than its
+      # depth, so the pass refused INCONSISTENT — a contradiction it had not observed — instead of the
+      # bound it genuinely ran out of.
+      if [ "$reads" -ge "$QUEUE_HEAD_SCAN_MAX" ]; then scan_exhausted=0; break; fi
+      scanned=$((scanned + 1))
+      reads=$((reads + 1))
+      cand_raw="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ THE PAGE ROW IS STRIPPED HERE (see `run_queued_demand` for why it is on stdout): what is
+      # left is the label sets, so the ghost/head distinction below is unchanged, and the job total is
+      # only ever read as measured when the row was actually there.
+      cand_jobs_measured=0; cand_jobs_total=0; cand_demand="$cand_raw"
+      case "$cand_raw" in
+        '#jobs'$'\t'*)
+          cand_jobs_measured=1
+          cand_jobs_total="${cand_raw%%$'\n'*}"; cand_jobs_total="${cand_jobs_total#*$'\t'}"
+          case "$cand_raw" in *$'\n'*) cand_demand="${cand_raw#*$'\n'}" ;; *) cand_demand="" ;; esac ;;
+      esac
       if [ "$cand_rc" -eq 0 ]; then
         if [ -n "$cand_demand" ]; then
           demand_head_id="$cand_id"; demand_head_created="$cand_created"; DEMAND_LABELS="$cand_demand"
           break
         fi
         QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1))
+        # ⛔ REMEMBERED ONLY ON THE TWO CONDITIONS THAT MAKE THE READING TERMINAL (see the ledger block
+        # in the header): ZERO JOBS AT ALL — a measured zero, never an absent reading — and OLD ENOUGH
+        # that progressive job creation cannot still be filling the run in. A run with jobs but none
+        # queued (concurrency-held, or executing) fails the first condition and is re-read on EVERY pass,
+        # because it can become demand; that is the fail-open direction this must never take.
+        if [ "$cand_jobs_measured" = 1 ] && [ "$cand_jobs_total" -eq 0 ] && ts_is_old "$cand_created"; then
+          GHOST_KEEP="$GHOST_KEEP $cand_id:$(date +%s)"
+        fi
       else
         if [ "$cand_rc" -eq 2 ]; then
           log "queue candidate run $cand_id: the jobs read ANSWERED with a label set this read cannot spell — cannot prove it is a ghost, so it STAYS the queue head (no discount)"
@@ -918,6 +1422,22 @@ print(comp, len(inc))
         break
       fi
     done <<< "$(printf '%s' "$candidates" | tr ';' '\n')"
+    # ⛔ THE LEDGER IS PERSISTED HERE — BEFORE BOTH REFUSALS BELOW (agent-infra#4113). The refusing pass
+    # is the COMMON one while a ghost population is being walked, so persisting only on the paths that
+    # reach a verdict would throw away every proof and the walk could never finish (that is the pin, with
+    # extra steps). An entry is kept when this pass proved it (stamped NOW) OR when it was already known
+    # and the run is still among this pass's candidates (stamped with ITS ORIGINAL proof time, so it
+    # expires on schedule rather than on use); anything else is dropped. That bounds the file by the
+    # current queue depth, and it forgets a ghost as soon as a pass with candidates no longer lists it.
+    _cand_ids=" $(printf '%s' "$candidates" | tr ';' '\n' | awk -F, 'NF {printf "%s ", $1}')"
+    for _led in $GHOST_LEDGER; do
+      case "$_cand_ids" in
+        *" $_led "*)
+          _led_stamp="$(ghost_ledger_stamp "$_led")"
+          case "$_led_stamp" in ''|*[!0-9]*) ;; *) GHOST_KEEP="$GHOST_KEEP $_led:$_led_stamp" ;; esac ;;
+      esac
+    done
+    ghost_ledger_write "$GHOST_KEEP"
     # ⛔ THE CONTRADICTION CHECK APPLIES TO BOTH OUTCOMES, AND THAT ORDER IS THE POINT (cycle-5 review,
     # finding 1). It used to sit INSIDE the "no demand found" branch, so on the path that DID measure
     # a head the check never ran: a page one row longer than its own depth, with the extra row being
@@ -940,34 +1460,9 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$scanned" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing; the walk covers up to CI_GATE_QUEUE_READ_MAX_PAGES pages of ${QUEUE_PAGE} runs, so a short read here means the list answered fewer rows than it reported depth (a truncated body, or a page that answered nothing), not that the queue is deeper than the read can ever reach"; return 2
       else
-        # ⛔ THE PAGE-CEILING NOTE IS GATED ON THE QUEUE BEING DEEPER THAN A PAGE, NOT LEFT UNGATED
-        # (agent-infra#3995 review cycle 7, P1 — MEASURED defect). A bound break proves the candidate
-        # list is LONGER THAN THE BOUND; it does NOT prove the list is a page (a 30-deep queue read at
-        # the shipped bound of 25 breaks the window with a 30-ROW list). Emitted ungated, the clause
-        # stated "the candidate list is ONE page of 100 runs" about that 30-row list AND told the
-        # operator a bound at or above 100 could not see past it — when raising the bound is exactly
-        # the remedy (measured: the same fixture at bound 30 measures the demand head and writes a
-        # verdict). `queued > QUEUE_PAGE` is the fact that makes BOTH halves true: the request is
-        # `per_page=QUEUE_PAGE` (:775), `per_page` caps at 100 and silently reduces larger values
-        # (GitHub pagination docs), and a queue deeper than the page cannot be enumerated by ANY knob.
-        # ⛔ AND IT CLAIMS NOTHING ABOUT THE CANDIDATE LIST'S LENGTH (review cycle 8, F1; premise
-        # corrected under cycle 9's F2, which measured the one it USED to state as unreachable here):
-        # this branch is reached only when the scan broke the bound, so the list is at least
-        # `bound + 1` rows of the ONE page requested — its LENGTH is therefore not what the note is
-        # about, and the sentence asserts only the READ REQUEST and the QUEUE DEPTH, the two facts the
-        # `queued > QUEUE_PAGE` operand actually establishes. (The single synthesised candidate on the
-        # degrade path above cannot reach here: one candidate means `scanned` tops out at 1, and
-        # `1 > bound` needs a bound of 0 — a literal `0` is refused by name above, and a `00` spelling
-        # slips that case (pre-existing, fail-closed, out of scope here). ⛔ The sibling SATURATED
-        # surface's `page-saturated-at-page` arm is NOT that shape either: it passes no
-        # `GH_QUEUE_ROWS_SPEC`, so the stub's `queue_rows_field` serves its DEFAULT single head row and
-        # the scan reads a ONE-ROW PAGE — the row comes from the PAGE field, so the degrade branch is
-        # never reached (cycle 9 instrumented it: n=1 page rows, zero degrade hits). A synthesised
-        # candidate DOES reach the saturated refusal, but only when that sole candidate carries demand
-        # — a shape no arm drives. Naming it as the arm's shape was the cycle-9 F1 defect.)
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap)$(if [ "$queued" -gt "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window ($reads jobs read(s) spent, $GHOST_CACHED discounted from the ledger) — FAIL-CLOSED, changing nothing; this pass REMEMBERED what it proved, so the NEXT pass resumes where this one stopped, and a proof is never re-bought (agent-infra#4113); CI_GATE_QUEUE_HEAD_SCAN_MAX is a per-pass READ budget, not a bound on the region the scan can ever reach, so raising it buys reads, not reach"; return 2
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
@@ -987,18 +1482,7 @@ print(comp, len(inc))
   oldest_queued_s=""
   case "$demand_head_created" in
     '') : ;;
-    *)  oldest_queued_s="$(python3 -c '
-import datetime, sys
-t = sys.argv[1]
-try:
-    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-except ValueError:
-    sys.exit(1)
-age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
-if age < 0:
-    sys.exit(1)
-print(age)
-' "$demand_head_created" 2>/dev/null)" || oldest_queued_s="" ;;
+    *)  oldest_queued_s="$(ts_age "$demand_head_created")" || oldest_queued_s="" ;;
   esac
 
   # A queue with NOTHING DEMANDING in it has no head to age — either nothing is queued (an idle repo)
@@ -1007,7 +1491,7 @@ print(age)
   # as a STRING compare so it cannot run before `queued_demanding` has been shape-checked as a number.
   if [ "$queued_demanding" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS ghost_cached=$GHOST_CACHED queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
   ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
   ABSORPTION_DEMANDING="$queued_demanding"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
 
@@ -1060,6 +1544,13 @@ print(age)
       CENSUS_VERDICT=unknown; CENSUS_BLIND=1
       return 2
     fi
+    # ⛔ A MEASURABLE POOL CLEARS THE STREAK (agent-infra#4085). The alarm's self-expiry covers the
+    # gap case; this covers the fast one — the gate saw the pool, so the next blindness is a new
+    # episode and must not inherit a count from the last one.
+    # ⛔ A READ VERB CHANGES NOTHING (#3002, and #4085 review P2). `evaluate` runs BEFORE the DRY gate,
+    # so an unguarded clear here made `--dry-run` reset the escalation counter the gate exists to make
+    # trustworthy — MEASURED: a seeded streak was gone after a dry run.
+    [ "${DRY:-0}" = 0 ] && rm -f "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null || true
   else
     census_err="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$census_err")"
@@ -1119,48 +1610,21 @@ print(age)
     UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw depth $queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
-  # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
-  # (review P2). Reaching here means the LENGTH leg did NOT fire (`queued_demanding < QUEUE_THRESHOLD`
-  # — the operand that leg tests since #2344; the RAW `queued` may be at or above the threshold here,
-  # which is precisely what a ghost discount does), yet the
-  # queue is deeper than one page — which can only happen when an operator has raised
-  # QUEUE_THRESHOLD above the page size. In that state `oldest_queued_s` is a LOWER BOUND on the
-  # head's age (newest-first page), so a stalled queue can read young and the gate would certify
-  # healthy and strip the pool during a full stop. Could-not-measure (2) is this script's answer for
-  # every other unread operand; it is the answer here too, and the message names BOTH values so the
-  # misconfiguration is visible instead of silent.
-  # ⛔ THE PAGE-CEILING NOTE BELONGS ON THIS SURFACE TOO, AND ITS GATE IS THE BOUND (agent-infra#3995
-  # review, F2 — restored, with a presence arm, after the record asserted coverage that had been
-  # deleted). `queued > QUEUE_PAGE` means the single read that produced these rows could not carry the
-  # whole queue, and `per_page` is capped at 100 with larger values SILENTLY REDUCED — so no bound can
-  # read past it: raising the knob is not a remedy, and an operator must be told that before concluding
-  # the refusal is a knob problem.
-  # ⛔ THE GATE IS NOT WHAT MAKES THAT SENTENCE TRUE (cycle 9, P3 — the justification this line used to
-  # carry, "below the page the ceiling is not yet what stopped the pass (the knob still has room)", was
-  # FALSE HERE, and is corrected in place rather than deleted). This refusal's own condition
-  # (`queued > QUEUE_PAGE`, below) carries NO reference to the bound, so raising QUEUE_HEAD_SCAN_MAX
-  # cannot change it at ANY bound — the ceiling stops the pass at 25 exactly as it does at 100, and the
-  # suite measures the SAME refusal at both (`page-saturated` at the shipped bound,
-  # `page-saturated-at-page` at the ceiling). What the bound gate decides is therefore ADDRESS, not
-  # truth: the note names the ceiling only for an operator whose knob is VISIBLY maxed, i.e. who has
-  # already spent the obvious remedy. Below the page the identical advice is equally true and is
-  # withheld on ADDRESS alone, so the gate never implies the advice would be false there.
-  # ⛔ Do NOT read this as licence to relax the gate: the presence/absence pair is cycle-5 F2's restored
-  # two-sidedness and a recorded prescription on this PR, so changing the gate is a reopen, not a
-  # repair. (The TRUNCATED sibling's `scanned` gate is not an analogue: that one pins a fact about the
-  # LIST, this one a fact about the KNOB.)
-  # ⛔ AND IT DOES NOT CLAIM HOW MANY ROWS THE CANDIDATE LIST HELD (agent-infra#3995 review cycle 8,
-  # F1). `queued > QUEUE_PAGE` proves the PAGE REQUEST could not carry the queue; it says nothing about
-  # the list the scan read, which on this branch may be as little as ONE ROW. Measured: the cycle-7 arm
-  # `page-saturated-at-page` reads a ONE-ROW PAGE — it passes no `GH_QUEUE_ROWS_SPEC`, so the stub's
-  # `queue_rows_field` serves its DEFAULT single head row, and that row comes from the PAGE field, NOT
-  # the synthesised candidate on the degrade path above (cycle 9 instrumented the branch and measured
-  # n=1 page rows, zero degrade hits; naming the degrade shape was the cycle-9 F1 defect). Over that
-  # one-row list the old wording asserted "the candidate list is ONE page of 100 runs" — the
-  # misdiagnosis class this change exists to remove. The sentence now names the READ REQUEST and the
-  # QUEUE DEPTH, both established.
-  if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"
+  # ⛔ A QUEUE THIS PASS COULD NOT COVER LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather
+  # than certified (review P2, amended by agent-infra#4113). Reaching here means the LENGTH leg did NOT
+  # fire (`queued_demanding < QUEUE_THRESHOLD` — the operand that leg tests since #2344; the RAW
+  # `queued` may be at or above the threshold here, which is precisely what a ghost discount does),
+  # yet the queue is deeper than one page. ⛔ THE CONDITION IS NOW "COULD NOT COVER", NOT "DEEPER THAN A
+  # PAGE": the read above walks as many pages as the depth needs, so a deep queue is normally FULLY
+  # COVERED and the head it yields is a measurement, not a lower bound — refusing those passes was how
+  # a 150-deep queue on a served repo was refused every tick. What still cannot be covered is named:
+  # a degraded body that carried no row order at all, a short page, or a queue past the read cap. There
+  # `oldest_queued_s` IS only a LOWER BOUND on the head's age (the page is newest-first), so a stalled
+  # queue could read young and the gate would certify healthy and strip the pool during a full stop.
+  # Could-not-measure (2) is this script's answer for every other unread operand; it is the answer here
+  # too, and the message names BOTH values so the misconfiguration is visible instead of silent.
+  if [ "$queued" -gt "$QUEUE_PAGE" ] && [ "$queue_covered" != 1 ]; then
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) and this pass could not cover it (${queue_rows_count:-0} run row(s) read) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
     return 2
   fi
 
@@ -1572,18 +2036,85 @@ notify() { # $1 = text
 # same silence one step later. The stamp file means a restarting job cannot spam the lane.
 alarm_blind() { # $1 = the signature (what could not be measured, and why)
   local sig="$1" now last=0 stamp="$STATE_DIR/ci-runner-gate.blind"
+  local streak_file="$STATE_DIR/ci-runner-gate.blind-streak"
+  local defect_file="$STATE_DIR/ci-runner-gate.DEFECT"
+  local streak=0 prev_now=0 defect_after="$BLIND_DEFECT_AFTER"
   now="$(date -u +%s)"
+  # ⛔ THE STREAK IS SELF-EXPIRING, SO NO SUCCESS HOOK IS NEEDED (agent-infra#4085). Each pass is its
+  # own process, so "consecutive" can only be counted across passes in a file. A gap longer than
+  # BLIND_STREAK_RESET_S (default 3600 s) means the condition ENDED and this is a NEW episode, so the
+  # count restarts without any pass having to remember to clear it — a reset hook is a second thing
+  # that can be forgotten, and the direction it fails in is the silent one. The window is deliberately
+  # NOT the alarm interval: coupling them collapses it to "any gap" as soon as that interval is 0.
+  # ⛔ OUT-OF-RANGE REJECTS TOO, LIKE EVERY SIBLING KNOB (#4085 review P3). A shape check alone is not
+  # enough: an out-of-intmax value makes BOTH `[ "$defect_after" -lt 1 ]` and `[ "$streak" -ge
+  # "$defect_after" ]` error, and an errored arithmetic test reads as FALSE — so the DEFECT escalation
+  # this function exists to add would be silently disabled by an unvalidated operand (MEASURED:
+  # `[ 5 -ge 99999999999999999999 ]` -> `integer expression expected`, false). This was the one #4085
+  # knob that never got the >=10-digit arm that CENSUS_READ_ATTEMPTS, CENSUS_READ_BACKOFF_S,
+  # BLIND_STREAK_RESET_S and BLIND_DEFECT_EVERY_S all carry.
+  case "$defect_after" in ''|*[!0-9]*) defect_after=6 ;; ??????????*) defect_after=6 ;; esac
+  if [ "$defect_after" -lt 1 ]; then defect_after=1; fi
+  if [ -f "$streak_file" ]; then
+    read -r streak prev_now < "$streak_file" 2>/dev/null || true
+    case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+    case "$prev_now" in ''|*[!0-9]*) prev_now=0 ;; esac
+    # ⛔ OUT-OF-RANGE IS REJECTED TO THE DEFAULT, NOT LEFT TO ERROR (#4085 review round 2). An
+    # out-of-intmax value errors inside the arithmetic test, which reads as FALSE — i.e. it silently
+    # DISABLES the very record this issue adds, decided by nothing but an unvalidated operand.
+    case "$BLIND_STREAK_RESET_S" in ''|*[!0-9]*) local reset_s=3600 ;; ??????????*) local reset_s=3600 ;; *) local reset_s="$BLIND_STREAK_RESET_S" ;; esac
+    [ "$reset_s" -lt 1 ] && reset_s=3600
+    if [ "$prev_now" -gt 0 ] && [ "$((now - prev_now))" -gt "$reset_s" ]; then
+      streak=0
+    fi
+  fi
+  streak=$((streak + 1))
+  # ⛔ AN UNWRITABLE STREAK IS NAMED, NOT ABSORBED (#4085 review P3, same class as the DEFECT write).
+  # Without `set -e` a failed write here leaves the count advancing nowhere, so the escalation silently
+  # never fires — the exact silent-disarm this change removes.
+  printf '%s %s\n' "$streak" "$now" > "$streak_file" 2>/dev/null \
+    || log "BLIND streak WRITE FAILED -> ${streak_file} (streak=${streak}) — the escalation counter is NOT being persisted; unwritable or blocked STATE_DIR=${STATE_DIR}"
+  # ⛔ ESCALATION IS THE PART THAT WAS MISSING (#4085): 43 identical alarms produced no action. Past
+  # `BLIND_DEFECT_AFTER` consecutive blind passes a durable DEFECT record is appended — and the
+  # `BLIND_DEFECT_EVERY_S` time floor, not the threshold, decides how OFTEN it is written (one record
+  # per 6 h at the shipped values), so a month-long condition leaves a readable handful of records
+  # instead of a wall of repeats. ⛔ THIS RUNS BEFORE THE ALARM WINDOW IS CONSULTED, on purpose: a
+  # suppressed NOTIFICATION is not a suppressed CONDITION, and a record that depends on the notify
+  # interval disappears exactly when the pass rate outruns the interval — the long outage.
+  local escalation=""
+  if [ "$streak" -ge "$defect_after" ]; then
+    escalation=" This is now a RECURRING DEFECT: ${streak} consecutive blind passes."
+    local defect_stamp="${defect_file}.stamp" last_defect=0
+    case "$BLIND_DEFECT_EVERY_S" in ''|*[!0-9]*) local every_s=21600 ;; ??????????*) local every_s=21600 ;; *) local every_s="$BLIND_DEFECT_EVERY_S" ;; esac
+    [ "$every_s" -lt 1 ] && every_s=1
+    [ -f "$defect_stamp" ] && last_defect="$(sed -n 1p "$defect_stamp" 2>/dev/null)"
+    case "$last_defect" in ''|*[!0-9]*) last_defect=0 ;; esac
+    if [ "$last_defect" -eq 0 ] || [ "$((now - last_defect))" -ge "$every_s" ]; then
+      # ⛔ THE LOG LINE REPORTS THE WRITE'S OUTCOME (#4085 review P3). There is no `set -e` here, so an
+      # unconditional "recorded" log asserted a durable record on an unwritable STATE_DIR — a claim of
+      # a write that did not land, which is the same silence-as-reassurance shape #4085 removes. The
+      # throttle stamp is written ONLY on success: stamping a FAILED write would suppress the retry for
+      # a full `BLIND_DEFECT_EVERY_S` while nothing at all is on record.
+      if printf '%s\tstreak=%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$streak" "$sig" >> "$defect_file" 2>/dev/null; then
+        printf '%s\n' "$now" > "$defect_stamp" 2>/dev/null \
+          || log "BLIND DEFECT throttle-stamp WRITE FAILED -> ${defect_stamp} — the next pass may re-record"
+        log "BLIND DEFECT recorded -> ${defect_file} (streak=$streak, at most one per ${every_s}s)"
+      else
+        log "BLIND DEFECT WRITE FAILED -> ${defect_file} (streak=$streak) — the CONDITION IS UNRECORDED, not absent; unwritable or blocked STATE_DIR=${STATE_DIR}"
+      fi
+    fi
+  fi
   if [ -f "$stamp" ]; then
     last="$(sed -n 1p "$stamp" 2>/dev/null)"
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
   fi
   if [ "$last" -gt 0 ] && [ "$((now - last))" -lt "$BLIND_ALARM_EVERY_S" ]; then
-    log "BLIND alarm SUPPRESSED (sent $((now - last))s ago, floor ${BLIND_ALARM_EVERY_S}s) — ${sig}"
+    log "BLIND alarm SUPPRESSED (sent $((now - last))s ago, floor ${BLIND_ALARM_EVERY_S}s) — ${sig}${escalation}"
     return 0
   fi
   printf '%s\n' "$now" > "$stamp"
-  notify ":warning: CI runner gate is BLIND — ${sig}. It is refusing to certify capacity (exit 2, changing nothing). Repo: ${REPO}."
-  log "BLIND alarm SENT (at most one per ${BLIND_ALARM_EVERY_S}s while the condition lasts)"
+  notify ":warning: CI runner gate is BLIND — ${sig}. It is refusing to certify capacity (exit 2, changing nothing). Repo: ${REPO}.${escalation}"
+  log "BLIND alarm SENT (at most one per ${BLIND_ALARM_EVERY_S}s while the condition lasts; streak=${streak}${escalation})"
 }
 
 # ── main ────────────────────────────────────────────────────────────────────────

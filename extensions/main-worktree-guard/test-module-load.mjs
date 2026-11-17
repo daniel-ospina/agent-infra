@@ -35,7 +35,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-module-load.mjs
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -393,6 +393,231 @@ async function partB() {
     const reset = await callBash("git reset --hard origin/main");
     expectTrue("B6b: `git reset --hard` is blocked by the loaded extension end-to-end",
       !!reset && reset.block === true, `handler returned ${JSON.stringify(reset)}`);
+
+    // ── B10: #594 — the git ALIAS indirection layer and the untracked
+    //    ref-write forms are GATED end-to-end (probe-verified bypasses: each of
+    //    these moved a branch ref rc 0 while the pre-#594 classifier returned
+    //    verdict "allow" + branchState false, so no arm ever ran) ──
+    const aliasVisible = await callBash("git -c alias.co='checkout victim' co");
+    expectTrue("B10a: #594 a statically-visible alias invocation is BLOCKED (the alias is EXPANDED)",
+      !!aliasVisible && aliasVisible.block === true,
+      `handler returned ${JSON.stringify(aliasVisible)} — the walk classified verb "co" instead of "checkout"`);
+    const aliasPersist = await callBash("git config alias.x 'branch -fq victim main' && git x");
+    expectTrue("B10b: #594 persist-then-invoke alias (`git config alias.x … && git x`) is BLOCKED",
+      !!aliasPersist && aliasPersist.block === true, `handler returned ${JSON.stringify(aliasPersist)}`);
+    const aliasOpaque = await callBash("git br");
+    expectTrue("B10c: #594 an alias whose definition is NOT visible (persisted config) is BLOCKED, naming the indirection",
+      !!aliasOpaque && aliasOpaque.block === true && /alias/i.test(String(aliasOpaque.reason ?? aliasOpaque.message ?? "")),
+      `handler returned ${JSON.stringify(aliasOpaque)}`);
+    const aliasBenign = await callBash("git -c alias.lg='log --graph' lg");
+    expectTrue("B10d: control — a READ-ONLY visible alias expands to `log` and stays ALLOWED",
+      aliasBenign === undefined, `handler returned ${JSON.stringify(aliasBenign)}`);
+    // ⛔ GIT'S PRECEDENCE (probe-verified): builtin > `git-<cmd>` on PATH >
+    // alias, so a BUILTIN-named alias definition is never used. Expanding it
+    // would have classified `reset --hard` as the ignored alias value — a false
+    // ALLOW of a destructive command.
+    const aliasShadow = await callBash("git -c alias.reset=status reset --hard");
+    expectTrue("B10d2: #594 a builtin-named alias CANNOT mask `reset --hard` (still BLOCKED)",
+      !!aliasShadow && aliasShadow.block === true, `handler returned ${JSON.stringify(aliasShadow)}`);
+    // ── B10p1: review P1 — MEASURED FALSE REFUSAL. The alias net may cover only
+    //    a verb an ALIAS CAN WIN. git's precedence (probe-verified) is builtin >
+    //    `git-<cmd>` on the exec path/PATH > alias, so a RESIDENT git extension
+    //    can NEVER be shadowed by an alias — yet it was classified `aliasOpaque`,
+    //    which refused `git lfs pull` and a post-clone `git submodule update
+    //    --init` in EVERY checkout, in every repo, though neither moves branch
+    //    state. The controls below are load-bearing: without them this would be a
+    //    deletion of the class rather than a narrowing of it.
+    const extDir = mkdtempSync(join(tmpdir(), "mwg594-ext-"));
+    const prevPath = process.env.PATH;
+    try {
+      const fakeExt = join(extDir, "git-fx594ext");
+      writeFileSync(fakeExt, "#!/bin/sh\nexit 0\n");
+      chmodSync(fakeExt, 0o755);
+      process.env.PATH = extDir + ":" + prevPath;
+      const resident = await callBash("git fx594ext pull");
+      expectTrue("B10p1a: #594 a RESIDENT `git-<cmd>` invocation is ALLOWED — no alias can shadow it (P1 false refusal)",
+        resident === undefined, `handler returned ${JSON.stringify(resident)}`);
+      // A REAL resident extension, resolved through git's EXEC PATH rather than
+      // PATH: `git-submodule` lives in `<git --exec-path>`, which is on no shell
+      // PATH and which git prepends to its own lookup before `git-<cmd>`.
+      const submodule = await callBash("git submodule update --init --recursive");
+      expectTrue("B10p1b: …and a real one too — `git submodule update --init` (resident in git's exec path) is not alias-shadowable",
+        submodule === undefined, `handler returned ${JSON.stringify(submodule)}`);
+      // CONTROL: an uninstalled verb HAS no `git-<verb>` anywhere, so a persisted
+      // alias could be what git resolves — the class must still fail closed.
+      const absent = await callBash("git fx594absent pull");
+      expectTrue("B10p1c: control — a verb with NO `git-<verb>` on PATH stays alias-opaque BLOCKED (an alias could win it)",
+        !!absent && absent.block === true && /alias/i.test(String(absent.reason ?? absent.message ?? "")),
+        `handler returned ${JSON.stringify(absent)}`);
+    } finally {
+      process.env.PATH = prevPath;
+      try { rmSync(extDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    // ── B10p2: round-11 P2 — THE SEARCH RUNS IN THE CHILD'S ENV, NOT THE GUARD'S
+    //    The exemption above is bought by an executable GIT must find, and git
+    //    searches the environment the command is EXECUTED with. The walker already
+    //    carries that env's `VAR=value` prefixes (`inv.envPrefixes`), so a prefix
+    //    that RESTRICTS `PATH` (or REPLACES `GIT_EXEC_PATH`) narrows what git can
+    //    resolve. Reading only the guard's own `process.env` bought the exemption
+    //    with a shim git would never find, and a persisted `alias.<verb>` then ran
+    //    unclassified: measured on the pre-fix head, `PATH=/usr/bin:/bin git
+    //    fx594ext` executed a persisted `alias.fx594ext='branch -fq victim594
+    //    main'` (branch created) while the classifier answered `branchState:false`.
+    const extEnvDir = mkdtempSync(join(tmpdir(), "mwg594childenv-"));
+    const prevEnvPath = process.env.PATH;
+    try {
+      const shim = join(extEnvDir, "git-fx594env");
+      writeFileSync(shim, "#!/bin/sh\nexit 0\n");
+      chmodSync(shim, 0o755);
+      process.env.PATH = extEnvDir + ":" + prevEnvPath;
+      const childSees = await callBash("git fx594env pull");
+      expectTrue("B10p2a: control — a `git-<cmd>` the CHILD can find stays ALLOWED (no over-block)",
+        childSees === undefined, `handler returned ${JSON.stringify(childSees)}`);
+      const childBlind = await callBash("PATH=/usr/bin:/bin git fx594env pull");
+      expectTrue("B10p2b: #594 a `PATH` prefix that HIDES the shim from the child leaves the verb opaque BLOCKED (the exemption needs an executable GIT can find)",
+        !!childBlind && childBlind.block === true, `handler returned ${JSON.stringify(childBlind)}`);
+      const childBlindEnv = await callBash("env PATH=/usr/bin:/bin git fx594env pull");
+      expectTrue("B10p2c: …the same through `env` (its assignments are argv, not the shell's)",
+        !!childBlindEnv && childBlindEnv.block === true, `handler returned ${JSON.stringify(childBlindEnv)}`);
+    } finally {
+      process.env.PATH = prevEnvPath;
+      try { rmSync(extEnvDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    // The exec-path half, on a FRESH module instance: git's `git_exec_path()`
+    // RETURNS `GIT_EXEC_PATH` when the child sets it (it does not append to it), so
+    // a shim reachable ONLY through the guard's own exec path must stop buying the
+    // exemption once the child replaces that variable. A fresh instance is needed
+    // because the list is probed once per module lifetime, by design.
+    const execShimDir = mkdtempSync(join(tmpdir(), "mwg594execpath-"));
+    const execEmptyDir = mkdtempSync(join(tmpdir(), "mwg594execnone-"));
+    const prevExecPath = process.env.GIT_EXEC_PATH;
+    try {
+      const execShim = join(execShimDir, "git-fx594exe");
+      writeFileSync(execShim, "#!/bin/sh\nexit 0\n");
+      chmodSync(execShim, 0o755);
+      process.env.GIT_EXEC_PATH = execShimDir;
+      const fresh = await import(`${pathToFileURL(join(HERE, "classify-git.mjs")).href}?childenv=${Date.now()}`);
+      expectTrue("B10p2d: control — a shim reachable only via the guard's own GIT_EXEC_PATH is exempt (no over-block)",
+        fresh.classifyGitCommandDetailed("git fx594exe pull").branchState === false,
+        `branchState=${fresh.classifyGitCommandDetailed("git fx594exe pull").branchState}`);
+      const replaced = fresh.classifyGitCommandDetailed(`GIT_EXEC_PATH=${execEmptyDir} git fx594exe pull`);
+      expectTrue("B10p2e: #594 a child `GIT_EXEC_PATH` REPLACES git's exec path — the shim is gone, so the verb is opaque (fail closed)",
+        replaced.branchState === true, `branchState=${replaced.branchState}`);
+      // ── B10p3: review round 12 — `--exec-path=<dir>` is git's THIRD and HIGHEST-
+      //    precedence exec-path channel: `handle_options` hands it to
+      //    `git_set_exec_path()`, and `git_exec_path()` then returns THAT value, so
+      //    `setup_path()` prepends it INSTEAD of `GIT_EXEC_PATH` and instead of the
+      //    built-in gitexecdir (git.c:163-166, :913-918; exec-cmd.c:281-325 at the
+      //    v2.43.0 this box runs). The walk dropped the flag, so `_gitExternalOnPath`
+      //    resolved against the GUARD's exec path (here: `GIT_EXEC_PATH=<shim dir>`
+      //    from the block above) and bought the exemption for a lookup git could
+      //    not satisfy — git then fell through to a persisted `alias.fx594exe`.
+      //    Measured pre-fix: `alias.submodule='branch -fq victim'` +
+      //    `git --exec-path=<empty> submodule master` force-moved the ref rc 0 while
+      //    the classifier answered `branchState:false` (ALLOW).
+      const optResident = fresh.classifyGitCommandDetailed(`git --exec-path=${execShimDir} fx594exe pull`);
+      expectTrue("B10p3a: control — an `--exec-path=` dir that HOLDS the `git-<cmd>` still buys the exemption (the option's dir is searched, no over-block)",
+        optResident.branchState === false, `branchState=${optResident.branchState}`);
+      const optReplaced = fresh.classifyGitCommandDetailed(`git --exec-path=${execEmptyDir} fx594exe pull`);
+      expectTrue("B10p3b: #594 `--exec-path=<empty>` REPLACES the exec path (the guard's own `GIT_EXEC_PATH` must not survive it) — the shim is unreachable, so the verb is aliasOpaque (fail closed)",
+        optReplaced.branchState === true, `branchState=${optReplaced.branchState}`);
+      const optLast = fresh.classifyGitCommandDetailed(`git --exec-path=${execEmptyDir} --exec-path=${execShimDir} fx594exe pull`);
+      expectTrue("B10p3c: …and the LAST `--exec-path=` wins, as git applies them in turn, so the shim is found again (not a blanket refusal of the spelling)",
+        optLast.branchState === false, `branchState=${optLast.branchState}`);
+      const optUnreadable = fresh.classifyGitCommandDetailed("git --exec-path=$MWG594_UNSET_VAR fx594exe pull");
+      expectTrue("B10p3d: an `--exec-path=$VAR` whose value the walk never saw set stays opaque — unreadable, never a silent admission",
+        optUnreadable.branchState === true, `branchState=${optUnreadable.branchState}`);
+    } finally {
+      if (prevExecPath === undefined) delete process.env.GIT_EXEC_PATH;
+      else process.env.GIT_EXEC_PATH = prevExecPath;
+      for (const d of [execShimDir, execEmptyDir]) {
+        try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
+    // ── B10p3e/f: the same channel at the HANDLER layer, on git's OWN resident
+    //    extension (host-independent: `git-submodule` lives in `<git --exec-path>`,
+    //    which is on no shell PATH, and B10p1b already relies on that). Pre-fix the
+    //    guard resolved `git-submodule` through its own exec path and exempted the
+    //    verb while GIT — told `--exec-path=<empty>` — could not find it at all and
+    //    fell through to a persisted `alias.submodule` (measured ref force-move).
+    const optEmptyDir = mkdtempSync(join(tmpdir(), "mwg594optnone-"));
+    try {
+      const subOptNone = await callBash(`git --exec-path=${optEmptyDir} submodule master`);
+      expectTrue("B10p3e: #594 `--exec-path=<empty> submodule master` is BLOCKED aliasOpaque (pre-fix: the guard's exec path exempted it, so a persisted `alias.submodule` ran)",
+        !!subOptNone && subOptNone.block === true && /alias/i.test(String(subOptNone.reason ?? subOptNone.message ?? "")),
+        `handler returned ${JSON.stringify(subOptNone)}`);
+      const subOptReal = await callBash(`git --exec-path=${execSync("git --exec-path", { encoding: "utf-8" }).trim()} submodule update --init --recursive`);
+      expectTrue("B10p3f: control — pointing `--exec-path=` at the REAL exec dir keeps the resident extension ALLOWED (the option is MODELLED, not refused)",
+        subOptReal === undefined, `handler returned ${JSON.stringify(subOptReal)}`);
+    } finally {
+      try { rmSync(optEmptyDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    // CONTROL: where an alias genuinely CAN win, the destructive shape is still
+    // gated exactly as it was (the review's verified `branch(op=force)` case).
+    const aliasWins = await callBash("git -c alias.x='branch -fq victim main' x");
+    expectTrue("B10p1d: control — where an alias CAN win, `git -c alias.x='branch -fq victim main' x` is still a force BLOCK",
+      !!aliasWins && aliasWins.block === true, `handler returned ${JSON.stringify(aliasWins)}`);
+    // The classifier's OWN sentinel is not a spelled verb: `__unverifiable__` marks a
+    // multiword `$VAR` command word, which git never receives as a name, so an alias
+    // lookup cannot apply to it. #607 (a recorded decision) admits the read form.
+    const varWord = await callBash('G="git log --oneline"; $G');
+    expectTrue("B10p1e: …and a `$VAR` command word holding a READ is ALLOWED again (the `__unverifiable__` sentinel is not an alias candidate, #607)",
+      varWord === undefined, `handler returned ${JSON.stringify(varWord)}`);
+    const symRefWrite = await callBash("git symbolic-ref refs/heads/victim2 refs/heads/main");
+    expectTrue("B10e: #594 `git symbolic-ref refs/heads/<b> <target>` is BLOCKED",
+      !!symRefWrite && symRefWrite.block === true && /Ref write blocked/.test(String(symRefWrite.reason ?? "")),
+      `handler returned ${JSON.stringify(symRefWrite)}`);
+    const updateStdin = await callBash("git update-ref --stdin");
+    expectTrue("B10f: #594 `git update-ref --stdin` is BLOCKED (refs named on stdin)",
+      !!updateStdin && updateStdin.block === true, `handler returned ${JSON.stringify(updateStdin)}`);
+    const updateMsg = await callBash("git update-ref -m why refs/heads/victim3 HEAD");
+    expectTrue("B10g: #594 `git update-ref -m <reason> refs/heads/<b>` is BLOCKED (the -m VALUE is not a ref)",
+      !!updateMsg && updateMsg.block === true, `handler returned ${JSON.stringify(updateMsg)}`);
+    const symRefQuery = await callBash("git symbolic-ref HEAD");
+    expectTrue("B10h: control — a bare `git symbolic-ref HEAD` QUERY stays ALLOWED",
+      symRefQuery === undefined, `handler returned ${JSON.stringify(symRefQuery)}`);
+    const symRefRead = await callBash("git symbolic-ref refs/heads/main");
+    expectTrue("B10i: control — `git symbolic-ref refs/heads/main` (single positional = QUERY) stays ALLOWED",
+      symRefRead === undefined, `handler returned ${JSON.stringify(symRefRead)}`);
+    // Round-2 review findings, at the handler layer.
+    const aliasSegOrder = await callBash("git -c alias.x='branch -fq victimA main' x && git -c alias.x=status x");
+    expectTrue("B10j: #594 a LATER benign redefinition does not launder an EARLIER destructive alias segment",
+      !!aliasSegOrder && aliasSegOrder.block === true, `handler returned ${JSON.stringify(aliasSegOrder)}`);
+    const clusteredM = await callBash("git symbolic-ref -qm why refs/heads/v2 refs/heads/main");
+    expectTrue("B10k: #594 `-qm why` (clustered -m value slot) is BLOCKED",
+      !!clusteredM && clusteredM.block === true, `handler returned ${JSON.stringify(clusteredM)}`);
+    // ⛔ P1 (measured false refusal): `git p4` was this row's probe and it is the
+    // WRONG probe — `git-p4` IS a resident executable in `<git --exec-path>`
+    // (172866 bytes, mode 755, in the same directory as `git-submodule`), so git
+    // resolves it ahead of any alias and no alias can shadow it. Refusing it was
+    // the over-block the review measured, not a fail-closed win. The row's INTENT
+    // — a verb NOTHING can resolve is never trusted — is unchanged; the probe is
+    // now a name with no `git-<name>` anywhere, i.e. the case an alias CAN win.
+    const nonBuiltin = await callBash("git fx594absent");
+    expectTrue("B10l: #594 a verb with no `git-<verb>` resolvable and no visible definition (`git fx594absent`) is BLOCKED, not trusted",
+      !!nonBuiltin && nonBuiltin.block === true, `handler returned ${JSON.stringify(nonBuiltin)}`);
+    const transientLeak = await callBash("git -c alias.br=status br && git br");
+    expectTrue("B10m: #594 a transient `-c` does not license a later segment's persisted alias",
+      !!transientLeak && transientLeak.block === true, `handler returned ${JSON.stringify(transientLeak)}`);
+
+    // ── B11: #594 (round 6) — the WORKTREE exemption is not universal ──
+    // A linked worktree's checkout is its own, but the REF NAMESPACE is shared
+    // with the hub and every sibling worktree, and an unreadable verb cannot
+    // establish locality at all (it may carry `-C <hub>`). Both were reproduced
+    // rc 0 from a linked worktree at the previous head.
+    const probeWt = join(tmp, "hub-wt");
+    execSync(`git -C "${repo}" worktree add -q -b ${JSON.stringify("wt-probe")} "${probeWt}"`, { stdio: "ignore" });
+    process.chdir(probeWt);
+    const wtRefWrite = await callBash("git symbolic-ref refs/heads/wtvictim refs/heads/main");
+    expectTrue("B11a: #594 a `ref-write` from a LINKED WORKTREE is BLOCKED (shared ref namespace)",
+      !!wtRefWrite && wtRefWrite.block === true, `handler returned ${JSON.stringify(wtRefWrite)}`);
+    const wtOpaque = await callBash("git br");
+    expectTrue("B11b: #594 an opaque alias invocation from a LINKED WORKTREE is BLOCKED (locality unprovable)",
+      !!wtOpaque && wtOpaque.block === true, `handler returned ${JSON.stringify(wtOpaque)}`);
+    const wtBranchForce = await callBash("git branch -f wtvictim2 main");
+    expectTrue("B11c: control — an ordinary branch-state op from a LINKED WORKTREE keeps its existing exemption",
+      wtBranchForce === undefined, `handler returned ${JSON.stringify(wtBranchForce)}`);
+    process.chdir(repo);
 
     // ── B9: #1144 — the shared-baseline sync allowance is EFFECT-shaped ──
     // The allowance is BASELINE-keyed, so the session baseline must be
@@ -1334,11 +1559,44 @@ async function partB() {
     expectTrue("#607 predicate: a TWO-positional `symbolic-ref` DOES write, so it IS a hidden mutation (the read narrowing is not blanket)",
       classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation === true,
       JSON.stringify(classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation));
-    expectTrue("#607 predicate: `update-ref <ref>` alone is a USAGE ERROR (rc 129, moves nothing) — not a hidden mutation; `--stdin`/`<ref> <new>` are",
-      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === false
-      && classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
+    expectTrue("#607 predicate: `update-ref <ref>` alone — no hidden mutation on the READ side; `--stdin`/`<ref> <new>` are [flipped by #594 round 16, see below]",
+      classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
       && classify607('echo "$(git update-ref refs/heads/x HEAD)"').hiddenStateMutation === true,
       "update-ref arity narrowing is wrong");
+    // ⛔ #594 (review round 16, P2): the substitution surface held the THIRD copy of
+    // the ref-write reading (`_argAwareBranchStateMutation`) and still compared the
+    // EXACT tokens `-d`/`--delete`/`--stdin`. Every clustered/abbreviated spelling
+    // the DIRECT surface already blocks was therefore admitted behind a `$( … )`,
+    // and `hiddenStateMutation` is the only input to index.ts's
+    // `hiddenBranchStateRefusal` — so these moved a hub branch while the direct
+    // spelling of the same command was already blocked. Measured at `c666b162`
+    // against git 2.43.0 in a throwaway repo: each row below is rc 0 and the ref
+    // really moves, while the head reported `hiddenStateMutation: false`.
+    expectTrue("#594-R16a: `$(git symbolic-ref -qd <ref>)` (clustered delete) IS a hidden mutation — the exact-token `-d` test missed it",
+      classify607('git log "$(git symbolic-ref -qd refs/heads/victim)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('git log "$(git symbolic-ref -qd refs/heads/victim)"').hiddenStateMutation));
+    expectTrue("#594-R16b: `$(git symbolic-ref --del <ref>)` (unambiguous prefix) IS a hidden mutation",
+      classify607('git log "$(git symbolic-ref --del refs/heads/victim3)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('git log "$(git symbolic-ref --del refs/heads/victim3)"').hiddenStateMutation));
+    expectTrue("#594-R16c: `$(… | git update-ref --stdi)` (parse-options prefix of `--stdin`) IS a hidden mutation",
+      classify607(`git log "$(printf 'update refs/heads/v2 HEAD\\n' | git update-ref --stdi)"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`git log "$(printf 'update refs/heads/v2 HEAD\\n' | git update-ref --stdi)"`).hiddenStateMutation));
+    // ── #594-R16 negative controls: the delegation did NOT become blanket ─────
+    expectTrue("#594-R16d: the #607 documented READ `$(git symbolic-ref --short HEAD)` is STILL not a hidden mutation",
+      classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation));
+    expectTrue("#594-R16e: a `refs/tags/**` symref write is NOT branch state — the delegation keeps the direct surface's own namespace boundary",
+      classify607('echo "$(git symbolic-ref refs/tags/x refs/heads/y)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('echo "$(git symbolic-ref refs/tags/x refs/heads/y)"').hiddenStateMutation));
+    // #594 round 16 REVERSES one #607 pin, deliberately and for the reason the
+    // review gave: `_argAwareBranchStateMutation` now reaches the SAME
+    // `updateRefWriteTarget` the direct surface uses, and that predicate returns a
+    // write for a bare `<ref>` ("today's behaviour and the over-block is free" —
+    // an rc-129 no-op). Reading it the other way here would be exactly the split
+    // reading this round removed, so the pin moves with it and says why.
+    expectTrue("#594-R16f: a bare `$(git update-ref <ref>)` is a hidden mutation too — the direct surface's historic over-block, now read ONCE",
+      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation));
 
     // ── NO worktree exemption — and this is the SECOND attempt at one ────────
     // ATTEMPT 1 exempted a session whose cwd resolved to a worktree, on the

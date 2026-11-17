@@ -77,10 +77,37 @@ SH
   printf 'base\n' > "$d/repo/base.txt"
   "$REAL_GIT" -C "$d/repo" add -A
   "$REAL_GIT" -C "$d/repo" commit -qm init
+  # ⛔ THE PUSH TARGET IS A LOCAL BARE REPO, WHILE `origin` STILL NAMES THE REAL SLUG (review P2,
+  # MEASURED). The lane's exit path is not read-only: `terminal_wip_rescue` → `lane_end_push` approves
+  # `ls-remote --symref` and then `git push origin HEAD:refs/heads/$BR` the moment the unpushed count is
+  # positive — which it is for every arm whose stub commits. With `origin` pointed at the production
+  # `https://github.com/$SLUG.git` that push is two network calls per run and, on a box holding a
+  # credential helper, a SUCCESSFUL write of a stray branch into the real repository — after which the
+  # delivery read answers `delivered` and 10b/10b2 go red for a reason unrelated to the code.
+  # ⇒ Two URLs, one remote, and both are honest: `remote.origin.url` stays the GitHub URL because that is
+  # what the lane's identity gate reads (`repo-target.sh` compares the artifact's slug with the target, and
+  # a local-path remote cannot NAME a repo — it refuses 72), while `remote.origin.pushurl` is the fixture's
+  # own bare repository. `lane_end_push` resolves and PROVES its target from `get-url --push`, so every
+  # read and the write address the same, local, repository — a real push that can succeed (10a) or be
+  # refused (10b), with no network and no credential.
+  "$REAL_GIT" init -q --bare -b main "$d/origin.git"
   "$REAL_GIT" -C "$d/repo" remote add origin "https://github.com/$SLUG.git"
+  "$REAL_GIT" -C "$d/repo" config remote.origin.pushurl "$d/origin.git"
+  "$REAL_GIT" -C "$d/repo" push -q "$d/origin.git" main:refs/heads/main
   "$REAL_GIT" -C "$d/repo" worktree add -q "$d/repo/.worktrees/tm-3331" -b "$BR" main
+  "$REAL_GIT" -C "$d/repo/.worktrees/tm-3331" update-ref refs/remotes/origin/main \
+    "$("$REAL_GIT" -C "$d/repo" rev-parse main)"
   ARMDIR="$d"
   ARMWT="$d/repo/.worktrees/tm-3331"
+}
+
+# reject_pushes <arm> — install a pre-receive hook on the fixture's origin that refuses every push.
+# ⛔ THE #4009/#4012 SHAPE IS "COMMITTED, AND THE PUSH DID NOT LAND", not "no push was attempted": the
+# harness's exit path DOES try (`lane_end_push`) and can fail, be refused or be impossible, and the arm has
+# to pin the state a reader sees afterwards. A local hook makes that refusal deterministic and offline.
+reject_pushes() { # <armdir>
+  printf '#!/bin/sh\necho "fixture: pushes refused" >&2\nexit 1\n' > "$1/origin.git/hooks/pre-receive"
+  chmod +x "$1/origin.git/hooks/pre-receive"
 }
 
 # ⛔ `ENV_FILE` IS PINNED TO A FIXTURE-OWNED (ABSENT) FILE, AND THAT IS NOT COSMETIC — IT IS WHAT MAKES
@@ -103,12 +130,20 @@ SH
 # key arm flip to `done` — green on a deepseek box, red on a zai one. `provider-credential.test.sh` already
 # scrubs exactly these two for exactly this reason; this suite now does the same.
 #
+# ⛔ `WIP_PATH` IS SCRUBBED FOR THE SAME REASON `ENV_FILE` IS, AND IT IS THE SHARPER CASE (measured
+# 2026-11-13 on this very suite). `terminal_wip_rescue` measures `${WIP_PATH:-$PWD}`, and a HARNESS
+# DISPATCHED AGENT SESSION EXPORTS IT — every lane's own shell carries `WIP_PATH=<its worktree>`. So on the
+# box this suite runs on, every arm measured the CALLER's checkout instead of its own fixture: the tree
+# read `dirty` (the agent's live edits), the delivery arms all answered `uncommitted-N`, and the exit path
+# attempted a `bg-rescue-wip.sh` archive of the wrapper's own branch against the REAL origin. A fixture
+# that inherits the runner's environment is green on an idle box and red on a working one.
+#
 # drive <worktree> [<VAR>=<value> …] — run the SHIPPED lane.sh in that worktree; echoes nothing, sets
 # LANE_RC. `pi` must already be exported by the caller. `TARGET_SLUG` overrides the repo the lane is told
 # to work on (arm 7d uses a WRONG one on purpose, to reach a refusal with a dry run).
 drive() {
   local wt="$1"; shift
-  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL -u WIP_PATH \
       O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
@@ -120,7 +155,7 @@ drive() {
 # arms have to prove BOTH that the flag works and that the variable does NOT.
 drivef() {
   local wt="$1"; shift
-  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL -u WIP_PATH \
       O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" \
@@ -130,7 +165,7 @@ drivef() {
 # drive_bg <worktree> — the same, in the background, so a signal can reach the LANE process.
 drive_bg() {
   local wt="$1"; shift
-  ( cd "$wt" && exec env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+  ( cd "$wt" && exec env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL -u WIP_PATH \
       O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
@@ -432,6 +467,15 @@ RUNOUT="$ARMDIR/o/logs/lane-3331.outcome"
 [ -s "$RUNOUT" ]; ck "2d the run-scoped verdict file exists (logs/lane-<N>.outcome)" $?
 eqv "$(cat "$RUNOUT" 2>/dev/null)" "$(lastline)" "2e …and carries the SAME line the log ends on"
 printf 'outcome=failed reason=STALE-PREVIOUS-RUN lane=3331 rc=9 utc=1999-01-01T00:00:00Z\n' > "$RUNOUT"
+# ⛔ THE FIRST RUN RECLAIMED THE WORKTREE, AND THAT IS THE SHIPPED BEHAVIOUR, NOT A FIXTURE BUG
+# (`lane_exit_cleanup` → `wt_reap_if_empty`: a lane that produced no commits must not leave a checkout
+# behind, #2033). This arm needs a SECOND dispatch into the same `$O`, so it re-creates the checkout
+# explicitly instead of relying on an unclean tree to keep it alive — which is what it silently relied on
+# before, because the fixture inherited the RUNNER's `WIP_PATH` and measured the runner's dirty checkout.
+# ⛔ `-b $BR` AGAIN, BECAUSE THE RECLAIM TOOK THE BRANCH TOO: `wt_reap_if_empty` removes a worktree the lane
+# left with nothing on it, and the branch it held (0 commits ahead) goes with it — so a later `worktree add
+# <path> <branch>` answers `fatal: invalid reference`. Re-creating the pair is the honest fixture.
+"$REAL_GIT" -C "$ARMDIR/repo" worktree add -q "$ARMWT" -b "$BR" main 2>/dev/null || true
 drive "$WT" LANE_DRY_RUN=1
 has "$(cat "$RUNOUT" 2>/dev/null)" "reason=dry-run" "2f a re-dispatch OVERWRITES it — a pre-seeded previous-run verdict is gone, so no reader can act on it"
 hasnt "$(cat "$RUNOUT" 2>/dev/null)" "STALE-PREVIOUS-RUN" "2g …and the stale line does not survive anywhere in the run-scoped read"
@@ -580,13 +624,13 @@ done
 # its name in the contract reddens here rather than in an operator's misread.
 _gates="$(sed -n '/^cap_refusal_gate()/,/^}/p' "$(dirname "$LANE")/chain-merge.sh" \
           | sed -n 's/^[[:space:]]*\([a-z][a-z-]*\))[[:space:]]*printf.*/\1/p' | sort -u | paste -sd ',' -)"
-eqv "$_gates" "capability,disk,fork,key,land,mem,skew" \
-    "4e the normaliser's own vocabulary is the expected named arms — eight of them, load being the FOLD and not an arm"
+eqv "$_gates" "capability,disk,fork,key,land,mem,skew,stale" \
+    "4e the normaliser's own vocabulary is the expected named arms — all of them but \`load\`, which is the FOLD and not an arm"
 _fmt="$(sed -n '/^# FORMAT — one line/,/^# (`land` is the CREATION/p' "$LANE")"
-for _g in load disk land fork capability skew key mem; do
+for _g in load disk land fork capability skew key mem stale; do
   has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
 done
-has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight)"
+has "$_fmt" "NINE refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight, then EIGHT beside the nine #3932 added)"
 # ⛔ LOCATE THE DECLARATION BY NAME, NOT BY LINE NUMBER (agent-infra#2095). This read used to be
 # `head -n 80 … | grep -n '^cap_refusal_gate()'`, which gave the three arms below a SECOND, unstated
 # precondition: that no unrelated change ever pushes the function past line 80. #2095 adds lines of
@@ -597,7 +641,7 @@ has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it 
 # and the contract lives ON the declaration line; position was never part of it. Same class as the
 # #2095 P0: an assertion that silently encoded a positional assumption the diff never mentioned.
 _ret="$(grep -n '^cap_refusal_gate()' "$(dirname "$LANE")/chain-merge.sh" | head -1)"
-for _g in key skew mem; do
+for _g in key skew mem stale; do
   has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
 done
 
@@ -712,6 +756,13 @@ has "$(cat "$(LOG)" 2>/dev/null)" "check=warn reason=box-default-not-provisioned
     "7h2 the fixture really printed the companion's warn line FIRST (else the arm measures nothing)"
 has "$(lastline)" "keygate=checked " "7h3 …and the terminal line still reports the VERDICT (checked), not the companion's warning nor notrun"
 : > "$PI_MARK"
+# ⛔ THE FIRST DRIVE RECLAIMED THE WORKTREE, AND THAT IS THE SHIPPED BEHAVIOUR, NOT A FIXTURE BUG
+# (`lane_exit_cleanup` → `wt_reap_if_empty`: a lane that produced no commits must not leave a checkout
+# behind, #2033) — the same pair the 2f arm re-creates for the same reason. ⛔ AND IT ONLY BECAME VISIBLE
+# WHEN THE FIXTURE STOPPED INHERITING THE RUNNER'S `WIP_PATH`: the dirty checkout of whichever tree ran
+# this suite used to make the probe refuse the reap, so this arm silently depended on the runner's state.
+# `-b $BR` again because the reap took the branch with it.
+"$REAL_GIT" -C "$ARMDIR/repo" worktree add -q "$ARMWT" -b "$BR" main 2>/dev/null || true
 LANE_BIN="$STUBH/lane.sh" drive "$WT" "KG_STUB_REFUSE=1"
 eqv "$LANE_RC" "82" "7h4 the same stub refuses with 82 when told to"
 has "$(lastline)" "keygate=refused " "7h5 …and that refusal is reported as keygate=refused, not notrun (a warn-first refusal used to read as a harness bug)"
@@ -932,6 +983,138 @@ pi() {
 export -f pi
 drive "$WT" "$KEYVAR=sk_fixture"
 check_terminal "9h" failed "agent-exit-1" 1
+
+# ═══ 10. THE LANE'S PRODUCT IS A PUSHED HEAD, NOT THE AGENT'S EXIT STATUS (agent-infra#4047) ═══
+# MEASURED: ten lanes were dispatched to deliver children of #4006 and FOUR exited 0 having delivered
+# nothing — #4009 (1 commit) and #4012 (6 commits) committed and never pushed, #4011 left four files
+# staged and never committed, #4016 produced nothing at all. All four wrote the SAME terminal line,
+# `outcome=done reason=agent-exit-0`, which is indistinguishable from the six that did deliver.
+#
+# ⛔ WHICH ARMS REDDEN ON THE PRE-CHANGE TREE, STATED HONESTLY (review P3). Before this change NO arm's
+# `done` line carried a delivery token at all, so 10b (unpushed-1), 10b2 (the sentence), 10c
+# (uncommitted-1), 10d (nochange) and 10e (delivery-unknown) are FALSIFIERS — they fail there. 10a/10a2
+# are NOT falsifiers and never were: a delivered lane is the state that must read EXACTLY as it did
+# before this change (`reason=agent-exit-0`, no suffix), so they pass on the pre-change tree by design
+# and are GUARDS against a delivered lane being reclassified. Saying so is cheaper than a reader
+# discovering it and distrusting the rest of the block.
+# The pre-existing arms stay green because `check_terminal` matches the reason by SUBSTRING and every
+# new token keeps `agent-exit-0` as its prefix — that compatibility is a designed property, not luck.
+#
+# ⛔ AND 10a/10a3 IS ALSO THE RUN-SCOPED FALSIFIER (review P1, MEASURED). "origin already carries this
+# branch" is TRUE of a lane that did nothing whenever an earlier run pushed it — the harness's own exit
+# path pushes the lane branch unprompted — so an arm that only fabricates `refs/remotes/origin/$BR` at
+# HEAD pins the false PASS instead of catching it. 10a therefore makes the stub really commit and lets
+# the SHIPPED exit path really push to the fixture's origin, and 10d is the same fixture WITHOUT the
+# commit: the two arms differ only in whether this run moved the head, and only one of them is delivery.
+
+# 10a DELIVERED — the stub commits, and the harness's own exit path puts those commits on origin and
+# verifies it. If this arm ever drifts to a suffix, delivered lanes have been silently reclassified.
+mk_arm deliv_ok; WT="$ARMWT"
+pi() {
+  printf 'work\n' > "$PWD/lane-work.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  printf 'ran\n'; return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10a" done "agent-exit-0" 0
+has "$(lastline)" "reason=agent-exit-0 " "10a2 …and a DELIVERED lane carries NO suffix — the one case that must read exactly as it did before this change"
+[ "$("$REAL_GIT" -C "$ARMDIR/origin.git" rev-parse --verify -q "refs/heads/$BR" 2>/dev/null)" = "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)" ]; rc=$?
+ck "10a3 …and origin really carries this run's head (the arm measures delivery, not a string)" $rc
+
+# 10b UNPUSHED — the #4009/#4012 shape: real commits that origin does not carry, because the push did
+# not land. The origin's hook REFUSES it, which is the deterministic, offline form of the state a reader
+# actually meets (a credential-less box, a refused refspec): the exit path tried and failed.
+# ⛔ THE STUB USES `git`, NOT `$REAL_GIT`, AND THAT IS THE FIX TO THIS ARM'S FIRST CUT (measured
+# 2026-11-12). `export -f pi` carries the function BODY across the process boundary into lane.sh's own
+# `bash`, but `REAL_GIT` is a plain shell variable and is NOT exported — so inside that process it was
+# empty, the command degenerated to `-C <path> add …` with no command word, `pi` returned non-zero,
+# and the lane took the `rc=1` path the delivery read never sees. An exported function inherits an
+# exported ENVIRONMENT, never the caller's unexported locals.
+mk_arm deliv_unpushed; WT="$ARMWT"
+reject_pushes "$ARMDIR"
+pi() {
+  printf 'work\n' > "$PWD/pushed-later.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  printf 'ran\n'; return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10b" done "agent-exit-0-undelivered:unpushed-1" 0
+has "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+    "10b2 …and the log says it in words, not only in a grep key — an operator reads the log, not the census"
+
+# 10b3 THE OTHER SHAPE OF "THE PUSH DID NOT LAND", AND THE ONE THE SENTENCE WAS FALSE FOR (review of
+# #4047 at this head, P2 — MEASURED against the writer): the push target POSITIVELY holds
+# `refs/heads/<br>` at a DIFFERENT sha, so the client's push is rejected/moved under it and
+# `spawn-gate.sh` assigns `FAILED` — whose own log line ends "whether they are on some OTHER ref is not
+# measured here". The pre-fix sentence ("NOTHING LEFT THE BOX … no pushed head carries it … no PR can be
+# opened … Re-dispatch") asserted exactly the absence the writer refuses to assert, two lines above it in
+# the same log, and prescribed the redundant relaunch. The state and the reason token are unchanged (the
+# lane really did not deliver); only the claim and the remedy are.
+mk_arm deliv_unpushed_other_sha; WT="$ARMWT"
+# an UNRELATED commit on origin's copy of the branch: different sha, not an ancestor of this lane's HEAD
+"$REAL_GIT" -C "$ARMDIR/repo" -c user.email=t@t -c user.name=t commit --allow-empty -qm 'peer work' >/dev/null 2>&1
+PEER_SHA="$("$REAL_GIT" -C "$ARMDIR/repo" rev-parse HEAD)"
+"$REAL_GIT" -C "$ARMDIR/repo" push -q "$ARMDIR/origin.git" "$PEER_SHA:refs/heads/$BR"
+reject_pushes "$ARMDIR"
+pi() {
+  printf 'work\n' > "$PWD/pushed-later.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  printf 'ran\n'; return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10b3" done "agent-exit-0-undelivered:unpushed-1" 0
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+    "10b3b …and it does NOT claim the box was empty: the push target holds a DIFFERENT sha on this branch, which the writer says is not a measurement about any other ref"
+has "$(cat "$(LOG)" 2>/dev/null)" "NOT measured here" \
+    "10b3c …and it says in words what was NOT measured, mirroring the writer's own FAILED note"
+
+# 10c UNCOMMITTED — the #4011 shape: files written, never committed — WITH THE BRANCH AND ITS PR ALREADY
+# LIVE on origin. That is the shape whose remedy the first cut got BACKWARDS (review P2): it printed
+# "NOTHING LEFT THE BOX … no pushed head carries it … Re-dispatch", every clause of which is false here,
+# and re-dispatching is the redundant relaunch #4047 exists to remove. So this arm pins BOTH the token and
+# the absence of that sentence.
+mk_arm deliv_dirty; WT="$ARMWT"
+pi() { printf 'staged\n' > "$PWD/staged.txt"; printf 'ran\n'; return 0; }
+export -f pi
+"$REAL_GIT" -C "$ARMWT" push -q origin "HEAD:refs/heads/$BR"
+"$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10c" done "agent-exit-0-undelivered:uncommitted-1" 0
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+    "10c2 …and it does NOT claim nothing left the box: this branch IS on origin, so that sentence was false (review P2)"
+has "$(cat "$(LOG)" 2>/dev/null)" "Do NOT re-dispatch" \
+    "10c3 …and the remedy is 'commit and push on the same branch', NOT the redundant relaunch"
+
+# 10d NOCHANGE — the #4016 shape: no commit, clean tree, nothing to push. Same fixture as 10a minus the
+# commit, which is exactly the pair that separates "this run delivered" from "this branch was already
+# pushed by someone else" (review P1). Named rather than folded into `undelivered`, because a lane
+# dispatched to CHECK something legitimately ends here while one dispatched to CHANGE something has
+# silently done nothing, and the report must let a reader tell.
+mk_arm deliv_nochange; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10d" done "agent-exit-0-nochange" 0
+
+# 10e UNKNOWN — the read cannot answer. It must SAY so rather than assume delivery: reporting an absence
+# of evidence as evidence of delivery is the defect being fixed, and rebuilding it inside its own fix is
+# what this arm exists to prevent. `WIP_RESCUE_DISABLE=1` is the harness's own documented escape hatch,
+# and it is the real shape of this state: the exit path examined NOTHING (`tree=not-measured`), so there is
+# no measurement a delivery claim could rest on. (The first cut reached `unknown` by fabricating a repo
+# with no origin ref of any kind — which, now that the state is derived from the exit path's own
+# measurement, is a repo the exit path simply measures.)
+mk_arm deliv_unknown; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture" WIP_RESCUE_DISABLE=1
+check_terminal "10e" done "agent-exit-0-delivery-unknown" 0
+
 
 echo
 if [ "$FAIL" -gt 0 ]; then

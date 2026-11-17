@@ -6182,7 +6182,8 @@ export default function (pi: ExtensionAPI) {
         // allow-when-no-sibling-checkout return.
         const rawDeleteNames = extractPushDeleteBranch(localCommand) ?? [];
         // `allow-non-git` is intentionally absent: a non-empty extractor
-        // requires a literal `git push` token, so the legacy verdict for any
+        // requires a `git … push` token (global options may sit between the two —
+        // round 17), so the legacy verdict for any
         // such command is `allow` or a `block:*` — never `allow-non-git`.
         // The extractor is string-matched, so a command that merely MENTIONS a
         // delete push (`echo git push origin -d b`, comments) is conservatively
@@ -6196,12 +6197,22 @@ export default function (pi: ExtensionAPI) {
         // arm below so the main-checkout force-push block is preserved.
         const pushDeleteVerdict = verdict === "block:push-delete" ||
           (verdict === "allow" && rawDeleteNames.length > 0) ||
-          (verdict === "block:force-push" && rawDeleteNames.length > 0);
+          (verdict === "block:force-push" && rawDeleteNames.length > 0) ||
+          // #506: ANY other legacy block whose compound ALSO carries a delete
+          // spelling. Symmetric with the full path's #506 arm: the guard must
+          // not lose the #73 sibling check just because a more severe verb owns
+          // the verdict. It NEVER returns the coordinated arm's allow verdict —
+          // it falls through to the generic block arm below, so this can only
+          // add a refusal (in a linked worktree, where the legacy arm exempts,
+          // it is the only thing that still stops a sibling's upstream being
+          // deleted).
+          (verdict.startsWith("block:") && rawDeleteNames.length > 0);
         if (pushDeleteVerdict) {
           const blocked = _coordinatedDeleteBlock(rawDeleteNames);
           if (blocked) return blocked;
           if (verdict === "block:push-delete" || verdict === "allow") return undefined;
-          // verdict === block:force-push: fall through to the generic arm.
+          // verdict === block:force-push (or any other legacy block, #506): fall
+          // through to the generic arm.
         }
         if (verdict.startsWith("block:")) {
           let inWorktree = true;
@@ -6423,7 +6434,19 @@ export default function (pi: ExtensionAPI) {
         const previewBranch = new Map<string, string>();
         const freedNames = new Map<string, Set<string>>();
         for (const mu of mutations) {
-          const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
+          const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs, {
+            // #594 Finding 1: the invocation is an ALIAS indirection whose
+            // definition is not statically visible (`git br` from persisted
+            // config, `git -c alias.x=$VAR x`). git expands it inside its own
+            // process, so no arm here can name the command that runs — decideM3
+            // refuses it (fail closed). classifyBranchOp is TOLD, rather than the
+            // refusal living here, so there is still ONE verdict function.
+            // ⛔ The worktree exemption below does NOT apply to this op (see the
+            // arm there): a hidden command may carry `-C <hub>`, so it cannot
+            // establish the locality the exemption rests on. An installed
+            // `git-<name>` command is NOT this op — it is not alias-shadowable.
+            aliasOpaque: mu.aliasOpaque === true,
+          });
           if (!branchOp || branchOp.op === "other") continue;
           // Resolve THIS mutation's repo: the classifier's own boundary-aware
           // hints (visible spellings); extractor-invisible spellings
@@ -6449,7 +6472,21 @@ export default function (pi: ExtensionAPI) {
               reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
             };
           }
-          if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
+          // #594 (round-6 review): the WORKTREE EXEMPTION IS NOT UNIVERSAL.
+          // It exists because a linked worktree's checkout (HEAD, index) is its
+          // OWN — but two of the op classes below are not checkout state at all:
+          //   · `ref-write` mutates a ref in the namespace SHARED by the hub and
+          //     every sibling worktree (measured: from a linked worktree `git
+          //     symbolic-ref refs/heads/victim refs/heads/main` rc 0 re-points
+          //     the branch the MAIN checkout then reads);
+          //   · `alias-opaque` cannot establish locality in the first place — the
+          //     hidden command may carry `-C <hub>` / `--git-dir=<hub>`, in which
+          //     case the resolution sees the worktree while git writes the hub.
+          //     That is exactly the premise the exemption rests on, so an
+          //     unreadable verb never earns it.
+          if (muEff.isWorktree && branchOp.op !== "ref-write" && branchOp.op !== "alias-opaque") {
+            continue; // THIS mutation is wt-scoped — exempt
+          }
           const muRepoKey = muEff.repoKey ?? "";
           const sessionBaseline = baselines.get(pid);
           // #607: judge this segment against the baseline the compound will
@@ -6602,6 +6639,103 @@ export default function (pi: ExtensionAPI) {
 
       if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
 
+      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──
+      // The classifier keeps the legacy verdict when a compound pairs an
+      // UNRELATED destructive with a push-delete spelling
+      // (`git reset --hard && git push origin --delete b` ⇒ block:reset), so
+      // the two push-family arms below never see the delete targets and the
+      // #73 sibling check would silently stop applying to the delete half —
+      // exactly the protection the pre-#506 (laundered) verdict used to get.
+      // Fall THROUGH on null: the legacy verdict keeps its own arm below
+      // (LEGACY_BLOCK in the main checkout, worktree exemption unchanged). This
+      // arm can only ADD a block — it never returns an allow.
+      // ⛔ IT SITS **ABOVE** THE OWNERSHIP ALLOWANCE, AND THAT PLACEMENT IS
+      // LOAD-BEARING (review round 4, P2). The allowance's admit is a `return`
+      // (`if (!foreignDelete) return admitAfterM3();`), so anything below it is
+      // UNREACHABLE for every kind the map covers — and `branch-force-delete` is
+      // one of them, admitted when every target is the baseline OR a
+      // pid-owned name. A delete-carrying compound that part 1 moved onto that
+      // verdict therefore lost the #73 check entirely: the delete half is a real
+      // effect of the command whatever the verdict's verb, and #73's harm does
+      // not change because a local `branch -D` (which #376/#543 do keep allowed)
+      // shares the command. Deny-wins ordering is also the converged practice in
+      // comparable harnesses (Claude Code: "deny → ask → allow", an allow on one
+      // subcommand never authorises a chained one; VS Code agent approvals: false
+      // rules take precedence). The claim this arm makes — it can only ADD a
+      // block — was FALSE while it sat below an allowing return.
+      // ⛔ GATED ON A REAL PUSH INVOCATION (`det.hasPush`), because the fallback
+      // extractor is STRING-matched and would otherwise manufacture evidence:
+      // `block:commit` is only produced when the classifier proved there is NO
+      // push invocation, so `git commit -m "revert: stop running git push origin
+      // -d main"` would be refused with a #73 "main is checked out" message for
+      // a delete that exists only in the commit MESSAGE — and it would split the
+      // spellings, since the `--delete` twin is excluded above and silently
+      // allowed. A real push invocation is the precondition for every shape this
+      // arm exists to cover, and the echo/comment over-match it still shares with
+      // the degraded arm stays confined to commands that really do push.
+      // ⛔ EVERY DELETE TARGET IN THE COMPOUND MUST BE ATTRIBUTED (review round 6,
+      // finding 1). `det.pushTargets` describes ONE push invocation — the FIRST —
+      // because the classifier's later-segment fold-in is conditional on that
+      // invocation carrying NO delete spelling (`classify-git.mjs:4328`, the
+      // `deleteIdx === -1 && !hasColonTargets` guard — re-derived at round 14;
+      // this citation previously read `:4099`, which is inside the unrelated
+      // `hiddenStateSubst` doc block, the third stale citation on this PR). So in
+      // `git reset --hard && git push origin --delete stale && git push origin
+      // --delete held` the parsed list is `["stale"]` while the whole-command
+      // extractor returns `["stale","held"]`: preferring `pushTargets` outright
+      // LOST the second delete, and `held` — checked out in a sibling — kept its
+      // upstream destroyed. Measured pre-fix: that row was ADMITTED in a worktree.
+      // The fix is the UNION of both surfaces, taken when the parsed list is EMPTY
+      // (the #504 later-segment case, unchanged) **or** the first push really
+      // carried a delete spelling (`det.isPushDelete` — a parsed fact, not string
+      // evidence). Union rather than replace: `pushTargets` also carries targets
+      // the string extractor does not see (the `-o`/`--push-option` value
+      // over-capture documented above, which errs toward BLOCKING), and adopting
+      // the extractor wholesale would trade this hole for a narrower one.
+      // ⛔ AND THE PARSED INVOCATION SURFACE IS A THIRD ONE (review round 14, P0).
+      // `det.pushTargets` is FIRST-invocation-scoped, so on its own it is a strict
+      // subset of the rows an arm must attribute — which is why the parsed
+      // `det.pushMutations` entries are unioned in below.
+      // ⚠️ HISTORY, because this paragraph has already been wrong once: until
+      // round 16 `extractPushDeleteBranch` required the literal `git push`
+      // adjacency (`git -C . push` was invisible), and round 16 hand-taught it a
+      // list of prefixes — which round 17 then found incomplete (`--no-pager`) and
+      // REPLACED with a read of the parser's own invocations. On the rows these
+      // arms actually gate (P33–P40) the two surfaces now agree, so the union below
+      // is defence in depth rather than two different answers. They do NOT agree on
+      // everything, and the difference is a real command class: for a command
+      // substitution the parser reports the single marker token `$` while the text
+      // surface reports the space-split fragments (`test-653-delete-target.mjs`
+      // pins `git push origin -d $(echo held/branch)` → `["$", "$(echo",
+      // "held/branch)"]`), and each name is unresolvable, so #653 refuses — the
+      // union is what keeps that complete.
+      // They are NOT identical, and the difference is kept deliberately: the
+      // extractor also over-matches plain TEXT (`echo git push origin -d b`, a
+      // commit message), which is the fail-closed direction for attribution but is
+      // not evidence that a push exists — that is what `det.hasPush` gates, and why
+      // a `git commit -m "… git push origin -d main"` row stays ALLOWED (B13).
+      // Every `det.pushMutations` entry carries its own
+      // `targets` and its own `isDelete`.
+      // MEASURED at `5bac9475b` against base `e4716a058`, worktree session with
+      // `held` checked out in a sibling — base BLOCKED via #73, the two-surface
+      // head ALLOWED, for all of `--delete`/`-d`/`-c`-prefixed later pushes and
+      // for the first-push-delete and stash-lead twins. This is the SAME class as
+      // the round-6 finding one line up and the round-13 finding below: a gate
+      // scoped to a strict subset of the rows it must cover.
+      if (det.hasPush === true &&
+          det.verdict !== "block:push-delete" &&
+          det.verdict !== "block:push" && det.verdict !== "block:force-push") {
+        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)
+          ? (extractPushDeleteBranch(localCommand) ?? [])
+          : [];
+        const parsedDeletes = (det.pushMutations ?? [])
+          .filter((mu: any) => mu.verb === "push" && mu.isDelete === true)
+          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));
+        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];
+        const blocked = _coordinatedDeleteBlock(legacyDeletes);
+        if (blocked) return blocked;
+      }
+
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
       // current-branch == baseline; push/delete/branch -D gate on ALL targets ==
@@ -6616,6 +6750,155 @@ export default function (pi: ExtensionAPI) {
         "block:push-delete": "push-delete",
         "block:branch-force-delete": "branch-force-delete",
       };
+      // ── #506 round 11 (P0): A PROMOTION MUST NOT SWALLOW AN ADMITTED-SET HOLE ──
+      // The comment above says the skimmed pass "can only RAISE a verdict", and
+      // that is true of PRIORITY — but priority is not restrictiveness, and the
+      // map right above is where the two disagree. This map ADMITS
+      // pull/merge/rebase/push/force-push/push-delete/branch-force-delete and
+      // NEVER admits reset/clean/force-checkout/checkout-discard-all/
+      // checkout-branch/restore/stash-pop. A promotion that moves a compound
+      // from the second set into the first therefore hands the WHOLE command —
+      // the un-admitted verb included — to `ownershipAllowed`, which gates only
+      // the admitted kind and then returns `admitAfterM3()`.
+      //
+      // MEASURED end-to-end against the real handler (hermetic hub, session on
+      // baseline `main`, hub clean) — base `319c82526` vs the pre-fix head, each
+      // BLOCKED on base and ALLOWED on head, in the hub:
+      //   git stash drop      && git -C . push -f origin main
+      //   git stash pop       && git -C . push -f origin main
+      //   git stash apply     && git -C .. push -f origin main
+      //   git restore .       && git -C . push -f origin main
+      //   git checkout .      && git -C . push -f origin main
+      //   git checkout main   && git -C . push -f origin main
+      //   git -C . branch -D main && git checkout .
+      // (base blocked every one via LEGACY_BLOCK on the un-admitted verdict it
+      // saw; the skimmed pass promoted them onto `force-push` /
+      // `branch-force-delete`, both admitted). `git stash drop` in particular
+      // destroys a shared stashed changeset and is NOT mitigated by M4 — a stash
+      // is not working-tree dirt, so a clean hub admitted it.
+      //
+      // The fix is DENY-WINS and it is NOT "base-faithful by construction" —
+      // round 12 withdrew that claim and round 13 found the premise still asserted
+      // here, which is what made `block:push-delete` look covered. `promotedFrom`
+      // is the raw pass's winner under the CURRENT (post-#506) order, not the
+      // pre-#506 one, so the restore is RESTITUTION: it puts the compound back on
+      // the verdict that is not admitted, and the arms below then refuse it. What
+      // the restore CANNOT do on its own is keep the push half gated — the
+      // restored verdict is not a push kind — so the delete attribution runs
+      // BEFORE it and the push-half gate runs from the mutation list.
+      // ⛔ It is deliberately NOT "skip the allowance when promoted": that would
+      // NOT have blocked this class. `block:force-push` (7 of the 8 rows) falls
+      // through to the `block:push || block:force-push` arm below, whose
+      // `return admitAfterM3()` admits — so a fix at the allowance alone closes
+      // only the `branch-force-delete` row and leaves seven open (measured).
+      // ⛔ And when the restored kind IS itself admitted (`git pull` promoted to
+      // `git reset` by a prefixed lead verb), nothing is restored: the promoted
+      // verdict is the more severe one, it is not admitted, and the existing
+      // LEGACY_BLOCK arm already refuses it — rewriting there would WEAKEN the
+      // #506 fix.
+      // ⛔ THE RESTORE REMOVES THE VERDICT'S *PUSH-NESS*, SO THE #73 DELETE CHECK
+      // MUST RUN FIRST (round 12, P0 — measured). Every delete-coordination arm
+      // below keys on the verdict being a push kind: the #506 arm above, and the
+      // `block:push-delete` / `block:push` / `block:force-push` arms below. Once
+      // this rewrite turns `block:force-push` into `block:stash-pop`, all of them
+      // are skipped and the command lands on LEGACY_BLOCK — which is EXEMPT in a
+      // linked worktree. So a compound BASE refused via #73 became ALLOWED in a
+      // worktree, i.e. a sibling worktree's checked-out branch lost its upstream
+      // (irreversible). MEASURED, worktree session, `held` checked out in a
+      // sibling — base BLOCK via #73, pre-probe head ALLOW, for all of:
+      //   git stash pop|drop  && git -C . push -f origin main && git push origin --delete held
+      //   git checkout .      && git -C . push -f origin main && git push origin --delete held
+      //   git stash pop       && git -C . push -f origin main && git push origin --delete main
+      // The probe's rows must equal the REWRITE's rows, which is a wider set than
+      // the first draft assumed (round 13, P0 — measured): `promoteTo` also fires
+      // when the compound's FIRST push itself carries the delete spelling, because
+      // the classifier's push block rewrites the verdict to `block:push-delete`
+      // AFTER the promotion bookkeeping, and `block:push-delete` is in ALLOWANCE.
+      // Gating the probe on `block:push`/`block:force-push` therefore left four
+      // rows open in a worktree (base BLOCK via #73, pre-fix head ALLOW):
+      //   git stash pop  && git -C . push -f --delete main
+      //   git stash pop  && git -C . push -f --delete held
+      //   git restore .  && git -C . push -f --delete held
+      //   git stash pop  && git push origin :held && git -C . push -f origin main
+      // ⚠️ THE `-C`-PREFIX SENTENCE BELOW IS HISTORICAL (round 16): the extractor
+      // used to return null for a `-C .`-prefixed spelling; it no longer does, so
+      // the two surfaces OVERLAP on that class now. The paragraph is kept because
+      // the reason it gives for the two-surface rule is still true — the extractor
+      // is blind to the forms the regex cannot express, and `wholeCommandDeleteTargets`
+      // is still gated on the push/force-push verdict.
+      // ⛔ The attribution is TWO-SURFACE and verdict-dependent, because neither
+      // single surface sees every shape: `wholeCommandDeleteTargets` returns `[]`
+      // for a `block:push-delete` verdict (it is gated on push/force-push), while
+      // the extractor alone cannot express every prefix form.
+      // So: for a `block:push-delete` verdict the delete refspecs are the parsed
+      // `pushTargets` (the classifier set `isPushDelete`) UNION the extractor's
+      // later-segment finds — the same two-surface rule the #506 arm above uses;
+      // for the push/force-push verdicts the whole-command extractor is the one
+      // that sees a delete in a LATER segment. Both are gated on a REAL push
+      // invocation (`hasPush`), so a commit message cannot manufacture a target.
+      // The check can only ADD a block: with no sibling holder it falls through.
+      let promoteTo = null;
+      if (det.promotedFrom !== null && det.promotedFrom !== undefined) {
+        const promotedFromVerdict = `block:${det.promotedFrom}`;
+        if (ALLOWANCE[promotedFromVerdict] === undefined &&
+            ALLOWANCE[det.verdict] !== undefined) promoteTo = promotedFromVerdict;
+      }
+      if (promoteTo !== null && det.hasPush === true) {
+        // ⛔ THE PARSED INVOCATION SURFACE IS PART OF BOTH BRANCHES (round 15, P0).
+        // Round 14 fixed exactly this omission in the `#506` arm above and left it
+        // here, one arm over: this probe's `block:push-delete` branch attributed
+        // from `pushTargets ∪ extractor`, which is the same strict subset
+        // (`pushTargets` is FIRST-invocation-scoped and — ⚠️ HISTORICAL, fixed by
+        // round 17 — the extractor was segment-matched on `/\bgit\s+push\b/`, so
+        // a LATER `-C`/`-c`-prefixed push was invisible to both; the extractor now
+        // reads the parser's invocations, so it sees those rows too). Because the
+        // verdict is `block:push-delete`
+        // there, the `#506` arm is skipped by its own exclusion, so this probe is
+        // the ONLY thing standing between the compound and the restore — it missed
+        // `held`, the restore rewrote the verdict onto a legacy kind, and
+        // `LEGACY_BLOCK` exempted the worktree.
+        // MEASURED at `7053bc29e` against base `e4716a058` (worktree session, `held`
+        // checked out in a sibling): base BLOCKED via #73 and the head ALLOWED for
+        // every prefixed pair — `-f --delete`/`-f -d`/`-f :refspec` first pushes ×
+        // `-C`/`-c`-prefixed later deletes, with `stash pop`, `reset --hard` and
+        // `restore .` leads.
+        // The `else` branch gets it too, and that half is a DECLARED TIGHTENING
+        // against a BASE GAP rather than a regression: on base the same compound
+        // (`git stash pop && git -C . push -f origin main && git -C . push origin
+        // --delete held`) classifies `block:stash-pop`, so no push arm runs at all
+        // and base ALLOWED a sibling-held delete outright. It is closed here because
+        // the harm is identical — a sibling worktree's upstream destroyed — and the
+        // surface can only ADD a target; the unheld control below still allows.
+        const probeParsed = (det.pushMutations ?? [])
+          .filter((mu: any) => mu.verb === "push" && mu.isDelete === true)
+          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));
+        const probeDeletes = det.verdict === "block:push-delete"
+          ? [...new Set([
+            ...(det.pushTargets ?? []),
+            ...(extractPushDeleteBranch(localCommand) ?? []),
+            ...probeParsed,
+          ])]
+          : [...new Set([...wholeCommandDeleteTargets(det.verdict, localCommand), ...probeParsed])];
+        if (probeDeletes.length > 0) {
+          const blocked = _coordinatedDeleteBlock(probeDeletes);
+          if (blocked) return blocked;
+        }
+      }
+      // #506 round 13 (P2): a promotion that REPLACED a push-family kind must not
+      // lose the push half's gate. The rewrite above only fires when the replaced
+      // kind is UN-admitted; the mirror case — replaced kind ADMITTED (`force-push`),
+      // promoted kind a legacy verb — restores nothing, so the verdict becomes
+      // `block:reset` and every push arm is skipped: `LEGACY_BLOCK` is
+      // worktree-exempt, and the #805 fail-closed refusal for a push whose repo
+      // cannot be resolved goes with it. MEASURED (worktree session):
+      //   git -C . reset --hard && git --git-dir=$PWD/.git push -f origin main
+      // base BLOCK (`#805`: target repository unresolved) → head ALLOW. The
+      // refusal is restored below, from the mutation list, so it does not depend
+      // on the verdict naming a push.
+      const PROMOTE_PUSH_KINDS = ["push", "force-push", "push-delete"];
+      const pushHalfUngated = PROMOTE_PUSH_KINDS.includes(det.promotedFrom) &&
+        !PROMOTE_PUSH_KINDS.includes(String(det.verdict).slice("block:".length));
+      if (promoteTo !== null) det.verdict = promoteTo;
       // ── M2 mutation list (#605) — built BEFORE the ownership-allowance arm and
       // the push-delete arm, because BOTH used to close the whole command on one
       // segment's evidence and return (reviews F1, I1).
@@ -6937,6 +7220,16 @@ export default function (pi: ExtensionAPI) {
         const hit = gateMutations(m2Mutations);
         if (hit) return hit;
         return admitAfterM3(); // on-baseline or unverifiable-but-exempt
+      }
+
+      // #506 round 13 (P2): restore the push half's #805 fail-closed refusal —
+      // see `pushHalfUngated` above. The push/commit verdict arms below are skipped
+      // once a promotion has replaced a push kind with a legacy one, and
+      // LEGACY_BLOCK is worktree-exempt, so a push whose target repo cannot be
+      // resolved was admitted. This can only ADD a refusal.
+      if (pushHalfUngated) {
+        const pushHit = gateMutations(m2Mutations);
+        if (pushHit) return pushHit;
       }
 
       // ── Legacy destructive blocks (main checkout only) ──

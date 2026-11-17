@@ -84,8 +84,8 @@ CMUX_LOG="$T/cmux.log"
 #                  matrix run the jobs still queued are exactly the ones past page 1; a reader that
 #                  stops at page 1 sees "no queued job" on a run that has one (#2344 review P1).
 #   GH_MODE        queued-null | queued-empty | queued-twofield | queued-threefield |
-#                  queued-countonly | inprog-null | inprog-fail | oldest-junk | enum-fail |
-#                  enum-garbage | enum-badtab | ok
+#                  queued-countonly | queued-fail | inprog-null | inprog-fail | oldest-junk |
+#                  enum-fail | enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
 #   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
 #   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
@@ -100,6 +100,30 @@ printf '%s\n' "$*" >> "${GH_LOG:?}"
 # the pass reports `mode=unknown` or raises a false BLIND alarm on a perfectly readable inventory.
 if [ -n "${GH_NOISE:-}" ]; then
   printf 'gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)\n' >&2
+fi
+# ⛔ THE CENSUS READ CAN BE MADE TO FAIL, BY COUNT (#4085). The measured causes are TRANSIENT —
+# `net/http: TLS handshake timeout` and `API rate limit exceeded` — and each one used to cost a whole
+# 300 s pass because the read was single-attempt. Matched on the page-row program so only the CENSUS
+# read is affected: `current_mode` reads the same endpoint with a different `--jq`, and a knob that
+# failed both could never show which of the two recovered.
+if [ -n "${GH_CENSUS_FAIL_N:-}" ]; then
+  case "$*" in
+    *actions/runners*'#page'*)
+      _cf="${GH_LOG}.censusfail"
+      _n="$(cat "$_cf" 2>/dev/null || printf 0)"
+      case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+      if [ "$_n" -lt "$GH_CENSUS_FAIL_N" ]; then
+        printf '%s\n' "$((_n + 1))" > "$_cf"
+        # ⛔ THE CLASS IS SELECTABLE (#4085 review P1). Arm (r1) alone pinned the TLS cause, so a mutant
+        # that put `rate limit` on the NON-TRANSIENT list — the plausible edit, since a rate-limit 403
+        # IS a 403 — reproduced 125 of the 183 measured failures with the suite green.
+        case "${GH_CENSUS_FAIL_MODE:-tls}" in
+          ratelimit) printf 'HTTP 403: API rate limit exceeded for user ID 1 (https://api.github.com/repos/o/r/actions/runners)\n' >&2 ;;
+          *)         printf 'Get "https://api.github.com/repos/o/r/actions/runners": net/http: TLS handshake timeout\n' >&2 ;;
+        esac
+        exit 1
+      fi ;;
+  esac
 fi
 # ⛔ EVERY `--jq` PROGRAM THE GATE SHIPS IS COMPILED HERE (#3002 review P2). This double used to answer
 # every read by pattern-matching argv and PRINTING the rows it believed the program would emit, so the
@@ -144,21 +168,30 @@ now = datetime.datetime.now(datetime.timezone.utc)
 print((now - datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))
 ' "$1"
 }
-# queue_rows_field — the 4th field of the queue read: the page's `id,created_at` pairs, OLDEST
-# FIRST, `;`-joined. Derived from GH_QUEUE_ROWS_SPEC when set, else the single head row.
-queue_rows_field() {
+# queue_rows_body — the API's OWN queued-runs body: `{"total_count":N,"workflow_runs":[…]}`.
+# The stub pipes this through the GATE'S OWN `--jq` program, so what the gate reads is that program's
+# OUTPUT on a body shaped like the real endpoint's — a program that cannot run on a real body is a red
+# HERE, at the call that ships it, instead of on the box it was written for. The rows come from the same
+# fixtures every arm already passes (`GH_QUEUE_ROWS_SPEC`, else the single head row at
+# `GH_HEAD_RUN_ID`/`GH_QUEUE_OLDEST_AT`), and every stamp is rendered at CALL time.
+# ⛔ THIS REPLACED A `queue_rows_field` HELPER THAT PRINTED THE 4TH FIELD ITSELF (#4116 review, P2). A
+# double that prints the rows it BELIEVES a program would emit certifies a protocol the shipped program
+# does not have — which is how a `--jq` that raised on EVERY non-empty page stayed green behind every
+# arm here, and how the same class was measured on the census read (#3002 review P2). The helper is
+# deleted rather than kept beside this one: a shape-answer with no caller is an invitation to return.
+queue_rows_body() { # <total_count>
   if [ -n "${GH_QUEUE_ROWS_SPEC:-}" ]; then
-    _out=""; _rest="${GH_QUEUE_ROWS_SPEC}"
-    while [ -n "$_rest" ]; do
-      _pair="${_rest%%;*}"
-      case "$_rest" in *';'*) _rest="${_rest#*;}" ;; *) _rest="" ;; esac
-      [ -n "$_pair" ] || continue
-      _out="${_out:+$_out;}$(printf '%s' "${_pair%%:*}"),$(ts_ago "${_pair#*:}")"
+    _qb_rows=""; _qb_rest="$GH_QUEUE_ROWS_SPEC"
+    while [ -n "$_qb_rest" ]; do
+      _qb_pair="${_qb_rest%%;*}"
+      case "$_qb_rest" in *';'*) _qb_rest="${_qb_rest#*;}" ;; *) _qb_rest="" ;; esac
+      [ -n "$_qb_pair" ] || continue
+      _qb_rows="${_qb_rows:+$_qb_rows,}{\"id\":${_qb_pair%%:*},\"created_at\":\"$(ts_ago "${_qb_pair#*:}")\"}"
     done
-    printf '%s' "$_out"
-    return
+  else
+    _qb_rows="{\"id\":${GH_HEAD_RUN_ID-4001},\"created_at\":\"$(queue_oldest_at)\"}"
   fi
-  printf '%s,%s' "${GH_HEAD_RUN_ID-4001}" "$(queue_oldest_at)"
+  printf '{"total_count":%s,"workflow_runs":[%s]}' "$1" "$_qb_rows"
 }
 # ⛔ CONSUME `--input -` (the label PUT body), because the REAL gh does. The gate calls
 # `printf '%s' "$body" | gh api -X PUT … --input -` under `set -o pipefail`, so a double that
@@ -229,6 +262,16 @@ case "$*" in
   #   demand (run_queued_demand)     → the `labels` of the queued jobs
   #   mode inference (mode_from_jobs) → `runner_group_name` of the executing jobs
   *"/jobs"*)
+    # ⛔ `GH_JOBS_BODY` RUNS THE SHIPPED `--jq` PROGRAM FOR REAL (agent-infra#4113 review cycle 2). Every
+    # other arm here answers by SHAPE, which is fine for the gate's shell half but blind to the program
+    # that produces the shape — measured: a mutant that coerced an ABSENT `.jobs` to a measured zero (the
+    # one coercion that mints a permanent ghost out of a read that measured nothing) passed all 649
+    # assertions, because no arm ever handed a body to the program. With this hook the double executes the
+    # exact shipped program over a canned body, so the jq half is testable at all.
+    if [ -n "${GH_JOBS_BODY:-}" ]; then
+      printf '%s' "$GH_JOBS_BODY" | jq -r "$_jq_prog" 2>/dev/null
+      exit 0
+    fi
     case "$*" in
       *runner_group_name*)
         case "${GH_JOBS_MODE:-hosted}" in
@@ -257,6 +300,19 @@ case "$*" in
           esac
         done
         if [ -n "$_rid" ]; then
+          # ⛔ THE `#jobs` PAGE ROW (agent-infra#4113). The gate asks every jobs read for the run's TOTAL
+          # job count, because that is what separates the two shapes the ghost ledger must tell apart:
+          # ZERO JOBS AT ALL (the run whose jobs were never created — permanent, and the only kind that
+          # may be remembered) from JOBS BUT NONE QUEUED (concurrency-held or executing — time-local,
+          # and never remembered). Unset means the double answers NO page row at all, which is how every
+          # pre-existing arm keeps its exact behaviour: the gate must read an ABSENT total as "not
+          # measured" and remember nothing, never as zero.
+          if [ -n "${GH_DEMAND_JOBS_TOTAL+x}" ]; then
+            case " ${GH_DEMAND_GHOST_IDS:-} " in
+              *" ${_rid} "*) printf '#jobs\t%s\n' "${GH_DEMAND_GHOST_TOTAL_JOBS:-0}" ;;
+              *)             printf '#jobs\t%s\n' "$GH_DEMAND_JOBS_TOTAL" ;;
+            esac
+          fi
           case " ${GH_DEMAND_GHOST_IDS:-} " in *" ${_rid} "*) exit 0 ;; esac
           # …and the run whose queued job is on page 2 answers the same way to an UNPAGINATED read.
           case " ${GH_DEMAND_PAGE2_IDS:-} " in
@@ -383,6 +439,39 @@ case "$*" in
     esac
     exit 0 ;;
   *"status=queued"*)
+    # ⛔ PAGE 2+ IS A DIFFERENT READ AND A DIFFERENT SHAPE (agent-infra#4113). The gate now walks as many
+    # pages as the queue's reported depth needs, because one page is the NEWEST $QUEUE_PAGE queued runs
+    # and the head scan's question ("which queued run is the OLDEST with a queued job?") is exactly the
+    # one that page cannot answer. Page 1 keeps the `@tsv` shape below — every pre-existing arm depends
+    # on it — while a later page is asked for the ROW ORDER only, so the double answers THAT program's
+    # output: the `id,created_at` pairs of `GH_QUEUE_ROWS_PAGE2` (an `id:age_seconds` spec, rendered at
+    # call time like every other fixture here), or nothing at all when unset, which is what a real short
+    # page answers and is the "the list ends here" signal the gate must not read as "the queue ends
+    # here".
+    case "$*" in
+      *"page="[2-9]*)
+        [ -n "${GH_QUEUE_ROWS_PAGE2:-}" ] || exit 0
+        # ⛔ A REAL BODY, THROUGH THE SHIPPED PROGRAM (#4116 review, P2). This used to print the
+        # `id,created_at` pairs itself — so NO assertion in this suite ever handed a body to the page
+        # 2+ `--jq`, and a program that raises on every non-empty page passed all of them. Now the
+        # body is served the way the endpoint serves it and the gate's own program produces the rows;
+        # if that program cannot run on a real body, `jq` exits non-zero and so does this stub — which
+        # is what `gh` does, and what turns the gate's `read FAILED` arm into a red assertion.
+        _p2=""; _rest2="$GH_QUEUE_ROWS_PAGE2"; _n2=0
+        while [ -n "$_rest2" ]; do
+          _pair2="${_rest2%%;*}"
+          case "$_rest2" in *';'*) _rest2="${_rest2#*;}" ;; *) _rest2="" ;; esac
+          [ -n "$_pair2" ] || continue
+          _n2=$((_n2 + 1))
+          _p2="${_p2:+$_p2,}{\"id\":${_pair2%%:*},\"created_at\":\"$(ts_ago "${_pair2#*:}")\"}"
+        done
+        # ⛔ THE PROGRAM'S EXIT STATUS IS THE READ'S EXIT STATUS, exactly as `gh` reports it. Without
+        # this the stub would print nothing on a program that raises and still exit 0, i.e. it would
+        # answer "an empty page" — the one reading the gate must never take as "the queue ends here".
+        _out2="$(printf '{"total_count":%d,"workflow_runs":[%s]}\n' "$_n2" "$_p2" | jq -r "$_jq_prog")" || exit $?
+        printf '%s\n' "$_out2"
+        exit 0 ;;
+    esac
     # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at> TAB <oldest run id> TAB
     # <page order>` (`@tsv`), with empty trailing fields when nothing is queued. The head run id is
     # the third field because the DEMAND read (`/actions/runs/{id}/jobs`, `actions:read`) hangs off
@@ -390,6 +479,12 @@ case "$*" in
     # walks (agent-infra#2344): a run id alone cannot tell the scan WHICH run is older, and the age
     # has to come from the run the scan chooses.
     case "${GH_MODE:-ok}" in
+      # ⛔ THE REASON, NOT JUST THE FAILURE (#1704's class, and the arm that pins the straggler): the
+      # queue read is the gate's most important read, and it shipped `2>/dev/null` while its own
+      # sibling nine lines below captured `$GH_ERR` — so `API rate limit exceeded` (wait for the
+      # reset) and a TLS/network fault (repair the host) produced the SAME log line. This is the 403
+      # the fleet actually hit at 2026-11-17T12:25:27Z with the shared pool at `core=0/5000`.
+      queued-fail)  printf 'HTTP 403: API rate limit exceeded\n' >&2; exit 1 ;;
       queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
       # A body carrying only the count and the oldest timestamp: no run id, no row order. This is the
@@ -406,18 +501,16 @@ case "$*" in
       # leave the arm green for the wrong reason.
       oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\t%s\t%s,Wed Oct 27 13:00:00 2026\n' "${GH_QUEUED:-5}" "${GH_HEAD_RUN_ID-4001}" "${GH_HEAD_RUN_ID-4001}" ;;
       *)
+        # ⛔ THE DEFAULT ANSWER IS THE SHIPPED PROGRAM'S OUTPUT ON A REAL BODY (#4116 review, P2).
+        # Printing the fields by shape certified a protocol the program did not have; the program is
+        # handed the endpoint's own document instead, so a `--jq` that cannot run on one is a red here.
         if [ "${GH_QUEUED:-5}" = 0 ]; then
-          printf '0\t\t\t\n'
+          _out0="$(printf '{"total_count":0,"workflow_runs":[]}\n' | jq -r "$_jq_prog")" || exit $?
         else
-          # ⛔ FIELD 2 IS THE HEAD OF THE SPEC, NOT A SEPARATE FIXTURE (agent-infra#2344). The pre-fix
-          # gate computed its age from `min(created_at)` i.e. from field 2 alone; a stub whose field 2
-          # disagreed with the row order would let the OLD gate compute a healthy 30 s age over a page
-          # whose real head is a 30-day ghost — and every #2344 arm would stay green against it, which
-          # is exactly the vacuity this suite exists to prevent.
-          _rows="$(queue_rows_field)"
-          _head="${_rows%%;*}"
-          printf '%s\t%s\t%s\t%s\n' "${GH_QUEUED:-5}" "${_head#*,}" "${_head%%,*}" "$_rows"
-        fi ;;
+          _out0="$(printf '%s\n' "$(queue_rows_body "${GH_QUEUED:-5}")" | jq -r "$_jq_prog")" || exit $?
+        fi
+        printf '%s\n' "$_out0"
+        exit 0 ;;
     esac
     exit 0 ;;
   *"--paginate"*)
@@ -532,18 +625,40 @@ fi
 # mutant that merely changes the bound skip the arm. Fatal when unreadable — a fixture that cannot
 # restate the bound must not silently test a different number.
 QUEUE_HEAD_SCAN_SHIPPED="$(sed -n 's/^QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
+# ⛔ DERIVED, NEVER RESTATED (#4085 review round 3, P1). A fixture that restates a production constant
+# cannot fail when that constant moves — the file already records this twice (#3261, #3995). MEASURED
+# BEFORE this fix: a mutant that put the defect rate back to 1800 s (the inbox-flooding rate #4085
+# exists to remove) passed all 587 assertions.
+_derive_shipped() { # <knob-name> -> the gate's shipped default
+  # ⛔ ${GATE_UNDER_TEST:-$GATE} — NOT "$GATE" (#4085 review round 4, P1). Reading the shipped file
+  # meant the two-sided pins read 21600 no matter what the gate under test shipped, so a mutant that
+  # reverted the defect floor to the old 1800 s rate passed all 592 assertions. The file already
+  # records this same correction for GH_THRESHOLD_DEFAULT (#3261).
+  sed -n "s/.*CI_GATE_$1:-\([0-9][0-9]*\)}.*/\1/p" "${GATE_UNDER_TEST:-$GATE}" | head -1
+}
+CENSUS_BACKOFF_SHIPPED="$(_derive_shipped CENSUS_READ_BACKOFF_S)"
+CENSUS_ATTEMPTS_SHIPPED="$(_derive_shipped CENSUS_READ_ATTEMPTS)"
+BLIND_DEFECT_AFTER_SHIPPED="$(_derive_shipped BLIND_DEFECT_AFTER)"
+BLIND_DEFECT_EVERY_SHIPPED="$(_derive_shipped BLIND_DEFECT_EVERY_S)"
+BLIND_STREAK_RESET_SHIPPED="$(_derive_shipped BLIND_STREAK_RESET_S)"
+# …and the two #4113 knobs, derived the same way and for the same reason.
+GHOST_TRUST_SHIPPED="$(_derive_shipped GHOST_TRUST_AFTER_S)"
+QUEUE_MAX_PAGES_SHIPPED="$(_derive_shipped QUEUE_READ_MAX_PAGES)"
+# ⛔ AND THE THIRD ONE (review cycle 3, P1 — measured, not inferred): with only the two above exported, an
+# ambient `CI_GATE_GHOST_REPROVE_AFTER_S=1` reddened 8 assertions with NO code change, including both
+# cycle-1 walk arms. THIS knob has to be pinned here, or the environment decides the suite's colour —
+# and for the same reason its shipped VALUE is pinned literally below ("TWO-SIDED"), because
+# `_derive_shipped` reads ${GATE_UNDER_TEST:-$GATE}: a mutant of the gate alone would otherwise redden
+# nothing while shipping a different default (measured: 43200 → 999999999 stayed 685/685 green).
+GHOST_REPROVE_SHIPPED="$(_derive_shipped GHOST_REPROVE_AFTER_S)"
+for _v in "$CENSUS_BACKOFF_SHIPPED" "$CENSUS_ATTEMPTS_SHIPPED" "$BLIND_DEFECT_AFTER_SHIPPED" \
+          "$BLIND_DEFECT_EVERY_SHIPPED" "$BLIND_STREAK_RESET_SHIPPED" \
+          "$GHOST_TRUST_SHIPPED" "$QUEUE_MAX_PAGES_SHIPPED" "$GHOST_REPROVE_SHIPPED"; do
+  [ -n "$_v" ] || { echo "❌ fixture cannot derive a #4085 default from the gate — a fixture that cannot" \
+    "restate the bound must not silently test a different number" >&2; exit 3; }
+done
 if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
   echo "❌ FATAL: cannot read QUEUE_HEAD_SCAN_MAX's own default out of $GATE — the suite refuses to guess it" >&2
-  exit 3
-fi
-
-# ⛔ THE CANDIDATE PAGE SIZE IS DERIVED FOR THE SAME REASON, and it is what the page-ceiling note is
-# ABOUT (#3995 review cycle 3): the scan can never see past ONE page of `QUEUE_PAGE` rows, so an arm
-# that pins that note must build a FULL page — and must not hardcode 100 in a way that drifts from the
-# gate. Fatal when unreadable, like the bound above.
-QUEUE_PAGE_SHIPPED="$(sed -n 's/^QUEUE_PAGE=\([0-9][0-9]*\).*/\1/p' "$GATE" | head -1)"
-if [ -z "$QUEUE_PAGE_SHIPPED" ]; then
-  echo "❌ FATAL: cannot read QUEUE_PAGE out of $GATE — the page-ceiling arm refuses to guess it" >&2
   exit 3
 fi
 
@@ -553,9 +668,9 @@ fi
 # scan stopped by the BOUND does, so they must be fed the SHIPPED bound rather than a hardcoded 5:
 # with the shipped bound at 25 a five-ghost page no longer exhausts the window, and those arms no
 # longer refuse at all — the scan reaches the demand row behind the five ghosts (measured: both exit 0
-# and write a verdict). They RED in that state rather than passing quietly (measured: 8 — each arm's RC
-# assertion and message assertions, plus the no-state-file / no-PUT safety assertions), and the shipped
-# value itself is ALSO pinned literally at the `#3995` arm (agent-infra#3995).
+# and write a verdict). They RED in that state rather than passing quietly (measured against a 5-ghost
+# page: 7 assertions), and the shipped value itself is ALSO pinned literally at the `#3995` arm
+# (agent-infra#3995).
 ghost_window_fixture() {
   local n="$1" ids="" rows="" i id
   for i in $(seq 1 "$n"); do
@@ -581,6 +696,10 @@ run_gate() {
   KEEP_STATE_NEXT=0
   if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; KEEP_STATE_NEXT=1; else mkdir -p "$STATE_DIR" "$home"; fi
   : > "$GH_LOG"
+  # ⛔ THE FAILURE COUNTER IS PER PASS (#4085): GH_LOG is truncated each run but this sidecar was not,
+  # so an arm that asked for ONE failure inherited the previous arm's count and silently stopped
+  # failing — arm (r1b) passed for the wrong reason until this line existed.
+  rm -f "$GH_LOG.censusfail"
   [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE"
   # a re-assertion pending from the PREVIOUS pass lands now: the runner agent overwrote the label set in
   # the 60-120 s between ticks, so this pass must find it gone (that is the defect being pinned).
@@ -617,6 +736,26 @@ PYDROP
     # an arm that tests the operand passes `ENV=…` afterwards and still overrides (measured: a gate
     # mutated to ignore the knob reds `ghost-bound-zero`/`ghost-bound-junk`).
     export CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_HEAD_SCAN_SHIPPED"
+    # ⛔ THE #4085 KNOBS ARE WHITELISTED FOR THE SAME REASON: the retry attempts, the retry backoff,
+    # the blind-defect threshold, the defect write interval and the streak reset are all read by the
+    # arms below, and an ambient value must not decide whether the suite is red — MEASURED: ambient
+    # `CI_GATE_CENSUS_READ_ATTEMPTS=1` reddened 4 assertions with no code change. Exported at their
+    # DERIVED values; arms that test the operand pass `ENV=...` afterwards and still override.
+    export CI_GATE_CENSUS_READ_BACKOFF_S="$CENSUS_BACKOFF_SHIPPED"
+    export CI_GATE_CENSUS_READ_ATTEMPTS="$CENSUS_ATTEMPTS_SHIPPED"
+    export CI_GATE_BLIND_DEFECT_AFTER="$BLIND_DEFECT_AFTER_SHIPPED"
+    export CI_GATE_BLIND_DEFECT_EVERY_S="$BLIND_DEFECT_EVERY_SHIPPED"
+    export CI_GATE_BLIND_STREAK_RESET_S="$BLIND_STREAK_RESET_SHIPPED"
+    # ⛔ …AND THE TWO KNOBS THE GHOST-LEDGER ARMS WOULD OTHERWISE READ FROM THE AMBIENT ENV
+    # (agent-infra#4113 review, P2). `ledger-young` asserts that a 60 s old ghost writes NO entry, and
+    # `ledger-young-floor` proves the same fixture writes TWO at a 30 s floor: an ambient
+    # CI_GATE_GHOST_TRUST_AFTER_S below 60 would make the first arm red with no code change, which is the
+    # failure the #4085 block above was written to prevent (measured then: ambient
+    # CI_GATE_CENSUS_READ_ATTEMPTS=1 reddened 4 assertions). Same for the page cap, whose arms test the
+    # operand and override it afterwards.
+    export CI_GATE_GHOST_TRUST_AFTER_S="$GHOST_TRUST_SHIPPED"
+    export CI_GATE_QUEUE_READ_MAX_PAGES="$QUEUE_MAX_PAGES_SHIPPED"
+    export CI_GATE_GHOST_REPROVE_AFTER_S="$GHOST_REPROVE_SHIPPED"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
     # semantics, or they would all be asserting the same counter; the streak has its own section,
@@ -718,38 +857,6 @@ assert_eq "$GH_THRESHOLD_DEFAULT" "10" \
 echo "── #3995: the gate SHIPS the measured head-scan bound (25), not the falsified 5 ──"
 assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
   "the gate ships a head-scan bound above the measured ghost population (14 on tortoise 2026-11-12, agent-infra#3995) — a REVERSAL to 5 must redden THIS line"
-# ⛔ AND THE PAGE SIZE IS PINNED LITERALLY FOR THE SAME REASON (agent-infra#3995 review cycle 8, F2).
-# `QUEUE_PAGE_SHIPPED` above is DERIVED from the SHIPPED "$GATE" — deliberately NOT from
-# `GATE_UNDER_TEST`, exactly as the bound's derivation records above, so that a mutant which merely
-# changes the constant cannot quietly re-point the arms' own fixtures at its value. The consequence is
-# that under `GATE_UNDER_TEST` a `QUEUE_PAGE` mutant does NOT reach this line: measured (cycle 9),
-# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN. Only ONE
-# of the 13 is a 100-row-fixture arm — `ghost-window-at-exact-page`, `unexpected: cannot see past it`,
-# because its fixture still builds the shipped 100 while the gate's page dropped to 50. The OTHER 12 are
-# the 54-deep queue arms: they pass NO `GH_QUEUE_ROWS_SPEC`, so their page is the stub's default single
-# row, and they are REFUSED at the SATURATED check because `queued (54) > QUEUE_PAGE (50)` — the same
-# mechanism the next paragraph records. (The 13 failure LINES break down as 4 `got: 2, want: 0` — one
-# per refused arm — 7 follow-on `missing:` assertions on those refusals, 1 follow-on
-# `got: , want: github` for the never-written state file, and 1 the `unexpected:` row above.)
-# What the pin protects is
-# the IN-PLACE reversal — the route
-# that actually ships — where the derivation and the file move together:
-# MEASURED (cycle 9 re-measured both routes, after the first version of this paragraph contradicted
-# itself): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh` the suite is NOT
-# green — 13 failures / 591 passed — and THIS line is one of the 13, printing exactly
-# `(got: 50, want: 100)`. The OTHER 12 red incidentally: a 54-deep serving queue (its threshold pinned
-# at 60) becomes "deeper than the read page" and refuses, so the idle-capacity and deep-queue arms fail
-# with `got: 2, want: 0`.
-# ⛔ THAT SPLIT IS THE POINT, not a detail: without this line the twelve behaviour rows look like
-# fixture drift, and the natural repair for a future reader is to edit their expected values — which is
-# exactly how a read-page reversal would ship. This line is what makes the reversal read as a decision
-# reversed. (An earlier version of this paragraph said every one of the 13 was incidental and that
-# nothing named the constant — it had carried the count over from the `GATE_UNDER_TEST` run above,
-# where the pin really is green. Corrected here by measurement, not by re-wording.) The literal is the
-# two-sided half, the arms are the wired half — the same split the bound's pin above uses.
-echo "── #3995: the gate ships GitHub's per_page cap (100) — a REVERSAL must redden THIS line ──"
-assert_eq "$QUEUE_PAGE_SHIPPED" "100" \
-  "the gate ships GitHub's per_page cap (100) and every ceiling note's arithmetic is about it — reversing it must redden THIS line"
 # …and the number is WIRED, not merely present: a queue exactly AT the shipped threshold takes the
 # fallback, one job under it does not. (Threshold-relative on purpose — see (i): this half proves the
 # constant reaches the LENGTH leg, and the literal above proves which constant it is.)
@@ -1140,83 +1247,19 @@ echo "── #2344: a scan window that is entirely ghosts, with more queue behin
 # The page carries AS MANY ghost rows as the shipped bound (agent-infra#3995: a hardcoded five would
 # no longer exhaust a 25-run window), then one row that HAS demand.
 GW_FIXTURE="$(ghost_window_fixture "$QUEUE_HEAD_SCAN_SHIPPED")"
-# ⛔ THE DEMAND ROW'S ID IS DERIVED, NOT ASSUMED (agent-infra#3995): the generator's ids are
-# `4000+i`, so at a bound of 100 they reach 4100 — a hardcoded `4100:` demand row becomes ANOTHER
-# ghost and the arms silently stop testing "ghosts then demand".
-GW_DEMAND=$((4000 + QUEUE_HEAD_SCAN_SHIPPED + 100))
 # ⛔ THE DEPTH MUST SCALE WITH THE BOUND TOO (agent-infra#3995 review cycle 2, finding 1): at a fixed
 # 40, a bound of 100 reads more rows than the page reports as deep, which is the INCONSISTENT refusal
 # — `RC` is 2 in both branches, so only the message assertions noticed, and the natural repair for a
 # future raise would be to edit the expected string and leave the arm pinning INCONSISTENT instead of
 # the window. `shipped + 15` is 40 today (no arm changes) and stays genuinely deeper at any bound.
 run_gate ghost-window GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 15))" GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}${GW_DEMAND}:120" \
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:120" \
   CI_GATE_QUEUE_THRESHOLD=100 --
 assert_eq "$RC" "2" "a ghost-only scan window with real queue behind it → exit 2"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound it ran out of"
 assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "the refusal names the KNOB an operator can raise (agent-infra#3995)"
-# ⛔ AND ON THIS SHAPE THE CEILING NOTE IS ABSENT (agent-infra#3995 review cycle 7, P1 — MEASURED
-# defect). The queue here is 40 deep and the candidate list 26 rows: the window break happened over a
-# SHORT list, so a bound at or above the page COULD read past it (measured: the same fixture at a
-# bound of 30 measures the demand head and writes a verdict). Emitted ungated, the note told this
-# operator the list was "ONE page of 100 runs" and that no bound could help — a false statement about
-# the read AND the suppression of the one remedy that works. These two rows RED on the pre-fix gate.
-assert_not_contains "$OUT" "ONE page of" "a SHORT list is NOT blamed on the page ceiling"
-assert_not_contains "$OUT" "cannot see past it" "…and the 'no knob can help' note is absent: here raising the bound IS the remedy"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a refused head scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a refused head scan relabelled no runner"
-# ⛔ THE WINDOW REFUSAL CARRIES THE CEILING TOO — WHEN THE QUEUE IS REALLY DEEPER THAN A PAGE
-# (agent-infra#3995 review, F1; gated in review cycle 7, P1). Only the TRUNCATED branch's note was
-# asserted after cycle 4 deleted `ghost-window-at-page` — whose 101-row page the API cannot produce — so
-# DELETING this branch's clause, or breaking either operand, left the whole suite GREEN.
-# Re-fixtured to the REAL shape: the shipped bound (25), a FULL page of 100 ghosts, a queue deeper than
-# the page. ⛔ THE GATE IS THE QUEUE DEPTH, NOT THE BOUND and NOT `scanned`: a bound break proves the
-# list is longer than the BOUND, not that it is a page (the `ghost-window` arm above is the short-list
-# side of this same pair). `scanned` is 25 in this arm — well below the page — so this arm also proves
-# the note is NOT the `scanned >= QUEUE_PAGE` conditional the TRUNCATED branch uses.
-GW_WIN="$(ghost_window_fixture "$QUEUE_PAGE_SHIPPED")"
-run_gate ghost-window-at-page GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
-  GH_DEMAND_GHOST_IDS="${GW_WIN%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_WIN#*|}" \
-  CI_GATE_QUEUE_THRESHOLD=200 --
-assert_eq "$RC" "2" "a full ghost page scanned to the SHIPPED bound → exit 2 (could-not-measure)"
-assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the window refusal names its bound"
-assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
-# ⛔ THE CLAUSE NEEDS ITS OWN TOKEN, NOT ONE THE BASE LINE ALREADY PRINTS (#3995 review cycle 6, F2).
-# This row used to assert the bare token `CI_GATE_QUEUE_HEAD_SCAN_MAX`, which the WINDOW base text above
-# already carries from #3996 (`…or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> …`), so it
-# stayed GREEN with the ceiling clause deleted — it claimed to pin the note while pinning the older,
-# unrelated remedy sentence, and no mutant of this diff could red it (#3442 rule 3). The clause's own
-# wording is `CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it` — it NAMES the knob and then
-# qualifies it — and the token `cannot see past it` appears nowhere else on this output, so the row now
-# reds exactly when the clause is removed. Note the clause QUALIFIES the knob ("at or above %s")
-# instead of dismissing it. ⛔ AND THE GATE ON THIS SURFACE IS THE QUEUE DEPTH, NOT THE BOUND: below the
-# page the same advice would be FALSE — a bound at the page reads such a queue whole, so raising the
-# knob IS the remedy there (measured: the same short-list fixture at bound 30 measures the demand head
-# and writes a verdict) — which is why the clause is gated on `queued > QUEUE_PAGE`. ⛔ BUT THE `-gt`
-# BOUNDARY IS NOT THIS ARM'S: it feeds a queue of PAGE+5, so the clause is emitted under `-ge` too and
-# this arm stays green either way — `ghost-window-at-exact-page` (queue == PAGE) is the side that reds on
-# that relaxation, as its own note records. (The ADDRESS rationale — "the gate names the ceiling only
-# where the knob is visibly maxed" — belongs to the SATURATED surface, which IS bound-gated; do not
-# transplant it here: this arm runs at the SHIPPED bound and asserts the note PRESENT, so no bound is
-# maxed on that side.)
-# That distinction lives in the base remedy sentence, not here.
-assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: a bound at or above the page cannot see past it"
-assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
-assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
-# ⛔ THE BOUNDARY OF THAT GATE: a queue EXACTLY one page deep is MEASURABLE by a bound AT the page, so
-# the ceiling note must be ABSENT (agent-infra#3995 review cycle 7 proposed `queued >= QUEUE_PAGE`;
-# measured, `-ge` prints the note here and tells the operator the knob cannot help — when
-# `CI_GATE_QUEUE_HEAD_SCAN_MAX=100` reads this queue WHOLE and writes a verdict). So the gate is "the queue is DEEPER than a page",
-# `-gt`, and this arm is the side that reds if it is relaxed to `-ge`.
-echo "── #3995: a queue EXACTLY one page deep is measurable at the page bound, so NO ceiling note ──"
-run_gate ghost-window-at-exact-page GH_QUEUED="$QUEUE_PAGE_SHIPPED" GH_INPROGRESS=0 \
-  GH_DEMAND_GHOST_IDS="${GW_WIN%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_WIN#*|}" \
-  CI_GATE_QUEUE_THRESHOLD=200 --
-assert_eq "$RC" "2" "a full ghost page over a queue exactly one page deep → exit 2 at the SHIPPED bound"
-assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "it is the WINDOW branch, not TRUNCATED"
-assert_not_contains "$OUT" "cannot see past it" "…and the ceiling note is ABSENT: a bound AT the page reads this queue whole, so the knob IS the remedy"
 # …and the bound is an OPERAND like every other one here: a zero or non-numeric value would silently
 # disarm the leg (every non-empty queue unmeasurable), so it is refused instead of defaulted.
 echo "── #2344: the head-scan bound is shape-checked like every other operand ──"
@@ -1293,19 +1336,20 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction ad
 # the leg exists to catch, certified `github` with `oldest_queued_s=0`. The fixture is the shipped
 # bound's worth of ghosts (derived, never the literal 5 — agent-infra#3995), and one more row that HAS
 # demand.
+# ⛔ THE DEMANDING ROW IS THE 26TH OLDEST, AND THAT IS NOW EXPRESSED BY ITS AGE (#4116 review, P2). The
+# page used to be hand-ordered by the stub, so "just past the window" could be written as ANY fixture
+# order. It cannot any more: the stub serves a real API body and the GATE'S OWN `--jq` program sorts it
+# oldest-first, which is what the real endpoint + program produce. So "past the 25-run window" has to
+# be true after that sort, i.e. the demanding row must be YOUNGER than the 25 ghosts — a 30-day age
+# sorts it to the FRONT (the scan then finds demand on row 1 and the arm would pin nothing). Its age
+# was never what this arm asserts; its POSITION past the window is.
 echo "── #2344: a bound-limited scan is never mistaken for a complete one ──"
 run_gate ghost-bound-truncated GH_QUEUED="$QUEUE_HEAD_SCAN_SHIPPED" GH_INPROGRESS=0 \
   GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}${GW_DEMAND}:2592000" --
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:120" --
 assert_eq "$RC" "2" "a bound break over a deeper page → exit 2 (could-not-measure), not 'no demand'"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound that stopped it"
 assert_not_contains "$OUT" "nothing is waiting for a runner" "it is NOT read as a complete measurement"
-# ⛔ …AND IT IS THE SHORT-LIST SIDE OF THE CEILING PAIR, so it must carry NO ceiling note (review cycle
-# 7, P1): the queue is 25 deep — a quarter of a page — so a bound at or above the page reads it whole.
-# The shape is asserted here rather than only in the dedicated arm because THIS is the arm a future
-# reader finds first when asking "is the short-page case covered?" (review cycle 7, closing note).
-assert_not_contains "$OUT" "ONE page of" "a bound break over a SHORT list does not blame the page ceiling"
-assert_not_contains "$OUT" "cannot see past it" "…and does not tell the operator the knob cannot help"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a bound-limited scan advanced no state file"
 # …and a TRUNCATED page (fewer rows than the depth it reports) is refused for its own reason, rather
 # than being reported as a scan window that ran out — the two are different reads.
@@ -1314,34 +1358,362 @@ run_gate ghost-truncated GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4
   GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" --
 assert_eq "$RC" "2" "a page shorter than its own depth → exit 2"
 assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
-# …and at the SHIPPED bound the page-ceiling note is NOT appended: the knob can reach this branch and
-# the ceiling does not apply below QUEUE_PAGE (agent-infra#3995 review cycle 2, finding 4).
-assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent below QUEUE_PAGE"
+# …and at the SHIPPED bound the old page-ceiling note is NOT appended either (the read walks pages).
+assert_not_contains "$OUT" "ONE page of" "the removed page-ceiling note is never printed"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
-echo "── #3995: a TRUNCATED read of a FULL page NAMES the page ceiling the knob cannot pass ──"
-# ⛔ THE REACHABLE CEILING SHAPE IS A FULL PAGE THAT ENDS EARLY — not a bound break (agent-infra#3995
-# review cycle 4, findings 1/2, measured): with `per_page=100` no response can carry 101 rows, so a
-# bound at or above the page size never breaks on the bound; the scan runs out of ROWS and reaches the
-# TRUNCATED refusal, which is where the note belongs. A 101-row fixture made this arm take the WINDOW
-# branch — a page the API cannot produce.
-GW_FULL="$(ghost_window_fixture "$QUEUE_PAGE_SHIPPED")"
-run_gate ghost-truncated-fullpage GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
-  GH_DEMAND_GHOST_IDS="${GW_FULL%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FULL#*|}" CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
-assert_eq "$RC" "2" "a full ghost page that ends early → exit 2 (could-not-measure)"
-assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
-assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
-assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
-# ⛔ …AND THE NOTE IS ABOUT A FULL PAGE, NOT ABOUT THE BOUND (agent-infra#3995 review cycle 3, finding
-# 1). Keyed on the bound alone it fired on a DEGRADED body (a synthesised single candidate) and on any
-# short page, blaming the page cap for a list no bound could have widened — advice that cannot help.
-# Measured: bound 100 over a TWO-row page used to print it; it must not.
-echo "── #3995: a SHORT page is not blamed on the page ceiling, even at the ceiling ──"
-run_gate ghost-truncated-shortpage GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+# ⛔ THE TRUNCATED REFUSAL NAMES THE READ CAP NOW, AND THAT IS THE FACT THE OPERATOR NEEDS
+# (agent-infra#4113 — this arm replaces the #3995 ceiling arm, because the ceiling it pinned NO LONGER
+# EXISTS: the candidate list is assembled from up to CI_GATE_QUEUE_READ_MAX_PAGES pages, so a scan bound
+# at or above QUEUE_PAGE can see past one page and "a deeper read is a code change" is no longer true).
+# What still matters is that a SHORT read is reported as truncation and says which bound produced it, so
+# an operator repairs the right thing; the arm keeps its RC/message bite and the mutated `printf` still
+# reddens it.
+echo "── #4113: a truncated read NAMES the read cap the walk covers (the #3995 ceiling is gone) ──"
+run_gate ghost-truncated-ceiling GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
   GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" CI_GATE_QUEUE_HEAD_SCAN_MAX=100 --
-assert_eq "$RC" "2" "a short page at the ceiling → exit 2 (still could-not-measure)"
+assert_eq "$RC" "2" "a truncated page → exit 2"
 assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
-assert_not_contains "$OUT" "ONE page of" "a short page is NOT blamed on the page ceiling"
+assert_contains "$OUT" "CI_GATE_QUEUE_READ_MAX_PAGES" "it names the READ CAP that now bounds the walk"
+assert_contains "$OUT" "fewer rows than it reported depth" "…and says what a short read means (not 'the queue is too deep to reach')"
+assert_not_contains "$OUT" "a deeper read is a code change" "the stale 'code change, not a knob' sentence is GONE (the read now walks pages)"
+
+# ⛔ agent-infra#4113 — THE SCAN WINDOW IS A *COST* BOUND, NOT A *REACH* BOUND, AND ONE PAGE IS NOT THE
+# QUEUE. Both halves were measured on the live fleet on 2026-11-17:
+#   * 43 consecutive passes each proved the 25 oldest of a ~190-deep queue were ghosts (zero TOTAL jobs)
+#     and then refused, so `mode=local` had been pinned since 2026-11-06T01:30Z — the gate could not
+#     reach a verdict in EITHER direction, and the pool stayed armed on a repo whose hosted runners were
+#     serving (in_progress=7). The bound had already been raised once for this exact reason (5 -> 25,
+#     agent-infra#3995, landed 2026-11-11) and the population outgrew it in six days.
+#   * the queue's genuinely oldest demanding run (42064937107, 2026-11-05T16:29Z, 1 of its 22 jobs
+#     queued) was on PAGE 2 of the newest-first runs list, i.e. outside the single page the walk read.
+# So the proofs are now REMEMBERED (`ci-runner-gate.ghosts`) and the walk covers as many pages as the
+# reported depth needs. The arms below pin the three properties that make that safe, and the one that
+# makes it cheap.
+# ⛔ THE FIXTURE IS GENERATED, NEVER RESTATED (#3995 review P1): the ghost population in the first arm
+# is derived from the SHIPPED read budget, so the arm follows the bound instead of pinning a number.
+ghost_ledger_fixture() { # <count> <first id> <age seconds> -> "<ids>|<rows>"
+  _glf_rows=""; _glf_ids=""; _glf_i=0
+  while [ "$_glf_i" -lt "$1" ]; do
+    _glf_id=$(( $2 + _glf_i ))
+    _glf_rows="${_glf_rows:+$_glf_rows;}$_glf_id:$3"
+    _glf_ids="$_glf_ids $_glf_id"
+    _glf_i=$((_glf_i + 1))
+  done
+  printf '%s|%s' "$_glf_ids" "$_glf_rows"
+}
+# When the pool is already engaged, a healthy verdict is the only thing that can disarm it — so the
+# arms below run against a queue deep enough that the walk cannot finish inside one read budget, which is
+# the state the pin was observed in.
+GL1="$(ghost_ledger_fixture "$((QUEUE_HEAD_SCAN_SHIPPED + 5))" 4001 172800)"
+GH_DEEP_IDS="${GL1%%|*}"; GH_DEEP_ROWS="${GL1#*|}"
+echo "── #4113: a ghost population deeper than the read budget is WALKED across passes, not refused forever ──"
+run_gate ledger-pass1 GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 5))" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$GH_DEEP_IDS" GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="$GH_DEEP_ROWS" --
+assert_eq "$RC" "2" "pass 1 spends its whole read budget on ghosts and refuses"
+assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "…and still names the bound it ran out of"
+assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX is a per-pass READ budget" "…and says the knob buys reads, not reach"
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "$QUEUE_HEAD_SCAN_SHIPPED" \
+  "…having PERSISTED every proof it made ON THE PASS THAT REFUSED (a proof kept only on success would be thrown away every time, which is the pin with extra steps)"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a refused pass still advanced no state file"
+
+KEEP_STATE=1
+run_gate ledger-pass1 GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 5))" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$GH_DEEP_IDS" GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="$GH_DEEP_ROWS" --
+KEEP_STATE=0
+assert_eq "$RC" "0" "pass 2 RESOLVES what pass 1 could not: the walk resumes from the remembered proofs"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and the queue's real answer is finally measured"
+assert_contains "$OUT" "ghost_cached=$QUEUE_HEAD_SCAN_SHIPPED" "…naming how many ghosts cost no read this pass"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "…so the fallback DISARMS (the state the pin made unreachable)"
+assert_eq "$(grep -c '/jobs' "$GH_LOG")" "5" \
+  "a remembered ghost costs NO READ: only the 5 runs pass 1 never proved are read"
+assert_not_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and the specific ledgered run is never re-read"
+
+# ⛔ THE TWO CONDITIONS THAT MAKE A GHOST PERMANENT, EACH WITH ITS NEGATIVE CONTROL. A cache that trusted
+# either of them on weaker evidence would discount a run that can still become demand — understating
+# `queued_demanding` and certifying "nothing is waiting" over a real stall, which is the exact defect
+# #2344 exists to remove, one cache layer down.
+echo "── #4113: a run with jobs but NONE queued is time-local, and is never remembered ──"
+run_gate ledger-not-permanent GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_DEMAND_GHOST_TOTAL_JOBS=3 GH_DEMAND_JOBS_TOTAL=3 GH_QUEUE_ROWS_SPEC="4001:172800;4002:172800" --
+assert_eq "$RC" "0" "a queue of two such runs is read normally"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and the answer is the same ghost discount it always was"
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "NO entry: 'jobs exist, none queued' can become demand, so it is re-read every pass"
+KEEP_STATE=1
+run_gate ledger-not-permanent GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_DEMAND_GHOST_TOTAL_JOBS=3 GH_DEMAND_JOBS_TOTAL=3 GH_QUEUE_ROWS_SPEC="4001:172800;4002:172800" --
+KEEP_STATE=0
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and the next pass DOES re-read it (the cost is the point)"
+
+echo "── #4113: a run too YOUNG for its zero-job reading to be terminal is never remembered ──"
+run_gate ledger-young GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:60;4002:60" --
+assert_eq "$RC" "0" "a young all-ghost queue still reaches its verdict"
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "NO entry: GitHub creates a run's jobs progressively, so a 60 s old run's zero is not yet terminal"
+run_gate ledger-young-floor GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:60;4002:60" CI_GATE_GHOST_TRUST_AFTER_S=30 --
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "2" \
+  "…and the floor is the operand that decides it (30 s makes the same fixture permanent, so the arm is not vacuous)"
+
+# ⛔ AN UNPARSEABLE LEDGER IS DISCARDED WHOLE. A partially trusted ledger is a FAIL-OPEN: a run nobody
+# proved gets discounted, demand is understated, and the pool is stripped during a real stall. Discarding
+# costs reads; trusting costs the claim.
+echo "── #4113: a ledger that cannot be parsed discounts NOTHING ──"
+run_gate ledger-unreadable GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "the control pass resolves the queue and remembers the ghost"
+KEEP_STATE=1
+printf '4001\nnot-an-id\n' > "$STATE_DIR/ci-runner-gate.ghosts"
+run_gate ledger-unreadable GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_contains "$OUT" "ghost ledger UNREADABLE" "a malformed ledger is NAMED, not silently ignored"
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…and its run is READ, never discounted on an entry that did not parse"
+assert_eq "$(awk '{print $1}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null)" "4001" "…and the file is rewritten to the proofs that DID parse, stamped with the moment they were proved"
+assert_eq "$(awk 'NF != 2' "$STATE_DIR/ci-runner-gate.ghosts" | grep -c . | tr -d ' ')" "0" \
+  "…every row carries exactly `<run id> <epoch>` (a row with no stamp is a proof nobody dated)"
+
+# ⛔ ONE PAGE IS NOT THE QUEUE (see the block above): the runs endpoint is newest-first, so a head that is
+# older than the newest QUEUE_PAGE runs is INVISIBLE to a single-page walk — measured on the live repo,
+# where the oldest demanding run was on page 2. This arm walks to it; the pre-fix gate refused TRUNCATED.
+echo "── #4113: a head OLDER than the newest page is found, not refused as truncated ──"
+GLP1="$(ghost_ledger_fixture 100 5001 172800)"
+# ⛔ THE HEAD IS PLACED AT THE NEWEST END *AND* GIVEN A NON-ZERO TOTAL (agent-infra#4113 review, P2). An
+# earlier draft made 6001 the OLDEST row, so after the global sort it was candidate 1 and the walk broke
+# there having proved ZERO ghosts — the arm then asserted the ledger was empty, which was true for a
+# reason unrelated to the claim, and its only remaining bite came from a stub answer GitHub cannot emit
+# (`#jobs 0` beside a demand label set). Now 149 ghosts are walked first (so the ledger is non-empty and
+# `ghost_cached` is not what carries the page), the head is last, and its total is 22 — a real, running
+# workflow — so "it is absent from the ledger" means "demand was never remembered", not "nothing was".
+GLP2="$(ghost_ledger_fixture 49 5101 172900)"
+run_gate ledger-pages GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="${GLP1%%|*} ${GLP2%%|*}" \
+  GH_DEMAND_JOBS_TOTAL=22 GH_QUEUE_ROWS_SPEC="${GLP1#*|}" GH_QUEUE_ROWS_PAGE2="${GLP2#*|};6001:60" \
+  CI_GATE_QUEUE_HEAD_SCAN_MAX=200 --
+assert_eq "$RC" "0" "a head beyond page 1 is reachable, so the pass ACTS"
+assert_contains "$OUT" "queue_head_run=6001" "the head is the oldest run WITH a queued job, found on page 2"
+assert_contains "$(cat "$GH_LOG")" "page=2" "…because the read walked past the newest page instead of stopping at it"
+assert_not_contains "$OUT" "TRUNCATED" "…so the pre-fix 'only 100 rows were readable' refusal is gone"
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "149" \
+  "the 149 ghosts the walk DID prove are remembered"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.ghosts")" "6001" \
+  "…and the DEMANDING run is never remembered, however the walk reached it"
+
+# ⛔ THE PAGE WALK IS BOUNDED (T8). Three shape refusals and one arithmetic refusal, all of which were
+# unpinned when this arm was added: nothing in the suite named QUEUE_MAX_PAGES, so deleting the cap — or
+# letting `_need > cap` fall through — reddened NOTHING (agent-infra#4113 review, P1).
+echo "── #4113: the multi-page read is bounded like every other read here ──"
+run_gate pages-cap-zero GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_READ_MAX_PAGES=0 --
+assert_eq "$RC" "2" "a zero page cap → exit 2 (it would disarm the read, not bound it)"
+assert_contains "$OUT" "queue read page cap is ZERO" "…naming the misconfiguration"
+run_gate pages-cap-junk GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_READ_MAX_PAGES=abc --
+assert_eq "$RC" "2" "an unreadable page cap → exit 2"
+assert_contains "$OUT" "queue read page cap UNREADABLE" "…naming the read failure"
+# …and a queue whose depth NEEDS more pages than the cap allows is refused BY NAME rather than walked
+# halfway: two pages of 100 under a cap of 1.
+run_gate pages-cap-short GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_READ_MAX_PAGES=1 --
+assert_eq "$RC" "2" "a queue deeper than the page cap → exit 2"
+assert_contains "$OUT" "beyond the 1-page read cap" "…and the refusal names the cap, not a truncated read"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an over-cap queue advanced no state file"
+# …and a page that answers NOTHING ends the walk (it does not spin): the stub answers no page 2 unless a
+# fixture gives it one, which is exactly the short-page shape.
+run_gate pages-empty-page2 GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_DEMAND_GHOST_IDS="${GLP1%%|*}" GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_HEAD_SCAN_MAX=200 --
+assert_eq "$RC" "2" "a page 2 that answers nothing ends the walk and the short read is REFUSED"
+assert_contains "$OUT" "TRUNCATED" "…as a truncation, which is what it is"
+
+# ⛔ A COVERED READ IS A SET OF RUNS, AND A COUNT THAT EXCEEDS THE DEPTH IS A CONTRADICTION, NOT A TRIM
+# (T6/T9, agent-infra#4113 review P0 — this arm is the FAIL-OPEN the first cut shipped). Pages are
+# fetched seconds apart from a live newest-first list, so a row can be served twice and a row can be
+# extra. The first cut TRIMMED the assembly to the reported depth, which silenced the contradiction check
+# and — measured — DROPPED the one row that had a queued job, certifying "nothing is waiting" over a
+# demand it never read. Both shapes are pinned here.
+echo "── #4113: an assembled read longer than the depth is REFUSED, never trimmed ──"
+GLX2="$(ghost_ledger_fixture 51 5301 172900)"
+run_gate pages-longer-than-depth GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_DEMAND_GHOST_IDS="${GLP1%%|*} ${GLX2%%|*}" GH_QUEUE_ROWS_SPEC="${GLP1#*|}" \
+  GH_QUEUE_ROWS_PAGE2="${GLX2#*|}" CI_GATE_QUEUE_HEAD_SCAN_MAX=200 --
+assert_eq "$RC" "2" "151 assembled rows for a 150-deep queue → exit 2"
+assert_contains "$OUT" "INCONSISTENT" "…named as the contradiction it is"
+assert_contains "$OUT" "never trimmed" "…and the message says why trimming is not the answer"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "the contradiction is NEVER read as 'no demand'"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a contradictory read advanced no state file"
+# …and the DUPLICATE shape: page 2 serving a run page 1 already served means the window shifted, so the
+# pass has fewer DISTINCT runs than the queue is deep — it must refuse, not certify what it did not cover
+# (deduping by id is what makes that legible at all: without it the duplicate would inflate the count to
+# the depth and read as "covered").
+run_gate pages-duplicate-row GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_DEMAND_GHOST_IDS="${GLP1%%|*} ${GLP2%%|*}" GH_QUEUE_ROWS_SPEC="${GLP1#*|}" \
+  GH_QUEUE_ROWS_PAGE2="5100:172800;${GLP2#*|}" CI_GATE_QUEUE_HEAD_SCAN_MAX=200 --
+assert_eq "$RC" "2" "a duplicated row means the pass covered 149 of 150 runs → exit 2"
+assert_contains "$OUT" "TRUNCATED" "…the uncovered queue is named as a short read"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "a queue the pass did not cover is NEVER certified empty"
+
+# …and an ABSENT total is never read as a zero (T1/T3): a jobs body that answers a label set but NO
+# `#jobs` row is an UNMEASURED total, so nothing may be remembered from it — the coercion the first cut
+# shipped in jq (`.jobs // [] | length`) minted exactly the claim that makes a ghost permanent.
+# ⛔ THESE TWO GO THROUGH THE SHIPPED JQ PROGRAM, NOT THE STUB'S SHAPE ANSWERS (`GH_JOBS_BODY`), because
+# the defect being pinned LIVES IN THAT PROGRAM: a body carrying `"jobs": null` must produce NO page row
+# (unmeasured), while a body carrying `"jobs": []` is the real never-created-jobs ghost and produces
+# `#jobs 0` (measured zero). Written with the shape answers instead, a mutant that coerced null to zero
+# passed every assertion in this suite — measured (agent-infra#4113 review cycle 2).
+echo "── #4113: the shipped jq must not turn an ABSENT job list into a measured zero ──"
+run_gate ledger-null-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":0,"jobs":null}' --
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "a body whose .jobs is null remembers NOTHING (an absent reading is not a zero)"
+run_gate ledger-empty-jobs GH_QUEUED=1 GH_INPROGRESS=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  GH_JOBS_BODY='{"total_count":0,"jobs":[]}' --
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "1" \
+  "…while an EMPTY job list is the real ghost shape and IS remembered (so the arm is not vacuous)"
+
+# …and an unmeasured total from the SHAPE double behaves the same way (the shell half): no page row, no
+# entry, whatever the reason the row is missing.
+echo "── #4113: a jobs read with no page row remembers NOTHING ──"
+run_gate ledger-no-total GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "the control: measured zero writes one entry"
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "1" "…one entry"
+run_gate ledger-absent-total GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$(grep -c . "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | tr -d ' ')" "0" \
+  "NO entry from an unmeasured total: absence is not zero"
+
+# ⛔ A PROOF IS NOT FOREVER (T1, agent-infra#4113 review CYCLE 2, P0). A reading is a fact about one
+# moment, and a run can gain jobs WHILE STAYING `queued` (a progressive job set finishing, a new attempt),
+# so "it never leaves the queue" does not invalidate an entry. Reproduced by the reviewer against the
+# first cut: pass 1 sees `.jobs: []`, pass 2 answers a queued job for the SAME run, and the pass logged
+# `ghost_cached=1`, `jobs reads: 0`, "nothing is waiting for a runner" → `fallback_off` strips the pool
+# over live demand. The fix is an EXPIRY: each entry carries the epoch at which it was proved, a HIT DOES
+# NOT REFRESH IT, and an entry older than GHOST_REPROVE_AFTER_S is dropped at load (re-read and re-proven).
+# The arms below are the flip itself (expired proof → demand seen), the load-bearing expiry (fresh proof →
+# demand NOT re-read, which is the whole point of the ledger), and clock skew.
+echo "── #4113: a remembered ghost that GAINS jobs is re-read once its proof expires (the flip) ──"
+run_gate ledger-flip GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "pass 1: a zero-job run is proved and remembered"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and it certifies the queue empty, which is correct AT THAT MOMENT"
+GL_FLIP_STAMP="$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts")"
+assert_eq "$(awk 'NF' "$STATE_DIR/ci-runner-gate.ghosts" | wc -l | tr -d ' ')" "1" "…with exactly one stamped entry"
+assert_eq "$(( $(date +%s) - GL_FLIP_STAMP < 300 ))" "1" "…stamped NOW (a proof is dated, not just asserted)"
+KEEP_STATE=1
+# The SAME run now answers a queued job (no GH_DEMAND_GHOST_IDS) — the flip — and its proof is BACK-DATED
+# past the interval rather than made short-lived: a 1 s TTL would need a sleep at a 1 s boundary, i.e. a
+# flake on a loaded runner, where an aged stamp is the same claim stated deterministically.
+printf '4001 %s\n' "$(( $(date +%s) - 100 ))" > "$STATE_DIR/ci-runner-gate.ghosts"
+run_gate ledger-flip GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=50 --
+KEEP_STATE=0
+assert_eq "$RC" "0" "pass 2 still reaches a verdict"
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "…because the EXPIRED proof is RE-READ, not trusted"
+assert_contains "$OUT" "proof(s) EXPIRED" "…and the pass says so"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "the flipped run's demand is SEEN — the fail-open this arm exists for"
+assert_not_contains "$OUT" "ghost_cached=1" "it was not discounted from the ledger"
+# …and the negative control: a FRESH proof is trusted (that is the ledger's whole job), so the same flip
+# does NOT redden anything when the interval has not elapsed — without this pair the arm above would pass
+# on a gate that simply never remembered anything.
+run_gate ledger-fresh-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+# ⛔ THE STAMP IS BACK-DATED BY 100 s BEFORE THE HIT, AND THAT IS WHAT MAKES THE ASSERTION BITE. Two
+# passes run within the same SECOND, so a mutant that re-stamps on every hit would write the SAME epoch
+# and the arm would pass — measured: `hit-refreshes` survived this assertion when the stamp was real.
+# A back-dated stamp (still well inside the shipped 12 h interval) separates "carried forward" from
+# "refreshed" deterministically, with no sleep at a boundary.
+GL_STAMP_AGED="$(( $(date +%s) - 100 ))"
+printf '4001 %s\n' "$GL_STAMP_AGED" > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-fresh-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_not_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "a FRESH proof is trusted and the run is not re-read (the cost bound the ledger exists for)"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and the verdict is the remembered one (so the flip arm is not vacuous)"
+# ⛔ A HIT MUST CARRY THE OLD STAMP FORWARD, NOT STAMP ITSELF (review cycle 2, P0 — the subtle half). An
+# entry re-stamped on every use is IMMORTAL: it would never expire, so the flip the arm above pins would
+# be missed forever instead of for one interval. Asserted directly on the file, because a sleep-based
+# arm at a 1 s boundary is a flake waiting to happen on a loaded runner.
+assert_eq "$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts")" "$GL_STAMP_AGED" \
+  "the hit did NOT refresh the stamp (an immortal proof would never expire)"
+assert_eq "$(awk 'NF' "$STATE_DIR/ci-runner-gate.ghosts" | wc -l | tr -d ' ')" "1" \
+  "…and the hit did not append a SECOND row for the same run (the dedupe is on the id, not the pair)"
+# …and a proof stamped in the FUTURE (a clock skew no reading can date) is not trusted either.
+echo "── #4113: a proof dated in the FUTURE is not trusted ──"
+run_gate ledger-future-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+printf '4001 %s\n' "$(( $(date +%s) + 99999 ))" > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-future-stamp GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" "a future-dated proof is re-read, never trusted (it would never expire)"
+assert_contains "$OUT" "nothing is waiting for a runner" "…and, being re-proved zero-job, the verdict is still correct"
+# ⛔ SKEW IS NOT AGE, AND THE LOG MUST NOT CALL IT AGE (review cycle 3, P2): an operator debugging a clock
+# skew was told "older than 43200s", which is the opposite of what the stamp said. Both arms exist so the
+# wording is pinned in both directions.
+assert_contains "$OUT" "proof(s) SKEWED (stamped in the FUTURE)" "a future stamp is reported as SKEW, not as age"
+assert_not_contains "$OUT" "EXPIRED" "…and NOT as an expiry (the run is 99999 s in the FUTURE)"
+# ⛔ A STAMP TOO LONG TO BE AN EPOCH IS A FORMAT VIOLATION, AND THE PRE-FIX LOADER TRUSTED IT (review
+# cycle 4, P2 — measured). `date +%s` writes 10 digits until 2286, so 11+ digits is corrupt state; bash's
+# 64-bit `$(( ))` then WRAPS a 20-digit stamp into a NEGATIVE age, and `[ "$stamp" -gt "$now" ]` errors on
+# an operand beyond intmax — so an over-long stamp is neither "expired" nor "future", it is TRUSTED, and
+# the run behind it is never re-read again. That is the cycle-2 P0 through the parser instead of the clock.
+# The row below is exactly the shape a garbled write produces: two fields, both all-digits, undeniable to
+# every shape test the loader had.
+echo "── #4113: a proof stamp too long to be an epoch is REFUSED, not wrapped into 'fresh' ──"
+run_gate ledger-stamp-overflow GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+assert_eq "$RC" "0" "the control pass resolves the queue and remembers the ghost"
+printf '4001 99999999999999999999\n' > "$STATE_DIR/ci-runner-gate.ghosts"
+KEEP_STATE=1
+run_gate ledger-stamp-overflow GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="4001:172800" --
+KEEP_STATE=0
+assert_contains "$(cat "$GH_LOG")" "/runs/4001/jobs" \
+  "a 20-digit stamp WRAPS the age arithmetic negative, so it must be REFUSED — the pre-fix loader trusted it and never re-read the run"
+assert_contains "$OUT" "ghost ledger UNREADABLE" "…and the row is named as the format violation it is"
+assert_not_contains "$OUT" "ghost_cached=1" "…so it is never counted as a discounted ghost"
+assert_eq "$(awk '{print $2}' "$STATE_DIR/ci-runner-gate.ghosts" 2>/dev/null | grep -cE '^[0-9]{10}$' | tr -d ' ')" "1" \
+  "…and the run is re-proved and re-stamped with a DATEABLE epoch, so the refusal costs one read and no claim"
+
+# ⛔ THE TWO NEW BOUNDS ARE SHAPE-CHECKED LIKE EVERY OTHER ONE, ZERO INCLUDED WHERE ZERO IS FAIL-OPEN.
+# The gap was real (review cycle 2, P2): neither of these `case` arms was named by any assertion, so
+# deleting either reddened nothing — the same half-fixed gap as cycle 1's missing page-cap arm.
+echo "── #4113: the trust floor and the re-prove interval are bounded, not defaulted ──"
+run_gate ledger-floor-zero GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:60" \
+  CI_GATE_GHOST_TRUST_AFTER_S=0 --
+assert_eq "$RC" "2" "a ZERO trust floor → exit 2 (it would disarm the age condition, which is fail-OPEN here)"
+assert_contains "$OUT" "ghost ledger trust floor is ZERO" "…naming the misconfiguration"
+# ⛔ AND EVERY SPELLING OF ZERO (review cycle 3, P1 — measured): the first cut matched the literal `0` only,
+# so `00` passed all three arms and disarmed the age condition while the comment claimed it was refused.
+run_gate ledger-floor-zeros GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:60" \
+  CI_GATE_GHOST_TRUST_AFTER_S=00 --
+assert_eq "$RC" "2" "'00' is ZERO too → exit 2 (the refusal is on the VALUE, not on its spelling)"
+assert_contains "$OUT" "ghost ledger trust floor is ZERO" "…naming it"
+run_gate ledger-floor-huge GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_TRUST_AFTER_S=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE trust floor → exit 2"
+assert_contains "$OUT" "ghost ledger trust floor OUT OF RANGE" "…named as a range error, not a read"
+run_gate ledger-reprove-junk GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=abc --
+assert_eq "$RC" "2" "an unreadable re-prove interval → exit 2"
+assert_contains "$OUT" "ghost proof re-prove interval UNREADABLE" "…naming the read failure"
+run_gate ledger-reprove-huge GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="4001:172800" \
+  CI_GATE_GHOST_REPROVE_AFTER_S=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE re-prove interval → exit 2"
+assert_contains "$OUT" "ghost proof re-prove interval OUT OF RANGE" "…named as a range error"
+run_gate pages-cap-huge GH_QUEUED=150 GH_INPROGRESS=0 GH_DEMAND_JOBS_TOTAL=0 \
+  GH_QUEUE_ROWS_SPEC="${GLP1#*|}" CI_GATE_QUEUE_READ_MAX_PAGES=99999999999 --
+assert_eq "$RC" "2" "an OUT-OF-RANGE page cap → exit 2"
+assert_contains "$OUT" "queue read page cap OUT OF RANGE" "…the third unpinned bound of this change, now pinned"
+
+# ⛔ A READ VERB CHANGES NOTHING: the ledger is a cache, and `--dry-run` must leave the box as it found it
+# (the same rule the blind-streak arms pin for their own state).
+echo "── #4113: --dry-run writes no ledger ──"
+run_gate ledger-dry GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 5))" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="$GH_DEEP_IDS" GH_DEMAND_JOBS_TOTAL=0 GH_QUEUE_ROWS_SPEC="$GH_DEEP_ROWS" -- --dry-run
+assert_absent "$STATE_DIR/ci-runner-gate.ghosts" "--dry-run proved ghosts and wrote none of them (a read verb changes nothing)"
 
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.
@@ -1354,6 +1726,21 @@ assert_contains "$OUT" "HTTP 500" "the failure carries gh's reason (not swallowe
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed in-progress read advanced no state file"
 assert_not_contains "$OUT" "TRANSITION" "a failed in-progress read sent no transition notification"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed in-progress read relabelled no runner"
+
+# ⛔ AND THE QUEUE READ ITSELF, which is the read every leg above depends on (#1704's class, caught
+# as a STRAGGLER: the suite pinned the in-progress read's reason but left this one's `2>/dev/null`
+# unobserved, so reverting it stayed green). MEASURED 2026-11-17T12:25:27Z the fleet was handed
+# `queue probe FAILED (gh api)` with no reason, on a pass that failed at this read while the shared
+# REST pool sat at `core=0/5000` — where `API rate limit exceeded` and a network fault call for
+# OPPOSITE remedies and the log distinguished neither. The failure stays FAIL-CLOSED either way;
+# what this arm pins is that the REASON reaches the operator.
+echo "── #1704 straggler: a failed QUEUE read carries gh's reason (not swallowed) ──"
+run_gate queue-probe-fail GH_MODE=queued-fail --
+assert_eq "$RC" "2" "a failed queue read → exit 2 (could-not-measure)"
+assert_contains "$OUT" "queue probe FAILED" "the failure NAMES the read that failed"
+assert_contains "$OUT" "API rate limit exceeded" "the failure carries gh's reason (not swallowed)"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed queue read advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed queue read relabelled no runner"
 
 run_gate inprog-null GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
   GH_MODE=inprog-null --
@@ -1390,50 +1777,9 @@ run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_
   CI_GATE_QUEUE_THRESHOLD=200 --
 assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
 assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
-# ⛔ THIS BRANCH'S NOTE IS RESTORED, GATED ON THE BOUND — the review's option (a) (agent-infra#3995,
-# F2), chosen over option (b) "document that it was dropped". Two corrections are folded in here and
-# neither should be lost again: 4304f70c4 was right that the previous "two-sidedly pinned" claim was
-# FALSE (the branch carried no note at all, so no arm could hold the other side), and cycle 4's reason
-# for deleting it was wrong — it defended a `scanned` gate, but the clause is BOUND-gated and
-# `queued > QUEUE_PAGE` makes "no bound can see past this page" true BY CONSTRUCTION (`per_page` caps
-# at 100 and silently reduces above it). So the statement was CORRECT and its coverage was missing;
-# restoring the note is what makes the pin two-sided, rather than a tripwire over an absence.
-# Below the page the same advice would still be true; the note is withheld on ADDRESS, not on truth —
-# the gate names the ceiling only where the knob is visibly maxed — so it is absent here:
-assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent at a bound BELOW the page"
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"
-# ⛔ …AND PRESENT AT THE CEILING — the half that REDS when the note is DELETED (agent-infra#3995 review,
-# F2 + F4). It is this pair, with the absence assertion above, that makes the conditional TWO-SIDED:
-# this arm reds if the bound-gated clause is removed from the refusal, and the arm above reds if it is
-# emitted UNGATED. An operator facing a queue deeper than one page needs to be told the knob cannot
-# help — `per_page` is capped at 100 and larger values are silently reduced, so no bound reads past the
-# page. ⛔ NOTE what does NOT guard it (measured in cycle 4): `page-saturated` alone cannot — the
-# clause's plain absence, and a `scanned`-gated rewrite, both leave it green because that arm refuses
-# at the same line whatever the note says.
-# ⛔ AND WHAT THIS ARM DOES NOT PIN: a claim about the CANDIDATE LIST'S LENGTH (review cycle 8, F1 —
-# MEASURED). This arm passes no `GH_QUEUE_ROWS_SPEC`, so `queue_rows_field` serves its DEFAULT single
-# head row and the scan reads a ONE-ROW PAGE — the row comes from the PAGE field, NOT the synthesised
-# candidate on the degrade path (cycle 9 instrumented the branch: n=1 page rows, zero degrade hits;
-# naming the degrade shape was that cycle's own F1 defect). The clause used to say "the candidate list
-# is ONE page of 100 runs" over that one-row list, and this arm asserted the phrase — pinning a
-# falsehood. The clause
-# now claims only what the branch establishes (the READ REQUEST is at most one page, and the QUEUE is
-# deeper than a page), so the assertion below is true of the one-row list as well as of a full page.
-# The clause's own wording is a REQUIRED token (`cannot see past it`): `ONE page of` alone would also be
-# satisfied by a future re-introduction of the length claim.
-echo "── #3995: a SATURATED read at the page ceiling NAMES the ceiling the knob cannot pass ──"
-run_gate page-saturated-at-page GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
-  CI_GATE_QUEUE_THRESHOLD=200 CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
-assert_eq "$RC" "2" "a saturated read at the ceiling → exit 2 (still could-not-measure)"
-assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
-assert_contains "$OUT" "ONE page of" "a saturated read at the ceiling NAMES the ceiling"
-assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: no bound reads past the page"
-assert_not_contains "$OUT" "the candidate list is" "…and it claims NOTHING about how many rows the candidate list held (cycle 8, F1)"
-assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
-assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated read at the ceiling advanced no state file"
-assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated read at the ceiling relabelled no runner"
 # …and the saturation is NOT a new way to red the normal path: with the SHIPPED threshold the length
 # leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
 run_gate page-saturated-shipped GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --
@@ -2688,6 +3034,139 @@ assert_eq "$(wc -l < "$CMUX_LOG" | tr -d ' ')" "1" "exactly one cmux message is 
 assert_contains "$(cat "$CMUX_LOG")" "TEST-LANE-UUID" "the cmux message names the configured lane"
 
 echo "───────────────────────────────────────────────────────────────────"
+# ── the #4085 defaults are pinned TWO-SIDED: derived for the export, literal for the verdict ─────
+assert_eq "$CENSUS_ATTEMPTS_SHIPPED" "3" "the gate SHIPS 3 census attempts"
+assert_eq "$CENSUS_BACKOFF_SHIPPED" "2" "the gate SHIPS a 2 s first backoff"
+assert_eq "$BLIND_DEFECT_AFTER_SHIPPED" "6" "the gate SHIPS escalation at 6 consecutive blind passes"
+assert_eq "$BLIND_DEFECT_EVERY_SHIPPED" "21600" \
+  "the gate SHIPS a 6 h defect write floor — NOT the 1800 s inbox rate #4085 replaced"
+assert_eq "$BLIND_STREAK_RESET_SHIPPED" "3600" \
+  "the gate SHIPS a 1 h streak window, DECOUPLED from the alarm interval"
+# …and the three #4113 bounds, for exactly the same reason (review cycle 4, P1 — measured: a mutant
+# shipping 999999999 for the re-prove interval, i.e. proofs that never expire, stayed 685/685 GREEN).
+assert_eq "$GHOST_TRUST_SHIPPED" "3600" \
+  "the gate SHIPS a 1 h ghost trust floor"
+assert_eq "$GHOST_REPROVE_SHIPPED" "43200" \
+  "the gate SHIPS a 12 h re-prove interval — a proof is re-proven, never trusted forever"
+assert_eq "$QUEUE_MAX_PAGES_SHIPPED" "5" \
+  "the gate SHIPS a 5-page queue read — 5 is the DEFAULT bound (CI_GATE_QUEUE_READ_MAX_PAGES can raise it, needing a measured queue depth: each page is one more list call per pass)"
+
+# ── (r1) A TRANSIENT CENSUS FAILURE IS RETRIED, NOT LOST (agent-infra#4085) ────────────────────
+# The measured shape: `net/http: TLS handshake timeout` on the runners read. One attempt per 300 s
+# pass meant one blip cost a whole pass — 183 failed enumerations and 245 relabel failures in a month,
+# with the pool serving 3 of 24 runners while 284 runs queued.
+run_gate census-retry GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok GH_CENSUS_FAIL_N=1 \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 --
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "capacity=unknown" \
+  "(r1) one transient census failure does not make the pass BLIND"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
+  "(r1) the recovery is REPORTED, so a box that had a blip is distinguishable from one that did not"
+
+# ── (r1b) A RATE-LIMIT 403 IS RETRIED, NOT FAST-FAILED (#4085 review P1) ───────────────────────
+# `API rate limit exceeded` was 125 of the 183 measured failures. It is a 403 that CLEARS, so the
+# fast-fail list must not swallow it — and this arm is what makes a mutant that adds it red.
+# ⛔ WHAT THIS ARM DOES *NOT* CLAIM (#4085 review P3): it pins the CLASSIFICATION and the retry PATH,
+# not a guarantee of recovery. The stub fails once and the backoff is forced to 0, so it cannot show
+# that the shipped budget (3 attempts, 2 s + 4 s = ≤6 s of sleep) outlives the window — and the measured
+# message, `API rate limit exceeded for user ID 1`, is the PRIMARY limit, whose reset window is far
+# longer than 6 s. What change #1 genuinely buys back is the timeout/transport class; a primary limit
+# is retried correctly and recovers only when its reset lands inside the budget.
+run_gate census-retry-ratelimit GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok GH_CENSUS_FAIL_N=1 \
+  GH_CENSUS_FAIL_MODE=ratelimit CI_GATE_CENSUS_READ_BACKOFF_S=0 --
+assert_not_contains "$OUT" "capacity=unknown" \
+  "(r1b) a rate-limit 403 is retried, NOT treated as a permanent capability failure"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "READ RECOVERED on attempt 2/" \
+  "(r1b) the rate-limit retry is REPORTED (a retried path, not a guaranteed recovery — see above)"
+
+# ── (r1c) A DETERMINISTIC 403 IS NOT RETRIED, AND COSTS EXACTLY ONE CALL (#4085 review P1) ─────
+# Without this, dropping the fast-fail list retries a permission failure three times and the suite
+# stays green — the retry budget is part of the contract, so the CALL COUNT is asserted, not the log.
+run_gate census-403-noretry GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_contains "$OUT" "NON-TRANSIENT error — NOT retried" "(r1c) a permission failure is NOT retried"
+assert_eq "$(grep -c "#page" "$GH_LOG" 2>/dev/null)" "1" \
+  "(r1c) exactly ONE census call (the page-row read) is spent on a deterministic 403 — current_mode's read is a different program"
+
+# ── (r2) SUSTAINED BLINDNESS BECOMES A DEFECT RECORD (#4085) ──────────────────────────────────
+# `orchestrator-inbox.log` held 43 identical blind alarms across a month and provoked no action.
+# Repetition is not escalation, so past `CI_GATE_BLIND_DEFECT_AFTER` consecutive blind passes the
+# condition STARTS escalation, and the record is WRITTEN at most once per CI_GATE_BLIND_DEFECT_EVERY_S
+# (time-bounded) — not once per threshold.
+# The FIRST pass must not set KEEP_STATE: KEEP_STATE=1 means "reuse the existing state dir", which
+# by its own semantics SKIPS creating it — so a first pass that sets it has nowhere to write the
+# streak and the arm would fail for a reason unrelated to the code under test.
+run_gate census-blind GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=3 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+# ⛔ SIX passes, not four (#4085 review round 5, P1). With defect_after=3, four passes cannot tell the
+# time floor from the old `streak % defect_after` rule — BOTH write exactly one line (3%3=0; 4%3=1).
+# At six they diverge: modulo writes at 3 AND 6, the time floor writes once. MEASURED BEFORE this:
+# reverting the predicate kept all 592 assertions green.
+for _i in 2 3 4 5 6; do
+  KEEP_STATE=1 run_gate census-blind GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+    CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=3 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+done
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')" "1" \
+  "(r2) 6 consecutive blind passes record EXACTLY ONE defect line — the file is rate-limited in TIME, not per pass (modulo would write 2)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null)" "streak=3" \
+  "(r2) the defect record names the streak, so its severity is readable without the log"
+# ⛔ THIS .stamp ASSERTION IS A PRESENCE CHECK, NOT AN INDEPENDENT DISCRIMINATOR (#4085 review P3,
+# correcting an earlier claim of exactly that). MEASURED: a revert to the `streak % defect_after`
+# predicate still writes the stamp when it writes a record, so this arm does NOT catch that revert —
+# the LINE-COUNT assertion above is what reddens (modulo writes at 3 and 6). It is kept because a
+# mutant that stops writing the time floor altogether (a dropped stamp write) is otherwise silent, and
+# the owner's review trail records that claim as false rather than leaving it to be trusted again.
+[ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ] \
+  && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); echo "  ❌ (r2) the defect write floor keeps a .stamp (time-based rate limit)"; }
+
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)" "RECURRING DEFECT" \
+  "(r2) the alarm wording escalates once the condition is sustained"
+
+# ── (r2b) AN OUT-OF-RANGE THRESHOLD STILL ESCALATES (#4085 review P3) ──────────────────────────
+# `BLIND_DEFECT_AFTER` was the one #4085 knob with no >=10-digit arm, and the failure is silent: an
+# out-of-intmax operand makes `[ "$streak" -ge "$defect_after" ]` ERROR, and an errored arithmetic
+# test reads as FALSE — so the DEFECT escalation this PR adds is disabled by an unvalidated override
+# (MEASURED: `[ 5 -ge 99999999999999999999 ]` -> `integer expression expected`, false). With the arm in
+# place the value falls back to the shipped 6, so six passes must leave a record.
+run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+  CI_GATE_BLIND_ALARM_EVERY_S=0 --
+for _i in 2 3 4 5 6; do
+  KEEP_STATE=1 run_gate census-defect-outofrange GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+    CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=99999999999999999999 \
+    CI_GATE_BLIND_ALARM_EVERY_S=0 --
+ done
+assert_eq "$(wc -l < "$STATE_DIR/ci-runner-gate.DEFECT" 2>/dev/null | tr -d ' ')" "1" \
+  "(r2b) an OUT-OF-RANGE CI_GATE_BLIND_DEFECT_AFTER falls back to the shipped 6, so the escalation FIRES instead of erroring to FALSE"
+
+# ── (r2c) A FAILED DEFECT WRITE IS REPORTED AS UNRECORDED (#4085 review P3) ────────────────────
+# The gate runs without `set -e`, so the write's status was discarded and the log asserted
+# "BLIND DEFECT recorded" unconditionally. A DIRECTORY at the record path is the cheapest portable
+# unwritable target: `>>` fails, and the log must say the condition is UNRECORDED (and the throttle
+# stamp must stay absent, or a failed write would suppress the retry for a whole BLIND_DEFECT_EVERY_S).
+mkdir -p "$T/state-census-defect-unwritable/ci-runner-gate.DEFECT"
+run_gate census-defect-unwritable GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden \
+  CI_GATE_CENSUS_READ_BACKOFF_S=0 CI_GATE_BLIND_DEFECT_AFTER=1 CI_GATE_BLIND_ALARM_EVERY_S=0 --
+_GATE_LOG="$(cat "$STATE_DIR/ci-runner-gate.log" 2>/dev/null)"
+assert_not_contains "$_GATE_LOG" "BLIND DEFECT recorded" \
+  "(r2c) a FAILED defect write does NOT log 'recorded' — the log must not assert a durable record that does not exist"
+assert_contains "$_GATE_LOG" "BLIND DEFECT WRITE FAILED" \
+  "(r2c) the failure is NAMED as UNRECORDED, so the condition is not silently dropped"
+if [ -f "$STATE_DIR/ci-runner-gate.DEFECT.stamp" ]; then
+  FAIL=$((FAIL + 1)); echo "  ❌ (r2c) a FAILED write leaves NO throttle stamp (otherwise the retry is suppressed for BLIND_DEFECT_EVERY_S)"
+else
+  PASS=$((PASS + 1)); echo "  ✅ (r2c) a FAILED defect write leaves NO throttle stamp, so the next pass retries the record"
+fi
+
+# ── (r3) A READ VERB DOES NOT CONSUME THE STREAK (#4085 review round 5, P2) ─────────────────────
+# The dry-run guard was real but unproven: no arm ever read the streak file, so a mutant dropping
+# `[ "${DRY:-0}" = 0 ]` stayed green.
+run_gate census-dryrun GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" " -f1)" "1" \
+  "(r3) a blind pass records streak=1"
+KEEP_STATE=1 run_gate census-dryrun GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok -- --dry-run
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.blind-streak" 2>/dev/null | cut -d" " -f1)" "1" \
+  "(r3) --dry-run does NOT clear the streak (a read verb changes nothing)"
+
+
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ ci_runner_gate suite: $FAIL failure(s), $PASS passed"
   exit 1

@@ -720,13 +720,17 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the NINE refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`,
+# `stale`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
-# emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
+# emitted SIX since the fork/capability/skew/key gates were added — and it said SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
-# beside a list of seven). The list and the count are asserted against `cap_refusal_gate` by
-# `lane-outcome.test.sh`, so a gateway added without this line reddens a test instead of a reader.
+# beside a list of seven). ⛔ IT DRIFTED THE SAME WAY TWICE MORE, AND THE SECOND TIME WAS THIS CHANGE:
+# it read SEVEN beside eight names, then EIGHT beside eight names while `#3932` added a NINTH arm
+# (`stale`) to `cap_refusal_gate` — so the count is the part that rots, not the list. The list and the
+# count are asserted against `cap_refusal_gate` by `lane-outcome.test.sh` §4e, which is what turns the
+# next gateway added without this line into a red test instead of a misled reader.
 # `chain-merge.sh` folds an UNRECOGNISED third field to `load` — so a reader implemented from this
 # sentence alone would report a credential stand-down as a load wait, which is the #2991 mislabelling
 # this file is careful to avoid three lines above. The vocabulary lives in `cap_refusal_gate`; this
@@ -999,6 +1003,119 @@ lane_transport_rotations() {
   n="$(printf '%s' "${n:-0}" | tr -dc '0-9')"
   printf '%s\n' "${n:-0}"
 }
+# ── DID ANYTHING LEAVE THE BOX? (agent-infra#4047) ─────────────────────────────────────────────────
+# MEASURED, and the reason this function exists: ten lanes were dispatched to deliver children of
+# #4006 and FOUR exited 0 having delivered nothing — #4009 (1 commit) and #4012 (6 commits) committed
+# and never pushed; #4011 left four files staged and never committed; #4016 produced nothing at all.
+# All four wrote the same terminal line, `outcome=done reason=agent-exit-0`, indistinguishable from
+# the six that DID deliver. `done` was therefore true of the exit and false of the lane: **a lane's
+# product is a pushed head (and the PR on it), never the agent's status.**
+#
+# ⛔ THE VOCABULARY IS NOT EXTENDED. The four words are a closed set that readers match with an
+# allow-list (`grep -L '^outcome=\(done\|refused\|failed\|died\)'`), so a fifth word would make a lane
+# read as UNREPORTED — a worse lie than the one being fixed, and the same class #2833 refused when it
+# declined a new exit code. The state rides in the REASON, which keeps `reason=agent-exit-0` as a
+# prefix, so every existing reader and every existing test arm still matches.
+#
+# ⛔ A READ THAT CANNOT ANSWER SAYS SO. If the worktree, the repo, or any origin ref cannot be read,
+# the state is `unknown` — never `delivered`. The defect being fixed is precisely that an ABSENCE of
+# evidence was reported as evidence of delivery; defaulting to the old answer here would rebuild that
+# defect inside its own fix.
+#
+# ⛔ ONE HOME PER MEASUREMENT: `run_agent` ALREADY MEASURED THIS, ONE LINE BEFORE THIS FUNCTION RUNS
+# (review P3, and the repo's own rule). `spawn-gate.sh::terminal_wip_rescue` publishes the tree verdict, the
+# porcelain listing, the "commits on this disk only" count, the push verdict and the sha origin held AFTER
+# the push as CALLER SIGNALS on the same shell (`LANE_END_TREE`, `LANE_END_PORCELAIN`, `LANE_END_UNPUSHED`,
+# `LANE_END_PUSH`, `LANE_END_ORIGIN`, `LANE_END_HEAD`). A second, independent "did anything leave the box"
+# reader beside it contradicts it inside one log — a `[wip] NOTE … the exit path PUSHED them` next to
+# "NOTHING LEFT THE BOX" — so this function READS those signals and states no verdict the exit path did not
+# take. It also removes two defects the private read had: it compared against a hardcoded `origin/main`
+# (the harness's own exit path refuses to assume a default branch and resolves it with `ls-remote --symref`,
+# so a `trunk` repo made every lane `unknown`), and it read the LOCAL `refs/remotes/origin/*` cache without
+# fetching it first.
+#
+# ⛔ AND IT IS RUN-SCOPED (review P1, MEASURED). "origin/$branch exists and HEAD is not ahead of it" is
+# true of a lane that did NOTHING whenever an EARLIER run pushed that branch name — `run_agent` pushes the
+# lane branch on its exit path unprompted, so this is the ORDINARY case for a re-dispatched branch, not a
+# corner. That read minted `delivered` for a lane that contributed nothing: the false PASS this change
+# exists to remove, rebuilt inside its own fix. The start HEAD is captured before `run_agent` runs
+# (`LANE_START_HEAD`) and a run that moved nothing is `nochange`, never `delivered`.
+#
+# ⛔ A READ THAT CANNOT ANSWER SAYS SO (review P2, MEASURED). The first cut tested
+# `git status --porcelain 2>/dev/null | wc -l`, so a status that FAILED (an `index.lock` held by a
+# concurrent process) yielded 0 = "clean", and `${ahead:-0}` turned a failed `rev-list` into 0 = "not
+# ahead" — both then satisfied `delivered`, contradicting this function's own header. Every field below is
+# POLARITY-CHECKED against the allow-list the exit path can actually emit (`not-measured`, `cannot-verify`,
+# `not-a-worktree`, `unmeasured`, `running`, and the `?` the unpushed column carries when the count could
+# not be read) and anything else is `unknown`.
+#
+# States: delivered | unpushed-<N> | uncommitted-<N> | nochange | unknown
+lane_delivery_state() {
+  local push tree porcelain unpushed dirty head start
+  push="${LANE_END_PUSH:-}"
+  tree="${LANE_END_TREE:-}"
+  # `clean` / `unpushed-only` / `dirty` are the three measured tree verdicts. Everything else —
+  # `not-measured` (the rescue was disabled), `not-a-worktree`, `cannot-verify`, or EMPTY (a pre-change
+  # `spawn-gate.sh` that publishes none of this) — is a reading that was never taken, and an untaken
+  # reading is never evidence of delivery.
+  case "$tree" in clean|unpushed-only|dirty) : ;; *) printf 'unknown'; return 0 ;; esac
+  # ⛔ POLARITY, NOT VOCABULARY (this repo's rule for every verdict field): TWO allow-lists — the ways the
+  # commit(s) ARE on origin, and the ways they are NOT — and EVERY other value abstains. `pushed` means this
+  # run's exit path put them there and VERIFIED it by reading the remote back; `nothing` means no commit
+  # needed pushing. `refused-*`, `FAILED`, `UNAVAILABLE` and `detached` are the measured NOT-pushed
+  # verdicts. Everything else (`running` — the lane ended mid-push; `unmeasured`; `push-killed`;
+  # `push-unreported`; the three `verify-*` verdicts, where the push RAN and the read back did not answer;
+  # and any word a future helper adds) abstains: `delivered` needs positive proof, and "the push may have
+  # landed" is not proof. The direction is the fail-closed one — an operator re-checks a lane, and no false
+  # `delivered` is minted.
+  local on_origin
+  case "$push" in
+    pushed|nothing)                          on_origin=1 ;;
+    refused-*|FAILED|UNAVAILABLE|detached)   on_origin=0 ;;
+    *)                                       printf 'unknown'; return 0 ;;
+  esac
+  unpushed="${LANE_END_UNPUSHED:-}"
+  case "$unpushed" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  if [ "$tree" = "dirty" ]; then
+    dirty="$(printf '%s' "${LANE_END_PORCELAIN:-}" | grep -c '' 2>/dev/null || true)"
+    case "$dirty" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  else
+    dirty=0
+  fi
+  # Commits that exist on this disk only. ⛔ `LANE_END_UNPUSHED` is the count measured BEFORE the push and
+  # the column deliberately still NAMES them after one (#3396), so `pushed` is the one verdict that
+  # ANSWERS them; on any other verdict they are the delivery the lane failed to make (#4009/#4012).
+  if [ "$unpushed" != "0" ] && [ "$on_origin" != "1" ]; then
+    printf 'unpushed-%s' "$unpushed"; return 0
+  fi
+  if [ "$dirty" != "0" ]; then printf 'uncommitted-%s' "$dirty"; return 0; fi
+  # Nothing to push, clean tree — so the ONLY thing that can distinguish "this run delivered" from "this
+  # run produced nothing" is whether the head moved.
+  head="${LANE_END_HEAD:-}"
+  start="${LANE_START_HEAD:-}"
+  if [ -n "$head" ] && [ "$head" = "$start" ]; then printf 'nochange'; return 0; fi
+  printf 'delivered'
+}
+
+# lane_origin_has_branch — does origin already carry the branch this lane is on (`yes` | `no`)?
+# ⛔ THE `uncommitted-*` REMEDY TURNS ON THIS FACT, AND ON ITS OWN IT WAS INVERTED (review P2). The
+# `uncommitted-N` state is reachable from BOTH "nothing was pushed at all" (#4011) and "the branch and PR
+# are live, and one scratch file was left dirty" — and the first cut printed one sentence for both: "no
+# pushed head carries it, so the issue is not delivered and no PR can be opened … Re-dispatch". Every
+# clause after the first is FALSE for the second shape, and the remedy is the redundant relaunch that
+# wastes a whole lane. ONE question, asked of the same repository the state came from, so the sentence
+# and the state cannot disagree.
+lane_origin_has_branch() {
+  local wt="${LANE_WT:-}" cur
+  [ -n "$wt" ] && [ -d "$wt" ] || { printf 'no'; return 0; }
+  cur="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  case "$cur" in ''|HEAD) printf 'no'; return 0 ;; esac
+  if git -C "$wt" rev-parse --verify -q "refs/remotes/origin/$cur" >/dev/null 2>&1; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
 # The killer, read back from the run's own bound verdict file — and, when `run_agent` could not hand
 # it over (a pre-change `$O` helper under the tolerant-reference rule), from the `[lane-bound]
 # VERDICT` line `lane-bound.sh` writes into the same log. Run-scoped for the same reason the rotation
@@ -1026,6 +1143,12 @@ lane_bound_killer() {
     *)                         : ;;
   esac
 }
+# ⛔ THE RUN-SCOPED START FACT, CAPTURED BEFORE THE AGENT CAN MOVE ANYTHING (agent-infra#4047 review,
+# P1). Without it "origin carries this branch" is indistinguishable from "THIS RUN put it there", and
+# `run_agent` pushes the lane branch on its exit path unprompted — so a lane that did nothing on an
+# already-pushed branch read `delivered`. A read that cannot answer is left EMPTY, and the delivery read
+# treats an empty start as "cannot prove this run contributed nothing" rather than as a match.
+LANE_START_HEAD="$(git -C "${LANE_WT:-$PWD}" rev-parse HEAD 2>/dev/null || true)"
 run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -1047,8 +1170,8 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
 # AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83),
-# AGENT_MEM_REFUSED (81)
-# or AGENT_DISK_REFUSED (77);
+# AGENT_MEM_REFUSED (81), AGENT_DISK_REFUSED (77)
+# or AGENT_STALE_CODE_REFUSED (85);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
 # ── THE OUTCOME, RECORDED ONCE, IN THE SAME BREATH AS THE STATUS IT IS DERIVED FROM (#3331) ──────
@@ -1072,6 +1195,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
     "${AGENT_HARNESS_SKEW_REFUSED:-83}") lane_outcome refused "harness-skew" ;;
+    # ⛔ THE STALE-CHECKOUT REFUSAL GETS ITS OWN OUTCOME NAME TOO (this change's review, P1-2), for the
+    # reason above and one more: `refused capability-gate` is what an operator greps to decide whether to
+    # repair the box's pi/credential or move the item, and neither is right here.
+    "${AGENT_STALE_CODE_REFUSED:-85}")   lane_outcome refused "stale-code" ;;
     "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
     # ⛔ NO `pi-gate` ARM: THE CODE CANNOT REACH HERE (review, P2, measured). `run_agent` translates the
     # spawn point's `PI_GATE_REFUSED` (76) into `AGENT_LOAD_REFUSED` (75) before returning
@@ -1085,7 +1212,64 @@ if [ "$AGENT_STARTED" = "0" ]; then
     *)                                    lane_outcome refused "agent-not-started:rc$rc" ;;
   esac
 elif [ "$rc" = "0" ]; then
-  lane_outcome done "agent-exit-0"
+  # ⛔ `rc=0` IS THE AGENT'S STATUS, NOT THE LANE'S PRODUCT (agent-infra#4047; MEASURED — 4 of 10 lanes
+  # exited 0 having delivered nothing, all four reading as `done`). The delivery read is what turns
+  # "the agent stopped cleanly" into "the lane delivered", and it is the difference the census needs.
+  LANE_DELIVERY="$(lane_delivery_state)"
+  case "$LANE_DELIVERY" in
+    delivered)
+      lane_outcome done "agent-exit-0" ;;
+    nochange)
+      lane_outcome done "agent-exit-0-nochange"
+      echo "[lane $N] DELIVERY: the agent exited 0 and produced NO CHANGE — no commit beyond origin/main, clean tree. If this lane was dispatched to CHANGE something it delivered nothing; if it was dispatched to CHECK something, the check itself is the product and this line is its record. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+    unpushed-*|uncommitted-*)
+      lane_outcome done "agent-exit-0-undelivered:$LANE_DELIVERY"
+      # ⛔ TWO STATES, TWO SENTENCES — ONE SENTENCE FOR BOTH WAS A LIE (review P2, MEASURED).
+      # `uncommitted-N` is reachable when the branch AND its PR are already live and the agent merely left
+      # a file dirty; telling that reader "no pushed head carries it … no PR can be opened … Re-dispatch"
+      # is false in every clause and prescribes the redundant relaunch this issue exists to remove.
+      case "$LANE_DELIVERY" in
+        unpushed-*)
+          # ⛔ "NOTHING LEFT THE BOX" IS A MEASURED-ABSENCE CLAIM, AND ONE PUSH VERDICT FORBIDS IT
+          # (review of #4047 at this head, P2 — MEASURED against the writer). `spawn-gate.sh` assigns
+          # `FAILED` in the arm where the push target POSITIVELY holds `refs/heads/<branch>` at a
+          # DIFFERENT sha, and that arm's own log line ends "whether they are on some OTHER ref is not
+          # measured here" — so a sentence saying "no pushed head carries them … the issue is not
+          # delivered and no PR can be opened" contradicts a line two above it in the SAME log, and its
+          # remedy (re-dispatch) is inverted when a peer or the rail landed the commits under another
+          # ref. `UNAVAILABLE`/`detached`/`refused-*` are the same class from the other side: the exit
+          # path could not read the remote, so it says nothing about what origin holds. Only a verdict
+          # that TRIED and established the remote carries no such ref may print the absence — which is
+          # what the `*)` arm is: the count is `unpushed` and the push never landed anywhere.
+          case "${LANE_END_PUSH:-}" in
+            FAILED)
+              # ⛔ AND `FAILED` + NO ORIGIN IS THE ONE SHAPE THAT *DID* MEASURE THE ABSENCE, so it keeps
+              # the original sentence: `spawn-gate.sh` assigns `FAILED` with an empty `LANE_END_ORIGIN`
+              # only in the arm where "the REMOTE ANSWERED and does NOT hold refs/heads/<branch>". The
+              # over-claim lives in the OTHER `FAILED` arm — origin holds a DIFFERENT sha there — and that
+              # is the split below.
+              if [ -n "${LANE_END_ORIGIN:-}" ]; then
+                echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) that ${LANE_END_PUSH_URL:-origin} does NOT carry at THIS head (state=$LANE_DELIVERY). That repository holds refs/heads/${LANE_END_BRANCH:-$BR} at ${LANE_END_ORIGIN} — a DIFFERENT sha, and this run's commits are not on that ref; whether they are on some OTHER ref is NOT measured here, so do NOT read this as 'nothing left the box'. Land or push them explicitly (or hand the branch to the merge chain) rather than re-dispatching: the commits exist here and a relaunch abandons them. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+              else
+                echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — the push target ANSWERED and does not hold this branch, so the commit(s) exist only on this disk. No pushed head carries them, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+              fi ;;
+            UNAVAILABLE|detached|refused-*)
+              echo "[lane $N] DELIVERY: the agent exited 0 with ${LANE_DELIVERY#unpushed-} commit(s) on this disk (state=$LANE_DELIVERY, push=${LANE_END_PUSH}) — the exit path could NOT establish what the push target holds, so this line asserts NOTHING about origin either way. Push them explicitly and verify with a remote read; do not read this as delivered and do not read it as lost. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+            *)
+              echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — the commit(s) exist only on this disk. No pushed head carries them, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+          esac ;;
+        *)
+          if [ "$(lane_origin_has_branch)" = "yes" ]; then
+            echo "[lane $N] DELIVERY: the agent exited 0 and LEFT UNCOMMITTED WORK (state=$LANE_DELIVERY) — origin already carries this branch, but the tree still holds path(s) no pushed head has. That is the only part that did not leave the box: COMMIT AND PUSH it on the same branch, then carry on with the existing PR. Do NOT re-dispatch — the pushed head is already there, and a relaunch would abandon this work on top of it. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+          else
+            echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY) — origin carries no branch of this name and the tree still holds the work. No pushed head carries it, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log"
+          fi ;;
+      esac ;;
+    *)
+      # The read could not answer. Reported as such, never as `delivered` — see the function's comment.
+      lane_outcome done "agent-exit-0-delivery-unknown"
+      echo "[lane $N] DELIVERY: state could not be determined (worktree=$LANE_WT branch=$BR) — reporting the read failure instead of assuming delivery. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+  esac
 else
   # ── ATTRIBUTION (#2833): WHO ended this lane, before calling it a work failure ──────────────────
   # Order matters and is not interchangeable. A bound that ended the lane is a fact about the
@@ -1116,8 +1300,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`,
-  # `capability`, `skew` and `land` are the seven values the gate can refuse on, and each is chosen by the
+  # CAPACITY TRANSFER block above for the format and its two readers. There are NINE values the gate can
+  # refuse on — `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`, `stale`, and the `load` FOLD
+  # that absorbs anything unrecognised (see `cap_refusal_gate`; this line said "seven" and listed seven
+  # while the writer emitted nine — review P3, agent-infra#3932) — and each is chosen by the
   # code its own caller already distinguishes, so the record can never disagree with the exit status.
   # `mem` (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's
   # memory floor refused — which is why it takes the capacity-transfer branch below and not the `land`
@@ -1166,6 +1352,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
     elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then _cap_gate=mem
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
     elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
+    # ⛔ A STALE CHECKOUT IS THE OTHER REFUSAL WHOSE CODE MUST NOT BE 71 (this change's review, P1-2).
+    # The 71 arm below is the one that mints a capacity record, and its consumer in `orch-loop.sh`
+    # stands this box down SO A PEER CAN TAKE THE ITEM — correct for a capability refusal (a property
+    # of this box) and exactly wrong for a stale checkout, because the measured fleet state was EVERY
+    # cell 496-7093 commits behind (#3932): the item circulates between boxes that refuse identically
+    # and is never built. Its own code is what makes this file's words, and the controller's, publish
+    # the checkout remedy instead of "dispatch the issue to another box".
+    elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then _cap_gate=stale
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -1195,6 +1389,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # EVERY box. The record is still written (chain-merge.sh must stop waiting for a PR that
         # cannot appear), and the words say exactly what it buys, the same way `land` does.
         echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
+      elif [ "$_cap_gate" = "stale" ]; then
+        # ⛔ A SEVENTH VALUE, AND THE THIRD WHOSE RECORD IS NOT A CAPACITY CLAIM (this change's review,
+        # P1-2). The record is still written, for the `skew` reason: chain-merge.sh must stop waiting for
+        # a PR that cannot appear, and this box must not re-claim the item while its checkout is being
+        # advanced. What it must NOT do is tell the operator the item has moved to a peer — the peer
+        # behind the same wave of stale cells refuses identically, so the words say what the stand-down
+        # actually buys and where the remedy lives.
+        echo "[lane $N] stand-down recorded: gate=stale, until +${_cap_yield}s — this stops THIS box re-claiming #$N while its checkout is advanced; it does NOT free the item for a peer to clear, because the measured fleet state was every cell hundreds of commits behind (#3932), so a peer is likely stale too. The remedy is on the checkout the reading NAMED, by what it is — 'git -C <repo> pull --ff-only origin main' for a base checkout, 'git -C <repo> merge origin/main' for a PR-branch worktree (never a re-cut: that discards the PR) — and the repo and the distance are on the [capability-gate] REFUSED line in this log." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
       fi
@@ -1240,6 +1442,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # issue to another box", and both are wrong here: the extension set is fine and the peer refuses
     # identically. The fix is one verified redeploy on every box that runs lanes.
     echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991), OR the spawn gate could not resolve capacity.sh at all (the fork resolver's `nodeploy` arm, agent-infra#2293 follow-up). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair with a VERIFIED redeploy — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+    # ⛔ NAMED, AND NAMED AS A CHECKOUT PROBLEM RATHER THAN A CAPACITY ONE (this change's review, P1-2).
+    # Before this arm a stale-code refusal landed on the CAPABILITY text below — "repair this box's
+    # installed pi/extension set or its provider credential, or dispatch the issue to another box" —
+    # and all three remedies are wrong for it: the model call SUCCEEDED (that is how the reading was
+    # taken), and the fleet was measured stale on every cell, so the peer refuses identically. Two
+    # surfaces publishing contradictory instructions for one refusal is the harm this arm removes.
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THE READING CAME FROM (this change's review, P2-4): the probe
+    # measures `$PWD` on THIS path (`WIP_PATH` is unset in lane.sh), which is the lane's own WORKTREE — a
+    # base cut from origin/main. So the base remedy is right here, but it must be the BASE's advice and
+    # say so, because the same refusal text is published on the FIXER path where the measured artifact is
+    # a PR branch and re-cutting it would discard the PR (fix-one.sh's arm carries that shape).
+    echo "[lane $N] NOT started: STALE-CODE gate refused — this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (agent-infra#3932), so a lane cut from it produces a plausible log and a WRONG diff: it re-derives what main already fixed, or reverts it. Waiting will NOT clear it and load has nothing to do with it, and do NOT dispatch the issue to another box — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. The repo and the distance are on the [capability-gate] REFUSED line in this log, and it names the checkout that was measured: advance THAT one — for a BASE checkout (this lane's worktree, or the shared checkout) run 'git -C <repo> pull --ff-only origin main', or use the cell's own sync path; for a PR-BRANCH worktree (the fixer path) integrate origin/main INTO the branch with 'git -C <repo> merge origin/main' — and never re-cut a worktree that carries commits, because that discards the PR. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
     # this arm a capability refusal fell into the `else` below and the operator read "load gate refused
