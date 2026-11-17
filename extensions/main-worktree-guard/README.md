@@ -308,20 +308,35 @@ land on content that would be lost?*:
 
 - **no redirect target at all** ⇒ a pure read (`git show HEAD:x`, including the
   `$var`-SOURCE spelling, and `> /dev/null`) — nothing can be written;
-- otherwise `git status --porcelain` is probed on every statically identifiable
-  landing site — the **checkout each write target declares into** (links
-  resolved, including a DANGLING one: the write lands where the bytes land, so a
-  symlink sink is judged by its destination, not its spelling — the KERNEL's
-  resolution is used whenever the destination exists, and a chain it refuses is
-  followed by hand with each relative target joined to the link's **real**
-  parent, so a link reached through a symlinked directory is not resolved to a
-  reconstruction), the nearest
-  **existing ancestor directory** of that resolved path, and the **checkout the
-  discard was read from** when it came from a script file — and the command is
-  allowed ONLY if all of them are free of tracked dirt. Untracked-only dirt is
-  not tracked loss, so `??` scratch output never blocks. A sink that is a
-  **hardlink** (`nlink > 1`) has no statically determinable landing checkout and
-  fails CLOSED.
+- otherwise the write targets are the ones `bashWriteTargetsResolved` reports —
+  the SAME bash-cd-chain walker the discard verbs use (`cd`/`pushd`/`popd`,
+  pipes, subshells, `&&`/`;` boundaries) — so each target is anchored at the cwd
+  its own chain reached, and `git status --porcelain` is probed on every
+  statically identifiable landing site: the **nearest existing ancestor
+  directory** of the resolved path (**links resolved**, including a DANGLING
+  one — the write lands where the bytes land, so a symlink sink is judged by its
+  destination, not its spelling; the KERNEL's resolution is used whenever the
+  destination exists, and a chain it refuses is followed by hand with each
+  relative target joined to the link's **real** parent, so a link reached
+  through a symlinked directory is not resolved to a reconstruction), and the
+  **checkout the discard was read from** when it came from a script file — and
+  the command is allowed ONLY if all of them are free of tracked dirt.
+  Untracked-only dirt is not tracked loss, so `??` scratch output never blocks.
+  A sink that is a **hardlink** (`nlink > 1`) has no statically determinable
+  landing checkout and fails CLOSED.
+
+⛔ **A `cd`-relative target is judged at the cwd the chain reached, not at the
+session's checkout** (#4101 P0-1/P0-2). It was not: the arm used to build
+`relative(writeCwd, extractBashWriteTargets(...))` with `writeCwd =
+commandExecutionCwd(...) ?? sessionCwd`, and `commandExecutionCwd` reports a cwd
+**at a script token only** — so a plain `cd` chain yielded `null` and the target
+was re-anchored at the session cwd. Measured on `origin/main` (`789e68dda`) from
+a CLEAN hub with a DIRTY linked worktree, `cd <wt> && git show HEAD:f > f` was
+ALLOWED, probed `<hub>/f`, and running it replaced the worktree's uncommitted
+content with committed content **while `git status` read clean**. Two rows now
+pin it in `test-discard-gate.mjs`: `D15` (this shape — it FAILS on main, so it
+is evidence) and `D16` (`cd <wt>/sub && … > ../f`, which main already refused —
+a regression pin, not evidence on its own).
 
 ⛔ **The command's cwd is not a candidate in its own right** (#3620). It was,
 and that made the arm refuse a redirect whose target is outside every checkout:
@@ -339,11 +354,11 @@ Three consequences are deliberate and pinned by tests:
 2. The arm stays **conservative past what it can prove**, in the fail-closed
    direction only: a target it cannot resolve (a `$VAR` the command never
    assigns) keeps the literal component and is anchored by
-   `resolve(writeCwd, spelling)` — so a **relative** spelling is anchored at the
-   command's directory and probed there, while an **absolute** one is not
-   re-rooted by that `resolve` and anchors at its OWN outermost existing
-   directory (`/tmp/$X/f` → the ancestor walk stops at `/tmp`). An unreadable
-   `git status` blocks, and a hardlink sink blocks unread.
+   `resolve(<the target's own site cwd>, spelling)` — so a **relative** spelling
+   is anchored where the write executes and probed there, while an **absolute**
+   one is not re-rooted by that `resolve` and anchors at its OWN outermost
+   existing directory (`/tmp/$X/f` → the ancestor walk stops at `/tmp`). An
+   unreadable `git status` blocks, and a hardlink sink blocks unread.
 3. The reason line names the **redirect** — what is discarded — never the
    source pathspec: `git show HEAD:clean > <dirty-target>` used to report
    `clean`.
@@ -365,6 +380,13 @@ still not statically reachable — the framework's own helper is covered by the
 #1139 sanctioned exemption, and its agent-writable copies DO block whenever a
 candidate checkout is dirty (pinned), but the runtime-computed cross-checkout
 case stays open.
+
+**Residual (accepted, recorded):** the out-of-checkout sink is admitted **per
+command**, not across commands. `git show HEAD:f > /tmp/x` is allowed because
+nothing a checkout can see is touched, but a SECOND command that copies it back
+(`cp /tmp/x <target>`) lands on the `#618` arm, which skips non-main checkouts —
+so "the `/tmp` sink destroys nothing" is a claim about the single redirect, not
+about the session. Two-step exfiltration-and-restore is not this arm's class.
 
 `git restore --staged`-style **index-only** operations (`git restore --staged`
 — including the `--pathspec-from-file` spelling — `git rm --cached`,

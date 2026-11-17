@@ -354,14 +354,21 @@ async function partB() {
 
     // #3620 — the ctx's session id is a PARAMETER: a `pi -p --no-session` lane
     // resolves to null, which is the population whose marker mint is inert.
-    const driveWith = async (sessionId, command) => {
+    const driveWith = async (sessionId, command, envId) => {
       const mod = await import(pathToFileURL(join(HERE, "index.ts")).href);
       const handlers = new Map();
       mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
-      delete process.env.PI_SESSION_ID; // production: the id comes from ctx, not env
+      // production: the id comes from ctx, not env — `envId` exists ONLY for the
+      // B2b row, which is about what a SET-but-EMPTY env does to that resolution.
+      delete process.env.PI_SESSION_ID;
+      if (envId !== undefined) process.env.PI_SESSION_ID = envId;
       const ctx = { sessionManager: { getSessionId: () => sessionId } };
-      const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
-      return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
+      try {
+        const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
+        return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
+      } finally {
+        delete process.env.PI_SESSION_ID;
+      }
     };
     const drive = (command) => driveWith(TID, command);
     // Like check(), but a FAILURE carries the refusal text (these cases assert on
@@ -377,6 +384,20 @@ async function partB() {
     check("B1 dirty hub + marker ⇒ `git checkout -- <path>` PERMITTED end-to-end", b1, null);
     const b1b = await drive("git restore wip.txt");
     check("B2 dirty hub + marker ⇒ `git restore <path>` PERMITTED end-to-end", b1b, null);
+    // ── B2b (#4101 review, P2): a SET-but-EMPTY `PI_SESSION_ID` is NOT an id ──
+    // `_currentSessionId` used `??`, so `PI_SESSION_ID=` (an exported-but-empty
+    // var, or a `PI_SESSION_ID= pi …` launch) became the ANSWER and shadowed the
+    // ctx's real id. The read side treats `""` as no-id, so the marker went INERT
+    // — and the refusal said "none from the session manager", which is FALSE of
+    // the very process it was printed in. Empty is absent now, so the id resolves
+    // from ctx and the marker stays scoped to the right session.
+    process.env.PI_SESSION_ID = "";
+    try {
+      const b2b = await driveWith(TID, "git checkout -- wip.txt", "");
+      check("B2b an EMPTY `PI_SESSION_ID` does not shadow the ctx id (marker stays effective)", b2b, null);
+    } finally {
+      delete process.env.PI_SESSION_ID;
+    }
 
     // B3 — WITHOUT the marker: still blocked (protection unchanged, both gates).
     setMarker(false);
@@ -680,13 +701,57 @@ async function partB() {
     // write, compound, worktree, …). Fails loudly with line numbers if a new
     // site appears without the caveat.
     const srcLines = readFileSync(join(HERE, "index.ts"), "utf8").split("\n");
-    const offenders = [];
-    srcLines.forEach((ln, i) => {
-      if (!/Or set AGENT_ALLOW_MAIN_EDITS/.test(ln)) return;
-      if (!/_ENV_HATCH_CAVEAT/.test(srcLines.slice(i, i + 4).join("\n"))) offenders.push(i + 1);
-    });
-    check("B9 (#1239): every `Or set AGENT_ALLOW_MAIN_EDITS` refusal also carries the session-start caveat",
-      offenders, []);
+    // ⛔ KEYED ON THE HATCH ITSELF, NOT ON ONE PHRASE (#4101 review, P2). This
+    // sweep used to key on the literal `Or set AGENT_ALLOW_MAIN_EDITS`, so it
+    // could not see three live sites that offer the hatch in their own words —
+    // `index.ts` M5's "Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1" (the text
+    // the #3620 report actually hit), the fast-forward refusal, and the
+    // hidden-branch-state refusal — plus two banner warnings. A phrase-keyed
+    // sweep answers "does one wording carry the caveat", which is not the
+    // property; the property is "no text a blocked reader can act on offers an
+    // env var that a RUNNING session cannot set".
+    //
+    // What is exempt, and why each exemption is safe:
+    //  · comments — they are never printed;
+    //  · the caveat block itself;
+    //  · a site whose OWN text says the hatch is unavailable ("is NOT an
+    //    alternative here", "so … is / not its remedy") — that is the opposite
+    //    claim, and it is the one we want more of;
+    //  · a site carrying `hatch-sweep-exempt: <reason>` within 2 lines.
+    // A caveat satisfies the sweep in either form: the shared
+    // `_ENV_HATCH_CAVEAT` spread, or a line pair naming `session START` and
+    // `CANNOT` (the fixed-width banner boxes cannot hold the shared array).
+    const hatchSweep = (lines) => {
+      const whole = lines.join("\n");
+      const cavDef = whole.match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
+      const cavStart = cavDef ? whole.slice(0, cavDef.index).split("\n").length : 0;
+      const cavEnd = cavDef ? cavStart + cavDef[0].split("\n").length - 1 : 0;
+      const found = [];
+      lines.forEach((ln, i) => {
+        const lineNo = i + 1;
+        const t = ln.trim();
+        if (!ln.includes("AGENT_ALLOW_MAIN_EDITS")) return;
+        if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return;
+        if (cavStart > 0 && lineNo >= cavStart && lineNo <= cavEnd) return;
+        if (/\b(?:NOT|not|cannot|CANNOT)\b/.test(lines.slice(i, i + 3).join("\n"))) return;
+        if (lines.slice(Math.max(0, i - 2), i + 3).join("\n").includes("hatch-sweep-exempt:")) return;
+        const window = lines.slice(i, i + 8).join("\n");
+        if (window.includes("_ENV_HATCH_CAVEAT")) return;
+        if (/session START/.test(window) && /(?:CANNOT|cannot)/.test(window)) return;
+        found.push(lineNo);
+      });
+      return found;
+    };
+    check("B9 (#1239): every printed offer of the env hatch carries the session-start caveat",
+      hatchSweep(srcLines), []);
+    // ⛔ AND THE SWEEP MUST BE ABLE TO FAIL — a source scan that cannot flag a
+    // caveat-less offer is the same no-op gate it replaced. Measured: the previous
+    // version passed on a tree with three offending sites.
+    check("B9e the sweep is not vacuous — a caveat-less offering is FLAGGED",
+      hatchSweep([
+        '            `   → Set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1).`,',
+        '          ].join("\\n"),',
+      ]), [1]);
     const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
     checkD("B9b the caveat names session START and says an inline/export CANNOT set it",
       /session START/.test(caveat?.[1] ?? "") && /CANNOT/.test(caveat?.[1] ?? ""), caveat?.[1]);

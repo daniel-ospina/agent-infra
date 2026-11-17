@@ -597,8 +597,16 @@ function _markerPath(): string {
 // bash-tool child envs; subagents resolve their OWN id), then the ctx
 // sessionManager fallback (loop-enforcer precedent), else null → fail-safe
 // (a headless session with no id can never have an active marker).
+//
+// ⛔ `||`, NOT `??` (#4101 review P2). A SET-but-EMPTY `PI_SESSION_ID=` is a
+// real state (an unset-but-exported var, a `PI_SESSION_ID= pi …` launch) and
+// `??` would take the empty string as an ANSWER, shadowing a perfectly good ctx
+// id. The read side treats `""` as no-id, so the marker was inert — and the
+// refusal then said "none from the session manager", which is FALSE of the
+// process it was printed in and sends the reader hunting another session for
+// nothing. Empty is absent here; fall through to the manager.
 function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => string } }): string | null {
-  return process.env.PI_SESSION_ID ?? ctx?.sessionManager?.getSessionId?.() ?? null;
+  return process.env.PI_SESSION_ID || ctx?.sessionManager?.getSessionId?.() || null;
 }
 // Guard-stamping at creation-observation: write the stamp BEFORE allowing the
 // touch command. try/catch fail-silent (F7) — when the stamp write FAILS no
@@ -3320,7 +3328,13 @@ function _worktreeDiscardBlockReason(
                 // test-discard-gate pin it) and the scoping is stated around it.
                 `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
                 `     ELDATO_ALLOW_MAIN_EDITS=1) — a FULL bypass of M4/M5, whole-tree`,
-                `     discards included — or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
+                `     discards included.`,
+                // #4101 review (P2) — the #3620 report hit THIS text, and it offered
+                // the env route with no session-start caveat: a reader mid-session
+                // who took it got a setting the guard never reads. Stated BEFORE
+                // the marker line, which is the route that actually works now.
+                ..._ENV_HATCH_CAVEAT,
+                `     → …or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
                 `     which opens the same narrow recovery window as M4: name the paths,`,
                 `     \`git restore <path>\` / \`git checkout -- <path>\`. Refused UNDER THE MARKER:`,
                 `     a whole-tree discard (\`.\`, \`./\`, pathspec magic, a glob, a brace) — and`,
@@ -6004,6 +6018,7 @@ function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: a
     "     reachable from an ALREADY-RUNNING session — or set",
     "     AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for deliberate",
     "     solo sessions.",
+    ..._ENV_HATCH_CAVEAT,
   ].join("\n");
 }
 
@@ -6070,6 +6085,9 @@ function _reportClassifierDegradation(ctx?: { ui?: { notify?: (msg: string, leve
     row("cell-install.sh on a cell), then verify with:"),
     row("  node extensions/main-worktree-guard/test-module-load.mjs"),
     row("Deliberate acceptance: AGENT_ALLOW_MAIN_EDITS=1 (solo sessions)."),
+    // #4101 review (P2) — a session-START env var offered with no caveat is the
+    // same dead end everywhere it is offered, banners included.
+    row("⚠️ That env is read at session START: an export CANNOT set it (#1239)."),
     "╚══════════════════════════════════════════════════════════════════╝",
     `   cause: ${reason}`,
     "",
@@ -6216,7 +6234,12 @@ export default function (pi: ExtensionAPI) {
         }
         lines.push(
           "║  → Invoke the using-git-worktrees skill to create one.            ║",
-          "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
+          // #4101 review (P2) — the same dead end one layer out: a warning that
+          // offers a session-START env var to a running session. Width-safe for
+          // the 62-char banner box.
+          "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning — but    ║",
+          "║    only at session START: an inline prefix or an `export` in a    ║",
+          "║    running session CANNOT set it (#1239).                         ║",
           "╚══════════════════════════════════════════════════════════════════╝",
           "",
         );
@@ -6782,6 +6805,7 @@ export default function (pi: ExtensionAPI) {
             "     worktree are exempt as before (using-git-worktrees skill).",
             "   Hatch, if this is deliberate solo work in the hub:",
             "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
+            ..._ENV_HATCH_CAVEAT,
           ].join("\n"),
         };
       };
@@ -7862,7 +7886,11 @@ export default function (pi: ExtensionAPI) {
           }
           lines.push(
             "║  → Invoke the using-git-worktrees skill to create one.            ║",
-            "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
+            // #4101 review (P2) — session-start caveat, width-safe (see the
+            // module-load copy above).
+            "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning — but    ║",
+            "║    only at session START: an inline prefix or an `export` in a    ║",
+            "║    running session CANNOT set it (#1239).                         ║",
             "╚══════════════════════════════════════════════════════════════════╝",
             "",
           );

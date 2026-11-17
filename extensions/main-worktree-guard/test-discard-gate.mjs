@@ -2791,7 +2791,18 @@ async function partD() {
       expectTrue("D10c2 …and the reason names the link count and why the landing checkout cannot be determined",
         /hardlink \(link count > 1\)/.test(reason(hardSink)) && /cannot be determined/.test(reason(hardSink)),
         `reason=${JSON.stringify(reason(hardSink)).slice(0, 300)}`);
-    } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
+    } finally {
+      writeFileSync(join(wt, "dirty.txt"), "v1\n");
+      // ⛔ THE HARDLINK MUST NOT OUTLIVE ITS ROW (#4101). `linkSync` raised
+      // `wt/dirty.txt` to nlink=2, and this arm fails CLOSED on nlink>1 — so every
+      // LATER row whose redirect lands on that file (D14c's 40-hop chain tail,
+      // D15/D16's cd-relative targets) was adjudicated by the HARDLINK arm instead
+      // of the dirty-checkout one. The verdicts were still BLOCK, but for a reason
+      // those rows do not assert — a vacuous pass. Measured: adding D15's
+      // attribution assertions turned D15b/D15c/D16b red with
+      // `⚠️ the redirect target is a hardlink`, and D14c passes either way.
+      rmSync(join(linkOut, "hard.txt"), { force: true });
+    }
     // Control: the same symlink shape onto CLEAN content is a read-and-export
     // that destroys nothing — the link resolution must not become a blanket rule.
     symlinkSync(join(wt, "clean.txt"), join(linkOut, "clean-sink.txt"));
@@ -2957,6 +2968,80 @@ async function partD() {
           blocked(await bash(`git show HEAD:dirty.txt > ${head}`, wt)), "was allowed");
       } finally { writeFileSync(join(wt, "dirty.txt"), "v1\n"); }
       rmSync(hopRoot, { recursive: true, force: true });
+    }
+
+    // ── D15/D16 (#4101 review P0-1/P0-2, MEASURED): a `cd`-relative redirect is
+    // anchored at the cwd the cd chain REACHED, not at the session's checkout.
+    //
+    // The arm built `relative(writeCwd, extractBashWriteTargets(src, writeCwd))`
+    // with `writeCwd = commandExecutionCwd(...) ?? sessionCwd`, and
+    // `commandExecutionCwd` reports a cwd AT A SCRIPT TOKEN only — so a plain
+    // `cd` chain yields null and the redirect was measured against the SESSION
+    // checkout. Both rows below redirect committed content onto a file that
+    // holds TRACKED uncommitted work — the unrecoverable class this arm exists
+    // for. Running the admitted command replaced the worktree's uncommitted
+    // content with committed content and left `git status --porcelain` EMPTY.
+    //
+    // ⛔ THE TWO ROWS ARE NOT THE SAME KIND OF EVIDENCE (review P1-1):
+    //   D16 — `cd <wt>/sub && … > ../tracked.txt`, session checkout ALSO dirty:
+    //         origin/main BLOCKS it. It is a REGRESSION pin (this branch had made
+    //         it ALLOW) and on its own it CANNOT discriminate the fix.
+    //   D15 — `cd <wt> && … > tracked.txt` with a CLEAN SESSION checkout:
+    //         origin/main ALLOWS it and the worktree loses its work. THIS is the
+    //         row that fails on main, so it is the evidence for the fix.
+    // The controls beside them keep the fix from becoming a blanket refusal: the
+    // same shapes against a CLEAN checkout destroy nothing, and an
+    // out-of-checkout sink stays admitted (the #3620 owner ruling) even when the
+    // redirect is reached through a `cd` chain.
+    mkdirSync(join(wt, "sub"), { recursive: true });
+    writeFileSync(join(wt, "sub", "keep.txt"), "sub\n");
+    gg("add sub/keep.txt", wt);
+    gg("commit -qm 4101-sub", wt);
+    try {
+      // ── D15 (THE evidence row: BLOCKED by the fix, ALLOWED on origin/main) ──
+      hubClean();
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      const cdSelf = await bash(`cd ${wt} && git show HEAD:dirty.txt > dirty.txt`, hub);
+      expectTrue("D15 (#4101 P0-2): `cd <dirty wt> && git show HEAD:f > f` from a CLEAN session checkout is BLOCKED",
+        blocked(cdSelf), `was allowed: ${JSON.stringify(reason(cdSelf)).slice(0, 200)}`);
+      expectTrue("D15b …and the block names the WORKTREE the bytes land in, not the session's hub",
+        /Checkout: .*\/wt\b/.test(reason(cdSelf)), `reason=${JSON.stringify(reason(cdSelf)).slice(0, 240)}`);
+      expectTrue("D15c …and it names the REDIRECT target, not the `HEAD:` source",
+        /Target: dirty\.txt/.test(reason(cdSelf)), `reason=${JSON.stringify(reason(cdSelf)).slice(0, 240)}`);
+
+      // ── D16 (regression pin: origin/main BLOCKS this one too) ──
+      hubDirty();
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      const cdParent = await bash(`cd ${wt}/sub && git show HEAD:dirty.txt > ../dirty.txt`, hub);
+      expectTrue("D16 (#4101 P0-1): `cd <dirty wt>/sub && git show HEAD:f > ../f` is BLOCKED (main also blocks: regression pin)",
+        blocked(cdParent), `was allowed: ${JSON.stringify(reason(cdParent)).slice(0, 200)}`);
+      expectTrue("D16b …and it names the WORKTREE, not the session's hub",
+        /Checkout: .*\/wt\b/.test(reason(cdParent)), `reason=${JSON.stringify(reason(cdParent)).slice(0, 240)}`);
+
+      // ── D15d/D16c: the same two shapes against a CLEAN checkout destroy
+      // nothing, so the cd chain itself must never be what blocks.
+      gg("checkout -q -- dirty.txt", wt);
+      hubDirty();
+      expectTrue("D15d `cd <CLEAN wt> && git show HEAD:f > f` ALLOWED (nothing to destroy — the chain is not the trigger)",
+        allowed(await bash(`cd ${wt} && git show HEAD:dirty.txt > dirty.txt`, hub)), "was blocked");
+      hubClean();
+      expectTrue("D16c `cd <CLEAN wt>/sub && git show HEAD:f > ../f` ALLOWED (nothing to destroy)",
+        allowed(await bash(`cd ${wt}/sub && git show HEAD:dirty.txt > ../dirty.txt`, hub)), "was blocked");
+
+      // ── D15e: an OUT-OF-CHECKOUT sink stays admitted through a cd chain.
+      // The #3620 owner ruling must not be undone by the new anchor: the target
+      // is outside every checkout, so it cannot discard tracked work.
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      hubDirty();
+      const sinkOut = join(tmpd, "4101-out.txt");
+      rmSync(sinkOut, { force: true });
+      expectTrue("D15e `cd <dirty wt> && git show HEAD:f > <tmp>/x` ALLOWED (#3620 scope: outside every checkout)",
+        allowed(await bash(`cd ${wt} && git show HEAD:dirty.txt > ${sinkOut}`, hub)), "was blocked");
+    } finally {
+      gg("checkout -q -- dirty.txt", wt);
+      rmSync(join(wt, "sub"), { recursive: true, force: true });
+      gg("reset -q --hard HEAD~1", wt);
+      hubClean();
     }
 
     // ── D8: M4's disorder early-return must not shadow M5 ──
