@@ -285,11 +285,17 @@ does the same at the manager's own `# <path>` separators for the disk reaper's `
 the checkout cannot be the truth source. Both callers guard the helpers as FATAL when a farmed lib
 predates them, because a missing boundary silently restores the false PASS.
 
-## Suites, re-measured at `a5ae388ed` (this worktree, this host)
+## Suites, re-measured at `3c108eb0a` (this worktree, this host) — the head shifted twice under this lane
+
+The branch moved twice while this lane held it (`a5ae388ed` → the round-4 lane's `bbfb43e5a` +
+`2416fa99a`, which moved the per-target arms into the lib as `unit_text_effective`, on top of this
+lane's boundary helpers). Every row above and every suite below was therefore re-run at the FINAL head,
+not at the one first measured — a count quoted at a superseded head is the defect this report already
+carries a correction for.
 
 | command | result |
 |---|---|
-| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **221 passed, 0 failed** (219 before the two F5 arms; a `(g)` worktree-reap arm flaked twice on timing and passed on every re-run — it kills a `sleep` and races the reap; it touches nothing here) |
+| `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **226 passed, 0 failed** (221 before the round-4 lane's five arms; 219 before the two F5 arms; a `(g)` worktree-reap arm flaked twice on timing and passed on every re-run — it kills a `sleep` and races the reap; it touches nothing here) |
 | `bash scripts/disk-reaper.test.sh` | **ALL PASS (727 assertions)** |
 | `bash scripts/check-bash32-parse.sh` | **471 scripts parse** under bash 3.2.57 |
 
