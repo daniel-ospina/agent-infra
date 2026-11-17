@@ -3081,7 +3081,7 @@ stalled fleet and a human reading a report.
 **How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
 `<lane log>.lanebound`):
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=7200s
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=36000s
   idle_bound=2700s silent=2805s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
@@ -4826,7 +4826,8 @@ reap. The decisions that are not obvious:
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
-leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+leaves the claim held for the whole lease (13 h 20 m of a free issue, for the issue key, at the
+48000 s `CLAIM_ISSUE_TTL` agent-infra#4034 set).
 
 The registry now carries **three** keys, one question each, and none is a re-keying of another:
 `<PR>-<sha12>` ("this head", review/evidence), `issue-<N>` ("this issue", dispatch), and
@@ -5081,7 +5082,7 @@ this", because the refusal's consequences were invisible and **long-lived**:
    the whole time, because releasing it is its EXIT trap's job.
 3. Every peer's `claim_issue_preflight` reads a live claim as **COLLISION**, so ONE box's capacity
    decision made the issue ineligible on **all five** boxes for 90 minutes (up to `CLAIM_ISSUE_TTL`,
-   3 h, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
+   13 h 20 m, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
    different route: the item's turn was consumed by a machine that did no work.
 4. Nothing stopped the refusing box from re-winning the claim next cycle and being refused again —
    starving the peers it had just yielded to.
@@ -5858,7 +5859,8 @@ were deleted.
 | **`claim_issue_preflight`'s clock was unguarded** | `date +%s` is a *second* input to the same decision — the `ls-remote` read that proves "no claim ref exists" does not need it, but the lease comparison does. On an unreadable clock `[ "$now" -le "$until" ]` is FALSE (bash prints `integer expression expected`), so a **held** claim's reader fell through to `return 0` — a **false CLEAN** in the one direction the gate exists to prevent | a non-numeric/empty `now` is rc=2 INCOMPLETE, alongside an unreadable registry |
 | **the release record was read when the trap FIRED, not when the claim was taken** | the record file is keyed on the **issue**, so a box that re-acquires after its lease lapses overwrites it. The older chain's trap then fenced on the *new* commit — which **is** the ref tip — and deleted the live holder's claim, freeing a busy issue for a peer: the exact duplicate the key exists to prevent | `chain-merge.sh` captures the commit at chain start (`claim_issue_record_commit`) and `claim_issue_release_record` refuses on a generation mismatch, naming it and leaving the newer record intact |
 | **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
-| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
+| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (13 h 20 m of a free issue, the
+48000 s `CLAIM_ISSUE_TTL` agent-infra#4034 set) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
 | **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
 | **a chain with NO captured generation still released** | the capture is empty when the handover record was absent at chain start (`orch-loop.sh`'s `claim_issue_record` failed) or `$O/claims.sh` predates the reader. `claim_issue_release_record` treats an empty expectation as "read the record now" — right for `dispatch-merge.sh`, whose release is milliseconds after the write, but WRONG for a trap that can fire **hours** later: the record then holds the newer holder's own commit, which **is** the ref tip, so the stale chain deleted a live claim | `chain-merge.sh` refuses the release when it has no captured generation, names the reason and lets the lease reap it (one lease lost vs duplicated work on two boxes) |
 | **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |

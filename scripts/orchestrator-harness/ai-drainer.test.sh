@@ -1745,7 +1745,8 @@ fi
 reset_run
 # ── ARM (o): A LIVE LANE'S WINDOW IS NEVER REUSED BY A LATER TICK ───────────────────────────
 # ⛔ THE DEFECT THIS ARM EXISTS FOR: the ring clamp bounds ONE tick's fan-out but not disjointness
-# ACROSS ticks. A lane keeps its window for up to LANE_TIMEOUT (3000s ≈ 2.5 ticks), so with target 3
+# ACROSS ticks. A lane keeps its window for up to LANE_TIMEOUT (36000 s — the agent-infra#4034 seam,
+# ~30 ticks at the shipped 20 m cadence — so a ring of windows can be held for a whole shift), so with target 3
 # and SLICE_TOTAL=30/SLICE_WIDTH=10 (3 windows), tick 2 walks the ring back to the offsets tick 1's
 # still-running lanes hold and hands them to NEW lanes — two lanes per window, two reviews per head.
 # ⛔ TARGET 6 ON A 3-WINDOW RING, ON PURPOSE: with target == 3 the second tick has nothing to add
