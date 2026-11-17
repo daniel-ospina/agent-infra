@@ -1,13 +1,14 @@
 {
   "base_sha": "6ae4777fc3e2ea1a1d897dcf5302c79ede018230",
   "branch": "fix/4085-gate-blind-cache",
-  "head_at_write": "489562f08e21318daa2472952c9884bbd4cc08c0",
+  "head_at_write": "d1e4cda6d73af166a8cb0b505e93bba7062ab386",
   "issue": "4085",
   "not_done": [
     "LIVE verification is OWED: the mechanism is proven against stubs only. On a box whose queue head is all ghosts, a pass must now converge the pool to ci-runner-gate.state and publish verdict=unknown (reason names DEMAND). Not claimed here.",
     "The ENGAGE/RELEASE DECISION is still unreachable when demand cannot be measured \u2014 deliberately: a pass may not arm or strip the pool on a value it did not read (#2327). Direction 2 (scaling the scan window with queue depth) was NOT taken; the bound stays 25 (#3995) and the reach question stays open.",
     "The gate's fallback footprint is bounded by FALLBACK_ARM_MAX=3 (#3261), so the 4/23 -> 23/23 hand-relabel in #4085 is an OPERATOR action beyond the gate's arm cap and is NOT restored by this change. The repair restores the RECORDED MODE, not an operator's wider label union.",
-    "The two comment-only P2s from #4104 round 6 needed no change: both are already corrected on main (ci_runner_gate.sh:228-238 states the time-bounded DEFECT rate, and ci_runner_gate.test.sh:2650 marks the .stamp assertion as a presence check, not an independent discriminator). Verified by reading, not assumed."
+    "The two comment-only P2s from #4104 round 6 needed no change: both are already corrected on main (ci_runner_gate.sh:228-238 states the time-bounded DEFECT rate, and ci_runner_gate.test.sh:2650 marks the .stamp assertion as a presence check, not an independent discriminator). Verified by reading, not assumed.",
+    "MUTANT PROOFS (reproduction, run from this worktree): each new arm was proven load-bearing by mutating this branch's OWN change and re-running the suite with GATE_UNDER_TEST=<mutant>. m1b-true-revert (the window-exhausted branch returns 2 again, message intact) reddens 13 assertions, all in the new d1-d5 section, with every pre-existing arm green. m6-no-rc3 (fall through to the legs) reddens the pre-existing ghost-window arms (exit 0, state written, a runner relabelled) plus d1/d2. m2-raw-demand / m2b-raw-demand redden d1 (queued_demanding=unmeasured / a false engagement). m3-always-engage reddens d2 (#2327 strip direction weakened). m3b-default-local reddens d3 (labelling with no recorded mode). m4b-dry-ignored reddens d5 (a read verb repairing). m5-seed-zero reddens d1 \u2014 that one was a real defect in the first draft. m7-always-put reddens d4 (a PUT storm on an already-converged pool)."
   ],
   "started_at": "2026-11-17T05:42:47Z",
   "suites": [
@@ -22,6 +23,18 @@
       "log_sha256": "21b5abcfeec30f88c8da30402b6b8bd70c5dd3ddd1a56d38235d8c64a8b55f61",
       "n": 1,
       "started_at": "2026-11-17T05:42:47Z"
+    },
+    {
+      "command": "bash scripts/ci_runner_gate.test.sh",
+      "counts": null,
+      "duration_s": 66.7,
+      "exit": 0,
+      "finished_at": "2026-11-17T06:04:55Z",
+      "label": "ci_runner_gate suite (final head)",
+      "log": ".worktree-report/logs/02-bash-scripts-ci-runner-gate-test-sh.log",
+      "log_sha256": "21b5abcfeec30f88c8da30402b6b8bd70c5dd3ddd1a56d38235d8c64a8b55f61",
+      "n": 2,
+      "started_at": "2026-11-17T06:03:49Z"
     }
   ],
   "version": 1,
