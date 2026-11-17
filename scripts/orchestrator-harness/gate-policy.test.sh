@@ -774,6 +774,17 @@ bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; AB
 [ "$ABSENT_RC" -eq 2 ] \
   && ok "(5d) edges: an ungradable declaration answers 2 (not 0) — 'cannot check' is never a pass" \
   || bad "(5d) edges: an absent declaration answered rc=$ABSENT_RC (a no-op gate reports clean)"
+# ⛔ rc 2 IS THE FILE PREFLIGHT, AND *ONLY* THAT — the boundary is pinned in both directions (recorded code
+# review of PR #4020 at `921aeed45`, P3). The contract used to advertise "an ungradable continuation" and
+# both installers repeated it, but the fold has no error branch (an error branch on that loop could never
+# fire, so it would be a NO-OP GATE), which means a continuation still pending at EOF is FOLDED AND GRADED.
+# This arm is the positive half of the claim above: content never yields 2. If a future fold grows an error
+# branch that answers 2 here, the operators' rc-2 sentence becomes describable again and this reddens.
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=1 \\\n' >"$TMP/unterminated.service"
+UTR_RC=0; bash "$POLICY" --unit-veto "$TMP/unterminated.service" unterminated >/dev/null 2>&1 || UTR_RC=$?
+[ "$UTR_RC" -eq 1 ] \
+  && ok "(5d) edges: a declaration ENDING on a continuation is FOLDED and GRADED (rc=1), never answered 2 as 'cannot fold' — rc 2 is the file preflight alone" \
+  || bad "(5d) edges: a declaration ending on a continuation answered rc=$UTR_RC (want 1) — either the pending accumulator is dropped (fail-open) or rc 2 has grown a content cause the contract does not describe"
 
 # (5e) THE INSTALL PATH, NOT JUST THE CENSUS — because the installer is where the refusal is FELT, and
 # a hatch can arrive on the RENDERED bytes from a substitution while the template stays clean. §5d
@@ -918,9 +929,15 @@ bash "$POLICY" --unit-veto "$LG/rendered.txt" "install-lane-arm-timer service_bo
   && ok "(5g) inline generator: its GENERATED declaration carries no gate-bypass Environment= entry" \
   || bad "(5g) inline generator: the declaration install-lane-arm-timer.sh generates carries a bypass"
 { cat "$LG/rendered.txt"; printf 'Environment=AGENT_ADMIN_MERGE_OVERRIDE=1\n'; } >"$LG/mutated.txt"
-bash "$POLICY" --unit-veto "$LG/mutated.txt" "install-lane-arm-timer mutant" >/dev/null 2>&1 \
-  && bad "(5g) inline generator: a hatch injected into those SAME bytes was NOT vetoed — the arm cannot redden" \
-  || ok "(5g) inline generator: a hatch injected into those same bytes IS vetoed (the arm reads a declaration, not an error message)"
+# ⛔ EXACTLY rc 1, NOT "non-zero" (recorded code review of PR #4020 at `921aeed45`, P3). `&& bad || ok` is
+# satisfied by rc 2 (ungradable) and rc 64 (a judge predating the flag), so this arm printed PASS for a judge
+# that graded NOTHING — it could not tell "vetoed" from an error message, which is precisely what the
+# sentence below claims it tells apart. Same defect, same fix as §5d's quoted-form arm above (which was
+# fixed in round 3 and left this one behind).
+LGMR_RC=0; bash "$POLICY" --unit-veto "$LG/mutated.txt" "install-lane-arm-timer mutant" >/dev/null 2>&1 || LGMR_RC=$?
+[ "$LGMR_RC" -eq 1 ] \
+  && ok "(5g) inline generator: a hatch injected into those same bytes IS vetoed (rc=1 — the arm reads a declaration, not an error message)" \
+  || bad "(5g) inline generator: the injected hatch answered rc=$LGMR_RC (want 1) — either the bytes were not vetoed, or the judge never graded them and this arm cannot tell the two apart"
 
 # ── 5h. THE THIRD INLINE GENERATOR IS VETTED ON ITS INSTALL PATH (fresh review of PR #4020 at
 # `4f9ff9b3e`, P2) ────────────────────────────────────────────────────────────────────────────────

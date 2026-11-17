@@ -141,8 +141,15 @@ GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
 #   0  clean (the declaration names none of the flags)
 #   1  VETOED (it names at least one; the names are printed on stderr)
-#   2  cannot answer (no file / not readable / an ungradable continuation)
+#   2  cannot answer — the FILE PREFLIGHT only (no file named / not readable / a directory)
 #      ⛔ NEVER a pass: an ungradable declaration is not a clean one.
+#      ⛔ AND THAT IS THE WHOLE rc-2 SET: a declaration is never ungradable for its CONTENT. The fold has
+#      no error branch BY DESIGN (an error branch on that loop could never fire — see the note below it),
+#      so a continuation still pending at EOF is FOLDED AND GRADED (rc 0 or 1), never deferred as "cannot
+#      fold". The previous wording here advertised "an ungradable continuation" and both installers'
+#      rc-2 sentences repeated it, so an operator was told a cause this function cannot produce
+#      (recorded code review of PR #4020 at `921aeed45`, P3). What is listed above is the set that is
+#      reachable, and §5d pins the boundary.
 # Grades BOTH declaration dialects, because the fleet ships both from this repo: a systemd
 # `Environment=<NAME>=…` directive and a launchd `<key><NAME></key>` inside EnvironmentVariables.
 gate_policy_unit_veto() {

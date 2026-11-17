@@ -318,7 +318,8 @@ resolve_launcher() {
 # the flag is live in a running job.
 # ⛔ EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS (fresh review of PR #4020,
 # P3). Collapsing them into "carries a GATE-BYPASS environment entry (named above)" is a FALSE ACCUSATION
-# when the judge could not grade at all: rc 2 means unreadable/ungradable (nothing was named above), and
+# when the judge could not grade at all: rc 2 means its file PREFLIGHT refused the artifact (unreadable, or
+# not a regular file — never the content of a declaration, which the fold always grades), and
 # rc 64 means the `gate-policy.sh` this installer resolved predates `--unit-veto` — e.g. a stale
 # `~/agent-infra` supplying `TEMPLATES_DIR`. The operator is then told to hunt a hatch that no line names,
 # which is the wrong-diagnosis failure the `(5c2)` missing-judge arm exists to prevent for an ABSENT judge;
@@ -332,7 +333,7 @@ vet_unit() {
     if [ "$rc" -eq 1 ]; then
         err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduler that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
     elif [ "$rc" -eq 2 ]; then
-        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — unreadable, or a declaration it cannot fold; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
     else
         err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (#4002) or it could not run at all, so the rendered $label was never vetted and will not be installed. Point GP_GUARD at a current, executable gate-policy.sh (the one beside the templates you are rendering)."
     fi

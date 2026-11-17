@@ -188,7 +188,8 @@ case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=36000 ;; esa
 # which collapses them into ONE message — and for two of the three answers nothing was "named above", so
 # the operator is told to hunt a hatch the declaration does not have:
 #   * rc 1  — the judge graded it and FOUND a hatch (its own line above names it);
-#   * rc 2  — the judge could not grade it at all (unreadable, or a continuation it cannot fold);
+#   * rc 2  — the judge could not grade it at all (its file preflight: unreadable, or not a regular file),
+#             i.e. nothing was graded — never the CONTENT of a declaration, which the fold always grades;
 #   * rc 64 — the `gate-policy.sh` this installer resolved PREDATES `--unit-veto` (a stale farmed or
 #             ambient copy), i.e. the unit was never vetted by anything but this installer's exit code.
 # The verdict stays fail-closed in ALL THREE cases — this is a wrong-diagnosis defect, not a bypass — and
@@ -202,7 +203,7 @@ vet_unit() { # <rendered-artifact> <template-label>
     if [ "$rc" -eq 1 ]; then
         err "the rendered unit carries a GATE-BYPASS Environment= entry (named above) — refusing to install a dispatcher that hands the hatch to every lane it spawns (agent-infra#4002)"
     elif [ "$rc" -eq 2 ]; then
-        err "the judge at $GP_GUARD could not GRADE the rendered unit (rc 2 — unreadable, or a declaration it cannot fold; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+        err "the judge at $GP_GUARD could not GRADE the rendered unit (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
     else
         err "the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (agent-infra#4002) or it could not run at all, so the rendered unit was NEVER vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
     fi
