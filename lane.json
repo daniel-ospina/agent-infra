@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-L-2557-1794964500-p2753371-02d534d6",
+  "_sha": "0e01a5bffff70641df377ae1ecec1b430cdf06d8",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/L-2557.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/2557-pr-repair-claim"
+    },
+    {
+      "kind": "sha",
+      "value": "ccb2c7ec4ef43fdd0cfb116e822f685aaf7c9ad4"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/2557-pr-claim"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7261,
+  "ended_at": 1794971761,
+  "exit_code": 143,
+  "heartbeat_at": 1794971761,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-L-2557-1794964500-p2753371-02d534d6",
+  "lease_until": 1794979561,
+  "pid": 2753371,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794964500,
+  "state": "FAILED",
+  "tag": "L-2557",
+  "worktree": "/home/cmux/agent-infra/.worktrees/2557-pr-claim"
+}
