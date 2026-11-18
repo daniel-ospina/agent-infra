@@ -176,17 +176,22 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  // Hermetic: a FRESH unique dir, never os.tmpdir() itself. The shared temp root is
-  // ambient state — on the self-hosted runner a leftover `<tmp>/skills` from another
-  // job made the implicit resolution SUCCEED, so this arm read "0 SKILL.md files
-  // checked" instead of the no-directory message and `ci / unit-test` went red at
-  // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
-  // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  // ⛔ THE cwd MUST BE A DIRECTORY THIS TEST OWNS. `os.tmpdir()` is AMBIENT state, and on a
+  // self-hosted runner it is SHARED: `resolveSkillsDir` falls back to cwd-relative
+  // `operations/skills`, `.agents/skills`, `skills`, so a leftover `skills/` in the runner's temp dir
+  // makes implicit resolution SUCCEED — the CLI then lints that tree instead of printing "No skills
+  // directory found", and this arm reds for a reason that has nothing to do with the code under
+  // test. MEASURED on ci-main `ci / unit-test` at head 75b90a908: the CLI printed
+  // `0 SKILL.md files checked. 0 issue(s).\nClean.\n` and this assertion failed (170 passed, 1
+  // failed) while the SAME file passed 171/0 on a box whose temp dir had no such directory. An owned
+  // empty dir makes the arm decide on the RESOLUTION LADDER, which is what its caption claims.
   //
-  // The two fixes for this landed independently (#4103, #4116) and agree on the cause and the
-  // mechanism; this merge keeps main's wording and adds #4103's `try/finally` so the unique dir is
-  // also REMOVED — one `mkdtemp` per run that is never cleaned is a slow leak on a long-lived runner,
-  // and a temporary test dir must not become host state in the very test that exists to avoid it.
+  // Hermetic means BOTH halves: a FRESH unique dir, never os.tmpdir() itself (Node's documented
+  // practice for `fs.mkdtemp`), and a dir this test REMOVES. A `mkdtemp` per run that is never
+  // cleaned is a slow leak on a long-lived runner, and a temporary test dir must not become host
+  // state in the very test that exists to avoid it. Three fixes for this same flake landed
+  // independently (#4103, #4116, and this branch's c43c996c5) and all agree on the cause and the
+  // mechanism; this merge keeps the unique dir and the `try/finally` removal together.
   const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
   try {
     const r = runLint([], emptyCwd);

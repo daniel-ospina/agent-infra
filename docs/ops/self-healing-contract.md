@@ -469,7 +469,9 @@ be minted by a fresh-context reviewer that returned a clean verdict.
 `carried_from`/`carried_at` on a carried record). REFUSING = no record + a **printed** reason
 (`tests/review-pr/run.sh` pins: findings are *not* recorded and exit **7**; no auth / missing `pi` /
 no verdict / a head that moved mid-review all refuse with no record; an unchanged head is never
-re-recorded).
+re-recorded; and a CLEAN whose artifact carries no `MUTATION ATTRIBUTION` block is refused at the
+producer with exit **11**, naming the block, instead of posting a verdict `record-review.sh` would
+reject — agent-infra#3987).
 IDLE does not apply — a review is requested, not scheduled.
 
 **What repairs it.** Re-run `review-pr.sh` at the new head; a **base-only** head move CARRYs
