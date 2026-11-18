@@ -350,7 +350,14 @@ fi
 # heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
 # OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
 # made this whole block report a red it could not explain. Capture the ONE assignment line.
-grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE SHIPPED READ IS `gh_bounded pr checks` (#2293's bounded wrapper, which budgets forks and
+# never silently retries a mutating call). This pin extracted only `gh pr checks`, so after that
+# migration it matched ZERO lines and the whole block below — the one assertion that drives the
+# classifier's bash substitution and could catch a backtick escaping from a comment — reported its
+# `need` failure and then did nothing. That is the no-op-gate direction: measured RED on this box at
+# `origin/main` and at every head since, while the guard it names read as present. Both spellings are
+# accepted, and the driver supplies the wrapper the shipped line actually calls.
+grep -m1 -E '^    V="[$][(]gh(_bounded)? pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -369,6 +376,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # The shipped assignment calls `gh_bounded` (the bounded gh wrapper). The driver stands it in for
+    # the PATH shim below, so the SHELL still runs the real line and the shim counts the calls.
+    printf '%s\n' 'gh_bounded() { gh "$@"; }'
     # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
     # SHIPPED file so the shell runs the real classifier, not a missing path.
     printf '%s\n' "_CK_PY='$HERE/check-class.py'"
@@ -4623,7 +4633,7 @@ ck "…while the one act that ADDS a run to the queue — the CI rerun — is st
 ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
-grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
+grep -qE 'gh(_bounded)? pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
 ck "the cheap merge path stays ungated" $rc
 
 # ── refresh-candidates.sh: the pool is ordered by SEVERITY, not by issue number ─────

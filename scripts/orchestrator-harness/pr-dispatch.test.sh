@@ -496,7 +496,10 @@ PY
     done
   ) >/dev/null 2>&1
 }
-# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>] [<head_n>]
+# ── drive_route <V> <mergeable> [<conflictcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>] [<head_n>]
+# ⛔ ARGUMENT 3 IS THE **CONFLICT** BUDGET (`state/conflictcount-<PR>`, seeded at `$528`), NOT
+# `fixcount` — the docstring said `fixcount` while the body wrote `conflictcount`, so a fixture written
+# from the docstring seeded the counter the conflict arm no longer books (review P3, #4126).
 # `<head_n>` defaults to the suite's opaque token `abc1234`. It exists because `parkorigin-<PR>` and
 # `park-human.sh` are keyed on a FULL 40-char sha — the live `headRefOid` the guard compares in
 # production — so the rows that drive the producer need a head of that shape.
