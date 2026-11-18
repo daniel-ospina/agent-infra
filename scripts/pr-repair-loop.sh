@@ -38,6 +38,16 @@
 #      through the env seams (`PR_DOCTOR_REPO`, `PR_DOCTOR_REPO_DIR`, `OBJECTIVE_REPO`). A cell whose
 #      checkout is `/tmp/cell-t3` cannot use `pr-doctor`'s macOS default path, and pointing it at one
 #      is #1974's exact defect.
+#      ⛔ THE CROSS-BOX CLAIM IS TAKEN ONE LAYER DOWN, PER PR, AND THAT IS WHERE IT BELONGS
+#      (agent-infra#2557). This file spawns NO lane: `pr-doctor.py`'s `dispatch()` is the only spawn
+#      path in the fleet (`git grep 'nonblocking-dispatch'` — every other hit is a READER of the
+#      `$O/bg/*.started` marker or the dispatcher's own docs), and it now takes
+#      `refs/claims/<pr>-<sha12>` via `claims.sh`'s `claim_acquire` BEFORE the lane is spawned. So a
+#      claim taken HERE would be one claim for a whole pass over N PRs -- the wrong granularity, and
+#      a second lock for one question. The measured defect was two CELLS dispatching one PR
+#      (pi-cell-2 and pi-cell-5, 2026-11-17); that is decided per PR, at the PR. What this file still
+#      owns is the LOCAL pass lock above (one repair pass per box), which `flock` covers and the
+#      registry cannot.
 #   5. RECORD one status row (`$O/state/pr-repair.status.json`) that a reader can act on: the
 #      measurement, the cap, the decision and the rc of every step. `systemctl is-active` is a
 #      HINT; this row is the answer to "did it do anything, and if not, why not".

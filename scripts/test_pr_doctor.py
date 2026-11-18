@@ -64,6 +64,13 @@ _REAL_GH_TOKEN = getattr(pr, "_gh_token", None)
 # it to "capable" so a pass test is not decided by whatever `$O` copy this box happens to have. The
 # tests that drive the guard restore this.
 _REAL_KIND_SUPPORT = getattr(pr, "dispatcher_kind_support", None)
+# …and the CROSS-BOX CLAIM (agent-infra#2557), captured for the same reason: the autouse fixture
+# stubs the gate to "free, and this box took it" so ~40 dispatch tests are not decided by a git
+# remote. ⛔ THAT STUB IS A DECLARATION, NOT A CONVENIENCE: the tests that drive the claim itself
+# restore this value and run the REAL `claims.sh` against a real bare remote (``_claim_fleet``
+# below), so the gate is proved in both directions rather than stubbed away.
+_REAL_CLAIM_GATE = getattr(pr, "pr_claim_gate", None)
+_REAL_CLAIM_RELEASE = getattr(pr, "pr_claim_release", None)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
@@ -149,6 +156,15 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # fail for a reason none of them is about. Stub it to "capable"; the guard itself is driven directly,
     # in both directions, by `test_a_stale_dispatcher_refuses_the_pass*` below.
     monkeypatch.setattr(pr, "dispatcher_kind_support", lambda: "", raising=False)
+    # ⛔ AND THE CROSS-BOX CLAIM IS STUBBED FREE-AND-TAKEN, NOT ABSENT (agent-infra#2557).
+    # `dispatch()` now takes `refs/claims/<pr>-<sha12>` before it prepares anything, and a unit test
+    # has no remote to take it from -- refusing here (the honest answer to "no registry") would make
+    # every existing dispatch test fail for a reason none of them is about. The stub returns a
+    # COMMIT, not an empty string, so `_give_back` still runs on every failure path and the release
+    # wiring stays exercised. The gate's own polarity is driven against the real `claims.sh` in the
+    # `_claim_fleet` tests below.
+    monkeypatch.setattr(pr, "pr_claim_gate", lambda p, dry=False: (None, "0" * 40), raising=False)
+    monkeypatch.setattr(pr, "pr_claim_release", lambda p, commit: True, raising=False)
 
 
 # ── 1. the machine's config reaches capacity() ────────────────────────────────────────────
@@ -1099,6 +1115,309 @@ def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp
     assert ok is False
     assert "worktree add failed" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
+
+
+# ── THE CROSS-BOX CLAIM, DRIVEN AGAINST THE REAL REGISTRY (agent-infra#2557) ──────────────────────
+#
+# Every test below runs the SHIPPED `scripts/orchestrator-harness/claims.sh` against a REAL bare
+# remote and two REAL checkouts (box A / box B), with `CLAIM_OWNER_HOST` and `CLAIM_STATE_DIR` per
+# box so the two are honestly different boxes to the registry. That is deliberate: the defect this
+# closes was two boxes dispatching one PR, and a stub of the registry cannot reproduce it -- the
+# loser's refusal has to come from the CAS.
+
+def _git(*args, cwd):
+    r = subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True)
+    assert r.returncode == 0, (args, r.stdout, r.stderr)
+    return r.stdout.strip()
+
+
+def _claim_fleet(tmp_path):
+    """A bare origin plus two boxes' clones of it at ONE head. Returns (origin, head, boxa, boxb)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _git("init", "-q", cwd=src)
+    (src / "f.txt").write_text("head\n")
+    _git("add", "f.txt", cwd=src)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "head", cwd=src)
+    head = _git("rev-parse", "HEAD", cwd=src)
+    origin = tmp_path / "origin.git"
+    _git("init", "-q", "--bare", str(origin), cwd=tmp_path)
+    _git("push", "-q", str(origin), "HEAD:refs/heads/main", cwd=src)
+    boxes = {}
+    for name in ("boxa", "boxb"):
+        d = tmp_path / name
+        _git("clone", "-q", str(origin), str(d), cwd=tmp_path)
+        _git("checkout", "-q", head, cwd=d)
+        boxes[name] = d
+    return origin, head, boxes["boxa"], boxes["boxb"]
+
+
+def _as_box(monkeypatch, box, tmp_path, name):
+    """Point pr-doctor at ONE box: its checkout, its registry module, its identity, its state dir.
+
+    `CLAIM_OWNER_HOST` is the claims.sh SEAM (the shipped way to simulate a second box), and the
+    state dir is separated because `claim_host_record` remembers a box's FORMER host names -- shared
+    between two simulated boxes it would make box A look like one of box B's own old names, and the
+    orphan rule would then correctly reclaim a live claim, which is not what these tests measure.
+    """
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    monkeypatch.setattr(pr, "REPO_DIR", str(box))
+    monkeypatch.setenv(pr.CLAIMS_SH_ENV, str(_HARNESS / "claims.sh"))
+    monkeypatch.setenv("CLAIM_OWNER_HOST", name)
+    monkeypatch.setenv("CLAIM_STATE_DIR", str(tmp_path / ("state-" + name)))
+    for k in ("CLAIM_KNOWN_HOSTS", "CLAIM_DEAD_HOSTS", "CLAIM_NS"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def _claimed_refs(origin):
+    out = subprocess.run(["git", "ls-remote", str(origin), "refs/claims/*"],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return [line.split("\t")[1] for line in out.stdout.splitlines() if line.strip()]
+
+
+def test_a_second_box_cannot_spawn_a_lane_for_a_head_the_first_has_claimed(monkeypatch, tmp_path):
+    """THE MEASURED INCIDENT (2026-11-17): one PR, two boxes, two live `prd-` lanes on one head.
+
+    ⛔ NAMING THE MUTANT. Delete the `pr_claim_gate()` call in `dispatch()` (i.e. dispatch as before
+    this change) and this test goes RED at `assert ok is False` -- box B spawns happily on a head box
+    A owns. Nothing else in the suite reddens for that edit, because the autouse fixture stubs the
+    gate to free-and-taken; this is the row that proves the gate is WIRED, not merely present.
+    """
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    # box A takes the claim through the REAL gate...
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    hold, commit = _REAL_CLAIM_GATE(pr_)
+    assert hold is None, hold
+    assert commit, "the CAS must hand back the commit a fenced release needs"
+    assert _claimed_refs(origin) == ["refs/claims/13126-%s" % head[:12]], \
+        "the key must be the SAME per-head ref the issue/fixer path uses"
+    # ...then box B tries the same head, through `dispatch()`.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)      # undo the autouse stub
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    prepared, spawned = [], []
+    monkeypatch.setattr(pr, "materialise_worktree",
+                        lambda p, dry=False: prepared.append(p["number"]) or (str(tmp_path), ""))
+    # ⛔ `spawn_argv`, NOT `sh_err`: the claim bridge goes through `sh_err` too, and stubbing it
+    # would make the registry answer empty -- i.e. it would stub out the very thing under test.
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: spawned.append(a) or ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert pr.claim_hold_token(detail) == "holder-on-foreign-box", detail
+    assert "boxA:" in detail, "the skip must NAME the holder: %r" % (detail,)
+    assert not prepared, "a claimed head must cost this box NOTHING -- no worktree is prepared"
+    assert not spawned, "no spawn may be attempted for a head a peer holds"
+    assert _claimed_refs(origin) == ["refs/claims/13126-%s" % head[:12]], \
+        "box B must not have disturbed box A's claim"
+
+
+def test_an_unreadable_registry_is_SKIPPED_and_reported_with_its_token(monkeypatch, tmp_path):
+    """⛔ NAMING THE MUTANT. Return `(None, ...)` on the abstention branch -- i.e. treat an
+    unreadable registry as freedom -- and this test goes RED at `assert ok is False`: the dispatch
+    proceeds on a head this box cannot prove is free, which is the duplicate the owner's decision
+    exists to prevent. The token assertion reddens too, which is why the SKIP is reported rather
+    than silent.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)      # undo the autouse stub
+    # The registry becomes unreadable: `git ls-remote`/`push` cannot reach the origin at all. This is
+    # a GIT-only failure -- exactly the class `orch-loop.sh` warns must not be softened on the
+    # assumption that a `gh` outage took the registry down too.
+    _git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=boxa)
+    logged = []
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    # (no `sh_err` stub: the registry answer is what this test measures -- see the note in the
+    # two-box test above.)
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert pr.claim_hold_token(detail) == pr.CLAIM_UNREADABLE_TOKEN, detail
+    assert _claimed_refs(origin) == [], "nothing may be minted on an unreadable registry"
+    assert any("verdict=claims-unreadable" in m for m in logged), \
+        "a silent skip is indistinguishable from a bug: %r" % (logged,)
+
+
+def test_the_claim_is_released_when_the_spawn_never_launches(monkeypatch, tmp_path):
+    """A gate-refused spawn must give the claim back, or the head is held for a whole lease.
+
+    ⛔ NAMING THE MUTANT. Delete the `pr_claim_release()` call from `_give_back()` and this test goes
+    RED on the `_claimed_refs(...) == []` assertion: the box refuses to spawn and then owns the PR for
+    its entire lease with every peer refusing it -- the abandoned-claim class.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(42, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[load-gate] REFUSED bg: load=99 >= max_load=40" >> "$2"; return 75; }\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    _git("init", "-q", cwd=wt)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and "75" in detail, detail
+    # The refusal is a GATE refusal, not a claim hold -- the two classes must not be confused.
+    assert pr.claim_hold_token(detail) == ""
+    assert _claimed_refs(origin) == [], "the refused spawn must give the claim back"
+
+
+def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_path):
+    """`--dry-run` must not publish a claim for work it will not do (it would hold a real box)."""
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(9, head=head)
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    logged = []
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    # a FREE head, seen from box B: reported as spawnable, and NOT claimed.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    assert pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=True)[0] is True
+    assert _claimed_refs(origin) == [], "a dry run must mint nothing"
+    # box A claims it; the same dry run from box B must now report the HOLD, still minting nothing.
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    assert _REAL_CLAIM_GATE(pr_)[0] is None
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    ok, detail, _ = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=True)
+    assert ok is False and pr.claim_hold_token(detail) == "holder-on-foreign-box", detail
+    assert any("would NOT spawn" in m for m in logged), logged
+    assert len(_claimed_refs(origin)) == 1, "the dry run must not have changed the registry"
+
+
+def test_the_claim_verdict_mapping_covers_the_published_tokens(monkeypatch):
+    """Every branch of the mapping, driven directly -- the tokens are a CLOSED, published set.
+
+    The two vocabularies meeting here are `claims.sh`'s (rc + its own `held-by-*` words) and
+    `docs/ops/fleet-liveness.md`'s six. A seventh word, or a wrong rung, is what this pins: the
+    same-host arm is the one a fixer/reviewer lane on THIS box produces (its pid is live), and the
+    foreign arm is the measured #2557 incident.
+    """
+    def tok(**kw):
+        base = {"loaded": "1", "stale": "0", "me": "boxB", "rc": "1",
+                "result": "", "hresult": ""}
+        base.update(kw)
+        t = pr.claim_verdict_token(base)
+        assert t == "" or t in pr.CLAIM_TOKENS, t
+        return t
+
+    live_own = "held by boxB:123 until 9999999999 (100s left; held-by-live)"
+    live_foreign = "a claim on PR #5 at abc is held by boxA:9 until 9999999999 (100s left; held-by-live)"
+    assert tok(rc="2") == "claims-unreadable"
+    assert tok(rc="1", hrc="2") == "claims-unreadable"
+    assert tok(loaded="0") == "claims-unreadable"
+    assert tok(stale="1") == "claims-unreadable"          # too old to expose claim_acquire
+    assert tok(result=live_own) == "claim-held"
+    assert tok(hresult=live_foreign) == "holder-on-foreign-box"
+    assert tok(result="held by ? until 9999999999 (x; held-by-live)") == "claim-owner-unparseable"
+    assert tok(result="held by boxA:9 (no parseable lease -- held-by-unreadable-lease; ...)") \
+        == "claim-holder-unverifiable"
+    assert tok(result="could not mint a claim: the LOCAL CLOCK is unreadable ... "
+                      "held-by-unreadable-clock") == "claim-holder-unverifiable"
+    assert tok(result="lost the reclaim race for refs/claims/5-abc (another box took it: a -> b)") \
+        == "claim-held"
+    assert tok(result="something this reader has never seen") == "claim-holder-unverifiable"
+    # …and the acquiring answer is NOT a refusal.
+    assert tok(rc="0") == ""
+
+
+def test_a_peer_held_head_does_not_refuse_the_pass(monkeypatch):
+    """A peer repairing a PR is NOT a fault of this pass -- it must not exit 3/2.
+
+    ⛔ NAMING THE MUTANT. Count a `claim-held` skip as `undeliverable` in `run_pass()`'s refusal
+    arm and this test goes RED (rc 3): every healthy fleet would then read UNDELIVERED on every
+    pass, which is the false alarm that would get the gate switched off.
+    """
+    rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_PEER_TOKENS[1])
+    assert rc == 0, (rc, reason)
+    assert "holder-on-foreign-box=1" in reason, reason
+    assert "no worker accepted" not in reason, reason
+
+
+def test_an_unreadable_registry_refuses_the_pass(monkeypatch):
+    """…but a registry this box cannot read IS a failed order, and 0 is reserved for a real pass.
+
+    ⛔ NAMING THE MUTANT. Drop the `undeliverable += 1` from the `claims-unreadable` arm and this
+    test goes RED (rc 0): a box that can see no claim on anything would report a clean pass while
+    placing no order at all -- the false PASS shape this file exists to remove.
+    """
+    rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_UNREADABLE_TOKEN)
+    assert rc == pr.EXIT_UNDELIVERED, (rc, reason)
+    assert "claims-unreadable=1" in reason, reason
+    assert "no worker accepted" in reason, reason
+
+
+def _drive_claim_pass(monkeypatch, token):
+    """One pass whose only PR is refused by the claim gate; returns (rc, recorded reason)."""
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(5)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_r: (False, pr._ClaimHold(
+                            "cross-box claim registry: verdict=%s" % token, token=token), False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    monkeypatch.setenv("MAX_FIX", "4")
+    monkeypatch.setenv("MAX_REVIEW", "4")
+    return pr.main(), (pr.LAST_PASS.get("reason") or "")
+
+
+def test_the_claim_lease_never_exceeds_the_keyings_ceiling(monkeypatch):
+    """The lease is capped at `claims.sh`'s `CLAIM_TTL_MAX`, from a seam, and never by accident.
+
+    ⛔ MEASURED WHY THIS EXISTS: `SPAWN_TIMEOUT_S` is 36000 s at the shipped default, so the
+    `backstop + pad` form is 37200 s -- and the FIRST version of this code passed that straight to
+    `claim_acquire`, which clamped it to 9600 and printed a warning on stderr on every mint. Relying
+    on someone else's clamp is not a bound: it is a line in a log nobody reads until it matters.
+    """
+    for k in (pr.CLAIM_LEASE_ENV, pr.CLAIM_LEASE_MAX_ENV):
+        monkeypatch.delenv(k, raising=False)
+    assert pr.claim_lease() == min(pr.SPAWN_TIMEOUT_S + pr.CLAIM_LEASE_PAD_S,
+                                   pr.CLAIM_LEASE_MAX_S)
+    assert pr.claim_lease() <= 9600, "the shipped CLAIM_TTL_MAX is the ceiling this may not exceed"
+    # a SHORTER explicit lease is honoured (an operator may know the work is small)…
+    monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "1800")
+    assert pr.claim_lease() == 1800
+    # …a typo never shortens it, and never unbinds it
+    monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "not-a-number")
+    assert pr.claim_lease() == pr.CLAIM_LEASE_MAX_S
+    # the ceiling itself is a seam, so a box that raised CLAIM_TTL_MAX can raise it in step
+    monkeypatch.setenv(pr.CLAIM_LEASE_MAX_ENV, "20000")
+    assert pr.claim_lease() == 20000
+
+
+def test_every_claim_token_is_from_the_published_closed_set():
+    """The mapping may only emit words `docs/ops/fleet-liveness.md` publishes (no seventh token)."""
+    sys.path.insert(0, str(_REPO / "tools" / "fleet"))
+    try:
+        import liveness  # noqa: WPS433 -- the published vocabulary, read from its owner
+    finally:
+        sys.path.pop(0)
+    assert set(pr.CLAIM_TOKENS) == set(liveness.CLAIM_REASONS)
+    assert set(pr.CLAIM_PEER_TOKENS) < set(liveness.CLAIM_REASONS)
+    assert pr.CLAIM_UNREADABLE_TOKEN in liveness.CLAIM_REASONS
+
 
 
 def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
