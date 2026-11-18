@@ -813,9 +813,16 @@ function _markerTouchBlockReason(
       ? [
           `⛔ The escape marker was WRITTEN but cannot open a window (#3620).`,
           `   Diagnosis: ${why}.`,
-          `   The stamp landed — the file exists at ${_markerPath()} and a \`gate_bypass\``,
-          `   audit row was appended — but the READ side refuses THAT file, so this`,
-          `   \`touch\` is refused rather than reported as an open window (no false PASS).`,
+          // ⛔ NAME THE ROUTE, NOT A ROW (#4101 review, P3). `stampLanded` witnesses
+          // that `_stampMarker` did not throw; the `gate_bypass` append inside it is
+          // best-effort (`appendJsonl` swallows its own write failures), so "an audit
+          // row was appended" can assert a row that does not exist — the false-claim-
+          // about-the-audit-trail class this branch already closed one level up.
+          `   The stamp landed — the file exists at ${_markerPath()} — so "the stamp`,
+          `   did not take" would be the wrong direction. The READ side refuses THAT`,
+          `   file, so this \`touch\` is refused rather than reported as an open window`,
+          `   (no false PASS). The mint routes through the audited \`gate_bypass\` path;`,
+          `   that append is best-effort, so this sentence names the route, not a row.`,
         ]
       : [
           `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
