@@ -2341,25 +2341,44 @@ agent-infra#4034 took `LANE_TIMEOUT` to 36000 s the chunk count moved with it �
 120 = 247` — and an arithmetic row still reading `7 × 120` was the 7200 s clock's residue: the same
 stale-measurement defect this paragraph is otherwise about, one layer down. `lane-merge.sh:286-300`
 carries the same recomputation at the source.
-⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
-paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
-compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
-"4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
-invariant one paragraph up), so the honest row is:
+⛔ **The trade is stated, because the arithmetic does not make it small — and BOTH the first version of
+this paragraph and its first "correction" got it wrong** (review cycle 7, P2; then the #4065 re-review,
+which recomputed the base column instead of carrying it, and read the DESIGN operand as the runtime
+allowance). `WAIT_S` is **5400 on BOTH sides** — `origin/main` ships `LANE_MERGE_WAIT:-5400` too — so
+the only thing the 5× clock changes is the chunk count, `(clock − 5400 − 900) / 120`: **7** at 7200 s,
+**247** at 36000 s. ⛔ THE LEFT COLUMN IS THE PRE-#4034 TREE, NOT `origin/main` (round-2 re-review, P3):
+`origin/main` has shipped `LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-36000}"` (`spawn-gate.sh:3566`, since #4065
+merged), so labelling it `origin/main` pointed a reader at a revision that no longer carries the 7200 s
+clock — in the block this PR rewrites. The numbers are right for the tree they were measured on; the
+label now names that tree.
+⛔ AND THAT COUNT IS A DESIGN OPERAND, NOT WHAT A LANE GETS, because EVERY `--watch`
+path clamps it to the watchdog's allowance — `_idle_fit = (2700 − 40) / 120 = 22` chunks — whenever that
+is smaller, which at 36000 s it is. The honest row, with both columns:
 
-| | `origin/main` (7200 s clock) | this tree (36000 s clock) |
+| | pre-#4034 tree (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
-| `WAIT_S` | 1500 | 5400 |
-| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 247 × 120 = 29640 |
-| merge phase's share of the clock | 6300 | 35040 |
-| left for implement → commit → push → open PR | 900 | 960 |
+| `WAIT_S` | 5400 | 5400 |
+| **design operand** (`MAX_WATCH_FIT` × `POLL`) — the guarantee's FLOOR, never a delivered allowance | 7 × 120 = 840 | 247 × 120 = 29640 |
+| **operative** `--watch` allowance (the watchdog's `_idle_fit` = `(2700 − 40)/120`) | **22 × 120 = 2640**, falling to **14 × 120 = 1680** once a full 5400 s check wait has been spent and only the clock's remainder is left | **22 × 120 = 2640** — the watchdog binds and the clock never does |
+| merge phase's operative share (wait + watch) | 7080 … 8040 | 8040 |
 
-The implementation reserve goes **up** by 60 s, so this constant does not starve implementation, and
-what the 5× clock buys is **supervision chunks, 40 → 247**: the merge phase can out-watch its own check
-wait instead of being sized out of it. That is the deliberate trade — a wait that reaches the merge phase,
-with enough clock left to supervise it — and at the pre-#4034 7200 s clock the same change bought only
-**7** chunks (840 s of `--watch` over a 5400 s wait), which is why raising `LANE_BACKSTOP_S` was the
-cheap half of it and is what #4034 did. A lane that needs longer than the reserve hands off
+The DECLARED reserve is unchanged and is the earlier row, not this one: `IMPL_RESERVE_S` is 900 s on
+both clocks, and the invariant `5400 + 247 × 120 + 900 = 35940 ≤ 36000` holds with 60 s of slack — the
+same 60 s it had at 7200 s (`5400 + 7 × 120 + 900 = 7140`). So this constant neither starves
+implementation nor gains from the 5×.
+⛔ **WHAT THE 5× ACTUALLY BUYS HERE IS SMALL, AND SAYING OTHERWISE WAS THIS PARAGRAPH'S LAST ERROR**
+(re-review of #4065, finding 4, P2 — the delivered benefit was overstated ~11×). The watchdog clamp is
+22 chunks on BOTH clocks, so in the ordinary case the operative `--watch` allowance is **the same
+2640 s** before and after: at 7200 s it is the clock's remainder that shrinks it (1680 s after a full
+wait), which the 5× removes. ⛔ AND THE MERGE PHASE STILL **CANNOT** OUT-WATCH ITS CHECK WAIT: 2640 s
+against 5400 s, so "the merge phase can out-watch its own check wait instead of being sized out of it" —
+which this paragraph used to say — is false, and `lane-merge.test.sh` still grades chunk 23 as REFUSED.
+The 5400 s check wait is a separate mechanism with its own cap and heartbeat; `lane-merge.sh` says so,
+and only that wait can outlive the watchdog. What #4034 buys is the LANE TERM (the wall stops ending
+lanes that are still working — the issue's own measurement), a design floor that no longer sits below
+the watchdog's allowance, and a `--watch` allowance that no longer decays with the time already spent.
+That is the deliberate trade, and it is a bound the lane itself reaches before its own kill rather than
+one only a later lane could inherit. A lane that needs longer than the reserve hands off
 (`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
 ⛔ **THE DESIGN FLOOR IS A WORST CASE, NOT WHAT A LANE GOT — and at the 7200 s clock it sat below the
 phase it supervises** (#3850 review, P2 — recomputed against the chain's own declared budgets).
@@ -2375,7 +2394,8 @@ re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from th
 the shipped 36000 s defaults and 1 when the wall axis is off), never beyond the
 watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
 kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
-nothing, and keeps exactly the 247 shipped chunks.
+nothing, and keeps the design operand (247 chunks) — the `_idle_fit` clamp still applies to it, so what it
+gets is **22** chunks, the same operative allowance a lane gets, not 247.
 ⛔ **AND "WALL AXIS OFF" (`LANE_TIMEOUT=0`) IS NOT READ AS A ZERO CLOCK FOR SUPERVISION EITHER** (review
 cycle 13, P2 — measured: the same arithmetic floored that lane at ONE chunk, 120 s, on a lane documented
 as unbounded, so `--watch` posted a blocker two minutes into a legitimate chain wait). With the wall axis
@@ -3081,7 +3101,7 @@ stalled fleet and a human reading a report.
 **How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
 `<lane log>.lanebound`):
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=7200s
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=36000s
   idle_bound=2700s silent=2805s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
@@ -4826,7 +4846,8 @@ reap. The decisions that are not obvious:
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
-leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+leaves the claim held for the whole lease (13 h 20 m of a free issue, for the issue key, at the
+48000 s `CLAIM_ISSUE_TTL` agent-infra#4034 set).
 
 The registry now carries **three** keys, one question each, and none is a re-keying of another:
 `<PR>-<sha12>` ("this head", review/evidence), `issue-<N>` ("this issue", dispatch), and
@@ -5081,7 +5102,7 @@ this", because the refusal's consequences were invisible and **long-lived**:
    the whole time, because releasing it is its EXIT trap's job.
 3. Every peer's `claim_issue_preflight` reads a live claim as **COLLISION**, so ONE box's capacity
    decision made the issue ineligible on **all five** boxes for 90 minutes (up to `CLAIM_ISSUE_TTL`,
-   3 h, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
+   13 h 20 m, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
    different route: the item's turn was consumed by a machine that did no work.
 4. Nothing stopped the refusing box from re-winning the claim next cycle and being refused again —
    starving the peers it had just yielded to.
@@ -5858,7 +5879,7 @@ were deleted.
 | **`claim_issue_preflight`'s clock was unguarded** | `date +%s` is a *second* input to the same decision — the `ls-remote` read that proves "no claim ref exists" does not need it, but the lease comparison does. On an unreadable clock `[ "$now" -le "$until" ]` is FALSE (bash prints `integer expression expected`), so a **held** claim's reader fell through to `return 0` — a **false CLEAN** in the one direction the gate exists to prevent | a non-numeric/empty `now` is rc=2 INCOMPLETE, alongside an unreadable registry |
 | **the release record was read when the trap FIRED, not when the claim was taken** | the record file is keyed on the **issue**, so a box that re-acquires after its lease lapses overwrites it. The older chain's trap then fenced on the *new* commit — which **is** the ref tip — and deleted the live holder's claim, freeing a busy issue for a peer: the exact duplicate the key exists to prevent | `chain-merge.sh` captures the commit at chain start (`claim_issue_record_commit`) and `claim_issue_release_record` refuses on a generation mismatch, naming it and leaving the newer record intact |
 | **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
-| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
+| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (13 h 20 m of a free issue, the 48000 s `CLAIM_ISSUE_TTL` agent-infra#4034 set) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
 | **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
 | **a chain with NO captured generation still released** | the capture is empty when the handover record was absent at chain start (`orch-loop.sh`'s `claim_issue_record` failed) or `$O/claims.sh` predates the reader. `claim_issue_release_record` treats an empty expectation as "read the record now" — right for `dispatch-merge.sh`, whose release is milliseconds after the write, but WRONG for a trap that can fire **hours** later: the record then holds the newer holder's own commit, which **is** the ref tip, so the stale chain deleted a live claim | `chain-merge.sh` refuses the release when it has no captured generation, names the reason and lets the lease reap it (one lease lost vs duplicated work on two boxes) |
 | **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |

@@ -45,6 +45,16 @@
 # Run: bash scripts/orchestrator-harness/lane-reap.test.sh
 set -uo pipefail
 
+# ⛔ THE SUITE GRADES THE SHIPPED WINDOW, SO THE AMBIENT ONE MUST NOT REACH THE CHILD (re-review of
+# #4065, finding 3 — verified). `run_reap`/`run_count` pass their knobs as an env PREFIX, so they
+# OVERRIDE but never REMOVE an inherited value: `lane-reap.sh` reads `LANE_REAP_LIVE_MIN` /
+# `LANE_REAP_IDLE_MIN` from the environment, and this suite derives `STALE_S` from the SHIPPED literal
+# (601 min). On a box exporting either seam — and 125 is the value the #4034 work itself recommends
+# lowering to — the LIVE-WINDOW and DEFAULT arms then grade the ambient window while blaming the
+# shipped one, i.e. the arm reports the wrong cause for its own red. Scrubbed here, once, so every
+# arm below measures the literals in `lane-reap.sh` unless the arm itself sets a seam.
+unset LANE_REAP_LIVE_MIN LANE_REAP_IDLE_MIN
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAPER="$HERE/lane-reap.sh"
 EXEC="$HERE/lane-exec.sh"
