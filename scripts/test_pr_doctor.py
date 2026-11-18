@@ -1595,16 +1595,22 @@ def test_an_unreadable_registry_refuses_the_pass(monkeypatch):
     test goes RED (rc 0): a box that can see no claim on anything would report a clean pass while
     placing no order at all -- the false PASS shape this file exists to remove.
 
-    ⛔ AND THE SENTENCE NAMES THE REGISTRY, NOT THE TRANSPORT (harness review of #4134, P2).
-    `no worker accepted` is a claim about `nonblocking-dispatch.sh`, which was never invoked for an
-    order the claim gate returned before; the first version of this row asserted that sentence, so
-    it pinned the false remedy alongside the right exit code.
+    ⛔ AND THE SENTENCE AND THE REMEDY NAME THE REGISTRY, NOT THE TRANSPORT (harness review of
+    #4134, P2). `no worker accepted` is a claim about `nonblocking-dispatch.sh`, which was never
+    invoked for an order the claim gate returned before, and `next=repair-chain` named that same
+    healthy chain from the verdict line; the first version of this row asserted both, so it pinned
+    the false remedy alongside the right exit code. The verdict is now its own token
+    (`CLAIM-UNREADABLE` / `next=repair-claim-registry`), the way #4009 split `RUBRIC`.
     """
     rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_UNREADABLE_TOKEN)
     assert rc == pr.EXIT_UNDELIVERED, (rc, reason)
     assert "claims-unreadable=1" in reason, reason
     assert "CLAIM REGISTRY could not answer" in reason, reason
     assert "no worker accepted" not in reason, reason
+    # ⛔ AND THE REMEDY MUST SURVIVE THE BEAT'S 110-CHAR CUT, or the operator reads only the token.
+    assert "VERDICT=CLAIM-UNREADABLE" in reason, reason
+    assert "next=repair-claim-registry" in reason[:110], reason
+    assert "repair-chain" not in reason, reason
 
 
 def _drive_claim_pass(monkeypatch, token):

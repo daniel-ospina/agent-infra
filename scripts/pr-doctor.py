@@ -1329,6 +1329,10 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
                       # ⛔ NOT `repair-chain` (#4009): nothing was exec'd at all, so the chain
                       # cannot be the thing to repair. The remedy is the seam nobody supplied.
                       "RUBRIC": "supply-rubric",
+                      # ⛔ NOT `repair-chain` EITHER (harness review of #4134, P2): a claim gate
+                      # that cannot read `refs/claims/` refuses before the chain is exec'd, so the
+                      # remedy is the registry's own transport.
+                      "CLAIM-UNREADABLE": "repair-claim-registry",
                       "REFUSING": "restore-read", "SLOTS-FULL": "none"}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -6605,11 +6609,13 @@ def run_pass(args, rubric_note: str = "") -> int:
             if _rub:
                 parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
                              % _rub)
-            if _claim_unread:
-                # ⛔ NAMED ON EVERY PASS THAT HAD ONE, not only the zero-dispatch one: the stall
-                # loop above prints it ONLY when nothing went out, so on a pass that dispatched
-                # two orders and stood down from an unreadable registry the count appeared nowhere
-                # and the sentence blamed the transport (harness review of #4134, P2).
+            if _claim_unread and dispatched:
+                # ⛔ NAMED ON A PASS THAT DELIVERED TOO, not only the zero-dispatch one: the stall
+                # loop above prints it ONLY when nothing went out, so on a pass that dispatched two
+                # orders and stood down from an unreadable registry the count appeared NOWHERE and
+                # the sentence blamed the transport (harness review of #4134, P2). The `dispatched`
+                # guard is the `_peers` block's own convention -- on a zero-dispatch pass the stall
+                # counter is already on this line, and this file never prints one quantity twice.
                 parts.append("%d order(s) could not be placed: the CLAIM REGISTRY could not answer"
                              " (%s=%d -- a head whose claim cannot be read is never proven free)"
                              % (_claim_unread, CLAIM_UNREADABLE_TOKEN, _claim_unread))
@@ -6735,6 +6741,16 @@ def run_pass(args, rubric_note: str = "") -> int:
         # `undeliv`, or a real transport drop would be hidden behind a single asserted cause.
         elif not dispatched and rubric_n and undeliv == rubric_n + carried:
             code, verdict = EXIT_UNDELIVERED, "RUBRIC"
+        # ⛔ AND AN UNREADABLE CLAIM REGISTRY IS THE SAME CLASS, ONE LAYER DOWN (harness review of
+        # #4134, P2). Nothing was exec'd: `pr_claim_gate` refuses BEFORE the brief, the worktree and
+        # `nonblocking-dispatch.sh`, so `next=repair-chain` named a component that was never invoked
+        # and left the failing one -- the registry's git transport -- unnamed. The remedy is the
+        # registry (`git ls-remote`/`push` to the claims remote, or a missing `$O/claims.sh`).
+        # The same equality guard applies: `claims-unreadable` + `carried` must be the WHOLE of
+        # `undeliv`, or a real transport drop would be hidden behind a single asserted cause.
+        elif (not dispatched and (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0)
+              and undeliv == (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0) + carried):
+            code, verdict = EXIT_UNDELIVERED, "CLAIM-UNREADABLE"
         # ⛔ THE REFUSAL TOKEN WINS ONLY WHEN THE WHOLE UNDELIVERABLE SET IS REFUSALS (#2291 merged
         # with #2710's `carried`). Both changes route a durable refusal to rc 3 -- #2710 through
         # `undeliverable`/`carried`, #2291 through its own `refused-cooldown` axis -- so the code is
@@ -6789,6 +6805,15 @@ def run_pass(args, rubric_note: str = "") -> int:
             head += ("; the dispatch chain was NEVER INVOKED -- supply this repo's own rubric through"
                      " the OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE seams named on this pass's `rubric:`"
                      " line; repairing the chain cannot help and this does NOT clear by waiting")
+        elif verdict == "CLAIM-UNREADABLE":
+            # ⛔ THE OTHER COMPONENT THAT IS NOT THE CHAIN (harness review of #4134, P2). Same
+            # measured shape as #4009: nothing was exec'd, so the old `next=repair-chain` sent an
+            # operator to a healthy dispatcher while `git ls-remote`/`push` to the claim registry
+            # (or a missing `$O/claims.sh`) was the thing that failed.
+            head += ("; the CLAIM REGISTRY could not answer -- check `git ls-remote`/`push` to the"
+                     " claims remote and `$O/claims.sh`; the dispatch chain and its workers were"
+                     " NEVER INVOKED, so repairing them cannot help"
+                     " and this does NOT clear by waiting")
         elif verdict == "SLOTS-FULL":
             head += "; capacity is present and the queue is being served"
         log("dispatched %d of %d queued — %s" % (dispatched, queued, head + "; " + why))
