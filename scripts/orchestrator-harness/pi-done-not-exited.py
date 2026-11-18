@@ -69,8 +69,9 @@ THE EVIDENCE, AND WHAT EACH CHANNEL CANNOT SEE
      the window (growth is positive liveness and beats CPU). An abstention is not an ending.
   C. THE LOG — the file this process holds on fd 1/2, whose last line is a SUCCESSFUL completion
      line and which did not grow inside the window. Three attribution traps, all measured:
-       * `[reflect-hook] Failed: …` is a HOOK FAILURE. So are two other shapes the extension writes
-         — `Hosted capture FAILED (…)` and `Attribution resolution failed` — so the test is
+       * `[reflect-hook] Failed: …` is a HOOK FAILURE. So are the other shapes the extension writes
+         — `Hosted capture REFUSED — …` / `Hosted capture DEFERRED (…)` (the #4108 shapes that
+         replaced `Hosted capture FAILED (…)`) and `Attribution resolution failed` — so the test is
          case-insensitive `failed|error`, never a `\bFailed\b` match.
        * a launcher path is RE-USED by later dispatches (`> log` truncates the same inode): measured
          5 `pi` on `adv-cipressure.log`, 4 on `adv-reaping.log`. A log held by more than one
@@ -153,9 +154,15 @@ COMPLETION_OK = (                # written by extensions/reflect-hook.ts AFTER t
     "[reflect-hook] Captured session ",
     "[reflect-hook] Skipped — empty session",
 )
-COMPLETION_FAILED = (            # the same extension's three failure shapes
+COMPLETION_FAILED = (            # the same extension's failure/deferral shapes
     "[reflect-hook] Failed: ",
-    "[reflect-hook] Hosted capture FAILED (",
+    # #4108 replaced the single-attempt `Hosted capture FAILED (…)` line with these
+    # two: a refusal that is NOT retried ("REFUSED —") and one deferred to the
+    # detached retry worker ("DEFERRED ("). Both mean the end-of-turn hook ran and
+    # did not land the capture, so both belong on the failure side of this
+    # allow-list — an unrecognised shape would report as `absent` and say less.
+    "[reflect-hook] Hosted capture REFUSED — ",
+    "[reflect-hook] Hosted capture DEFERRED (",
     "[reflect-hook] Attribution resolution failed",
 )
 STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
@@ -708,8 +715,8 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
                        why="turn ENDED (the transcript is the attribution); log evidence is %s" % marker)
         elif marker == "hook-failed":
             out.update(cls="DONE-NOT-EXITED",
-                       why="turn ENDED; the end-of-turn hook FAILED (%s) — nothing left to write"
-                       % mdetail)
+                       why="turn ENDED; the end-of-turn hook reported a capture problem (%s) — "
+                           "nothing left to write" % mdetail)
         elif marker == "ok":
             out.update(cls="DONE-NOT-EXITED",
                        why="turn ENDED; its own log ends with a completion line; cpu frozen")

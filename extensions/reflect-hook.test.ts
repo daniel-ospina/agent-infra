@@ -8,8 +8,18 @@
 // are safe because they don't depend on this env var.
 
 import { ok, equal, deepEqual, notEqual } from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  existsSync,
+  utimesSync,
+} from "node:fs";
 import { execSync } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { machineIdFrom } from "./shared/capture-attribution.js";
@@ -597,6 +607,507 @@ async function testShutdownUploadGate() {
   });
 }
 
+// ── Tests: capture refusal classification + retry policy (#4108) ───────────
+// The server's capacity gate REFUSES with 429 + Retry-After, and since
+// tortoise#13000 the body is TYPED (`detail.code` + `detail.retry_after`).
+// Before #4108 this hook made ONE POST and treated every non-2xx as terminal.
+//
+// These tests drive the REAL table, the REAL detached worker (`node -e …`,
+// spawned for real, POSTing over REAL HTTP to a loopback server) and the REAL
+// `session_shutdown` handler — so the acceptance criteria are behavioural:
+//
+//   * a 429 advertising `Retry-After: 2` is retried after that delay and lands;
+//   * a persistent 429 exhausts the bounded attempts, is LOGGED with its typed
+//     code, and the session is NOT lost (it stays in the spool);
+//   * a non-retryable refusal is not retried at all;
+//   * the agent's turn is not held for the retry window.
+
+interface Loopback {
+  url: string;
+  requests: Array<{ at: number; body: string }>;
+  close(): Promise<void>;
+}
+
+/** A loopback `/v1/sessions` server — the retry path talks REAL HTTP here. */
+async function startLoopback(
+  handler: (n: number, req: any, res: any) => void,
+): Promise<Loopback> {
+  const requests: Array<{ at: number; body: string }> = [];
+  const server = createServer((req: any, res: any) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => {
+      raw += c.toString();
+    });
+    req.on("end", () => {
+      requests.push({ at: Date.now(), body: raw });
+      handler(requests.length, req, res);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const port = (server.address() as { port: number }).port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    requests,
+    close: () =>
+      new Promise<void>((resolve) => {
+        // `fetch` keeps its socket alive, and `server.close()` waits for open
+        // connections — which is Node's 5 s keep-alive timeout, per server, on
+        // top of the deliberate retry waits. Drop them explicitly (Node ≥18.2).
+        (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+function capacityRefusal(res: any, retryAfterS: number): void {
+  res.writeHead(429, { "content-type": "application/json", "retry-after": String(retryAfterS) });
+  res.end(
+    JSON.stringify({
+      detail: {
+        code: "capture_capacity_saturated",
+        message: "capture capacity saturated — too many captures in flight; retry shortly",
+        retry_after: retryAfterS,
+        in_flight: 8,
+        limit: 8,
+      },
+    }),
+  );
+}
+
+async function waitFor(pred: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
+}
+
+/** Collect console output around `fn`, so a log line can be asserted on. */
+async function captureConsole(fn: () => Promise<void> | void): Promise<{
+  out: string[];
+  err: string[];
+  warn: string[];
+}> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const warn: string[] = [];
+  const orig = { log: console.log, error: console.error, warn: console.warn };
+  console.log = (...a: any[]) => void out.push(a.map((x) => String(x)).join(" "));
+  console.error = (...a: any[]) => void err.push(a.map((x) => String(x)).join(" "));
+  console.warn = (...a: any[]) => void warn.push(a.map((x) => String(x)).join(" "));
+  try {
+    await fn();
+  } finally {
+    console.log = orig.log;
+    console.error = orig.error;
+    console.warn = orig.warn;
+  }
+  return { out, err, warn };
+}
+
+function retryFixture(label: string): { dir: string; log: string } {
+  const dir = mkdtempSync(join(tmpdir(), `${label}-`));
+  TEMP_DIRS.push(dir);
+  return { dir, log: join(dir, "retry.log") };
+}
+
+async function testCaptureRetry() {
+  console.log("\n# capture refusal classification + retry policy (#4108)");
+  const {
+    classifyCaptureRefusal,
+    parseCaptureRefusal,
+    retryAfterSecondsFromHeader,
+    retryDelayMs,
+    captureToHosted,
+  } = reflectMod;
+
+  // A payload shaped exactly like the one the shutdown handler builds.
+  function payloadFor(sessionId: string) {
+    return buildQuitPayload({
+      sessionId,
+      turns: [
+        { role: "user", content: "ship it" },
+        { role: "assistant", content: "shipped" },
+      ],
+      meta: {
+        team: "organisation-design-team",
+        projectRoot: "/tmp/reflect-retry",
+        prs: [],
+        charCount: 20,
+      },
+      attribution: testAttribution(),
+    });
+  }
+
+  // ── The closed vocabulary (parity with tortoise's capture_outcome table) ──
+  await test("classification: the ONE status→class table, in the shared vocabulary", () => {
+    const cases: Array<[number | null, string]> = [
+      [200, "landed"],
+      [204, "landed"],
+      [301, "retryable"],
+      [500, "retryable"],
+      [503, "retryable"],
+      [504, "retryable"],
+      [401, "policy"],
+      [403, "policy"],
+      [407, "policy"],
+      [402, "retryable"],
+      [408, "retryable"],
+      [409, "retryable"],
+      [425, "retryable"],
+      [429, "retryable"],
+      [400, "permanent"],
+      [404, "permanent"],
+      [413, "permanent"],
+      [422, "permanent"],
+      [null, "retryable"],
+      [Number.NaN, "retryable"],
+    ];
+    for (const [status, expected] of cases) {
+      equal(
+        classifyCaptureRefusal(status),
+        expected,
+        `status ${String(status)} must classify as ${expected}`,
+      );
+    }
+  });
+
+  await test("parse: a typed capacity 429 yields code + retry_after (never a bare HTTP 429)", () => {
+    const headers = new Headers({ "retry-after": "30" });
+    const body = {
+      detail: {
+        code: "capture_capacity_saturated",
+        message: "capture capacity saturated — too many captures in flight; retry shortly",
+        retry_after: 30,
+        in_flight: 8,
+        limit: 8,
+      },
+    };
+    const refusal = parseCaptureRefusal(429, headers, body);
+    equal(refusal.outcome, "retryable");
+    equal(refusal.status, 429);
+    equal(refusal.code, "capture_capacity_saturated");
+    equal(refusal.retryAfterS, 30);
+  });
+
+  await test("parse: no header → the body's typed retry_after is used", () => {
+    const refusal = parseCaptureRefusal(429, new Headers(), {
+      detail: { code: "ingest_rate_limited", retry_after: 12 },
+    });
+    equal(refusal.outcome, "retryable");
+    equal(refusal.code, "ingest_rate_limited");
+    equal(refusal.retryAfterS, 12);
+  });
+
+  await test("parse: a PROSE-only detail is never matched — the class comes from the status", () => {
+    // The 409 in-flight refusal on this route carries a bare string detail. A
+    // prose-matching client would have to know the wording (tortoise#11225);
+    // this one does not read it at all.
+    const refusal = parseCaptureRefusal(409, new Headers({ "retry-after": "30" }), {
+      detail: "a capture for this session_id is already in flight — retry shortly",
+    });
+    equal(refusal.outcome, "retryable");
+    equal(refusal.code, null, "a prose detail must not be parsed into a code");
+    equal(refusal.retryAfterS, 30);
+  });
+
+  await test("Retry-After: delta-seconds and the HTTP-date form both parse", () => {
+    equal(retryAfterSecondsFromHeader("30"), 30);
+    equal(retryAfterSecondsFromHeader(" 2 "), 2);
+    equal(retryAfterSecondsFromHeader(null), null);
+    equal(retryAfterSecondsFromHeader("soon"), null);
+    const now = Date.parse("2026-11-17T00:00:00Z");
+    equal(retryAfterSecondsFromHeader("Tue, 17 Nov 2026 00:00:20 GMT", now), 20);
+    equal(retryAfterSecondsFromHeader("Tue, 17 Nov 2026 00:00:00 GMT", now), 0);
+  });
+
+  await test("delay: the advertised wait wins, the backoff applies without one, both clamped", () => {
+    equal(retryDelayMs(1, 2), 2000, "the advertised 2s must be honoured exactly");
+    equal(retryDelayMs(1, 600), 120_000, "an absurd advertised value is clamped, never awaited");
+    equal(retryDelayMs(1, 0), 1000, "a zero/absent wait is floored so the worker cannot spin");
+    equal(retryDelayMs(1, null), 30_000, "no advertisement → 30s × 2^(n-1)");
+    equal(retryDelayMs(2, null), 60_000);
+    equal(retryDelayMs(3, null), 120_000);
+    equal(retryDelayMs(12, null), 120_000, "the backoff is capped too");
+  });
+
+  // ── The retry actually happens, in a REAL detached worker ──────────────
+  await test("a 429 advertising Retry-After: 2 is retried after the delay and lands", async () => {
+    const srv = await startLoopback((n, _req, res) => {
+      if (n === 1) return capacityRefusal(res, 2);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const fixture = retryFixture("reflect-retry-lands");
+    const spool = join(fixture.dir, "spool.jsonl");
+    try {
+      const t0 = Date.now();
+      await captureToHosted(srv.url, "tt_test", payloadFor("sess-retry-lands"), spool, {
+        retryDir: fixture.dir,
+        retryLogPath: fixture.log,
+      });
+      const elapsed = Date.now() - t0;
+      // The retry window is 2s, so a call that waited it out could not return here.
+      ok(elapsed < 1500, `captureToHosted must not wait the retry window (took ${elapsed}ms)`);
+
+      await waitFor(
+        () => existsSync(fixture.log) && readFileSync(fixture.log, "utf-8").includes("LANDED"),
+        15_000,
+        "the detached retry worker to land the capture",
+      );
+      const log = readFileSync(fixture.log, "utf-8");
+      ok(
+        log.includes("waiting 2s before attempt 2/4"),
+        `the worker must wait the advertised delay; log:\n${log}`,
+      );
+      equal(srv.requests.length, 2, "exactly one retry POST, after the refusal");
+      const gap = srv.requests[1].at - srv.requests[0].at;
+      ok(gap >= 1900, `the retry must come at least 2s after the refusal (came after ${gap}ms)`);
+      equal(
+        srv.requests[1].body,
+        srv.requests[0].body,
+        "the retry must re-POST the identical body",
+      );
+      const staged = readdirSync(fixture.dir).filter((f) => f.endsWith(".json"));
+      equal(staged.length, 0, `the staged body must be cleaned up: ${staged.join(",")}`);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  await test("a non-retryable refusal (422) is NOT retried and says why", async () => {
+    const srv = await startLoopback((_n, _req, res) => {
+      res.writeHead(422, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          detail: { code: "conversation_invalid", message: "turn count out of range" },
+        }),
+      );
+    });
+    const fixture = retryFixture("reflect-retry-terminal");
+    let spawns = 0;
+    try {
+      const logs = await captureConsole(async () => {
+        await captureToHosted(srv.url, "tt_test", payloadFor("sess-terminal"), join(fixture.dir, "s.jsonl"), {
+          retryDir: fixture.dir,
+          retryLogPath: fixture.log,
+          spawnFn: (() => {
+            spawns += 1;
+            throw new Error("a terminal refusal must never spawn a retry worker");
+          }) as any,
+        });
+      });
+      equal(spawns, 0, "a permanent 4xx must not be retried");
+      equal(srv.requests.length, 1, "exactly one POST — no second attempt");
+      const said = logs.err.join("\n");
+      ok(said.includes("NOT retried"), `must say it was not retried; got:\n${said}`);
+      ok(said.includes("code=conversation_invalid"), `must name the typed code; got:\n${said}`);
+      ok(said.includes("class=permanent"), `must name the class; got:\n${said}`);
+      ok(said.includes("kept in the spool"), `must say the record is kept; got:\n${said}`);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  await test("a network failure (no status) is retryable and hands off, not dropped", async () => {
+    const fixture = retryFixture("reflect-retry-netfail");
+    const origFetch = globalThis.fetch;
+    let spawns = 0;
+    globalThis.fetch = (async () => {
+      throw Object.assign(new Error("fetch failed"), { cause: new Error("ECONNREFUSED") });
+    }) as any;
+    try {
+      const logs = await captureConsole(async () => {
+        await captureToHosted(
+          "http://127.0.0.1:1",
+          "tt_test",
+          payloadFor("sess-netfail"),
+          join(fixture.dir, "s.jsonl"),
+          {
+            retryDir: fixture.dir,
+            retryLogPath: fixture.log,
+            spawnFn: (() => {
+              spawns += 1;
+              return { on: () => undefined, unref: () => undefined } as any;
+            }) as any,
+          },
+        );
+      });
+      equal(spawns, 1, "a network failure is `retryable` — it must be handed to the worker");
+      const said = logs.warn.join("\n");
+      ok(said.includes("DEFERRED"), `must report the deferral; got:\n${said}`);
+      ok(said.includes("ECONNREFUSED"), `must surface the real cause; got:\n${said}`);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("if the worker cannot start, the refusal is reported and the record is kept", async () => {
+    const srv = await startLoopback((_n, _req, res) => capacityRefusal(res, 1));
+    const fixture = retryFixture("reflect-retry-nostart");
+    // A FILE where a directory is expected: staging cannot succeed.
+    const notADir = join(fixture.dir, "blocker");
+    writeFileSync(notADir, "x", "utf-8");
+    try {
+      const logs = await captureConsole(async () => {
+        await captureToHosted(srv.url, "tt_test", payloadFor("sess-nostart"), join(fixture.dir, "s.jsonl"), {
+          retryDir: join(notADir, "sub"),
+          retryLogPath: fixture.log,
+        });
+      });
+      const said = logs.err.join("\n");
+      ok(said.includes("could not be started"), `must report the failed hand-off; got:\n${said}`);
+      ok(said.includes("kept in the spool"), `must name where the record is; got:\n${said}`);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  await test("a header-only `Retry-After: 0` is honoured (floored) by the WORKER's own parse too", async () => {
+    // Two refusals on purpose: the first is parsed by the PARENT (which hands off),
+    // the second is parsed by the WORKER — and that is the only place the worker's
+    // own delay rule runs. A falsy `header || body` test would read this header-only
+    // 0 as "nothing advertised" and wait the 30 s backoff; the fixed null check
+    // floors it to 1 s. With a `retry_after` in the body the `||` would have
+    // returned that 0 and hidden the drift, so the body carries none.
+    const srv = await startLoopback((n, _req, res) => {
+      if (n <= 2) {
+        res.writeHead(429, { "content-type": "application/json", "retry-after": "0" });
+        res.end(JSON.stringify({ detail: { code: "capture_capacity_saturated" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const fixture = retryFixture("reflect-retry-zero");
+    try {
+      await captureToHosted(srv.url, "tt_test", payloadFor("sess-retry-zero"), join(fixture.dir, "s.jsonl"), {
+        retryDir: fixture.dir,
+        retryLogPath: fixture.log,
+      });
+      await waitFor(
+        () => existsSync(fixture.log) && readFileSync(fixture.log, "utf-8").includes("LANDED"),
+        8000,
+        "the worker to retry an advertised-0 refusal within the 1s floor (not the 30s backoff)",
+      );
+      const log = readFileSync(fixture.log, "utf-8");
+      ok(log.includes("STARTED"), `the worker must announce itself before waiting; log:\n${log}`);
+      ok(
+        log.includes("waiting 1s before attempt 3/4"),
+        `the worker's own parse of a header-only 0 must floor to 1s, not the 30s backoff; log:\n${log}`,
+      );
+      ok(!log.includes("waiting 30s"), `no backoff wait may appear for an advertised 0; log:\n${log}`);
+      equal(srv.requests.length, 3, "two refusals then the landing POST");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  await test("an ORPHANED staged body (worker killed mid-wait) is swept, a fresh one is not", async () => {
+    const srv = await startLoopback((_n, _req, res) => capacityRefusal(res, 1));
+    const fixture = retryFixture("reflect-retry-sweep");
+    const orphan = join(fixture.dir, "orphan-1-2.json");
+    const fresh = join(fixture.dir, "fresh-1-2.json");
+    writeFileSync(orphan, "{}", "utf-8");
+    writeFileSync(fresh, "{}", "utf-8");
+    const longAgo = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    utimesSync(orphan, longAgo, longAgo);
+    try {
+      await captureConsole(async () => {
+        await captureToHosted(srv.url, "tt_test", payloadFor("sess-sweep"), join(fixture.dir, "s.jsonl"), {
+          retryDir: fixture.dir,
+          retryLogPath: fixture.log,
+          // A mock worker: the sweep is what this test is about, not the retry.
+          spawnFn: (() => ({ on: () => undefined, unref: () => undefined }) as any) as any,
+        });
+      });
+      equal(existsSync(orphan), false, "a staged body older than the bound must be removed");
+      ok(existsSync(fresh), "a recent staged body must never be swept");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // ── End to end through the REAL shutdown handler ──────────────────────
+  await test("persistent 429: bounded attempts exhaust, the code is logged, the record survives", async () => {
+    // Advertised 2 s × 2 worker waits = a 4 s retry window, and the assertion below
+    // allows 2.5 s: the measured shutdown-handler BASELINE on this box (a 200 with no
+    // retry at all) is 0.5–1.8 s, dominated by the egress gate's `git` spawns — so
+    // 2.5 s tolerates a loaded box while still being unable to have waited 4 s.
+    const srv = await startLoopback((_n, _req, res) => capacityRefusal(res, 2));
+    const dir = tmpProject("reflect-retry-exhaust");
+    const fixture = retryFixture("reflect-retry-exhaust-work");
+    const today = new Date().toISOString().slice(0, 10);
+    const jsonl = join(FALLBACK_DIR, `${today}.jsonl`);
+    const sessionId = `sess-exhaust-${Math.random().toString(36).slice(2)}`;
+    const ctx = {
+      cwd: dir,
+      model: "mock:model",
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "ship it" } },
+          { type: "message", message: { role: "assistant", content: "shipped" } },
+        ],
+        getSessionId: () => sessionId,
+      },
+    };
+    const handlers: Record<string, (event: any, ctx: any) => Promise<void>> = {};
+    createReflectHook(
+      {
+        apiUrl: srv.url,
+        apiKey: "tt_test",
+        team: "organisation-design-team",
+        cloud: true,
+      },
+      {
+        projectDir: dir,
+        env: {},
+        captureRetry: {
+          retryDir: fixture.dir,
+          retryLogPath: fixture.log,
+          maxAttempts: 3, // 1 inline + 2 retries
+        },
+      },
+    )({
+      on: (ev: string, fn: (event: any, ctx: any) => Promise<void>) => {
+        handlers[ev] = fn;
+      },
+    } as any);
+    try {
+      const t0 = Date.now();
+      const logs = await captureConsole(async () => {
+        await handlers["session_shutdown"]({ reason: "quit" }, ctx);
+      });
+      const elapsed = Date.now() - t0;
+      // The worker waits 2 s + 2 s; a handler that waited them out could not be here.
+      ok(elapsed < 2500, `the agent's turn must not be held for the retry window (took ${elapsed}ms)`);
+      ok(
+        logs.warn.join("\n").includes("capture_capacity_saturated"),
+        `the deferral line must name the typed code; got:\n${logs.warn.join("\n")}`,
+      );
+
+      await waitFor(
+        () => existsSync(fixture.log) && readFileSync(fixture.log, "utf-8").includes("EXHAUSTED"),
+        15_000,
+        "the worker to exhaust its bounded attempts",
+      );
+      const log = readFileSync(fixture.log, "utf-8");
+      ok(log.includes("code=capture_capacity_saturated"), `the final refusal must name its code; log:\n${log}`);
+      ok(log.includes("retry_after=2s"), `the final refusal must name the advertised delay; log:\n${log}`);
+      ok(/capture retry: attempt 3\/3 REFUSED/.test(log), `all 3 attempts must be visible; log:\n${log}`);
+      equal(srv.requests.length, 3, "the attempt bound must be honoured exactly");
+      // NOT LOST: the day-file record the handler wrote before the POST is still there.
+      const spool = readFileSync(jsonl, "utf-8");
+      ok(spool.includes(sessionId), "the exhausted session must still be in the spool");
+      const staged = readdirSync(fixture.dir).filter((f) => f.endsWith(".json"));
+      equal(staged.length, 0, `the staged body must be cleaned up: ${staged.join(",")}`);
+    } finally {
+      await srv.close();
+    }
+  });
+}
+
 // ── Run all suites ──────────────────────────────────────────────────────────
 
 (async () => {
@@ -608,6 +1119,7 @@ async function testShutdownUploadGate() {
     await testExtractTurns();
     await testCaptureGate();
     await testShutdownUploadGate();
+    await testCaptureRetry();
 
     console.log(`\n# tests ${passed + failed}`);
     console.log(`# pass ${passed}`);
