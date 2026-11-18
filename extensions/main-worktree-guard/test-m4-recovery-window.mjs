@@ -665,6 +665,33 @@ async function partB() {
       /session-start/i.test(noSessRestore?.reason ?? "") && /cannot/i.test(noSessRestore?.reason ?? ""),
       noSessRestore?.reason);
 
+    // ── B7g/B7h (#4101 review, P2): the PRE-STAMP id refusal must not tell an
+    // env-HATCHED, id-less process that it holds nothing.
+    //
+    // The mint check sits OUTSIDE the `if (!_isAllowMainEdits())` block by design
+    // (the touch is guard-stamped for EVERY session), so it also fires for
+    // `AGENT_ALLOW_MAIN_EDITS=1 pi -p --no-session` — the fleet lane shape this
+    // PR names at the sibling suite — a process that already carries a FULL
+    // bypass. Measured before the fix: the refusal printed
+    // "`AGENT_ALLOW_MAIN_EDITS=1` is NOT an alternative here", which is false in
+    // that very process and is the mirror of the #3620 dead end (a reader that
+    // HOLDS a bypass is told it holds nothing). The block itself is right — an
+    // id-less stamp would clobber a sibling's live marker — so only the text
+    // changes, and the row asserts BOTH halves.
+    process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+    try {
+      const hatchedTouch = await driveWith(null, `touch ${markerPath}  # recovery: hatched id-less lane`);
+      check("B7g an env-HATCHED, id-less lane's marker touch is still REFUSED (a null-id stamp would clobber a sibling's marker)",
+        hatchedTouch !== null, true);
+      checkD("B7h …and the refusal names the hatch as ALREADY ACTIVE instead of unavailable",
+        /IS ALREADY ACTIVE/.test(hatchedTouch?.reason ?? "") &&
+        !/NOT a remedy/.test(hatchedTouch?.reason ?? "") &&
+        !/NOT an alternative/.test(hatchedTouch?.reason ?? ""),
+        hatchedTouch?.reason);
+    } finally {
+      delete process.env.AGENT_ALLOW_MAIN_EDITS;
+    }
+
     // B8 — a REAL session, with a marker that exists but is INERT (here: it
     // belongs to another session). The refusal used to tell this reader to
     // stamp the marker it already has; it must instead say the file is inert
@@ -714,13 +741,22 @@ async function partB() {
     // What is exempt, and why each exemption is safe:
     //  · comments — they are never printed;
     //  · the caveat block itself;
-    //  · a site whose OWN text says the hatch is unavailable ("is NOT an
-    //    alternative here", "so … is / not its remedy") — that is the opposite
-    //    claim, and it is the one we want more of;
-    //  · a site carrying `hatch-sweep-exempt: <reason>` within 2 lines.
-    // A caveat satisfies the sweep in either form: the shared
-    // `_ENV_HATCH_CAVEAT` spread, or a line pair naming `session START` and
-    // `CANNOT` (the fixed-width banner boxes cannot hold the shared array).
+    //  · a site carrying `hatch-sweep-exempt: <reason>` within 2 lines — the
+    //    EXPLICIT, per-site form a site whose own text is the OPPOSITE claim ("the
+    //    hatch is NOT the remedy", "the hatch is ALREADY ACTIVE here") has to use;
+    //  · `_ENV_HATCH_CAVEAT` inside its 8-line window;
+    //  · a `session START` / `CANNOT` pair inside that window (the fixed-width
+    //    banner boxes cannot hold the shared array).
+    //
+    // ⛔ NO BLANKET NEGATION EXEMPTION (#4101 review, P3). This sweep used to
+    // release any site whose NEXT THREE LINES contained `not|NOT|cannot|CANNOT`,
+    // which is the commonest word in these refusal texts: 6 of the file's ~30
+    // occurrences were released by it rather than by a caveat, and a caveat-less
+    // offer placed next to an unrelated "this does not lift the arm" passed. The
+    // property is "every PRINTED OFFER carries the caveat", so the exemption is
+    // now either the caveat itself or a marker a reader can audit — never the
+    // absence of the word "not". B9e/B9f pin that a bare negation NO LONGER
+    // releases a site.
     const hatchSweep = (lines) => {
       const whole = lines.join("\n");
       const cavDef = whole.match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
@@ -733,11 +769,10 @@ async function partB() {
         if (!ln.includes("AGENT_ALLOW_MAIN_EDITS")) return;
         if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return;
         if (cavStart > 0 && lineNo >= cavStart && lineNo <= cavEnd) return;
-        if (/\b(?:NOT|not|cannot|CANNOT)\b/.test(lines.slice(i, i + 3).join("\n"))) return;
         if (lines.slice(Math.max(0, i - 2), i + 3).join("\n").includes("hatch-sweep-exempt:")) return;
         const window = lines.slice(i, i + 8).join("\n");
         if (window.includes("_ENV_HATCH_CAVEAT")) return;
-        if (/session START/.test(window) && /(?:CANNOT|cannot)/.test(window)) return;
+        if (/session[ -]?start/i.test(window) && /(?:CANNOT|cannot)/.test(window)) return;
         found.push(lineNo);
       });
       return found;
@@ -751,6 +786,16 @@ async function partB() {
       hatchSweep([
         '            `   → Set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1).`,',
         '          ].join("\\n"),',
+      ]), [1]);
+    // B9f (#4101 review, P3) — the NEGATION exemption this sweep used to carry is
+    // gone, so an unrelated "not" in the next lines must NOT release an offer.
+    // Measured before the narrowing: this snippet returned [] (released), because
+    // line 3 contains "does not". The real tree had 6 sites released that way.
+    check("B9f an unrelated negation near a caveat-less offer NO LONGER releases it",
+      hatchSweep([
+        '      `   → Set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1).`,',
+        '      `   this does not lift the arm — it suppresses the whole gate.`,',
+        '      `   Work in a worktree instead.`,',
       ]), [1]);
     const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
     checkD("B9b the caveat names session START and says an inline/export CANNOT set it",

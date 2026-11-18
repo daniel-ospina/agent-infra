@@ -723,9 +723,19 @@ function _inertMarkerLines(): string[] {
       `          git -C <repo> restore <path>`,
     );
   } else if (d.cause === "session-mismatch") {
+    // ⛔ RE-SCOPING IS A CLOBBER, SO SAY SO (#4101 review, P3). `_stampMarker`
+    // writes unconditionally: a re-touch from THIS session REPLACES the other
+    // session's marker and revokes ITS recovery window while it is still open —
+    // the very hazard this PR refuses an id-less stamp for, one branch away. The
+    // advice stays (the window may well be the reader's own, from a session they
+    // left), but the cost is named instead of discovered.
     lines.push(
-      `        Re-touch it from THIS session, as its own bash call, to re-scope it:`,
+      `        The marker is scoped to ANOTHER session. Re-touching it from THIS one`,
+      `        OVERWRITES that marker and revokes the other session's window while it`,
+      `        is still open — do it only if that window is yours to end:`,
       `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+      `        Otherwise recover from a human terminal (never intercepted):`,
+      `          git -C <repo> restore <path>`,
     );
   } else {
     lines.push(
@@ -741,15 +751,23 @@ function _inertMarkerLines(): string[] {
  *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check;
  *  `stampLanded` is `_stampMarker`'s own answer (false when no stamp was
  *  attempted at all, i.e. the pre-stamp id check). */
-function _markerTouchBlockReason(cause: string | null, sessionId: string | null, stampLanded: boolean): string {
+function _markerTouchBlockReason(
+  cause: string | null,
+  sessionId: string | null,
+  stampLanded: boolean,
+  envHatchOn = false,
+): string {
   // `no-session-id` after a stamp means the same thing as before it (an empty
   // PI_SESSION_ID normalizes to null here), and the remedy is identical: a
   // re-touch cannot help. Route it to the same text rather than prescribing one.
   if (cause === null || cause === "no-session-id") {
     return [
       `⛔ The escape marker cannot be opened from this session (#3620).`,
-      `   Why: this session's id does not resolve — no PI_SESSION_ID in the env and`,
-      `   none from the session manager — and the marker is SCOPED to a session id.`,
+      // "no PI_SESSION_ID" was literally false for the set-but-EMPTY spelling
+      // this PR's `??`→`||` change exists for (#4101 review, P3): the env VAR is
+      // there, it just does not RESOLVE to an id. Say what is measured.
+      `   Why: no RESOLVABLE \`PI_SESSION_ID\` — none in the env and none from the`,
+      `   session manager — and the marker is SCOPED to a session id.`,
       `   The read side refuses a marker with no id (deliberate, and pinned), so an`,
       `   allowed \`touch\` here would leave a fresh file that opens nothing while the`,
       `   guard logged \`🔓 marker active\`. It is refused instead of reported as open.`,
@@ -760,9 +778,26 @@ function _markerTouchBlockReason(cause: string | null, sessionId: string | null,
       `       git -C <repo> restore <path>`,
       `   → For anything beyond recovery, work in a worktree:`,
       `       bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
-      `   ⛔ \`AGENT_ALLOW_MAIN_EDITS=1\` is NOT an alternative here: it is read from`,
-      `      the session-start host env, so an inline prefix or an \`export\` in a`,
-      `      running session cannot set it (#1239).`,
+      // ⛔ WHICH HATCH STATE THIS PROCESS IS IN (#4101 review, P2). One branch for
+      // a session the DISPATCHER hatched (the hatch IS on: it needs no marker),
+      // one for the session that has nothing and must be told the hatch is
+      // session-START only. A single unconditional "is NOT an alternative here"
+      // was false in the hatching process.
+      ...(envHatchOn
+        ? [
+            // hatch-sweep-exempt: states the hatch is ALREADY ACTIVE in this
+            // process — the opposite of an offer, so there is no caveat to add.
+            `   ⚠️ The env hatch IS ALREADY ACTIVE in this process (\`AGENT_ALLOW_MAIN_EDITS=1\`),`,
+            `      so this session needs no marker: it already bypasses M4/M5. The`,
+            `      \`touch\` is still refused, because an id-less stamp would OVERWRITE a`,
+            `      sibling session's marker and revoke THAT session's recovery window.`,
+          ]
+        : [
+            `   ⛔ \`AGENT_ALLOW_MAIN_EDITS=1\` is NOT a remedy from inside this session:`,
+            `      it is read from the session-START host env, so an inline prefix or an`,
+            `      \`export\` in a running session cannot set it (#1239) — only the`,
+            `      dispatcher can hatch the process.`,
+          ]),
     ].join("\n");
   }
   const why = _MARKER_CAUSE_TEXT[cause] ?? cause;
@@ -2114,6 +2149,11 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  * @returns {string|null} the path the write would actually create/modify, or null
  */
 function _resolveThroughDanglingLinks(p: string): string | null {
+  // The kernel answer first: it is exact for every spelling, including a link
+  // whose destination does not exist. The hand loop below is the fallback for the
+  // one input `_kernelResolve` refuses (a chain longer than the kernel follows).
+  const viaKernel = _kernelResolve(p);
+  if (viaKernel !== null) return viaKernel;
   let cur = p;
   for (let hop = 0; hop <= 40; hop++) {
     let st;
@@ -2128,6 +2168,78 @@ function _resolveThroughDanglingLinks(p: string): string | null {
     cur = resolve(parent, target);
   }
   return null; // chain longer than the kernel would follow — unresolvable, fail closed
+}
+
+/** The ABSOLUTE SPELLING the shell would hand the kernel — WITHOUT lexical
+ *  normalisation (#4101 review, P1 ×2 — both MEASURED allowed at this head).
+ *
+ *  `resolve()` answers a different question in two ways, and both are the arm's
+ *  own subject (a redirect that lands inside a tracked-dirty checkout):
+ *   · a leading `~` is expanded by the SHELL, so `resolve(cwd, "~/hub/f")` gives
+ *     `<cwd>/~/hub/f`, whose ancestor walk stops at `<cwd>` — the dirty checkout
+ *     the write truncates is never probed;
+ *   · `..` is applied by the KERNEL to the directory a symlink RESOLVED to, so
+ *     `<d>/ld/../f` with `ld -> <dirty wt>/sub` lands in `<wt>/f` while
+ *     `resolve()` cancels it lexically to `<d>/f`.
+ *
+ *  Keeping the spelling verbatim lets `statSync` answer in the kernel's own
+ *  semantics — and `_kernelResolve` below carries that answer out to a canonical
+ *  path, which `realpathSync` cannot do (see the ⛔ there). `~user` is left
+ *  literal: this process cannot know another user's home, and a literal `~user`
+ *  directory is what the shell writes when no such user exists. */
+function _writeLandingSpelling(cwd: string, raw: string): string {
+  const withHome = raw === "~" ? homedir() : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
+  if (isAbsolute(withHome)) return withHome;
+  return `${cwd.replace(/\/+$/, "")}/${withHome}`;
+}
+
+/** The path the KERNEL would arrive at, walking the spelling one component at a
+ *  time (#4101 review, P1 — MEASURED fail-open at this head).
+ *
+ *  ⛔ `realpathSync` CANNOT ANSWER THIS. Node normalises `..` LEXICALLY before it
+ *  calls `realpath(3)` (measured on node 24: for `<d>/ld/../f` with
+ *  `ld -> <dirty wt>/sub`, `realpathSync` throws ENOENT, while `readlink -f`,
+ *  `statSync` and `readFileSync` all reach `<wt>/f` — the path the bytes land in).
+ *  The KERNEL applies `..` to the directory the link RESOLVED to, so the arm was
+ *  probing `<d>/f` ("not a git repository") and admitting a redirect that
+ *  truncates `<wt>/f`'s uncommitted content.
+ *
+ *  So walk it the way the kernel does: each component is `lstat`ed in the
+ *  directory reached SO FAR, a symlink replaces that directory, and `..` steps to
+ *  the parent of the RESOLVED one. A component that does not exist ends the walk
+ *  and the remainder is appended verbatim — that is the landing path a
+ *  not-yet-created target has, and its nearest existing ancestor is what the
+ *  caller probes.
+ *
+ *  Bounded like the kernel: MAXSYMLINKS is 40 followed links, so 41 returns null
+ *  (unresolvable ⇒ the caller fails closed rather than guess).
+ * @param {string} p an absolute spelling (see `_writeLandingSpelling`)
+ * @returns {string|null} the kernel's landing path, or null if unresolvable
+ */
+function _kernelResolve(p: string): string | null {
+  if (!isAbsolute(p)) return null;
+  const parts = p.split("/").filter((s) => s !== "" && s !== ".");
+  let cur = "/";
+  let hops = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "..") { cur = dirname(cur); continue; }
+    const next = cur === "/" ? `/${part}` : `${cur}/${part}`;
+    let st;
+    try { st = lstatSync(next); } catch { return [next, ...parts.slice(i + 1)].join("/"); }
+    if (!st.isSymbolicLink()) { cur = next; continue; }
+    if (++hops > 40) return null;
+    let target: string;
+    try { target = readlinkSync(next); } catch { return next; }
+    // A RELATIVE target is joined to the directory reached so far, and the walk
+    // continues inside it — so a `..` in the target applies to the REAL directory,
+    // which is the whole point. An absolute target restarts from the root. The
+    // target's components are INSERTED before whatever spelling remains.
+    const tail = target.split("/").filter((s) => s !== "" && s !== ".");
+    if (isAbsolute(target)) cur = "/";
+    parts.splice(i + 1, 0, ...tail);
+  }
+  return cur;
 }
 
 function _catFileRevertStateBlock(
@@ -2158,7 +2270,7 @@ function _catFileRevertStateBlock(
   // walker the discard-verb arm already trusts (`classify-git.mjs` cdChain) —
   // so the pair (site cwd, raw operand) comes from IT, and the substitution
   // still happens on the OPERAND, never on a resolved absolute path.
-  const targets = writeTargets.map((t) => resolve(t.cwd, _wtSubstituteVars(t.raw, vars)));
+  const targets = writeTargets.map((t) => _writeLandingSpelling(t.cwd, _wtSubstituteVars(t.raw, vars)));
 
   // Candidate checkouts: each target's nearest EXISTING ancestor (the landing
   // site), then the checkout the discard was READ FROM when it came from a
@@ -2220,7 +2332,12 @@ function _catFileRevertStateBlock(
       // fail closed — the arm's own doctrine is that one wrong ALLOW here is
       // unrecoverable, one wrong BLOCK costs a retry.
       if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = t; continue; }
-      landing = realpathSync(t);
+      // ⛔ NOT `realpathSync` (#4101 review, P1): Node normalises `..` lexically
+      // before calling `realpath(3)`, so a target reached through a symlinked
+      // directory was verified against a checkout the bytes never touch.
+      const k = _kernelResolve(t);
+      if (k === null) { unresolvable = t; continue; }
+      landing = k;
     } catch {
       // Dangling somewhere in the chain — resolve the rest by hand (REAL parents,
       // see `_resolveThroughDanglingLinks`), then apply the same two rules to the
@@ -2278,8 +2395,14 @@ function _catFileRevertStateBlock(
       form: d.form,
       scope: "paths",
       pathspecs: targets.map((t) => {
-        const rel = relative(cand, t);
-        return rel && !rel.startsWith("..") ? rel : t;
+        // Display spelling: the `..`-preserving form is correct for the PROBE but
+        // reads as a different path than the reader typed (`<d>/ld/../f` above).
+        // Name the KERNEL landing path instead — the arm's attribution claim is
+        // "this is where the bytes were going", and a reader must be able to see
+        // it is the file the checkout below actually holds.
+        const shown = _kernelResolve(t) ?? resolve(t);
+        const rel = relative(cand, shown);
+        return rel && !rel.startsWith("..") ? rel : shown;
       }),
     };
     return _worktreeDiscardBlockReason(
@@ -3280,6 +3403,8 @@ function _worktreeDiscardBlockReason(
             ? [`       bash "${sanctionedHelper}" <branch>`]
             : [`       bash <framework-checkout>/scripts/checkout-hygiene/hub-worktree.sh <branch>`]),
           `   → This arm fails closed because the EFFECT was unverifiable, not`,
+          // hatch-sweep-exempt: the text below says the hatch is NOT the remedy —
+          // it disclaims the offer rather than making one.
           `     because uncommitted work was found, so AGENT_ALLOW_MAIN_EDITS=1 is`,
           `     not its remedy: the hatch suppresses the whole gate instead of`,
           `     resolving the reason.`,
@@ -6527,8 +6652,17 @@ export default function (pi: ExtensionAPI) {
         // side treats "" as no-session-id, so the mint must not stamp `""` and
         // claim a window it cannot have.
         const markerSid = _currentSessionId(_ctx) || null;
+        // ⛔ THE REFUSAL MUST NOT TELL A HATCHED SESSION IT HOLDS NOTHING (#4101
+        // review, P2). This check sits OUTSIDE the `if (!_isAllowMainEdits())`
+        // block by design (the mint is stamped for every session), so it also
+        // fires for `AGENT_ALLOW_MAIN_EDITS=1 pi -p --no-session` — a process
+        // that ALREADY carries a full bypass. The block is still right (a
+        // null-id stamp would overwrite a sibling's live marker), but the text
+        // has to name the hatch as ACTIVE here, not as unavailable: telling a
+        // reader who holds a bypass that it holds nothing is the mirror of the
+        // #3620 dead end ("the honest response is to stop").
         if (markerSid === null) {
-          return { block: true, reason: _markerTouchBlockReason(null, null, false) };
+          return { block: true, reason: _markerTouchBlockReason(null, null, false, _isAllowMainEdits()) };
         }
         const stampLanded = _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
         // (b) read back what we just minted, with the same id the read side will
@@ -6539,7 +6673,10 @@ export default function (pi: ExtensionAPI) {
         const minted = diagnoseAllowMarkerState(_markerPath(), markerSid);
         if (!minted.active) {
           _currentMarkerDiagnosis = minted;
-          return { block: true, reason: _markerTouchBlockReason(minted.cause, markerSid, stampLanded) };
+          return {
+            block: true,
+            reason: _markerTouchBlockReason(minted.cause, markerSid, stampLanded, _isAllowMainEdits()),
+          };
         }
         _currentMarkerDiagnosis = minted;
         return undefined;

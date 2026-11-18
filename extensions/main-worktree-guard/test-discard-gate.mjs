@@ -3044,6 +3044,77 @@ async function partD() {
       hubClean();
     }
 
+    // ── D17/D18 (#4101 review, P1 ×2 — BOTH MEASURED allowed at the head that
+    // carried them): two SPELLINGS whose lexical resolution lands outside every
+    // checkout while the BYTES land inside a tracked-dirty one. Neither is a
+    // trick for its own sake — `~` is how a shell user writes "my home directory",
+    // and `..` after a symlink is how a `cd`-through-link works — and both destroy
+    // uncommitted tracked work while `git status` reads clean afterwards.
+    //
+    // Why they were open: the arm resolved a target with `resolve()`, which
+    //   1. never expands a leading `~` (the SHELL does), so the target became
+    //      `<cwd>/~/hub/f` and the ancestor walk stopped at `<cwd>`; and
+    //   2. cancels `..` LEXICALLY, while the kernel applies it to the directory a
+    //      symlink RESOLVED to (`<d>/ld/../f` with `ld -> <wt>/sub` lands in
+    //      `<wt>/f`). `realpathSync` cannot repair (2): node normalises `..`
+    //      lexically BEFORE it calls `realpath(3)` (measured), which is why the
+    //      fix walks the spelling component by component instead.
+    // `origin/main` BLOCKED both only INCIDENTALLY (its candidate set seeded the
+    // session cwd); from a session rooted anywhere else main allows them too, so
+    // these rows are pinned for the EFFECT, not as regression evidence.
+    let ht = null;
+    let ldDotdot = null;
+    let ldClean = null;
+    try {
+      // ── D17: the `~` spelling, against a checkout UNDER $HOME ──
+      ht = join(home, "ht");
+      gg(`worktree add -q -b feat3 "${ht}"`, hub);
+      writeFileSync(join(ht, "dirty.txt"), "MUTANT-HT\n");
+      const tilde = await bash(`git -C ${hub} show HEAD:dirty.txt > ~/ht/dirty.txt`, hub);
+      expectTrue("D17 (#4101 P1) `… > ~/ht/dirty.txt` into a tracked-dirty checkout under $HOME is BLOCKED",
+        blocked(tilde), `was allowed: ${JSON.stringify(reason(tilde)).slice(0, 200)}`);
+      expectTrue("D17b …and it names the $HOME checkout the bytes land in",
+        /Checkout: .*\/ht\b/.test(reason(tilde)), `reason=${JSON.stringify(reason(tilde)).slice(0, 240)}`);
+      gg("checkout -q -- dirty.txt", ht);
+      expectTrue("D17c control: the same `~` spelling against a CLEAN checkout is ALLOWED (the tilde is not the trigger)",
+        allowed(await bash(`git -C ${hub} show HEAD:dirty.txt > ~/ht/dirty.txt`, hub)), "was blocked");
+
+      // ── D18: `..` AFTER a symlink that points into a dirty worktree ──
+      mkdirSync(join(wt2, "sub"), { recursive: true });
+      writeFileSync(join(wt2, "sub", "keep.txt"), "sub\n");
+      gg("add -A && git commit -qm 4101-wt2-sub", wt2);
+      ldDotdot = join(tmpd, "ld-dotdot");
+      rmSync(ldDotdot, { force: true });
+      symlinkSync(join(wt2, "sub"), ldDotdot);
+      writeFileSync(join(wt2, "dirty.txt"), "MUTANT-WT2\n");
+      hubClean();
+      const dotdot = await bash(`git -C ${hub} show HEAD:dirty.txt > ${ldDotdot}/../dirty.txt`, hub);
+      expectTrue("D18 (#4101 P1) `> <ld>/../dirty.txt` (ld -> <dirty wt2>/sub) is BLOCKED — the kernel applies `..` to the LINK's target",
+        blocked(dotdot), `was allowed: ${JSON.stringify(reason(dotdot)).slice(0, 200)}`);
+      expectTrue("D18b …and it names the WORKTREE the bytes land in",
+        /Checkout: .*\/wt2\b/.test(reason(dotdot)), `reason=${JSON.stringify(reason(dotdot)).slice(0, 240)}`);
+      expectTrue("D18c …and the reason names the LANDING path, not the lexical spelling",
+        /Target: dirty\.txt/.test(reason(dotdot)), `reason=${JSON.stringify(reason(dotdot)).slice(0, 240)}`);
+      // Control: the same `..`-after-link shape whose parent is outside every
+      // checkout destroys nothing, so it must stay admitted — the fix resolves
+      // the spelling, it does not refuse it.
+      const nowhere = join(tmpd, "notacheckout");
+      mkdirSync(nowhere, { recursive: true });
+      ldClean = join(tmpd, "ld-clean");
+      rmSync(ldClean, { force: true });
+      symlinkSync(nowhere, ldClean);
+      expectTrue("D18d control: the same `..`-after-link spelling landing OUTSIDE every checkout is ALLOWED",
+        allowed(await bash(`git -C ${hub} show HEAD:dirty.txt > ${ldClean}/../out-4101.txt`, hub)), "was blocked");
+    } finally {
+      for (const l of [ldDotdot, ldClean]) if (l !== null) { try { rmSync(l, { force: true }); } catch { /* fixture teardown */ } }
+      if (ht !== null) {
+        try { gg(`worktree remove --force "${ht}"`, hub); } catch { /* fixture teardown */ }
+        try { gg("branch -D feat3", hub); } catch { /* fixture teardown */ }
+      }
+      gg("checkout -q -- dirty.txt", wt2);
+      hubClean();
+    }
+
     // ── D8: M4's disorder early-return must not shadow M5 ──
     // The issue names this as a second reachability gap in the same region, to
     // be assessed with the fix rather than separately. Measured before the fix
