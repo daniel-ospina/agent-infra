@@ -850,6 +850,38 @@ out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1 FAKE_MINT_MARKER=0 FAKE_LIVE_H
 rc=0; grep -qF 'FRESH review at head' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "…and the PAID path still says a FRESH review is owed (the branch did not flatten the two arms)" $rc
 
+# ══ 20) THE RAIL CAP'S CONDITIONAL AUTHOR STAMP (#4126 review, P3) — BOTH of its states, DRIVEN ══
+# `rail_attempt`'s cap branch is the ONLY rail-cap `parkorigin` writer, and nothing could see it:
+# `red-fixer.test.sh` drives just the `[railrefusal]` recorder fragment (the cap branch never executes
+# there), and this file drove `rail_attempt` only on the BELOW-cap path. Both mutants therefore
+# survived every suite — DELETE the stamp, and DROP its `[ -s parkreason ]` condition. The second is
+# the one that matters: unguarded, the cap stamps `<head> harness` OVER a surviving human reason at
+# the same head, and `[parked-guard]` trusts an author ahead of prose it cannot recognise
+# (`orch-loop.sh:7242-7254`) — so the controller rebases a head a human deliberately froze. Row (a)
+# pins the guard, row (b) pins the stamp it guards, and each is the other's non-vacuity proof.
+# ⛔ THE CAP IS SEEDED, NOT EARNED: `railcount-<PR>` naming THIS head with RC_N >= RAIL_TRIES makes
+# the branch execute on the first run (earning it would be three real rail invocations), and
+# `write_record "$HEAD" clean` is what reaches `rail_attempt` at all (`record_at_head`).
+# ⛔ NO `parked-<PR>` IS SEEDED: a park at this head short-circuits at the worker's own
+# `parked == HEAD` refusal (:1396), which is BEFORE the rail, so the cap branch would never run.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+printf '%s 3\n' "$HEAD" > "$MRG/o/state/railcount-$PR"
+printf 'needs a human decision: do not rebase until legal signs off\n' > "$MRG/o/state/parkreason-$PR"
+out="$(run_merge FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; [ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) — the cap branch never ran; log: $(tail -3 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…(setup) a cap SPENT at this head parks it" $rc
+rc=0; ! rail_ran || { rc=1; note "the rail RAN past a spent cap ($(merge_ran_whence))"; }
+ck "…and the rail is not invoked" $rc
+rc=0; [ -e "$MRG/o/state/parkorigin-$PR" ] && { rc=1; note "parkorigin=$(cat "$MRG/o/state/parkorigin-$PR" 2>/dev/null) — a HUMAN reason was relabelled as this harness's park"; }
+ck "a SURVIVING human reason is never stamped over (the cap stamps only when the park is its OWN)" $rc
+# …and the CONVERSE: the state this site CREATES on a fresh head must carry its author, or a later
+# hand-written reason at this head has no machine stamp to be outranked by.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+printf '%s 3\n' "$HEAD" > "$MRG/o/state/railcount-$PR"
+out="$(run_merge FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; [ "$(cat "$MRG/o/state/parkorigin-$PR" 2>/dev/null)" = "$HEAD harness" ] || { rc=1; note "parkorigin=$(cat "$MRG/o/state/parkorigin-$PR" 2>/dev/null) (want '$HEAD harness')"; }
+ck "RED→GREEN: …and a reason-less rail cap IS stamped '<head> harness'" $rc
+
 # ══ THE LANE REPORT GATE ON THE BACKSTOP CARRIER ═════════════════════════════════════════════════
 # ⛔ merge-one.sh IS THE `$O`-PINNED BACKSTOP that chain-merge.sh / fix-one.sh reach, and until now no
 # test drove its gate at all (see the git() stub comment). These two rows pin the OBSERVABLE outcome —

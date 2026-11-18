@@ -6976,7 +6976,9 @@ while true; do
           [ "${RF_H:-}" = "$HEAD_N" ] || RF_N=0
           # ⛔ A CROSS-BOX BAIL IS NOT AN ATTEMPT (the same P2 the fixcount refund documents):
           # `fix-one.sh` writes `fixbail-<PR>-<head>` when another box already owns this head, having
-          # done NO work. `refund_bailed_fixer` consumes that marker for `fixcount`; this role's own
+          # done NO work. `refund_bailed_fixer` consumes that marker for whichever budget the spawn
+          # BOOKED, read off `state/spendcount-<PR>-<head>` — `fixcount` for this role's own bookings,
+          # `conflictcount` for the CONFLICT router's (agent-infra#4126 review, P2) — so this role's
           # counter must be given back too, or three peer bails park a PR no fixer ever touched.
           # ⛔ ONLY CONSUME A BAIL MARKER WHEN THIS ROLE BOOKED SOMETHING (review P2, cycle 7). The
           # marker is not arm-tagged: a `fixbail` written by a REVIEW-GATE fixer is that arm's own
