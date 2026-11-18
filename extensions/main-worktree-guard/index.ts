@@ -138,8 +138,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, dirname, join, relative, sep } from "node:path";
-import { realpathSync, existsSync, lstatSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolve, dirname, join, relative, sep, isAbsolute } from "node:path";
+import { realpathSync, existsSync, lstatSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -183,7 +183,7 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean; markerInertLines?: string[] | null } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -267,7 +267,7 @@ let _HUB_NEW_FILE_BLOCK_CAP = 25;
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
-let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
+let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; raw?: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
 // #709: the working-tree-discard family + its effect decision. Fail-safe
 // defaults: [] / false → M5 is inert when the classifier fails to load (the
 // gate must never false-block on a degraded import; test-module-load.mjs is
@@ -338,10 +338,14 @@ let extractMarkerReason: (command: string) => string | null = () => null;
 let parseMarkerContent: (content: string) => Record<string, unknown> | null = () => null;
 let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
+// #3620 — the SAME decision as readAllowMarkerState, carrying WHY it refused.
+// Fail-safe default: inactive, and the cause says the classifier never loaded
+// (so a degraded import can neither open a window nor claim one is open).
+let diagnoseAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => { active: boolean; cause: string } = () => ({ active: false, cause: "unavailable" });
 // #1484: ONE three-shape dirty-hub recovery text, shared by every block message
 // (M4's classifier reason and this file's write/edit + bash-write surfaces) so
 // the advice cannot drift from the enforcement.
-let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
+let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean, inertMarkerLines?: string[] | null) => string[] = () => [];
 let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
 // Round 11 (P2): the REAL hatch state for the CURRENT tool call, resolved with the
 // ctx session id (not the env-only form). `_hubWriteRecoverLines` used to derive
@@ -349,6 +353,20 @@ let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
 // sets PI_SESSION_ID only in bash CHILDREN), so the hatch-active paragraph was
 // unreachable on the write/edit, bash-write and inline-payload surfaces.
 let _currentHatchActive = false;
+// #3620 — the marker's diagnosis for THIS tool call (same ctx id, same read as
+// `_currentHatchActive`). Every refusal that prescribes the escape marker reads
+// this, so a marker that is present but inert is explained rather than
+// re-prescribed. Fail-safe default: inactive/absent (nothing to explain).
+let _currentMarkerDiagnosis: { active: boolean; cause: string } = { active: false, cause: "absent" };
+// #4101 review (P3) — can THIS session ever hold an active marker? Same read, same
+// ctx id as `_currentMarkerDiagnosis`, and it exists because the two facts are not
+// the same one: the CAUSE describes the FILE, this describes the READER. An
+// id-less lane that finds a pre-fix `{"session_id": null}` stamp on disk is
+// diagnosed `unscoped` (correct about the file) and was then told to RE-TOUCH —
+// which its own pre-stamp check refuses, a two-step dead end whose second step is
+// the right answer. A reader with no id gets the no-id advice whatever the file
+// says. Fail-safe default: true (the pre-existing advice is the least surprising).
+let _currentReaderHasId = true;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
@@ -357,6 +375,7 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      hubDirtyRecoveryLines, isRepoSelectingEnvKey,
      readAllowMarkerState, readHubDisorder,
+     diagnoseAllowMarkerState,
      extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
@@ -561,6 +580,28 @@ function _getEnv(name: string): string | undefined {
 function _isAllowMainEdits(): boolean {
   return _getEnv("ALLOW_MAIN_EDITS") === "1";
 }
+// #1239 — THE SENTENCE EVERY "override with the env" REFUSAL MUST CARRY.
+//
+// `AGENT_ALLOW_MAIN_EDITS=1` is read from the PROCESS env at session start. A
+// blocked agent cannot set it: an `AGENT_ALLOW_MAIN_EDITS=1 <cmd>` prefix sets it
+// in the CHILD shell the guard never inspects, and an `export` in a running
+// session cannot reach the already-running process. Measured: the report that
+// produced #3620 tried both spellings, both were inert, and the refusal had
+// presented them as THE remedy — so the honest response (stop) was a dead end.
+//
+// The env hatch stays (it is a real route for a session the DISPATCHER hatched),
+// but every message that offers it now says which route it is. The reachable
+// one — the TTL marker — is named by the recovery texts above.
+//
+// ⛔ THIS TEXT IS MIRRORED IN `classify-git.mjs` (#4101 review, P2), because THAT
+// module prints refusals too (the #1919 `worktree add|move` pair) and the sweep
+// that asserts the property now reads both files. The two arrays are pinned
+// byte-identical by the sweep's B9g row, so a one-sided edit fails a test instead
+// of leaving a module quietly caveat-less.
+const _ENV_HATCH_CAVEAT = [
+  "   \u26a0\ufe0f That env is read at session START: an inline `AGENT_ALLOW_MAIN_EDITS=1",
+  "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
+];
 // ── Escape marker (#207) helpers ────────────────────────────────────────────
 // Marker path is derived per call (lazy like gateEventsFile()) — never a
 // module-level constant, so a $HOME change (tests, alternate agent dirs) works.
@@ -571,15 +612,44 @@ function _markerPath(): string {
 // bash-tool child envs; subagents resolve their OWN id), then the ctx
 // sessionManager fallback (loop-enforcer precedent), else null → fail-safe
 // (a headless session with no id can never have an active marker).
+//
+// ⛔ `||`, NOT `??` (#4101 review P2). A SET-but-EMPTY `PI_SESSION_ID=` is a
+// real state (an unset-but-exported var, a `PI_SESSION_ID= pi …` launch) and
+// `??` would take the empty string as an ANSWER, shadowing a perfectly good ctx
+// id. The read side treats `""` as no-id, so the marker was inert — and the
+// refusal then said "none from the session manager", which is FALSE of the
+// process it was printed in and sends the reader hunting another session for
+// nothing. Empty is absent here; fall through to the manager.
 function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => string } }): string | null {
-  return process.env.PI_SESSION_ID ?? ctx?.sessionManager?.getSessionId?.() ?? null;
+  return process.env.PI_SESSION_ID || ctx?.sessionManager?.getSessionId?.() || null;
 }
 // Guard-stamping at creation-observation: write the stamp BEFORE allowing the
 // touch command. try/catch fail-silent (F7) — when the stamp write FAILS no
 // stamp exists, so the shell `touch` then leaves an EMPTY (unparseable →
 // inert) marker: readAllowMarkerState stays false → blocked. A failed stamp
 // never weakens the gate (and a later guard-observed touch re-stamps over it).
-function _stampMarker(path: string, sessionId: string | null, reason: string | null): void {
+//
+// ⛔ IT RETURNS WHAT IT WROTE (null when it did not land) (#3620 follow-up),
+// because the refusal built from the post-stamp diagnosis must not INFER that. A
+// cause describing an EXISTING file (`unreadable`, `expired`, `session-mismatch`,
+// …) can accompany a stamp that threw before writing anything — e.g. the marker
+// path is a directory, or the file is not writable — and inferring "written"
+// from the cause then claims a `gate_bypass` row was appended when none was.
+// That is a false claim about the audit trail, which is the artifact a reader
+// trusts when auditing why an escape window existed. The returned bytes are also
+// what the audit row records as `marker_content`, so the row and the file agree.
+//
+// ⛔ AND IT WRITES ONLY THE FILE (#4101 review, P3). The audit row and the
+// `🔓 marker active` log line used to be emitted HERE — before the caller's
+// read-back — so a mint the read side then REFUSED (a symlinked `~/.pi/agent`, a
+// stamp that reads back `unscoped`/`expired`) still appended `gate_bypass` and
+// logged a window as open. The message half of that was fixed one level up; the
+// ARTIFACT was not, and `gate_bypass` is exactly what an operator queries to
+// answer "why did an escape window exist" — after the TTL nothing distinguished
+// such a row from a real one, so a bypass was recorded that was never granted.
+// The emitting half now lives in `_auditMarkerMint`/`_auditMarkerInert`, called
+// AFTER the read-back, each with its own event name.
+function _stampMarker(path: string, sessionId: string | null, reason: string | null): string | null {
   try {
     // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
     // (and thus the whole touch path) silently dead.
@@ -590,7 +660,20 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
       ts: new Date().toISOString(),
     });
     writeFileSync(path, content + "\n", { flag: "w" });
-    const expiresAt = new Date(Date.now() + ALLOW_MAIN_EDITS_MARKER_TTL_MS).toISOString();
+    return content;
+  } catch (e) {
+    console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
+    return null;
+  }
+}
+
+/** The AUDIT + LOG half of a mint that the read side confirmed (#4101 review, P3).
+ *  Called only after `diagnoseAllowMarkerState(...).active` is true, so every
+ *  `gate_bypass` row and every `🔓 marker active` line describes a window that
+ *  really opened. Best-effort: an audit write must never change a verdict. */
+function _auditMarkerMint(path: string, sessionId: string | null, reason: string | null, content: string): void {
+  const expiresAt = new Date(Date.now() + ALLOW_MAIN_EDITS_MARKER_TTL_MS).toISOString();
+  try {
     appendJsonl({
       event: "gate_bypass",
       extension: "main-worktree-guard",
@@ -601,12 +684,225 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
       expires_at: expiresAt,
       marker_content: content, // bare touch still records a timestamped creation (F10d)
     });
-    console.log(
-      `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
-    );
-  } catch (e) {
-    console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
+  } catch { /* fail-silent: auditing never alters the gate */ }
+  console.log(
+    `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
+  );
+}
+
+/** The audit + log half of a mint the read side REFUSED: the bytes landed, but no
+ *  window opened. Recorded under its OWN event name (#4101 review, P3) — a
+ *  `gate_bypass` row for this shape is a bypass recorded that was never granted,
+ *  and nothing after the TTL would distinguish it from a real one. */
+function _auditMarkerInert(path: string, sessionId: string | null, cause: string): void {
+  try {
+    appendJsonl({
+      event: "marker_minted_inert",
+      extension: "main-worktree-guard",
+      reason: "main_edits_marker_inert",
+      session_id: sessionId,
+      marker_path: path,
+      cause,
+      ttl_ms: ALLOW_MAIN_EDITS_MARKER_TTL_MS,
+    });
+  } catch { /* fail-silent: auditing never alters the gate */ }
+  console.warn(
+    `[main-worktree-guard] ⚠️ Escape marker written but INERT [${cause}] — no window opened; recorded as marker_minted_inert (NOT gate_bypass).`
+  );
+}
+
+// ── #3620: the marker mint is VERIFIED, and an inert marker is DIAGNOSED ─────
+//
+// WHAT WENT WRONG. `_stampMarker` is deliberately try/catch fail-silent (F7): a
+// failed stamp must never weaken the gate, so "no stamp ⇒ empty/inert marker ⇒
+// blocked" is the safe direction. The DIRECTION OF THE MESSAGE was not safe. Two
+// session shapes produced a marker file that is byte-fresh, parses, and cannot
+// open a window, while the guard logged `🔓 Escape marker active …` and wrote a
+// `gate_bypass` audit row:
+//
+//   * the session id does not resolve → `{"session_id": null}`. The read side
+//     requires a STRING id (pinned: `test.mjs` "headless null session id →
+//     inactive (cannot escalate)"), so `pi -p --no-session` — every orchestrator
+//     lane and every unhatched `task` child — mints an inert marker EVERY time;
+//   * the stamp itself fails (an unwritable/symlinked `~/.pi/agent`), leaving the
+//     EMPTY file the shell's own `touch` creates.
+//
+// Both then refused the recovery op with "stamp the marker", which the agent had
+// just done. That is the same false-PASS shape as a no-op gate: the guard reports
+// the escape open while it is shut, so the honest response (stop) is a dead end
+// and the dishonest one (retry) cannot help.
+//
+// THE FIX IS DIAGNOSTIC, NOT ANY WIDENING (see the fail-safe above: no id ⇒ still
+// no window). One, the touch is refused BEFORE the stamp when this session can
+// never hold an active marker, so no misleading file is created — which also
+// stops an id-less lane from OVERWRITING a sibling's live marker, since
+// `_stampMarker` writes unconditionally. Two, a refusal that runs while an inert
+// marker sits on disk names the cause instead of re-prescribing the touch.
+const _MARKER_CAUSE_TEXT: Record<string, string> = {
+  "no-session-id": "this session has no resolvable id, and the marker is scoped to one",
+  unscoped: "the file carries no string `session_id` (an un-guarded `touch`, or a null-id stamp)",
+  "session-mismatch": "the marker belongs to ANOTHER session (a sibling touched it, or a subagent re-scoped it)",
+  expired: "its mtime is older than the 15-minute TTL",
+  unparseable: "its content is not the guard's one-line JSON stamp (an out-of-band write)",
+  symlinked: "it is reached through a symlink, which the guard never trusts",
+  unreadable: "it could not be read",
+  absent: "there is no marker file",
+  unavailable: "the guard's marker rules failed to load in this process",
+};
+
+/** The INERT-marker paragraph for a refusal, or [] when there is nothing to
+ *  explain (no marker, or an active one). Reads the per-tool_call diagnosis. */
+function _inertMarkerLines(): string[] {
+  const d = _currentMarkerDiagnosis;
+  if (d.active || d.cause === "absent") return [];
+  const why = _MARKER_CAUSE_TEXT[d.cause] ?? d.cause;
+  // ⛔ `unavailable` is NOT an observation about the file (#3620 review, P3): it
+  // is the stub `diagnoseAllowMarkerState` that stands in when the marker rules
+  // never loaded, so NOTHING was stat'ed and "a marker file EXISTS at …" would
+  // assert a fact this process does not have. It is the degraded-import cause,
+  // and it says so instead of pointing at a file.
+  if (d.cause === "unavailable") {
+    return [
+      `     ⚠️ The escape marker's state is UNKNOWN [unavailable] — ${why}.`,
+      `        Nothing was read, so no marker can be claimed active here and none`,
+      `        can be claimed absent either. Recovery does not need the marker:`,
+      `          git -C <repo> restore <path>   # from a human terminal`,
+    ];
   }
+  const lines = [
+    `     ⚠️ A marker file EXISTS at ${_markerPath()} but is INERT [${d.cause}] — ${why}.`,
+  ];
+  if (d.cause === "no-session-id" || !_currentReaderHasId) {
+    // ⛔ AND `!_currentReaderHasId` IS PART OF THE SAME CASE (#4101 review, P3).
+    // The pre-stamp check refuses a touch from a session with no resolvable id, so
+    // telling such a reader to re-touch is advice the guard itself vetoes — the
+    // two-step dead end ("unscoped → re-touch → refused for the reason the first
+    // message already had"). The file cause is still named in the line above.
+    lines.push(
+      `        No marker can ever be active for an id-less session, so this is not`,
+      `        something a re-touch fixes: recover from a session that HAS an id, or`,
+      `        from a human terminal (terminals are never intercepted):`,
+      `          git -C <repo> restore <path>`,
+    );
+  } else if (d.cause === "session-mismatch") {
+    // ⛔ RE-SCOPING IS A CLOBBER, SO SAY SO (#4101 review, P3). `_stampMarker`
+    // writes unconditionally: a re-touch from THIS session REPLACES the other
+    // session's marker and revokes ITS recovery window while it is still open —
+    // the very hazard this PR refuses an id-less stamp for, one branch away. The
+    // advice stays (the window may well be the reader's own, from a session they
+    // left), but the cost is named instead of discovered.
+    lines.push(
+      `        The marker is scoped to ANOTHER session. Re-touching it from THIS one`,
+      `        OVERWRITES that marker and revokes the other session's window while it`,
+      `        is still open — do it only if that window is yours to end:`,
+      `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+      `        Otherwise recover from a human terminal (never intercepted):`,
+      `          git -C <repo> restore <path>`,
+    );
+  } else {
+    lines.push(
+      `        Re-touch it from THIS session, as its own bash call:`,
+      `          touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+      `        (if that is refused, the refusal names the cause.)`,
+    );
+  }
+  return lines;
+}
+
+/** Refusal for a marker `touch` that provably cannot open a window.
+ *  `cause` is the post-stamp diagnosis, or null for the pre-stamp id check;
+ *  `stampLanded` is `_stampMarker`'s own answer (false when no stamp was
+ *  attempted at all, i.e. the pre-stamp id check). */
+function _markerTouchBlockReason(
+  cause: string | null,
+  sessionId: string | null,
+  stampLanded: boolean,
+  envHatchOn = false,
+): string {
+  // `no-session-id` after a stamp means the same thing as before it (an empty
+  // PI_SESSION_ID normalizes to null here), and the remedy is identical: a
+  // re-touch cannot help. Route it to the same text rather than prescribing one.
+  if (cause === null || cause === "no-session-id") {
+    return [
+      `⛔ The escape marker cannot be opened from this session (#3620).`,
+      // "no PI_SESSION_ID" was literally false for the set-but-EMPTY spelling
+      // this PR's `??`→`||` change exists for (#4101 review, P3): the env VAR is
+      // there, it just does not RESOLVE to an id. Say what is measured.
+      `   Why: no RESOLVABLE \`PI_SESSION_ID\` — none in the env and none from the`,
+      `   session manager — and the marker is SCOPED to a session id.`,
+      `   The read side refuses a marker with no id (deliberate, and pinned), so an`,
+      `   allowed \`touch\` here would leave a fresh file that opens nothing while the`,
+      `   guard logged \`🔓 marker active\`. It is refused instead of reported as open.`,
+      `   This is the \`pi -p --no-session\` class (orchestrator lanes and unhatched`,
+      `   task children); an id-less lane also must not clobber a sibling's marker.`,
+      `   → Recover from a session that HAS an id, or from a human terminal`,
+      `     (terminals are never intercepted):`,
+      `       git -C <repo> restore <path>`,
+      `   → For anything beyond recovery, work in a worktree:`,
+      `       bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+      // ⛔ WHICH HATCH STATE THIS PROCESS IS IN (#4101 review, P2). One branch for
+      // a session the DISPATCHER hatched (the hatch IS on: it needs no marker),
+      // one for the session that has nothing and must be told the hatch is
+      // session-START only. A single unconditional "is NOT an alternative here"
+      // was false in the hatching process.
+      ...(envHatchOn
+        ? [
+            // hatch-sweep-exempt: states the hatch is ALREADY ACTIVE in this
+            // process — the opposite of an offer, so there is no caveat to add.
+            `   ⚠️ The env hatch IS ALREADY ACTIVE in this process (\`AGENT_ALLOW_MAIN_EDITS=1\`),`,
+            `      so this session needs no marker: it already bypasses M4/M5. The`,
+            `      \`touch\` is still refused, because an id-less stamp would OVERWRITE a`,
+            `      sibling session's marker and revoke THAT session's recovery window.`,
+          ]
+        : [
+            `   ⛔ \`AGENT_ALLOW_MAIN_EDITS=1\` is NOT a remedy from inside this session:`,
+            `      it is read from the session-START host env, so an inline prefix or an`,
+            `      \`export\` in a running session cannot set it (#1239) — only the`,
+            `      dispatcher can hatch the process.`,
+          ]),
+    ].join("\n");
+  }
+  const why = _MARKER_CAUSE_TEXT[cause] ?? cause;
+  // ⛔ WHICH DIRECTION (#3620 review, P3) — answered by the STAMP, not inferred
+  // from the cause. `_stampMarker` is fail-silent, so a cause that describes an
+  // EXISTING file can accompany a write that threw before landing anything:
+  // inferring "written" from `cause !== "absent"` claimed a `gate_bypass` audit
+  // row (and a file "exists at …") for a stamp that never took. The landed flag
+  // is the only evidence that the write actually happened.
+  const written = stampLanded && cause !== "absent" && cause !== "unavailable";
+  return [
+    ...(written
+      ? [
+          `⛔ The escape marker was WRITTEN but cannot open a window (#3620).`,
+          `   Diagnosis: ${why}.`,
+          // ⛔ NAME THE ROUTE, NOT A ROW (#4101 review, P3). `stampLanded` witnesses
+          // that `_stampMarker` did not throw; the audit append is a SEPARATE,
+          // best-effort step, so "an audit row was appended" can assert a row that
+          // does not exist — the false-claim-about-the-audit-trail class this
+          // branch already closed one level up.
+          `   The stamp landed — the file exists at ${_markerPath()} — so "the stamp`,
+          `   did not take" would be the wrong direction. The READ side refuses THAT`,
+          `   file, so this \`touch\` is refused rather than reported as an open window`,
+          `   (no false PASS). Because the read back refuses it, NO \`gate_bypass\` row is`,
+          `   appended: the mint is audited as \`marker_minted_inert\`, so an operator`,
+          `   asking "why did an escape window exist" cannot find a bypass that was`,
+          `   never granted.`,
+        ]
+      : [
+          `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
+          `   Diagnosis: ${why}.`,
+          `   Allowing the \`touch\` would leave a file that cannot open the recovery`,
+          `   window and a log line claiming it did, so it is refused instead.`,
+          `   → Check that ${dirname(_markerPath())} is writable and is not a symlink.`,
+        ]),
+    `   → Fix the cause named above, then run the touch again as its own bash call`,
+    `     (an \`expired\` / \`session-mismatch\` / \`unscoped\` marker re-stamps; for`,
+    `     \`symlinked\`, ~/.pi/agent must stop being a link first):`,
+    `       touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+    `   → Or recover from a human terminal (terminals are never intercepted):`,
+    `     git -C <repo> restore <path>`,
+    `   (session id: ${sessionId ?? "<none>"})`,
+  ].join("\n");
 }
 
 function _mainTopLevel(): string | null {
@@ -659,6 +955,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
         "   let the delete through unchecked (#653).",
         "   → Re-run with the LITERAL ref: `git push origin --delete feat/my-branch`.",
         "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+        ..._ENV_HATCH_CAVEAT,
       ].join("\n"),
     };
   }
@@ -687,6 +984,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
       "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
       "   → Switch those worktrees/main to another branch first, then retry.",
       "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n"),
   };
 }
@@ -740,7 +1038,11 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
 function _hubWriteRecoverLines(st: { disorder: string | null } | null, hatchActive: boolean = _currentHatchActive): string[] {
   // ONE text, shared with M4's classifier reason (round 9): the two used to
   // diverge, and only the classifier's covered all three dirt shapes.
-  const lines = hubDirtyRecoveryLines(st, hatchActive);
+  //
+  // #3620 — the INERT-marker diagnosis rides along: this route is where a
+  // stranded lane lands, and telling a reader to stamp a marker that is already
+  // on disk (and inert) is the dead end the report measured.
+  const lines = hubDirtyRecoveryLines(st, hatchActive, _inertMarkerLines());
   if (lines.length > 0) return lines;
   return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
@@ -976,6 +1278,7 @@ function _hubTargetWriteBlockReason(rel: string, top: string, wipHint: string): 
     `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
     `     override (deliberate solo sessions only).`,
+    ..._ENV_HATCH_CAVEAT,
   ].join("\n");
 }
 
@@ -1749,6 +2052,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n");
   }
   if (hit.kind === "script-depth") {
@@ -1763,6 +2067,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
+      ..._ENV_HATCH_CAVEAT,
     ].join("\n");
   }
   const gitMeta = hit.rel === ".git" || hit.rel.startsWith(".git/");
@@ -1792,6 +2097,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
     `     override (deliberate solo sessions only).`,
+    ..._ENV_HATCH_CAVEAT,
   ].join("\n");
 }
 
@@ -1835,27 +2141,200 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
  *
  *   - no redirect target at all ⇒ a pure read; nothing can be written;
  *   - otherwise probe `git status --porcelain` on every statically identifiable
- *     candidate checkout — `writeCwd`, plus the nearest EXISTING ancestor
- *     directory of each write target — and allow ONLY if all are free of
- *     tracked dirt.
+ *     candidate checkout — the checkout each write target LANDS in (links are
+ *     resolved, so a symlink sink is judged by the bytes it points at), plus
+ *     `scriptDir` — and allow ONLY if all are free of tracked dirt. A target
+ *     that is a HARDLINK (link count > 1) has no statically identifiable
+ *     landing checkout at all, so it fails closed rather than guess.
  *
  * `discardDestroysWip` (scope "all") already separates tracked dirt (real loss)
  * from untracked-only dirt (nothing tracked is destroyed), so the arm neither
  * blocks on `??` scratch output nor conflates the two in its message. Unlike
  * the comparison it replaces, one wrong ALLOW here is unrecoverable, which is
- * why the arm is conservative: an unresolvable target is probed at its nearest
- * existing ancestor, and an unreadable status FAILS CLOSED.
+ * why the arm is conservative: an unresolvable target keeps its literal
+ * component and is anchored at ITS OWN SITE (the cwd the `cd`/pushd chain in
+ * the command had reached — `bashWriteTargetsResolved`'s `cwd`), then probed at
+ * its nearest existing ancestor — which is that site for a RELATIVE spelling
+ * and the spelling's OWN outermost existing directory for an absolute one
+ * (`resolve(site, "/tmp/$X/f")` stays `/tmp/$X/f`, so the walk stops at
+ * `/tmp`) — and an unreadable status FAILS CLOSED.
  *
  * Declared residual: a target anchored to a name this command never assigns
  * (`> "$SOME_ENV_VAR/f"`) keeps the literal `$SOME_ENV_VAR` component and is
- * therefore probed at the command's own directory — the same conservative
- * answer the old arm gave by failing closed. A target anchored to a name the
+ * therefore anchored as above — the same conservative answer the old arm gave
+ * by failing closed, and NOT "always the command's own directory": that is only
+ * true of the relative spelling. A target anchored to a name the
  * command DOES assign is resolved here (`_wtCommandVars`), which is the fail-open
  * this predicate exists to close.
  */
+/**
+ * #3620 — follow a chain of symlinks whose FINAL destination may not exist yet.
+ *
+ * `statSync`/`realpathSync` both throw on a dangling link, so the arm used to
+ * fall back to the link's OWN path and probe its parent — which is not where the
+ * bytes land (reviewer-reproduced, cycle 1): with `<wt>/deleted.txt` tracked and
+ * DELETED in the worktree,
+ *
+ *     ln -s <wt>/deleted.txt /tmp/sink && git show HEAD:deleted.txt > /tmp/sink
+ *
+ * CREATES the file, erasing the deletion, and `git status` reads clean. The
+ * landing site is `<wt>/deleted.txt`; the spelling is `/tmp/sink`.
+ *
+ * ⛔ THE KERNEL RESOLVES THE WHOLE CHAIN whenever the destination EXISTS, and
+ * that answer must be kept — `statSync(t)`/`realpathSync(t)` do it correctly in
+ * one step and are tried FIRST by the caller. This helper exists ONLY for the
+ * case the kernel refuses (a dangling destination somewhere in the chain).
+ *
+ * ⛔ AND A RELATIVE TARGET IS JOINED TO THE LINK'S **REAL** PARENT, never the
+ * lexical one (review cycle 2, REPRODUCED — this is the shape that turned a
+ * correct BLOCK into an ALLOW). When the link is reached through a symlinked
+ * directory, `dirname(cur)` names a directory that is not the link's parent at
+ * all, so `../x` joined there resolves to a path that is neither the spelling
+ * nor the destination — and the ancestor walk then probes a checkout the write
+ * never touches. With `<tmp>/ld -> <wt>/sub` and `<wt>/sub/sink -> ../sub/wip.txt`:
+ *
+ *     git show HEAD:sub/wip.txt > <tmp>/ld/sink
+ *
+ * truncated `wt/sub/wip.txt`'s UNCOMMITTED work while the arm probed `<tmp>/sub`.
+ * `realpathSync(dirname(cur))` is the kernel's own answer for the parent (it
+ * exists — `lstat` just read the link), so the join matches what the shell does.
+ *
+ * That answer is then treated like any other target: the ancestor walk below
+ * finds the nearest existing directory and probes THAT checkout, so a dangling
+ * sink into `/tmp` stays admitted and one into a checkout is blocked by its
+ * effect. Nothing new fails closed — the class is closed by resolving it, not by
+ * refusing it.
+ *
+ * A chain longer than the kernel would follow returns null (unresolvable → the
+ * caller fails closed, like the hardlink arm): the landing site genuinely cannot
+ * be named, and "harmless by coincidence" is not a reason to hand the probe a
+ * path this function could not resolve.
+ *
+ * ⛔ THE BOUND IS 40 FOLLOWED LINKS, NOT 40 LOOP ITERATIONS (measured). Linux
+ * MAXSYMLINKS is 40 and the kernel FOLLOWS all 40, so a 40-link chain resolves
+ * and its destination is written; 41 is ELOOP. Counting iterations with `< 40`
+ * threw away a correct answer the loop was already holding on the 40th hop and
+ * turned a benign 40-hop sink into a block. Hence `<=`: the extra iteration is
+ * the one that reads the final, non-link destination.
+ * @param {string} p
+ * @returns {string|null} the path the write would actually create/modify, or null
+ */
+function _resolveThroughDanglingLinks(p: string): string | null {
+  // The kernel answer first: it is exact for every spelling, including a link
+  // whose destination does not exist. The hand loop below is the fallback for the
+  // one input `_kernelResolve` refuses (a chain longer than the kernel follows).
+  const viaKernel = _kernelResolve(p);
+  if (viaKernel !== null) return viaKernel;
+  let cur = p;
+  for (let hop = 0; hop <= 40; hop++) {
+    let st;
+    try { st = lstatSync(cur); } catch { return cur; } // does not exist → this IS the landing path
+    if (!st.isSymbolicLink()) return cur;
+    let target: string;
+    try { target = readlinkSync(cur); } catch { return cur; }
+    if (isAbsolute(target)) { cur = target; continue; }
+    // REAL parent, not the lexical one — see the ⛔ above.
+    let parent = dirname(cur);
+    try { parent = realpathSync(parent); } catch { /* keep the lexical parent (best effort) */ }
+    cur = resolve(parent, target);
+  }
+  return null; // chain longer than the kernel would follow — unresolvable, fail closed
+}
+
+/** The ABSOLUTE SPELLING the shell would hand the kernel — WITHOUT lexical
+ *  normalisation (#4101 review, P1 ×2 — both MEASURED allowed at this head).
+ *
+ *  `resolve()` answers a different question in two ways, and both are the arm's
+ *  own subject (a redirect that lands inside a tracked-dirty checkout):
+ *   · a leading `~` is expanded by the SHELL, so `resolve(cwd, "~/hub/f")` gives
+ *     `<cwd>/~/hub/f`, whose ancestor walk stops at `<cwd>` — the dirty checkout
+ *     the write truncates is never probed;
+ *   · `..` is applied by the KERNEL to the directory a symlink RESOLVED to, so
+ *     `<d>/ld/../f` with `ld -> <dirty wt>/sub` lands in `<wt>/f` while
+ *     `resolve()` cancels it lexically to `<d>/f`.
+ *
+ *  Keeping the spelling verbatim lets `statSync` answer in the kernel's own
+ *  semantics — and `_kernelResolve` below carries that answer out to a canonical
+ *  path, which `realpathSync` cannot do (see the ⛔ there). `~user` is left
+ *  literal: this process cannot know another user's home, and a literal `~user`
+ *  directory is what the shell writes when no such user exists. */
+function _writeLandingSpelling(cwd: string, raw: string, bareTilde?: boolean): string {
+  // ⛔ ONLY A WORD THAT REALLY STARTS WITH AN UNQUOTED `~` IS EXPANDED (#4101
+  // review, P3). `bashWriteTargetsResolved` carries the DE-QUOTED operand, so
+  // `> "~/x"` — which the shell writes as `<cwd>/~/x`, quoting suppressing the
+  // expansion — arrives here indistinguishable from `> ~/x`. Expanding both
+  // probed `$HOME/x` for the quoted spelling, which is a false block when
+  // `$HOME/x` sits in a dirty checkout AND a fail-open when a literal `~`
+  // directory inside a dirty checkout holds the tracked target the shell really
+  // writes. The walker records the raw source fact per target (`bareTilde`),
+  // and `undefined` (a non-redirect caller) keeps the historical expansion.
+  const expandTilde = bareTilde !== false;
+  // ⛔ SCONCAT, NOT `join`: `join` normalises, so `~/a/../b` would lose the `..`
+  // lexically and reintroduce the very defect this function exists to avoid,
+  // one segment further in.
+  const withHome = !expandTilde
+    ? raw
+    : raw === "~"
+      ? homedir()
+      : raw.startsWith("~/")
+        ? `${homedir().replace(/\/+$/, "")}/${raw.slice(2)}`
+        : raw;
+  if (isAbsolute(withHome)) return withHome;
+  return `${cwd.replace(/\/+$/, "")}/${withHome}`;
+}
+
+/** The path the KERNEL would arrive at, walking the spelling one component at a
+ *  time (#4101 review, P1 — MEASURED fail-open at this head).
+ *
+ *  ⛔ `realpathSync` CANNOT ANSWER THIS. Node normalises `..` LEXICALLY before it
+ *  calls `realpath(3)` (measured on node 24: for `<d>/ld/../f` with
+ *  `ld -> <dirty wt>/sub`, `realpathSync` throws ENOENT, while `readlink -f`,
+ *  `statSync` and `readFileSync` all reach `<wt>/f` — the path the bytes land in).
+ *  The KERNEL applies `..` to the directory the link RESOLVED to, so the arm was
+ *  probing `<d>/f` ("not a git repository") and admitting a redirect that
+ *  truncates `<wt>/f`'s uncommitted content.
+ *
+ *  So walk it the way the kernel does: each component is `lstat`ed in the
+ *  directory reached SO FAR, a symlink replaces that directory, and `..` steps to
+ *  the parent of the RESOLVED one. A component that does not exist ends the walk
+ *  and the remainder is appended verbatim — that is the landing path a
+ *  not-yet-created target has, and its nearest existing ancestor is what the
+ *  caller probes.
+ *
+ *  Bounded like the kernel: MAXSYMLINKS is 40 followed links, so 41 returns null
+ *  (unresolvable ⇒ the caller fails closed rather than guess).
+ * @param {string} p an absolute spelling (see `_writeLandingSpelling`)
+ * @returns {string|null} the kernel's landing path, or null if unresolvable
+ */
+function _kernelResolve(p: string): string | null {
+  if (!isAbsolute(p)) return null;
+  const parts = p.split("/").filter((s) => s !== "" && s !== ".");
+  let cur = "/";
+  let hops = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "..") { cur = dirname(cur); continue; }
+    const next = cur === "/" ? `/${part}` : `${cur}/${part}`;
+    let st;
+    try { st = lstatSync(next); } catch { return [next, ...parts.slice(i + 1)].join("/"); }
+    if (!st.isSymbolicLink()) { cur = next; continue; }
+    if (++hops > 40) return null;
+    let target: string;
+    try { target = readlinkSync(next); } catch { return next; }
+    // A RELATIVE target is joined to the directory reached so far, and the walk
+    // continues inside it — so a `..` in the target applies to the REAL directory,
+    // which is the whole point. An absolute target restarts from the root. The
+    // target's components are INSERTED before whatever spelling remains.
+    const tail = target.split("/").filter((s) => s !== "" && s !== ".");
+    if (isAbsolute(target)) cur = "/";
+    parts.splice(i + 1, 0, ...tail);
+  }
+  return cur;
+}
+
 function _catFileRevertStateBlock(
   d: { form: string; scope: string; pathspecs: string[] },
-  writeTargetsRel: string[],
+  writeTargets: { raw: string; cwd: string; bareTilde?: boolean }[],
   writeCwd: string,
   command: string,
   scriptDir: string | null,
@@ -1866,26 +2345,108 @@ function _catFileRevertStateBlock(
   // (`git cat-file -e "origin/$BRANCH:$f"`) is allowed instead of fail-closed
   // on the unresolvable source: the hint has no LANDING SITE, so there is no
   // discard. The decision is ordered by EFFECT, not by the pathspec's spelling.
-  if (writeTargetsRel.length === 0) return null;
+  if (writeTargets.length === 0) return null;
 
   const vars = _wtCommandVars(command);
-  const targets = writeTargetsRel.map((rel) => resolve(writeCwd, _wtSubstituteVars(rel, vars)));
+  // ⛔ EACH TARGET RESOLVES FROM ITS **OWN** SITE CWD (#4101 P0-1/P0-2).
+  // This used to be `resolve(writeCwd, rel)` over `relative(writeCwd, …)` from
+  // `extractBashWriteTargets` — which does NOT walk a `cd` chain, and was fed
+  // `commandExecutionCwd(...) ?? sessionCwd`, which is `null` for a plain `cd`
+  // (that function reports a cwd at a SCRIPT token only). So every `cd`-relative
+  // redirect was re-anchored at the SESSION checkout: `cd <wt> && git show
+  // HEAD:f > f` probed `<session>/f` instead of `<wt>/f` and was ALLOWED while
+  // it destroyed the worktree's uncommitted content (§ declared residual below).
+  // `bashWriteTargetsResolved` answers the same question correctly — it is the
+  // walker the discard-verb arm already trusts (`classify-git.mjs` cdChain) —
+  // so the pair (site cwd, raw operand) comes from IT, and the substitution
+  // still happens on the OPERAND, never on a resolved absolute path.
+  const targets = writeTargets.map((t) => _writeLandingSpelling(t.cwd, _wtSubstituteVars(t.raw, vars), t.bareTilde));
 
-  // Candidate checkouts, in a deterministic order: the write cwd FIRST (its
-  // dirt is the one a relative target lands in, and it is the checkout the
-  // message should name first), then each target's nearest existing ancestor,
-  // then the checkout the discard was READ FROM when it came from a script.
+  // Candidate checkouts: each target's nearest EXISTING ancestor (the landing
+  // site), then the checkout the discard was READ FROM when it came from a
+  // script.
   //
-  // The script's own directory earns its place: a script's redirect is often
-  // anchored to a name the script computes at runtime (`hub-worktree.sh`
-  // derives `MAIN_REPO` from `git rev-parse --git-common-dir`), so it is not
-  // statically resolvable from the command text — but the script FILE is a
-  // statically identifiable checkout, and that is where such a discard can
-  // land. On the clean fixture it changes nothing; with tracked dirt there it
-  // is the difference between a block and an unrecoverable loss.
-  const candidates = new Set<string>([writeCwd]);
+  // ⛔ `writeCwd` IS NOT AN UNCONDITIONAL CANDIDATE (#3620, owner ruling on the
+  // issue 2026-11-15). It used to be seeded first, "its dirt is the one a
+  // relative target lands in" — but a target that lands OUTSIDE this checkout
+  // cannot discard this checkout's tracked work, and probing the cwd anyway
+  // refused the plain read-and-export on the merge path:
+  //
+  //     git show origin/main:tools/fleet_state.py > /tmp/fs-main.py
+  //     ⛔ Working-tree discard blocked … it would destroy uncommitted work
+  //
+  // The headline claim there is FALSE of the target (and was measured on a
+  // 1290-staged-path hub in the #3620 report). The arm's question is "does this
+  // redirect land on content that would be lost?", so it must probe the checkouts
+  // the write LANDS in, not the one the shell happens to sit in.
+  //
+  // WHAT THIS DOES NOT RELAX. The #1060 fail-open this arm exists for still
+  // blocks, because every such target lands INSIDE a checkout and the ancestor
+  // walk finds it: `> dirty.txt` / `> "$MAIN_REPO/dirty.txt"` resolve into the
+  // hub or worktree and are probed exactly as before (pinned D1a/D1b/D3, and the
+  // new D7 case for a target inside a DIFFERENT dirty checkout). The scope is
+  // "inside a checkout", never "outside the cwd of this invocation".
+  //
+  // The #1060 residual is preserved rather than special-cased: an UNRESOLVABLE
+  // component (`> "$SOME_ENV_VAR/f"`) keeps its literal segment through
+  // `_writeLandingSpelling(t.cwd, …)` above — which anchors a RELATIVE spelling at
+  // the cwd its own `cd` chain reached (its ancestor walk lands there and it is
+  // still probed) and an ABSOLUTE one at its own outermost existing directory
+  // (`resolve` does not re-root an absolute path: `/tmp/$X/f` walks to `/tmp`).
+  // `writeCwd` survives only as MESSAGE attribution (`Target:`/`Checkout:`), not as
+  // a resolution input — the stale sentence that described it as the anchor of this
+  // path was deleted with the call site (#4101 review, P3).
+  const candidates = new Set<string>();
+  let hardlinked: string | null = null;
+  // A link chain longer than the kernel would follow: the landing site could not
+  // be determined at all, which is the same answer the hardlink arm gives.
+  let unresolvable: string | null = null;
   for (const t of targets) {
-    let dir = dirname(t);
+    // ── LINK RESOLUTION (#3620 review, MEASURED fail-open without it) ────
+    // The write lands where the BYTES land. A sink that is a SYMLINK into a
+    // tracked-dirty checkout is an ordinary path here and a real revert to the
+    // shell: `ln -s <dirty wt>/dirty.txt /tmp/sink; git show HEAD:dirty.txt >
+    // /tmp/sink` truncates the wt's uncommitted content and leaves `git status`
+    // clean. origin/main blocked that only INCIDENTALLY (the dirty checkout was
+    // the session cwd, which used to be an unconditional candidate); resolving
+    // the link blocks it on the effect, which is what this arm claims to gate.
+    // ── LANDING SITE, in the kernel's own words first ──────────────────
+    // `statSync`/`realpathSync` follow the ENTIRE chain, correctly, for an
+    // existing destination — including a relative target reached through a
+    // symlinked parent. That answer is authoritative and is tried FIRST; the
+    // hand resolution below exists only for the case the kernel REFUSES (a
+    // dangling destination), which is the one it cannot answer.
+    let landing: string | null = t;
+    try {
+      const lst = statSync(t);
+      // A HARDLINK shares the inode with a file that may be tracked content in a
+      // checkout this walk never enumerates, and NO path-based probe can see
+      // that: `realpath` answers with the link's own name. Rather than guess,
+      // fail closed — the arm's own doctrine is that one wrong ALLOW here is
+      // unrecoverable, one wrong BLOCK costs a retry.
+      if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = t; continue; }
+      // ⛔ NOT `realpathSync` (#4101 review, P1): Node normalises `..` lexically
+      // before calling `realpath(3)`, so a target reached through a symlinked
+      // directory was verified against a checkout the bytes never touch.
+      const k = _kernelResolve(t);
+      if (k === null) { unresolvable = t; continue; }
+      landing = k;
+    } catch {
+      // Dangling somewhere in the chain — resolve the rest by hand (REAL parents,
+      // see `_resolveThroughDanglingLinks`), then apply the same two rules to the
+      // answer, so a dangling sink into a dirty checkout is blocked on its effect.
+      landing = _resolveThroughDanglingLinks(t);
+      if (landing === null) { unresolvable = t; continue; }
+      try {
+        const lst = statSync(landing);
+        if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = landing; continue; }
+        // `_kernelResolve` first, for the same reason as above: `realpathSync`
+        // normalises `..` lexically and can name a directory the write never
+        // reaches.
+        landing = _kernelResolve(landing) ?? realpathSync(landing);
+      } catch { /* nothing at the landing path yet — the ancestor walk below decides */ }
+    }
+    let dir = dirname(landing);
     // Bounded: a target under a not-yet-existing directory has no checkout of
     // its own, so the walk finds the nearest one that exists.
     for (let i = 0; i < 64 && !existsSync(dir); i++) {
@@ -1893,9 +2454,30 @@ function _catFileRevertStateBlock(
       if (parent === dir) break;
       dir = parent;
     }
+    // …and the ancestor itself may be reached THROUGH a symlinked directory
+    // (`> /tmp/out/f` where `out` → a checkout), so resolve that too — with the
+    // KERNEL walker, because a `..` above a link must be applied to the link's
+    // target, not to its spelling.
+    dir = _kernelResolve(dir) ?? dir;
     candidates.add(dir);
   }
   if (scriptDir !== null) candidates.add(scriptDir);
+  // A hardlinked sink is the ONE case this walk cannot answer, and the answer is
+  // "cannot be verified" — never a silent allow.
+  if (hardlinked !== null) {
+    return _worktreeDiscardBlockReason(
+      { form: d.form, scope: "paths", pathspecs: [hardlinked] },
+      writeCwd,
+      "the redirect target is a hardlink (link count > 1), so the checkout it would destroy cannot be determined",
+    );
+  }
+  if (unresolvable !== null) {
+    return _worktreeDiscardBlockReason(
+      { form: d.form, scope: "paths", pathspecs: [unresolvable] },
+      writeCwd,
+      "the redirect target is a symlink chain too long to resolve, so the checkout it would destroy cannot be determined",
+    );
+  }
 
   for (const cand of candidates) {
     // Whole-checkout scope: the redirect's own path is not always statically
@@ -1911,8 +2493,14 @@ function _catFileRevertStateBlock(
       form: d.form,
       scope: "paths",
       pathspecs: targets.map((t) => {
-        const rel = relative(cand, t);
-        return rel && !rel.startsWith("..") ? rel : t;
+        // Display spelling: the `..`-preserving form is correct for the PROBE but
+        // reads as a different path than the reader typed (`<d>/ld/../f` above).
+        // Name the KERNEL landing path instead — the arm's attribution claim is
+        // "this is where the bytes were going", and a reader must be able to see
+        // it is the file the checkout below actually holds.
+        const shown = _kernelResolve(t) ?? resolve(t);
+        const rel = relative(cand, shown);
+        return rel && !rel.startsWith("..") ? rel : shown;
       }),
     };
     return _worktreeDiscardBlockReason(
@@ -2913,6 +3501,8 @@ function _worktreeDiscardBlockReason(
             ? [`       bash "${sanctionedHelper}" <branch>`]
             : [`       bash <framework-checkout>/scripts/checkout-hygiene/hub-worktree.sh <branch>`]),
           `   → This arm fails closed because the EFFECT was unverifiable, not`,
+          // hatch-sweep-exempt: the text below says the hatch is NOT the remedy —
+          // it disclaims the offer rather than making one.
           `     because uncommitted work was found, so AGENT_ALLOW_MAIN_EDITS=1 is`,
           `     not its remedy: the hatch suppresses the whole gate instead of`,
           `     resolving the reason.`,
@@ -2961,12 +3551,26 @@ function _worktreeDiscardBlockReason(
                 // test-discard-gate pin it) and the scoping is stated around it.
                 `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
                 `     ELDATO_ALLOW_MAIN_EDITS=1) — a FULL bypass of M4/M5, whole-tree`,
-                `     discards included — or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
+                `     discards included.`,
+                // #4101 review (P2) — the #3620 report hit THIS text, and it offered
+                // the env route with no session-start caveat: a reader mid-session
+                // who took it got a setting the guard never reads. Stated BEFORE
+                // the marker line, which is the route that actually works now.
+                ..._ENV_HATCH_CAVEAT,
+                `     → …or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
                 `     which opens the same narrow recovery window as M4: name the paths,`,
                 `     \`git restore <path>\` / \`git checkout -- <path>\`. Refused UNDER THE MARKER:`,
                 `     a whole-tree discard (\`.\`, \`./\`, pathspec magic, a glob, a brace) — and`,
                 `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
                 `     entire subtree, so name a FILE when that is what you mean.`,
+                // #3620 review (P2) — the INERT-marker diagnosis rides along HERE
+                // too, not only on M4's disorder surface. This arm is the one that
+                // prints "stamp the … MARKER" to a session that may have already
+                // stamped it: without this, a reader whose marker is inert (no
+                // session id, another session's id, past the TTL, behind a symlink)
+                // is told to do the thing they just did — the exact recurrence the
+                // README now claims is impossible.
+                ..._inertMarkerLines(),
               ]),
         ]),
   ].join("\n");
@@ -4501,16 +5105,30 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
 
   for (const set of gatedSets) {
     // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
-    // bash WRITE targets (pure string walk) to find where the content lands.
-    // #1060 — they are kept in their WRITE-CWD-RELATIVE spelling: the state
-    // predicate substitutes a same-command `NAME=<literal>` assignment BEFORE
-    // resolving, so an ABSOLUTE `$MAIN_REPO` is not re-anchored under the write
-    // cwd (which is how the fail-open was measured).
-    let writeTargetsRel: string[] = [];
+    // bash WRITE targets to find where the content lands. #1060 — each target is
+    // carried as its OPERAND plus the SITE cwd the shell's own `cd`/pushd chain
+    // had reached, so the state predicate resolves it exactly as bash does and
+    // still substitutes a same-command `NAME=<literal>` before resolving (so an
+    // ABSOLUTE `$MAIN_REPO` is not re-anchored under any cwd — that re-anchor is
+    // how the #1060 fail-open was measured).
+    //
+    // ⛔ THE SEED IS `set.baseCwd`, NOT `set.writeCwd` (#4101 P0-1/P0-2):
+    // `baseCwd` is the cwd the walked shell STARTS in — the session cwd for
+    // direct argv, the script's exec cwd for a script set — which is what
+    // `bashWriteTargetsResolved` expects, because it applies the command's cd
+    // chain itself. `writeCwd` is the EXECUTION cwd (`commandExecutionCwd`, null
+    // for a plain `cd`), and anchoring relative targets there is precisely the
+    // mis-resolution this arm had.
+    let writeTargets: { raw: string; cwd: string; bareTilde?: boolean }[] = [];
     if (set.discs.some((d) => d.form === "cat-file-revert")) {
       try {
         const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
-        writeTargetsRel = extractBashWriteTargets(src, set.writeCwd).map((t) => relative(set.writeCwd, t.resolvedPath) || ".");
+        // ⛔ `bareTilde` MUST SURVIVE THIS PROJECTION (#4101 review, P3). Dropping
+        // it here put the de-quoted spelling back in front of
+        // `_writeLandingSpelling` with no tilde fact, so a QUOTED `> "~/x"` was
+        // expanded again — the fix was in the walker and the arm never saw it.
+        writeTargets = bashWriteTargetsResolved(src, set.baseCwd)
+          .map((t) => ({ raw: t.raw ?? t.resolvedPath, cwd: t.cwd, bareTilde: t.bareTilde }));
       } catch { /* best-effort — a miss only means no extra block */ }
     }
 
@@ -4546,7 +5164,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         if (set.script !== null && !/[$`]/.test(set.script)) {
           try { scriptDir = dirname(resolve(execCwd, set.script)); } catch { scriptDir = null; }
         }
-        const stateReason = _catFileRevertStateBlock(d, writeTargetsRel, set.writeCwd, command, scriptDir);
+        const stateReason = _catFileRevertStateBlock(d, writeTargets, set.writeCwd, command, scriptDir);
         if (stateReason !== null) return stateReason;
         continue;
       }
@@ -5250,8 +5868,13 @@ function _gateScriptPathContent(command: string, scriptPath: string, execCwd: st
         `   → Run the underlying git commands directly (each is gated on its own), or do`,
         `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
         `   → cd-ing into a worktree from a HUB-ROOTED session does not lift this — the`,
-        `     gate keys on the session cwd. Start the session in the worktree, or set`,
-        `     the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a solo session.`,
+        `     gate keys on the session cwd. The reachable routes are to START the`,
+        `     session in the worktree, or to run the work from a human terminal`,
+        `     (terminals are never intercepted).`,
+        `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for a`,
+        `     deliberate solo session — the TTL escape MARKER does NOT lift this arm`,
+        `     (M4 stays active under it, D3), so the env hatch is the only one.`,
+        ..._ENV_HATCH_CAVEAT,
       ].join("\n");
     }
     return null;
@@ -5267,6 +5890,7 @@ const WHY = [
   "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
   "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
   "     deliberate solo sessions.",
+  ..._ENV_HATCH_CAVEAT,
 ].join("\n");
 
 // ── #265 per-session baseline state ────────────────────────────────────────
@@ -5618,9 +6242,18 @@ function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: a
     "     (a fast-forward cannot move the tip backwards or rewrite a commit).",
     "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
     "   → Or stamp the ~/.pi/agent/.allow-main-edits marker (15-min TTL) —",
-    "     reachable from an ALREADY-RUNNING session — or set",
-    "     AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for deliberate",
-    "     solo sessions.",
+    "     reachable from an ALREADY-RUNNING session with a resolvable session id —",
+    "     or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
+    "     deliberate solo sessions.",
+    ..._ENV_HATCH_CAVEAT,
+    // ⛔ THE CLOBBER HAZARD ABOVE IS ONE BRANCH; THE INERT MARKER IS ANOTHER
+    // (#4101 review, P3). `_inertMarkerLines()` was spliced only into
+    // `_dirtyRecoveryBody` and the M5 discard arm, so THIS refusal — like #607's
+    // below — could prescribe stamping the marker to a reader holding one that
+    // is on disk and cannot open a window, which is the recurrence the README
+    // claims is impossible. Every printed offer of the marker must carry the
+    // diagnosis.
+    ..._inertMarkerLines(),
   ].join("\n");
 }
 
@@ -5687,6 +6320,9 @@ function _reportClassifierDegradation(ctx?: { ui?: { notify?: (msg: string, leve
     row("cell-install.sh on a cell), then verify with:"),
     row("  node extensions/main-worktree-guard/test-module-load.mjs"),
     row("Deliberate acceptance: AGENT_ALLOW_MAIN_EDITS=1 (solo sessions)."),
+    // #4101 review (P2) — a session-START env var offered with no caveat is the
+    // same dead end everywhere it is offered, banners included.
+    row("⚠️ That env is read at session START: an export CANNOT set it (#1239)."),
     "╚══════════════════════════════════════════════════════════════════╝",
     `   cause: ${reason}`,
     "",
@@ -5833,7 +6469,12 @@ export default function (pi: ExtensionAPI) {
         }
         lines.push(
           "║  → Invoke the using-git-worktrees skill to create one.            ║",
-          "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
+          // #4101 review (P2) — the same dead end one layer out: a warning that
+          // offers a session-START env var to a running session. Width-safe for
+          // the 62-char banner box.
+          "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning — but    ║",
+          "║    only at session START: an inline prefix or an `export` in a    ║",
+          "║    running session CANNOT set it (#1239).                         ║",
           "╚══════════════════════════════════════════════════════════════════╝",
           "",
         );
@@ -5858,7 +6499,12 @@ export default function (pi: ExtensionAPI) {
     // empty in production (pi sets PI_SESSION_ID only in bash CHILDREN) — so the
     // hatch-active paragraph was unreachable on exactly the surfaces a stranded
     // lane hits.
-    _currentHatchActive = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+    const hatchSid = _currentSessionId(_ctx);
+    _currentReaderHasId = hatchSid !== null;
+    _currentMarkerDiagnosis = _isAllowMainEdits()
+      ? { active: true, cause: "env-hatch" }
+      : diagnoseAllowMarkerState(_markerPath(), hatchSid);
+    _currentHatchActive = _currentMarkerDiagnosis.active;
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
     // mid-review sees the warn before proceeding, AC8). Active under the
@@ -5928,7 +6574,11 @@ export default function (pi: ExtensionAPI) {
         // the write/edit route, whose #618 gate the marker return precedes — the
         // marker is an audited solo-session recovery hatch, not a license to
         // write other hubs).
-        const markerOn = readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+        // #3620: the marker state is READ ONCE per tool call (`_currentHatchActive`,
+        // resolved at the top of this handler from the same ctx id and the same
+        // predicate). Re-reading here would let a marker touched in between be
+        // acted on with one answer and explained with another.
+        const markerOn = _currentHatchActive;
         const bashWrite = _hubBashTrackedWrite(localCommand, st.disorder, markerOn);
         if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
@@ -5963,7 +6613,7 @@ export default function (pi: ExtensionAPI) {
           // recovery and M5 never consulted. Wiring the hatch to the shape (not
           // just to the window) makes M4 refuse those forms exactly as main does.
           const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(localCommand);
-          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
+          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive, markerInertLines: _inertMarkerLines() });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -6105,7 +6755,50 @@ export default function (pi: ExtensionAPI) {
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
       if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
+        // ── #3620: verify the mint, never assume it ──────────────────────
+        // (a) FAIL BEFORE STAMPING when this session can never hold an active
+        // marker. `_stampMarker` writes unconditionally, so an id-less lane
+        // would not only mint an inert file — it would REPLACE a sibling's live
+        // marker with `{session_id: null}` and revoke that sibling's window.
+        // An EMPTY PI_SESSION_ID (`PI_SESSION_ID= pi …`) is no id at all: the read
+        // side treats "" as no-session-id, so the mint must not stamp `""` and
+        // claim a window it cannot have.
+        const markerSid = _currentSessionId(_ctx) || null;
+        // ⛔ THE REFUSAL MUST NOT TELL A HATCHED SESSION IT HOLDS NOTHING (#4101
+        // review, P2). This check sits OUTSIDE the `if (!_isAllowMainEdits())`
+        // block by design (the mint is stamped for every session), so it also
+        // fires for `AGENT_ALLOW_MAIN_EDITS=1 pi -p --no-session` — a process
+        // that ALREADY carries a full bypass. The block is still right (a
+        // null-id stamp would overwrite a sibling's live marker), but the text
+        // has to name the hatch as ACTIVE here, not as unavailable: telling a
+        // reader who holds a bypass that it holds nothing is the mirror of the
+        // #3620 dead end ("the honest response is to stop").
+        if (markerSid === null) {
+          return { block: true, reason: _markerTouchBlockReason(null, null, false, _isAllowMainEdits()) };
+        }
+        const stampContent = _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
+        const stampLanded = stampContent !== null;
+        // (b) read back what we just minted, with the same id the read side will
+        // use. A stamp that did not land (unwritable/symlinked ~/.pi/agent, a
+        // disk error) leaves an empty or absent file: the touch is refused with
+        // the cause instead of being reported as an open window (F7 stays
+        // fail-safe; only the REPORTING changes).
+        const minted = diagnoseAllowMarkerState(_markerPath(), markerSid);
+        if (!minted.active) {
+          // ⛔ THE AUDIT ARTEFACT FOLLOWS THE VERDICT (#4101 review, P3). The
+          // `gate_bypass` row and the `🔓 marker active` log line used to be
+          // emitted inside `_stampMarker`, i.e. BEFORE this read-back — so a mint
+          // the read side refuses (a symlinked `~/.pi/agent`, a stamp reading
+          // back `unscoped`/`expired`) recorded a bypass that was never granted.
+          if (stampLanded) _auditMarkerInert(_markerPath(), markerSid, minted.cause);
+          _currentMarkerDiagnosis = minted;
+          return {
+            block: true,
+            reason: _markerTouchBlockReason(minted.cause, markerSid, stampLanded, _isAllowMainEdits()),
+          };
+        }
+        _auditMarkerMint(_markerPath(), markerSid, extractMarkerReason(command), stampContent ?? "");
+        _currentMarkerDiagnosis = minted;
         return undefined;
       }
     }
@@ -6130,7 +6823,9 @@ export default function (pi: ExtensionAPI) {
 
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
-    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
+    // Same single read as above (#3620) — the hatch verdict and the diagnosis it
+    // is explained by must come from ONE observation of the marker.
+    if (_currentHatchActive) {
       return undefined;
     }
     if (isBash) {
@@ -6367,6 +7062,11 @@ export default function (pi: ExtensionAPI) {
             "     worktree are exempt as before (using-git-worktrees skill).",
             "   Hatch, if this is deliberate solo work in the hub:",
             "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
+            ..._ENV_HATCH_CAVEAT,
+            // Same rule as the #1144 refusal above (#4101 review, P3): an offer
+            // of the marker must carry the inert-marker diagnosis, or a reader
+            // holding a marker on disk is told to do what they already did.
+            ..._inertMarkerLines(),
           ].join("\n"),
         };
       };
@@ -7323,6 +8023,7 @@ export default function (pi: ExtensionAPI) {
           "   other's uncommitted changes. Each agent needs its own branch.",
           "   → Create a worktree: invoke the using-git-worktrees skill.",
           "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override (solo sessions only).",
+          ..._ENV_HATCH_CAVEAT,
         ].join("\n"),
       };
     }
@@ -7378,6 +8079,7 @@ export default function (pi: ExtensionAPI) {
             `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
             `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
             `     override (deliberate solo sessions only).`,
+            ..._ENV_HATCH_CAVEAT,
           ].join("\n"),
         };
       }
@@ -7445,7 +8147,11 @@ export default function (pi: ExtensionAPI) {
           }
           lines.push(
             "║  → Invoke the using-git-worktrees skill to create one.            ║",
-            "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
+            // #4101 review (P2) — session-start caveat, width-safe (see the
+            // module-load copy above).
+            "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning — but    ║",
+            "║    only at session START: an inline prefix or an `export` in a    ║",
+            "║    running session CANNOT set it (#1239).                         ║",
             "╚══════════════════════════════════════════════════════════════════╝",
             "",
           );

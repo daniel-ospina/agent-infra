@@ -10,7 +10,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
+import { existsSync, lstatSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -24,6 +24,26 @@ import { fileURLToPath } from "node:url";
 // so text inside string literals/comments (e.g. `echo "git pull"`) is a rare
 // false positive. Accepted — agents rarely echo git commands, and the block
 // message explains the escape hatch.
+
+// ── #1239 / #3620: the env-hatch caveat, for the refusals THIS module prints ──
+//
+// `AGENT_ALLOW_MAIN_EDITS=1` is read from the PROCESS env at session start, so a
+// blocked agent cannot set it: an inline prefix sets it in the child shell the
+// guard never inspects, and an `export` cannot reach the running process. A
+// refusal that prints the hatch as THE remedy is therefore a dead end.
+//
+// ⛔ TWO MODULES PRINT REFUSALS (#4101 review, P2). This file's own #1919
+// refusals offered the hatch with the label `(session start)` and no caveat —
+// the label is not the caveat — while the sweep that asserts the property read
+// `index.ts` alone, so it reported green over them (a verifier asserting a
+// universal property it could only check in one file). The text below is a
+// VERBATIM MIRROR of index.ts's `_ENV_HATCH_CAVEAT`, and the two are pinned
+// equal by the sweep's B9g row: drift fails a test instead of a reader.
+export const _ENV_HATCH_CAVEAT = [
+  "   \u26a0\ufe0f That env is read at session START: an inline `AGENT_ALLOW_MAIN_EDITS=1",
+  "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
+];
+
 export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "reset", re: /\bgit\s+reset\b/ },
   { name: "clean", re: /\bgit\s+clean\b/ },
@@ -7754,18 +7774,74 @@ export function isAllowMarkerRealpath(path) {
  * @returns {boolean}
  */
 export function readAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
+  return diagnoseAllowMarkerState(path, sessionId, nowMs, ttlMs).active;
+}
+
+/**
+ * #3620 — the SAME decision as readAllowMarkerState, with the REASON it refused.
+ *
+ * One implementation, two readers, because the two must never disagree: the
+ * decision is `active`, and every message that explains an inert marker is
+ * reading `cause` from this call rather than re-deriving it. A second copy of
+ * this logic is how a guard ends up telling an agent to do what it just did.
+ *
+ * Why this exists at all: the D3 escape marker is the only mid-session route
+ * out of a dirty shared hub, and its mint is fail-SILENT by design (F7 — a
+ * failed stamp must never weaken the gate). Silent in the safe direction is
+ * correct; silent in the DIAGNOSTIC direction is a false PASS, because the
+ * touch is allowed, the file looks fresh, and the window is shut. Measured
+ * 2026-11-16: a `pi -p --no-session` lane stamps `{session_id: null}`, logs
+ * `🔓 Escape marker active for session null`, audits a `gate_bypass` row — and
+ * readAllowMarkerState answers false, so the recovery op is refused with
+ * "stamp the marker", which the agent has just done.
+ *
+ * The causes are deliberately distinct, because the remedy differs for each:
+ *   absent            no marker file — the normal, expected refusal
+ *   symlinked         a marker behind a symlink is never trusted (pinned F6)
+ *   expired           mtime older than the TTL — re-touch (or `touch` again)
+ *   unparseable       not the guard's one-JSON-line stamp — out-of-band write
+ *   unscoped          parses, but carries no string session_id — an un-guarded
+ *                     `touch` (a human terminal) or a null-id stamp
+ *   no-session-id     THIS reader has no resolvable id, so no marker can ever be
+ *                     active for it; the class `pi -p --no-session` lives in
+ *   session-mismatch  the marker belongs to ANOTHER session (parallel-session
+ *                     safety) — a sibling touched it, or a subagent re-scoped it
+ *   unreadable        stat/read failed
+ * @param {string} path
+ * @param {string|null|undefined} sessionId
+ * @param {number} [nowMs]
+ * @param {number} [ttlMs]
+ * @returns {{active: boolean, cause: string}}
+ */
+export function diagnoseAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
   try {
-    if (!isAllowMarkerRealpath(path)) return false;
+    // ⛔ lstat, NOT existsSync (#4101 review, P3). `existsSync` FOLLOWS links, so
+    // a marker that is a DANGLING symlink reported `absent` — never `symlinked` —
+    // and `_inertMarkerLines()` returns [] for `absent`, so that shape got no
+    // diagnosis at all while `symlinked` is one of the causes the README
+    // advertises and the table above lists. A dangling link is a LINK (the guard trusts no link,
+    // pinned F6), not a missing file. The symlink test below is unchanged and
+    // still the sole defense; this only stops the existence probe from hiding it.
+    try {
+      lstatSync(path);
+    } catch (e) {
+      if (e?.code === "ENOENT") return { active: false, cause: "absent" };
+      return { active: false, cause: "unreadable" };
+    }
+    // The SOLE symlink defense (pinned F6/round-2 F3): realpath inequality.
+    if (!isAllowMarkerRealpath(path)) return { active: false, cause: "symlinked" };
     const stats = statSync(path);
-    if (!isAllowMarkerActive(stats, nowMs, ttlMs)) return false;
+    if (!isAllowMarkerActive(stats, nowMs, ttlMs)) return { active: false, cause: "expired" };
     const content = readFileSync(path, "utf-8");
     const parsed = parseMarkerContent(content);
-    if (!parsed) return false;
+    if (!parsed) return { active: false, cause: "unparseable" };
     const sid = parsed.session_id;
-    if (typeof sid !== "string" || !sessionId || sid !== sessionId) return false;
-    return true;
+    if (typeof sid !== "string" || sid === "") return { active: false, cause: "unscoped" };
+    if (!sessionId) return { active: false, cause: "no-session-id" };
+    if (sid !== sessionId) return { active: false, cause: "session-mismatch" };
+    return { active: true, cause: "active" };
   } catch {
-    return false;
+    return { active: false, cause: "unreadable" };
   }
 }
 
@@ -9393,10 +9469,17 @@ function _ambientGitEnvLines() {
   ];
 }
 
-export function hubDirtyRecoveryLines(hubContext, hatchActive = false) {
+export function hubDirtyRecoveryLines(hubContext, hatchActive = false, inertMarkerLines = null) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) return [];
   _dirtyHatchActive = hatchActive === true;
+  // #3620 — a PRESENT but INERT marker is the one state in which the advice
+  // below is actively misleading: it tells the reader to acquire the hatch, the
+  // reader has already tried, and the file that proves they tried is exactly
+  // what makes the next attempt look identical. The caller renders the cause
+  // (it owns the marker path and the session id); the classifier only splices it
+  // in at the one place the hatch is prescribed.
+  _dirtyInertMarkerLines = Array.isArray(inertMarkerLines) ? inertMarkerLines : [];
   return _dirtyRecoveryBody();
 }
 
@@ -9414,14 +9497,34 @@ function _hatchParagraph(hatchActive) {
       `     \`cd … &&\` prefix, no \`-C\`/\`GIT_DIR\` target, no wrapper (\`env\`/\`nice\`).`,
     ];
   }
+  // #3620/#1239 — the two hatches are NOT interchangeable and the old text
+  // presented them as an either/or. `AGENT_ALLOW_MAIN_EDITS=1` is read from the
+  // PROCESS env at session start: an `AGENT_ALLOW_MAIN_EDITS=1 git restore …`
+  // prefix sets it in the CHILD shell, which the guard's own process never
+  // sees, and an `export` in a running session cannot reach it either. The
+  // marker is the ONLY one a running session can open — so it is named first,
+  // with the one-touch-per-call contract, and the env is labelled for what it
+  // is. (Measured: the report that produced this text tried BOTH spellings and
+  // the env form was inert by construction.)
   return [
-    `     These named-path recoveries need an active escape hatch: the`,
-    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
-    `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
+    `     These named-path recoveries need an active escape hatch, and only ONE`,
+    `     of them is reachable from a running session:`,
+    `       → THE MARKER — as its OWN bash call, nothing else in it:`,
+    `           touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>`,
+    `         then run the restore as ONE bare command in the NEXT call.`,
+    `         (15-min TTL, re-read every call; re-touch to refresh.)`,
+    `       ✗ \`AGENT_ALLOW_MAIN_EDITS=1 <cmd>\` does NOT work: it is read from the`,
+    `         session-START host env, so an inline prefix or an \`export\` in a`,
+    `         running session cannot set it (#1239).`,
+    ...(_dirtyInertMarkerLines.length > 0 ? _dirtyInertMarkerLines : []),
   ];
 }
 
 let _dirtyHatchActive = false;
+// #3620 — caller-rendered INERT-marker diagnosis, spliced into the hatch
+// paragraph. Per-call state, like `_dirtyHatchActive`: set by
+// hubDirtyRecoveryLines, read immediately by the body builder.
+let _dirtyInertMarkerLines = [];
 
 function _dirtyRecoveryBody() {
   const _ambientLines = _ambientGitEnvLines();
@@ -9451,7 +9554,7 @@ function _dirtyRecoveryBody() {
   ];
 }
 
-function _m4RecoveryLines(hubContext, hatchActive = false) {
+function _m4RecoveryLines(hubContext, hatchActive = false, inertMarkerLines = null) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) {
     return [
@@ -9460,6 +9563,10 @@ function _m4RecoveryLines(hubContext, hatchActive = false) {
     ];
   }
   _dirtyHatchActive = hatchActive === true;
+  // #3620 — the caller owns the marker path and session id, so it renders the
+  // INERT diagnosis; this only carries it to the paragraph that prescribes the
+  // marker. Absent/active markers pass null and change nothing.
+  _dirtyInertMarkerLines = Array.isArray(inertMarkerLines) ? inertMarkerLines : [];
   return _dirtyRecoveryBody();
 }
 
@@ -9485,7 +9592,7 @@ export function evaluateHubGate(command, currentBranch, opts = {}) {
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
@@ -10174,7 +10281,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
-        ..._m4RecoveryLines(hubContext, hatchActive),
+        ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
       ].join("\n"),
     };
   }
@@ -10191,7 +10298,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
@@ -10391,7 +10498,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, hatchActive),
+          ..._m4RecoveryLines(hubContext, hatchActive, opts.markerInertLines ?? null),
         ].join("\n"),
       };
     }
@@ -10753,6 +10860,11 @@ function _judgeResolvedTarget(sub, target, execCwd) {
     `     IGNORES (the fleet's sanctioned layout is the gitignored .worktrees/:`,
     `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+    ..._ENV_HATCH_CAVEAT,
+    `   ⛔ The TTL escape MARKER does NOT lift this gate: a stranded lane may recover`,
+    `     with it, it may not manufacture the deadlock. So the route above (outside`,
+    `     the checkout, or under the ignored .worktrees/) IS the reaching-session`,
+    `     remedy here — it needs no hatch at all.`,
   ].join("\n");
 }
 
@@ -10807,7 +10919,13 @@ function _unjudgeableTargetReason(sub, targetText, execCwd, why) {
     `   git op that could move it out again — the deadlock cannot repair itself.`,
     `   → Spell the target literally so it can be judged, and put the worktree`,
     `     OUTSIDE the checkout or under a path that checkout IGNORES.`,
+    `   → Worktree targets under a path the checkout ALREADY ignores need no hatch`,
+    `     at all (that is the sanctioned .worktrees/ layout) — so the route above is`,
+    `     the one a running session can take.`,
     `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+    ..._ENV_HATCH_CAVEAT,
+    `   ⛔ The TTL escape MARKER does NOT lift this gate: a stranded lane may recover`,
+    `     with it, it may not manufacture the deadlock.`,
   ].join("\n");
 }
 
@@ -11322,18 +11440,64 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const out = [];
   const seen = new Set();
   const base0 = resolve(sessionCwd || process.cwd());
-  const push = (raw, cwd, via, site = "top") => {
+  const push = (raw, cwd, via, site = "top", bareTilde) => {
     const t = _stripQuotes(String(raw ?? "").trim());
     if (!t || t === "/dev/null" || t.startsWith("/dev/")) return;
     const resolved = resolve(cwd, t);
-    const key = `${via}:${resolved}`;
+    // ⛔ THE DEDUPE KEY IS THE OPERAND AND ITS SITE CWD — NEVER THE LEXICAL
+    // ANSWER (#4101 review, P2 — REPRODUCED). `resolve()` collapses `..`
+    // LEXICALLY, while the kernel applies it to the directory a symlink
+    // RESOLVED to, so two spellings that bash sends to two different files can
+    // share one key and the second is dropped before any link-aware probe:
+    //
+    //     ln -s <dirty wt>/sub /tmp/ld
+    //     git show HEAD:dirty.txt > /tmp/dirty.txt 1> /tmp/ld/../dirty.txt
+    //
+    // reported ONE target (`/tmp/dirty.txt`) — the arm probed `/tmp`, found no
+    // checkout and ALLOWED — while bash writes `<wt>/dirty.txt` through the
+    // second spelling and truncates its uncommitted content (then `git status`
+    // reads clean, so the loss is silent). The key is the PAIR the caller keeps
+    // for exactly this reason (`raw` + `cwd`), so two spellings are two
+    // landing questions; only a REPEAT of the same spelling from the same site
+    // is deduped, which is what this set is for.
+    const key = `${via}:${resolve(cwd)}:${t}`;
     if (seen.has(key)) return;
     seen.add(key);
     // #618/#621: carry the SITE cwd (the dir the write executes from) so the
     // caller can classify same-checkout vs deliberate cross-checkout writes
     // (a candidate whose resolved target sits in a DIFFERENT checkout than
     // its site cwd is a hub write the session shell is not rooted in).
-    out.push({ resolvedPath: resolved, via, site, cwd: resolve(cwd) });
+    //
+    // ⛔ `raw` IS THE DE-QUOTED SPELLING, AND IT IS NOT REDUNDANT (#4101).
+    // `resolvedPath` is `resolve(cwd, raw)` — an answer — while a caller that
+    // must substitute a same-command `NAME=<literal>` assignment (#1060's
+    // `$MAIN_REPO`) needs the OPERAND, because substituting INTO a resolved
+    // absolute path would re-anchor it. Carrying both lets such a caller ask
+    // `resolve(site.cwd, substitute(raw))` and get the shell's own answer,
+    // instead of re-anchoring a `relative(...)` string at whatever cwd it
+    // happens to hold (the #4101 P0: a plain `cd` chain yielded no execution
+    // cwd, so `../f` was measured against the SESSION checkout).
+    out.push({
+      resolvedPath: resolved,
+      raw: t,
+      via,
+      site,
+      cwd: resolve(cwd),
+      // ⛔ WHETHER THE SHELL WOULD EXPAND A LEADING `~` (#4101 review, P3).
+      // `readWord` hands back the DE-QUOTED text, so `> "~/x"` (which writes
+      // `<cwd>/~/x`) and `> ~/x` (which writes `$HOME/x`) are the same string
+      // here — and only the second is a tilde word. The raw source character is
+      // the only place that survives, so the redirect sites record it and
+      // `_writeLandingSpelling` (index.ts) expands `~` only when it is set.
+      // `undefined` keeps the pre-#4101 behaviour for non-redirect callers.
+      bareTilde: bareTilde === undefined ? undefined : !!bareTilde,
+    });
+  };
+  // A redirect operand, with the tilde fact its de-quoted spelling lost.
+  // `at` is the operand's first RAW source character.
+  const _pushRedir = (w, at, cwd) => {
+    const rt = { raw: w, cwd, bareTilde: s[at] === "~" };
+    redirs.push(rt, ...forkTwins(rt));
   };
   // Bash cwd semantics (probe-verified):
   //  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),
@@ -12788,7 +12952,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (s[p2] === ">") p2++;
         p2 = skipWs(p2);
         const operand = readWord(p2);
-        if (operand.w && !/^-?[0-9]*$/.test(operand.w)) { const _rt1 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt1, ...forkTwins(_rt1)); }
+        if (operand.w && !/^-?[0-9]*$/.test(operand.w)) _pushRedir(operand.w, p2, f().cwd);
         i = operand.k;
         continue;
       }
@@ -12865,9 +13029,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (s[k] === ">" && s[k + 1] === "&") {
         // `N>&M` / `N>&-` is a dup/close (no file). Legacy `>&file` (target not
         // an fd) DOES write the file, so keep it.
-        const tgt = readWord(skipWs(k + 2));
+        const tgtAt = skipWs(k + 2);
+        const tgt = readWord(tgtAt);
         if (/^[0-9-]*$/.test(tgt.w)) { i = tgt.k; continue; }
-        const _rtd = { raw: tgt.w, cwd: f().cwd }; redirs.push(_rtd, ...forkTwins(_rtd));
+        _pushRedir(tgt.w, tgtAt, f().cwd);
         i = tgt.k; continue;
       }
       // `N>f` / `N>>f` / `N>|f` opens f with O_TRUNC for ANY fd — a tracked-file
@@ -12880,7 +13045,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (n1 === ">" || n1 === "|") { op += n1; p = k + 2; }
       p = skipWs(p);
       const operand = readWord(p);
-      const _rt2 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt2, ...forkTwins(_rt2));        // pre-cd (pending not applied)
+      _pushRedir(operand.w, p, f().cwd);        // pre-cd (pending not applied)
       i = operand.k;
       continue;
     }
@@ -13474,7 +13639,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               p2++;
               p2 = skipWs(p2);
               const opnd = readWord(p2);
-              if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+              if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
               k = opnd.k;
               continue;
             }
@@ -13489,13 +13654,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               // >& file — legacy redirect-ALL: the operand IS a content write
               p2 = skipWs(p2);
               const opnd = readWord(p2);
-              if (opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt4 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt4, ...forkTwins(_rt4)); }
+              if (opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
               k = opnd.k;
               continue;
             }
             p2 = skipWs(p2);
             const opnd = readWord(p2);
-            if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+            if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
             k = opnd.k;
             continue;
           }
@@ -13658,7 +13823,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
   }
   applyPending();
-  for (const r of redirs) push(r.raw, r.cwd, "redirect", "site");
+  for (const r of redirs) push(r.raw, r.cwd, "redirect", "site", r.bareTilde);
   for (const v of verbToks) push(v.raw, v.cwd, v.via, "site");
   for (const t of tees) {
     // cycle-36 B: the collection must stop at the first top-level `;`/`&`/`|`/`)`
