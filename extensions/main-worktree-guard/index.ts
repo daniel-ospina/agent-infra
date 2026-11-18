@@ -2354,7 +2354,10 @@ function _catFileRevertStateBlock(
       try {
         const lst = statSync(landing);
         if (!lst.isDirectory() && lst.nlink > 1) { hardlinked = landing; continue; }
-        landing = realpathSync(landing);
+        // `_kernelResolve` first, for the same reason as above: `realpathSync`
+        // normalises `..` lexically and can name a directory the write never
+        // reaches.
+        landing = _kernelResolve(landing) ?? realpathSync(landing);
       } catch { /* nothing at the landing path yet — the ancestor walk below decides */ }
     }
     let dir = dirname(landing);
@@ -2366,8 +2369,10 @@ function _catFileRevertStateBlock(
       dir = parent;
     }
     // …and the ancestor itself may be reached THROUGH a symlinked directory
-    // (`> /tmp/out/f` where `out` → a checkout), so resolve that too.
-    try { dir = realpathSync(dir); } catch { /* keep the lexical dir */ }
+    // (`> /tmp/out/f` where `out` → a checkout), so resolve that too — with the
+    // KERNEL walker, because a `..` above a link must be applied to the link's
+    // target, not to its spelling.
+    dir = _kernelResolve(dir) ?? dir;
     candidates.add(dir);
   }
   if (scriptDir !== null) candidates.add(scriptDir);
