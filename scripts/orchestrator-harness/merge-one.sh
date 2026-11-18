@@ -1967,8 +1967,9 @@ REV_STARTED=1
 # that keying's ceiling `CLAIM_TTL_MAX` (43200 since agent-infra#4034; 9600 before it), and its test is
 # a STRICT `-gt`, so a lease of exactly
 # the ceiling is never clamped. The reviewer bound therefore stays un-clamped only while
-# `REVIEW_TIMEOUT + _gw + 300 <= 43200` — 42000 s at the default 900 s gate wait, and 39000 s on a
-# box running `GATE_POLL_SECS=60`. Past that threshold the lease is pinned at 43200 and the clamp
+# `REVIEW_TIMEOUT + _gw + 300 <= 43200` — 42000 s at the default 900 s gate wait, and 41100 s on a
+# box running `GATE_POLL_SECS=60` (`43200 − 1800 − 300`; ⛔ 3900 is that box's whole merge TERM, not
+# its `_gw`). Past that threshold the lease is pinned at 43200 and the clamp
 # erodes the post-review headroom, reaching ZERO at `REVIEW_TIMEOUT` = 43200; only ABOVE 43200 does
 # the
 # claim actually expire under a reviewer that is still running — a second lane free to take the claim

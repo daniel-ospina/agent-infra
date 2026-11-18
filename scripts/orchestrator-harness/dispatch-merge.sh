@@ -39,7 +39,8 @@ chmod +x "${_DM_WORK:-$O}/lane.sh" "${_DM_WORK:-$O}/merge-one.sh" "${_DM_WORK:-$
 # from its EXIT trap — the NORMAL path. This is the path that never reaches that trap: the worktree
 # could not be created, so no lane and no chain are spawned and NOTHING else will ever release the
 # claim. Without this, a single failed `git worktree add` would hold a FREE issue across every box
-# until the lease ran out (CLAIM_ISSUE_TTL, 5 h since #2029 and 13 h 20 m since agent-infra#4034) — and the reaper would meanwhile return the issue to
+# until the lease ran out (CLAIM_ISSUE_TTL, 4 h since #2029, 5 h since #2999, 13 h 20 m since
+# agent-infra#4034) — and the reaper would meanwhile return the issue to
 # the pool, where every box would read it as another box's live claim.
 # The record/fence convention is claims.sh's `claim_issue_release_record` (one implementation; see
 # its comment for why the handover file exists rather than the acquiring process doing the release).

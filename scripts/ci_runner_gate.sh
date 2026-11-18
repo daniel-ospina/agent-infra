@@ -66,7 +66,16 @@
 #   ci_runner_gate.sh --dry-run  # evaluate and report, change nothing
 #   ci_runner_gate.sh --status   # print mode + capacity census, exit 0 (2 when either is unmeasured)
 #
-# EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
+# EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act. On exit 2 NO mode DECISION is taken
+# (the pool is neither engaged nor released on a value that was not read), and since #4085's second leg
+# a pass that could not measure the QUEUE'S DEMAND CONVERGES the pool to the mode the state file records
+# WHERE THE POOL DIFFERS FROM IT — a repair of an earlier pass's decision, never a new one. That is ONE
+# narrow arm of several: with nothing recorded, with the pool already in that mode, with an empty managed
+# set, when the write does not land, and on a re-read that does not answer, the pass changes nothing (or
+# says exactly what it did change) and names it in BOTH the log and the verdict. No count is stated here
+# on purpose — the arm list is the rc 3 block in `main`, and a number in this header has already drifted
+# once (#4085 review P3).
+
 #
 # OUTPUT A SCHEDULER CAN BRANCH ON: `$STATE_DIR/ci-runner-gate.verdict`, one `key=value` line per
 # run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `reason=` (last). The mode
@@ -78,6 +87,15 @@ STATE_DIR="${CI_GATE_STATE_DIR:-$HOME/.pi/agent/state}"
 STATE_FILE="$STATE_DIR/ci-runner-gate.state"
 VERDICT_FILE="$STATE_DIR/ci-runner-gate.verdict"
 LOG_FILE="$STATE_DIR/ci-runner-gate.log"
+# ⛔ THE THREE DECISION KEYS A NON-DECIDING PASS REPORTS AS `unmeasured` (review P3, #3002 P2's rule:
+# `missing != unmeasured`). `write_verdict` always emits `held=`/`streak=`/`engagement_lost=` — they are
+# the ones a scheduler reads to answer "is the gate holding, and has engagement been lost?" — so a
+# strict parser must never see them ABSENT on a pass that took no hold decision and read no durability.
+# `0` would be a number that pass never measured. ONE literal, referenced by every non-deciding writer:
+# the blind writer was fixed first and the two `could not measure` writers still omitted these keys
+# while their own comment claimed "same keys, same order, in both writers" — duplication is how a key
+# set drifts, so the text lives here and nowhere else.
+VERDICT_NO_DECISION_KV="held=unmeasured streak=unmeasured engagement_lost=unmeasured"
 # ⛔ gh ITSELF WRITES DIAGNOSTICS TO STDERR, AND THIS SCRIPT READS gh's OUTPUT AS VALUES (agent-infra#2897,
 # measured on this box). A wrapper on PATH printed
 #   `gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)`
@@ -99,6 +117,82 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
+# ⛔ THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113). The runs endpoint is NEWEST-FIRST, so
+# one page is the NEWEST $QUEUE_PAGE queued runs — not the queue. Measured on daniel-ospina/tortoise
+# 2026-11-17T11:16Z: 201 runs queued, the oldest row of page 1 was 2026-11-11T20:47Z, and the queue's
+# genuinely oldest demanding run (42064937107, 2026-11-05T16:29Z, 1 of its 22 jobs queued) was on
+# page 2 and therefore INVISIBLE to the walk. The walk's question is "which queued run is the
+# OLDEST with a queued job", and it cannot be answered from the newest page. Reading the extra pages
+# costs one list call per $QUEUE_PAGE runs (2 for the queue above) and the length leg's own threshold
+# bounds how much of it can ever matter, so the read is cheap; the bound below exists only so a
+# pathological queue cannot turn one pass into an unbounded walk.
+QUEUE_MAX_PAGES="${CI_GATE_QUEUE_READ_MAX_PAGES:-5}"
+# ⛔ THE GHOST LEDGER (agent-infra#4113) — WHY THE SCAN BOUND CANNOT SIMPLY BE RAISED AGAIN.
+# `QUEUE_HEAD_SCAN_MAX` bounds READS PER PASS, but the population it must walk is PERMANENT and
+# MONOTONICALLY GROWING: GitHub keeps a run whose jobs were never created in `status=queued` forever
+# (such a run cannot be cancelled — 409 — or deleted, and it can never occupy a runner, so no pass
+# will ever clear it). Measured 2026-11-17: 43 consecutive passes each proved the 25 oldest of a
+# ~190-deep queue were ghosts and then refused, so `mode=local` was pinned from 2026-11-06T01:30Z on
+# — the gate could not reach a verdict in either direction, and the pool stayed armed on a repo whose
+# hosted runners were demonstrably serving (in_progress=7). The bound was already raised once for
+# this exact reason (5 -> 25, agent-infra#3995, landed 2026-11-11) and the population outgrew it
+# within six days: a raise is an EXPIRY DATE, not a fix, because any fixed count over a growing
+# population is exceeded eventually by construction.
+# So the proof is REMEMBERED: a run that a readable jobs read showed to have ZERO JOBS AT ALL — and
+# that was already older than GHOST_TRUST_AFTER_S when it was read — is a ghost for good, and the next
+# pass discounts it without a read. The bound then bounds API cost (reads per pass) instead of bounding
+# how much of the queue the gate can ever see, and the walk completes CUMULATIVELY: a 200-deep ghost
+# population resolves in ceil(200/25) passes instead of never.
+# ⛔ THE TWO CONDITIONS ARE THE SOUNDNESS ARGUMENT, NOT DECORATION. (a) ZERO TOTAL JOBS, not merely
+# "no job in `queued` status": a run whose jobs exist but are `waiting` (concurrency group, environment
+# approval) or executing is TIME-LOCAL evidence — it can become demand later, so it is re-read on every
+# pass and never remembered. (b) AN AGE FLOOR, for the case where the run's jobs have not been created
+# yet at all: GitHub creates a run's jobs progressively, and the #2344 comment in this file records
+# 8-11 h old runs whose job set was still filling in.
+# ⛔ (a) AND (b) ARE NOT REDUNDANT, AND THE DIFFERENCE IS EXACTLY THE #2344 MEASUREMENT (agent-infra#4113
+# review, P1). The 8-11 h population the #2344 comment names had ZERO QUEUED jobs, not zero TOTAL jobs —
+# those runs' job sets were fully created. They are excluded here by (a), which is the strict predicate,
+# and NO age rule could separate them (the #2344 comment says so). The age floor exists only for the
+# narrower case (a) cannot express: a run created minutes ago whose job set is still being created, where
+# "zero jobs so far" really can become "jobs" a moment later. One hour is far past that window (jobs
+# appear within seconds-to-minutes of a run's creation) while remaining well below the multi-day ages of
+# the population actually measured live: the ghosts on the pinned repo were created 2026-11-05…11-11, read
+# on 2026-11-17.
+# ⛔ AND THE PROOF EXPIRES, WHICH IS WHAT MAKES THE 8-11 h AMBIGUITY NOT LOAD-BEARING (agent-infra#4113
+# cycle 2, P1 — an earlier draft left two paragraphs that disagreed about it, one of which would have made
+# a 3600 s floor unsatisfiable). Whichever reading of that note holds, an entry is re-read within
+# GHOST_REPROVE_AFTER_S, which is set ABOVE 11 h, so a job set that is still filling in is re-read after
+# the window closes instead of being trusted for the life of the queue.
+# ⛔ THE FAIL-OPEN DIRECTION THIS MUST NEVER TAKE: discounting a run that could still become demand
+# would understate `queued_demanding` and certify "nothing is waiting" over a real stall — the exact
+# defect #2344 exists to remove, one cache layer down. Hence: an UNREADABLE ledger is discarded whole
+# (never partially trusted), an unreadable jobs read remembers nothing, and an entry is dropped the
+# moment the run leaves the queued candidates.
+# ⛔ AND A PROOF EXPIRES (agent-infra#4113 review cycle 2, P0 — measured). A reading is a fact about ONE
+# MOMENT, and a run can gain jobs WHILE STAYING `queued` (a progressive job set finishing, a new
+# attempt), so "it never leaves the queue" does NOT invalidate the entry. Without an expiry the entry is
+# re-written on every pass, the run is never re-read, and the gate certifies "nothing is waiting" over
+# live demand and STRIPS the pool — reproduced: pass 1 sees `.jobs: []`, pass 2 answers a queued job for
+# the same run, and the pass logged `ghost_cached=1`, `jobs reads: 0`, `nothing is waiting for a runner`.
+# So every entry carries the EPOCH AT WHICH IT WAS PROVEN, a hit does NOT refresh it, and an entry older
+# than GHOST_REPROVE_AFTER_S is dropped at load — i.e. re-read and re-proven by this pass. The staleness
+# of a discount is therefore bounded by that interval instead of by GitHub's behaviour.
+GHOST_LEDGER_FILE="$STATE_DIR/ci-runner-gate.ghosts"
+# 3600 s is a floor on TRUST only: a younger ghost is re-read, which costs a read and never costs a
+# claim. It is NOT what excludes the 8-11 h population the #2344 comment cites — those runs had zero
+# QUEUED jobs, not zero TOTAL jobs, and are excluded by the zero-total predicate itself (see above).
+GHOST_TRUST_AFTER_S="${CI_GATE_GHOST_TRUST_AFTER_S:-3600}"
+# ⛔ HOW LONG A PROOF IS TRUSTED (agent-infra#4113 cycle 2, P0). 43200 s = 12 h — ABOVE the widest
+# progressive-creation reading anywhere in this file (the #2344 comment's 8-11 h runs), so under EITHER
+# reading of that measurement a re-prove happens before a job set could still be filling in — and it also
+# bounds the cost: a proven population of a few hundred ghosts costs a handful of re-reads per DAY.
+# 0 is allowed and means "never trust a remembered proof", i.e. exactly the pre-ledger behaviour
+# (every pass re-reads): safe, just expensive. It is NOT refused like the other zeros, because here the
+# zero is the fail-CLOSED end of the scale, not a disarmed bound.
+GHOST_REPROVE_AFTER_S="${CI_GATE_GHOST_REPROVE_AFTER_S:-43200}"
+#   (12 h: above the 11 h progressive-creation reading, and ~18x the 40 min a 200-deep population needs to
+#    be swept at the shipped 25-read budget and 5 min cadence — a sweep must finish well inside the
+#   interval, or expired entries would keep restarting it and the walk could never certify anything.)
 # ⛔ HOW MANY QUEUED RUNS THE HEAD SCAN MAY READ (agent-infra#2344), and why a bound is enough.
 # A run in `status=queued` is NOT evidence that anything is waiting for a runner. GitHub leaves a run
 # whose jobs were never created in that state FOREVER, and such a run cannot be cancelled (409
@@ -128,13 +222,23 @@ QUEUE_PAGE=100
 # Ghosts accumulate at the OLD end (they never start while newer runs come and go), which is both
 # where they are and where the age comes from — so the bound must exceed the LIVE ghost population or
 # every pass refuses. ⛔ IT WAS 5, ON THE MEASUREMENT "3 on agent-infra, 3 on tortoise with headroom",
-# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43Z): tortoise's queue
-# carried **14 consecutive job-less runs** at the head of the gate's own candidate list (2026-11-11
-# 20:49:45Z…20:53:24Z, `jobs: 0` on every one), so a 5-run window refused on EVERY pass —
-# `beyond the 5-run scan window`, no verdict written for 15 h (the verdict file still said `queued=83`
-# against a live queue of 238), and the `local → github` release unreachable. The SAME script with
-# `CI_GATE_QUEUE_HEAD_SCAN_MAX=25` measured the queue on the same minute. 25 is that population with
-# ~1.8x headroom; the cost is one jobs read per skipped ghost, on a pass whose cadence is minutes.
+# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43–03:47Z). Two readings of
+# the SAME queue head, kept separate because they are different measurements:
+#   * a walk of page 1 of `status=queued` (oldest-first, this gate's own `jobs[].status == "queued"`
+#     predicate) found **14 consecutive rows with ZERO jobs created at all**, 2026-11-11
+#     20:49:45Z…20:53:24Z, with real demand at index 15 (run 43130574723, 30 jobs, 1 queued);
+#   * the gate's own 25-row pass one minute earlier discounted **10** ghosts before reaching demand
+#     (`probe: … ghost_runs=10 … oldest_queued_s=11178 in_progress=9` — quoted with an elision: the
+#     line in the log carries `threshold=` between those fields, so it cannot be grepped contiguously)
+#     — the head moves as new runs arrive, so the two counts differ by WHEN they were taken, not by
+#     method.
+# Either way a 5-run window cannot reach demand, and the pass refuses: measured twice by hand on
+# 2026-11-12 (`beyond the 5-run scan window`, exit 2 — and `--dry-run` writes no verdict, so a box
+# that only ever hand-runs this gate keeps an arbitrarily old verdict file; this box's said
+# `queued=83`). 25 is the 14 with ~1.8x headroom; the cost is one jobs read per skipped ghost, on a
+# pass whose cadence is minutes. WHICH COPY ACTUALLY RUNS ON THE OWNER'S MAC IS NOT MEASURED HERE
+# (agent-infra#3936: the farm/plist chain can sit behind the repo) — this constant is what the repo
+# ships, and the fix reaches an executed copy by sync, not by an env var (see the next paragraph).
 # ⛔ THE POPULATION GROWS (3 a week earlier → 14), so if this refuses again the answer is to raise the
 # bound HERE — the default — and never to treat the refusal as "no demand". ⛔ AND NOT BY SETTING THE
 # ENV KNOB ON THE DEPLOYED COPY: the farmed `~/.pi/agent/scripts/ci_runner_gate.sh` is overwritten by
@@ -289,6 +393,21 @@ ABSORPTION_QUEUED=""
 # dead state with a comment claiming a consumer (cycle-6 review, finding 2).
 ABSORPTION_DEMANDING=""
 ABSORPTION_GHOSTS=""
+# ⛔ THE DEMAND READ CAN BE UNMEASURED WITHOUT THE PASS BEING UNMEASURABLE (agent-infra#4085, second
+# leg). `DEMAND_BLIND` is the FOURTH evaluate answer (rc 3, after 0 ok / 1 unhealthy / 2 cannot-measure): the queue's DEPTH was read, the census was
+# read, and the ONE thing that could not be measured is which label set the head of real demand asks
+# for — because the head scan's window ran out on ghost runs (see the scan).
+#   * It is NOT `queued_demanding=0` and NOT "no demand": treating a refusal as no demand is the
+#     fail-open the #2344 scan exists to prevent (`queued_demanding` is left EMPTY, and every surface
+#     renders it `unmeasured`, never `0`).
+#   * It is NOT a licence to decide: a pass that could not measure demand takes NO new mode decision
+#     (the length and throughput legs are DISARMED, so it can neither engage nor release on a value it
+#     did not read). What it CAN do is honour the decision an EARLIER pass took and recorded — the
+#     pool is converged to `ci-runner-gate.state`, which is a repair, not a decision (see `main`).
+#   * It is NOT a silent exit: `main` writes `verdict=unknown` naming the unmeasured leg and the log
+#     line names what stopped the scan. It does NOT notify/alarm — the alarm set is scoped to the
+#     CAPACITY read on purpose (#2897), and that scope is a recorded decision this change keeps.
+DEMAND_BLIND=0
 
 # ── capacity census state (agent-infra#2904 · #2897 · #2931) ───────────────────────────────────
 # CENSUS_VERDICT is the CAPACITY question's answer, kept separate from the MODE answer on purpose:
@@ -348,6 +467,12 @@ DEMAND_SHOWN=""        # the same sets on ONE line (`;`-joined), for the key=val
 # ever match it, so a run nobody is stranded for read as `stranded` while both arch runners sat ONLINE
 # AND IDLE. The union is a fine THING TO REPORT and a wrong thing to MATCH.
 CAPABILITY=""          # which permission the inventory read needed, when it could not be read
+# ⛔ HOW MANY RUNNERS THE LAST `set_labels` ACTUALLY WROTE (agent-infra#4085 review P1, measured). Its exit
+# status means "no failures", NOT "something was written": an EMPTY managed set (no runner carries the
+# pool marker — an empty pool, or a pool whose registrations lost the marker) leaves `WANTED_BODY` empty,
+# so `ok=0 fail=0 unverified=0` and the function returns 0. A caller that reads only the exit code then
+# reports a convergence NO PUT PERFORMED. Never infer a write from the status; read this.
+SET_LABELS_OK=0
 MODE_SOURCE="runners"  # runners | jobs-inference | none — how `mode` was obtained
 CAP_DENY=0             # set by capacity_verdict: 1 = this pass may not certify capacity
 
@@ -369,7 +494,7 @@ need gh; need curl; need python3
 # ── runner capacity census ──────────────────────────────────────────────────────
 # ONE paginated read of the runner inventory, reduced to the three fields that carry the answer.
 # `<status> TAB <busy> TAB <labels,comma>`. ⛔ THE COMMA IS NOT ASSERTED SAFE (#3002 review P2): labels
-# are no longer character-policed (:197-206 — policing them froze the fleet on somebody else's label
+# are no longer character-policed (policing them froze the fleet on somebody else's label
 # name), so one CAN contain the delimiter, and the split is then untrustworthy. That is not ignored: it
 # is DETECTED (`CENSUS_LABEL_AMBIGUOUS`) and it narrows every demand claim below. Do not restore a
 # "can never contain one" claim here — it would re-justify deleting the only guard against a false
@@ -395,7 +520,7 @@ runner_census() {
   # has no runners" and "the response body contained nothing at all" used to be BYTE-IDENTICAL output
   # (empty stdout, rc 0) — and this script resolved that ambiguity toward "measured zero". A blank 200
   # then read as `runners=0`, which in mode=local with a measured demand is a `stranded` DENY, i.e. a
-  # relabel taken on a read with no value in it — while `current_mode` (:800) refuses the identical
+  # relabel taken on a read with no value in it — while `current_mode` refuses the identical
   # body. A page row is emitted by JQ ITSELF the moment it parses a body whose `.runners` is an array,
   # so its presence distinguishes "answered, with N runners" (N may be 0) from "produced nothing"
   # without a second read. `.runners|type` is carried rather than assumed: a body that answers with
@@ -530,7 +655,7 @@ census_classify() {
     [ -n "$row" ] || continue
     # ⛔ A PAGE ROW IS THE PROOF THE BODY ANSWERED (#3002 review P1) — see runner_census. It is
     # consumed here and never counted as a registration; without at least one of them the stream is a
-    # read that produced nothing, and "nothing" is NOT "no runners" (:391 below).
+    # read that produced nothing, and "nothing" is NOT "no runners" (the row shape check below).
     case "$row" in
       '#'*)
         case "$row" in '#page'$'\t'*$'\t'*) ;; *) return 1 ;; esac
@@ -582,7 +707,7 @@ $labels" ;;
     else
       # ⛔ `offline` IS THE FACT; "never online" IS NOT (#3002 review P2). The runner object carries
       # `id os status busy labels` and NOTHING that says a registration has EVER connected — `status`
-      # is validated to be `online|offline` (:302). Measured 2026-10-28 on this repo: 5 of 8 offline,
+      # is validated to be `online|offline`. Measured 2026-10-28 on this repo: 5 of 8 offline,
       # and they are long-standing pool members (cell3-x64-4, cell4-1), i.e. runners that were online
       # earlier and dropped. Reporting those as "never came online" states a fact the read cannot
       # establish, and it was used as the operational diagnosis in the PR body.
@@ -630,7 +755,7 @@ $labels" ;;
 # ghost/not-ghost distinction (measured against the live API 2026-11-06: the ghost run 37642335832 →
 # rc 0, no output; a run with queued jobs → rc 0, `ubuntu-latest`; an unknown run id → rc 1).
 run_queued_demand() {
-  local rid="$1" out l sets=0
+  local rid="$1" out l sets=0 labels_out="" page_jobs jobs_measured=0 jobs_total=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
   # ⛔ `--paginate` IS REQUIRED, NOT TIDINESS (review P1). GitHub's list endpoints default to 30 per
   # page, and a RUN'S JOBS ARE LISTED IN CREATION ORDER — so on a run with more than 30 jobs the ones
@@ -641,19 +766,186 @@ run_queued_demand() {
   # made that shape load-bearing evidence, the under-read would silently DISCOUNT real demand and
   # strip the pool during a stall. `per_page=100` keeps the ordinary run at one call; `--paginate`
   # covers the rest, and gh applies `--jq` per page so the per-line output concatenates.
+  # ⛔ AN ABSENT `.jobs` IS NOT A MEASURED ZERO (agent-infra#4113 review, P1), which is why the page row
+  # is guarded by `type == "array"` and the queued-job selection reads `(.jobs // [])[]`: a 200 body that
+  # parses but carries no job array (a schema change, a proxy body — the #1704 class this file cites
+  # twice) must produce NO page row, so the caller's `jobs_measured` stays 0 and NOTHING is remembered.
+  # `(.jobs // []) | length` — the first cut — coerced that absence to 0, i.e. it minted the exact claim
+  # ("zero total jobs") that makes a ghost PERMANENT, from a read that measured nothing.
+  # ⛔ THE `#jobs` PAGE ROW IS THE LEDGER'S EVIDENCE (agent-infra#4113): it reports how many jobs the
+  # page carried, so the caller can tell "this run has NO jobs at all" (permanent) from "this run has
+  # jobs, none of them queued" (time-local). It is a page row rather than a return-code arm because
+  # rc carries the ghost/failed/unspellable distinction the scan already depends on, and it is emitted
+  # for EVERY page and SUMMED (a run's job set may span pages). `#` and TAB cannot appear in a
+  # job label — the label shape check below admits only `A-Za-z0-9._,+-` — so a page row can never be
+  # confused with a label set, which is the same protocol the census's page row uses.
+  # ⛔ IT IS CARRIED ON STDOUT AND REPARSED BY THE CALLER, DELIBERATELY (agent-infra#4113). A first cut
+  # set two globals here; the caller reads the demand through `$( … )`, i.e. in a SUBSHELL, so both
+  # were gone by the time the ledger decision ran and `set -u` killed the pass with "unbound variable".
+  # A side channel that a subshell silently drops is the same class of defect as a value nobody read:
+  # the output IS the channel, and the caller strips the row it recognises.
   out="$(gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --paginate \
-        --jq '[.jobs[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[]' 2>"$GH_ERR")" || return 1
+        --jq '(if ((.jobs|type) == "array") then "#jobs\t\(.jobs|length)" else empty end), ([(.jobs // [])[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[])' 2>"$GH_ERR")" || return 1
   [ -n "$out" ] || return 0
-  # Every LINE is one QUEUED JOB's set, and each must be spellable on its own: a job whose set cannot
-  # be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because a
-  # multi-job run is now several lines — see DEMAND_LABELS).
+  # Every OTHER line is one QUEUED JOB's set, and each must be spellable on its own: a job whose set
+  # cannot be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because
+  # a multi-job run is now several lines — see DEMAND_LABELS).
   while IFS= read -r l; do
     [ -n "$l" ] || continue
+    case "$l" in
+      '#jobs'$'\t'*)
+        page_jobs="${l#*$'\t'}"
+        case "$page_jobs" in ''|*[!0-9]*) return 2 ;; esac
+        jobs_measured=1
+        jobs_total=$((jobs_total + page_jobs))
+        continue ;;
+    esac
     case "$l" in *[!A-Za-z0-9._,+-]*) return 2 ;; esac
     sets=$((sets+1))
+    labels_out="$labels_out$l
+"
   done <<<"$out"
-  [ "$sets" -gt 0 ] || return 2
-  printf '%s' "$out"
+  # The measured total rides out on ONE row (never one per page: the caller compares it as a number,
+  # and a per-page row would make a multi-page run look like N readings). It is absent — not zero —
+  # when the body carried no page row at all, because an ABSENT reading must never be read as "zero
+  # jobs": zero is the claim that makes a ghost permanent.
+  [ "$jobs_measured" = 1 ] && printf '#jobs\t%s\n' "$jobs_total"
+  # ⛔ A BODY CARRYING ONLY A `#jobs` ROW IS A GHOST, NOT A FAILURE (agent-infra#4113): the pre-ledger
+  # function returned 2 here because a non-empty body always meant at least one label line. With the
+  # page row a readable zero is spelled explicitly, so rc 0 with NO label output keeps its #2344
+  # meaning — "readable, nothing queued" — while the total rides along in the page row above.
+  [ "$sets" -gt 0 ] || return 0
+  printf '%s' "${labels_out%$'\n'}"
+}
+
+# ts_age <RFC-3339 UTC stamp> — seconds since that stamp, on stdout.
+# rc 1 when the stamp does not parse or is in the FUTURE (a clock skew no reading can resolve). Pure
+# extraction of the one computation this file already did inline for the queue head, so the ghost
+# ledger's age floor and the throughput leg's age can never be measured on two different clocks.
+ts_age() {
+  [ -n "$1" ] || return 1
+  python3 -c '
+import datetime, sys
+t = sys.argv[1]
+try:
+    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except ValueError:
+    sys.exit(1)
+age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
+if age < 0:
+    sys.exit(1)
+print(age)
+' "$1" 2>/dev/null
+}
+
+# ts_is_old <stamp> — is this run OLD ENOUGH for its zero-job reading to be terminal?
+# rc 0 = yes (age >= GHOST_TRUST_AFTER_S), rc 1 = no / unparseable (so it is NEVER remembered).
+ts_is_old() {
+  local age
+  age="$(ts_age "$1")" || return 1
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$GHOST_TRUST_AFTER_S" ]
+}
+
+# ghost_ledger_load — the remembered ghost ids, SPACE-WRAPPED on GHOST_LEDGER (`" 4001 4002 "`) so a
+# membership test is one `case` glob and no per-candidate subprocess.
+# ⛔ AN UNPARSEABLE LEDGER IS DISCARDED WHOLE, AND THAT IS THE FAIL-CLOSED DIRECTION: a partially
+# trusted ledger could discount a run nobody proved, which understates demand and strips the pool
+# during a real stall. Discarding costs reads; trusting costs a false "nothing is waiting".
+ghost_ledger_load() {
+  local line id stamp age fresh=0 stale=0 skewed=0 now bad=0
+  GHOST_LEDGER=""
+  [ -f "$GHOST_LEDGER_FILE" ] || return 0
+  now="$(date +%s)"
+  while IFS=' ' read -r id stamp line; do
+    [ -n "$id" ] || continue
+    # ⛔ TWO FIELDS, BOTH CHECKED (agent-infra#4113 cycle 2, P1). `id` and `epoch` must each be digits and
+    # NOTHING else may follow (a third field traps a row with extra columns, which an older format or a
+    # hand edit would produce; a row with NO stamp is a proof nobody dated — exactly the shape that must
+    # not be trusted). A file that does not parse is discarded WHOLE — see the header.
+    bad=0
+    case "$id" in ''|*[!0-9]*) bad=1 ;; esac
+    case "$stamp" in ''|*[!0-9]*) bad=1 ;; esac
+    # ⛔ A STAMP THAT CANNOT BE AN EPOCH IS NOT A DATEABLE PROOF (review cycle 4, P2 — measured). `date +%s`
+    # writes 10 digits until 2286, so 11+ digits is already a format violation; it must be REFUSED here
+    # rather than left to the arithmetic below, because bash's `$(( ))` is 64-bit and WRAPS. Measured with
+    # now=1700000000: a 20-digit stamp gave `age = now - stamp` = -7766279629752241919, i.e. NEGATIVE, so
+    # the expiry test read FALSE; and `[ "$stamp" -gt "$now" ]` ERRORS on an operand beyond intmax, so the
+    # future-stamp arm never fired either. Both tests false is "not stale" — the entry is trusted, the run
+    # is never re-read, and the cycle-2 P0 (a run that gains jobs while staying `queued`, discounted
+    # forever, certifying "nothing is waiting") re-opens through the parse instead of through the clock.
+    # The bound is the length, not the value: 10 digits fits int64 with room to spare, so no accepted row
+    # can wrap, and the `??????????`-plus-one idiom matches the knob guards above.
+    case "$stamp" in ???????????*) bad=1 ;; esac
+    case "$line" in '') ;; *) bad=1 ;; esac
+    if [ "$bad" = 1 ]; then
+      log "ghost ledger UNREADABLE (bad line: '${id} ${stamp} ${line}') — DISCARDING the whole ledger: a run may be discounted only from a ledger that parsed, so every candidate is re-read this pass"
+      GHOST_LEDGER=""; return 1
+    fi
+    age=$(( now - stamp ))
+    # ⛔ A PROOF OLDER THAN GHOST_REPROVE_AFTER_S IS DROPPED HERE, not read around (cycle-2 P0): it
+    # simply is not a ghost this pass, so the run is re-read and, if still zero-job, re-proven and
+    # re-stamped. A FUTURE stamp (clock skew) is treated the same way — it is not a proof this pass can
+    # date, and trusting it would make the entry immortal.
+    if [ "$stamp" -gt "$now" ]; then
+      skewed=$((skewed + 1)); continue
+    fi
+    if [ "$age" -ge "$GHOST_REPROVE_AFTER_S" ]; then
+      stale=$((stale + 1)); continue
+    fi
+    GHOST_LEDGER="$GHOST_LEDGER $id"
+    fresh=$((fresh + 1))
+  done < "$GHOST_LEDGER_FILE"
+  GHOST_LEDGER="$GHOST_LEDGER "
+  [ "$stale" -gt 0 ] && log "ghost ledger: $stale of $((fresh + stale + skewed)) proof(s) EXPIRED (older than ${GHOST_REPROVE_AFTER_S}s) — those runs are re-read this pass and re-proven"
+  # ⛔ SKEW IS NAMED SEPARATELY (review cycle 3, P2): a future-dated stamp is dropped for a DIFFERENT
+  # reason than age, and reporting it as "older than Ns" tells an operator debugging a clock the opposite
+  # of what happened.
+  [ "$skewed" -gt 0 ] && log "ghost ledger: $skewed of $((fresh + stale + skewed)) proof(s) SKEWED (stamped in the FUTURE) — those runs are re-read this pass and re-proven"
+  return 0
+}
+
+# ghost_ledger_stamp <id> — the epoch at which this run's proof was made, or empty.
+# A HIT WHOSE STAMP CANNOT BE READ IS NOT A HIT: the caller re-reads the run. That is the fail-closed
+# direction and it costs one read, where guessing would cost a claim.
+ghost_ledger_stamp() {
+  awk -v id="$1" '$1 == id { print $2; exit }' "$GHOST_LEDGER_FILE" 2>/dev/null
+}
+
+# ghost_ledger_write <id:stamp pairs> — persist "<id> <epoch>" rows (deduped by id, first stamp wins).
+# ⛔ WRITTEN VIA A TEMP FILE AND `mv`, so a pass killed mid-write cannot leave a half-written ledger
+# that the next pass must discard (a discard is safe, but it throws away proofs and costs reads).
+# ⛔ A READ VERB DOES NOT WRITE IT (--dry-run): the ledger is a cache of read results like the verdict
+# file, but a read-out-loud verb must leave the box exactly as it found it, and losing one pass of
+# proofs is free — the next scheduled pass re-proves them.
+ghost_ledger_write() {
+  local pairs="$1" pair id stamp out="" seen=""
+  [ "$DRY" = 1 ] && return 0
+  for pair in $pairs; do
+    id="${pair%%:*}"; stamp="${pair#*:}"
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    # ⛔ DEDUPE ON THE **ID**, NOT ON THE PAIR (agent-infra#4113 cycle 2, found while pinning the stamp
+    # rule). The first cut kept ` out ` as a list of `id:stamp` PAIRS and tested `*" $id "*` against it —
+    # which can never match "4001:1794…", so the SAME run entering twice with two different stamps (the
+    # hit path and the carry-forward path both append it) produced TWO rows. A second row is not harmless:
+    # each row is a proof claim about the same run, and the loader trusts whichever it reads, so the file
+    # would grow one row per pass and re-assert a stale stamp beside a fresh one.
+    case " $seen " in *" $id "*) continue ;; esac
+    seen="$seen $id"
+    out="$out $id:$stamp"
+  done
+  if [ -z "$out" ]; then
+    # ⛔ THE FILE IS WRITTEN EVEN WHEN IT IS EMPTY, DELIBERATELY: "the ledger says nothing is remembered"
+    # and "there is no ledger" must not be the same reading to an operator (this suite asserts the first,
+    # and a `wc -l` on an absent file is an error, not a zero). It is one byte-zero write on a pass that
+    # already wrote a verdict file.
+    { : > "$GHOST_LEDGER_FILE"; } \
+      || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the ledger could not be cleared; prove-or-remember is degraded for the passes that follow"
+    return 0
+  fi
+  { printf '%s\n' $out | while IFS= read -r _row; do printf '%s %s\n' "${_row%%:*}" "${_row#*:}"; done > "$GHOST_LEDGER_FILE.tmp" && mv -f "$GHOST_LEDGER_FILE.tmp" "$GHOST_LEDGER_FILE"; } \
+    || log "ghost ledger WRITE FAILED -> ${GHOST_LEDGER_FILE} — the proved ghosts are NOT remembered; every pass re-reads them (cost, not a wrong claim)"
 }
 
 # ⛔ `queue_demand()` IS GONE (agent-infra#2344), and with it a contract that had no caller left: the
@@ -750,7 +1042,7 @@ capacity_verdict() {
   # pool's own state.
   # ⛔ IDLE IS TESTED BEFORE BUSY (#3002 review P1, and again in round 3). `saturated` means EVERY
   # ONLINE runner is busy, so a pool with idle runners must never be labelled with it — and `saturated`
-  # is a CERTIFYING word (:1049 routes it to "GitHub Actions healthy"), so the mislabel is not
+  # is a CERTIFYING word (the success writer routes it to "GitHub Actions healthy"), so the mislabel is not
   # cosmetic: it restores the very "9 busy while 7 idle" reading this instrument exists to remove.
   # ⛔ THE TWO ARMS USED TO READ THE STATES SEPARATELY, and that divergence produced the same defect
   # twice: the demand arm returned `saturated` whenever no DEMAND-matching runner was idle, even with
@@ -836,7 +1128,7 @@ print(comp, len(inc))
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
-  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (`:97` now ships 10 on the
+  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (the `QUEUE_THRESHOLD` declaration now ships 10 on the
   # 2026-11-02 owner ruling), FALSE whenever an operator raises QUEUE_THRESHOLD above the page size,
   # and the operator-invisible result was a gate that read a 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
@@ -863,7 +1155,7 @@ print(comp, len(inc))
   # HAS, even where the runner inventory is 403). Extra fields are optional: a two-field body still
   # parses, and an absent field leaves one question unmeasured instead of failing a pass that needs
   # nothing else from it.
-  local q1 q2 q3 q4 queue_rows
+  local q1 q2 q3 q4 queue_rows all_rows _p _need _got _more _more_rows _first _cand_ids _led _led_stamp reads cand_raw cand_jobs_measured cand_jobs_total queue_covered queue_rows_count cand_stamp
   IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
   queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; queue_rows="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
@@ -909,6 +1201,89 @@ print(comp, len(inc))
     ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ── THE CANDIDATE LIST MUST COVER THE QUEUE (agent-infra#4113) ────────────────────────────────
+  # ⛔ THE WALK CANNOT FIND A HEAD IT CANNOT SEE. The runs endpoint is newest-first, so the single
+  # read above is the NEWEST $QUEUE_PAGE queued runs, and the question the scan asks ("which queued run
+  # is the OLDEST with a queued job?") is exactly the one that page cannot answer. Measured
+  # 2026-11-17T11:16Z on daniel-ospina/tortoise: 201 queued, and the queue's genuinely oldest demanding
+  # run (2026-11-05T16:29Z) sat on page 2 — so the pre-fix scan walked a newest-100 window whose oldest
+  # row was 2026-11-11T20:47Z, all ghosts, and refused on EVERY pass.
+  # The extra pages cost one list call per $QUEUE_PAGE runs (2 for that queue) and nothing is read that
+  # the legs could not use: the length leg's threshold bounds how many demanding runs can matter. The
+  # rows are assembled into ONE list of DISTINCT runs (deduped by id — the pages are separate snapshots
+  # of a live newest-first list, so a run can be served twice as the window shifts), re-sorted GLOBALLY
+  # (a per-page sort only orders within a page) and never trimmed: a count greater than the reported
+  # depth is refused as contradictory, because the alternative — slicing to fit — drops rows, and the
+  # row it drops can be the head (agent-infra#4113 review, P0).
+  # ⛔ `queue_covered` IS WHAT THE PASS LATER OWES AN ANSWER FOR (see the saturated-page refusal): it is
+  # the statement "this pass read a row for every run the count reported", and it is the ONE thing that
+  # separates a measured head from a lower bound. It is cleared at entry, so the degraded bodies (no
+  # row order) cannot inherit it.
+  queue_covered=0
+  if [ -n "$queue_rows" ] && [ "$queued" -gt "$QUEUE_PAGE" ]; then
+    case "$QUEUE_MAX_PAGES" in
+      '' | *[!0-9]*) log "queue read page cap UNREADABLE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      ??????????*)  log "queue read page cap OUT OF RANGE ('${QUEUE_MAX_PAGES}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      0)            log "queue read page cap is ZERO ('${QUEUE_MAX_PAGES}') — the queue could never be covered, so this would disarm the read rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
+    esac
+    all_rows="$queue_rows"
+    _got="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    _need=$(( (queued + QUEUE_PAGE - 1) / QUEUE_PAGE ))
+    if [ "$_need" -gt "$QUEUE_MAX_PAGES" ]; then
+      log "queue ($queued) needs $_need page(s) of $QUEUE_PAGE runs to be covered, beyond the ${QUEUE_MAX_PAGES}-page read cap — FAIL-CLOSED, changing nothing; raise QUEUE_MAX_PAGES' default in this file, and only with a measurement of the queue's real depth, because each page is one more list call on every pass"
+      return 2
+    fi
+    _p=1
+    while [ "$_p" -lt "$_need" ] && [ "$_got" -lt "$queued" ]; do
+      _p=$((_p + 1))
+      # ⛔ ONE SHAPE PER FIELD, AS ABOVE: this read asks only for the row order, because the count and
+      # the oldest stamp belong to the FIRST page (a later page's min is not the queue's oldest).
+      # ⛔ THE SORT IS OVER THE ARRAY, NOT INSIDE IT (#4116 review, P0 — a one-token edit that made
+      # the ENTIRE multi-page read impossible). `sort_by` is `map([f])|sort` over its INPUT, so
+      # `[.workflow_runs[] | sort_by(.created_at)]` sorts EACH RUN — and a run object indexed by a
+      # string field of a NUMBER is a RUNTIME error, so `gh` exited non-zero on EVERY non-empty page.
+      # On any queue deeper than $QUEUE_PAGE (tortoise's measured 178-216 is exactly the case this leg
+      # exists for) that fired the `read FAILED` arm below and the gate refused every pass — the
+      # pinned state of #4113 re-worded, not fixed. The bracket closes BEFORE `sort_by`, exactly as
+      # the first page's program above does it. Verified against jq itself: the pre-fix program exits
+      # 5 with `Cannot index number with string "created_at"` on a real two-row body, this one exits 0.
+      _more="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE&page=$_p" \
+          --jq '([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";")' 2>"$GH_ERR")" \
+        || { log "queue page $_p read FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
+      _more_rows="$(printf '%s' "$_more" | tr ';' '\n' | grep -c .)"
+      # A page that answers nothing ENDS the list: the truncation it implies is refused below, by the
+      # branch that already owns that diagnosis — never read as "the queue ends here".
+      [ "$_more_rows" -gt 0 ] || break
+      all_rows="$all_rows;$_more"
+      _got=$((_got + _more_rows))
+    done
+    # ⛔ DEDUPED AND COUNTED, NEVER TRIMMED (agent-infra#4113 review, P0 — this was a SLICE, and the
+    # slice was a FAIL-OPEN). Pages are fetched seconds apart from a live, newest-first list, so the
+    # window SHIFTS between calls and one run can be served twice — deduping by run id is what makes
+    # the assembled list a set of runs. The first cut instead did `awk 'NR<=queued'`, i.e. it TRIMMED the
+    # extra rows to the reported depth to keep "scanned <= queued" true. That clamp silenced the
+    # contradiction check BELOW (which can never fire on a list that cannot exceed the depth) and, far
+    # worse, it DROPPED rows — and a dropped row is exactly where the head can be: MEASURED against this
+    # very code, a queue reported 150 deep with 151 rows assembled (page 2 one row longer than it should
+    # be, that row being the one with a queued job) logged "nothing is waiting for a runner",
+    # `ghost_runs=150`, and never read that run. So the assembled list must never be trimmed, and a
+    # count GREATER than the reported depth is refused as the contradiction it is.
+    queue_rows="$(printf '%s' "$all_rows" | tr ';' '\n' | awk -F, 'NF && !seen[$1]++' | LC_ALL=C sort -t, -k2,2 -k1,1n | paste -sd';' -)"
+    queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+    if [ "$queue_rows_count" -gt "$queued" ]; then
+      log "queue reading INCONSISTENT: the covered read assembled $queue_rows_count distinct run(s) for a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing; a page longer than its own depth is REFUSED here, never trimmed, because trimming drops rows and a dropped row is exactly where the head can be"
+      return 2
+    fi
+    # The oldest row of the COVERED list is the head the degraded-body fallback ages — recomputed here
+    # so fields 2/3 and field 4 cannot disagree about which run is oldest (the single-page body's
+    # `min_by` is the same statement over the same rows, so this only ever sharpens it).
+    _first="${queue_rows%%;*}"
+    case "$_first" in
+      *,*) oldest_created="${_first#*,}"; head_run_id="${_first%%,*}" ;;
+    esac
+  fi
+  queue_rows_count="$(printf '%s' "$queue_rows" | tr ';' '\n' | grep -c .)"
+  [ "$queue_rows_count" -ge "$queued" ] && queue_covered=1
   # ── THE HEAD SCAN: WHICH QUEUED RUN IS THE QUEUE'S ACTUAL HEAD? (agent-infra#2344) ──────────────
   # ⛔ THE QUESTION THIS ANSWERS, and why the answer was wrong before it existed. The throughput
   # leg's age came from `min(created_at)` over `status=queued`, i.e. from the oldest run that is
@@ -929,7 +1304,47 @@ print(comp, len(inc))
     ??????????*)  log "queue head scan bound OUT OF RANGE ('${QUEUE_HEAD_SCAN_MAX}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
+  # The ledger's trust floor is an operand of a numeric test like every other bound here: a non-numeric
+  # value makes `[ "$age" -ge "$GHOST_TRUST_AFTER_S" ]` ERROR, and the `&&` chain reads that as FALSE —
+  # which would silently stop remembering anything (cost), or, if a later edit inverted the comparison,
+  # remember a run too young to be terminal (a false discount).
+  case "$GHOST_TRUST_AFTER_S" in
+    '' | *[!0-9]*) log "ghost ledger trust floor UNREADABLE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost ledger trust floor OUT OF RANGE ('${GHOST_TRUST_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # ⛔ THE TRUST FLOOR REFUSES ZERO BY NAME, like the two sibling bounds (cycle-2 review, P2): a zero floor
+  # disables the age condition entirely, so a run read seconds after creation with no jobs yet — the one
+  # case the condition exists for — becomes a PERMANENT ghost. That is the fail-OPEN direction, which is a
+  # stronger reason to refuse than the siblings' "could never measure".
+  # ⛔ ALL ZEROS, NOT THE LITERAL `0` (review cycle 3, P1): `00`/`000` are the same number and passed every
+  # arm above, so the knob disarmed the age condition while the comment claimed it was refused — measured
+  # with the three arms copied verbatim: floor=0 → ZERO-REFUSED, floor=00 → ACCEPTED, and `ts_is_old` then
+  # answers OLD for a 5 s old run. The test is therefore on the VALUE, not on its spelling.
+  case "$GHOST_TRUST_AFTER_S" in
+    *[!0]*) ;;  # has a non-zero digit → a real floor
+    *) log "ghost ledger trust floor is ZERO ('${GHOST_TRUST_AFTER_S}') — it would disarm the age condition rather than bound it, so a run read seconds after creation (no jobs yet) would be remembered forever; FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # The re-prove interval is a bound too, but its zero is the SAFE end (re-read every pass), so only its
+  # shape is checked — a non-numeric value would make the `-ge` test error and trust an entry forever.
+  case "$GHOST_REPROVE_AFTER_S" in
+    '' | *[!0-9]*) log "ghost proof re-prove interval UNREADABLE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "ghost proof re-prove interval OUT OF RANGE ('${GHOST_REPROVE_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
   QUEUE_GHOSTS=0
+  # ⛔ `scanned` IS INITIALISED BESIDE THE SCAN, NOT HERE (agent-infra#3995 review, F3 — the line that
+  # sat here is gone, removed by 4304f70c4). It was DEAD: every read of `$scanned` is inside the `else`
+  # block below, which assigns it (`scanned=0; scan_exhausted=1`) before its first use, and the degraded
+  # no-candidate path never expands it. The reason recorded for ADDING it — "so the degraded
+  # no-candidate path cannot hit `set -u`" — was false, and the half of that reason a reader is most
+  # likely to carry away is the DANGEROUS half: a `local` declaration gives a name no VALUE, so it is
+  # no defence against `set -u` at all (measured on bash 5.2: `set -u; f(){ local b; echo "${b}"; }`
+  # aborts with `b: unbound variable`, rc 1 — an exit code this gate never emits deliberately). What
+  # actually protects the path is that NOTHING READS IT THERE, and that `scanned=0` below precedes the
+  # first read. The durable record is corrected HERE, where the next reader looks, because that commit
+  # message is append-only.
+  GHOST_CACHED=0     # how many of those ghosts were REMEMBERED (no read spent this pass)
+  GHOST_KEEP=""      # ids to persist: this pass's proofs, plus prior entries still in the queue
+  reads=0            # jobs reads SPENT this pass — what QUEUE_HEAD_SCAN_MAX actually bounds
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
@@ -965,22 +1380,77 @@ print(comp, len(inc))
     # read — the same fail-open direction as the clamp, one condition over. Only running OUT OF ROWS
     # proves the scan reached the end of the page.
     scanned=0; scan_exhausted=1
+    # ⛔ THE LEDGER IS LOADED BEFORE THE WALK, AND AN UNPARSEABLE ONE IS DISCARDED BY ITS OWN FUNCTION
+    # (see `ghost_ledger_load`): the pass then re-reads every candidate, which is the pre-ledger
+    # behaviour and costs reads rather than making a claim.
+    ghost_ledger_load
     while IFS= read -r cand; do
       [ -n "$cand" ] || continue
-      scanned=$((scanned + 1))
-      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); scan_exhausted=0; break; fi
       case "$cand" in
         *,*) cand_id="${cand%%,*}"; cand_created="${cand#*,}" ;;
         *)   cand_id="$cand"; cand_created="" ;;
       esac
       case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-      cand_demand="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ A REMEMBERED GHOST COSTS NO READ (agent-infra#4113). It has already been proven, by a readable
+      # jobs read, to have ZERO JOBS AT ALL while older than the trust floor — and the proof is not older
+      # than GHOST_REPROVE_AFTER_S, because `ghost_ledger_load` DROPS expired entries into a re-read
+      # (cycle-2 P0: without that, a run that gains jobs while staying `queued` was discounted forever).
+      # THIS IS THE LINE THAT MAKES THE BOUND A COST BOUND: with the proof remembered, a 200-deep ghost
+      # population is walked in ceil(200/QUEUE_HEAD_SCAN_MAX) passes instead of never, and a fully-proven
+      # population costs one read per pass (the head) however deep the queue is.
+      # ⛔ AND THE HIT CARRIES THE OLD STAMP FORWARD, IT DOES NOT REFRESH IT: stamping `now` on every hit
+      # would make the entry immortal and re-open the P0 one layer down.
+      case "$GHOST_LEDGER" in
+        *" $cand_id "*)
+          cand_stamp="$(ghost_ledger_stamp "$cand_id")"
+          case "$cand_stamp" in
+            ''|*[!0-9]*)
+              # NO USABLE STAMP IS NOT A HIT (fail-closed): fall through and READ the run.
+              log "ghost ledger: run $cand_id is listed but its proof stamp could not be read — treating it as UNPROVEN and reading it (one read, not a claim)" ;;
+            *)
+              scanned=$((scanned + 1))
+              QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1)); GHOST_CACHED=$((GHOST_CACHED + 1))
+              GHOST_KEEP="$GHOST_KEEP $cand_id:$cand_stamp"
+              continue ;;
+          esac ;;
+      esac
+      # ⛔ THE BOUND IS NOW ON READS, NOT ON CANDIDATES SKIPPED OVER (agent-infra#4113), and the
+      # difference is the whole fix: `scanned` counts only candidates this pass ACTUALLY EXAMINED (a
+      # ledger hit or a read), while a ledger hit above spends no read — so the budget cannot be eaten
+      # by runs whose answer is already known. A cap on candidates examined would re-pin the gate the
+      # moment the ghost population exceeded it, which is the defect, not a bound. ⛔ AND THE COUNT IS
+      # INCREMENTED AFTER THIS TEST, not before it (measured): counting the candidate that the budget
+      # refused to read made `scanned` exceed `queued` on a page that merely had one row more than its
+      # depth, so the pass refused INCONSISTENT — a contradiction it had not observed — instead of the
+      # bound it genuinely ran out of.
+      if [ "$reads" -ge "$QUEUE_HEAD_SCAN_MAX" ]; then scan_exhausted=0; break; fi
+      scanned=$((scanned + 1))
+      reads=$((reads + 1))
+      cand_raw="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      # ⛔ THE PAGE ROW IS STRIPPED HERE (see `run_queued_demand` for why it is on stdout): what is
+      # left is the label sets, so the ghost/head distinction below is unchanged, and the job total is
+      # only ever read as measured when the row was actually there.
+      cand_jobs_measured=0; cand_jobs_total=0; cand_demand="$cand_raw"
+      case "$cand_raw" in
+        '#jobs'$'\t'*)
+          cand_jobs_measured=1
+          cand_jobs_total="${cand_raw%%$'\n'*}"; cand_jobs_total="${cand_jobs_total#*$'\t'}"
+          case "$cand_raw" in *$'\n'*) cand_demand="${cand_raw#*$'\n'}" ;; *) cand_demand="" ;; esac ;;
+      esac
       if [ "$cand_rc" -eq 0 ]; then
         if [ -n "$cand_demand" ]; then
           demand_head_id="$cand_id"; demand_head_created="$cand_created"; DEMAND_LABELS="$cand_demand"
           break
         fi
         QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1))
+        # ⛔ REMEMBERED ONLY ON THE TWO CONDITIONS THAT MAKE THE READING TERMINAL (see the ledger block
+        # in the header): ZERO JOBS AT ALL — a measured zero, never an absent reading — and OLD ENOUGH
+        # that progressive job creation cannot still be filling the run in. A run with jobs but none
+        # queued (concurrency-held, or executing) fails the first condition and is re-read on EVERY pass,
+        # because it can become demand; that is the fail-open direction this must never take.
+        if [ "$cand_jobs_measured" = 1 ] && [ "$cand_jobs_total" -eq 0 ] && ts_is_old "$cand_created"; then
+          GHOST_KEEP="$GHOST_KEEP $cand_id:$(date +%s)"
+        fi
       else
         if [ "$cand_rc" -eq 2 ]; then
           log "queue candidate run $cand_id: the jobs read ANSWERED with a label set this read cannot spell — cannot prove it is a ghost, so it STAYS the queue head (no discount)"
@@ -991,6 +1461,22 @@ print(comp, len(inc))
         break
       fi
     done <<< "$(printf '%s' "$candidates" | tr ';' '\n')"
+    # ⛔ THE LEDGER IS PERSISTED HERE — BEFORE BOTH REFUSALS BELOW (agent-infra#4113). The refusing pass
+    # is the COMMON one while a ghost population is being walked, so persisting only on the paths that
+    # reach a verdict would throw away every proof and the walk could never finish (that is the pin, with
+    # extra steps). An entry is kept when this pass proved it (stamped NOW) OR when it was already known
+    # and the run is still among this pass's candidates (stamped with ITS ORIGINAL proof time, so it
+    # expires on schedule rather than on use); anything else is dropped. That bounds the file by the
+    # current queue depth, and it forgets a ghost as soon as a pass with candidates no longer lists it.
+    _cand_ids=" $(printf '%s' "$candidates" | tr ';' '\n' | awk -F, 'NF {printf "%s ", $1}')"
+    for _led in $GHOST_LEDGER; do
+      case "$_cand_ids" in
+        *" $_led "*)
+          _led_stamp="$(ghost_ledger_stamp "$_led")"
+          case "$_led_stamp" in ''|*[!0-9]*) ;; *) GHOST_KEEP="$GHOST_KEEP $_led:$_led_stamp" ;; esac ;;
+      esac
+    done
+    ghost_ledger_write "$GHOST_KEEP"
     # ⛔ THE CONTRADICTION CHECK APPLIES TO BOTH OUTCOMES, AND THAT ORDER IS THE POINT (cycle-5 review,
     # finding 1). It used to sit INSIDE the "no demand found" branch, so on the path that DID measure
     # a head the check never ran: a page one row longer than its own depth, with the extra row being
@@ -1013,15 +1499,59 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing; the walk covers up to CI_GATE_QUEUE_READ_MAX_PAGES pages of ${QUEUE_PAGE} runs, so a short read here means the list answered fewer rows than it reported depth (a truncated body, or a page that answered nothing), not that the queue is deeper than the read can ever reach"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
+        # ⛔ THE WINDOW RAN OUT ON GHOSTS: DEMAND IS UNMEASURED, NOT ZERO AND NOT A DEAD PASS
+        # (agent-infra#4085, second leg — measured 2026-11-17T04:35:15Z: `the 25 oldest of 184 queued
+        # run(s) ALL report ZERO jobs in 'queued' status … FAIL-CLOSED, changing nothing`, for days).
+        # The refusal to treat this as "no demand" is CORRECT and is kept (#2344/#3995): the scan proved
+        # the 25 runs in front of it have nothing schedulable, and proved NOTHING about the 159 behind
+        # them. What was WRONG is the blast radius of the refusal: `return 2` here also threw away the
+        # CENSUS and the repair below, so a pool whose recorded mode was `local` stayed stripped until a
+        # human relabelled it by hand — three times (2026-11-14, -16, -17). A measurement the pass may
+        # never get must not decide whether the pass can keep a promise an earlier pass already made.
+        # So: the queue legs that need demand are DISARMED (no new mode decision either way), the pass
+        # continues to the census, and `main` converges the pool to the RECORDED mode. rc 3.
+        # ⛔ THE TWO THINGS AN OPERATOR CAN DO ARE STILL NAMED, because the demand question itself is
+        # unchanged by this fix: the bound, and a hand pass. A bound at or above ${QUEUE_PAGE} cannot
+        # reach past the one page this read carries — that is a code change, not a knob.
+        # ⛔ THIS LINE PREDICTS NO OUTCOME — IT IS WRITTEN BEFORE THE STATE FILE IS READ (review P1,
+        # measured). It used to end "…and the pool is converged to the mode the state file records",
+        # the SAME sentence the verdict no longer carries: here the state file has not been read yet
+        # (`recorded="$(cat "$STATE_FILE"…)"` is ~900 lines below) and no repair has been attempted,
+        # so on the no-recorded-mode arm (no state file exists at all, no PUT is sent), on the
+        # repair-FAILED arm and on every rc 2 exit the scan can still reach, the durable LOG asserted a
+        # convergence that never happened. The repair step below logs what it actually did; this line
+        # names the disposition and the two operator levers, and nothing else.
+        # ⛔ AND IT LEARNS FROM #4113, WHICH LANDED ON main WHILE THIS BRANCH WAS OPEN: the proofs this
+        # pass made are PERSISTED (the ledger write is above, before every refusal), so the NEXT pass
+        # resumes where this one stopped and a proof is never re-bought. That is the fact the operator
+        # needs here — the read budget is a COST bound, not a reach bound — and the older wording this
+        # line carried ("the candidate list is ONE page … a bound at or above ${QUEUE_PAGE} cannot see
+        # past it") is NO LONGER TRUE: the walk assembles candidates from up to
+        # CI_GATE_QUEUE_READ_MAX_PAGES pages, so a budget at or above QUEUE_PAGE can reach past one
+        # page. A stale TRUE-sounding sentence in a log is the defect class this PR removes, so it is
+        # deleted rather than reworded.
+        DEMAND_BLIND=1
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status, so the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window ($reads jobs read(s) spent, $GHOST_CACHED discounted from the ledger) — DEMAND UNMEASURED for this pass: the legs that need it are DISARMED (this pass takes NO new mode decision and does NOT read the refusal as 'no demand'); WHEN THE OPERANDS BELOW ARE READABLE the pass continues to the census, so a mode an EARLIER pass recorded can still be repaired, and the repair step logs what it actually did — THIS line predicts no outcome; this pass REMEMBERED what it proved, so a LATER pass resumes where this one stopped and a proof is never re-bought (agent-infra#4113) — CI_GATE_QUEUE_HEAD_SCAN_MAX is a per-pass READ budget, not a bound on the region the scan can ever reach, so raising it buys reads, not reach; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap)"
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
     # arithmetic below cannot go negative once it has been (a head found ⇒ ghosts ≤ scanned-1 <
     # queued; no head ⇒ ghosts == queued exactly).
-    queued_demanding=$((queued - QUEUE_GHOSTS))
+    # ⛔ LEFT EMPTY WHEN DEMAND IS BLIND (#4085): `queued - ghosts` is NOT a demanding count when the
+    # window never reached the runs behind the ghosts — it would book the WHOLE tail as demand, which
+    # is a number this read never measured. Empty is rendered `unmeasured` on every surface and is
+    # excluded from every numeric test below, so it cannot be read as 0 and cannot be read as demand.
+    # ⛔ AND IT MUST BE CLEARED, NOT MERELY SKIPPED (measured while writing this, and again under
+    # review — the mechanism is NOT the seed): leaving the assignment to the `else` would leave
+    # `queued_demanding` as the value the queue parse RE-SEEDS (its `local` declaration + the raw-depth
+    # assignment), i.e. the RAW depth, so a pass
+    # whose scan window never reached the runs behind the ghosts would publish the WHOLE tail as
+    # demand and the LENGTH LEG would arm the pool on it. That is the fail-open direction — the refusal
+    # read as demand, the one thing #2344/#3995 forbid — and it is why the clear is explicit. Arm (d1)
+    # reddens on it.
+    if [ "$DEMAND_BLIND" = 0 ]; then queued_demanding=$((queued - QUEUE_GHOSTS)); else queued_demanding=""; fi
     fi
   fi
 
@@ -1035,18 +1565,7 @@ print(comp, len(inc))
   oldest_queued_s=""
   case "$demand_head_created" in
     '') : ;;
-    *)  oldest_queued_s="$(python3 -c '
-import datetime, sys
-t = sys.argv[1]
-try:
-    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-except ValueError:
-    sys.exit(1)
-age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
-if age < 0:
-    sys.exit(1)
-print(age)
-' "$demand_head_created" 2>/dev/null)" || oldest_queued_s="" ;;
+    *)  oldest_queued_s="$(ts_age "$demand_head_created")" || oldest_queued_s="" ;;
   esac
 
   # A queue with NOTHING DEMANDING in it has no head to age — either nothing is queued (an idle repo)
@@ -1055,9 +1574,16 @@ print(age)
   # as a STRING compare so it cannot run before `queued_demanding` has been shape-checked as a number.
   if [ "$queued_demanding" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
-  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
-  ABSORPTION_DEMANDING="$queued_demanding"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
+  # ⛔ `${x:-unmeasured}`, NEVER `$x`, ON BOTH VALUES (#4085). On a demand-blind pass both are empty by
+  # construction, and printing `queued_demanding=` / `oldest_queued_s=` would put an EMPTY value on the
+  # line a scheduler splits on — indistinguishable from a key that was never written, and one `-eq`
+  # test away from being read as zero. `unmeasured` is the vocabulary the census KV already uses.
+  # ⛔ AND `ghost_cached=` IS KEPT FROM #4113 (main): it says how many ghosts cost NO read this pass,
+  # which is the fact that makes the remembered proofs visible on the probe line rather than only in the
+  # ledger file.
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=${queued_demanding:-unmeasured} ghost_runs=$QUEUE_GHOSTS ghost_cached=$GHOST_CACHED queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=${oldest_queued_s:-unmeasured} in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  ABSORPTION_OLDEST_S="${oldest_queued_s:-unmeasured}"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
+  ABSORPTION_DEMANDING="${queued_demanding:-unmeasured}"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
 
   # ⛔ THE THROUGHPUT LEG'S OPERANDS ARE SHAPE-CHECKED EXACTLY AS THE EXISTING ONES ARE, for the
   # same reason (agent-infra#1704): an unreadable number makes `[ … -gt … ]` ERROR, and the `||`
@@ -1072,13 +1598,20 @@ print(age)
   # A run WITH A QUEUED JOB exists, so its age MUST be a measurement: empty here means the timestamp
   # did not parse (or was in the future), which is a failed read of the queue head, not "young
   # queue".
-  if [ "$queued_demanding" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
-    log "oldest queued timestamp UNREADABLE ('${demand_head_created}') — FAIL-CLOSED, changing nothing"; return 2
+  # ⛔ BOTH AGE CHECKS ARE SKIPPED WHEN DEMAND IS BLIND (#4085) — and `[ "" -gt 0 ]` is exactly why the
+  # guard is explicit rather than left to the arithmetic: an empty operand ERRORS, and an errored test
+  # in this file reads as FALSE, which here would silently accept an age that was never read. The age is
+  # empty because there is no head to age, which is already asserted by `DEMAND_BLIND`; rc 3 is
+  # returned below, before any leg could use it.
+  if [ "$DEMAND_BLIND" = 0 ]; then
+    if [ "$queued_demanding" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
+      log "oldest queued timestamp UNREADABLE ('${demand_head_created}') — FAIL-CLOSED, changing nothing"; return 2
+    fi
+    case "$oldest_queued_s" in
+      '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+      ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    esac
   fi
-  case "$oldest_queued_s" in
-    '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
-    ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
-  esac
   case "$QUEUE_STUCK_AFTER_S" in
     '' | *[!0-9]*) log "queue stuck-after floor UNREADABLE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "queue stuck-after floor OUT OF RANGE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
@@ -1159,6 +1692,23 @@ print(age)
   CAP_DENY=0
   capacity_verdict "${mode:-unknown}" || CAP_DENY=1
   log "capacity: verdict=${CENSUS_VERDICT} ${CENSUS_KV} (${CENSUS_DETAIL})"
+  # ⛔ DEMAND-BLIND IS ITS OWN ANSWER (agent-infra#4085, rc 3), AND IT IS RETURNED HERE — AFTER the
+  # census and the capacity reading (so the pass still publishes what it COULD see) and BEFORE every leg
+  # that would turn an unmeasured demand into a mode DECISION (the length leg, the saturated-page
+  # refusal, the throughput leg, the capacity deny). ⛔ THE RULE THIS ENCODES: a pass may not ENGAGE or
+  # RELEASE the pool on a value it did not read — the direction that must never happen is arming the
+  # pool for a queue nobody measured (#2327's strip stays intact). What `main` does with rc 3 is
+  # deliberately narrower than a decision: converge the pool to the RECORDED mode WHERE IT DIFFERS
+  # (repair) — or change nothing, naming why, when nothing is recorded, the pool is already in that mode,
+  # or the write does not land — report `verdict=unknown` naming this leg, and exit 2. Not 0 —
+  # "could not measure demand" is never "healthy" (#2344/#3995: never treat the refusal as no demand).
+  # ⛔ THE COMPONENT/INCIDENT DISJUNCTS OF THE LENGTH LEG ARE SKIPPED TOO, AND THAT IS A CHOICE, NOT AN
+  # OVERSIGHT (a reviewer will ask). They do not need demand: an Actions outage is a conclusive, MEASURED
+  # signal, and the normal path denies on it unconditionally. Arming the pool on it during a demand-blind
+  # pass would still be a NEW mode decision taken on a box that cannot subsequently RELEASE — the release
+  # needs the same measurement — so it would trade one indefinite label for another on evidence that says
+  # nothing about whether this pool can serve the queue. The outlier is left to the measuring path.
+  if [ "$DEMAND_BLIND" = 1 ]; then return 3; fi
 
   # ⛔ THE LENGTH LEG COUNTS RUNS THAT COULD OCCUPY A RUNNER (#2344): `queued_demanding`, i.e. the
   # queue minus the runs a READABLE read proved have no job in `queued` status. A ghost run will never
@@ -1174,18 +1724,21 @@ print(age)
     UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw depth $queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
-  # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
-  # (review P2). Reaching here means the LENGTH leg did NOT fire (`queued_demanding < QUEUE_THRESHOLD`
-  # — the operand that leg tests since #2344; the RAW `queued` may be at or above the threshold here,
-  # which is precisely what a ghost discount does), yet the
-  # queue is deeper than one page — which can only happen when an operator has raised
-  # QUEUE_THRESHOLD above the page size. In that state `oldest_queued_s` is a LOWER BOUND on the
-  # head's age (newest-first page), so a stalled queue can read young and the gate would certify
-  # healthy and strip the pool during a full stop. Could-not-measure (2) is this script's answer for
-  # every other unread operand; it is the answer here too, and the message names BOTH values so the
-  # misconfiguration is visible instead of silent.
-  if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
+  # ⛔ A QUEUE THIS PASS COULD NOT COVER LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather
+  # than certified (review P2, amended by agent-infra#4113). Reaching here means the LENGTH leg did NOT
+  # fire (`queued_demanding < QUEUE_THRESHOLD` — the operand that leg tests since #2344; the RAW
+  # `queued` may be at or above the threshold here, which is precisely what a ghost discount does),
+  # yet the queue is deeper than one page. ⛔ THE CONDITION IS NOW "COULD NOT COVER", NOT "DEEPER THAN A
+  # PAGE": the read above walks as many pages as the depth needs, so a deep queue is normally FULLY
+  # COVERED and the head it yields is a measurement, not a lower bound — refusing those passes was how
+  # a 150-deep queue on a served repo was refused every tick. What still cannot be covered is named:
+  # a degraded body that carried no row order at all, a short page, or a queue past the read cap. There
+  # `oldest_queued_s` IS only a LOWER BOUND on the head's age (the page is newest-first), so a stalled
+  # queue could read young and the gate would certify healthy and strip the pool during a full stop.
+  # Could-not-measure (2) is this script's answer for every other unread operand; it is the answer here
+  # too, and the message names BOTH values so the misconfiguration is visible instead of silent.
+  if [ "$queued" -gt "$QUEUE_PAGE" ] && [ "$queue_covered" != 1 ]; then
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) and this pass could not cover it (${queue_rows_count:-0} run row(s) read) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
     return 2
   fi
 
@@ -1346,6 +1899,7 @@ labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
 set_labels() { # $1 = on|off
   local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
   local WANTED_BODY="" verified=0 unverified=0
+  SET_LABELS_OK=0
   if ! rows="$(runner_rows 2>"$GH_ERR")"; then
     rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$rows")"
@@ -1389,7 +1943,7 @@ set_labels() { # $1 = on|off
     # ⛔ THE REFUSAL IS DEFERRED TO BELOW THE COMPLEMENT SWEEP (agent-infra#3261 review P1). It used
     # to `return 1` HERE, before the loop at "The complement is disarmed FIRST", while the message
     # claimed "the complement was disarmed above" — a log line asserting an action that had not run.
-    # The `FALLBACK_ARM_MAX=0` contract (:188-190) is exactly "the pool is RELEASED and the engaging
+    # The `FALLBACK_ARM_MAX=0` contract (stated in this script's own configuration block) is exactly "the pool is RELEASED and the engaging
     # pass refuses", so the release is the part that must happen first; measured before this fix,
     # cap=0 produced `rc=1` with **0** PUTs, stranding `ubuntu-latest` on every pool member where it
     # keeps accepting CI and is never swept, because every later pass refuses for the same reason.
@@ -1484,6 +2038,9 @@ set_labels() { # $1 = on|off
     fi
   fi
   log "set_labels accepted=$verified rejected=$unverified engagement=$eng (SYNCHRONOUS: what the API took on this call — durability is checked on the NEXT pass, because the runner agent re-asserts its own set 60-120s later)"
+  # ⛔ PUBLISH WHAT WAS WRITTEN (#4085 review P1, measured): `ok=0 fail=0` is a SUCCESSFUL no-op (an empty
+  # managed set), and a caller told only the exit status cannot tell it from a pool that was relabelled.
+  SET_LABELS_OK="$ok"
   # Unverified writes are a FAILURE for the caller: recording the transition on them is what produced
   # a state file claiming `local` with no carrier.
   [ "$fail" -eq 0 ] && [ "$unverified" -eq 0 ]
@@ -1735,7 +2292,7 @@ if [ "$STATUS_ONLY" = 1 ]; then
   exit "$status_rc"
 fi
 
-evaluate; healthy=$?          # 0 = github, 1 = unhealthy, 2 = cannot measure
+evaluate; healthy=$?          # 0 = github, 1 = unhealthy, 2 = cannot measure, 3 = demand unmeasured
 if [ "$healthy" = 2 ]; then
   # ⛔ A BLIND PASS ALARMS (#2897): the fail-closed exit is right and it is also INVISIBLE, so the
   # one thing that must not happen again is a gate that spends a morning at exit 2 while the fleet
@@ -1773,8 +2330,8 @@ if [ "$healthy" = 2 ]; then
       # reason` while the success line also carried `runners online_idle online_busy offline
       # demanding_idle demanding_busy label_ambiguity demand`). A census that was not read is
       # `unmeasured` — recorded, never assumed, and never absent.
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
-        "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — capacity was not read\n' \
+        "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" "$VERDICT_NO_DECISION_KV" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   else
@@ -1790,13 +2347,257 @@ if [ "$healthy" = 2 ]; then
     if [ "$DRY" = 1 ]; then
       log "verdict NOT updated: --dry-run reports and changes nothing (the previous verdict file is left untouched; this pass measured nothing it could stand behind)"
     else
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
         "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
-        "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
+        "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" "$VERDICT_NO_DECISION_KV" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   fi
   log "cannot measure — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
+  exit 2
+fi
+
+# ⛔ DEMAND UNMEASURED — HONOUR THE DECISION AN EARLIER PASS RECORDED (agent-infra#4085, rc 3).
+# THE MEASURED DEFECT THIS CLOSES: 2026-11-17T04:35:15Z, "./ci_runner_gate.sh": the queue's head scan
+# ran out on ghost runs, `evaluate` returned 2, and the pass said `leaving mode=local` while **no runner
+# carried the label** — three separate times capacity came back only when a human relabelled the pool by
+# hand (19 runners, `with_ul` 4/23 -> 23/23). A gate whose WRITE PATH is reachable only through a READ it
+# may never get is the same defect as the single-attempt census (#4104), one leg over: the instrument can
+# see what it should do and cannot do it.
+# ⛔ WHAT THIS PASS DOES, AND WHAT IT REFUSES TO DO. It takes NO new mode decision — not engage, not
+# release — because demand was not measured and #2327's strip is not weakened by guessing. What it does is
+# REPAIR: the pool is converged to the mode `ci-runner-gate.state` records, which is the decision an
+# EARLIER pass took when it COULD measure. That is idempotent (`set_labels` is arm-capped on engage and
+# uncapped on release, and both are plain PUTs of the derived per-runner body), it never advances the state
+# file, it never sends a transition, and it never touches the hysteresis streak — a blind pass must not
+# count toward DISENGAGE_TICKS, or three blind passes could release a pool nobody measured.
+# ⛔ IT ALSO PUBLISHES, WHICH THE OLD PATH DID NOT: `verdict=unknown` naming the leg that could not be read,
+# so the file says `demand unmeasured` instead of the previous pass's answer standing.
+# ⛔ IT DOES NOT ALARM, ON PURPOSE: the alarm set is scoped to the CAPACITY read (#2897's scope is a
+# recorded decision — see the rc 2 block above), and widening it here would make `alarm_blind`'s streak and
+# DEFECT records mean two different conditions at once.
+if [ "$healthy" = 3 ]; then
+  # ⛔ THE MEASURED FIGURES COME FROM THE ABSORPTION GLOBALS, NEVER FROM `$queued` (#3002 review P1 — the
+  # same correction the rc 2 block carries): `queued` is `local` to `evaluate`, so out here it is unset and
+  # a `${queued:-unmeasured}` would structurally ALWAYS take the default. These three are what the probe
+  # actually read on this pass, and `unmeasured` is a fact, not a default.
+  blind_queued="${ABSORPTION_QUEUED:-unmeasured}"
+  blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
+  blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
+  # ⛔ THE CAPABILITY IS CAPTURED HERE, NOT READ AT WRITE TIME (review P2, measured). `$CAPABILITY` is a
+  # global that `set_labels` OVERWRITES when ITS OWN enumeration fails, and the repair runs BETWEEN this
+  # point and the last verdict write — so a writer reading `${CAPABILITY:-none}` at call time published
+  # the LABEL read's capability beside a `capacity=` the CENSUS measured. Measured on the
+  # enumeration-failure shape: `capacity=saturated` (a certifying census verdict) next to
+  # `capability=runner_inventory:upstream http=5xx` (the label read) on one durable line. `capability=`
+  # is defined as the INVENTORY read's capability (the `CAPABILITY` declaration at the top), so the census value is the honest one; the
+  # label read's failure is already named by `set_labels`' own log lines.
+  blind_capability="${CAPABILITY:-none}"
+  if [ "$DRY" = 1 ]; then
+    # A READ VERB CHANGES NOTHING (#3002): no relabel, no verdict file, no state.
+    log "verdict NOT updated and NO repair applied: --dry-run reports and changes nothing (demand is unmeasured: the head scan could not reach the head of real demand; the pool was NOT converged to $(cat "$STATE_FILE" 2>/dev/null || echo 'the recorded mode — none recorded'))"
+    echo "dry-run: mode=$mode demand=unmeasured recorded=$(cat "$STATE_FILE" 2>/dev/null || echo unknown) — a demand-blind pass takes no mode decision and would only converge the pool to the recorded mode"
+    exit 2
+  fi
+  # ⛔ ONE WRITER, AND ITS CLAIM IS THE PASS'S OUTCOME (review P1, measured). This line used to be a bare
+  # `printf` written BEFORE the recorded-mode read and BEFORE the repair, with the claim hardcoded:
+  # "the pool was converged to the mode the state file records". On the NO-RECORDED-MODE arm (nothing
+  # existed to converge to — no PUT is sent at all) and on the REPAIR-FAILED arm (the labels are
+  # unchanged) the durable verdict therefore asserted a convergence that did not happen and a state file
+  # that does not exist — the exact defect class this file's #r2c arm pins for the DEFECT write ("a
+  # FAILED defect write does NOT log 'recorded' — the log must not assert a durable record that does not
+  # exist"); and `verdict=` is the surface a scheduler/operator reads to answer the one question this
+  # branch exists to answer ("did the gate restore the pool?").
+  # ⛔ TWO WRITES, BOTH TRUE AT THEIR MOMENT. The first says the repair is IN PROGRESS and claims no
+  # outcome, so a pass killed mid-PUT cannot leave the PREVIOUS pass's answer standing (#3002); the
+  # second replaces the claim with what actually happened on every terminal arm.
+  # ⛔ FIELD PARITY WITH `write_verdict` (review P3): same keys, same order — including `held=`,
+  # `streak=` and `engagement_lost=`, which a NON-DECIDING pass reports as `unmeasured` rather than
+  # omitting (`$VERDICT_NO_DECISION_KV`, defined once at the top and used by every non-deciding writer).
+  # This is the #3002 P2 rule ("missing != unmeasured") applied to the three keys the success writer
+  # always carries: this pass takes no hold/disengage decision and reads no durability, so a `0` here
+  # would be a number the pass never measured.
+  write_blind_verdict() { # $1 = what happened to the pool, in this pass's own words
+    printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s %s reason=cannot measure — DEMAND was not measured (the head scan ran out on runs with no queued job), so this pass took NO mode decision; %s\n' \
+      "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
+      "$blind_queued" "$blind_in_progress" "$blind_oldest" "$blind_capability" "$VERDICT_NO_DECISION_KV" "$1" \
+      > "$VERDICT_FILE" 2>/dev/null || true
+  }
+  # ⛔ THE FIRST WRITE NAMES NO UNREAD VALUE (review P3): it used to say "the repair to the RECORDED mode
+  # is IN PROGRESS" BEFORE the state file is read (`recorded=` is four lines below), so on the
+  # no-recorded-mode arm — where no repair ever begins — a pass killed inside this window left a durable
+  # verdict claiming a repair in progress to a mode that does not exist. The POSITION is deliberate (#3002:
+  # a killed pass must not leave the PREVIOUS pass's answer standing); only the claim is bounded.
+  write_blind_verdict "any repair this pass attempts is IN PROGRESS — its outcome replaces this line when it completes, and is in the log"
+  # ⛔ THE RECORDED MODE IS READ FROM THE STATE FILE, AND ONLY A MODE IT ACTUALLY RECORDS IS ACTED ON.
+  # An absent/garbled state file means no earlier pass took a decision, and `prev`'s own convention is
+  # `unknown` — so there is nothing to converge TO, and labelling the pool here would be exactly the
+  # "label on an unmeasured signal" this direction refuses. Nothing is written and nothing is PUT.
+  recorded="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  case "$recorded" in
+    local|github) ;;
+    *) log "repair SKIPPED: no recorded mode to converge to (state file says '${recorded:-absent}') — a demand-blind pass takes no new mode decision, and it will not label the pool on an unmeasured signal; nothing changed"
+       write_blind_verdict "no mode is recorded in the state file ('${recorded:-absent}'), so there was NOTHING to converge to and the pool was NOT relabelled"
+       log "cannot measure DEMAND — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
+       exit 2 ;;
+  esac
+  # The pool is already in the recorded mode: nothing to converge, and a blind pass must not PUT labels
+  # it was not asked to change (a PUT storm on the runner agent's own label set is a real cost — the
+  # agent re-asserts 60-120 s later, which is why the success path compares modes rather than re-writing).
+  # ⛔ THE SKIP REQUIRES A LABEL READING, NOT A SUBSTITUTE — the same ruling this file already makes for
+  # the hysteresis hold in `main` ("key the hold on `prev` … NOT on `mode`"), because a reading that
+  # resolves from the JOBS INFERENCE is not the pool's label state). `current_mode` counts the runners
+  # carrying the fallback label; `mode_from_jobs` answers "which pool is SERVING" — a NARROWED claim
+  # (#2897) — and the two are NOT interchangeable at a write decision. Measured shape: recorded mode
+  # `github`, the labels still ARMED, and ONE in-flight `ubuntu-latest` workflow makes the inference
+  # answer `github`; the equality below then held, the repair the recorded decision demands was SKIPPED,
+  # and the durable verdict told an operator the pool "ALREADY advertised" a mode this pass never read.
+  # That is the fail-open direction this whole branch exists to close — a repair skipped AND reported as
+  # unnecessary. It is reachable whenever the count read fails alone: `runner_census` RETRIES in-pass
+  # (#4085) and this read does NOT, so a 5xx/rate-limit blip on this call lands the pass here with
+  # `mode_source=jobs-inference` and a measured census. An UNREAD label state is not "already converged",
+  # so the pass converges instead: one idempotent PUT of the RECORDED mode, which is exactly what it
+  # does when the two modes differ. The cost that buys the safety is a redundant PUT against a pool that
+  # may already be in that mode; the opposite costs a strip that never happens and is reported as done.
+  if [ "$mode" = "$recorded" ] && [ "$MODE_SOURCE" = runners ]; then
+    log "repair: the pool already advertises the recorded mode=$recorded (measured mode=$mode) — nothing to converge; the pass changed nothing"
+    write_blind_verdict "the pool ALREADY advertised the recorded mode=$recorded, so nothing needed converging and no label was written"
+    log "cannot measure DEMAND — the recorded mode was already in force (leaving mode=$mode)"
+    exit 2
+  fi
+  # ⛔ THE REPAIR'S REASON IS STATED IN THIS PASS'S OWN TERMS — and `MODE_SOURCE` is THREE-valued
+  # ("runners | jobs-inference | none"), not two (review P2, measured). Collapsing `none` into
+  # `jobs-inference` asserted "mode is only INFERRED" on a pass where NO inference was taken either
+  # (`main` logs `mode=unknown … no in-progress job to infer from`), i.e. an absent answer described as a
+  # present one. `unknown` there is the ABSENCE of a reading, and that is what the sentence must say.
+  if [ "$mode" = "$recorded" ]; then
+    log "repair: mode=$mode equals the recorded mode=$recorded, but this pass could NOT read the runner labels (mode_source=$MODE_SOURCE) — a substituted reading says which pool is SERVING, not what the labels SAY, so it is not evidence the pool advertises the recorded mode and this pass does NOT skip the repair on it"
+    repair_why="a reading equal to the recorded mode came from a SUBSTITUTE (mode_source=$MODE_SOURCE), and the pool's LABEL state is UNESTABLISHED"
+  elif [ "$MODE_SOURCE" = runners ]; then
+    repair_why="this pass measures mode=$mode"
+  elif [ "$MODE_SOURCE" = jobs-inference ]; then
+    repair_why="the label read did not answer, so mode=$mode is only INFERRED from which pool is SERVING (mode_source=jobs-inference) and the pool's LABEL state is UNESTABLISHED"
+  else
+    repair_why="NEITHER the label read NOR a job inference answered (mode_source=$MODE_SOURCE), so mode=$mode is the ABSENCE of a reading rather than a mode — the pool's LABEL state is UNESTABLISHED"
+  fi
+  log "repair: the state file records mode=$recorded but $repair_why — CONVERGING the pool to the RECORDED mode=$recorded (repair of an earlier pass's decision, not a new one; the state file is NOT advanced and no transition is notified)"
+  repair_ok=1
+  if [ "$recorded" = local ]; then fallback_on || repair_ok=0; else fallback_off || repair_ok=0; fi
+  # ⛔ TWO PRECONDITIONS, NOT ONE (review P1, measured): `repair_ok` records that `set_labels` reported NO
+  # FAILURE, which an EMPTY managed set also does (`set_labels` returns success on `fail=0` and leaves
+  # `ok=0`) — so a
+  # pass that wrote NOTHING and one that relabelled the pool were indistinguishable, and this arm
+  # published a convergence for both. `SET_LABELS_OK` is the write COUNT the function now publishes; the
+  # convergence verb requires ok>0, and the empty-set arm below claims no convergence at all.
+  if [ "$repair_ok" = 1 ] && [ "${SET_LABELS_OK:-0}" -gt 0 ]; then
+    # ⛔ THE CONVERGENCE IS RE-MEASURED, NOT INFERRED FROM THE WRITE (review P1, measured). `set_labels`
+    # writes ONLY the runners carrying this gate's pool marker (`managed_ids`), while `mode`
+    # counts EVERY runner carrying the fallback label (`current_mode`'s count read) — and this file's own
+    # vocabulary defines "the pool advertises mode=X" as that COUNT (see the `carriers` line above
+    # `write_verdict`: mode=local means AT LEAST ONE runner carries the fallback label). So a write that
+    # lands on the managed set does NOT establish that the pool's count changed: a runner outside the
+    # pool can still carry `ubuntu-latest` (the suite's (i) fixture — never relabelled, by design #2327),
+    # and the line would then claim a pool-wide convergence the very next pass contradicts. Measured, on
+    # the release-repair path with one such runner present: `repair OK … the pool now advertises github`
+    # and the verdict `the pool was converged to the mode the state file records (github)`, while the
+    # next pass read `mode=local`. The same line also published `mode=`, the PRE-write reading, beside a
+    # post-write claim — one durable line disagreeing with itself. So the post-repair state is READ, and
+    # the claim is only as wide as the re-read: the managed write is what this pass performed, and the
+    # pool's advertised mode is what it measures afterwards.
+    post_mode=""
+    if post_mode="$(current_mode)"; then
+      mode="$post_mode"; MODE_SOURCE="runners"
+    else
+      # ⛔ A RE-READ THAT DID NOT ANSWER LEAVES NO CURRENT POOL-WIDE VALUE, so the durable line may not
+      # carry the pre-write one as if it were current. `unknown`/`none` is this file's vocabulary for
+      # exactly that (and the claim text below says the managed write landed).
+      post_mode=""; mode="unknown"; MODE_SOURCE="none"
+    fi
+    if [ "$post_mode" = "$recorded" ]; then
+      log "repair OK: the pool was converged to the recorded mode=$recorded — CONFIRMED by a post-repair re-read (mode=$post_mode); ${SET_LABELS_OK} runner(s) were written, demand is still UNMEASURED, so no mode decision was taken and the state file still says $recorded"
+      write_blind_verdict "the pool was converged to the mode the state file records ($recorded), and a post-repair re-read of the label state AGREES (mode=$recorded)"
+      log "cannot measure DEMAND — no mode decision taken, pool converged to the recorded mode=$recorded where it differed — the pool now advertises $recorded and the recorded DECISION is unchanged (the state file still says $recorded)"
+    elif [ -z "$post_mode" ]; then
+      # The write landed on the managed set; the pool-wide question was not answerable afterwards.
+      log "repair OK (MANAGED SET ONLY): ${SET_LABELS_OK} managed runner(s) were converged to the recorded mode=$recorded, but the post-repair re-read did not answer — the POOL-WIDE label state is UNMEASURED (mode=unknown on this line is the absence of a reading, not a pool state); the state file still says $recorded and this pass took no new decision"
+      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read did NOT answer — the POOL-WIDE mode is unmeasured and $recorded is NOT confirmed — the recorded decision is unchanged"
+      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is unmeasured (the post-repair re-read did not answer) — the recorded DECISION is unchanged (the state file still says $recorded)"
+    else
+      # ⛔ THE CAUSE IS DIRECTION-DEPENDENT (review P1, measured). "A runner outside this gate's ownership
+      # still carries the label" is only TRUE when a carrier exists; `mode=github` means ZERO carriers by
+      # this file's own definition, so on the ENGAGE direction that sentence asserted the opposite of what
+      # the re-read had just proved — one durable line contradicting itself (measured: recorded=local, an
+      # EMPTY managed set, re-read github). So the cause names what THIS direction's disagreement means.
+      if [ "$recorded" = local ]; then
+        post_cause="no runner carries the fallback label AT ALL, so the write did NOT stick — the PUTs were accepted when they ran, and either the runner agent re-asserts its own label set 60-120 s later, or no runner the API reports still carries it (deregistered between the writes and this re-read, or a read that lags)"
+      else
+        post_cause="at least one runner still carries the fallback label: a carrier OUTSIDE this gate's managed set (set_labels writes only the managed set, #2327), or a PUT the runner agent has since re-asserted"
+      fi
+      log "repair OK (MANAGED SET ONLY): ${SET_LABELS_OK} managed runner(s) were converged to the recorded mode=$recorded, but the post-repair re-read does NOT agree — the pool-wide mode is $post_mode: ${post_cause}; the state file still says $recorded and this pass took no new decision"
+      write_blind_verdict "the gate's MANAGED runners were converged to the mode the state file records ($recorded), but a post-repair re-read does NOT confirm the pool-wide mode — mode=$post_mode, i.e. ${post_cause} — the recorded decision is unchanged"
+      log "cannot measure DEMAND — no mode decision taken: the managed runners were converged to the recorded mode=$recorded, but the POOL-WIDE mode is mode=$post_mode — the recorded DECISION is unchanged (the state file still says $recorded)"
+    fi
+  elif [ "$repair_ok" = 1 ]; then
+    # ⛔ A REPAIR THAT WROTE NOTHING IS NOT A CONVERGENCE (review P1, measured). `ok=0` with `fail=0` means the
+    # managed set is EMPTY: no runner carries this gate's pool marker, so `set_labels` had nothing to PUT and
+    # its exit status still says success. Nothing was relabelled, so — unlike the arms above — there is no
+    # write to observe and `mode` is still this pass's reading. No re-read.
+    # ⛔ AND THAT READING IS ONLY A LABEL READING WHEN `mode_source=runners` (review P1, measured). `mode`
+    # can be `mode_from_jobs`' answer ("which pool is SERVING, not what the labels SAY"), which the repair
+    # reason three lines above already refused to call a label state — publishing it here as "the pool's
+    # mode" reintroduced exactly that substitution on the newest path. Measured: the (d11) fixture's own
+    # verdict read `mode=local mode_source=jobs-inference … the pool's mode is still local` while the pool
+    # carried NO fallback label at all. So the claim follows the source, as the skip arm above does.
+    # ⛔ THREE-VALUED, LIKE `repair_why` ABOVE (review P2, measured): `jobs-inference` is "only the SERVING
+    # inference", but `none` is NO inference at all, and calling `mode=unknown` an inference there described
+    # an absent answer as a present one — on the durable verdict file.
+    if [ "$MODE_SOURCE" = runners ]; then
+      no_write_mode="the pool's LABEL state is still mode=$mode (read on this pass, and no write changed it)"
+    elif [ "$MODE_SOURCE" = jobs-inference ]; then
+      no_write_mode="the pool's LABEL state is UNMEASURED — this pass never read it (mode_source=jobs-inference), and mode=$mode is only the SERVING inference, not what the labels say"
+    else
+      no_write_mode="the pool's LABEL state is UNMEASURED — NEITHER the label read NOR a job inference answered (mode_source=$MODE_SOURCE), so mode=$mode is the ABSENCE of a reading, not a mode"
+    fi
+    log "repair WROTE NOTHING: set_labels reported no failure but wrote NO runner (ok=0) — the managed set is EMPTY (no runner carries this gate's pool marker), so nothing was relabelled; ${no_write_mode}; the recorded mode=$recorded is NOT confirmed"
+    write_blind_verdict "the repair wrote NOTHING — no runner carries this gate's pool marker, so there was nothing to relabel; ${no_write_mode} — the recorded mode ($recorded) is NOT confirmed"
+    log "cannot measure DEMAND — no mode decision taken, and NO repair was performed: the managed set is EMPTY (nothing carries this gate's pool marker); ${no_write_mode}; the recorded DECISION is unchanged (the state file still says $recorded)"
+  else
+    # ⛔ A REPAIR THAT DID NOT LAND IS NAMED, NOT ABSORBED: this is the write path whose failure is
+    # indistinguishable from success in the state file (which is not written here either way).
+    # ⛔ "THE LABELS ARE UNCHANGED" WAS FALSE ON THE SHAPE THIS ARM MOST OFTEN SEES (review P2,
+    # measured). `set_labels` fails a repair when ANY runner's PUT fails, and the suite's own d6 arm is
+    # a PARTIAL write (`GH_PUT_FAIL_ID` fails one runner while the other lands → `set_labels ok=1
+    # fail=1`, `accepted=1`): one managed runner IS relabelled. A second reachable shape is the
+    # arm-capped engage (`CI_GATE_FALLBACK_ARM_MAX=0`): the refusal PRECEDES the arm loop, so no arm id
+    # is armed — but the COMPLEMENT sweep has already run, so managed runners outside the arm ARE
+    # disarmed. Either way the write did not complete and the pool may be partly changed.
+    # So the durable line may not say the labels are unchanged, and it may not say the pool still
+    # advertises `$mode` either — the pass measured `$mode` BEFORE the write. It names what it knows:
+    # the write did not complete, and the recorded mode is NOT confirmed.
+    log "repair FAILED: the pool could NOT be converged to the recorded mode=$recorded (mode was $mode before the write) — set_labels did NOT complete (see the set_labels lines above: the ok=/fail= count when runners were written, 'no labels changed' when the enumeration refused, 'fallback arm resolved EMPTY' when the engage arm carried nothing), so the labels are PARTIALLY changed AT BEST and mode=$recorded is NOT confirmed; this is the #4085 write path failing, not a decision"
+    # ⛔ AND THE VERDICT'S OWN `mode=` KEY MAY NOT CARRY THAT READING EITHER (review P2, measured). The
+    # sentence above forbids publishing "the pool still advertises $mode" because `mode` was read BEFORE a
+    # write that may have PARTLY landed — but `write_blind_verdict` prints `mode=%s mode_source=%s` from
+    # exactly that reading, so the durable line contradicted the claim sitting next to it. Measured on
+    # (d6): `mode=github mode_source=runners` beside "the pool's labels may be PARTIALLY changed", while
+    # that arm's partial ENGAGE (`set_labels ok=1 fail=1`) has just armed one of the two managed runners —
+    # i.e. the pool may now advertise `local`, the OPPOSITE of the value the file published. A scheduler
+    # branching on `mode=` read the pre-write pool as the current one, which is the fail-open direction
+    # for the same reason a stale `verdict=` is (#3002). After an incomplete write this pass holds NO
+    # pool-wide label reading, so the key carries this file's vocabulary for exactly that — `unknown`/
+    # `none`, the same pair the "re-read did not answer" arm above uses. (Stated, not implied: the log line
+    # above still NAMES the pre-write reading, in the past tense and labelled as such, which is a true
+    # statement about what this pass measured; the durable key is not.)
+    mode="unknown"; MODE_SOURCE="none"
+    write_blind_verdict "the repair to the recorded mode=$recorded was ATTEMPTED AND FAILED — set_labels did NOT complete (see the set_labels lines in the log), so the pool's labels may be PARTIALLY changed and mode=$recorded is NOT confirmed"
+    # The closing log line is arm-specific too: the shared one said "pool converged … where it differed",
+    # which on this arm names an action that did not happen (same defect class, in the log this time).
+    # ⛔ THE ARM'S TERMINAL LINE MAY NOT PUBLISH THE PRE-WRITE READING (review P2/P3, measured). `mode` is
+    # `current_mode` taken BEFORE the write (up in `main`), so `(leaving mode=$mode)` reported a pre-repair
+    # measurement as the pool's post-repair state — after a PARTIAL write that is false, and it contradicts
+    # the line above it. What the pass knows: the repair did not land, and the labels may be partly changed.
+    log "cannot measure DEMAND — no mode decision taken, and the repair to the recorded mode=$recorded did NOT land — the pool's labels may be PARTIALLY changed (see the set_labels lines above); mode=$recorded is NOT confirmed"
+  fi
   exit 2
 fi
 

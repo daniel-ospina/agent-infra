@@ -35,3 +35,14 @@ tests/fixtures/drift/*/.agent-infra-version
 # #254 — oracle drift-lock runtime timestamp (dev-machine cron state)
 .last-oracle-run
 scripts/heartbeats/
+
+# #10220 (owner ruling 2026-10-28): a lane's MANDATORY per-lane report — "every lane writes
+# WORKTREE-REPORT.md before it exits", and its files "are gitignored and never committed"
+# (`docs/ops/disk-reaper.md`; `IGNORED_LANE_EVIDENCE` in `scripts/pi-reap-worktrees.sh`). Committing
+# one is not merely untidy: the report is per-LANE state (it names one worktree and one branch), so in
+# a repo that ships no `tools/worktree_report.py` — this one — `lane-report-gate.sh` reads its mere
+# PRESENCE as `UNMEASURABLE reason=report-present-but-repo-ships-no-consumer`, an arm `lane-merge.sh`
+# classifies as a BOX fault: it spends no fix round, and no lane can clear it by pushing. Measured:
+# #4048 committed one to main on 2026-11-12 and every subsequent PR refused at rc=7 with no remedy.
+.worktree-report/
+WORKTREE-REPORT.md
