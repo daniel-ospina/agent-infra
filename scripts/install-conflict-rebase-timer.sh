@@ -41,7 +41,12 @@
 #   * a leftover `{{PLACEHOLDER}}` after rendering, or a rendered plist that does not parse;
 #   * an invocation that arrived THROUGH sudo (SUDO_USER set): `{{USER}}` is `id -un` and `{{HOME}}` is
 #     `$HOME`, so a root install would render root's state and push with root's credential;
-#   * a state dir that is not writable by the invoking user (every pass would fail to record).
+#   * a state dir that is not writable by the invoking user (every pass would fail to record);
+#   * a rendered declaration that NAMES A GATE-BYPASS FLAG in its environment (systemd `Environment=` /
+#     `PassEnvironment=`, or a launchd `<key>` inside `EnvironmentVariables`), and it refuses the same way
+#     when the checker for that list is missing — an unvetted unit is not a clean one (agent-infra#4002;
+#     the class is a scheduler handing the review/verification/admin-merge hatch to every lane it spawns,
+#     for ever, which no spawned lane can un-inherit).
 #
 # Usage:
 #   install-conflict-rebase-timer.sh [--install] [--report-only] [--dry-run] [--status] [--uninstall]
@@ -63,6 +68,9 @@
 #   ELDATO_PLATFORM              override `uname -s` (tests render the Darwin artifact on any host)
 #   ELDATO_LAUNCHER_PY / ELDATO_LAUNCHER  the interpreter + TCC launcher a launchd job is started with
 #   SYSTEMCTL / LAUNCHCTL / SUDO the tools to call / probe (tests: shims)
+#   GP_GUARD                     the gate-policy.sh that owns the bypass-flag list (default: resolved
+#                                beside $TEMPLATES_DIR, then $INFRA_ROOT, then $AGENT_INFRA_PATH — the
+#                                template tree is a checkout, so a box that CAN install can always vet)
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage.
 set -uo pipefail
@@ -91,6 +99,29 @@ if [ -z "${LAUNCHD_TEMPLATES_DIR:-}" ]; then
     done
 fi
 LAUNCHD_TEMPLATES_DIR="${LAUNCHD_TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd/conflict-rebase}"
+
+# ⛔ THE DECLARATION CENSUS'S ONE JUDGE (agent-infra#4002; fresh review of PR #4020, finding 2). A unit
+# that sets a gate-bypass flag in its environment hands that hatch to EVERY process the job ever spawns,
+# and a spawned lane cannot un-inherit it. This installer is one of the two that write `Environment=`
+# bytes it does not render from `templates/` (`--report-only` appends CONFLICT_REBASE_DRY_RUN here, and
+# the plist's EnvironmentVariables dict is edited by python), and it is FARMED — so its bytes reach a
+# cell through a path no template census can see. An earlier revision of the guard's own header claimed
+# every generated declaration was graded while only `install-lane-arm-timer.sh` was, which made the claim
+# an unenforced invariant. Asking the judge HERE makes it true by construction.
+# `gate-policy.sh` owns the flag list, so this installer asks it rather than keeping a second copy.
+# Resolved from the SAME roots the templates come from, which is what makes a missing judge impossible on
+# a box that can install: the template tree this installer renders from is a checkout, and a checkout
+# carries `scripts/orchestrator-harness/gate-policy.sh`. The template-root derivation is the load-bearing
+# one — it ties the judge to the exact tree that supplied `TEMPLATES_DIR`, not to `dirname $0` (which on
+# a farmed box is the flat `~/.pi/agent/scripts`, where no such sibling exists).
+GP_GUARD="${GP_GUARD:-}"
+if [ -z "$GP_GUARD" ]; then
+    for _root in "$(dirname "$(dirname "$TEMPLATES_DIR")")" "$INFRA_ROOT" "${AGENT_INFRA_PATH:-}"; do
+        [ -n "$_root" ] || continue
+        _judge="$_root/scripts/orchestrator-harness/gate-policy.sh"
+        [ -f "$_judge" ] && { GP_GUARD="$_judge"; break; }
+    done
+fi
 
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
 UNIT_NAME="eldato-conflict-rebase"
@@ -275,6 +306,40 @@ resolve_launcher() {
     return 0
 }
 
+# vet_unit <rendered-artifact> <label> — does this DECLARATION hand a gate bypass to everything the job
+# spawns? (agent-infra#4002; fresh review of PR #4020, finding 2.)
+# ⛔ THE JUDGE IS ASKED ON THE BYTES THAT WOULD BE INSTALLED, after every append this script makes — the
+# `--report-only` `Environment=` line on the systemd path and the `EnvironmentVariables` dict edit on the
+# launchd path are both written HERE, not in a template, so a template census cannot see them.
+# ⛔ A MISSING JUDGE IS A REFUSAL, not a warning: an unvetted unit is not a clean one, and a checker that
+# was simply absent while the install printed `installed:` is the false-PASS class this installer already
+# refuses for a missing `ExecStart=` and a non-parsing plist. `return 2` from the judge (ungradable) and
+# `return 1` (vetoed) are both refusals here — there is no "installed but warned" state, because by then
+# the flag is live in a running job.
+# ⛔ EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS (fresh review of PR #4020,
+# P3). Collapsing them into "carries a GATE-BYPASS environment entry (named above)" is a FALSE ACCUSATION
+# when the judge could not grade at all: rc 2 means its file PREFLIGHT refused the artifact (unreadable, or
+# not a regular file — never the content of a declaration, which the fold always grades), and
+# rc 64 means the `gate-policy.sh` this installer resolved predates `--unit-veto` — e.g. a stale
+# `~/agent-infra` supplying `TEMPLATES_DIR`. The operator is then told to hunt a hatch that no line names,
+# which is the wrong-diagnosis failure the `(5c2)` missing-judge arm exists to prevent for an ABSENT judge;
+# a STALE one is the same event with a different rc. The verdict stays fail-closed either way.
+vet_unit() {
+    local f="$1" label="$2" rc=0
+    { [ -n "$GP_GUARD" ] && [ -f "$GP_GUARD" ]; } \
+        || { err "REFUSING: gate-policy.sh not found (looked beside $TEMPLATES_DIR, in $INFRA_ROOT and in \${AGENT_INFRA_PATH}) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted. Point GP_GUARD at a gate-policy.sh copy."; return 1; }
+    bash "$GP_GUARD" --unit-veto "$f" "$label" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 1 ]; then
+        err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduler that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
+    elif [ "$rc" -eq 2 ]; then
+        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+    else
+        err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (#4002) or it could not run at all, so the rendered $label was never vetted and will not be installed. Point GP_GUARD at a current, executable gate-policy.sh (the one beside the templates you are rendering)."
+    fi
+    return 1
+}
+
 refuse_bad_target() {
     local v p bad="" skip=0
     if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" = "0" ]; then
@@ -387,6 +452,12 @@ do_install_systemd() {
     if [ "$TARGET" = "user" ]; then
         sed -i.bak '/^User=/d' "$tmpd/$UNIT_NAME.service" && rm -f "$tmpd/$UNIT_NAME.service.bak"
     fi
+    # ⛔ THE DECLARATION IS VETTED ON THE BYTES THAT WOULD BE INSTALLED (agent-infra#4002, PR #4020
+    # finding 2) — after the `--report-only` append and the `User=` strip above, so nothing can add an
+    # `Environment=` line downstream of the judge. Placed ABOVE the `--dry-run` branch on purpose: the
+    # preview prints the artifact an install would write, so a preview that skips the veto is a preview of
+    # something this installer would refuse.
+    vet_unit "$tmpd/$UNIT_NAME.service" "$UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }
     # ⛔ A RENDERED SERVICE WITH NO `ExecStart=` IS A UNIT THAT CANNOT RUN, and systemd accepts the
     # FILE and then refuses the TIMER that triggers it ("unit … to trigger not loaded") — MEASURED
     # 2026-11-07: the first render of this very template shipped without one, `enable --now` printed
@@ -480,6 +551,10 @@ if chk != "1":
 PY
     fi
     plist_is_valid "$tmpd/$LABEL.plist" || { err "the rendered plist does not parse — refusing to install it (launchd would refuse it AFTER the artifact is in place, and the failure would read like a scheduler problem)"; rm -rf "$tmpd"; return 1; }
+    # ⛔ THE SAME VETO ON THE launchd DIALECT (agent-infra#4002, PR #4020 finding 2): the mode key lands
+    # inside `EnvironmentVariables` above, so the plist is a declaration that can name a hatch. Graded
+    # after every edit and above the `--dry-run` branch, exactly as on the systemd path.
+    vet_unit "$tmpd/$LABEL.plist" "$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
     # …and after it validates, the MODE must still be readable in the artifact we are about to install.
     if [ -n "$MODE_FLAG" ] && ! python3 -c 'import sys, plistlib
 d = plistlib.load(open(sys.argv[1], "rb"))

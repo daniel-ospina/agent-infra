@@ -44,6 +44,17 @@
 #                      PIN that the script will never recompute, which is exactly wrong for a box
 #                      whose size can change. Pass it only to override that ceiling deliberately.
 #   TEMPLATES_DIR      template dir (default: this repo's templates/systemd)
+#   GP_GUARD           the declaration census's judge — `gate-policy.sh`, whose
+#                      `--unit-veto <file>` refuses a unit carrying a gate-bypass `Environment=`
+#                      (agent-infra#4002). default: this checkout's copy, else a copy under
+#                      $HOME/.pi/agent/scripts. ⛔ `pi-bootstrap/setup.sh`'s farm arrays do NOT carry
+#                      `gate-policy.sh` (nor `ai-drainer.sh`), so on a box with only the farm set
+#                      GP_GUARD explicitly — the documented install path runs this script from a
+#                      checkout (docs/ops/ai-drainer.md), where the sibling resolves. An unset OR
+#                      missing judge REFUSES an install (an unvetted unit is not a clean one); there
+#                      is no "install it anyway" mode. `--status` and `--uninstall` are NOT gated by
+#                      it: vetting is irrelevant to a read and to a REMOVAL, the one path that must
+#                      always work.
 #   SYSTEMD_UNIT_DIR   install dir OVERRIDE (tests: a temp dir with SYSTEMCTL a fake)
 #   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
 #   SUDO               sudo probe           default: `sudo -n`
@@ -157,6 +168,20 @@ if [ -z "${DRAINER:-}" ]; then
         [ -f "$_c" ] && { DRAINER="$_c"; break; }
     done
 fi
+# ⛔ THE DECLARATION CENSUS'S ONE JUDGE (agent-infra#4002). A unit that sets a gate-bypass flag in its
+# `Environment=` hands that hatch to every lane the job spawns, for ever, and a spawned lane cannot
+# un-inherit it. The measured case is a cell's drainer started by a hand-written wrapper carrying
+# `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1` —
+# an UNATTENDED dispatcher with all three controls off (#4002). `gate-policy.sh` owns the flag list, so
+# this installer asks it rather than keeping a second copy that drifts. Resolved the same way DRAINER
+# is: this checkout first, then the farmed copy a cell actually has.
+GP_GUARD="${GP_GUARD:-}"
+if [ -z "$GP_GUARD" ]; then
+    for _c in "$INFRA_ROOT/scripts/orchestrator-harness/gate-policy.sh" \
+              "$HOME_DIR/.pi/agent/scripts/gate-policy.sh"; do
+        [ -f "$_c" ] && { GP_GUARD="$_c"; break; }
+    done
+fi
 # ⛔ EVERY PRE-FLIGHT ABORTS. `err` prints and returns 1, and at top level nothing consumed that
 # status (there is no `set -e`): a typo in DRAINER printed the error and then installed a unit whose
 # ExecStart does not exist, and a wrong TEMPLATES_DIR overwrote the ALREADY-WORKING units with empty
@@ -166,6 +191,17 @@ fi
 [ -f "$DRAINER" ] || { err "DRAINER=$DRAINER does not exist"; exit 1; }
 [ -f "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" ] || { err "template not found: $TEMPLATES_DIR/$UNIT_SRC_SERVICE"; exit 1; }
 [ -f "$TEMPLATES_DIR/$UNIT_SRC_TIMER" ] || { err "template not found: $TEMPLATES_DIR/$UNIT_SRC_TIMER"; exit 1; }
+# ⛔ AN UNGRADABLE DECLARATION IS NOT A CLEAN ONE, and it must not be a warning: a checker that is
+# simply missing installs an unvetted unit and prints "scheduled", which is the false PASS class this
+# installer already refuses for a missing ExecStart.
+# ⛔ SCOPED TO THE MODES THAT RENDER, DELIBERATELY (fresh review of #4002): vetting is irrelevant to a
+# READ (`--status`) and to a REMOVAL (`--uninstall`) — uninstall is the one path that must always work,
+# and gating it on a judge that resolves nothing turns "remove this dispatcher" into an error.
+case "$MODE" in
+    --install | --dry-run)
+        [ -f "${GP_GUARD:-}" ] \
+            || { err "gate-policy.sh not found (looked in this checkout at $INFRA_ROOT/scripts/orchestrator-harness and under $HOME_DIR/.pi/agent/scripts) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted. Point GP_GUARD at a gate-policy.sh copy."; exit 1; } ;;
+esac
 
 # ── which systemctl, and therefore which unit dir ─────────────────────────────────────────────
 # System unit first (the cell's normal shape), user unit when systemd's user manager answers but
@@ -203,6 +239,35 @@ if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
 fi
 case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=36000 ;; esac
 
+# vet_unit <rendered-artifact> <label> — does the DECLARATION that would be installed hand the hatch
+# to everything the job spawns? (agent-infra#4002)
+# ⛔ EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS (fresh review of PR #4020,
+# P3). This used to be `if ! bash "$GP_GUARD" --unit-veto …; then err "…carries a GATE-BYPASS …"; fi`,
+# which collapses them into ONE message — and for two of the three answers nothing was "named above", so
+# the operator is told to hunt a hatch the declaration does not have:
+#   * rc 1  — the judge graded it and FOUND a hatch (its own line above names it);
+#   * rc 2  — the judge could not grade it at all (its file preflight: unreadable, or not a regular file),
+#             i.e. nothing was graded — never the CONTENT of a declaration, which the fold always grades;
+#   * rc 64 — the `gate-policy.sh` this installer resolved PREDATES `--unit-veto` (a stale farmed or
+#             ambient copy), i.e. the unit was never vetted by anything but this installer's exit code.
+# The verdict stays fail-closed in ALL THREE cases — this is a wrong-diagnosis defect, not a bypass — and
+# the sibling installer (`install-conflict-rebase-timer.sh`'s `vet_unit`, arms T13) already separates
+# them. The two installers' refusals are the same refusal, so they must not tell an operator two different
+# stories about the same event.
+vet_unit() { # <rendered-artifact> <template-label>
+    local f="$1" label="$2" rc=0
+    bash "$GP_GUARD" --unit-veto "$f" "$label" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 1 ]; then
+        err "the rendered unit carries a GATE-BYPASS Environment= entry (named above) — refusing to install a dispatcher that hands the hatch to every lane it spawns (agent-infra#4002)"
+    elif [ "$rc" -eq 2 ]; then
+        err "the judge at $GP_GUARD could not GRADE the rendered unit (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+    else
+        err "the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (agent-infra#4002) or it could not run at all, so the rendered unit was NEVER vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
+    fi
+    return 1
+}
+
 render() { # <template> <dest>
     local v tmp
     # ⛔ RENDER TO A TEMP FILE AND CHECK THE RESULT. Writing straight to "$2" let the shell truncate
@@ -228,6 +293,11 @@ render() { # <template> <dest>
     # enables, activates and then does nothing every 20 minutes.
     if grep -q '{{' "$tmp"; then rm -f "$tmp"; err "unsubstituted placeholder remains in the rendered unit"; return 1; fi
     if [ ! -s "$tmp" ]; then rm -f "$tmp"; err "rendered $1 is EMPTY — refusing to install it"; return 1; fi
+    # ⛔ THE DECLARATION IS VETTED ON THE BYTES THAT WOULD BE INSTALLED, not on the template (#4002): an
+    # `Environment=` line can arrive from a substitution as easily as from the template, and the unit on
+    # the box is what hands the hatch to every lane. Vetoed = the install REFUSES; there is no "installed
+    # but warned" state, because the flag is already live in a running unit by then.
+    vet_unit "$tmp" "$1" || { rm -f "$tmp"; return 1; }
     case "$1" in
         *.service) grep -q '^ExecStart=' "$tmp" \
             || { rm -f "$tmp"; err "rendered service has no ExecStart — it would enable and do nothing"; return 1; } ;;

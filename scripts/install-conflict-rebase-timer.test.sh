@@ -92,7 +92,7 @@ RUN() { # <installer args...>
         CONFLICT_REBASE_TIMER="$FX/conflict-rebase-timer.sh" \
         CONFLICT_REBASE_CHECKOUT="$FX/checkout" \
         TEMPLATES_DIR="${TPL_DIR:-$REPO/templates/systemd}" \
-        LAUNCHD_TEMPLATES_DIR="$REPO/templates/launchd/conflict-rebase" \
+        LAUNCHD_TEMPLATES_DIR="${LTPL_DIR:-$REPO/templates/launchd/conflict-rebase}" \
         SYSTEMD_UNIT_DIR="$FX/units" \
         LAUNCHD_AGENTS_DIR="$FX/LaunchAgents" \
         SYSTEMCTL="$BIN/systemctl" \
@@ -257,6 +257,94 @@ BRAKE_ENV=("CONFLICT_REBASE_STATE=$UNIT_STATE")
 BRAKE pause
 assert_eq "$RC" 0 "T10 an ambient value that AGREES with the unit is accepted"
 ck "$([ -f "$UNIT_STATE/PAUSED" ]; echo $?)" "T10 and it lands in the same place"
+
+# ── T11: THE DECLARATION VETO — a rendered artifact that NAMES A GATE-BYPASS FLAG is refused ─────────
+# This installer writes `Environment=` bytes of its own (`--report-only` appends CONFLICT_REBASE_DRY_RUN,
+# and the plist's EnvironmentVariables dict is edited by python), and it is FARMED — so before this arm no
+# census in the tree graded its declarations, and deleting the whole veto left every suite green. The
+# defect class (agent-infra#4002): a scheduler that hands the review/verification/admin-merge hatch to
+# every lane it spawns, for ever, with no spawned lane able to un-inherit it.
+# ⛔ The mutation is in a COPY under the fixture — never the shipped template — and `--dry-run` is graded
+# too, because the preview prints the artifact an install would write.
+echo "== T11: a rendered declaration that names a gate-bypass flag is REFUSED (systemd half) ──"
+mkdir -p "$FX/tpl-hatch"
+cp "$REPO"/templates/systemd/eldato-conflict-rebase.service "$FX/tpl-hatch/"
+cp "$REPO"/templates/systemd/eldato-conflict-rebase.timer "$FX/tpl-hatch/"
+printf 'Environment=AGENT_SKIP_REVIEW_GATE=1\n' >>"$FX/tpl-hatch/eldato-conflict-rebase.service"
+TPL_DIR="$FX/tpl-hatch"; EXTRA_ENV=(); RUN --dry-run
+assert_eq "$RC" 1 "T11 a hatched service template makes --dry-run REFUSE (rc 1)"
+assert_contains "$OUT" 'GATE-BYPASS' "T11 the refusal says what it found (a GATE-BYPASS entry)"
+# ⛔ READ THE REFUSAL'S OWN LINES, not the whole output: with the veto deleted, `--dry-run` PRINTS the
+# hatched unit, so a bare `$OUT` contains the flag name for the wrong reason and the arm would stay green.
+REFUSAL_T11="$(grep -E 'GATE.BYPASS' <<<"$OUT" || true)"
+assert_contains "$REFUSAL_T11" 'AGENT_SKIP_REVIEW_GATE' "T11 …and the refusal NAMES the flag, so the operator can remove it"
+assert_absent "$OUT" 'ExecStart=' "T11 …and it does not print the artifact it refused as a preview"
+rm -f "$FX/units/eldato-conflict-rebase.service" "$FX/units/eldato-conflict-rebase.timer"
+RUN --install
+assert_eq "$RC" 1 "T11 --install refuses it too (the path that reaches a box)"
+ck "$([ ! -f "$FX/units/eldato-conflict-rebase.service" ]; echo $?)" \
+   "T11 a refused install left NO unit on the box"
+# …and a hatch that arrives on a CONTINUED line is the SAME declaration (systemd.syntax(7)). This is the
+# same judge the drainer installer asks, so the arm also pins that the two installers cannot diverge.
+printf 'Environment=NORMAL=1 \\\n            ELDATO_SKIP_VGATE=1\n' >>"$FX/tpl-hatch/eldato-conflict-rebase.service"
+TPL_DIR="$FX/tpl-hatch"; EXTRA_ENV=(); RUN --dry-run
+assert_eq "$RC" 1 "T11 a hatch on a BACKSLASH-CONTINUED line is refused too"
+assert_contains "$(grep -E 'GATE.BYPASS' <<<"$OUT" || true)" 'ELDATO_SKIP_VGATE' "T11 …and the refusal names the continued one"
+TPL_DIR=""
+
+# ── T12: …and the launchd dialect, where the mode key lands inside EnvironmentVariables ───────────────
+echo "== T12: the same veto on the launchd dialect (a <key> naming the hatch) ──"
+mkdir -p "$FX/tpl-hatch-plist"
+# ⛔ THE INJECTED KEY CARRIES A BYPASSING VALUE, and that is not decoration: the judge is VALUE-AWARE for
+# every name whose gate tests `=== "1"` (see `GP_UNIT_VALUE1_FLAGS`), so renaming the key alone leaves
+# `<string>{{REPO}}</string>` on it — a declaration that ASSIGNS the hatch an inert value, correctly CLEAN.
+# The arm would then have been pinning a refusal the judge no longer issues (measured: it reddened until the
+# value moved), i.e. vacuous in the direction that matters — it would have passed on a judge that stopped
+# grading plists altogether as long as some other arm reddened.
+sed -e 's|<key>CONFLICT_REBASE_REPO</key>|<key>AGENT_ADMIN_MERGE_OVERRIDE</key>|' \
+    -e 's|<string>{{REPO}}</string>|<string>1</string>|' \
+    "$REPO/templates/launchd/conflict-rebase/com.eldato.conflict-rebase.plist" \
+    >"$FX/tpl-hatch-plist/com.eldato.conflict-rebase.plist"
+LTPL_DIR="$FX/tpl-hatch-plist"; EXTRA_ENV=("ELDATO_PLATFORM=Darwin"); RUN --dry-run
+assert_eq "$RC" 1 "T12 a plist whose EnvironmentVariables names the hatch is REFUSED (rc 1)"
+assert_contains "$(grep -E 'GATE.BYPASS' <<<"$OUT" || true)" 'AGENT_ADMIN_MERGE_OVERRIDE' "T12 …and the refusal names the key it found"
+ck "$([ ! -f "$FX/LaunchAgents/com.eldato.conflict-rebase.plist" ]; echo $?)" \
+   "T12 nothing was installed into LaunchAgents"
+LTPL_DIR=""; EXTRA_ENV=()
+# POSITIVE CONTROL: the same path with the SHIPPED templates still installs — so every red above is
+# attributable to the injected hatch, not to a veto that refuses everything.
+RUN --install
+assert_eq "$RC" 0 "T12 control: the shipped templates still install (the veto is not refusing everything)"
+assert_contains "$(cat "$FX/units/eldato-conflict-rebase.service" 2>/dev/null)" 'ExecStart=' \
+   "T12 control: …and the clean unit still carries its ExecStart"
+
+# ── T13: A JUDGE THAT CANNOT ANSWER IS NOT A GATE-BYPASS FINDING ─────────────────────────────────────
+# (fresh review of PR #4020, P3.) `vet_unit` used to collapse EVERY non-zero rc into "carries a GATE-BYPASS
+# environment entry (named above)". rc 2 means the judge could not grade, and rc 64 means the resolved
+# `gate-policy.sh` predates `--unit-veto` (a stale `~/agent-infra` supplying TEMPLATES_DIR) — in both the
+# operator was told to hunt a hatch no line named. The refusal must stay (fail-closed) and must name the
+# REAL cause, which is what the missing-judge arm (§5c2) already demands for an absent judge.
+echo "== T13: a stale/unusable JUDGE is refused by its own diagnosis, not as a bypass it never found ──"
+printf '#!/usr/bin/env bash\nexit 64\n' >"$FX/stale-judge.sh"
+chmod +x "$FX/stale-judge.sh"
+TPL_DIR="$REPO/templates/systemd"; EXTRA_ENV=("GP_GUARD=$FX/stale-judge.sh"); RUN --dry-run
+STALE_OUT="$OUT"; STALE_RC="$RC"
+assert_eq "$STALE_RC" 1 "T13 a judge that does not know --unit-veto still REFUSES the install (fail-closed)"
+assert_contains "$STALE_OUT" 'rc=64' "T13 …and it reports the rc it actually got"
+assert_contains "$STALE_OUT" 'never vetted' "T13 …and says the artifact was never vetted, not that a hatch was found"
+assert_absent "$STALE_OUT" 'GATE-BYPASS' "T13 …and it does NOT claim a GATE-BYPASS entry no line named"
+# …and rc 2 (ungradable) is the third diagnosis: refused, named as ungradable, never as a bypass.
+printf '#!/usr/bin/env bash\nexit 2\n' >"$FX/ungradable-judge.sh"
+chmod +x "$FX/ungradable-judge.sh"
+EXTRA_ENV=("GP_GUARD=$FX/ungradable-judge.sh"); RUN --dry-run
+UNGR_OUT="$OUT"; UNGR_RC="$RC"
+assert_eq "$UNGR_RC" 1 "T13 an ungradable declaration is still refused (an ungradable unit is not a clean one)"
+assert_contains "$UNGR_OUT" 'could not GRADE' "T13 …and the refusal names the grading failure as the cause"
+assert_absent "$UNGR_OUT" 'GATE-BYPASS' "T13 …and it does not accuse the unit of a bypass"
+# CONTROL: the real judge still accepts the shipped templates — so T13's arms red on the DIAGNOSIS and not
+# because the resolver quietly stopped finding a judge at all.
+EXTRA_ENV=("GP_GUARD=$REPO/scripts/orchestrator-harness/gate-policy.sh"); RUN --dry-run
+assert_eq "$RC" 0 "T13 control: with the real judge and shipped templates the same invocation is clean"
 
 echo
 echo "install-conflict-rebase-timer.test.sh — passed=$PASS failed=$FAIL"
