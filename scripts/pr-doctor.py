@@ -1329,6 +1329,10 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
                       # ⛔ NOT `repair-chain` (#4009): nothing was exec'd at all, so the chain
                       # cannot be the thing to repair. The remedy is the seam nobody supplied.
                       "RUBRIC": "supply-rubric",
+                      # ⛔ NOT `repair-chain` EITHER (harness review of #4134, P2): a claim gate
+                      # that cannot read `refs/claims/` refuses before the chain is exec'd, so the
+                      # remedy is the registry's own transport.
+                      "CLAIM-UNREADABLE": "repair-claim-registry",
                       "REFUSING": "restore-read", "SLOTS-FULL": "none"}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -4396,6 +4400,436 @@ def set_tag_collisions(entries: list[str]) -> str:
             "in its own pass, or rename one of them (agent-infra#2281 removes this mode).")
 
 
+# ── THE CROSS-BOX CLAIM, TAKEN BEFORE THE LANE SPAWNS (agent-infra#2557) ─────────────────────────
+# THE MEASURED DEFECT. Five cell controllers were restarted on 2026-11-17 after ~12 days down.
+# Within the hour ONE PR was being repaired by TWO live lanes on TWO different boxes, with a third
+# logging it too:
+#
+#     pi-cell-2 (a1de7090): prd-daniel-ospina-tortoise-13126.log   pid 1408402   LIVE
+#     pi-cell-5 (246946a2): prd-daniel-ospina-tortoise-13126.log   pid 1851651   LIVE
+#     pi-cell-3 (915c3930): prd-daniel-ospina-tortoise-13126.log                (logged)
+#
+# It was NOT a missing mechanism. `scripts/orchestrator-harness/orch-loop.sh` already takes
+# `refs/claims/issue-<N>` before an ISSUE dispatch and fails closed when the registry cannot answer
+# (the block at its "CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH" banner). The CAS
+# (`claims.sh`'s `claim_acquire`) works. It was never wired into the PR-repair path, so every
+# `prd-…` lane was dispatchable by every box -- measured at `ec62b3753`: `pr-doctor.py` had ZERO
+# registry reads while `orch-loop.sh` had three.
+#
+# WHY `refs/claims/<pr>-<sha12>` (the same key the issue path's per-head sibling uses, NOT the
+# coarse `pr-<N>` landing key): a repair worker fixes THIS head, and a pushed update IS new work --
+# the content-addressed key is what `merge-one.sh`/`fix-one.sh` already use for exactly this
+# question, so a review or repair of a NEWER head is never blocked by the predecessor's claim.
+#
+# ⛔ CLAIMED BEFORE ANYTHING IS PREPARED -- before the brief is written and before
+# `materialise_worktree` runs -- because a claim taken after the lane spawns is not a lock, and a
+# claim taken after the worktree is a lock taken after minutes of work a peer already owns.
+#
+# ⛔ THE POLARITY IS `orch-loop.sh`'s, COPIED, NOT RE-INVENTED. An UNREADABLE registry is never
+# freedom; the registry read is `git ls-remote` (a GIT transport) while the pre-flight and the merge
+# path use the `gh` REST API, so a git-only failure refuses HERE on every box while merges keep
+# working. That direction is intended (`orch-loop.sh` records the mistake of softening it).
+#
+# ⛔ SKIP-AND-REPORT IS AN OWNER DECISION (2026-11-17), and it OVERRIDES the throughput-first default
+# of a dispatch loop:
+#
+#     OVERRIDES: the throughput-first default for a dispatch loop -- when the fleet cannot see the
+#     registry or sees no claim, the safe reading of a shared queue is "work it anyway" -- we choose
+#     idle capacity over duplicate writers, because the failures are not symmetric: a skipped issue
+#     waits, while two lanes on one PR write the same branch and a force-pushed head lands under a
+#     reviewer.
+#
+# So an abstention is a SKIP, never a licence; and the skip is REPORTED with its verdict token,
+# because a silent skip is indistinguishable from a bug. The tokens are the closed set in
+# `docs/ops/fleet-liveness.md` (`CLAIM_REASONS`, one function's vocabulary, not re-spelled here).
+#
+# ⛔ THE VERDICT FUNCTION IS `claims.sh`'s OWN, TWICE OVER: `claim_acquire` FOR the CAS and
+# `claim_head_preflight` FOR the answer when the CAS refuses. There is no second reader in this file
+# -- `tools/fleet/claim_lanes.py` is the Python reader, and it is deliberately NOT imported here:
+# `tools/fleet/` is not part of the harness deployment (`deploy-harness.sh` ships `claims.sh` into
+# `$O`, not `tools/`), so an import would work in a checkout and fail on exactly the cells this
+# fixes. What this file adds is a MAPPING from the shipped answer into the published token set.
+#
+# ⛔ KNOWN BOUNDARY, STATED BECAUSE IT IS A REAL LIMIT AND NOT A BUG: the claim is minted by a short
+# -lived `bash` child, and `claims.sh` stamps `owner=<host>:<pid>` with THAT child's pid
+# (`claim_owner` appends `$$`; `CLAIM_OWNER_ID` does not help -- the accepted branch appends `$$`
+# too, producing a three-field owner). So the minted owner's pid is gone before the next reader runs,
+# and a LOCAL-pid orphan verdict (`claim_orphan_reason`) reads the claim as ORPHANED -- reclaimable.
+# Consequences, MEASURED rather than assumed (each was executed, not traced):
+#   * ⛔ THE GUARANTEE IS "UNTIL THIS BOX'S NEXT `claim_prune`", NOT "FOR THE LEASE" (harness review,
+#     reproduced 2026-11-18 -- agent-infra#4136). The reaper deletes on exactly the verdict above
+#     with NO age gate: `claims.sh:2405` (`if why="$(claim_orphan_reason "$owner" "$ref")"; then
+#     push --delete`) off `claims.sh:844` ("owner host is this box (now or formerly) but the pid that
+#     took the PR claim (N) is gone"), and `orch-loop.sh:6133` runs it HOURLY, backgrounded, on the
+#     box that owns this checkout -- i.e. THIS box, the one that spawned the worker. Measured end to
+#     end against a bare origin: claim minted by a `bash -c` child, child gone, `claim_prune` in the
+#     same box -> `pruned orphaned-host …` with ~10 h of lease left, and a PEER's `claim_acquire` then
+#     won the create CAS (`rc=0`) while the worker was still running. A claim whose stamped pid IS
+#     alive survived the same pass, so the discriminator is holder LIVENESS, not the keying.
+#     ⛔ THIS PARAGRAPH REPLACED ITS OWN OPPOSITE ("CROSS-BOX EXCLUSION IS UNAFFECTED … a peer honours
+#     the lease for its whole term"), which was false against the three lines above and was repeated
+#     in `docs/ops/fleet-liveness.md`. Do not restore it: the window is <= 1 h, not 37200 s.
+#     The durable settlements (a live-holder pid, or a reaper abstention for a dispatcher mint that
+#     keeps the OWNER's own reclaim) are scoped in agent-infra#4136 -- they are `claims.sh` changes,
+#     outside this gate's surface, and one of them must land before #2557 can be called closed.
+#   * SAME-BOX duplicates stay guarded by the mechanism that already did it -- `worker_live_for()`
+#     plus the deterministic `prd-<n>` worker name and worktree -- not by this claim. Two concurrent
+#     passes on one box could therefore reclaim each other's claim; they could already collide on
+#     the same worker name, and the claim does not make that worse.
+#   * What the lease is still FOR: (i) the case where this box never prunes again (a stopped
+#     controller, a dead host -- the host rules then reap it, `claims.sh:2405`), and (ii) the
+#     owning box's OWN reclaim. A dead-pid claim is reclaimed by its owner on the next pass precisely
+#     BECAUSE the pid arm fires, which is what re-spawns a crashed repair worker; the reaper's use of
+#     the same verdict is what hands the head to a peer. One verdict, two callers, opposite
+#     correctness -- which is why the settlement has to be scoped to the REAPER (agent-infra#4136),
+#     not to `claim_orphan_reason`.
+#   * A lease long enough to cover the worker is required either way: a shorter one expires under a
+#     live lane and hands the same head to a peer, which is the duplicate this whole block removes.
+CLAIMS_SH_ENV = "PRD_CLAIMS_SH"
+CLAIM_LEASE_ENV = "PRD_CLAIM_LEASE_S"
+CLAIM_TIMEOUT_ENV = "PRD_CLAIM_TIMEOUT_S"
+CLAIM_LEASE_MAX_ENV = "PRD_CLAIM_LEASE_MAX_S"
+# The worker's own backstop plus the post-claim headroom, the SAME arithmetic `fix-one.sh` uses for
+# the identical key (`FIX_LEASE = FIX_TIMEOUT + 1200`): a lease that expires under a live worker lets
+# a peer take the same head, and a lease minted longer than the worker can run holds a PR for a term
+# nothing is working.
+CLAIM_LEASE_PAD_S = 1200
+# ⛔ THE CEILING IS `claims.sh`'s, AND THE FIRST VERSION OF THIS CONSTANT GOT IT WRONG IN THE ONE
+# DIRECTION THAT RE-CREATES THE BUG (measured by a fresh reviewer, then by reading the source).
+# `claims.sh:249` is `CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-43200}"` -- 12 h, MOVED THERE BY #4034 for the
+# derived reason that the fixer's own lease became 37200 s when the backstop went to 36000 s. This
+# constant was written as 9600 (the PRE-#4034 ceiling), and `min(36000 + 1200, 9600)` = 9600 s = 2 h
+# 40 m: the claim then expires 7 h 20 m INSIDE the worker's own bound and a peer takes the head -- the
+# second-worker-on-the-same-head hazard of #2888, which is exactly the defect #2557 exists to remove.
+# The mirrored cap is the registry's own default, and `test_the_claim_lease_never_exceeds_the_keyings
+# _ceiling` reads the ceiling OUT OF `claims.sh` rather than re-typing it here, so a future move of
+# that number reddens the test instead of silently shortening every repair lease.
+CLAIM_LEASE_MAX_S = 43200
+
+# The published verdict tokens (`docs/ops/fleet-liveness.md` §4, `liveness.CLAIM_REASONS`). Named as
+# a tuple here only so the mapping below cannot emit a word outside it; the MEANINGS live there.
+CLAIM_TOKENS = (
+    "claims-unreadable",
+    "no-claim-visible",
+    "claim-owner-unparseable",
+    "claim-held",
+    "holder-on-foreign-box",
+    "claim-holder-unverifiable",
+)
+# Of those, the ones that mean "a peer (or something unproven) owns this head" rather than "this box
+# could not read the registry". Only the second class is a FAILED READ of this pass; the first is a
+# peer doing the work, which is not a fault and must not refuse the pass.
+CLAIM_PEER_TOKENS = ("claim-held", "holder-on-foreign-box", "claim-owner-unparseable",
+                     "claim-holder-unverifiable")
+# The one token that is the registry itself failing to answer. `_finish` counts it on the
+# undeliverable axis: the ORDER could not be placed, and no amount of waiting on the star clears it.
+CLAIM_UNREADABLE_TOKEN = "claims-unreadable"
+
+
+class _ClaimHold(str):
+    """A dispatch SKIPPED by the cross-box claim registry -- a token, an optional holder, a reason.
+
+    A `str` subclass for the same reason `_Refusal` is one: `dispatch()`'s 3-tuple is a contract the
+    callers and ~40 test stubs unpack, so the machine-readable half rides ON the detail rather than
+    widening the tuple. `claim_hold_token()` is the ONE reader of it.
+    """
+
+    token = "claim-holder-unverifiable"
+    holder = ""
+
+    def __new__(cls, msg, token="claim-holder-unverifiable", holder=""):
+        self = super().__new__(cls, msg)
+        self.token = token if token in CLAIM_TOKENS else "claim-holder-unverifiable"
+        self.holder = holder or ""
+        return self
+
+
+def claim_hold_token(detail) -> str:
+    """The published claim token a dispatch refusal carries, or "" for every other refusal."""
+    tok = getattr(detail, "token", "") or ""
+    return tok if tok in CLAIM_TOKENS else ""
+
+
+# The bridge. `claims.sh` is BASH and its answers are GLOBALS (`CLAIM_RESULT`/`CLAIM_COMMIT`), so
+# they cannot be read across a process boundary without being printed -- and `$( … )` around the
+# acquire itself would run it in a subshell and discard them (the trap `claim_acquire` documents).
+# So ONE child does both calls and prints the globals; this file parses key=value lines.
+# ⛔ SEVEN ARGS, NEVER A SHELL STRING: the repo slug, the PR number and the head sha travel as argv,
+# so nothing in a PR title or a branch name is ever re-parsed by a shell.
+_CLAIM_ACQUIRE_BRIDGE = r"""
+set -u
+. "$1" || { printf 'loaded=0\n'; exit 0; }
+printf 'loaded=1\n'
+if ! command -v claim_acquire >/dev/null 2>&1; then
+  printf 'stale=1\n'; exit 0
+fi
+printf 'me=%s\n' "$(command -v claim_host >/dev/null 2>&1 && claim_host || :)"
+claim_acquire "$2" "$3" "$4" "$5" >/dev/null
+_rc=$?
+printf 'rc=%s\n' "$_rc"
+printf 'result=%s\n' "${CLAIM_RESULT:-}"
+printf 'commit=%s\n' "${CLAIM_COMMIT:-}"
+printf 'owner=%s\n' "${CLAIM_OWNER:-}"
+# The CAS refused: ask the registry's OWN pre-flight WHY, so the skip names a holder instead of a
+# prose reason this file would have to guess at (two keys, two questions -- the same pair
+# `pr-sickness.sh`'s `ps_held()` asks).
+if [ "$_rc" -ne 0 ] && command -v claim_head_preflight >/dev/null 2>&1; then
+  claim_head_preflight "$2" "$3" "$4" >/dev/null
+  printf 'hrc=%s\n' "$?"
+  printf 'hresult=%s\n' "${CLAIM_RESULT:-}"
+fi
+exit 0
+"""
+# The read-only arm: `--dry-run` must decide the SAME question without writing a ref. It asks the
+# pre-flight only (no push, no mint), so a dry run can report "a peer holds this head" and can never
+# publish a claim it will not work.
+_CLAIM_PREFLIGHT_BRIDGE = r"""
+set -u
+. "$1" || { printf 'loaded=0\n'; exit 0; }
+printf 'loaded=1\n'
+if ! command -v claim_head_preflight >/dev/null 2>&1; then
+  printf 'stale=1\n'; exit 0
+fi
+printf 'me=%s\n' "$(command -v claim_host >/dev/null 2>&1 && claim_host || :)"
+claim_head_preflight "$2" "$3" "$4" >/dev/null
+printf 'hrc=%s\n' "$?"
+printf 'hresult=%s\n' "${CLAIM_RESULT:-}"
+exit 0
+"""
+_CLAIM_RELEASE_BRIDGE = r"""
+set -u
+. "$1" || { printf 'rc=3\n'; exit 0; }
+if ! command -v claim_release >/dev/null 2>&1; then printf 'rc=3\n'; exit 0; fi
+claim_release "$2" "$3" "$4" "$5" >/dev/null
+printf 'rc=%s\n' "$?"
+printf 'result=%s\n' "${CLAIM_RESULT:-}"
+exit 0
+"""
+
+
+def claims_sh() -> str:
+    """The registry module this box has, or "" -- the SAME ranked candidates the harness uses.
+
+    `$O/claims.sh` is the deployed copy (`deploy-harness.sh` ships it, and `$O` is where every
+    other harness module this file calls already lives); the checkout's own copy covers a lane
+    running from a worktree. ⛔ NOT FOUND IS NOT FREEDOM -- the caller turns "" into
+    `claims-unreadable`, because an absent registry is a read that did not happen.
+    """
+    for cand in (os.environ.get(CLAIMS_SH_ENV) or "",
+                 os.path.join(ORCH_DIR, "claims.sh"),
+                 os.path.join(REPO_DIR or "", "scripts", "orchestrator-harness", "claims.sh")):
+        if cand and os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def claim_lease() -> int:
+    """The lease for a per-head repair claim: the worker's own backstop plus the post-claim pad.
+
+    Capped at this keying's ceiling (`CLAIM_LEASE_MAX_S`, which mirrors `claims.sh`'s
+    `CLAIM_TTL_MAX` default) so the mint does not rely on somebody else's clamp -- see the note on
+    the constant, including why the first version of this number was wrong in the dangerous
+    direction.
+    """
+    want = _positive_int_env(CLAIM_LEASE_ENV, SPAWN_TIMEOUT_S + CLAIM_LEASE_PAD_S)
+    cap = _positive_int_env(CLAIM_LEASE_MAX_ENV, CLAIM_LEASE_MAX_S)
+    return min(want, cap)
+
+
+def _claim_kv(stdout: str) -> dict:
+    """Parse the bridge's `key=value` lines. A line without `=` is dropped, never guessed at."""
+    out: dict = {}
+    for line in (stdout or "").splitlines():
+        key, sep, val = line.partition("=")
+        if sep and key:
+            out[key.strip()] = val
+    return out
+
+
+def claim_sh_err(args, timeout=180, env=None):
+    """The claim bridge's OWN child call, named at its call site.
+
+    ⛔ IT DELEGATES TO `sh_err` AT CALL TIME, AND THE SUBTLETY IS RECORDED BECAUSE IT BIT ONCE
+    (measured while writing the #2557 tests). Most dispatch tests stub `sh_err` to record the spawn
+    argv; that stub reaches THIS call too, and a stub returning `("", "", 0)` makes the registry
+    answer look empty -- which reads as `claims-unreadable` and hid the two-box case for two runs.
+    So: a test that needs a REAL registry answer must not stub `sh_err` (stub `spawn_argv` or
+    `dispatch` instead), and this wrapper exists so a reader tracing a failed claim finds the one
+    call that talks to `origin` rather than one `sh_err` among forty.
+    """
+    return sh_err(args, timeout=timeout, env=env)
+
+
+def _claim_run(bridge: str, extra: list) -> tuple[dict, str]:
+    """Run one bridge against the registry. Returns (parsed fields, stderr tail)."""
+    sh = claims_sh()
+    if not sh:
+        return {}, ""
+    env = {**os.environ, "CLAIM_REPO": REPO_DIR or os.getcwd()}
+    out, err, rc = claim_sh_err(["bash", "-c", bridge, "claims-bridge", sh] + extra,
+                                timeout=_positive_int_env(CLAIM_TIMEOUT_ENV, 120), env=env)
+    fields = _claim_kv(out)
+    if rc != 0 and "rc" not in fields and "hrc" not in fields:
+        # The child itself did not answer (bash absent, a killed process). An unanswerable bridge is
+        # an abstention, never a free head -- the same polarity the registry read takes.
+        fields.setdefault("rc", "2")
+        fields.setdefault("result", "the claim bridge exited %s: %s" % (rc, (err or "").strip()[:200]))
+    return fields, (err or "").strip()
+
+
+def claim_verdict_token(fields: dict) -> str:
+    """Map a registry answer into the PUBLISHED token set (`docs/ops/fleet-liveness.md` §4).
+
+    ⛔ ONE MAPPING, NAMED, BECAUSE THE TWO VOCABULARIES ARE DIFFERENT AND BOTH ARE LOAD-BEARING.
+    `claims.sh` answers with rc + a reason that carries its OWN machine token (`held-by-live`,
+    `held-by-orphan`, `held-by-unreadable-lease`, `held-by-unreadable-clock`); fleet-liveness
+    publishes six words for what a READER may conclude. Emitting `held-by-live` would be a seventh
+    word no monitor knows, so it is translated here and nowhere else:
+
+        rc=2 (or no answer at all)          -> claims-unreadable          (the registry did not answer)
+        held-by-unreadable-lease / -clock   -> claim-holder-unverifiable  (presence, no probeable holder)
+        holder unparseable (`?`)            -> claim-owner-unparseable
+        holder on THIS box                  -> claim-held                 (ownership window, open)
+        holder on another box               -> holder-on-foreign-box      (provenance, never probed)
+        lost a reclaim race                 -> claim-held                 (a peer took it and is live)
+        anything else                       -> claim-holder-unverifiable  (the catch-all rung)
+
+    `no-claim-visible` is deliberately NOT produced: it is what a FREE head reads on the reader
+    side, and this function is only asked about a head the CAS REFUSED -- which by construction
+    has a claim. A refusal whose reason names no claim at all falls to the catch-all, never to a
+    token that would read as "nothing there".
+    """
+    if fields.get("loaded") == "0" or fields.get("stale") == "1":
+        # A registry that cannot even be sourced, or one too old to expose `claim_acquire`, is the
+        # "present but stale" arm `orch-loop.sh` REFUSES (a local-drift fail-open would duplicate a
+        # peer's work, and this file's own gate would say otherwise on the same box).
+        return CLAIM_UNREADABLE_TOKEN
+    rc = (fields.get("rc") or "").strip()
+    hrc = (fields.get("hrc") or "").strip()
+    if rc == "0":
+        return ""                      # acquired: not a refusal, nothing to report
+    if rc != "1":
+        return CLAIM_UNREADABLE_TOKEN   # 2 = the registry could not answer; anything else is unknown
+    if hrc == "2":
+        return CLAIM_UNREADABLE_TOKEN   # the pre-flight could not read it either
+    text = " ".join(x for x in (fields.get("hresult"), fields.get("result")) if x)
+    if "held-by-unreadable-lease" in text or "held-by-unreadable-clock" in text:
+        return "claim-holder-unverifiable"
+    holder = claim_holder(text)
+    if holder == "?":
+        return "claim-owner-unparseable"
+    if holder:
+        host = holder.split(":", 1)[0]
+        me = (fields.get("me") or "").strip()
+        return "claim-held" if (me and host == me) else "holder-on-foreign-box"
+    if "lost the reclaim race" in text:
+        return "claim-held"
+    return "claim-holder-unverifiable"
+
+
+def claim_holder(text: str) -> str:
+    """The `<host>:<pid>` a registry reason names, or "" when it names none.
+
+    Read from the SHIPPED wording (`held by <owner> until <until> …`) rather than re-deriving it:
+    `claims.sh` is the only producer of these strings, and both its acquire and its pre-flight arms
+    use the same phrase. A shape this does not match leaves the holder empty -- the verdict token is
+    still emitted, and the verbatim reason is still reported, so nothing is hidden.
+    """
+    m = re.search(r"held by (\S+)", text or "")
+    return m.group(1) if m else ""
+
+
+def pr_claim_gate(pr: dict, dry: bool = False) -> tuple:
+    """Take this head's cross-box claim. Returns (hold, claim_commit).
+
+    `hold is None` -> this box owns the head and may spawn; `claim_commit` is what a later fenced
+    release must carry. `hold` is a `_ClaimHold` -> SKIP this head and REPORT it: a peer owns it, or
+    the registry could not answer, and BOTH mean "do not dispatch" (an abstention is not permission).
+
+    ⛔ DRY RUNS DO NOT CLAIM. They ask the registry the SAME question through its read-only
+    pre-flight, so a `--dry-run` reports the hold it would have hit without publishing a ref for
+    work it will not do -- a claim minted by a dry run would block a real box for a whole lease.
+    """
+    sha = pr.get("headRefOid") or ""
+    num = str(pr.get("number") or "")
+    if not sha or not num:
+        return (_ClaimHold("no PR number or head sha to key a claim on -- refusing to spawn "
+                           "unclaimed (the key is HEAD-scoped)",
+                           token=CLAIM_UNREADABLE_TOKEN), "")
+    if not claims_sh():
+        return (_ClaimHold(
+            "the claim registry (claims.sh) is not on this box, so this head's claim could not be "
+            "read -- an absent registry is not a free head; fix: deploy the harness "
+            "(scripts/orchestrator-harness/deploy-harness.sh --repo . --o " + ORCH_DIR + ")",
+            token=CLAIM_UNREADABLE_TOKEN), "")
+    if dry:
+        fields, err = _claim_run(_CLAIM_PREFLIGHT_BRIDGE, [REPO, num, sha])
+        hrc = (fields.get("hrc") or "").strip()
+        if hrc == "0":
+            log("DRY-RUN #%s: the cross-box claim for %s is FREE -- a real pass would take "
+                "%s" % (num, sha[:12], "refs/claims/%s-%s" % (num, sha[:12])))
+            return (None, "")
+        # ⛔ `rc` IS CARRIED FROM THE BRIDGE, NOT ASSUMED (harness review of #4134, P3). `_claim_run`
+        # stamps `rc=2` when the child itself did not answer (bash absent, killed process, `sh_err`
+        # timeout). Hard-coding `"1"` here discarded that stamp, so the outage fell through to the
+        # catch-all rung and a `--dry-run` reported `claim-holder-unverifiable` -- "presence, no
+        # probeable holder" -- about a registry NOTHING had read, which is the one direction this
+        # gate may not fail open in. The read-only bridge prints `hrc` and no `rc` when it DOES
+        # answer, so "1" stays the default for the answered case and the non-dry arm's mapping is
+        # now the same mapping.
+        token = claim_verdict_token({"rc": (fields.get("rc") or "1").strip(), "hrc": hrc,
+                                     "loaded": fields.get("loaded", "1"),
+                                     "stale": fields.get("stale", "0"), "me": fields.get("me", ""),
+                                     "hresult": fields.get("hresult", "")})
+        reason = (fields.get("hresult") or fields.get("result") or err
+                  or "the registry gave no reason").strip()
+        return (_claim_hold(token, claim_holder(reason), reason), "")
+    fields, err = _claim_run(_CLAIM_ACQUIRE_BRIDGE, [REPO, num, sha, str(claim_lease())])
+    rc = (fields.get("rc") or "").strip()
+    commit = (fields.get("commit") or "").strip()
+    if rc == "0":
+        return (None, commit)
+    # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL -- and this branch used to
+    # drop it. `claims.sh` deliberately leaves `CLAIM_COMMIT` set on the create/reclaim paths whose
+    # push MAY have landed and only the read-back failed, so the caller can attempt a FENCED release
+    # (its own comment says so). `orch-loop.sh:9517-9525` -- the implementation this gate copies --
+    # handles that arm explicitly, because discarding it orphans a claim THIS BOX created for the
+    # whole lease while every peer reads the head as taken: the abandoned-claim class #2557 closes.
+    # The commit travels back with the hold, and `dispatch()` releases it (fenced) before skipping.
+    token = claim_verdict_token(fields)
+    reason = (fields.get("hresult") or fields.get("result") or err
+              or "the registry gave no reason").strip()
+    return (_claim_hold(token, claim_holder(reason), reason), commit)
+
+
+def _claim_hold(token: str, holder: str, reason: str) -> _ClaimHold:
+    """The skip's detail: the token, the holder when one was parseable, and the verbatim reason."""
+    who = (" holder=%s" % holder) if holder else " holder=<unparseable>"
+    return _ClaimHold("cross-box claim registry: verdict=%s%s -- %s" % (token, who, reason[:400]),
+                      token=token, holder=holder)
+
+
+def pr_claim_release(pr: dict, commit: str) -> bool:
+    """Give the claim back, FENCED on the commit this box pushed (never a blind delete).
+
+    Called on every path that took the claim and then did not launch a worker. Without it a refused
+    spawn (a gate refusal, a vanished worktree) would hold the head for the whole lease and every
+    peer would refuse it -- the abandoned-claim class `claims.sh` documents, arrived at from here.
+    The fence is why this is safe to call even when the acquire's own answer was ambiguous: if the
+    ref moved, the push is rejected and the winner's claim is untouched.
+    """
+    if not commit:
+        return False
+    num = str(pr.get("number") or "")
+    sha = pr.get("headRefOid") or ""
+    fields, err = _claim_run(_CLAIM_RELEASE_BRIDGE, [REPO, num, sha, commit])
+    ok = (fields.get("rc") or "").strip() == "0"
+    if not ok:
+        log("⚠️ #%s: the cross-box claim could NOT be released (%s) -- it will run to its lease; "
+            "peers refuse this head until then" % (num, (fields.get("result") or err or "?")[:160]))
+    return ok
+
+
 def dispatch(pr: dict, action: str, text: str, dry: bool,
              rubric_note: str = "") -> tuple[bool, str, bool]:
     """Spawn a background worker for one PR. Returns (launched, detail, record).
@@ -4444,6 +4878,13 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
         # refuse. Walk the SAME tree READ-ONLY: nothing is created, fetched, checked out or reset.
+        # …and ask the cross-box registry FIRST, read-only: on the measured #2557 incident the PR
+        # was refused by the CLAIM, not by the worktree, so a dry run that skipped this question
+        # reported "would spawn" for a head another box already owned.
+        hold, _ = pr_claim_gate(pr, dry=True)
+        if hold is not None:
+            log("DRY-RUN %s would NOT spawn: %s" % (name, str(hold)[:200]))
+            return False, hold, False
         wt, werr = materialise_worktree(pr, dry=True)
         if not wt:
             log("DRY-RUN %s would NOT spawn: %s" % (name, werr[:160]))
@@ -4478,21 +4919,68 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         return (False, "worker liveness could not be read (`%s --status` failed) -- refusing to "
                        "spawn blind: a live worker would be destroyed" % NONBLOCKING_DISPATCH,
                 False)
-    path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w") as f:
-        f.write(text)
-    wt, err = materialise_worktree(pr)
-    if not wt:
-        return False, err, bool(getattr(err, "persistent", False))
+    # ── THE CROSS-BOX CLAIM, BEFORE ANYTHING IS PREPARED (agent-infra#2557) ─────────────────────
+    # Taken here -- after the LOCAL liveness guards (a live worker on this box is the cheaper, more
+    # certain refusal) and before the brief is written or a worktree materialised -- so that a head
+    # another box owns costs this box NOTHING, and so that the claim is held for the whole life of
+    # the spawn rather than for the part of it after the lock was taken.
+    hold, claim_commit = pr_claim_gate(pr, dry=False)
+    if hold is not None:
+        # ⛔ A SKIP THAT SAYS NOTHING IS INDISTINGUISHABLE FROM A BUG (the owner's 2026-11-17
+        # decision, verbatim). The line names the PR, the token and the holder, so an operator can
+        # tell "a peer is repairing this" from "this box cannot see the registry".
+        # ⛔ AND AN rc=2 MAY HAVE MINTED ONE: `claims.sh` sets `CLAIM_COMMIT` on the create/reclaim
+        # paths whose push may have landed and only the read-back failed, so a non-empty commit here
+        # is released FENCED before the skip -- the claim is ours, and leaving it would block every
+        # peer for a whole lease. rc=1 (a peer holds it) carries no commit and cannot reach this.
+        released = pr_claim_release(pr, claim_commit) if claim_commit else None
+        log("#%s (%s): SKIPPED -- verdict=%s%s; not spawning a second lane on head %s%s"
+            % (pr.get("number"), action, getattr(hold, "token", "?"),
+               (" holder=%s" % hold.holder) if getattr(hold, "holder", "") else "",
+               (pr.get("headRefOid") or "?")[:12],
+               "" if released is None else
+               (" -- the claim commit this box may have pushed WAS released (fenced on %s)"
+                % claim_commit[:12] if released else
+                " -- the possibly-created claim could NOT be released; it runs to its lease")))
+        return False, hold, False
+
+    def _give_back(detail, record_=False, ok=False):
+        """Every failure AFTER the claim gives it back: a held head nobody is working is a stuck PR.
+
+        One helper rather than a release line at each return, so a new early exit cannot silently
+        skip it -- and it is a no-op when `claim_commit` is empty (the acquire's own answer was
+        ambiguous, so there is nothing this box may safely fence on).
+        """
+        pr_claim_release(pr, claim_commit)
+        return ok, detail, record_
+
+    # ⛔ AN EXCEPTION BETWEEN THE CLAIM AND THE SPAWN LEAKS THE CLAIM (fresh-review finding, reproduced
+    # against a real registry + bare remote: an OSError from the brief write -- ENOSPC is exactly the
+    # condition this box's own rc=77 disk gate exists for -- or from `materialise_worktree` propagated
+    # with the claim minted, and `run_pass` does not guard `dispatch`, so no later pass releases it:
+    # every peer refused that head for the whole lease while nothing was working it). The window ends
+    # BEFORE the spawn: an exception after a worker has actually started must NOT release its claim.
+    try:
+        path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        wt, err = materialise_worktree(pr)
+        if not wt:
+            return _give_back(err, bool(getattr(err, "persistent", False)))
+    except Exception as exc:            # noqa: BLE001 -- the claim MUST be given back
+        return _give_back("could not prepare the spawn (%s: %s) -- the cross-box claim on head %s "
+                          "was released rather than left holding it"
+                          % (type(exc).__name__, exc, (pr.get("headRefOid") or "?")[:12]))
     # ⛔ THE GUARD IS CHECK-THEN-ACT, AND THE ACT IS MINUTES LATER. `materialise_worktree` can fetch
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
     again = worker_live_for(n)            # BOTH names: the pre-#2725 `prd-<n>` too, if it is ours
     if again is not False:
-        return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
-                       "was being prepared -- refusing to spawn a second one" % name, False)
+        return _give_back(
+            "worker %s appeared (or its liveness became unreadable) while the worktree "
+            "was being prepared -- refusing to spawn a second one" % name)
     # cwd is HOME for the same TCC reason the old cmux path used it: a cwd under ~/Documents is
     # protected and a launchd-spawned caller has no Full Disk Access. The dispatcher takes absolute
     # paths and does its own `cd "$WT"` internally.
@@ -4535,7 +5023,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         if code is not None and gate_refused(name, code):
             detail = "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
             log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
-            return False, detail, False
+            return _give_back(detail)
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
         # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
         # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
@@ -4561,17 +5049,40 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
-        return False, detail, False
+        return _give_back(detail)
     verdict, detail = _confirm(name)
     if verdict == "refused":
         log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
-        return False, detail, False
+        return _give_back(detail)
     if verdict == "unconfirmed":
         # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
         # checked before every spawn: if the worker did start, the next pass sees it running.
-        log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; liveness is re-checked next pass"
-            % (name, wt, detail))
+        # ⛔ THE CLAIM IS KEPT, AND THE FIRST VERSION OF THIS ARM RELEASED IT -- WHICH PUT BACK THE
+        # MEASURED DEFECT ON THE DOMINANT PATH (fresh-review round 2, reproduced against the real
+        # registry and a bare remote). `_confirm()` polls for `CONFIRM_WINDOW_S` = 1 s and then reads
+        # `--status` + the `[agent] provider=` marker, but THAT MARKER IS WRITTEN AFTER THE
+        # CAPABILITY GATE (5-25 s measured on a healthy box), so a worker that is alive and about to
+        # deliver is exactly what `unconfirmed` looks like. Releasing here therefore published the
+        # head free within a second of every spawn: a peer box's `pr_claim_gate` answered
+        # `hold=None` and it spawned a second live lane on the same head -- #2557 itself.
+        # ⛔ AND NOTHING REPAIRED IT LATER, which is what made the arm's own justification false:
+        # this pass writes no row, and the NEXT pass returns at the pre-claim liveness guard
+        # (`worker_live_for` → "one worker per PR") BEFORE it could ever re-claim the head -- so no
+        # pass mints the claim again while the lane runs, and "its own pushes re-key the claim" only
+        # moves the hole to the new head rather than closing it.
+        # The polarity is therefore the one this change's own OVERRIDES line records -- we choose
+        # idle capacity over duplicate writers -- and the cost is bounded by construction: a worker
+        # that never existed holds ONE head for ONE lease, while a released claim holds nothing and
+        # lets a peer write the same branch underneath a live lane. `refused` (no agent started) and
+        # every pre-spawn exit still give the claim back; only "could not tell" keeps it.
+        log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; the claim is KEPT (the worker may be "
+            "alive: the provider marker lands after the capability gate) and liveness is re-checked "
+            "next pass" % (name, wt, detail))
         return False, detail, False
+    # ✅ THE CLAIM IS KEPT: a lane is live on this head, and the whole point of the CAS is that no
+    # peer may take it while this worker runs. It is released by its LEASE (the worker's own backstop
+    # plus the pad) -- the worker is a `pi` process with a brief, not a claim-taking lane, so there is
+    # no exit trap to release it, and a pushed head re-keys to a new claim anyway.
     log("spawn %s -> %s: %s" % (name, wt, detail))
     return True, detail, True
 
@@ -5961,6 +6472,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         blind = unread + blind_surface + blind_partial + blind_abandoned
         stalls = stalled or {}
         if not dispatched:
+            # ⛔ THE TRANSPORT RESIDUE, COMPUTED ONCE (harness review of #4134, P2). `undeliverable`
+            # covers causes that NEVER REACHED THE TRANSPORT -- a row carried from an earlier pass's
+            # refusal, an order refused for the passage's rubric, and a `claims-unreadable` skip
+            # (the claim registry could not answer, so nothing was ever addressed) -- and ONE MORE
+            # that did (a spawn that was placed and failed, or was withheld on unreadable liveness).
+            # Only the last may be called "no worker accepted"; every arm below quotes a residue,
+            # never the whole count, so a number is never attributed to a component that was never
+            # invoked.
+            _rub = stalls.get("rubric") or 0
+            _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
+            _transport = undeliv - carried - _rub - _claim_unread
             # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
             # holds are appended rather than folded in: they are the same AXIS (a read that did not
             # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
@@ -5975,8 +6497,10 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # carried refusal printed both a transport claim and "refused in an earlier pass" in
                 # the same verdict — the contradiction the `parts` split above removed, one branch
                 # down. ⛔ AND A ZERO-COUNT CLAUSE IS STILL A FALSE CLAIM: when nothing was placed the
-                # clause is OMITTED, not printed with `0`.
-                _placed = undeliv - carried
+                # clause is OMITTED, not printed with `0`. ⛔ AND THE SAME RESIDUE APPLIES TO THE
+                # CLAIM REGISTRY AND THE RUBRIC (harness review of #4134, P2) — an order the
+                # registry never answered for never reached the transport either.
+                _placed = _transport
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
                 log("REFUSING: %d PR(s) were UNREADABLE%s, with nothing dispatched -- not a clean"
@@ -5985,7 +6509,7 @@ def run_pass(args, rubric_note: str = "") -> int:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
                     " pass%s" % (unread, _more))
             elif _held and undeliv:
-                _placed = undeliv - carried
+                _placed = _transport
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
                 log("REFUSING: %d PR(s) had an unusable changed-file list%s, with nothing"
@@ -5999,7 +6523,6 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # the chain was ever exec'd -- so this sentence asserted a transport failure over a
                 # component that was never addressed, one line above a verdict that repeated it. The
                 # class is named here so the two lines cannot tell different stories.
-                _rub = stalls.get("rubric") or 0
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 if carried and carried == undeliv:
                     log("REFUSING: %d PR(s) still undeliverable -- refused in an EARLIER pass and"
@@ -6010,9 +6533,27 @@ def run_pass(args, rubric_note: str = "") -> int:
                         " that is not %s's -- nothing was dispatched and the dispatch chain was"
                         " never invoked%s; not a clean pass"
                         % (undeliv - carried, REPO or "<unresolved>", _carried))
+                elif _claim_unread and _claim_unread == undeliv - carried:
+                    # ⛔ THE REGISTRY NOT ANSWERING IS NOT THE TRANSPORT NOT ACCEPTING (harness review
+                    # of #4134, P2). Both refuse (rc 3, deliberately -- see the `claims-unreadable`
+                    # arm in `run_pass`), but the sentence must name the component that failed: this
+                    # one sends an operator to the claim registry's git transport, never to
+                    # "repair the dispatch chain", which was never invoked.
+                    log("REFUSING: %d order(s) could not be placed because the CLAIM REGISTRY could"
+                        " not answer -- nothing was dispatched, and a head whose claim cannot be"
+                        " READ is never proven free%s; not a clean pass"
+                        % (undeliv - carried, _carried))
                 else:
-                    log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
-                        " a clean pass" % (undeliv - carried))
+                    # ⛔ ONLY ORDERS THAT ACTUALLY REACHED THE TRANSPORT MAY BE CALLED "no worker
+                    # accepted" (harness review of #4134, P2). The residue is what is left after
+                    # every cause that never invoked the chain; when there is none, the sentence
+                    # names the refusal without inventing a transport failure over zero orders.
+                    if _transport:
+                        log("REFUSING: %d order(s) no worker accepted and nothing was dispatched --"
+                            " not a clean pass%s" % (_transport, _carried))
+                    else:
+                        log("REFUSING: nothing was dispatched and %d order(s) could not be placed --"
+                            " not a clean pass%s" % (undeliv - carried, _carried))
         # WHY nothing (or something) went out. Named in the line itself, so the log answers the
         # question an operator actually asks -- never a bare number.
         parts = []
@@ -6052,7 +6593,14 @@ def run_pass(args, rubric_note: str = "") -> int:
             # on the same line that now says the chain was never invoked. Split, so the count and
             # the cause agree.
             _rub = stalls.get("rubric") or 0
-            placed_and_refused = undeliv - carried - _rub
+            # ⛔ AND THE CLAIM REGISTRY IS ITS OWN CAUSE HERE TOO (harness review of #4134, P2).
+            # `claims-unreadable` is the fourth cause on the `undeliverable` axis and it never
+            # reached the transport either, so folded into `no worker accepted` it made the pass
+            # line assert a transport failure in a pass where `nonblocking-dispatch.sh` was never
+            # invoked -- the exact shape #2291 and #4009 each split. Split, so the count and the
+            # cause agree.
+            _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
+            placed_and_refused = undeliv - carried - _rub - _claim_unread
             if placed_and_refused:
                 parts.append("%d order(s) no worker accepted%s"
                              % (placed_and_refused,
@@ -6061,11 +6609,32 @@ def run_pass(args, rubric_note: str = "") -> int:
             if _rub:
                 parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
                              % _rub)
+            if _claim_unread and dispatched:
+                # ⛔ NAMED ON A PASS THAT DELIVERED TOO, not only the zero-dispatch one: the stall
+                # loop above prints it ONLY when nothing went out, so on a pass that dispatched two
+                # orders and stood down from an unreadable registry the count appeared NOWHERE and
+                # the sentence blamed the transport (harness review of #4134, P2). The `dispatched`
+                # guard is the `_peers` block's own convention -- on a zero-dispatch pass the stall
+                # counter is already on this line, and this file never prints one quantity twice.
+                parts.append("%d order(s) could not be placed: the CLAIM REGISTRY could not answer"
+                             " (%s=%d -- a head whose claim cannot be read is never proven free)"
+                             % (_claim_unread, CLAIM_UNREADABLE_TOKEN, _claim_unread))
             if carried:
                 parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
                              " out a refusal cooldown" % carried)
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
+        # ⛔ A PEER-HELD HEAD IS NAMED ON A PASS THAT DELIVERED TOO (agent-infra#2557). The stall
+        # counters above are printed only when NOTHING went out, so without this a pass that
+        # dispatched two orders and stood down from two claimed heads read as "ok" with no trace of
+        # the two it declined -- which is the silent skip the owner's decision forbids. (On a
+        # zero-dispatch pass these keys are already on the line via the stall loop, so naming them
+        # again would print one quantity twice, which this block exists to remove.)
+        _peers = sum(v for k, v in stalls.items() if k in CLAIM_PEER_TOKENS)
+        if dispatched and _peers:
+            parts.append("%d PR(s) SKIPPED -- a peer holds the head (%s)"
+                         % (_peers, ",".join("%s=%d" % (k, stalls[k])
+                                             for k in CLAIM_PEER_TOKENS if stalls.get(k))))
         if no_room:
             # ⛔ COUNTED ON EVERY PASS, not only a refused one: a pass that dispatched four orders and
             # had three refused on load must say BOTH -- "4 of 7" hides that three never left the box
@@ -6172,6 +6741,16 @@ def run_pass(args, rubric_note: str = "") -> int:
         # `undeliv`, or a real transport drop would be hidden behind a single asserted cause.
         elif not dispatched and rubric_n and undeliv == rubric_n + carried:
             code, verdict = EXIT_UNDELIVERED, "RUBRIC"
+        # ⛔ AND AN UNREADABLE CLAIM REGISTRY IS THE SAME CLASS, ONE LAYER DOWN (harness review of
+        # #4134, P2). Nothing was exec'd: `pr_claim_gate` refuses BEFORE the brief, the worktree and
+        # `nonblocking-dispatch.sh`, so `next=repair-chain` named a component that was never invoked
+        # and left the failing one -- the registry's git transport -- unnamed. The remedy is the
+        # registry (`git ls-remote`/`push` to the claims remote, or a missing `$O/claims.sh`).
+        # The same equality guard applies: `claims-unreadable` + `carried` must be the WHOLE of
+        # `undeliv`, or a real transport drop would be hidden behind a single asserted cause.
+        elif (not dispatched and (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0)
+              and undeliv == (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0) + carried):
+            code, verdict = EXIT_UNDELIVERED, "CLAIM-UNREADABLE"
         # ⛔ THE REFUSAL TOKEN WINS ONLY WHEN THE WHOLE UNDELIVERABLE SET IS REFUSALS (#2291 merged
         # with #2710's `carried`). Both changes route a durable refusal to rc 3 -- #2710 through
         # `undeliverable`/`carried`, #2291 through its own `refused-cooldown` axis -- so the code is
@@ -6226,6 +6805,15 @@ def run_pass(args, rubric_note: str = "") -> int:
             head += ("; the dispatch chain was NEVER INVOKED -- supply this repo's own rubric through"
                      " the OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE seams named on this pass's `rubric:`"
                      " line; repairing the chain cannot help and this does NOT clear by waiting")
+        elif verdict == "CLAIM-UNREADABLE":
+            # ⛔ THE OTHER COMPONENT THAT IS NOT THE CHAIN (harness review of #4134, P2). Same
+            # measured shape as #4009: nothing was exec'd, so the old `next=repair-chain` sent an
+            # operator to a healthy dispatcher while `git ls-remote`/`push` to the claim registry
+            # (or a missing `$O/claims.sh`) was the thing that failed.
+            head += ("; the CLAIM REGISTRY could not answer -- check `git ls-remote`/`push` to the"
+                     " claims remote and `$O/claims.sh`; the dispatch chain and its workers were"
+                     " NEVER INVOKED, so repairing them cannot help"
+                     " and this does NOT clear by waiting")
         elif verdict == "SLOTS-FULL":
             head += "; capacity is present and the queue is being served"
         log("dispatched %d of %d queued — %s" % (dispatched, queued, head + "; " + why))
@@ -6391,6 +6979,29 @@ def run_pass(args, rubric_note: str = "") -> int:
             continue
         ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
+            # ── A PEER OWNS THIS HEAD, OR THE REGISTRY COULD NOT ANSWER (agent-infra#2557) ───────
+            # Its OWN class, and neither of the two below. It is NOT `no_room`: the box is fine and
+            # nothing about it needs repairing. It is NOT `undeliverable` when a PEER holds the head:
+            # the transport is fine too, the work is simply somebody else's -- the pass is healthy
+            # and the line says so (`claim-held=N`). ⛔ The one exception is `claims-unreadable`,
+            # which IS a failed order: the registry could not answer, so this box cannot prove the
+            # head is free, and the pass may not read as clean while it places nothing. That one
+            # rides the undeliverable axis (rc 3 -- "legible work, NONE of it out"), which is the
+            # same axis an unreadable worker liveness already takes, and it clears when the git
+            # transport answers rather than by waiting on the star.
+            # ⛔ NO STATE ROW AND NO COOLDOWN on either arm (`record` is False from `dispatch()`):
+            # a claim is a fact about ANOTHER box and it clears by itself, so a 45-min cooldown here
+            # would park the PR for three quarters of an hour after the peer released it.
+            ctoken = claim_hold_token(detail)
+            if ctoken:
+                stalled[ctoken] = stalled.get(ctoken, 0) + 1
+                if ctoken == CLAIM_UNREADABLE_TOKEN:
+                    undeliverable += 1
+                continue
+            # ⛔ THE BOX REFUSING AND THE TRANSPORT REFUSING ARE TWO FACTS (#2291). They arrived
+            # here as one `undeliverable += 1`, with one code, and therefore one remedy. The gate
+            # refusal is separated FIRST: it consumed nothing, it must not reach a cooldown, and its
+            # remedy is the axis it names (`GATE_NEXT_ACTION`) -- not "repair the dispatch chain".
             # ⛔ PENDING IS NEITHER A LAUNCH NOR A DELIVERY FAILURE (review of #4047 at this head, P1).
             # It is separated FIRST, before every other arm, for the reason the rubric arm below is: the
             # remedy is neither "wait for the box" nor "repair the chain" — it is "re-read liveness next

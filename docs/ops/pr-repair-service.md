@@ -73,7 +73,7 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
    | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
-   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708), **or** the pass holds no rubric for this repo and never reached the chain at all (`agent-infra#4009` — see **The dispatch chain** below; `VERDICT=RUBRIC next=supply-rubric`). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for all three causes; the human line on stderr names them and pr-doctor's own `verdict` field distinguishes them — renaming the token is left to a change that can verify every reader |
+   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708), **or** the pass holds no rubric for this repo and never reached the chain at all (`agent-infra#4009` — see **The dispatch chain** below; `VERDICT=RUBRIC next=supply-rubric`), **or** the cross-box claim registry could not answer so no head's freedom could be proven and the chain was never reached either (`agent-infra#2557`; `VERDICT=CLAIM-UNREADABLE next=repair-claim-registry`). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for all four causes; the human line on stderr names them and pr-doctor's own `verdict` field distinguishes them — renaming the token is left to a change that can verify every reader |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
    | `skipped` | another pass held the lock, so this one attempted nothing. Written to its **own** file (`pr-repair.skip.json`) so a skipping process can never replace the lock holder's verdict; `--status` prints both |
 
@@ -101,12 +101,22 @@ So the verdict now carries the chain **resolved**, and only when the chain is ac
 | verdict | means | next |
 |---|---|---|
 | `RUBRIC` (rc 3) | this pass holds no rubric for the repo it grades, so **no order could be placed** and the chain was never reached | `supply-rubric` — set the `OBJECTIVE_REQUIRED` / `OBJECTIVE_SURFACE` seams the same pass's `rubric:` line names |
+| `CLAIM-UNREADABLE` (rc 3) | the cross-box **claim registry** could not answer (`agent-infra#2557`), so no head's freedom could be proven and **no order was placed**; `pr_claim_gate()` refuses before the brief, the worktree and the chain, so the chain was never reached either | `repair-claim-registry` — check `git ls-remote`/`push` to the claims remote, and that `$O/claims.sh` is deployed |
 | `UNDELIVERED` (rc 3) | an order was **placed** and the transport would not take it | `repair-chain`, with `chain=<resolved path>` on the same line — `(MISSING)` when deploying is the repair |
 | `REFUSED` (rc 3) | the order was refused on durable grounds (a dirty worktree, commits the head does not have) | `fix-worktree` |
 | `NO-CAPACITY` (rc 6) | the box's own spawn gate refused; nothing was consumed | `wait` / `prune-disk` / `land-prs` / `restart-box` / `finish-lanes`, per the axis |
 
 ⛔ **`RUBRIC` IS STILL A REFUSAL (rc 3), never `0`.** `#3105`'s ruling stands: a pass that delivers
 nothing may not read as a quiet queue. Only the **attribution** changed.
+
+The same rule is why `CLAIM-UNREADABLE` exists (`agent-infra#4134` harness review). `claims-unreadable`
+rides the `undeliverable` axis deliberately — nothing about waiting on the star clears it, and a pass
+that places nothing may not read clean — but it shares **neither** of the other two components'
+failures: it is `git ls-remote`/`push` to `refs/claims/*`, or a missing `$O/claims.sh`. Reporting it as
+`N order(s) no worker accepted` / `next=repair-chain` sent an operator to a healthy dispatcher that
+had never been invoked. On a pass that ALSO delivered something the cause is named on the pass line
+instead (`N order(s) could not be placed: the CLAIM REGISTRY could not answer (claims-unreadable=N)`),
+because such a pass is not a refusal.
 
 ### What the chain resolves on each box
 
