@@ -3023,9 +3023,12 @@ RECORDER_VETO_RE='auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|
 #       reviewer's mutation row that merely NAMES the token (very natural: a row about a disclosure
 #       guard) is then refused AFTER the review was paid for and AFTER the artifact was posted.
 #   (b) an `Outcome:` declaration that is non-clean, or that names blocking findings. `record-review.sh`
-#       reads these with `OC_DECL_RE` (`:1069`) in arm (1a) (`:2216`) and arm (1c) (`:1618`). A row
+#       reads these with `OC_DECL_RE` in arm (1a) and arm (1c). A row
 #       quoting such a declaration is lexically identical to a declaration — the recorder's own F5
 #       residual says so — so IT refuses, and the seam's job is to refuse PRE-POST instead.
+#       ⛔ CITED BY SYMBOL, NOT BY LINE (a fresh review at 40d18e1a9 measured this sentence's `:1618`
+#       pointing into arm (1c)'s own comment block five lines above its grep — the exact rot the
+#       harness warns about elsewhere). Arm names do not move; line numbers do.
 #
 # ⛔ WHY THIS IS A SECOND MIRROR AND NOT A WIDENING OF `RECORDER_VETO_RE`. That variable is pinned
 # BYTE-IDENTICAL to the recorder's arm-(1) regex by a tripwire in tests/review-pr/run.sh, which is what
