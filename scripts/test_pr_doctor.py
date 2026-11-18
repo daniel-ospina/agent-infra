@@ -1348,6 +1348,47 @@ def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_
     assert len(_claimed_refs(origin)) == 1, "the dry run must not have changed the registry"
 
 
+def test_a_dry_run_whose_preflight_NEVER_ANSWERED_reports_an_UNREADABLE_registry(monkeypatch):
+    """⛔ P3 (harness review of #4134): an outage must not be read as "a peer holds this head".
+
+    `_claim_run` stamps `rc=2` when the bridge child itself did not answer (killed, `bash` absent,
+    `sh_err` timed out). The dry arm hard-coded `rc="1"` and defaulted `loaded`/`stale` to the
+    healthy values, so that stamp was discarded and the answer fell through `claim_verdict_token`'s
+    catch-all rung to `claim-holder-unverifiable` — "presence, no probeable holder" — about a
+    registry NOTHING had read. The non-dry arm mapped the same fields correctly, which is what made
+    this a dry-run-only defect; a `--dry-run` is where a lane decides whether it MAY work, so
+    reporting a phantom peer there is the direction this gate may not fail in.
+
+    ⛔ NAMING THE MUTANT. Put `"rc": "1"` back into the dry arm's field map and this test goes RED
+    at the token assertion (it comes back `claim-holder-unverifiable`).
+    """
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "claims_sh", lambda: "/shipped/claims.sh")
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    seen = []
+
+    def _bridge(script, *a, **k):
+        seen.append(script)
+        assert script == pr._CLAIM_PREFLIGHT_BRIDGE, "a dry run may only use the read-only arm"
+        return ({"rc": "2", "result": "the claim bridge exited 143: term"}, "")
+
+    monkeypatch.setattr(pr, "_claim_run", _bridge)
+    hold, commit = pr.pr_claim_gate(_pr(9), dry=True)
+    assert seen, "the dry arm must ASK the registry rather than assume"
+    assert hold is not None and commit == "", (hold, commit)
+    assert pr.claim_hold_token(hold) == pr.CLAIM_UNREADABLE_TOKEN, hold
+    assert "claim-holder-unverifiable" not in str(hold), \
+        "an unanswered registry is not evidence that a peer holds the head: %s" % (hold,)
+    # …and an ANSWERED preflight still maps to its holder, so the fix does not blind the mapping.
+    monkeypatch.setattr(pr, "_claim_run",
+                        lambda script, *a, **k: ({"hrc": "1", "loaded": "1", "stale": "0",
+                                                  "me": "boxB",
+                                                  "hresult": "held by boxA:42 until 9999"}, ""))
+    hold2, _ = pr.pr_claim_gate(_pr(9), dry=True)
+    assert pr.claim_hold_token(hold2) == "holder-on-foreign-box", hold2
+
+
 def test_an_acquire_that_may_have_LANDED_is_released_fenced(monkeypatch, tmp_path):
     """rc=2 with a commit in hand is a RELEASE path, not just a refusal (fresh-review finding).
 
@@ -1481,6 +1522,43 @@ def test_a_peer_held_head_does_not_refuse_the_pass(monkeypatch):
     assert "no worker accepted" not in reason, reason
 
 
+def test_a_pass_that_dispatched_and_stood_down_NAMES_an_UNREADABLE_registry(monkeypatch):
+    """⛔ P2 (harness review of #4134): the count printed NOWHERE, on a line that blamed the chain.
+
+    `claims-unreadable` rides the `undeliverable` axis deliberately (rc 3: no waiting on the star
+    clears it, and the pass may not read clean while it places nothing). But `_finish` computed
+    `placed_and_refused = undeliv - carried - rubric`, so on a pass that dispatched one order and
+    stood down from an unreadable registry the pass line read `1 order(s) no worker accepted` — a
+    TRANSPORT failure, for an order where `nonblocking-dispatch.sh` was never invoked — while the
+    `claims-unreadable` count appeared nowhere (the stall loop runs only when NOTHING was dispatched,
+    and the `_peers` block covers only the peer tokens). Same shape #2291 and #4009 each split.
+
+    ⛔ NAMING THE MUTANT. Drop `- _claim_unread` from `placed_and_refused` in `_finish` and this test
+    goes RED at the `"no worker accepted" not in` assertion (the clause reappears, with 1); drop the
+    `if _claim_unread:` clause as well and it reddens at the token assertion instead.
+    """
+    unreadable = pr._ClaimHold("cross-box claim registry: verdict=claims-unreadable",
+                               token=pr.CLAIM_UNREADABLE_TOKEN)
+
+    def _dispatch(p, action, text, dry, *_rest):
+        if p["number"] == 2:
+            return (False, unreadable, False)
+        return (True, "spawned", False)
+
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "red", []),
+                                      dispatch=_dispatch)
+    # ⛔ rc 0, NOT 3: a pass that DELIVERED is not punished for an order it could not place (the
+    # `not dispatched` guard on every rc-3 arm is deliberate -- see
+    # `test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed`). The defect this
+    # row pins is the SENTENCE, and the sentence is now the only place the cause is named.
+    assert rc == 0, (rc, joined)
+    reason = payload.get("reason", "")
+    assert payload.get("dispatched") == 1, payload  # the pass DID deliver one order
+    assert "no worker accepted" not in reason, reason
+    assert "CLAIM REGISTRY could not answer" in reason, reason
+    assert "%s=1" % pr.CLAIM_UNREADABLE_TOKEN in reason, reason
+
+
 def test_a_pass_that_dispatched_and_stood_down_NAMES_the_peer_held_heads(monkeypatch):
     """⛔ P2 (harness review of #4134): the ONLY report a dispatched-and-skipped pass has.
 
@@ -1516,11 +1594,17 @@ def test_an_unreadable_registry_refuses_the_pass(monkeypatch):
     ⛔ NAMING THE MUTANT. Drop the `undeliverable += 1` from the `claims-unreadable` arm and this
     test goes RED (rc 0): a box that can see no claim on anything would report a clean pass while
     placing no order at all -- the false PASS shape this file exists to remove.
+
+    ⛔ AND THE SENTENCE NAMES THE REGISTRY, NOT THE TRANSPORT (harness review of #4134, P2).
+    `no worker accepted` is a claim about `nonblocking-dispatch.sh`, which was never invoked for an
+    order the claim gate returned before; the first version of this row asserted that sentence, so
+    it pinned the false remedy alongside the right exit code.
     """
     rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_UNREADABLE_TOKEN)
     assert rc == pr.EXIT_UNDELIVERED, (rc, reason)
     assert "claims-unreadable=1" in reason, reason
-    assert "no worker accepted" in reason, reason
+    assert "CLAIM REGISTRY could not answer" in reason, reason
+    assert "no worker accepted" not in reason, reason
 
 
 def _drive_claim_pass(monkeypatch, token):

@@ -4765,10 +4765,20 @@ def pr_claim_gate(pr: dict, dry: bool = False) -> tuple:
             log("DRY-RUN #%s: the cross-box claim for %s is FREE -- a real pass would take "
                 "%s" % (num, sha[:12], "refs/claims/%s-%s" % (num, sha[:12])))
             return (None, "")
-        token = claim_verdict_token({"rc": "1", "hrc": hrc, "loaded": fields.get("loaded", "1"),
+        # ⛔ `rc` IS CARRIED FROM THE BRIDGE, NOT ASSUMED (harness review of #4134, P3). `_claim_run`
+        # stamps `rc=2` when the child itself did not answer (bash absent, killed process, `sh_err`
+        # timeout). Hard-coding `"1"` here discarded that stamp, so the outage fell through to the
+        # catch-all rung and a `--dry-run` reported `claim-holder-unverifiable` -- "presence, no
+        # probeable holder" -- about a registry NOTHING had read, which is the one direction this
+        # gate may not fail open in. The read-only bridge prints `hrc` and no `rc` when it DOES
+        # answer, so "1" stays the default for the answered case and the non-dry arm's mapping is
+        # now the same mapping.
+        token = claim_verdict_token({"rc": (fields.get("rc") or "1").strip(), "hrc": hrc,
+                                     "loaded": fields.get("loaded", "1"),
                                      "stale": fields.get("stale", "0"), "me": fields.get("me", ""),
                                      "hresult": fields.get("hresult", "")})
-        reason = (fields.get("hresult") or err or "the registry gave no reason").strip()
+        reason = (fields.get("hresult") or fields.get("result") or err
+                  or "the registry gave no reason").strip()
         return (_claim_hold(token, claim_holder(reason), reason), "")
     fields, err = _claim_run(_CLAIM_ACQUIRE_BRIDGE, [REPO, num, sha, str(claim_lease())])
     rc = (fields.get("rc") or "").strip()
@@ -6458,6 +6468,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         blind = unread + blind_surface + blind_partial + blind_abandoned
         stalls = stalled or {}
         if not dispatched:
+            # ⛔ THE TRANSPORT RESIDUE, COMPUTED ONCE (harness review of #4134, P2). `undeliverable`
+            # covers causes that NEVER REACHED THE TRANSPORT -- a row carried from an earlier pass's
+            # refusal, an order refused for the passage's rubric, and a `claims-unreadable` skip
+            # (the claim registry could not answer, so nothing was ever addressed) -- and ONE MORE
+            # that did (a spawn that was placed and failed, or was withheld on unreadable liveness).
+            # Only the last may be called "no worker accepted"; every arm below quotes a residue,
+            # never the whole count, so a number is never attributed to a component that was never
+            # invoked.
+            _rub = stalls.get("rubric") or 0
+            _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
+            _transport = undeliv - carried - _rub - _claim_unread
             # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
             # holds are appended rather than folded in: they are the same AXIS (a read that did not
             # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
@@ -6472,8 +6493,10 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # carried refusal printed both a transport claim and "refused in an earlier pass" in
                 # the same verdict — the contradiction the `parts` split above removed, one branch
                 # down. ⛔ AND A ZERO-COUNT CLAUSE IS STILL A FALSE CLAIM: when nothing was placed the
-                # clause is OMITTED, not printed with `0`.
-                _placed = undeliv - carried
+                # clause is OMITTED, not printed with `0`. ⛔ AND THE SAME RESIDUE APPLIES TO THE
+                # CLAIM REGISTRY AND THE RUBRIC (harness review of #4134, P2) — an order the
+                # registry never answered for never reached the transport either.
+                _placed = _transport
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
                 log("REFUSING: %d PR(s) were UNREADABLE%s, with nothing dispatched -- not a clean"
@@ -6482,7 +6505,7 @@ def run_pass(args, rubric_note: str = "") -> int:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
                     " pass%s" % (unread, _more))
             elif _held and undeliv:
-                _placed = undeliv - carried
+                _placed = _transport
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
                 log("REFUSING: %d PR(s) had an unusable changed-file list%s, with nothing"
@@ -6496,7 +6519,6 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # the chain was ever exec'd -- so this sentence asserted a transport failure over a
                 # component that was never addressed, one line above a verdict that repeated it. The
                 # class is named here so the two lines cannot tell different stories.
-                _rub = stalls.get("rubric") or 0
                 _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
                 if carried and carried == undeliv:
                     log("REFUSING: %d PR(s) still undeliverable -- refused in an EARLIER pass and"
@@ -6507,9 +6529,27 @@ def run_pass(args, rubric_note: str = "") -> int:
                         " that is not %s's -- nothing was dispatched and the dispatch chain was"
                         " never invoked%s; not a clean pass"
                         % (undeliv - carried, REPO or "<unresolved>", _carried))
+                elif _claim_unread and _claim_unread == undeliv - carried:
+                    # ⛔ THE REGISTRY NOT ANSWERING IS NOT THE TRANSPORT NOT ACCEPTING (harness review
+                    # of #4134, P2). Both refuse (rc 3, deliberately -- see the `claims-unreadable`
+                    # arm in `run_pass`), but the sentence must name the component that failed: this
+                    # one sends an operator to the claim registry's git transport, never to
+                    # "repair the dispatch chain", which was never invoked.
+                    log("REFUSING: %d order(s) could not be placed because the CLAIM REGISTRY could"
+                        " not answer -- nothing was dispatched, and a head whose claim cannot be"
+                        " READ is never proven free%s; not a clean pass"
+                        % (undeliv - carried, _carried))
                 else:
-                    log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
-                        " a clean pass" % (undeliv - carried))
+                    # ⛔ ONLY ORDERS THAT ACTUALLY REACHED THE TRANSPORT MAY BE CALLED "no worker
+                    # accepted" (harness review of #4134, P2). The residue is what is left after
+                    # every cause that never invoked the chain; when there is none, the sentence
+                    # names the refusal without inventing a transport failure over zero orders.
+                    if _transport:
+                        log("REFUSING: %d order(s) no worker accepted and nothing was dispatched --"
+                            " not a clean pass%s" % (_transport, _carried))
+                    else:
+                        log("REFUSING: nothing was dispatched and %d order(s) could not be placed --"
+                            " not a clean pass%s" % (undeliv - carried, _carried))
         # WHY nothing (or something) went out. Named in the line itself, so the log answers the
         # question an operator actually asks -- never a bare number.
         parts = []
@@ -6549,7 +6589,14 @@ def run_pass(args, rubric_note: str = "") -> int:
             # on the same line that now says the chain was never invoked. Split, so the count and
             # the cause agree.
             _rub = stalls.get("rubric") or 0
-            placed_and_refused = undeliv - carried - _rub
+            # ⛔ AND THE CLAIM REGISTRY IS ITS OWN CAUSE HERE TOO (harness review of #4134, P2).
+            # `claims-unreadable` is the fourth cause on the `undeliverable` axis and it never
+            # reached the transport either, so folded into `no worker accepted` it made the pass
+            # line assert a transport failure in a pass where `nonblocking-dispatch.sh` was never
+            # invoked -- the exact shape #2291 and #4009 each split. Split, so the count and the
+            # cause agree.
+            _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
+            placed_and_refused = undeliv - carried - _rub - _claim_unread
             if placed_and_refused:
                 parts.append("%d order(s) no worker accepted%s"
                              % (placed_and_refused,
@@ -6558,6 +6605,14 @@ def run_pass(args, rubric_note: str = "") -> int:
             if _rub:
                 parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
                              % _rub)
+            if _claim_unread:
+                # ⛔ NAMED ON EVERY PASS THAT HAD ONE, not only the zero-dispatch one: the stall
+                # loop above prints it ONLY when nothing went out, so on a pass that dispatched
+                # two orders and stood down from an unreadable registry the count appeared nowhere
+                # and the sentence blamed the transport (harness review of #4134, P2).
+                parts.append("%d order(s) could not be placed: the CLAIM REGISTRY could not answer"
+                             " (%s=%d -- a head whose claim cannot be read is never proven free)"
+                             % (_claim_unread, CLAIM_UNREADABLE_TOKEN, _claim_unread))
             if carried:
                 parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
                              " out a refusal cooldown" % carried)
