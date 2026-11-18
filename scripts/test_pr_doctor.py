@@ -1304,6 +1304,90 @@ def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_
     assert len(_claimed_refs(origin)) == 1, "the dry run must not have changed the registry"
 
 
+def test_an_acquire_that_may_have_LANDED_is_released_fenced(monkeypatch, tmp_path):
+    """rc=2 with a commit in hand is a RELEASE path, not just a refusal (fresh-review finding).
+
+    ⛔ NAMING THE MUTANT. Drop `fields.get("commit")` from `pr_claim_gate()`'s refusal return (i.e.
+    return `""` like the first version did) and this test goes RED at the `released` assertion: the
+    claim this box may have pushed is left holding the head for its whole lease while every peer
+    reads it as taken -- the abandoned-claim class `claims.sh` documents, arrived at from here.
+
+    ⛔ WHY THE COMMIT CAN EXIST ON A REFUSAL: `claims.sh` sets `CLAIM_COMMIT` on the create/reclaim
+    paths whose PUSH MAY HAVE LANDED and only the read-back failed, so the caller is expected to
+    attempt a FENCED release. `orch-loop.sh:9517-9525` does exactly that for issue dispatch, and
+    this test holds the PR path to the same contract.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(77, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    # Mint a REAL claim this box owns, then hand its commit back as an rc=2 answer -- exactly the
+    # shape of "the push landed, the read-back failed".
+    hold, commit = _REAL_CLAIM_GATE(pr_)
+    assert hold is None and commit, (hold, commit)
+    assert _claimed_refs(origin) == ["refs/claims/77-%s" % head[:12]]
+    real_run = pr._claim_run
+
+    def _rc2_for_acquire_only(script, *a, **k):
+        """Only the ACQUIRE answers rc=2 -- the release still has to reach the real registry."""
+        if script == pr._CLAIM_ACQUIRE_BRIDGE:
+            return ({"loaded": "1", "stale": "0", "me": "boxA", "rc": "2", "result": "",
+                     "commit": commit, "hresult": ""}, "")
+        return real_run(script, *a, **k)
+
+    monkeypatch.setattr(pr, "_claim_run", _rc2_for_acquire_only)
+    hold2, commit2 = pr.pr_claim_gate(pr_)
+    assert hold2 is not None, "a failed read-back is still a refusal -- never a licence to spawn"
+    assert pr.claim_hold_token(hold2) == pr.CLAIM_UNREADABLE_TOKEN, hold2
+    assert commit2 == commit, "the commit the push may have created must travel back with the hold"
+    # …and `dispatch()` must give it back before it skips.
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert _claimed_refs(origin) == [], \
+        "a claim this box may have created must be released (fenced), not left for its lease"
+
+
+def test_an_exception_between_the_claim_and_the_spawn_gives_the_claim_back(monkeypatch, tmp_path):
+    """An OSError while PREPARING the spawn must not leak the claim (fresh-review finding).
+
+    ⛔ NAMING THE MUTANT. Remove the `try/except` around the brief write + `materialise_worktree`
+    and this test REDS with `LEAKED CLAIM [...]`: the exception propagates out of `dispatch()` (the
+    pass does not guard it), the claim stays minted, and every peer refuses that head for the whole
+    lease while nothing is working it. ENOSPC on the brief write is the realistic trigger -- it is
+    the condition this box's own rc=77 disk gate exists for.
+
+    ⛔ AND THE WINDOW ENDS BEFORE THE SPAWN, deliberately: an exception after a worker has actually
+    started must NOT release that worker's claim, so the guard covers preparation only.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(4242, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    spawned = []
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: spawned.append(a) or ["/bin/true"])
+
+    def _boom(_p, dry=False):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pr, "materialise_worktree", _boom)
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "OSError" in detail, detail
+    assert not spawned, "nothing may be spawned after a failed preparation"
+    refs = _claimed_refs(origin)
+    assert refs == [], "LEAKED CLAIM %r -- the claim must be given back on the exception path" % refs
+
+
 def test_the_claim_verdict_mapping_covers_the_published_tokens(monkeypatch):
     """Every branch of the mapping, driven directly -- the tokens are a CLOSED, published set.
 
@@ -1383,28 +1467,60 @@ def _drive_claim_pass(monkeypatch, token):
     return pr.main(), (pr.LAST_PASS.get("reason") or "")
 
 
-def test_the_claim_lease_never_exceeds_the_keyings_ceiling(monkeypatch):
-    """The lease is capped at `claims.sh`'s `CLAIM_TTL_MAX`, from a seam, and never by accident.
+def _registry_ceiling() -> int:
+    """`claims.sh`'s OWN `CLAIM_TTL_MAX`, read from the registry rather than re-typed here.
 
-    ⛔ MEASURED WHY THIS EXISTS: `SPAWN_TIMEOUT_S` is 36000 s at the shipped default, so the
-    `backstop + pad` form is 37200 s -- and the FIRST version of this code passed that straight to
-    `claim_acquire`, which clamped it to 9600 and printed a warning on stderr on every mint. Relying
-    on someone else's clamp is not a bound: it is a line in a log nobody reads until it matters.
+    ⛔ THIS IS THE POINT OF THE HELPER. The first version of `CLAIM_LEASE_MAX_S` mirrored a number
+    from memory (9600) that the registry had MOVED (#4034 -> 43200), so every repair lease was
+    clamped 7 h 20 m inside the worker's own bound -- the duplicate-head hazard #2888 describes, and
+    the very defect #2557 removes. A test that re-types the ceiling cannot catch that; this one
+    asks the registry, so the day `claims.sh` moves again this goes red instead of the fleet.
+    """
+    out = subprocess.run(
+        ["bash", "-c", 'set -u; . "$1" >/dev/null 2>&1; printf "%s" "${CLAIM_TTL_MAX:-}"',
+         "-", str(_HARNESS / "claims.sh")],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0 and out.stdout.strip().isdigit(), (out.stdout, out.stderr)
+    return int(out.stdout.strip())
+
+
+def test_the_claim_lease_never_exceeds_the_keyings_ceiling(monkeypatch):
+    """The lease must be the worker's own term, and must not exceed the registry's real ceiling.
+
+    ⛔ MEASURED WHY THIS EXISTS (fresh-review finding, then reproduced against the shipped
+    `claims.sh`): `SPAWN_TIMEOUT_S` is 36000 s, so `backstop + pad` is 37200 s. An earlier version of
+    this file capped at 9600 s on the belief that the ceiling still was 9600 -- `claims.sh:249`
+    says `${CLAIM_TTL_MAX:-43200}`, moved by #4034 exactly so the fixer's 37200 s lease is not
+    clamped. Measured mutation: with the 9600 cap, `claim_lease()` is 9600 s = 2 h 40 m, so the
+    claim of a live repair lane expires 7 h 20 m INSIDE that lane's own 21600 s of headroom -- a
+    peer takes the head while the first box is still working it, which is bug #2557 itself.
     """
     for k in (pr.CLAIM_LEASE_ENV, pr.CLAIM_LEASE_MAX_ENV):
         monkeypatch.delenv(k, raising=False)
+    ceiling = _registry_ceiling()
     assert pr.claim_lease() == min(pr.SPAWN_TIMEOUT_S + pr.CLAIM_LEASE_PAD_S,
                                    pr.CLAIM_LEASE_MAX_S)
-    assert pr.claim_lease() <= 9600, "the shipped CLAIM_TTL_MAX is the ceiling this may not exceed"
+    assert pr.claim_lease() <= ceiling, (
+        "the lease (%s) exceeds claims.sh's CLAIM_TTL_MAX (%s) -- the mint would be clamped, and a "
+        "claim expiring under a live worker hands the head to a peer" % (pr.claim_lease(), ceiling))
+    assert pr.claim_lease() >= pr.SPAWN_TIMEOUT_S, (
+        "the lease must cover the worker's own backstop (%s) -- a shorter one expires under a live "
+        "lane, which is the duplicate this gate exists to prevent" % pr.SPAWN_TIMEOUT_S)
     # a SHORTER explicit lease is honoured (an operator may know the work is small)…
     monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "1800")
     assert pr.claim_lease() == 1800
     # …a typo never shortens it, and never unbinds it
     monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "not-a-number")
-    assert pr.claim_lease() == pr.CLAIM_LEASE_MAX_S
+    assert pr.claim_lease() == min(pr.SPAWN_TIMEOUT_S + pr.CLAIM_LEASE_PAD_S,
+                                   pr.CLAIM_LEASE_MAX_S)
     # the ceiling itself is a seam, so a box that raised CLAIM_TTL_MAX can raise it in step
     monkeypatch.setenv(pr.CLAIM_LEASE_MAX_ENV, "20000")
     assert pr.claim_lease() == 20000
+    # ⛔ AND THE MIRRORED DEFAULT IS THE REGISTRY'S, not a number this file likes the look of.
+    monkeypatch.delenv(pr.CLAIM_LEASE_MAX_ENV, raising=False)
+    assert pr.CLAIM_LEASE_MAX_S == ceiling, (
+        "CLAIM_LEASE_MAX_S (%s) has DRIFTED from claims.sh's CLAIM_TTL_MAX (%s) -- re-read the "
+        "coupling note in pr-doctor.py before changing either" % (pr.CLAIM_LEASE_MAX_S, ceiling))
 
 
 def test_every_claim_token_is_from_the_published_closed_set():

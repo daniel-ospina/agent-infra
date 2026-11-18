@@ -4460,10 +4460,10 @@ def set_tag_collisions(entries: list[str]) -> str:
 #     passes on one box could therefore reclaim each other's claim; they could already collide on
 #     the same worker name, and the claim does not make that worse.
 #   * The accepted cost is stated where the owner decision is: a head whose worker finishes without
-#     pushing stays claimed for its lease -- 9600 s = 2 h 40 m at the defaults, because the lease is
-#     CAPPED at this keying's ceiling (see `CLAIM_LEASE_MAX_S`: the shipped backstop would otherwise
-#     ask for 37200 s and be clamped). That is 2 h 40 m of idle capacity for PEER boxes on that one
-#     head, which is the deliberate trade ("we choose idle capacity over duplicate writers"); the
+#     pushing stays claimed for its lease -- 37200 s = 10 h 20 m at the defaults (`backstop + pad`,
+#     under this keying's 12 h ceiling, so `claims.sh` neither clamps nor warns). That is 10 h 20 m of
+#     idle capacity for PEER boxes on that one head, which is the deliberate trade ("we choose idle
+#     capacity over duplicate writers") and is the longest term that cannot outlive the worker; the
 #     owning box reclaims its own orphan on its next pass, and a worker that PUSHES re-keys the head
 #     free immediately.
 #   * A lease long enough to cover the worker is required either way: a shorter one expires under a
@@ -4477,16 +4477,17 @@ CLAIM_LEASE_MAX_ENV = "PRD_CLAIM_LEASE_MAX_S"
 # a peer take the same head, and a lease minted longer than the worker can run holds a PR for a term
 # nothing is working.
 CLAIM_LEASE_PAD_S = 1200
-# ⛔ THE CEILING IS `claims.sh`'s, MIRRORED, AND THE COUPLING IS NAMED BECAUSE IT BIT (measured).
-# `CLAIM_TTL_MAX` is 9600 s, and `SPAWN_TIMEOUT_S` is 36000 s at the shipped default -- so
-# `backstop + pad` is 37200 s and `_claim_acquire_at` CLAMPS it, printing a warning on stderr on
-# every single mint. That is `claims.sh`'s own documented coupling ("raise CLAIM_TTL_MAX at the same
-# time you raise a timeout"), and this file may not raise a fleet-wide knob for its own caller. So the
-# cap is applied HERE, from a seam, and the residual is stated: a repair worker that runs past the
-# lease keeps working while a PEER may take the same head -- which is why the lease is as long as the
-# keying permits rather than shorter. A `claims.sh` whose ceiling is LOWER clamps this value loudly
-# (safe direction); one whose ceiling is HIGHER only means this box gives up sooner than it must.
-CLAIM_LEASE_MAX_S = 9600
+# ⛔ THE CEILING IS `claims.sh`'s, AND THE FIRST VERSION OF THIS CONSTANT GOT IT WRONG IN THE ONE
+# DIRECTION THAT RE-CREATES THE BUG (measured by a fresh reviewer, then by reading the source).
+# `claims.sh:249` is `CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-43200}"` -- 12 h, MOVED THERE BY #4034 for the
+# derived reason that the fixer's own lease became 37200 s when the backstop went to 36000 s. This
+# constant was written as 9600 (the PRE-#4034 ceiling), and `min(36000 + 1200, 9600)` = 9600 s = 2 h
+# 40 m: the claim then expires 7 h 20 m INSIDE the worker's own bound and a peer takes the head -- the
+# second-worker-on-the-same-head hazard of #2888, which is exactly the defect #2557 exists to remove.
+# The mirrored cap is the registry's own default, and `test_the_claim_lease_never_exceeds_the_keyings
+# _ceiling` reads the ceiling OUT OF `claims.sh` rather than re-typing it here, so a future move of
+# that number reddens the test instead of silently shortening every repair lease.
+CLAIM_LEASE_MAX_S = 43200
 
 # The published verdict tokens (`docs/ops/fleet-liveness.md` §4, `liveness.CLAIM_REASONS`). Named as
 # a tuple here only so the mapping below cannot emit a word outside it; the MEANINGS live there.
@@ -4608,8 +4609,10 @@ def claims_sh() -> str:
 def claim_lease() -> int:
     """The lease for a per-head repair claim: the worker's own backstop plus the post-claim pad.
 
-    Capped at this keying's ceiling (`CLAIM_LEASE_MAX_S`, `claims.sh`'s `CLAIM_TTL_MAX`) so the mint
-    does not rely on a clamp -- see the note on the constant.
+    Capped at this keying's ceiling (`CLAIM_LEASE_MAX_S`, which mirrors `claims.sh`'s
+    `CLAIM_TTL_MAX` default) so the mint does not rely on somebody else's clamp -- see the note on
+    the constant, including why the first version of this number was wrong in the dangerous
+    direction.
     """
     want = _positive_int_env(CLAIM_LEASE_ENV, SPAWN_TIMEOUT_S + CLAIM_LEASE_PAD_S)
     cap = _positive_int_env(CLAIM_LEASE_MAX_ENV, CLAIM_LEASE_MAX_S)
@@ -4756,12 +4759,20 @@ def pr_claim_gate(pr: dict, dry: bool = False) -> tuple:
         return (_claim_hold(token, claim_holder(reason), reason), "")
     fields, err = _claim_run(_CLAIM_ACQUIRE_BRIDGE, [REPO, num, sha, str(claim_lease())])
     rc = (fields.get("rc") or "").strip()
+    commit = (fields.get("commit") or "").strip()
     if rc == "0":
-        return (None, (fields.get("commit") or "").strip())
+        return (None, commit)
+    # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL -- and this branch used to
+    # drop it. `claims.sh` deliberately leaves `CLAIM_COMMIT` set on the create/reclaim paths whose
+    # push MAY have landed and only the read-back failed, so the caller can attempt a FENCED release
+    # (its own comment says so). `orch-loop.sh:9517-9525` -- the implementation this gate copies --
+    # handles that arm explicitly, because discarding it orphans a claim THIS BOX created for the
+    # whole lease while every peer reads the head as taken: the abandoned-claim class #2557 closes.
+    # The commit travels back with the hold, and `dispatch()` releases it (fenced) before skipping.
     token = claim_verdict_token(fields)
     reason = (fields.get("hresult") or fields.get("result") or err
               or "the registry gave no reason").strip()
-    return (_claim_hold(token, claim_holder(reason), reason), "")
+    return (_claim_hold(token, claim_holder(reason), reason), commit)
 
 
 def _claim_hold(token: str, holder: str, reason: str) -> _ClaimHold:
@@ -4891,10 +4902,19 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # ⛔ A SKIP THAT SAYS NOTHING IS INDISTINGUISHABLE FROM A BUG (the owner's 2026-11-17
         # decision, verbatim). The line names the PR, the token and the holder, so an operator can
         # tell "a peer is repairing this" from "this box cannot see the registry".
-        log("#%s (%s): SKIPPED -- verdict=%s%s; not spawning a second lane on head %s"
+        # ⛔ AND AN rc=2 MAY HAVE MINTED ONE: `claims.sh` sets `CLAIM_COMMIT` on the create/reclaim
+        # paths whose push may have landed and only the read-back failed, so a non-empty commit here
+        # is released FENCED before the skip -- the claim is ours, and leaving it would block every
+        # peer for a whole lease. rc=1 (a peer holds it) carries no commit and cannot reach this.
+        released = pr_claim_release(pr, claim_commit) if claim_commit else None
+        log("#%s (%s): SKIPPED -- verdict=%s%s; not spawning a second lane on head %s%s"
             % (pr.get("number"), action, getattr(hold, "token", "?"),
                (" holder=%s" % hold.holder) if getattr(hold, "holder", "") else "",
-               (pr.get("headRefOid") or "?")[:12]))
+               (pr.get("headRefOid") or "?")[:12],
+               "" if released is None else
+               (" -- the claim commit this box may have pushed WAS released (fenced on %s)"
+                % claim_commit[:12] if released else
+                " -- the possibly-created claim could NOT be released; it runs to its lease")))
         return False, hold, False
 
     def _give_back(detail, record_=False, ok=False):
@@ -4907,13 +4927,24 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         pr_claim_release(pr, claim_commit)
         return ok, detail, record_
 
-    path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w") as f:
-        f.write(text)
-    wt, err = materialise_worktree(pr)
-    if not wt:
-        return _give_back(err, bool(getattr(err, "persistent", False)))
+    # ⛔ AN EXCEPTION BETWEEN THE CLAIM AND THE SPAWN LEAKS THE CLAIM (fresh-review finding, reproduced
+    # against a real registry + bare remote: an OSError from the brief write -- ENOSPC is exactly the
+    # condition this box's own rc=77 disk gate exists for -- or from `materialise_worktree` propagated
+    # with the claim minted, and `run_pass` does not guard `dispatch`, so no later pass releases it:
+    # every peer refused that head for the whole lease while nothing was working it). The window ends
+    # BEFORE the spawn: an exception after a worker has actually started must NOT release its claim.
+    try:
+        path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        wt, err = materialise_worktree(pr)
+        if not wt:
+            return _give_back(err, bool(getattr(err, "persistent", False)))
+    except Exception as exc:            # noqa: BLE001 -- the claim MUST be given back
+        return _give_back("could not prepare the spawn (%s: %s) -- the cross-box claim on head %s "
+                          "was released rather than left holding it"
+                          % (type(exc).__name__, exc, (pr.get("headRefOid") or "?")[:12]))
     # ⛔ THE GUARD IS CHECK-THEN-ACT, AND THE ACT IS MINUTES LATER. `materialise_worktree` can fetch
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
