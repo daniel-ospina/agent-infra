@@ -2508,6 +2508,19 @@ def _is_spawn_target(path: str) -> bool:
     return False
 
 
+def no_checkout_note(pr: dict) -> str:
+    """The ONE wording for "this pass was given no checkout" (agent-infra#4134 F1, P2).
+
+    ⛔ TWO SITES REFUSE ON IT AND THEY MUST NOT DRIFT: `materialise_worktree` (no worktree can be
+    built) and `dispatch()` (nothing can be claimed or spawned). The text is what an operator acts
+    on, so it is produced here rather than copied -- and both are GATE-class refusals about THIS
+    pass's own inputs, not facts about the PR, so neither records a cooldown row.
+    """
+    return ("no checkout of %s on this machine, so no worktree can be materialised for "
+            "#%s -- pass REPO=<checkout> (or <owner/name>=<checkout> in PR_DOCTOR_REPOS)"
+            % (REPO or "the target repo", pr.get("number")))
+
+
 def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
@@ -2538,9 +2551,7 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     # for PRs of the repo it was told to grade. Refused by name instead -- and it is a verdict
     # about THIS pass's inputs (not about the PR), so it is retryable, never a cooldown row.
     if not REPO_DIR:
-        return "", ("no checkout of %s on this machine, so no worktree can be materialised for "
-                    "#%s -- pass REPO=<checkout> (or <owner/name>=<checkout> in PR_DOCTOR_REPOS)"
-                    % (REPO or "the target repo", pr.get("number")))
+        return "", no_checkout_note(pr)
     branch = pr["headRefName"]
     head = pr["headRefOid"]
     # ⛔ THE ROOT IS CHECKED BEFORE ANY GIT CALL, so a misconfigured `WORKTREE_ROOT` refuses instead
@@ -4665,7 +4676,15 @@ def _claim_run(bridge: str, extra: list) -> tuple[dict, str]:
     sh = claims_sh()
     if not sh:
         return {}, ""
-    env = {**os.environ, "CLAIM_REPO": REPO_DIR or os.getcwd()}
+    # ⛔ `CLAIM_REPO` IS NEVER A GUESS (agent-infra#4134 F1, P2). It used to be
+    # `REPO_DIR or os.getcwd()`, so a pass with no checkout handed the registry whatever repo this
+    # process happened to be sitting in -- the exact thing `materialise_worktree`'s own note forbids
+    # 1,200 lines below ("NO CHECKOUT IS NOT 'THE CHECKOUT IN $HOME'"). `dispatch()` now refuses a
+    # no-checkout pass BEFORE this bridge is ever asked; if a direct caller still gets here with an
+    # empty `REPO_DIR`, `claims.sh` must see it SET-AND-EMPTY -- its documented fail-closed answer
+    # ("CLAIM_REPO is SET BUT EMPTY (cwd=…) — set CLAIM_REPO (or REPO) to the checkout"), which
+    # names the missing input instead of silently pushing a claim into the cwd's origin.
+    env = {**os.environ, "CLAIM_REPO": REPO_DIR}
     out, err, rc = claim_sh_err(["bash", "-c", bridge, "claims-bridge", sh] + extra,
                                 timeout=_positive_int_env(CLAIM_TIMEOUT_ENV, 120), env=env)
     fields = _claim_kv(out)
@@ -4874,6 +4893,18 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # every order died here reports the CONFIG refusal instead of `next=repair-chain` -- the
         # chain below this line is never reached, which is exactly what the rubric refusal means.
         return False, rubric_refusal_note(note), False
+    # ⛔ NO CHECKOUT IS NOT "CLAIM AGAINST THE CWD" (agent-infra#4134 F1, P2). `REPO_DIR == ""` is a
+    # SUPPORTED state -- `apply_repo` logs `checkout NONE -- queue only, nothing can be spawned` and
+    # nothing refuses the pass -- and UNTIL this guard the claim gate ran BEFORE
+    # `materialise_worktree`'s refusal, so a launchd-shaped pass (cwd = $HOME, no checkout) reported
+    # `CLAIM-UNREADABLE next=repair-claim-registry` instead of the accurate missing-checkout line,
+    # sending the operator to `git ls-remote` and `$O/claims.sh` for a fault that is a missing
+    # `REPO=`. That is the #4009 mis-attribution class this change's own token exists to remove.
+    # ⛔ PLACED BEFORE THE DRY-RUN BRANCH, exactly like the rubric refusal above it, so `--dry-run`
+    # says what a real pass would say -- and before the claim, so a pass with nothing to mint
+    # against mints nothing.
+    if not REPO_DIR:
+        return False, no_checkout_note(pr), False
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would

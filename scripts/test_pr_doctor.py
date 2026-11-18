@@ -148,6 +148,17 @@ def _clean_env(monkeypatch, tmp_path_factory):
     for _name, _val in (("REPO", ""), ("REPO_DIR", ""), ("REPO_DIR_ERROR", ""),
                         ("WORKTREE_ROOT", ""), ("_WORKER_TAG", "")):
         monkeypatch.setattr(pr, _name, _val, raising=False)
+    # ⛔ EXCEPT THE CHECKOUT, WHICH IS WHAT A DISPATCHING BOX HAS (agent-infra#4134 F1).
+    # `dispatch()` now refuses a pass with NO checkout BEFORE the claim gate (#4134 F1: the gate ran
+    # first and, with `CLAIM_REPO` guessed from the cwd, either pushed a claim into the repo the
+    # caller happened to sit in or blamed the registry for a missing `REPO=`). Leaving this empty
+    # made 21 rows that DRIVE `dispatch()` fail for that refusal instead of the thing they test --
+    # every one of them models a box that DOES have a checkout and stubs the step that would use it
+    # (`materialise_worktree`). The value is still freshened per test, which is the leak this block
+    # exists to prevent; the no-checkout refusal itself is driven by its OWN rows, which set it empty
+    # deliberately (`apply_repo(_REPO_A, "")`, and `test_dispatch_with_NO_checkout_never_claims…`).
+    monkeypatch.setattr(pr, "REPO_DIR", str(tmp_path_factory.mktemp("pr-doctor-checkout")),
+                        raising=False)
     # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
     # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
     # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
@@ -1330,6 +1341,74 @@ def test_the_claim_is_released_when_the_spawn_never_launches(monkeypatch, tmp_pa
     # The refusal is a GATE refusal, not a claim hold -- the two classes must not be confused.
     assert pr.claim_hold_token(detail) == ""
     assert _claimed_refs(origin) == [], "the refused spawn must give the claim back"
+
+
+def test_dispatch_with_NO_checkout_never_claims_and_names_the_MISSING_CHECKOUT(monkeypatch, tmp_path):
+    """#4134 F1 (P2): `REPO_DIR == ""` is a MISSING INPUT, not "claim in whatever repo we sit in".
+
+    `REPO_DIR == ""` is a SUPPORTED state (`apply_repo` logs `checkout NONE -- queue only` and the
+    pass still classifies PRs and calls `dispatch()` for each), and before this fix the claim gate
+    ran BEFORE `materialise_worktree`'s refusal. Two wrong outcomes followed from
+    `CLAIM_REPO = REPO_DIR or os.getcwd()`: a pass launched from a checkout pushed
+    `refs/claims/<pr>-<sha12>` into a repo nobody named, and a launchd-shaped pass (cwd = $HOME) was
+    reported as `claims-unreadable` / `next=repair-claim-registry` -- sending an operator to
+    `git ls-remote` and `$O/claims.sh` when the actual fault is a missing `REPO=`.
+
+    ⛔ NAMING THE MUTANT. Delete the `if not REPO_DIR:` guard at the top of `dispatch()` and this row
+    goes RED four ways at once: the claim bridge IS asked, the detail is a claim verdict
+    (`claims-unreadable`), it names `repair-claim-registry`, and it never says "no checkout of …".
+    """
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    # ⛔ THE FIXTURE SUPPLIES A CHECKOUT (a dispatching box has one), so THIS row must remove it
+    # EXPLICITLY: the state under test is the launchd/queue-only pass that has none.
+    monkeypatch.setattr(pr, "REPO_DIR", "")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    # The LOCAL liveness guard sits above the claim gate; answer it so the mutant reaches the gate
+    # rather than dying on an unreadable status and reddening for the wrong reason.
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    asked = []
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "_claim_run",
+                        lambda bridge, extra: asked.append((bridge, list(extra)))
+                        or ({"rc": "2"}, "no registry"))
+
+    for dry in (False, True):
+        ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=dry)
+        assert ok is False and record is False, (dry, ok, detail, record)
+        assert "no checkout of %s" % _TEST_REPO in detail, (dry, detail)
+        assert pr.claim_hold_token(detail) == "", \
+            "a missing checkout is not a claim verdict: %r" % (detail,)
+        assert "repair-claim-registry" not in detail, \
+            "the operator must not be sent to the registry for a missing REPO=: %r" % (detail,)
+    assert asked == [], \
+        "no checkout means nothing to mint against -- the claim bridge must never be asked: %r" % (
+            asked,)
+
+
+def test_the_claim_bridge_is_never_handed_a_GUESSED_repo(monkeypatch):
+    """The other half of #4134 F1: `CLAIM_REPO` is `REPO_DIR`, never `REPO_DIR or os.getcwd()`.
+
+    ⛔ NAMING THE MUTANT. Restore `REPO_DIR or os.getcwd()` on `_claim_run`'s env line and this row
+    goes RED: with no checkout the bridge is handed THIS process's cwd, so a claim is minted in (or
+    blamed on) a repository the pass was never told to grade.
+
+    ⛔ WHY THE EXPECTED VALUE IS EMPTY. `claims.sh` treats a SET-BUT-EMPTY `CLAIM_REPO` as a
+    REFUSAL that names the missing input (`CLAIM_REPO is SET BUT EMPTY (cwd=…) — set CLAIM_REPO (or
+    REPO) to the checkout`), never as a default. Passing the empty value through is therefore the
+    fail-closed answer: the registry says what is missing instead of a guess being pushed.
+    """
+    monkeypatch.setattr(pr, "REPO_DIR", "")
+    monkeypatch.setenv(pr.CLAIMS_SH_ENV, str(_HARNESS / "claims.sh"))   # any existing path
+    seen = []
+    monkeypatch.setattr(pr, "claim_sh_err",
+                        lambda args, timeout=180, env=None: seen.append(env)
+                        or ("rc=2\n", "not a work tree", 0))
+    pr._claim_run("true", [])
+    assert seen, "the bridge must be invoked at all for this row to mean anything"
+    assert seen[0].get("CLAIM_REPO") == "", \
+        "CLAIM_REPO must be the CHECKOUT the pass was given, empty included -- never the cwd: %r" % (
+            seen[0].get("CLAIM_REPO"),)
+    assert seen[0].get("CLAIM_REPO") != os.getcwd(), "a guessed repo is how a claim lands in the wrong origin"
 
 
 def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_path):
