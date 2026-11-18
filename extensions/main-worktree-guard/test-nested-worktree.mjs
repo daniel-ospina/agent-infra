@@ -27,7 +27,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-nested-worktree.mjs
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -521,6 +521,26 @@ try {
       const r9 = await bash("git worktree add nested-hatched -b nested-hatched", hub);
       expectTrue("B9: AGENT_ALLOW_MAIN_EDITS=1 bypasses the refusal (escape hatch intact)", allowed(r9), reasonOf(r9).slice(0, 120));
       delete process.env.AGENT_ALLOW_MAIN_EDITS;
+
+      // B9b/B9c (#4101 review, P2) — the refusal's NEW sentence claims the TTL
+      // escape MARKER does not lift this gate ("a stranded lane may recover with
+      // it, it may not manufacture the deadlock"), while the env hatch does. A
+      // sentence in a refusal is a FACT claim, and this whole PR exists because
+      // one such fact claim was wrong, so it is pinned in BOTH directions: the
+      // marker leaves #1919 standing, and B9 above proves the other arm can
+      // allow — which is what makes this row non-vacuous.
+      const markerPath = join(home, ".pi", "agent", ".allow-main-edits");
+      const mid = `nested-wt-marker-${process.pid}`;
+      writeFileSync(markerPath, JSON.stringify({ session_id: mid, reason: "nested-wt marker row", ts: new Date().toISOString() }) + "\n");
+      process.env.PI_SESSION_ID = mid;
+      try {
+        const r9b = await bash("git worktree add nested-wt-marker -b nested-wt-marker", hub);
+        expectTrue("B9b: an ACTIVE TTL marker does NOT lift the #1919 gate (the claim its refusal makes)", blocked(r9b), JSON.stringify(reasonOf(r9b).slice(0, 90)));
+        expectTrue("B9c: …it is still the #1919 refusal, not another arm answering", reasonOf(r9b).includes("#1919"), reasonOf(r9b).slice(0, 90));
+      } finally {
+        delete process.env.PI_SESSION_ID;
+        try { unlinkSync(markerPath); } catch { /* best-effort */ }
+      }
 
       // B10: the fix touched no git state — the worktree is still registered and
       // usable, and the nested branches are untouched.

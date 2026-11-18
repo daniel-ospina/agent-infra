@@ -13,6 +13,18 @@ import { homedir } from "node:os";
 import { existsSync, lstatSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+//
+// Purpose: in the SHARED main checkout, branch-state-changing git operations
+// (reset, checkout/switch, pull/merge/rebase, clean, force-push, branch -D,
+// restore, stash pop) clobber other agents' working trees and move branches
+// out from under them. Worktrees are isolated — these are only dangerous in
+// the main checkout.
+
+// Known limitation: classification is regex-based over the raw command string,
+// so text inside string literals/comments (e.g. `echo "git pull"`) is a rare
+// false positive. Accepted — agents rarely echo git commands, and the block
+// message explains the escape hatch.
+
 // ── #1239 / #3620: the env-hatch caveat, for the refusals THIS module prints ──
 //
 // `AGENT_ALLOW_MAIN_EDITS=1` is read from the PROCESS env at session start, so a
@@ -32,17 +44,6 @@ export const _ENV_HATCH_CAVEAT = [
   "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
 ];
 
-//
-// Purpose: in the SHARED main checkout, branch-state-changing git operations
-// (reset, checkout/switch, pull/merge/rebase, clean, force-push, branch -D,
-// restore, stash pop) clobber other agents' working trees and move branches
-// out from under them. Worktrees are isolated — these are only dangerous in
-// the main checkout.
-
-// Known limitation: classification is regex-based over the raw command string,
-// so text inside string literals/comments (e.g. `echo "git pull"`) is a rare
-// false positive. Accepted — agents rarely echo git commands, and the block
-// message explains the escape hatch.
 export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "reset", re: /\bgit\s+reset\b/ },
   { name: "clean", re: /\bgit\s+clean\b/ },
