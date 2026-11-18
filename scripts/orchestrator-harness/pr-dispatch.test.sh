@@ -218,6 +218,21 @@ _prrow_drive() { # <gh-answer>
   && ok "a MERGEABLE row keeps the mergeable (the split is not hardcoded to CONFLICTING)" \
   || bad "a MERGEABLE row produced '$(_prrow_drive 'abc1234 MERGEABLE')' (want abc1234|MERGEABLE)"
 
+# ── extraction 1f: the SPEND RECORD (`spend_book`/`spend_clear`, agent-infra#4120) ──────────────
+# ⛔ UNSOURCED, EVERY BOOKING CALL IN THIS SUITE IS A SILENT 127 (fresh-context review, P3 — #4126).
+# The driven arms call `spend_book` (the conflict arm at its spawn, the CI-red and red-fixer arms
+# later), and the drivers discard output (`) >/dev/null 2>&1`) and set no `-e`, so `command not found`
+# was INVISIBLE and the arm proceeded to `wt_spawn` as if the record had been written. That is a false
+# GREEN, which is the more expensive direction: no row here could observe that the conflict arm books
+# its spend record at all, so deleting the booking line stayed green. The SAME omission one file over
+# (`red-fixer.test.sh:75-83`) was a false RED — 17 arms read "the attempt counters could not be
+# written" against a controller that was correct. Extracted from the shipped file, never re-invented.
+sed -n '/^spend_book() {/,/^}/p' "$ORCH" > "$TMP/spend.sh"
+sed -n '/^spend_clear() {/,/^}/p' "$ORCH" >> "$TMP/spend.sh"
+[ -s "$TMP/spend.sh" ] && grep -q '^spend_book() {' "$TMP/spend.sh" && grep -q '^spend_clear() {' "$TMP/spend.sh" \
+  && ok "the spend record's producer and its clearer are extracted from the shipped loop" \
+  || bad "the spend record (spend_book/spend_clear) could not be extracted — every booking in this suite is a silent 127"
+
 # ── extraction 1d: the PARKED guard (agent-infra#4120) ───────────────────────────────────────────
 # ⛔ A PARK IS A TERMINATOR THAT RUNS BEFORE EVERY ARM, so a conflicting head that inherits one is
 # unreachable no matter what the conflict router does — and the parks most often held on a conflicting
@@ -379,6 +394,7 @@ PY
     # about a log line that is written BEFORE the park.
     # shellcheck disable=SC1090
     . "$TMP/parkctrl.sh"
+    . "$TMP/spend.sh"          # sourced, not stubbed: a 127 here is a SILENT loss of the booking
     # ⛔ THE CI-QUEUE PREDICATE IS STUBBED LIKE EVERY OTHER NEIGHBOUR (#2333 review cycle 2, P1).
     # It is not decoration: `orch-loop.sh` now calls `ciq_push_ok` in both fixer arms, and an
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
@@ -471,6 +487,7 @@ PY
     . "$TMP/shq.sh"
     . "$TMP/spawntok.sh"
     . "$TMP/isnum.sh"        # the blocks' `is_num "$NFC" || NFC=0` guards (see drive() for why)
+    . "$TMP/spend.sh"        # the CONFLICT arm books its spend record at spawn — sourced (see extraction 1f)
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     for _once in 1; do
@@ -479,7 +496,9 @@ PY
     done
   ) >/dev/null 2>&1
 }
-# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] ─────
+# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>]
+# `<parkorigin>` is `harness` (the default — what every machine park now stamps), `human`, or `none` for
+# NO marker file at all (a park written before the marker existed: the upgrade path).
 # THE CONTROLLER'S OWN ORDER, DRIVEN AS ONE LOOP (agent-infra#4120). The swept row runs the
 # `[conflict-case]` block and then the `[acting-case]` block inside the same `while read`, and the
 # conflict block ends in `continue` — so "did the acting case run for this PR" is a fact of the
@@ -548,6 +567,7 @@ PY
     . "$TMP/spawntok.sh"
     . "$TMP/isnum.sh"
     . "$TMP/parkctrl.sh"        # the SHIPPED park: the bound is only a bound if the file lands
+    . "$TMP/spend.sh"           # …and the CONFLICT arm's own booking (extraction 1f)
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     # ⛔ THE PARKED GUARD RUNS FIRST, EXACTLY AS IT DOES IN THE SWEEP (agent-infra#4120). With
@@ -560,6 +580,15 @@ PY
       # $7 overrides the reason so the HUMAN-park arm can be driven; the default is the REVIEW-side
       # park the measured population actually inherited.
       printf '%s\n' "${7:-REVIEW-CAP: 3/3 review re-records at head=$6 — the reviewer never produced a usable verdict}" > "$O/state/parkreason-$PR"
+      # ⛔ THE AUTHOR IS SEEDED TOO (fresh-context review, P2, #4126). Every machine park stamps
+      # `parkorigin-<PR>` = `harness`; `human` is a hand-written park, and `none` is a park written
+      # BEFORE the marker existed — the upgrade path the legacy prose allow-list still serves. A drive
+      # that seeded only `parked`/`parkreason` would grade the migration arm on every row and would not
+      # notice the marker being ignored.
+      case "${8:-harness}" in
+        none) : ;;
+        *) printf '%s\n' "${8:-harness}" > "$O/state/parkorigin-$PR" ;;
+      esac
     fi
     for _once in 1; do
       if [ -s "$TMP/parked.sh" ]; then
@@ -808,7 +837,7 @@ drive 'FAILED:docs-lint' rail 0 1
 # instead of spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…`
 # path (#709).
 t5_clear() {
-  for _f in fixcount-4242 conflictcount-4242 fixspend-4242-abc1234 spendcount-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
+  for _f in fixcount-4242 conflictcount-4242 fixspend-4242-abc1234 spendcount-4242-abc1234 parked-4242 parkreason-4242 parkorigin-4242 argv-4242; do
     [ -e "$TMP/O/state/$_f" ] && mv "$TMP/O/state/$_f" "$TMP/state.spent.$_f.$RANDOM" 2>/dev/null
   done
   return 0
@@ -871,6 +900,15 @@ drive_route 'FAILED:ai-review-gate' CONFLICTING    # the measured production cas
 [ "$(cat "$TMP/O/state/conflictcount-4242" 2>/dev/null)" = "1" ] \
   && ok "…and the rebase consumed exactly one round of the CONFLICT budget (its own counter)" \
   || bad "…the round was not booked (state/conflictcount-4242=$(cat "$TMP/O/state/conflictcount-4242" 2>/dev/null))"
+# ⛔ AND THE SPAWN BOOKS ITS SPEND RECORD (fresh-context review, P3 — #4126). `state/conflictcount`
+# above is written by the arm itself (`echo $((NFC+1)) > "$CF"`), so it says NOTHING about
+# `spend_book` having run: deleting the booking line at the conflict spawn left this whole section green
+# while `refund_bailed_fixer` — whose ONLY input for "which budget did this spawn charge" is this
+# record — lossily fell back to `fixcount` and refunded the repair budget nothing had booked. The
+# record's CONTENT is the assertion, not its existence.
+[ "$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)" = "conflictcount" ] \
+  && ok "…and the spawn BOOKED its spend record against the CONFLICT counter (the refund's only input)" \
+  || bad "…no spend record names conflictcount at the head (state/spendcount-4242-abc1234=[$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)]) — a bail would refund the repair budget instead"
 # ⛔ THE CONFLICT BUDGET IS NOT THE REPAIR BUDGET (fresh-context review, P2 — agent-infra#4120). A PR
 # that spent `MAX_FIX_TRIES` on REVIEW/CI repairs used to arrive at the router already at cap and park
 # having attempted ZERO rebases — this drive is the measurement of that, and it is RED on the pre-fix
@@ -964,15 +1002,53 @@ t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234
 [ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] && [ "$(acts)" = "1" ] \
   && ok "a CONFLICTING head parked REVIEW-CAP at that head is STILL rebased (the park does not outlive it)" \
   || bad "a REVIEW-CAP park at the conflicted head still hides it (route=$(cat "$TMP/route" 2>/dev/null) acts=$(acts)) — the fix would go inert after two cycles"
+# ⛔ THE WORDING `merge-one.sh` ACTUALLY WRITES, WHICH MATCHED NO ARM (fresh-context review, P2 —
+# #4126). `Review attempts at head=… are exhausted` is the park the REVIEW CHAIN writes, and the review
+# chain is what the measured population went through: 7 of 7 open CONFLICTING PRs classified
+# `FAILED:ai-review-gate`. Under the prose allow-list this row routed `parked` — the router never ran
+# and the head was unreachable until an operator hand-deleted the park. Three rows: the stamped park
+# (what ships), the SAME wording with no marker (a park written before the marker existed — the
+# upgrade path must not strand it), and a stamp of `human` on a MACHINE wording (the author outranks
+# the prose, which is the whole point of replacing the substring test).
+_me_reason='Review attempts at head=abc1234 are exhausted (3/3, counted once across the controller dispatch and this run), so nothing was reviewed here'
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 "$_me_reason" harness
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] && [ "$(acts)" = "1" ] \
+  && ok "a park stamped 'harness' with merge-one.sh's own wording is REBASED (the author, not the prose, decides)" \
+  || bad "merge-one.sh's 'are exhausted' park still hides a conflicted head (route=$(cat "$TMP/route" 2>/dev/null)) — the seven-reason gap is open"
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 "$_me_reason" none
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] \
+  && ok "…and the SAME wording with NO marker (written before the marker existed) is rebased too — the upgrade strands nobody" \
+  || bad "a pre-marker merge-one.sh park stranded the head (route=$(cat "$TMP/route" 2>/dev/null)) — the fix would be inert on the population it was written for"
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'REVIEW-CAP: 3/3 review re-records at head=abc1234 — the reviewer never produced a usable verdict' human
+[ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
+  && ok "…and a 'human' stamp is HONOURED even over a machine wording (the marker outranks the prose)" \
+  || bad "a human-stamped park on a conflicted head was rebased (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — a human decision was overridden"
 # ⛔ BUT A HUMAN PARK STANDS (review P3, #4126). The exemption reads the REASON, not only
 # `mergeable`: a park a human wrote records a judgement about the PR that a rebase does NOT settle, so
 # rebasing it would resolve conflict hunks the human parked it for. Non-vacuity: the SAME head,
 # the SAME `CONFLICTING`, and only the reason differs from the drive above.
 t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
-  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off'
+  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off' none
 [ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
   && ok "a HUMAN park on a conflicting head is HONOURED (no rebase resolves a decision a human owns)" \
   || bad "a human park was overridden by the conflict router (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — the harness rebased a PR a human parked"
+# ⛔ AND AN UNRECOGNISED REASON WITH NO MARKER FAILS CLOSED (the default arm is load-bearing): the
+# pre-marker prose list recognises the harness's own wordings, so the arm that keeps a HUMAN park is
+# the one nothing matches. Driven so a widened allow-list has to red it.
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'waiting on legal sign-off before this may move at all' none
+[ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
+  && ok "…and a reason no marker and no wording claims FAILS CLOSED — an unknown park is a human decision" \
+  || bad "an unknown park was rebased (route=$(cat "$TMP/route" 2>/dev/null)) — the fail-closed default is gone"
+# ⛔ NON-VACUITY OF THE MARKER ITSELF: the SAME unrecognised reason, stamped `harness`, IS rebased. So
+# neither half of the guard is decoration — the prose list cannot carry a new wording on its own, and
+# the marker does not need the prose to agree with it.
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'waiting on legal sign-off before this may move at all' harness
+[ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] && [ "$(acts)" = "1" ] \
+  && ok "…while the SAME reason stamped 'harness' IS rebased — the marker carries a wording the prose list does not know" \
+  || bad "a harness-stamped park with a new wording was honoured as human (route=$(cat "$TMP/route" 2>/dev/null)) — every future park wording regresses"
 t5_clear; drive_route 'FAILED:ai-review-gate' MERGEABLE 0 0 1 abc1234
 [ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
   && ok "control: the SAME park still SKIPS a non-conflicting head (the guard is still a guard)" \

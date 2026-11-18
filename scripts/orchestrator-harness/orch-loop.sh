@@ -4265,13 +4265,31 @@ print("RED" if red else ("UNKNOWN" if inflight else "GREEN"))
 # re-record by hand" for a PR actually parked for an unrelated cause. Write the pair together,
 # always, so a reason can never outlive the head it describes.
 park_ctrl() { # park_ctrl <pr> <head> <reason…> — returns non-zero when the park did NOT land
+  # ⛔ THE PARK CARRIES ITS AUTHOR (fresh-context review, P2, agent-infra#4126). `parked-<PR>` has
+  # three authors (`park_ctrl` here, `merge-one.sh`'s `park()` and its rail cap, and
+  # `pr-sickness.sh`'s two escalations) and ONE reader that has to decide a question the author
+  # alone can answer: does a rebase settle this park? That reader used to answer it by matching
+  # SUBSTRINGS of free prose produced by the other two files — a negative test over three
+  # independent writers, so every new reason wording was silently read as a HUMAN decision and a
+  # CONFLICTING head parked with it never moved again. Measured: seven `merge-one.sh` reasons
+  # matched no arm, including `Review attempts at head=… are exhausted` — the single most likely
+  # park to sit on a conflicted head, since that is the arm the measured population (7 of 7 open
+  # CONFLICTING PRs classified `FAILED:ai-review-gate`) went through. So every machine park now
+  # writes `parkorigin-<PR>` = `harness` beside the reason it describes, and the guard trusts THAT
+  # marker instead of guessing from the prose. A human park writes `parkorigin-<PR>` = `human`.
   # ⛔ THE PARK IS THE TERMINATOR, SO ITS WRITE STATUS MATTERS (review round 4 of #2653, P2). Every
   # escalation in this file ends in a park, and the sweep's guard is a `cat` of `parked-<PR>`; if that
   # file cannot be written (a stray directory of that name, a read-only or full `state/` — the hazard
   # this file names at its own `state/` note), the PR is NOT parked: it re-enters the arm every cycle
   # while the log and the ledger both claim "PARKED". The callers that escalate on a bound check this
   # status and say so; the older callers ignore it, so their behaviour is unchanged.
-  printf '%s\n' "$3" > "$O/state/parkreason-$1" && printf '%s\n' "$2" > "$O/state/parked-$1"
+  # ⛔ THE ORIGIN IS WRITTEN FIRST, IN THE SAME CHAIN: a reason with no author is the state the
+  # guard has to fail closed on, and the marker is only trustworthy when it was written with the
+  # reason it describes. A partial write therefore does not land the park at all, which is what this
+  # function's return contract already promises its callers.
+  printf '%s\n' 'harness' > "$O/state/parkorigin-$1" \
+    && printf '%s\n' "$3" > "$O/state/parkreason-$1" \
+    && printf '%s\n' "$2" > "$O/state/parked-$1"
 }
 
 # Merge priority: PR work OUTRANKS new work and is dispatched FIRST. It is a LEVEL, not a barrier —
@@ -6850,7 +6868,11 @@ while true; do
           RF_WHY="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
           case "${RF_WHY:-}" in
             ''|*'RED TREE'*|*'rail refused'*)
-              rm -f "$O/state/parked-$PR" "$O/state/parkreason-$PR" 2>/dev/null || true
+              # ⛔ THE ORIGIN GOES WITH THE REASON (agent-infra#4126). A lifted park that left
+              # `parkorigin-<PR>` = harness behind would attribute the NEXT park at this PR — a
+              # hand-written human one — to the harness, which is the one direction this marker
+              # must never be wrong in.
+              rm -f "$O/state/parked-$PR" "$O/state/parkreason-$PR" "$O/state/parkorigin-$PR" 2>/dev/null || true
               echo "#$PR park at head=$HEAD_N lifted: the tree is non-red now, so the premise it recorded is false (reason was: ${RF_WHY:-<none: the rail wrote it>})" >>"$LOG" ;;
             *)
               echo "#$PR park at head=$HEAD_N NOT lifted: its reason is '${RF_WHY}' (not this role's and not the rail's) — a green check surface does not settle it, so a human's decision stands" >>"$LOG" ;;
@@ -7141,27 +7163,56 @@ while true; do
     # `refund_bailed_fixer` deletes `parked-<PR>` outright). What IS unchanged is that the guard itself
     # never deletes, and that `test-gates.sh`'s park drives still see the file they seeded.
     # ⛔ A HUMAN PARK STILL STANDS (review P3, #4126 — the correction to the paragraph above). The
-    # exemption consults the REASON, not only `mergeable`: a park a human wrote ("needs a human
-    # decision") records a judgement about the PR that a rebase does NOT settle, so rebasing it would
-    # resolve conflict hunks the human parked it for. That is the same rule the red-fixer arm applies
-    # when it refuses to lift a park whose reason is not its own (the GREEN arm above). So the guard
-    # HONOURS a park whose reason is not one THIS harness wrote — an unrecognised reason fails closed
-    # (skip), exactly as the red-fixer's `case` does. Every review-side and rail-side reason is
-    # listed, because those ARE the parks a rebase makes obsolete.
-    _pk_why="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
-    _pk_rebase_settles=1
-    case "$_pk_why" in
-      '') _pk_rebase_settles=1 ;;                    # the rail's own park (no reason written)
-      *'RED TREE'*) _pk_rebase_settles=1 ;;
-      *'still CONFLICTING'*) _pk_rebase_settles=1 ;; # this router's own, head-bound
-      *'still needs fixes'*|*'REVIEW-CAP'*|*'REVIEW-CEILING'*|*'REVIEW-AT-HEAD-STUCK'*|*'review-round budget'*|*'review budget record'*) _pk_rebase_settles=1 ;;
-      *'CI still red'*) _pk_rebase_settles=1 ;;
-      *'NOCHECKS-UNRESOLVABLE'*) _pk_rebase_settles=1 ;;
-      *) _pk_rebase_settles=0 ;;                      # not one of ours — a human decision stands
-    esac
-    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] \
-      && { [ "${MSTAT:-}" != "CONFLICTING" ] || [ "$_pk_rebase_settles" = "0" ]; } \
-      && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
+    # exemption consults the AUTHOR of the park, not only `mergeable`: a park a human wrote ("needs a
+    # human decision") records a judgement about the PR that a rebase does NOT settle, so rebasing it
+    # would resolve conflict hunks the human parked it for. That is the same rule the red-fixer arm
+    # applies when it refuses to lift a park whose reason is not its own (the GREEN arm above).
+    # ⛔ THE AUTHOR IS A MARKER, NOT A SUBSTRING OF THE PROSE (fresh-context review, P2, #4126). This
+    # used to be a `case` over the REASON TEXT with a fail-closed default, and the text is written by
+    # THREE files (`park_ctrl` here, `merge-one.sh`'s `park()`/rail cap, `pr-sickness.sh`). Seven
+    # `merge-one.sh` wordings matched no arm — including `Review attempts at head=… are exhausted`,
+    # which is the single most likely park to sit on a conflicted head, because `merge-one.sh` IS the
+    # review chain and the measured population (7 of 7 open CONFLICTING PRs classified
+    # `FAILED:ai-review-gate`) went through it. So for those heads the router never ran and the only
+    # exit was an operator hand-deleting the park — the P0-ish "secretary at the keyboard" state
+    # #4120 was filed to remove. A negative test over free prose cannot be kept in sync across three
+    # writers, so the author is now a FACT each writer stamps: `parkorigin-<PR>` = `harness` for a
+    # machine park, `human` for a hand-written one.
+    # ⛔ NO MARKER IS NOT FREEDOM — it fails CLOSED (a human decision stands), with ONE exception that
+    # is a migration path, not a rule: a park written before this marker existed (an upgrading box)
+    # carries no author, and its prose is all there is. Falling through to "human" there would strand
+    # every head those parks hold — reintroducing the exact inertness this fix removes, once, at
+    # upgrade time. So the pre-marker wordings stay recognised, now including every `merge-one.sh`
+    # form, and the branch self-retires: the next park at that PR is stamped and never consults it.
+    _pk_head=""; _pk_why=""; _pk_origin=""; _pk_rebase_settles=0
+    # ⛔ THE READS ARE `-f`-GUARDED (review note 2, #4126): this runs for EVERY PR on EVERY cycle, and
+    # the loop budgets forks per PR per cycle as a dispatch gate (#2293). An unguarded `$(cat)` costs
+    # a double fork per file per PR to read a file that usually does not exist.
+    [ -f "$O/state/parked-$PR" ] && _pk_head="$(cat "$O/state/parked-$PR" 2>/dev/null)"
+    if [ -n "${HEAD_N:-}" ] && [ "$_pk_head" = "$HEAD_N" ]; then
+      [ -f "$O/state/parkreason-$PR" ] && _pk_why="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
+      [ -f "$O/state/parkorigin-$PR" ] && _pk_origin="$(cat "$O/state/parkorigin-$PR" 2>/dev/null)"
+      case "$_pk_origin" in
+        harness) _pk_rebase_settles=1 ;;   # a machine park: the rebase router's own cap bounds it
+        human) _pk_rebase_settles=0 ;;     # a POSITIVE human marker: it outranks the prose, by design
+        *)                                  # a park written before the marker existed (the upgrade path)
+          case "$_pk_why" in
+            '') _pk_rebase_settles=1 ;;   # the rail's own park writes no reason at all
+            *'RED TREE'*) _pk_rebase_settles=1 ;;
+            *'still CONFLICTING'*) _pk_rebase_settles=1 ;; # this router's own, head-bound
+            *'still needs fixes'*|*'REVIEW-CAP'*|*'REVIEW-CEILING'*|*'REVIEW-AT-HEAD-STUCK'*|*'review-round budget'*|*'review budget record'*) _pk_rebase_settles=1 ;;
+            *'CI still red'*) _pk_rebase_settles=1 ;;
+            *'NOCHECKS-UNRESOLVABLE'*) _pk_rebase_settles=1 ;;
+            # ── the `merge-one.sh` forms, unrecognised until this round (#4126 P2) ──────────────
+            *'are exhausted'*|*'NO usable verdict'*|*'CHECK SURFACE IS RED'*|*'diff-read counter'*|*'red-surface counter'*|*'posted no comment URL'*|*'could not resolve PR #'*) _pk_rebase_settles=1 ;;
+            *) _pk_rebase_settles=0 ;;      # unrecognised — a human decision stands (fail closed)
+          esac ;;
+      esac
+      if [ "${MSTAT:-}" != "CONFLICTING" ] || [ "$_pk_rebase_settles" = "0" ]; then
+        disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"
+        continue
+      fi
+    fi
     # [parked-guard:end]
     # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
     # spawns — the one action worse than doing nothing here would be acting on a contract this

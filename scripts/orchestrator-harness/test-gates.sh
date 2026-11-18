@@ -3642,19 +3642,33 @@ GHFAIL2
   fi
   # (11b) ⛔ AND THE PRODUCER'S `1` REALLY RE-ASSERTS THE FINDINGS PROOF, DRIVEN — the pin above would
   # stay green if `spend_book` ignored its 4th argument, which is exactly the restore authorisation the
-  # whole `fixspend` marker exists to carry. Both directions: `1` writes it, anything else clears it.
+  # whole `fixspend` marker exists to carry. Both directions, ON ONE KEY: `1` writes it, and a SECOND
+  # booking at the SAME (PR, head) with `0` CLEARS it.
+  # ⛔ THE TWO DIRECTIONS MUST SHARE THE KEY (fresh-context review, P3 — #4126). This row used to book
+  # PR `71` with `1` and PR `72` with `0`, then assert `[ ! -f fixspend-72-… ]`. Nothing ever created
+  # `72`'s file, so the CLEAR half could not fail: mutating `spend_book` to drop its
+  # `rm -f "$O/state/fixspend-$pr-$head"` left this row GREEN while the behaviour the message claims
+  # ("0 CLEARS it") was gone. And no other suite covers it — `selftest.sh` (b2)/(b3) and
+  # `red-fixer.test.sh` (3c2) all READ `spendcount`, none seeds a `fixspend` and books a second time at
+  # the same key. That clear is not decoration: it is the round-4 P3 fix this PR carries — a record
+  # left by an EARLIER spawn at this head would make `refund_bailed_fixer … 1` restore a findings marker
+  # for a bail that consumed none, a manufactured fixer authorisation (agent-infra#2132). So the
+  # transition is what is driven, and its first half is recorded from inside the run so the WRITE
+  # direction keeps its own attributable mutant.
   ex spend_book > "$TMP/fn_spend_book.sh"
   if grep -q '^spend_book() {' "$TMP/fn_spend_book.sh"; then
     mkdir -p "$TMP/sbO/state"
+    : > "$TMP/sb.steps"
     ( O="$TMP/sbO"; . "$TMP/fn_spend_book.sh"
       spend_book 71 cafe0001 fixcount 1
-      spend_book 72 cafe0001 fixcount 0 )
-    if [ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] \
-       && [ ! -f "$TMP/sbO/state/fixspend-72-cafe0001" ] \
+      if [ -f "$O/state/fixspend-71-cafe0001" ]; then printf 'wrote\n' >> "$TMP/sb.steps"; fi
+      spend_book 71 cafe0001 fixcount 0 )
+    if grep -qx 'wrote' "$TMP/sb.steps" \
+       && [ ! -f "$TMP/sbO/state/fixspend-71-cafe0001" ] \
        && [ "$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)" = "fixcount" ]; then
-      echo "  ✅ spend_book's 4th argument decides the findings proof (1 writes it, 0 CLEARS it), and the record names the counter"; PASS=$((PASS+1))
+      echo "  ✅ spend_book's 4th argument decides the findings proof (1 writes it, a second booking with 0 CLEARS it at the SAME key), and the record names the counter"; PASS=$((PASS+1))
     else
-      echo "  ❌ spend_book did not honour its 4th argument or did not record the counter (71 spends=$([ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] && echo yes || echo no) 72 spends=$([ -f "$TMP/sbO/state/fixspend-72-cafe0001" ] && echo yes || echo no) rec=[$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)])"; FAIL=$((FAIL+1))
+      echo "  ❌ spend_book did not honour its 4th argument, did not record the counter, or did not CLEAR the findings proof on a re-booking (wrote=$([ -s "$TMP/sb.steps" ] && echo yes || echo no) left=$([ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] && echo yes || echo no) rec=[$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)])"; FAIL=$((FAIL+1))
     fi
   else
     echo "  ❌ could not extract spend_book from orch-loop.sh"; FAIL=$((FAIL+1))

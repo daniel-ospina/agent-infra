@@ -1095,6 +1095,11 @@ ps_review_decide() {
     # escalation for ever — and the README row promises one. The tag check is what makes a retry safe
     # (a repeat pass finds the tag and posts nothing), so the order is: escalate, and park only on 0.
     if ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." "This queue booked \`$bcnt\` fixer attempt(s) against head \`${sha:0:12}\` — this budget is SHARED with the red-check source — and the recorded verdict is still \`not-clean\`, so a fixer that cannot fix is finite by design." "this budget is **keyed on the TREE** (\`psick-$pr-<head12>\`), so a **push re-arms it**: the new head gets its own budget, and any lane that pushes does that for you. To re-arm the head in place instead: \`rm -f \$O/state/psick-$pr-${sha:0:12} \$O/state/parked-$pr \$O/state/parkreason-$pr\`."; then
+      # ⛔ THE PARK NAMES ITS AUTHOR (fresh-context review, P2, agent-infra#4126). This file is the THIRD
+      # writer of `parkreason-<PR>`; the controller's parked-guard decides whether a rebase may overrule a
+      # park on a `CONFLICTING` head, and it must not have to guess from prose. `harness` says: a machine
+      # wrote this, and a rebase is allowed to proceed (the router's own `MAX_FIX_TRIES` bounds it).
+      printf '%s\n' 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
       # ⛔ THE REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
       # the bound is `psick-<PR>-<sha12>` (`ps_gates` reads it, `ps_review_cap_hit` compares it). A remedy
@@ -1128,6 +1133,8 @@ ps_review_decide() {
     # Same ordering rule as BOUND 1: escalate FIRST, park only on success — a parked head is refused by
     # `ps_gates`, so a failed POST must not be recorded as a park that loses the escalation for ever.
     if ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**No fixer was dispatched for this head.** The review-round book was already spent when the verdict arrived, so a fix would buy a head whose review the same ceiling refuses — nothing was spent and nothing ran." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand."; then
+      # see the note on the first escalation: the author is a marker, not a wording.
+      printf '%s\n' 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
       # ⛔ THE REMEDY IS `merge-one.sh`'s OWN ([rrceiling]), NOT "a push": the book is CUMULATIVE across
       # heads, so a push produces a head whose review the same ceiling refuses — the operator would push

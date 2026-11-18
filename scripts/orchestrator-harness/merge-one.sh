@@ -1121,6 +1121,12 @@ rail_attempt() {
       echo "[merge $PR] PARKED — the rail refused $RC_N time(s) at head=${HEAD:-?}; a new push re-arms it" >> "$L.log"
     fi
     echo "${HEAD:-}" > "$O/state/parked-$PR"
+    # ⛔ THIS PARK CARRIES NO REASON, SO IT MUST CARRY ITS AUTHOR (#4126 P2): the guard's `''` arm —
+    # "the rail's own park, which writes no reason at all" — is the state this site creates, and a
+    # previous head's reason may still be sitting beside it. Stamped only when no reason survives, so a
+    # HUMAN reason left at an earlier head is never relabelled as this harness's. `pr-sickness.sh`'s
+    # escalations write the same marker.
+    [ -s "$O/state/parkreason-$PR" ] || printf '%s\n' 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     exit 0
   fi
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
@@ -1324,6 +1330,17 @@ park() { # park <reason…>
   # wins. A NON-EMPTY HEAD is a fresh park — a moved head re-arms the PR and the already-parked
   # guard cannot have fired for it — so its reason must REPLACE a stale one from an earlier head.
   if [ -n "${HEAD:-}" ] || [ ! -s "$O/state/parked-$PR" ]; then
+    # ⛔ THE PARK NAMES ITS AUTHOR (fresh-context review, P2, agent-infra#4126). The controller's
+    # parked-guard has to answer ONE question about a `CONFLICTING` head — does a rebase settle this
+    # park? — and it used to answer it by matching substrings of THIS prose, with a fail-closed
+    # default. Seven reasons written here matched no arm (measured; `Review attempts at head=… are
+    # exhausted` is the worst, being the park the review chain writes most often), so those heads were
+    # read as HUMAN decisions and the conflict router never ran for them. The author is now a fact
+    # stamped beside the reason, so a wording added here can never silently become "a human decided".
+    # ⛔ AND IT IS WRITTEN WITH THE REASON, NEVER WITHOUT IT (the guarded block above): the first
+    # reason wins when there is no head to key a new park to, and stamping the author then would
+    # attribute the SURVIVING reason — possibly a human's — to this worker.
+    printf '%s\n' 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     printf '%s\n' "$why" > "$O/state/parkreason-$PR"
   fi
   [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
