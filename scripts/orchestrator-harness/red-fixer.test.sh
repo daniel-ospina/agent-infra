@@ -73,6 +73,14 @@ grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/isnum.sh"
 grep -E '^is_limit\(\) \{' "$ORCH" >> "$TMP/isnum.sh"
 grep -E '^refund_bailed_fixer\(\) \{' "$ORCH" > "$TMP/refund.sh"
 sed -n '/^refund_bailed_fixer() {/,/^}/p' "$ORCH" > "$TMP/refund.sh"
+# ⛔ THE SPEND RECORD'S PRODUCER IS EXTRACTED WITH ITS CONSUMER (fresh-context review, P2 — #4126
+# round 3). The red-fixer spawn now books through `spend_book`, which is defined OUTSIDE the `[redfix]`
+# block like `spawn_gate_tok` and `pr_owner_live`. Unsourced it is an UNDEFINED COMMAND (rc 127), so the
+# booking chain fails and EVERY drive reads "the attempt counters could not be written" — 17 arms went
+# red against a controller that was correct, which is the same false-red class the ownership guard
+# documents above. Sourced here, its failure mode is the shipped one.
+sed -n '/^spend_book() {/,/^}/p' "$ORCH" >> "$TMP/refund.sh"
+sed -n '/^spend_clear() {/,/^}/p' "$ORCH" >> "$TMP/refund.sh"
 # `head_reds` is the shipped clearance predicate (is ANY check red at this head) — extracted, not
 # stubbed, so its allow-list polarity is what the GREEN/UNKNOWN cases actually exercise.
 sed -n '/# \[fixgate-refund:begin\]/,/# \[fixgate-refund:end\]/p' "$HERE/fix-one.sh" | sed '1d;$d' > "$TMP/gaterefund.sh"
@@ -131,6 +139,7 @@ fi
 # function-local `local`s it does not use are fine, but `tail`/`wc` are external on purpose.
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num/is_limit not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/refund.sh" ] || { echo "FATAL: refund_bailed_fixer not found in orch-loop.sh"; exit 1; }
+grep -q '^spend_book() {' "$TMP/refund.sh" || { echo "FATAL: spend_book not found in orch-loop.sh — every booking arm would call an undefined command"; exit 1; }
 
 # ── the FAKE RAIL ───────────────────────────────────────────────────────────────
 # A real script with a real exit status and real stderr, because the recorder's whole job is to
@@ -849,6 +858,35 @@ rm -rf "$TMP/gO2"; mkdir -p "$TMP/gO2/state"; printf '2\n' > "$TMP/gO2/state/fix
 [ ! -f "$TMP/gO2/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] && [ "$(cat "$TMP/gO2/state/fixcount-4242")" = "2" ] \
   && ok "(3c2) a MANUAL run (CTRL=0) refunds nothing (it never booked an attempt)" \
   || bad "(3c2) a manual run refunded an attempt it never booked"
+# ⛔ THE REFUND GOES TO THE BUDGET THIS SPAWN ACTUALLY CHARGED (fresh-context review, P2 — #4126
+# round 3). The controller books `conflictcount` for a CONFLICT rebase and `fixcount` for every other
+# repair, and records which in `state/spendcount-<PR>-<HEAD>`. Refunding `fixcount` unconditionally
+# decremented a budget nothing had booked on this head (inventing a repair round on a review) while the
+# rebase attempt stayed spent for ever — three gate refusals (a DISK refusal never clears by waiting)
+# then parked a conflicting PR as "still CONFLICTING after N rebases" with ZERO rebases attempted.
+# Both directions are asserted: conflictcount drops, fixcount is UNTOUCHED, the record is consumed.
+rm -rf "$TMP/gO3"; mkdir -p "$TMP/gO3/state"
+printf '2\n' > "$TMP/gO3/state/conflictcount-4242"; printf '3\n' > "$TMP/gO3/state/fixcount-4242"
+printf 'conflictcount\n' > "$TMP/gO3/state/spendcount-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+(
+  PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO3"; L="$TMP/gO3/log"; CTRL=1
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt
+) >/dev/null 2>&1
+if [ "$(cat "$TMP/gO3/state/conflictcount-4242" 2>/dev/null)" = "1" ] \
+   && [ "$(cat "$TMP/gO3/state/fixcount-4242" 2>/dev/null)" = "3" ] \
+   && [ ! -f "$TMP/gO3/state/spendcount-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ]; then
+  ok "(3c2) a gate refusal on a CONFLICT dispatch refunds the CONFLICT budget (2 -> 1) and leaves fixcount alone"
+else
+  bad "(3c2) conflict=$(cat "$TMP/gO3/state/conflictcount-4242" 2>/dev/null) (want 1) fix=$(cat "$TMP/gO3/state/fixcount-4242" 2>/dev/null) (want 3, untouched) — the refund charged the wrong budget"
+fi
+# ...and with NO record on disk the refund keeps the pre-existing repair-budget behaviour (a manual or
+# legacy spawn booked nothing else, and an absent record must not silently withhold the refund).
+rm -rf "$TMP/gO4"; mkdir -p "$TMP/gO4/state"; printf '2\n' > "$TMP/gO4/state/fixcount-4242"
+( PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO4"; L="$TMP/gO4/log"; CTRL=1
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt ) >/dev/null 2>&1
+[ "$(cat "$TMP/gO4/state/fixcount-4242" 2>/dev/null)" = "1" ] \
+  && ok "(3c2) with no spend record the refund falls back to fixcount (2 -> 1) — an absent record withholds nothing" \
+  || bad "(3c2) fixcount=[$(cat "$TMP/gO4/state/fixcount-4242" 2>/dev/null)] — an absent spend record silently withheld the refund"
 
 echo
 echo "  -- (3c3) MAX_RED_FIX_TRIES=0 is REPORT-ONLY (it must not park at zero attempts) --"

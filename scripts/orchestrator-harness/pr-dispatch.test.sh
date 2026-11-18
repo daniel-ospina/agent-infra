@@ -773,7 +773,7 @@ drive 'FAILED:docs-lint' rail 0 1
 # instead of spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…`
 # path (#709).
 t5_clear() {
-  for _f in fixcount-4242 conflictcount-4242 fixspend-4242-abc1234 conflictspend-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
+  for _f in fixcount-4242 conflictcount-4242 fixspend-4242-abc1234 spendcount-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
     [ -e "$TMP/O/state/$_f" ] && mv "$TMP/O/state/$_f" "$TMP/state.spent.$_f.$RANDOM" 2>/dev/null
   done
   return 0

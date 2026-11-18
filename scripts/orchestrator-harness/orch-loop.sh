@@ -1795,6 +1795,39 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 #     box's own PR claim must stop reading as owned, or the PR never re-enters the queue;
 #   • an UNREADABLE CLOCK in the `now` probe is LIVE, never "not in flight" (P2, cycle-23 review).
 
+# spend_book <pr> <head-sha> <counter: fixcount|conflictcount> [consumed-findings: 0|1]
+# ⛔ ONE SPEND RECORD PER (PR, HEAD), AND IT CARRIES THE COUNTER'S NAME (fresh-context review, P2 —
+# #4126 round 3). Every booking arm books its own counter at SPAWN, and the two refund parties
+# (`refund_bailed_fixer` here, `refund_gate_attempt` in fix-one.sh) must know WHICH counter that spawn
+# charged. Presence-of-one-of-two-files cannot express "the LAST charge at this head was the other
+# arm's": the conflict arm wrote `conflictspend-<PR>-<head>` at its spawn and nothing consumed it on a
+# SUCCESSFUL spawn, so a later CI-red/red-fixer spawn AT THE SAME HEAD (a rebase that pushed nothing,
+# or a `gh` mergeable flap back to MERGEABLE) left the stale record in place — and the refund then
+# decremented `conflictcount` for a `fixcount` charge. That is wrong in BOTH directions at once: a real
+# repair attempt stayed spent for ever, while a rebase attempt was invented against a budget nothing
+# booked. So a booking OVERWRITES the single record, and the record always names the most recent spawn
+# at that head — which is the only party that could have written the bail marker being refunded.
+# `consumed-findings` re-asserts `fixspend-<PR>-<head>` for the ONE site that deletes a findings marker
+# (the review-gate arm). It is CLEARED on every booking, because a record left by an EARLIER spawn at
+# this head would make `refund_bailed_fixer … 1` restore a findings marker for a bail that consumed
+# none — the round-4 P3 class, a manufactured fixer authorisation.
+spend_book() {
+  local pr="${1:-}" head="${2:-}" cnt="${3:-}" fin="${4:-0}"
+  [ -n "$pr" ] && [ -n "$head" ] || return 0
+  case "$cnt" in fixcount|conflictcount) : ;; *) return 0 ;; esac
+  printf '%s\n' "$cnt" > "$O/state/spendcount-$pr-$head" 2>/dev/null || return 0
+  rm -f "$O/state/fixspend-$pr-$head" 2>/dev/null || true
+  [ "$fin" = "1" ] && : > "$O/state/fixspend-$pr-$head" 2>/dev/null
+  return 0
+}
+# spend_clear <pr> <head-sha> — a FAILED spawn charged nothing, so neither record may outlive it.
+spend_clear() {
+  local pr="${1:-}" head="${2:-}"
+  [ -n "$pr" ] && [ -n "$head" ] || return 0
+  rm -f "$O/state/spendcount-$pr-$head" "$O/state/fixspend-$pr-$head" 2>/dev/null || true
+  return 0
+}
+
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
 # fix-one.sh writes $O/state/fixbail-<pr>-<head> on any of its THREE pre-agent deferrals: the
 # cross-box CAS refusal (another box already owns this head), the PR-OWNER lock
@@ -1822,13 +1855,18 @@ refund_bailed_fixer() {
   # review-gate and CI-red arms spend the PR-lifetime `fixcount-<PR>`, the CONFLICT router spends its
   # own `conflictcount-<PR>`. Refunding the wrong one is silent in both directions — a real attempt
   # stays spent for ever, or an attempt is invented against a budget nothing booked — so the refund
-  # reads the marker the bailed SPAWN left, exactly as `fixspend` already proves the findings restore
-  # below. Each booking arm writes `<budget>spend-<PR>-<head>` at spawn and removes it on a failed
-  # spawn, so a marker present here means that budget was charged for this head.
-  if [ -f "$O/state/conflictspend-$pr-$head" ]; then
-    cnt="conflictcount"
-    rm -f "$O/state/conflictspend-$pr-$head"
+  # reads the record the bailed SPAWN left, exactly as `fixspend` already proves the findings restore
+  # below. `spend_book` writes ONE record per (PR, head) — `state/spendcount-<PR>-<head>` — whose
+  # CONTENT names the counter that spawn charged, and removes it on a failed spawn, so the record
+  # present here names the budget booked for this head. ⛔ A record whose content is not one of the two
+  # counters (truncated, hand-edited) falls back to `fixcount`: the repair budget is the arm every
+  # other booking site shares, so an unreadable record costs at most a repair round — never a rebase
+  # credit it never paid for.
+  if [ -n "$head" ] && [ -f "$O/state/spendcount-$pr-$head" ]; then
+    read -r cnt < "$O/state/spendcount-$pr-$head" 2>/dev/null || true
+    case "$cnt" in fixcount|conflictcount) : ;; *) cnt="fixcount" ;; esac
   fi
+  rm -f "$O/state/spendcount-$pr-$head" 2>/dev/null || true
   f="$O/state/$cnt-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
   is_num "$n" || n=0
   [ "$n" -gt 0 ] && n=$(( n - 1 ))
@@ -2125,7 +2163,7 @@ review_ceiling_line() { # <pr> <head> <n> <max>
 # [reviewround:end]
 
 # prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*` /
-# `conflictspend-*` / `conflictcount-*` markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
+# `spendcount-*` / `conflictcount-*` markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
 # in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
 # listing it is never visited again, so its markers would live forever — the monotonic `state/` growth
 # this file rejects elsewhere. Delete-only, against the listing the cycle already read.
@@ -2155,7 +2193,7 @@ prune_orphan_markers() {
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/conflictspend-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/spendcount-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -2166,7 +2204,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend|conflictspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend|spendcount)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
@@ -6642,7 +6680,7 @@ while true; do
     # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
-      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/conflictspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
       # of the hand-rolled `rm -f` lines that also clear it (`merge-one.sh`'s CLEAN path).
@@ -7023,7 +7061,8 @@ while true; do
             is_num "$RF_FN" || RF_FN=0
             RF_BOOK=$(( RF_N + 1 ))
             if printf '%s %s\n' "$HEAD_N" "$RF_BOOK" > "$RF_CF" 2>/dev/null \
-               && printf '%s\n' "$(( RF_FN + 1 ))" > "$RF_FC" 2>/dev/null; then
+               && printf '%s\n' "$(( RF_FN + 1 ))" > "$RF_FC" 2>/dev/null \
+               && spend_book "$PR" "$HEAD_N" fixcount 0; then
               if wt_spawn "fix-$PR" "$SPAWN_CWD" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 RF_N="$RF_BOOK"
                 # (7) PR NUMBER, the refusal VERBATIM, the attempt counter and the session name, in ONE
@@ -7037,6 +7076,7 @@ while true; do
                 # ROLL BOTH BACK: nothing ran, so nothing may be consumed.
                 printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || rm -f "$RF_CF" 2>/dev/null || true
                 printf '%s\n' "$RF_FN" > "$RF_FC" 2>/dev/null || true
+                spend_clear "$PR" "$HEAD_N"
                 echo "#$PR RED TREE, fix-$PR spawn FAILED (attempt not consumed — nothing ran; both counters rolled back). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
                 disp "$PR" "$HEAD_N" "RED-TREE" wait "red-fixer spawn FAILED (attempt not consumed)"
               fi
@@ -7286,15 +7326,16 @@ while true; do
             # ⛔ THE SPEND RECORD IS WRITTEN BEFORE THE SPAWN, for the same race the review arm's
             # `fixspend` closes: `fix-one.sh` starts concurrently inside the tmux session and can write
             # `fixbail-<PR>-<head>` before `wt_spawn` returns, and `refund_bailed_fixer` needs this
-            # marker to know WHICH budget to refund. Written only for a readable head (an empty
-            # `HEAD_N` is not a key — the refund refuses one too).
-            [ -n "${HEAD_N:-}" ] && : > "$O/state/conflictspend-$PR-$HEAD_N"
+            # record to know WHICH budget to refund. One record per (PR, head), naming the counter —
+            # see `spend_book`. Nothing is done for an unreadable head (an empty `HEAD_N` is not a key,
+            # and the refund refuses one too).
+            spend_book "$PR" "${HEAD_N:-}" conflictcount 0
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
             else
-              [ -n "${HEAD_N:-}" ] && rm -f "$O/state/conflictspend-$PR-$HEAD_N"
+              spend_clear "$PR" "${HEAD_N:-}"
               echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
             fi
@@ -7333,8 +7374,8 @@ while true; do
         # authority test stays the ONLY needsreview sweep on this arm.
         # ⛔ AND THE CONFLICT ARM'S OWN SPEND RECORD, for the same reason (it is only written on the
         # conflict path, so a rebased PR that now reads GREEN would otherwise carry one stale
-        # `conflictspend-<PR>-<oldhead>` per pushed head until the PR terminates).
-        rm -f "$O/state/fixspend-$PR-"* "$O/state/conflictspend-$PR-"* 2>/dev/null || true
+        # `spendcount-<PR>-<oldhead>` per pushed head until the PR terminates).
+        rm -f "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* 2>/dev/null || true
         [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
@@ -7532,13 +7573,13 @@ while true; do
               # findings). Writing it first closes the window; the spawn-failure arm removes it again.
               # It is the counterpart `refund_bailed_fixer … 1` requires: this is the ONLY site that
               # consumes a findings marker, so it is the only site that may authorise a restore.
-              : > "$O/state/fixspend-$PR-$HEAD_N"
+              spend_book "$PR" "$HEAD_N" fixcount 1
               if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
               else
-                rm -f "$O/state/fixspend-$PR-$HEAD_N"
+                spend_clear "$PR" "$HEAD_N"
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
@@ -7787,11 +7828,17 @@ while true; do
             # (#2927): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
             # `can_spawn`'s load/disk/memory gate and the cross-box claim.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            # ⛔ EVERY BOOKING ARM RECORDS ITS COUNTER (see `spend_book`): this arm charges
+            # `fixcount` and consumes no findings marker, so the record must say exactly that —
+            # otherwise a stale record from an earlier spawn at this head would attribute a bail here
+            # to the wrong budget.
+            spend_book "$PR" "${HEAD_N:-}" fixcount 0
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
               echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
             else
+              spend_clear "$PR" "${HEAD_N:-}"
               echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi

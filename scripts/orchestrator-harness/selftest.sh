@@ -2677,8 +2677,11 @@ fi
 # the attempt at spawn and (on the reviewer-findings arm) deleted the findings marker there, so
 # before this refund three refusals PARKED a PR no fixer ever touched, with the reviewer's findings
 # gone. The function is EXTRACTED and DRIVEN, not grepped (P2, second review round, 2026-10-14).
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
-if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted from the shipped orch-loop.sh"; then
+# ⛔ `spend_book` / `spend_clear` ARE EXTRACTED TOO (fresh-context review, P2 — #4126 round 3): the
+# booking record is what attributes a refund to a budget, so the drive must build it through the SHIPPED
+# producer — a fixture that hand-writes the file asserts the reader against its own copy of the format.
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^spend_book() {/,/^}/p' "$LOOP"; sed -n '/^spend_clear() {/,/^}/p' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
+if need "$TMP/refund-all.sh" "spend_book/spend_clear/refund_bailed_fixer/is_num are extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/RB/state"; O="$TMP/RB"; LOG="$TMP/RB/loop.log"; : > "$LOG"
   # shellcheck disable=SC1090
   . "$TMP/refund-all.sh"
@@ -2715,20 +2718,36 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   [ "$(cat "$O/state/fixcount-88" 2>/dev/null)" = "0" ] && [ ! -f "$O/state/needsfix-88-abc" ] && rc=0 || rc=1
   ck "a bail on an arm that deleted no findings marker does not invent one" $rc
   # (b2) ⛔ THE REFUND GOES TO THE BUDGET THE BAILED SPAWN SPENT (fresh-context review, P2 —
-  # agent-infra#4120). The CONFLICT router books `state/conflictcount-<PR>` and leaves
-  # `conflictspend-<PR>-<head>`; the review/CI arms book `fixcount`. A refund that always decremented
-  # `fixcount` would either consume the review budget for a rebase that never ran, or leave a real
-  # conflict attempt spent for ever. Both directions are asserted: conflictcount drops, fixcount is
-  # UNTOUCHED, and the spend marker is consumed.
-  rm -f "$O/state/conflictspend-89-abc" "$O/state/conflictcount-89" "$O/state/fixbail-89-abc"
+  # agent-infra#4120). The CONFLICT router books `state/conflictcount-<PR>` and records it through
+  # `spend_book`; the review/CI arms book `fixcount`. A refund that always decremented `fixcount` would
+  # either consume the review budget for a rebase that never ran, or leave a real conflict attempt spent
+  # for ever. Both directions are asserted: conflictcount drops, fixcount is UNTOUCHED, and the spend
+  # record is consumed.
+  rm -f "$O/state/spendcount-89-abc" "$O/state/conflictcount-89" "$O/state/fixbail-89-abc"
   echo 2 > "$O/state/conflictcount-89"; echo 3 > "$O/state/fixcount-89"
-  : > "$O/state/fixbail-89-abc"; : > "$O/state/conflictspend-89-abc"
+  : > "$O/state/fixbail-89-abc"; spend_book 89 abc conflictcount 0
   refund_bailed_fixer 89 abc 0
   if [ "$(cat "$O/state/conflictcount-89" 2>/dev/null)" = "1" ] \
      && [ "$(cat "$O/state/fixcount-89" 2>/dev/null)" = "3" ] \
-     && [ ! -f "$O/state/conflictspend-89-abc" ] && [ ! -f "$O/state/needsfix-89-abc" ]; then rc=0
-  else rc=1; echo "      conflict=$(cat "$O/state/conflictcount-89" 2>/dev/null) fix=$(cat "$O/state/fixcount-89" 2>/dev/null) spend=$([ -f "$O/state/conflictspend-89-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-89-abc" ] && echo yes || echo no)"; fi
+     && [ ! -f "$O/state/spendcount-89-abc" ] && [ ! -f "$O/state/needsfix-89-abc" ]; then rc=0
+  else rc=1; echo "      conflict=$(cat "$O/state/conflictcount-89" 2>/dev/null) fix=$(cat "$O/state/fixcount-89" 2>/dev/null) spend=$([ -f "$O/state/spendcount-89-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-89-abc" ] && echo yes || echo no)"; fi
   ck "a bailed CONFLICT dispatch refunds the CONFLICT budget and leaves the repair budget alone" $rc
+  # (b3) ⛔ THE ATTRIBUTION IS THE *LAST* CHARGE AT THIS HEAD, NOT "WHICH OF TWO FILES EXISTS"
+  # (fresh-context review, P2 — #4126 round 3). A conflict spawn's record survived its own SUCCESSFUL
+  # spawn, so a later repair spawn AT THE SAME HEAD (a rebase that pushed nothing, or a `gh` mergeable
+  # flap back to MERGEABLE) left it in place — and the bail that repair wrote was then refunded against
+  # `conflictcount`, wrong in both directions at once. The two bookings below are the shipped producer's
+  # own calls, in the production order, and only the SECOND may be refunded.
+  rm -f "$O/state/spendcount-90-abc" "$O/state/conflictcount-90" "$O/state/fixcount-90" "$O/state/fixbail-90-abc"
+  echo 1 > "$O/state/conflictcount-90"; echo 2 > "$O/state/fixcount-90"
+  spend_book 90 abc conflictcount 0     # the rebase spawn (its attempt is a real, kept charge)
+  spend_book 90 abc fixcount 0          # a later repair spawn at the SAME head
+  : > "$O/state/fixbail-90-abc"        # ...and the repair's own bail is what the controller refunds
+  refund_bailed_fixer 90 abc 0
+  if [ "$(cat "$O/state/fixcount-90" 2>/dev/null)" = "1" ] \
+     && [ "$(cat "$O/state/conflictcount-90" 2>/dev/null)" = "1" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-90" 2>/dev/null) (want 1) conflict=$(cat "$O/state/conflictcount-90" 2>/dev/null) (want 1, untouched) — a STALE record attributed the bail to the wrong budget"; fi
+  ck "a stale conflict record at a head where the LAST spawn charged fixcount does not steal the refund" $rc
   # (c) NO bail marker -> nothing to refund. Non-vacuity: the refund is conditional on a real bail.
   echo 3 > "$O/state/fixcount-99"; refund_bailed_fixer 99 abc 1
   [ "$(cat "$O/state/fixcount-99" 2>/dev/null)" = "3" ] && [ ! -f "$O/state/needsfix-99-abc" ] && rc=0 || rc=1
