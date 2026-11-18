@@ -1125,8 +1125,9 @@ rail_attempt() {
     # "the rail's own park, which writes no reason at all" — is the state this site creates, and a
     # previous head's reason may still be sitting beside it. Stamped only when no reason survives, so a
     # HUMAN reason left at an earlier head is never relabelled as this harness's. `pr-sickness.sh`'s
-    # escalations write the same marker.
-    [ -s "$O/state/parkreason-$PR" ] || printf '%s\n' 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
+    # escalations write the same marker. `<head> harness`, not a bare token (#4126 round 7): the guard
+    # trusts a stamp only for the head it names, so this one cannot outlive the park it describes.
+    [ -s "$O/state/parkreason-$PR" ] || [ -z "${HEAD:-}" ] || printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     exit 0
   fi
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
@@ -1339,8 +1340,10 @@ park() { # park <reason…>
     # stamped beside the reason, so a wording added here can never silently become "a human decided".
     # ⛔ AND IT IS WRITTEN WITH THE REASON, NEVER WITHOUT IT (the guarded block above): the first
     # reason wins when there is no head to key a new park to, and stamping the author then would
-    # attribute the SURVIVING reason — possibly a human's — to this worker.
-    printf '%s\n' 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
+    # attribute the SURVIVING reason — possibly a human's — to this worker. `<head> harness` (#4126
+    # round 7): the guard trusts the stamp only for the head it names, and a park with no head has
+    # nothing to name, so it writes no marker at all rather than a head-less one.
+    [ -n "${HEAD:-}" ] && printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     printf '%s\n' "$why" > "$O/state/parkreason-$PR"
   fi
   [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
@@ -1360,7 +1363,7 @@ head_ok=0
 case "${HEAD:-}" in '' | *[!0-9a-f]*) head_ok=1 ;; esac
 [ "${#HEAD}" -eq 40 ] || head_ok=1
 if [ "$head_ok" -ne 0 ]; then
-  park "could not resolve PR #$PR head (gh pr view returned '${HEAD:-<empty>}') — the record step needs a full 40-char hex sha, so a review paid for here could never be recorded or merged. Re-run once gh is reachable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "could not resolve PR #$PR head (gh pr view returned '${HEAD:-<empty>}') — the record step needs a full 40-char hex sha, so a review paid for here could never be recorded or merged. Re-run once gh is reachable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
   echo "[merge $PR] ABORT: unresolvable head '${HEAD:-<empty>}' — not paying for a review whose record step could never sign" >> "$L.log"
   exit 3
 fi
@@ -1369,7 +1372,7 @@ fi
 # directly, and the controller's parked guard is invisible to them; without this the park would
 # hold only the path that was already fixed. Exit 5 = "refused, already parked at this head".
 if [ -n "${HEAD:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD" ]; then
-  echo "[merge $PR] PARKED at head=$HEAD — refusing to re-review (reason: $(cat "$O/state/parkreason-$PR" 2>/dev/null)). A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >> "$L.log"
+  echo "[merge $PR] PARKED at head=$HEAD — refusing to re-review (reason: $(cat "$O/state/parkreason-$PR" 2>/dev/null)). A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'" >> "$L.log"
   exit 5
 fi
 
@@ -1385,22 +1388,22 @@ fi
 # re-pays, which is the #1717 loop one input over. Same shape cmd_check enforces.
 RECORDER="$HOME/.pi/agent/scripts/record-review.sh"
 if [ ! -e "$RECORDER" ]; then
-  park "record-review.sh MISSING at $RECORDER — the record step cannot run, so this PR can never be signed or merged. Provision it (cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "record-review.sh MISSING at $RECORDER — the record step cannot run, so this PR can never be signed or merged. Provision it (cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
   echo "[merge $PR] ABORT: $RECORDER missing — not paying for a review whose record step cannot run" >> "$L.log"
   exit 3
 fi
 if [ ! -f "$RECORDER" ]; then
-  park "record-review.sh at $RECORDER is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) after a PAID review. Remove it and re-provision (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "record-review.sh at $RECORDER is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) after a PAID review. Remove it and re-provision (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
   echo "[merge $PR] ABORT: $RECORDER not a regular file — not paying for a review whose record step cannot run" >> "$L.log"
   exit 3
 fi
 if [ ! -s "$RECORDER" ]; then
-  park "record-review.sh at $RECORDER is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so ai-review-gate can never go green and the loop would re-pay for a fresh review every cycle. Re-provision it (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "record-review.sh at $RECORDER is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so ai-review-gate can never go green and the loop would re-pay for a fresh review every cycle. Re-provision it (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
   echo "[merge $PR] ABORT: $RECORDER is empty — not paying for a review whose record step cannot sign" >> "$L.log"
   exit 3
 fi
 if [ ! -x "$RECORDER" ]; then
-  park "record-review.sh at $RECORDER is NOT EXECUTABLE — the record step would fail (126) after a PAID review. Fix: chmod +x '$RECORDER', then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "record-review.sh at $RECORDER is NOT EXECUTABLE — the record step would fail (126) after a PAID review. Fix: chmod +x '$RECORDER', then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
   echo "[merge $PR] ABORT: $RECORDER not executable — not paying for a review whose record step cannot run" >> "$L.log"
   exit 3
 fi
@@ -1605,7 +1608,7 @@ _cc_recover() {
         # first refusal parks, because a durable red/gh fault on a head that was already recovered
         # once needs a human look, and a flaky shard re-arms on the next push (the park is
         # head-keyed).
-        park "the record for head=$HEAD was RECOVERED from the PR body's signed marker and its verdict is clean, but --check-carry REFUSED it: token='${CC_TOKEN}' (rc=$CC_RC). $([ "$CC_TOKEN" = "red-surface" ] && printf 'The head'"'"'s CHECK SURFACE IS RED and the red is the PR'"'"'s own — the groups are named in the check-carry stderr in this log.' || printf 'The head'"'"'s CHECK SURFACE COULD NOT BE READ — a failed read is not a green one.') NOTHING WAS MERGED and NO review was ordered (a red build is not a review finding). Fix or re-run the failing check(s) / the gh layer, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        park "the record for head=$HEAD was RECOVERED from the PR body's signed marker and its verdict is clean, but --check-carry REFUSED it: token='${CC_TOKEN}' (rc=$CC_RC). $([ "$CC_TOKEN" = "red-surface" ] && printf 'The head'"'"'s CHECK SURFACE IS RED and the red is the PR'"'"'s own — the groups are named in the check-carry stderr in this log.' || printf 'The head'"'"'s CHECK SURFACE COULD NOT BE READ — a failed read is not a green one.') NOTHING WAS MERGED and NO review was ordered (a red build is not a review finding). Fix or re-run the failing check(s) / the gh layer, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         echo "[merge $PR] ABORT: check-carry refused the RECOVERED record at head=$HEAD (token=${CC_TOKEN}) — parked with the surface named, because nothing may merge over it and a review would not fix it" >> "$L.log"
         exit 3 ;;
     esac
@@ -1644,7 +1647,7 @@ _cc_recover() {
       # (#3440) Reached when the recovered record is NOT clean at this head: a red build or a failed
       # read must not become a 20-40 minute review. PARK — the caller's `4:*`/`0:*` arms would
       # otherwise report "a review is owed" for a token that says no such thing.
-      park "check-carry answered '${CC_TOKEN}' for head=$HEAD while recovering this PR's record from the body (rc=$CC_RC). The recovered verdict does not cover this head either, and a red surface / a failed READ is not a reason to buy a review. Nothing was merged and no review was ordered. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      park "check-carry answered '${CC_TOKEN}' for head=$HEAD while recovering this PR's record from the body (rc=$CC_RC). The recovered verdict does not cover this head either, and a red surface / a failed READ is not a reason to buy a review. Nothing was merged and no review was ordered. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
       echo "[merge $PR] ABORT: check-carry answered ${CC_TOKEN} during recovery at head=$HEAD — parked rather than buying a review for a broken tree or a failed read" >> "$L.log"
       exit 3 ;;
     0:carry|5:*|6:*)
@@ -1757,7 +1760,7 @@ case "$CC_RC:$CC_TOKEN" in
     # the state was bounded — an INERT ENFORCER. This is exactly why `rev_budget_spend` (:1298)
     # returns `unwritable` and its caller parks instead of assuming a budget it does not have.
     if ! printf '%s %s\n' "${HEAD:-}" "$DR_N" > "$DR_F" 2>/dev/null; then
-      park "the diff-read counter for head=$HEAD CANNOT BE WRITTEN ($DR_F), so DIFFREAD_TRIES cannot bound this head and the worker would retry an unreadable diff for ever. Make $O/state writable (rm -rf a stray DIRECTORY named diffreadcount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '${DR_F}'"
+      park "the diff-read counter for head=$HEAD CANNOT BE WRITTEN ($DR_F), so DIFFREAD_TRIES cannot bound this head and the worker would retry an unreadable diff for ever. Make $O/state writable (rm -rf a stray DIRECTORY named diffreadcount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '${DR_F}'"
       echo "[merge $PR] ABORT: state/diffreadcount-$PR is unwritable — the diff-read bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
       exit 3
     fi
@@ -1766,7 +1769,7 @@ case "$CC_RC:$CC_TOKEN" in
     # park message that named only the diff would send the operator to the wrong place.
     if [ "$CC_TOKEN" = "surface-unknown" ]; then READ_WHAT="the head's CHECK SURFACE"; else READ_WHAT="the PR's DIFF"; fi
     if [ "$DR_N" -ge "$DR_TRIES" ]; then
-      park "${READ_WHAT} could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered '${CC_TOKEN}' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable failed READ is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
+      park "${READ_WHAT} could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered '${CC_TOKEN}' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable failed READ is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$DR_F'"
       echo "[merge $PR] ABORT: ${READ_WHAT} was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
       exit 3
     fi
@@ -1832,12 +1835,12 @@ case "$CC_RC:$CC_TOKEN" in
     [ "${SF_H:-}" = "${HEAD:-}" ] || SF_N=0
     SF_N=$((SF_N + 1))
     if ! printf '%s %s\n' "${HEAD:-}" "$SF_N" > "$SF_F" 2>/dev/null; then
-      park "the red-surface counter for head=$HEAD CANNOT BE WRITTEN ($SF_F), so SURFACE_TRIES cannot bound this head and the worker would retry a red surface for ever while claiming to be bounded. Make $O/state writable (rm -rf a stray DIRECTORY named redsurfacecount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$SF_F'"
+      park "the red-surface counter for head=$HEAD CANNOT BE WRITTEN ($SF_F), so SURFACE_TRIES cannot bound this head and the worker would retry a red surface for ever while claiming to be bounded. Make $O/state writable (rm -rf a stray DIRECTORY named redsurfacecount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$SF_F'"
       echo "[merge $PR] ABORT: state/redsurfacecount-$PR is unwritable — the red-surface bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
       exit 3
     fi
     if [ "$SF_N" -ge "$SURF_TRIES" ]; then
-      park "check-carry answered 'red-surface' for head=$HEAD on $SF_N consecutive cycle(s) (cap $SURF_TRIES): the head's CHECK SURFACE IS RED and every red group is this PR's own (the producer named them in the check-carry stderr in this log; a base-owned red answers 'red-base-owned' instead). Nothing was paid for and nothing was merged — a red build is not a review finding. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$SF_F'"
+      park "check-carry answered 'red-surface' for head=$HEAD on $SF_N consecutive cycle(s) (cap $SURF_TRIES): the head's CHECK SURFACE IS RED and every red group is this PR's own (the producer named them in the check-carry stderr in this log; a base-owned red answers 'red-base-owned' instead). Nothing was paid for and nothing was merged — a red build is not a review finding. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$SF_F'"
       echo "[merge $PR] ABORT: the check surface is RED at head=$HEAD ($SF_N/$SURF_TRIES) — parked so the failure surfaces instead of re-looping" >> "$L.log"
       exit 3
     fi
@@ -1957,7 +1960,7 @@ if _rr_ceiling_hit "$_rr_now" "$_rr_max"; then
   # Exit 3 = refused BEFORE the paid step with the cause left in `parkreason-<PR>`, which is the code
   # `chain-<N>` propagates and `lane-merge.sh` already reads as BLOCKED (not 75, whose readers report a
   # capacity refusal and would tell an operator to wait for a quieter box).
-  park "REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — the per-PR review-round budget is SPENT, so NO further review is bought at this head. This is an ESCALATION EVENT, never a pass, and it is NOT a capacity refusal: nothing was spent here and waiting will not clear it. A push does NOT re-arm this book (it is cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it. ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which BOTH readers coerce to the 9-digit ceiling on purpose. To re-arm deliberately: rm -rf '$O/state/reviewround-$PR' '$O/state/parked-$PR' '$O/state/parkreason-$PR' (rm -rf, not rm -f: a DIRECTORY at the counter survives rm -f, which is how this state used to have no exit)"
+  park "REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — the per-PR review-round budget is SPENT, so NO further review is bought at this head. This is an ESCALATION EVENT, never a pass, and it is NOT a capacity refusal: nothing was spent here and waiting will not clear it. A push does NOT re-arm this book (it is cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it. ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which BOTH readers coerce to the 9-digit ceiling on purpose. To re-arm deliberately: rm -rf '$O/state/reviewround-$PR' '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' (rm -rf, not rm -f: a DIRECTORY at the counter survives rm -f, which is how this state used to have no exit)"
   echo "[merge $PR] REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — refusing to buy review round $(( _rr_now + 1 )); no reviewer started and NO round was spent (direct ingress, not the controller's dispatch arm)" >> "$L.log"
   exit 3
 fi
@@ -2321,12 +2324,12 @@ review_abandoned_record() {
   is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
   if [ "${mode:-}" = "unwritable" ]; then
     echo "[merge $PR] $why, but $(rev_budget_file) CANNOT BE WRITTEN — the (PR,head) review cap cannot be kept, so this head is PARKED rather than re-reviewed (a counter that cannot be written is not a bound)" >> "$L.log"
-    park "$why. state/reviewdisp-$PR could not be written, so MAX_REVIEW_TRIES cannot bound this head: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    park "$why. state/reviewdisp-$PR could not be written, so MAX_REVIEW_TRIES cannot bound this head: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
     return 0
   fi
   if [ "$n" -ge "$MAX_REVIEW_TRIES" ]; then
     echo "[merge $PR] NEEDS-REVIEW: $why — review attempts at head=$HEAD are EXHAUSTED ${n}/${MAX_REVIEW_TRIES}, PARKED" >> "$L.log"
-    park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewdisp-$PR'"
+    park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
     rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
     return 0
   fi
@@ -2398,7 +2401,7 @@ review_state_record() {
       is_limit "${rc_n:-}" || rc_n=0
       if [ "${_spmode:-}" = "unwritable" ]; then
         # A counter that cannot be written is not a bound. Say so and stop, rather than re-buy.
-        park "the reviewer produced NO usable verdict at head=$HEAD (last line was [${LAST:-<empty>}]), and $(rev_budget_file) CANNOT BE WRITTEN — MAX_REVIEW_TRIES cannot bound this head, so it is parked instead of re-reviewed. Make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        park "the reviewer produced NO usable verdict at head=$HEAD (last line was [${LAST:-<empty>}]), and $(rev_budget_file) CANNOT BE WRITTEN — MAX_REVIEW_TRIES cannot bound this head, so it is parked instead of re-reviewed. Make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD and the (PR,head) review budget CANNOT BE WRITTEN — PARKED (an unwritable counter is not a bound)" >> "$L.log"
         rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         return 0
@@ -2419,7 +2422,7 @@ review_state_record() {
         # ANY arm — never this file's private tally sitting beside an untouched controller budget.
         # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
         # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
-        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
         return 0
       fi
@@ -2492,7 +2495,7 @@ case "$LAST" in
       # The reviewer said CLEAN but named no comment, so there is no artifact to sign — the gate can
       # NEVER go green at this head. Park it: the pre-fix bare `exit 2` left no marker, so the loop
       # re-paid for a fresh review every cycle (#1717).
-      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id> --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id> --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
       echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
     fi
     # ── 2) record the review (writes the signed marker into the PR body) ──
@@ -2547,14 +2550,14 @@ case "$LAST" in
       fi
       if [ $rc -eq 3 ] && grep -qF -- "$PIN_UNCHECKABLE_LIT" "$REC_OUT" 2>/dev/null; then
         rec_out_cleanup
-        park "record-review.sh could NOT CHECK the --expect-head pin at head=$HEAD (rc=3) — the recorder could not READ the PR's live head, i.e. a gh/API TRANSPORT failure (secondary rate limit, 5xx, expired token), NOT a moved head and NOT a reason to re-review: the review this lane paid for is still the artifact for $HEAD. NOTHING was recorded. Re-run the RECORD once gh is healthy (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD — idempotent at this head), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        park "record-review.sh could NOT CHECK the --expect-head pin at head=$HEAD (rc=3) — the recorder could not READ the PR's live head, i.e. a gh/API TRANSPORT failure (secondary rate limit, 5xx, expired token), NOT a moved head and NOT a reason to re-review: the review this lane paid for is still the artifact for $HEAD. NOTHING was recorded. Re-run the RECORD once gh is healthy (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD — idempotent at this head), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         echo "[merge $PR] ABORT: pin unverifiable (gh/API) — record retry owed, no re-review" >> "$L.log"; exit 3
       fi
       rec_out_cleanup
       # No signed marker exists, so the gate cannot pass and the PR cannot merge. The pre-fix
       # `exit 3` left no marker at ALL, so the next cycle saw an unmarked FAILED:ai-review-gate and
       # spawned another fresh (paid) review — forever (#1717). Park, and name the failing rc.
-      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
       echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
     fi
     # the recorder's output is already in `$L.log`; the temp file is only here so THIS call's
@@ -2678,12 +2681,12 @@ case "$LAST" in
     # identically. `parkreason-<PR>` is the only remedy a human sees in-band.
     if [ -z "$MARK_KEY" ]; then
       marker_why="NO AI_REVIEW_GATE_KEY is available here (env or \$HOME/.pi/agent/.ai-review-gate-key), so no marker on this PR body can be verified — and the recorder on this box could not have signed one either, because an unsigned marker is one ai-review-gate rejects"
-      marker_how="Provision the key for the WORKER's environment (a cell sources keys.env with 'set -a', so check it survives into the tmux environment the worker runs in), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      marker_how="Provision the key for the WORKER's environment (a cell sources keys.env with 'set -a', so check it survives into the tmux environment the worker runs in), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
     elif ! command -v openssl >/dev/null 2>&1; then
       # The recorder signs with the same `command openssl`, so on this box the marker is unsigned
       # (or was signed on ANOTHER box); either way THIS box cannot verify it.
       marker_why="openssl IS NOT INSTALLED on this box, so the recorder here could not have signed a marker and no marker on this PR body can be verified"
-      marker_how="Install openssl (a hard dependency of this path — the recorder signs with it and this worker verifies with it), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      marker_how="Install openssl (a hard dependency of this path — the recorder signs with it and this worker verifies with it), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
     elif [ -z "$MARK_CAND" ]; then
       # ⛔ THIS ARM HAS **TWO** CAUSES AND ONLY ONE OF THEM IS SERVED BY A HAND RE-RECORD (P3, fresh
       # review of PR #2988). `marker_why` names `$LIVE_HEAD` — the head the GATE reads — but the
@@ -2713,20 +2716,20 @@ case "$LAST" in
         # a park whose reason names a call that was never made, or names the wrong one.
         if [ "${CC_OWED:-0}" = "1" ]; then
           marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED while this run was deciding whether a review was owed (the carried record covers head=$HEAD, which is no longer the PR head)"
-          marker_how="no review was ordered this cycle, so nothing was paid and there is no fresh verdict to record. A moved head over an UNCHANGED artifact is a CARRY, not a re-review: re-run the merge for this PR and the block's own check-carry/re-record arm re-binds the record at the new live head at no cost — and if the artifact genuinely changed with the head, that same arm answers 'fresh' and a review is ordered THEN, on evidence rather than on a guess. Do not record this by hand at head=$LIVE_HEAD: that would attest a revision no review has read. Then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+          marker_how="no review was ordered this cycle, so nothing was paid and there is no fresh verdict to record. A moved head over an UNCHANGED artifact is a CARRY, not a re-review: re-run the merge for this PR and the block's own check-carry/re-record arm re-binds the record at the new live head at no cost — and if the artifact genuinely changed with the head, that same arm answers 'fresh' and a review is ordered THEN, on evidence rather than on a guess. Do not record this by hand at head=$LIVE_HEAD: that would attest a revision no review has read. Then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         else
           marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED after this run's mint: the record was minted for head=$HEAD, which is no longer the PR head"
-          marker_how="the record this lane paid for is for head=$HEAD and can never satisfy a gate that reads head=$LIVE_HEAD. Re-recording it by hand CANNOT work: the --expect-head pin refuses it (record-review.sh: 'the PR head is $LIVE_HEAD, NOT the $HEAD you named'), and minting at head=$LIVE_HEAD instead would attest a revision no review has read. So a FRESH review at head=$LIVE_HEAD is owed, not a carry — run the merge again for this PR once head=$LIVE_HEAD is the tree to land, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+          marker_how="the record this lane paid for is for head=$HEAD and can never satisfy a gate that reads head=$LIVE_HEAD. Re-recording it by hand CANNOT work: the --expect-head pin refuses it (record-review.sh: 'the PR head is $LIVE_HEAD, NOT the $HEAD you named'), and minting at head=$LIVE_HEAD instead would attest a revision no review has read. So a FRESH review at head=$LIVE_HEAD is owed, not a carry — run the merge again for this PR once head=$LIVE_HEAD is the tree to land, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         fi
       else
         marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
-        marker_how="$RECORD_RECIPE, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        marker_how="$RECORD_RECIPE, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
       fi
     elif printf '%s\n' "$MARK_CAND" | verify_any_marker "$MARK_KEY"; then
       marker_ok=1
     else
       marker_why="NO marker for head=$LIVE_HEAD in the PR body VERIFIES against its signature — the PR body is not a trust boundary, so a forged, re-keyed or unsigned line is NOT evidence (#784)"
-      marker_how="$RERECORD_RECIPE, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      marker_how="$RERECORD_RECIPE, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
     fi
     if [ "$marker_ok" -ne 1 ]; then
       # ⛔ THE LEAD CLAUSE NAMES THE PATH, because the two paths fail here for different reasons and

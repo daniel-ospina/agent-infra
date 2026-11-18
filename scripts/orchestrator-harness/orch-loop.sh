@@ -4287,7 +4287,11 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…> — returns non-zero when the 
   # guard has to fail closed on, and the marker is only trustworthy when it was written with the
   # reason it describes. A partial write therefore does not land the park at all, which is what this
   # function's return contract already promises its callers.
-  printf '%s\n' 'harness' > "$O/state/parkorigin-$1" \
+  # ⛔ AND IT NAMES THE HEAD IT DESCRIBES (fresh-context review, P2, #4126 round 7): `<head> harness`.
+  # The guard trusts a stamp only when that head is the row's head, so a stamp can never outlive its
+  # own park and outrank a later hand-written one. Written in ONE `printf`, not two, so the two
+  # fields cannot disagree. The human counterpart is `scripts/orchestrator-harness/park-human.sh`.
+  printf '%s %s\n' "$2" 'harness' > "$O/state/parkorigin-$1" \
     && printf '%s\n' "$3" > "$O/state/parkreason-$1" \
     && printf '%s\n' "$2" > "$O/state/parked-$1"
 }
@@ -6698,6 +6702,13 @@ while true; do
     # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
+      # ⛔ THE PARK'S AUTHOR DIES WITH THE PR TOO (fresh-context review, P2, #4126 round 7). The
+      # attribution was in NO sweep family and no park remedy removed it, so it was append-only for
+      # the PR's life and after it — a stale `harness` beside a later hand-written park is exactly
+      # the inversion the marker exists to prevent. Only the MARKER is swept here, not the
+      # `parked-<PR>`/`parkreason-<PR>` pair it accompanies: the sweep's contract for that pair is
+      # unchanged by this round, and widening it is a separate change with its own readers.
+      rm -f "$O/state/parkorigin-$PR" 2>/dev/null || true
       rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
@@ -7029,7 +7040,7 @@ while true; do
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
               echo "#$PR RED TREE and $RF_FN_NOW fixer attempt(s) spent on this PR in total (MAX_FIX_TRIES=${MAX_FIX_TRIES:-3}, across heads) — PARKED, needs a human (fix-$PR). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             fi
-            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_FN_NOW fixer attempt(s) have been spent on this PR in total (MAX_FIX_TRIES=${MAX_FIX_TRIES:-3}, across heads) — a further fixer push would be the same repair again. REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/fixcount-$PR'"
+            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_FN_NOW fixer attempt(s) have been spent on this PR in total (MAX_FIX_TRIES=${MAX_FIX_TRIES:-3}, across heads) — a further fixer push would be the same repair again. REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/fixcount-$PR'"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: $RF_FN_NOW fixer attempt(s) spent in total (MAX_FIX_TRIES) and the tree is still red"
           elif [ "${RF_SURF:-}" != "RED" ]; then
             # NO MEASUREMENT, NO LANE — and the test is `!= RED`, not `= UNKNOWN` (review P2, cycle 3).
@@ -7051,7 +7062,7 @@ while true; do
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
               echo "#$PR RED TREE after $RF_N red-fixer attempt(s) at head=$HEAD_N — PARKED, needs a human (fix-$PR, MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             fi
-            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
+            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: the rail still refuses a RED TREE after $RF_N fixer attempt(s) at this head"
           elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then
             # (2) EXACTLY ONE LIVE FIXER PER PR. The key is the PR number in the session/lock name, so a
@@ -7178,23 +7189,48 @@ while true; do
     # #4120 was filed to remove. A negative test over free prose cannot be kept in sync across three
     # writers, so the author is now a FACT each writer stamps: `parkorigin-<PR>` = `harness` for a
     # machine park, `human` for a hand-written one.
+    # ⛔ THE MARKER IS KEYED TO THE HEAD IT DESCRIBES (fresh-context review, P2, #4126 — round 7).
+    # Stamping the author alone left the marker PER-PR while the park it describes is PER-HEAD, so a
+    # `harness` stamp outlived its own park and outranked a LATER HAND-WRITTEN one — the guard's
+    # "a human decision stands" invariant inverted for exactly the population it meets. The write is
+    # now `<head> <author>` and is trusted only when that head IS the row's head. Anything else is a
+    # stale stamp, which is read by the prose list below (and fails closed there), never by the marker.
+    # ⛔ AND THE MARKER HAS A HUMAN PRODUCER (same finding): a hand-written park used to have to be
+    # written by `printf` into the state dir, which stamped NO author — so the `human` arm below had no
+    # writer anywhere in the repo and a hand-written park agreed with the marker only by accident.
+    # `scripts/orchestrator-harness/park-human.sh <PR> <reason…>` writes all three files, this one
+    # included, at the LIVE head. Both directions are therefore reachable: a machine park stamps
+    # `harness`, a deliberate freeze stamps `human`, and an operator who types the files by hand gets
+    # the fail-closed prose path (a stale `harness` for THIS head is the one residual, and the recipe
+    # this file prints names `park-human.sh`, not `printf`).
     # ⛔ NO MARKER IS NOT FREEDOM — it fails CLOSED (a human decision stands), with ONE exception that
     # is a migration path, not a rule: a park written before this marker existed (an upgrading box)
     # carries no author, and its prose is all there is. Falling through to "human" there would strand
     # every head those parks hold — reintroducing the exact inertness this fix removes, once, at
     # upgrade time. So the pre-marker wordings stay recognised, now including every `merge-one.sh`
     # form, and the branch self-retires: the next park at that PR is stamped and never consults it.
+    # A bare one-field marker (`harness`, the round-6 shape, or `human`) parses as a head that is not
+    # this row's, so it lands on that same migration path — deliberately: it is a stamp WITH an age we
+    # cannot see, and the prose list recognises every machine wording it could accompany.
     _pk_head=""; _pk_why=""; _pk_origin=""; _pk_rebase_settles=0
     # ⛔ THE READS ARE `-f`-GUARDED (review note 2, #4126): this runs for EVERY PR on EVERY cycle, and
     # the loop budgets forks per PR per cycle as a dispatch gate (#2293). An unguarded `$(cat)` costs
-    # a double fork per file per PR to read a file that usually does not exist.
+    # a double fork per file per PR to read a file that usually does not exist. The marker is read with
+    # ONE `read` builtin for the same reason — it is now two fields, and parsing them must not cost a
+    # second fork.
     [ -f "$O/state/parked-$PR" ] && _pk_head="$(cat "$O/state/parked-$PR" 2>/dev/null)"
     if [ -n "${HEAD_N:-}" ] && [ "$_pk_head" = "$HEAD_N" ]; then
       [ -f "$O/state/parkreason-$PR" ] && _pk_why="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
-      [ -f "$O/state/parkorigin-$PR" ] && _pk_origin="$(cat "$O/state/parkorigin-$PR" 2>/dev/null)"
+      if [ -f "$O/state/parkorigin-$PR" ]; then
+        # <head> <author>, and NOTHING else: a third field is corruption, so the marker is ignored
+        # (fail closed through the prose list) rather than half-read.
+        _pk_orghead=""; _pk_orgauthor=""; _pk_orgextra=""
+        { read -r _pk_orghead _pk_orgauthor _pk_orgextra < "$O/state/parkorigin-$PR"; } 2>/dev/null || true
+        [ "${_pk_orghead:-}" = "$HEAD_N" ] && [ -z "${_pk_orgextra:-}" ] && _pk_origin="${_pk_orgauthor:-}"
+      fi
       case "$_pk_origin" in
-        harness) _pk_rebase_settles=1 ;;   # a machine park: the rebase router's own cap bounds it
-        human) _pk_rebase_settles=0 ;;     # a POSITIVE human marker: it outranks the prose, by design
+        harness) _pk_rebase_settles=1 ;;   # a machine park at THIS head: the router's own cap bounds it
+        human) _pk_rebase_settles=0 ;;     # a POSITIVE human marker (park-human.sh): it outranks the prose, by design
         *)                                  # a park written before the marker existed (the upgrade path)
           case "$_pk_why" in
             '') _pk_rebase_settles=1 ;;   # the rail's own park writes no reason at all
@@ -7396,7 +7432,7 @@ while true; do
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
               echo "#$PR PARKED (still CONFLICTING after $NFC rebases)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases in total (MAX_FIX_TRIES=$MAX_FIX_TRIES, counted across heads: conflictcount-$PR is NOT head-keyed, so a PUSH does not re-arm it) — a human must decide, or re-arm the rebase budget explicitly: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/conflictcount-$PR'"
+            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases in total (MAX_FIX_TRIES=$MAX_FIX_TRIES, counted across heads: conflictcount-$PR is NOT head-keyed, so a PUSH does not re-arm it) — a human must decide, or re-arm the rebase budget explicitly: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/conflictcount-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC rebases — needs a human"
           elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it
@@ -7679,7 +7715,7 @@ while true; do
               stg_lvl_start l3_fix || :
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
-              park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+              park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "parked: still needs fixes after $NF attempts — needs a human"
             # ⛔ A HEAD WITH FINDINGS NEVER REACHES THE REVIEW KEY (review round 5 of #2653, P1). The
@@ -7726,7 +7762,7 @@ while true; do
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-AT-HEAD-UNBOUNDED: the escalation counter is unwritable — a human must look at this head"
               elif [ "$_ahn" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
                 echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human. The remedy is a RE-RECORD, not a review, and it is one command: record-review.sh $PR ${HEAD_N:-?} clean $OR --evidence comment:<the id of that review comment> --expect-head ${HEAD_N:-?} — ⛔ THE PIN IS PART OF THE REMEDY (#2572, fresh review of PR #2988): this arm fires only when the record IS at this exact head, so the pin is statable and verifies, and WITHOUT it the #2982 carry arm of the recorder may re-bind that verdict to a live head nobody reviewed — the same defect #2572 closes at the two fresh-mint sites, reachable here through the one printed command an operator would run. The gate re-triggers on 'edited'. ⛔ AND THEN LIFT THIS PARK: the park is honoured BEFORE the acting case and the automatic lift only matches RED TREE / rail refusals, so a re-record on its own changes nothing — rm -f $O/state/parked-$PR $O/state/parkreason-$PR $O/state/reviewathead-$PR. ⛔ NO BACKTICKS AND NO APOSTROPHES IN THIS LINE: it is a double-quoted string, so a backticked command is SUBSTITUTED (the command the operator is told to run would be deleted from the log and its output spliced in) — measured on PR #2664 review round 2." >>"$LOG"
-                if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-AT-HEAD-STUCK: a CLEAN review is already recorded at head=${HEAD_N:-?} and the ai-review-gate never went green over it after ${_ahn} cycle(s). No review is dispatched (a second review of an unchanged head is waste) and the controller has no re-record actuator — a human must re-record the existing evidence or re-run the gate. A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewathead-$PR'"; then
+                if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-AT-HEAD-STUCK: a CLEAN review is already recorded at head=${HEAD_N:-?} and the ai-review-gate never went green over it after ${_ahn} cycle(s). No review is dispatched (a second review of an unchanged head is waste) and the controller has no re-record actuator — a human must re-record the existing evidence or re-run the gate. A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewathead-$PR'"; then
                   disp "$PR" "${HEAD_N:-}" "$V" wait "parked: REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} — recorded review, red gate, needs a human"
                 else
                   echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — the escalation bound is spent, but the PARK DID NOT LAND (state/parked-$PR is unwritable), so this state is NOT bounded and will re-enter this arm every cycle. REFUSAL: nothing dispatched. REPAIR: make $O/state writable (rm -rf a stray directory named parked-$PR), then re-record the existing evidence" >>"$LOG"
@@ -7748,7 +7784,7 @@ while true; do
               # ⛔ A PARK THAT DID NOT LAND MUST NOT BE REPORTED AS ONE (review round 4 of #2653, P2):
               # the park IS the terminator here, so an unwritable `parked-<PR>` means the PR re-enters
               # this arm every cycle while the log says PARKED — an inert bound with a green face.
-              if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewdisp-$PR'"; then
+              if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"; then
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, PARKED (an unfixable head must not loop; a push re-arms it)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at this head — needs a human (bounded, never a silent stop)"
               else
@@ -7783,7 +7819,7 @@ while true; do
               _rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
               # ⛔ THREE PLACES, so the diagnosis survives log-quiet (#943): the log, the ledger row
               # below, and the park reason file. A single `echo` is what #3331 measured being lost.
-              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
                 echo "#$_rcl — review-round budget EXHAUSTED, PARKED (the next review is refused; a runaway guard, never a pass)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "parked: $_rcl — review budget exhausted, needs a human (bounded, never a silent stop)"
               else
@@ -7838,12 +7874,12 @@ while true; do
                 # #2653, P2): the counter IS the bound, so an unwritable one would re-buy a paid review
                 # every cycle. Named, and the head is parked so the loop stops rather than spending again.
                 if ! review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"; then
-                  echo "#$PR review order review-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
+                  echo "#$PR review order review-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'" >>"$LOG"
                   # ⛔ AND THE PARK IS CHECKED TOO (review round 5 of #2653, P2): if the park did not
                   # land, the PR is NOT bound — it re-enters this arm and buys another paid review every
                   # cycle. Claiming PARKED over an unwritten `parked-<PR>` is the same inert-bound
                   # failure the sibling branches (CAP, AT-HEAD-STUCK) already refuse.
-                  if park_ctrl "$PR" "${HEAD_N:-}" "the review budget record state/reviewdisp-$PR cannot be written, so MAX_REVIEW_TRIES cannot bound this head — refusing further dispatch (a review was spent this cycle). Make $O/state writable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; then
+                  if park_ctrl "$PR" "${HEAD_N:-}" "the review budget record state/reviewdisp-$PR cannot be written, so MAX_REVIEW_TRIES cannot bound this head — refusing further dispatch (a review was spent this cycle). Make $O/state writable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"; then
                     # ONE row, and it is a WAIT: a second `disp` for the same PR would count one PR twice.
                     disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE — parked so the cap cannot be outrun"
                   else
@@ -7909,7 +7945,7 @@ while true; do
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
               echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+            park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
             disp "$PR" "${HEAD_N:-}" "$V" wait "parked: CI still red after $NFC2 fixes — needs a human"
           elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already on it

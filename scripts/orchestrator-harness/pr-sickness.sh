@@ -1099,13 +1099,13 @@ ps_review_decide() {
       # writer of `parkreason-<PR>`; the controller's parked-guard decides whether a rebase may overrule a
       # park on a `CONFLICTING` head, and it must not have to guess from prose. `harness` says: a machine
       # wrote this, and a rebase is allowed to proceed (the router's own `MAX_FIX_TRIES` bounds it).
-      printf '%s\n' 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
+      printf '%s %s\n' "$sha" 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
       # ⛔ THE REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
       # the bound is `psick-<PR>-<sha12>` (`ps_gates` reads it, `ps_review_cap_hit` compares it). A remedy
       # that removed only the park pair left the counter, so the very next pass re-parked with the same
       # reason — an escape that does not escape, printed to the only operator who reads this file.
-      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide. This budget is keyed on the TREE, so a push re-arms it; to re-arm deliberately: rm -f '$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
+      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide. This budget is keyed on the TREE, so a push re-arms it; to re-arm deliberately: rm -f '$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr' '$(ps_state_dir)/parkorigin-$pr'" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
     else
       # NOT PARKED ON PURPOSE: the bound is still true, so the next pass re-reads it and retries the
@@ -1134,12 +1134,12 @@ ps_review_decide() {
     # `ps_gates`, so a failed POST must not be recorded as a park that loses the escalation for ever.
     if ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**No fixer was dispatched for this head.** The review-round book was already spent when the verdict arrived, so a fix would buy a head whose review the same ceiling refuses — nothing was spent and nothing ran." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand."; then
       # see the note on the first escalation: the author is a marker, not a wording.
-      printf '%s\n' 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
+      printf '%s %s\n' "$sha" 'harness' > "$(ps_state_dir)/parkorigin-$pr" 2>/dev/null || true
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
       # ⛔ THE REMEDY IS `merge-one.sh`'s OWN ([rrceiling]), NOT "a push": the book is CUMULATIVE across
       # heads, so a push produces a head whose review the same ceiling refuses — the operator would push
       # and be exactly as stuck, with this parkreason telling them it was the remedy.
-      printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide. This book is CUMULATIVE across heads, so a PUSH DOES NOT RE-ARM IT (only a CLEAN verdict or the PR leaving the queue clears it). To re-arm deliberately: rm -rf '$(ps_state_dir)/reviewround-$pr' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr', or raise MAX_REVIEW" \
+      printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide. This book is CUMULATIVE across heads, so a PUSH DOES NOT RE-ARM IT (only a CLEAN verdict or the PR leaving the queue clears it). To re-arm deliberately: rm -rf '$(ps_state_dir)/reviewround-$pr' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr' '$(ps_state_dir)/parkorigin-$pr', or raise MAX_REVIEW" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
     else
       printf 'skip #%s: the escalation could NOT be posted (see above) — the head is NOT parked, so a later pass retries it\n' "$pr"
