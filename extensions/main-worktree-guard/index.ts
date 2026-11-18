@@ -2188,7 +2188,14 @@ function _resolveThroughDanglingLinks(p: string): string | null {
  *  literal: this process cannot know another user's home, and a literal `~user`
  *  directory is what the shell writes when no such user exists. */
 function _writeLandingSpelling(cwd: string, raw: string): string {
-  const withHome = raw === "~" ? homedir() : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
+  // ⛔ SCONCAT, NOT `join`: `join` normalises, so `~/a/../b` would lose the `..`
+  // lexically and reintroduce the very defect this function exists to avoid,
+  // one segment further in.
+  const withHome = raw === "~"
+    ? homedir()
+    : raw.startsWith("~/")
+      ? `${homedir().replace(/\/+$/, "")}/${raw.slice(2)}`
+      : raw;
   if (isAbsolute(withHome)) return withHome;
   return `${cwd.replace(/\/+$/, "")}/${withHome}`;
 }
