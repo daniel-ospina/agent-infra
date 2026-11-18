@@ -6697,13 +6697,15 @@ def run_pass(args, rubric_note: str = "") -> int:
             if _rub:
                 parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
                              % _rub)
-            if _no_ck and dispatched:
-                # Named on a DELIVERED pass too, by the `_claim_unread` block's own convention: the
-                # stall counters print only when nothing went out, so without this a count would
-                # appear nowhere on the one pass shape that could carry it.
-                parts.append("%d order(s) could not be placed: this pass was given NO CHECKOUT"
-                             " (no worktree could be materialised, the dispatch chain was NEVER"
-                             " INVOKED -- pass REPO=<checkout>)" % _no_ck)
+            # ⛔ NO `if _no_ck and dispatched:` BLOCK HERE, AND THE CONVENTION IS NOT COPIED
+            # (harness review of #4134, F3). The `_claim_unread` block below is reachable -- an
+            # unreadable registry can cost ONE PR while another dispatches -- but the no-checkout
+            # refusal cannot: `REPO_DIR` is a module global assigned only by `apply_repo()`, which
+            # runs in `main()`/`run_all_repos()` OUTSIDE `run_pass()`, so the guard at `dispatch()`
+            # is PASS-WIDE. `_no_ck > 0` therefore implies `dispatched == 0` (the one increment is
+            # under `if ok:`), and on a zero-dispatch pass the stall loop above already prints the
+            # counter. The block that used to sit here could never execute; a branch no input can
+            # reach is a comment pretending to be a guard (#3442 rule 3).
             if _claim_unread and dispatched:
                 # ⛔ NAMED ON A PASS THAT DELIVERED TOO, not only the zero-dispatch one: the stall
                 # loop above prints it ONLY when nothing went out, so on a pass that dispatched two

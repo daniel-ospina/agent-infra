@@ -1426,8 +1426,19 @@ def test_a_pass_with_NO_CHECKOUT_is_its_OWN_verdict_and_never_blames_the_dispatc
     ⛔ NAMING THE MUTANT. Remove the `no_checkout_refused(detail)` arm from `run_pass()`'s refusal
     chain and this row goes RED at `side["verdict"] == "NO-CHECKOUT"` (measured: `UNDELIVERED`, and
     the pass line carries `next=repair-chain`).
+
+    ⛔ AND THE PER-ORDER SENTENCE IS ASSERTED, NOT ONLY THE VERDICT LINE (harness review of #4134,
+    F1: a coverage gap, not a behaviour bug). Every assertion in the first version of this row was
+    satisfied by the VERDICT-line sentence, which independently carries `REPO=<checkout>` and
+    `NEVER INVOKED`; the `REFUSING: … given NO CHECKOUT` block in `_finish` could therefore be
+    DELETED with this row and the whole suite still green. That block IS this change's
+    operator-facing product -- on the measured launchd shape it is the only line that says "no
+    checkout" AT THE ORDER -- so the mutant that removes it must be red here: with the block gone,
+    the fallback prints `REFUSING: nothing was dispatched and 1 order(s) could not be placed`,
+    which neither assertion below accepts.
     """
-    rc, joined = _refused_pass(monkeypatch, pr.no_checkout_note(_pr(1, "a" * 40)))
+    written = []
+    rc, joined = _refused_pass(monkeypatch, pr.no_checkout_note(_pr(1, "a" * 40)), written=written)
     side = json.loads(pathlib.Path(pr.STATUS).read_text())
 
     # 1. THE REFUSAL IS PRESERVED (#3105): a pass that delivered nothing may not read clean.
@@ -1441,10 +1452,78 @@ def test_a_pass_with_NO_CHECKOUT_is_its_OWN_verdict_and_never_blames_the_dispatc
     # 4. THE SENTENCE NAMES THE INPUT TO SUPPLY, and says the chain was never invoked.
     assert "NEVER INVOKED" in joined, joined
     assert "REPO=<checkout>" in joined, joined
+    # 4b. THE PER-ORDER LINE, WHICH IS THE PRODUCT OF THIS PR (harness review F1): the cause is
+    #     named AT THE ORDER, not only in the verdict's prose. Deleting `_finish`'s no-checkout
+    #     `elif` prints the generic "nothing was dispatched and N could not be placed" instead.
+    assert ("REFUSING: 1 order(s) could not be placed because this pass was given NO CHECKOUT"
+            in joined), joined
+    assert "nothing was dispatched and 1 order(s) could not be placed" not in joined, joined
     # 5. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT.
     assert "next=supply-checkout" in side["reason"][:110], side["reason"]
-    # 6. Nothing was consumed: no cooldown row, no budget slot.
-    assert pr.load_state() == {}, pr.load_state()
+    # 6. NOTHING WAS CONSUMED -- PROVED ON THE WRITER (harness review of #4134, F2). The first
+    #    version asserted `pr.load_state() == {}` while `_refused_pass` stubs BOTH sides
+    #    (`load_state -> {}`, `save_state -> no-op`): a stub's constant compared to `{}`, which no
+    #    mutant of this diff could redden -- vacuous, and labelled as the proof of exactly the
+    #    property the no-checkout arm introduces. The rows captured here are what `run_pass`
+    #    actually handed the writer; a cooldown row written inside the no-checkout arm lands in
+    #    them and reddens this assertion.
+    assert written, "the pass must still persist its state for this proof to mean anything"
+    for st in written:
+        assert set(st) <= {"_updated"}, f"a no-checkout refusal must write NO row: {st!r}"
+
+
+def test_a_NO_CHECKOUT_refusal_ON_A_MIXED_pass_is_not_reported_as_a_transport_drop(monkeypatch):
+    """#4134 F1's related gap: the residue subtraction in `_transport` (:6561) is covered by NO row.
+
+    `_finish` computes the transport residue once, as `undeliv - carried - rubric - claim-unreadable
+    - no-checkout`, and TWO branches read it: the `unread and undeliv` sentence below and the
+    `_held` one. Every existing row is a NO-CHECKOUT-ONLY pass, so it matches the dedicated
+    `_no_ck` arm first and `_transport` is never read -- dropping `- _no_ck` from `_transport`
+    reddened nothing in the whole suite.
+
+    This row is the shape that reads it: ONE unreadable PR (a blind checks read, counted on the
+    `unread` axis and never dispatched) sharing the pass with ONE order refused for the missing
+    checkout. The residue is therefore 0 and the sentence must NOT claim a transport failure over
+    an order that never reached the transport -- which is exactly what #4009/#2291 are about.
+
+    ⛔ NAMING THE MUTANT. Drop `- _no_ck` from `_transport` (`pr-doctor.py:6561`) and this row goes
+    RED at `"no worker accepted" not in joined`: the residue becomes 1 and the pass asserts that a
+    worker refused an order the chain was never asked to carry.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", dict)
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    # PR #1's checks cannot be READ (`k is None` is the classifier's blind-read contract); PR #2 is
+    # real work that this pass cannot place because it holds no checkout.
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: ((None, "checks unreadable", []) if p["number"] == 1
+                                   else ("fix-ci", "why", [])))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry, *_rest: (False, pr.no_checkout_note(p), False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+
+    # The MIXED shape really did build -- otherwise this row proves nothing about `_transport`.
+    # ⛔ rc 2 IS THE MEASURED ANSWER HERE, not rc 3: a pass that ALSO held a blind PR is REFUSING
+    # (`next=restore-read`) by the pre-existing `unread` arm, and this change does not touch that
+    # precedence. The property under test is the SENTENCE, not the verdict.
+    assert rc == pr.EXIT_REFUSING == 2, joined
+    assert side["verdict"] == "REFUSING", side["reason"]
+    assert "1 PR(s) were UNREADABLE" in joined, joined
+    assert "no-checkout=1" in joined, joined
+    # ⛔ THE POINT: the no-checkout refusal is subtracted from the residue, so no transport claim.
+    assert "no worker accepted" not in joined, joined
+    assert "repair-chain" not in joined, joined
+    # …and the cause is named AT THE ORDER by `run_pass`, which is the operator-facing product.
+    assert "this pass was given NO CHECKOUT" in joined, joined
 
 
 def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_path):
@@ -4399,8 +4478,15 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     assert "REFUSING" not in joined, joined  # …but the pass is not a refusal
 
 
-def _refused_pass(monkeypatch, detail, logs=None):
-    """Drive ONE `main()` pass whose only order is refused with `detail` (the real shapes)."""
+def _refused_pass(monkeypatch, detail, logs=None, written=None):
+    """Drive ONE `main()` pass whose only order is refused with `detail` (the real shapes).
+
+    ⛔ PASS `written` WHEN THE ROW CLAIMS "NO COOLDOWN ROW WAS WRITTEN" (harness review of #4134,
+    F2). `save_state` is stubbed to a no-op by default so a row cannot touch disk, but that also
+    makes any `load_state() == {}` assertion VACUOUS: both the reader and the writer are replaced,
+    so nothing the code under test does can change the answer. A row that means to prove "nothing
+    was consumed" must capture what `run_pass()` actually handed the writer.
+    """
     logs = [] if logs is None else logs
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40)])
@@ -4408,7 +4494,12 @@ def _refused_pass(monkeypatch, detail, logs=None):
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "log", logs.append)
-    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    if written is None:
+        monkeypatch.setattr(pr, "save_state", lambda st: None)
+    else:
+        # A COPY per call: the real `save_state` mutates `st` (`_updated`), and one dict object
+        # appended twice would show only its FINAL contents.
+        monkeypatch.setattr(pr, "save_state", lambda st: written.append(dict(st)))
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (False, detail, False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -8777,7 +8868,9 @@ def test_a_rubric_refusal_is_its_OWN_verdict_and_never_blames_the_dispatch_chain
 
     Fails on the pre-#4009 tree: the same pass printed `VERDICT=UNDELIVERED next=repair-chain`.
     """
-    rc, joined = _refused_pass(monkeypatch, pr.rubric_refusal_note("no rubric declared for o/r"))
+    written = []
+    rc, joined = _refused_pass(monkeypatch, pr.rubric_refusal_note("no rubric declared for o/r"),
+                               written=written)
     side = json.loads(pathlib.Path(pr.STATUS).read_text())
 
     # 1. THE REFUSAL IS PRESERVED (#3105). Not 0, not "nothing to do".
@@ -8794,8 +8887,12 @@ def test_a_rubric_refusal_is_its_OWN_verdict_and_never_blames_the_dispatch_chain
     # 4. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT (`objective.py::pr_doctor_last_run`).
     assert "next=supply-rubric" in side["reason"][:110], side["reason"]
     # 5. No cooldown, no budget slot: a rubric refusal consumed nothing, so a row here would hold a
-    #    real 45-minute cooldown for work that never ran.
-    assert pr.load_state() == {}, pr.load_state()
+    #    real 45-minute cooldown for work that never ran. ⛔ PROVED ON THE WRITER, NOT ON A STUBBED
+    #    READER (the vacuity the harness review of #4134 found in the no-checkout row, which copied
+    #    THIS shape): `written` is what `run_pass()` actually handed `save_state`.
+    assert written, "the pass must still persist its state for this proof to mean anything"
+    for st in written:
+        assert set(st) <= {"_updated"}, f"a rubric refusal must write NO row: {st!r}"
 
 
 def test_a_broken_chain_is_NAMED_BY_RESOLVED_PATH_and_never_left_to_the_reader(monkeypatch, tmp_path):
