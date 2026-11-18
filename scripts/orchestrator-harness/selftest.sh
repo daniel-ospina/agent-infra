@@ -6386,6 +6386,26 @@ if [ -f "$CSS" ]; then
   bash "$CSS" --o "$CSD/execmissing" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a deployed copy missing an EXECUTED file exited $rc"; }
   ck "check-single-source: the EXECUTED presence arm refuses a copy missing one" $rc
+  # ⛔ `park-human.sh` IS PRESENCE-REQUIRED ON BOTH DEPLOY LISTS AND NOTHING OBSERVED IT (fresh-context
+  # review of #4126, P3). It is the ONLY producer of `parkorigin-<PR>` = `human`, so a `$O` without it
+  # silently loses the human arm and the parked-guard falls back to the prose path — the inertness the
+  # marker exists to remove. The arm above proves the MECHANISM by removing `merged-not-closed.sh`, which
+  # left dropping `park-human.sh` from EXECUTED completely green (the reviewer's mutation reddened
+  # nothing). Non-vacuity: the copy is byte-identical apart from that one name, and the row above shows an
+  # otherwise-identical copy PASSES.
+  rm -rf "$CSD/exec-ph"; mkdir -p "$CSD/exec-ph"
+  cp -a "$HERE"/. "$CSD/exec-ph"/; rm -f "$CSD/exec-ph/park-human.sh"
+  bash "$CSS" --o "$CSD/exec-ph" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 1 ]; then rc=0; else echo "      a deployed copy missing park-human.sh exited $rc (want 1) — the human producer of parkorigin can vanish with this gate still green"; rc=1; fi
+  ck "check-single-source: a copy missing park-human.sh is a DIVERGENCE (the human park producer is presence-required)" $rc
+  rm -rf "$CSD/exec-ph"
+  # …and the list `install.sh` COPIES from must carry it too: that loop is what puts the file on a box,
+  # so dropping the name there loses the same arm one step earlier and reds nothing otherwise. Pinned on
+  # the LOOP LINE, not a bare `grep park-human`, because the three prose mentions above that loop would
+  # satisfy a bare grep with the entry deleted.
+  grep -qE '^for f in .* park-human\.sh; do$' "$INST" && rc=0 \
+    || { rc=1; echo "      install.sh's deploy loop does not name park-human.sh — a fresh \$O is installed without the only 'human' park producer"; }
+  ck "install.sh's deploy loop carries park-human.sh (a \$O without it loses the only 'human' producer)" $rc
   env -u O bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --require-target with nothing to compare exited $rc"; }
   ck "check-single-source: --require-target with nothing to compare is UNKNOWN (rc 2)" $rc

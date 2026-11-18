@@ -751,6 +751,31 @@ out="$(run_pass)"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "the retry posts the escalation exactly once"
 eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "…and only THEN is the head parked"
 
+# (v4d) A PARTIAL PARK WRITE LANDS **NO** PARK (fresh-context review, P3, agent-infra#4126 round 9).
+# Both bounds used to write the three park files INDEPENDENTLY, with the author FIRST and the reason LAST
+# (`2>/dev/null || true` on each, and this file is `set -u` only), so a failed reason write left
+# `parkorigin-<head> harness` over whatever reason was ALREADY on disk — possibly a HUMAN's — plus a
+# `parked-<PR>` at this head. The controller's parked-guard then reads `harness` at this head and REBASES
+# A HEAD A HUMAN FROZE: the marker's one forbidden direction, reached through the very `state/` hazard
+# this file prints remedies for. Driven by making the reason path unwritable (a stray DIRECTORY at its
+# name). Non-vacuity: (v4)/(v5) drive the same calls with writable paths and the three files DO land, so
+# only the failure path can red these rows.
+for _bound in cap ceiling; do
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+  if [ "$_bound" = "cap" ]; then printf '2\n' > "$STATE/psick-77-$sha12r"; else printf '10\n' > "$STATE/reviewround-77"; fi
+  mkdir -p "$STATE/parkreason-77"          # the reason CANNOT be written; author+head still can
+  out="$(run_pass)"
+  [ -e "$STATE/parkorigin-77" ] \
+    && bad "($_bound) a failed reason write still stamped parkorigin-77=[$(cat "$STATE/parkorigin-77" 2>/dev/null)] — a surviving human reason would be attributed to the harness and its head rebased" \
+    || ok "($_bound) a park whose reason CANNOT be written lands NO author stamp (a half-park would outrank the reason it never wrote)"
+  [ -e "$STATE/parked-77" ] \
+    && bad "($_bound) a failed reason write still PARKED the head ($(cat "$STATE/parked-77" 2>/dev/null)) — the park is in force with a stale reason" \
+    || ok "($_bound) …and it does not park the head either (a park with no reason of its own is never landed)"
+  has "$out" "NO park was landed" "($_bound) and the skip line SAYS the park did not land, instead of implying it did"
+  has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" \
+    "($_bound) the PR-visible escalation is still posted — the park failed, the operator still hears about it"
+done
+
 # (v5) THE CEILING IS THE RECORDED ONE (`state/reviewround-<PR>`, agent-infra#3441), not an invented
 # bound: at the ceiling a fixer would push a head whose review is refused by that same ceiling, so no
 # fixer is spent — and it says so.

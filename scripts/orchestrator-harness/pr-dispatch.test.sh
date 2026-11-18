@@ -1180,6 +1180,37 @@ if [ -s "$TMP/parkfn.sh" ]; then
   [ "$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null)" = "abc1234 harness" ] \
     && ok "…and a head-less park does NOT rewrite the author (the surviving reason keeps its own)" \
     || bad "a head-less park rewrote the marker (marker=$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null || printf none)) — it can attribute a human's reason to the harness"
+  # ⛔ A PARTIAL WRITE MUST LAND *NO* PARK, NOT A HALF-PARK (fresh-context review, P3, agent-infra#4126
+  # round 9). The three writes used to be INDEPENDENT, with the author FIRST under `|| true`; `merge-one.sh`
+  # is `set -u` only, so a failed `parkreason` write did not abort — the author was stamped, `parked-<PR>`
+  # landed at this head, and the reason left on disk was the PREVIOUS one, possibly a human's. The guard
+  # then reads `harness` at this head and REBASES A HEAD A HUMAN FROZE: the marker's one forbidden
+  # direction, reached through the very failure the file already names (`state/` unwritable — driven here
+  # as a stray DIRECTORY at the reason's name, the same hazard the shipped remedies print).
+  # Non-vacuity: the rows above drive the SAME extracted body with the same HEAD and prove all three files
+  # ARE written when the paths are writable — so only the failure path can red this row.
+  rm -rf "$TMP/writerP"; mkdir -p "$TMP/writerP/state/parkreason-4242"
+  ( set -u; PR=4242; HEAD=abc1234; O="$TMP/writerP"; L="$TMP/writerP.log"; : > "$L.log"; . "$TMP/parkfn.sh"; park 'Review attempts at head=abc1234 are exhausted' ) >/dev/null 2>&1
+  { [ ! -e "$TMP/writerP/state/parkorigin-4242" ] && [ ! -e "$TMP/writerP/state/parked-4242" ]; } \
+    && ok "…and a park whose reason CANNOT be written lands NO attribution and NO park (a half-park would let 'harness' outrank the reason it never wrote)" \
+    || bad "a failed reason write still landed a half-park (parkorigin=[$(cat "$TMP/writerP/state/parkorigin-4242" 2>/dev/null)] parked=[$(cat "$TMP/writerP/state/parked-4242" 2>/dev/null)]) — the guard would rebase a head whose surviving reason may be a human's"
+  grep -q 'NOT-PARKED head=abc1234' "$TMP/writerP.log.log" 2>/dev/null \
+    && ok "…and it SAYS SO in the log (not 'PARKED' over a park that never landed)" \
+    || bad "a park that did not land was still logged as PARKED (log=$(tr '\n' ';' < "$TMP/writerP.log.log" 2>/dev/null)) — the audit trail contradicts the state dir"
+  # …and the STALE-REASON half: a reason already on disk (a human's) must not acquire THIS worker's stamp.
+  # A read-only file is the only way to make that write fail while a previous reason survives, so this row
+  # is inert where the uid can write a 0444 file (root) — the directory row above covers the invariant there.
+  rm -rf "$TMP/writerR"; mkdir -p "$TMP/writerR/state"
+  printf '%s\n' 'HUMAN DECISION: parked for a design call — do not rebase' > "$TMP/writerR/state/parkreason-4242"
+  if chmod 444 "$TMP/writerR/state/parkreason-4242" 2>/dev/null && [ ! -w "$TMP/writerR/state/parkreason-4242" ]; then
+    ( set -u; PR=4242; HEAD=abc1234; O="$TMP/writerR"; L="$TMP/writerR.log"; : > "$L.log"; . "$TMP/parkfn.sh"; park 'Review attempts at head=abc1234 are exhausted' ) >/dev/null 2>&1
+    [ "$(cat "$TMP/writerR/state/parkreason-4242" 2>/dev/null)" = 'HUMAN DECISION: parked for a design call — do not rebase' ] \
+      && [ ! -e "$TMP/writerR/state/parkorigin-4242" ] \
+      && ok "…and a SURVIVING human reason is never stamped 'harness' (the reported defect: the stamp outranked it)" \
+      || bad "a failed reason write stamped the harness over a surviving HUMAN reason (reason=[$(cat "$TMP/writerR/state/parkreason-4242" 2>/dev/null)] marker=[$(cat "$TMP/writerR/state/parkorigin-4242" 2>/dev/null)]) — the human's park becomes a machine park and is rebased"
+  else
+    echo "  (SKIP: cannot make the reason unwritable as $(id -un) — the stale-reason arm is inert on this host)"
+  fi
 fi
 t5_clear
 mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.end.$RANDOM" 2>/dev/null || true

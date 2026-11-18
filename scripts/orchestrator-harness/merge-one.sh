@@ -1322,6 +1322,7 @@ fi
 # reason is a state nobody can act on.
 park() { # park <reason…>
   local why="$*"
+  local landed=1
   # ⛔ THE REASON BELONGS TO THE HEAD THIS PARK IS KEYED TO. An EMPTY HEAD means the
   # unresolvable-head branch below (a transient `gh` blip) reached park() while an earlier park at a
   # real head is still in place: it writes no marker, and re-writing the reason there would replace
@@ -1330,7 +1331,7 @@ park() { # park <reason…>
   # would name the wrong cause. With no head there is no new park to describe, so the first reason
   # wins. A NON-EMPTY HEAD is a fresh park — a moved head re-arms the PR and the already-parked
   # guard cannot have fired for it — so its reason must REPLACE a stale one from an earlier head.
-  if [ -n "${HEAD:-}" ] || [ ! -s "$O/state/parked-$PR" ]; then
+  if [ -n "${HEAD:-}" ]; then
     # ⛔ THE PARK NAMES ITS AUTHOR (fresh-context review, P2, agent-infra#4126). The controller's
     # parked-guard has to answer ONE question about a `CONFLICTING` head — does a rebase settle this
     # park? — and it used to answer it by matching substrings of THIS prose, with a fail-closed
@@ -1343,11 +1344,32 @@ park() { # park <reason…>
     # attribute the SURVIVING reason — possibly a human's — to this worker. `<head> harness` (#4126
     # round 7): the guard trusts the stamp only for the head it names, and a park with no head has
     # nothing to name, so it writes no marker at all rather than a head-less one.
-    [ -n "${HEAD:-}" ] && printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
-    printf '%s\n' "$why" > "$O/state/parkreason-$PR"
+    # ⛔ REASON FIRST, AUTHOR SECOND, HEAD LAST — ONE CHAIN (fresh-context review, P3, agent-infra#4126
+    # round 9). The three writes used to be INDEPENDENT, with the author written FIRST under
+    # `2>/dev/null || true`: this file is `set -u` only (no `-e`), so a failed `parkreason` write (an
+    # unwritable or full `state/` — the hazard this file parks for BY NAME at its own
+    # `diffreadcount-`/`redsurfacecount-` arms) did not abort. Execution fell through, the author was
+    # stamped, `parked-<PR>` landed at THIS head — and the reason left behind was the PREVIOUS one,
+    # possibly a human's. The guard then reads `harness` at this head and rebases a head a human froze,
+    # i.e. the marker's one forbidden direction, reached through the very failure this file documents.
+    # Chaining enforces the invariant `park-human.sh` states for the same reason: a partial write lands
+    # NO park at all, which fails CLOSED (the controller re-spawns and this run retries) instead of
+    # attributing a surviving reason to this worker. `park_ctrl` in orch-loop.sh already chains.
+    if ! { printf '%s\n' "$why" > "$O/state/parkreason-$PR" 2>/dev/null \
+         && printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null \
+         && printf '%s\n' "$HEAD" > "$O/state/parked-$PR" 2>/dev/null; }; then
+      echo "[merge $PR] WARN: the park files could NOT be written in full at head=$HEAD ($O/state/parkreason-$PR, parkorigin-$PR, parked-$PR) — NO park was landed, so this head is not frozen and the next run retries it. Make $O/state writable (a stray DIRECTORY at one of those names is the usual cause); nothing was lost, and no author was stamped over a reason this run did not write" >> "$L.log"
+      landed=0
+    fi
+  elif [ ! -s "$O/state/parked-$PR" ]; then
+    # No head to key a park to AND no park in place: the reason alone is advisory (see above).
+    printf '%s\n' "$why" > "$O/state/parkreason-$PR" 2>/dev/null || true
   fi
-  [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
-  echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
+  if [ "$landed" = "1" ]; then
+    echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
+  else
+    echo "[merge $PR] NOT-PARKED head=${HEAD:-?} — $why" >> "$L.log"
+  fi
 }
 
 # ⛔ THE HEAD IS THE SAME CLASS OF PRE-REVIEW DEPENDENCY AS THE RECORDER (#1717). The `gh pr view`
