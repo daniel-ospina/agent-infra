@@ -685,6 +685,10 @@ out="$(run_pass)"
 has "$out" "skip #77: review-fix budget exhausted (2/2 fixer attempts at head=$sha12r)" "the third pass hits the cap and NAMES it"
 eq "$(spawns)" "2" "and nothing is spawned past the cap"
 eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is PARKED (the harness's own 'needs a human' state)"
+# ⛔ AND THE PARK NAMES ITS AUTHOR, WITH THE HEAD (agent-infra#4120 review, P3): this file is one of
+# the three writers the controller's parked-guard reads, and a stamp that does not name its head is
+# PR-LIFETIME — it would still be read at a LATER head and attribute a human's park to the machine.
+eq "$(cat "$STATE/parkorigin-77" 2>/dev/null)" "$sha_red harness" "…and it stamps its author as '<head> harness' (the guard trusts it only at that head)"
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "still unfixed after 2 fixer attempt(s)" "the park reason says what happened, in the operator's words"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "exactly ONE escalation comment was posted on the PR"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" "…tagged by head, so a repeat pass cannot duplicate it"

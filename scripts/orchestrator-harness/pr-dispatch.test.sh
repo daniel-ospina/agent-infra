@@ -496,9 +496,12 @@ PY
     done
   ) >/dev/null 2>&1
 }
-# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>]
+# ── drive_route <V> <mergeable> [<conflictcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>]
 # `<parkorigin>` is `harness` (the default — what every machine park now stamps), `human`, or `none` for
-# NO marker file at all (a park written before the marker existed: the upgrade path).
+# NO marker file at all (a park written before the marker existed: the upgrade path). The stamp is written
+# as `<parkhead> <origin>`, because the shipped guard trusts an author ONLY at the head it names;
+# `PARK_STAMP_HEAD` overrides the head the stamp carries (a stamp left at an EARLIER head — the state
+# every park that skipped the lift recipe leaves behind).
 # THE CONTROLLER'S OWN ORDER, DRIVEN AS ONE LOOP (agent-infra#4120). The swept row runs the
 # `[conflict-case]` block and then the `[acting-case]` block inside the same `while read`, and the
 # conflict block ends in `continue` — so "did the acting case run for this PR" is a fact of the
@@ -581,13 +584,14 @@ PY
       # park the measured population actually inherited.
       printf '%s\n' "${7:-REVIEW-CAP: 3/3 review re-records at head=$6 — the reviewer never produced a usable verdict}" > "$O/state/parkreason-$PR"
       # ⛔ THE AUTHOR IS SEEDED TOO (fresh-context review, P2, #4126). Every machine park stamps
-      # `parkorigin-<PR>` = `harness`; `human` is a hand-written park, and `none` is a park written
-      # BEFORE the marker existed — the upgrade path the legacy prose allow-list still serves. A drive
-      # that seeded only `parked`/`parkreason` would grade the migration arm on every row and would not
-      # notice the marker being ignored.
+      # `parkorigin-<PR>` with `<head> harness`; `human` is a hand-written park, and `none` is a park
+      # written BEFORE the marker existed — the upgrade path the legacy prose allow-list still serves. A
+      # drive that seeded only `parked`/`parkreason` would grade the migration arm on every row and would
+      # not notice the marker being ignored, and it would also hide the head key: `PARK_STAMP_HEAD` lets
+      # a row stamp a head OTHER than the parked one, which is what every skipped lift recipe produces.
       case "${8:-harness}" in
         none) : ;;
-        *) printf '%s\n' "${8:-harness}" > "$O/state/parkorigin-$PR" ;;
+        *) printf '%s %s\n' "${PARK_STAMP_HEAD:-$6}" "${8:-harness}" > "$O/state/parkorigin-$PR" ;;
       esac
     fi
     for _once in 1; do
@@ -1057,9 +1061,38 @@ t5_clear; drive_route 'FAILED:ai-review-gate' MERGEABLE 0 0 1 deadbee
 [ "$(cat "$TMP/route" 2>/dev/null)" = "arm" ] \
   && ok "a park recorded at a DIFFERENT head still skips nothing (unchanged: the row reaches the class arms)" \
   || bad "a stale park at another head blocked the row (route=$(cat "$TMP/route" 2>/dev/null)) — the guard must compare the HEAD, not just the file"
+# ⛔ AND THE AUTHOR IS KEYED TO THE HEAD TOO (fresh-context review, P2, #4126). The stamp used to be a
+# PR-LIFETIME `harness`: nothing deleted it on the operator path (the documented lift removes only
+# `parked-<PR>` + `parkreason-<PR>`), so after the harness had ever parked a PR, a human's LATER park at
+# a new head was read as the machine's and the router rebased a head a human had frozen. Non-vacuity:
+# the SAME head, the SAME `CONFLICTING`, the SAME human reason as the row above — and a pre-fix guard
+# (single-token `harness`, no head) routes it `conflict`, spawning a rebase onto the frozen PR.
+t5_clear; PARK_STAMP_HEAD=deadbee drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off' harness
+[ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
+  && ok "a stale 'harness' stamp at ANOTHER head does not overrule a human park at THIS one (the author is head-keyed)" \
+  || bad "a machine stamp left at an earlier head overruled a human park (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — the marker is PR-lifetime again"
+# ⛔ THE MARKER'S **WRITERS** ARE PINNED, NOT ONLY ITS READER (#3442 rule 1). Every row above SEEDS
+# `parkorigin-<PR>` itself, so a future edit that dropped the stamp from `park_ctrl` — or reverted it to
+# the PR-lifetime one-field form — stayed green while production parks stopped naming their author. The
+# drive below runs the SHIPPED `park_ctrl` and grades what it leaves on disk.
+t5_clear
+( O="$TMP/O"; . "$TMP/parkctrl.sh"; park_ctrl 4343 cafe0001 'a machine-written reason' ) >/dev/null 2>&1
+[ "$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)" = "cafe0001 harness" ] \
+  && ok "the shipped park_ctrl stamps its author WITH the head it parks (parkorigin-4343 = '<head> harness')" \
+  || bad "park_ctrl's stamp is '$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)' — expected 'cafe0001 harness' (a one-field stamp is PR-lifetime and overrules a later human park)"
+# ⛔ AND A PARK AT A NEW HEAD REPLACES IT: the guard trusts a stamp only at the head it names, so the
+# writer must OVERWRITE the earlier head's stamp when it parks a new one (a stale-name stamp would be
+# inert but a wrong-HEAD one would mis-attribute the next human park).
+( O="$TMP/O"; . "$TMP/parkctrl.sh"; park_ctrl 4343 d00dfeed 'a later machine reason' ) >/dev/null 2>&1
+[ "$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)" = "d00dfeed harness" ] \
+  && ok "…and a park at a NEW head rewrites it, so the stamp always names the park it describes (no accumulation)" \
+  || bad "a second park left the earlier head's stamp ('$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)') — the migration path is now the only one the guard can read"
+rm -f "$TMP/O/state/parked-4343" "$TMP/O/state/parkreason-4343" "$TMP/O/state/parkorigin-4343"
 t5_clear
 mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.t5b.end.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/parkorigin-4242" "$TMP/parkorigin.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/fixcount-4242" "$TMP/fixcount.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/conflictcount-4242" "$TMP/conflictcount.t5b.end.$RANDOM" 2>/dev/null || true
 

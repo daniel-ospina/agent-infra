@@ -912,14 +912,22 @@ ck "  …and a failure to CREATE it is flagged, not merely ignored (STG_LVL_QOK-
 # majority state on a rail repo — had its landing-side work reported as FIXING while `l2_merge` read `ns`
 # for the whole cycle. The suite was green at 101/0. The same class was already fixed once at
 # `[redfix:end]`, which is why attribution ORDER is now graded and not just existence.
+# ⛔ THE DECISION, NOT THE READ, IS WHAT THIS GRADES (agent-infra#4120). The mergeable value used to be
+# read INSIDE this block (`MSTAT="$(gh pr view …)"`), and this regex pinned that assignment. #4120
+# replaced it with ONE `gh pr view` for head+mergeable on the row itself — a classification read that
+# now happens BEFORE the block, and is honestly charged to no level. So the boundary marker is either
+# form: the old in-block assignment, or the `case "${MSTAT:-}" in` that branches on it. What the row
+# grades — level 3 opens only for the CONFLICTING arm, never above the decision — is unchanged, and a
+# `l3_fix` above the `case` (or a decision that never happens) still reds it.
 _cc_region="$(awk '
   /# \[conflict-case:begin\]/ { inb=1; next }
   /# \[conflict-case:end\]/   { inb=0 }
-  inb && /^[[:space:]]*MSTAT=/ { m=NR }
+  inb && /^[[:space:]]*MSTAT=/ { if (!m) m=NR }
+  inb && /^[[:space:]]*case "\$\{MSTAT:-\}" in/ { if (!m) m=NR }
   inb && /^[[:space:]]*stg_lvl_start l3_fix([[:space:]]|$)/ { if (!l3) l3=NR }
   END { printf "%d %d", m+0, l3+0 }' <<<"$_loop_tc")"
 set -- $_cc_region; _cc_mstat="${1:-0}"; _cc_l3="${2:-0}"
-ck "the conflict case opens level 3 INSIDE the CONFLICTING branch, not above the case (MSTAT line ${_cc_mstat}, l3_fix line ${_cc_l3})" \
+ck "the conflict case opens level 3 INSIDE the CONFLICTING branch, not above the case (mergeable-decision line ${_cc_mstat}, l3_fix line ${_cc_l3})" \
    "$(if [ "${_cc_mstat:-0}" -gt 0 ] && [ "${_cc_l3:-0}" -gt "${_cc_mstat}" ]; then echo 0; else echo 1; fi)"
 # ⛔ AND EVERY `case` ARM THAT LANDS A PR OPENS LEVEL 2 ITSELF. The PENDING arm does landing-side work
 # and opened no level, so it inherited the previous arm's — measured.

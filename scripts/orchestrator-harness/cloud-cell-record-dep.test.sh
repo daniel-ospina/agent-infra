@@ -668,6 +668,11 @@ ck "RED→GREEN: a record-step failure writes the terminal marker" $rc
 ck "the marker is keyed to the reviewed head (the controller's exact comparison)" $rc
 case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'rc=127'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
 ck "the reason file says WHY (the failing rc), so the park is actionable" $rc
+# ⛔ THE PARK NAMES ITS AUTHOR, KEYED TO THE HEAD (agent-infra#4120 review, P3): `park()` is one of the
+# three writers the controller's parked-guard reads, and a stamp without its head is PR-lifetime — the
+# guard would then trust it at a LATER head and overrule a human's park there.
+[ "$(cat "$MRG/o/state/parkorigin-$PR" 2>/dev/null)" = "$HEAD harness" ] && rc=0 || { rc=1; note "parkorigin=$(cat "$MRG/o/state/parkorigin-$PR" 2>/dev/null) head=$HEAD"; }
+ck "…and merge-one.sh's park() stamps its author WITH the head it parks ('<head> harness')" $rc
 grep -q 'PARKED' "$MRG/o/logs/merge-$PR.log" && rc=0 || rc=1
 ck "the worker's own log records the PARKED terminal state" $rc
 [ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || rc=1

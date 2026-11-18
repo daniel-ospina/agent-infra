@@ -5113,8 +5113,13 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # `sleep` in the reap decision, and an uncoerced typo makes that test ERROR — which reads FALSE, i.e.
 # "not idle", so the reaper would spare every worker for ever. That is the inert-enforcer direction
 # rather than the fail-open one, and it is still a bound silently disarmed by a typo.
-[ "$_ngrd_n" = "22" ] && rcn=0 || { rcn=1; echo "      expected 22 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 22 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 22 -> 23 for agent-infra#3009 (`QUEUE_STATE_MAX_AGE_MIN`: the cycle record's "which rung idled" read
+# declines to name a stale queue record, and an uncoerced typo there makes the comparison ERROR — a
+# bound that silently stops naming its rung, the inert-instrument direction). Its coercion shipped in
+# #3909 with this count left at 22, so this pin had been RED on `main` since that merge: the count is
+# what caught it, which is the row working as designed rather than a row to relax.
+[ "$_ngrd_n" = "23" ] && rcn=0 || { rcn=1; echo "      expected 23 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 23 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
