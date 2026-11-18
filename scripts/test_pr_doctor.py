@@ -1481,6 +1481,35 @@ def test_a_peer_held_head_does_not_refuse_the_pass(monkeypatch):
     assert "no worker accepted" not in reason, reason
 
 
+def test_a_pass_that_dispatched_and_stood_down_NAMES_the_peer_held_heads(monkeypatch):
+    """⛔ P2 (harness review of #4134): the ONLY report a dispatched-and-skipped pass has.
+
+    The stall counters are printed only when NOTHING went out, so on a pass that placed one order and
+    stood down from a claimed head, `_finish`'s `_peers` block is the sole surface naming the skip —
+    and a skip that says nothing is indistinguishable from a bug (the owner's 2026-11-17 decision).
+
+    ⛔ NAMING THE MUTANT. Delete the `_peers` block in `_finish` and NO row went red (measured by the
+    reviewer, and the reason this test exists). With it in place, this row is the one that does.
+    """
+    monkeypatch.setenv("MAX_FIX", "4")
+    monkeypatch.setenv("MAX_REVIEW", "4")
+    held = pr._ClaimHold("cross-box claim registry: verdict=holder-on-foreign-box",
+                         token="holder-on-foreign-box")
+
+    def _dispatch(p, action, text, dry, *_rest):
+        if p["number"] == 2:
+            return (False, held, False)
+        return (True, "spawned", False)
+
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "red", []),
+                                      dispatch=_dispatch)
+    assert rc == 0, joined                       # a peer holding a head is not a fault of this pass
+    assert payload.get("dispatched") == 1, payload
+    assert payload.get("prs") == [1], payload
+    assert "1 PR(s) SKIPPED -- a peer holds the head (holder-on-foreign-box=1)" \
+        in payload.get("reason", ""), payload
+
+
 def test_an_unreadable_registry_refuses_the_pass(monkeypatch):
     """…but a registry this box cannot read IS a failed order, and 0 is reserved for a real pass.
 
@@ -6454,7 +6483,7 @@ def test_a_stale_sibling_objective_is_a_RECORDED_refusal(tmp_path):
 # unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
 
 def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("pr-doctor.py",),
-                state=None, live=False):
+                state=None, live=False, dispatch=None):
     """Run one pass against a synthetic world; return (rc, joined log, status payload).
 
     ⛔ THE TRANSPORT IS THE WORKER ONE (#1890): `dispatch(pr, action, text, dry)` returns
@@ -6481,8 +6510,14 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
-                                              else (False, "dispatcher exited rc=78", False)))
+                        # ⛔ A CALLABLE LETS ONE PASS CARRY DIFFERENT OUTCOMES PER PR. Without it
+                        # every PR in a pass shares one `launched` verdict, so the dispatched-
+                        # AND-skipped pass -- the only shape that reaches `_finish`'s `_peers`
+                        # block -- could not be built by this helper at all (P2, harness review of
+                        # #4134: that block had no test, and deleting it reddened nothing).
+                        dispatch if dispatch is not None else
+                        (lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
+                                              else (False, "dispatcher exited rc=78", False))))
     monkeypatch.setattr(pr, "log", logs.append)
     # The repo-resolution tests are their OWN section; every other pass test names the repo it
     # grades so it keeps testing the thing it is about (a pass with no resolvable repo now REFUSES

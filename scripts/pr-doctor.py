@@ -4450,22 +4450,35 @@ def set_tag_collisions(entries: list[str]) -> str:
 # -lived `bash` child, and `claims.sh` stamps `owner=<host>:<pid>` with THAT child's pid
 # (`claim_owner` appends `$$`; `CLAIM_OWNER_ID` does not help -- the accepted branch appends `$$`
 # too, producing a three-field owner). So the minted owner's pid is gone before the next reader runs,
-# and THIS box's own local-pid orphan rule (`claim_orphan_reason`) will read the claim as ORPHANED --
-# i.e. reclaimable. Consequences, measured rather than assumed:
-#   * CROSS-BOX EXCLUSION IS UNAFFECTED, which is the measured defect this closes: a FOREIGN host is
-#     never pid-probed (a local pid collision could read `absent`, and `absent` is a death witness),
-#     so a peer honours the lease for its whole term.
+# and a LOCAL-pid orphan verdict (`claim_orphan_reason`) reads the claim as ORPHANED -- reclaimable.
+# Consequences, MEASURED rather than assumed (each was executed, not traced):
+#   * ⛔ THE GUARANTEE IS "UNTIL THIS BOX'S NEXT `claim_prune`", NOT "FOR THE LEASE" (harness review,
+#     reproduced 2026-11-18 -- agent-infra#4136). The reaper deletes on exactly the verdict above
+#     with NO age gate: `claims.sh:2405` (`if why="$(claim_orphan_reason "$owner" "$ref")"; then
+#     push --delete`) off `claims.sh:844` ("owner host is this box (now or formerly) but the pid that
+#     took the PR claim (N) is gone"), and `orch-loop.sh:6133` runs it HOURLY, backgrounded, on the
+#     box that owns this checkout -- i.e. THIS box, the one that spawned the worker. Measured end to
+#     end against a bare origin: claim minted by a `bash -c` child, child gone, `claim_prune` in the
+#     same box -> `pruned orphaned-host …` with ~10 h of lease left, and a PEER's `claim_acquire` then
+#     won the create CAS (`rc=0`) while the worker was still running. A claim whose stamped pid IS
+#     alive survived the same pass, so the discriminator is holder LIVENESS, not the keying.
+#     ⛔ THIS PARAGRAPH REPLACED ITS OWN OPPOSITE ("CROSS-BOX EXCLUSION IS UNAFFECTED … a peer honours
+#     the lease for its whole term"), which was false against the three lines above and was repeated
+#     in `docs/ops/fleet-liveness.md`. Do not restore it: the window is <= 1 h, not 37200 s.
+#     The durable settlements (a live-holder pid, or a reaper abstention for a dispatcher mint that
+#     keeps the OWNER's own reclaim) are scoped in agent-infra#4136 -- they are `claims.sh` changes,
+#     outside this gate's surface, and one of them must land before #2557 can be called closed.
 #   * SAME-BOX duplicates stay guarded by the mechanism that already did it -- `worker_live_for()`
 #     plus the deterministic `prd-<n>` worker name and worktree -- not by this claim. Two concurrent
 #     passes on one box could therefore reclaim each other's claim; they could already collide on
 #     the same worker name, and the claim does not make that worse.
-#   * The accepted cost is stated where the owner decision is: a head whose worker finishes without
-#     pushing stays claimed for its lease -- 37200 s = 10 h 20 m at the defaults (`backstop + pad`,
-#     under this keying's 12 h ceiling, so `claims.sh` neither clamps nor warns). That is 10 h 20 m of
-#     idle capacity for PEER boxes on that one head, which is the deliberate trade ("we choose idle
-#     capacity over duplicate writers") and is the longest term that cannot outlive the worker; the
-#     owning box reclaims its own orphan on its next pass, and a worker that PUSHES re-keys the head
-#     free immediately.
+#   * What the lease is still FOR: (i) the case where this box never prunes again (a stopped
+#     controller, a dead host -- the host rules then reap it, `claims.sh:2405`), and (ii) the
+#     owning box's OWN reclaim. A dead-pid claim is reclaimed by its owner on the next pass precisely
+#     BECAUSE the pid arm fires, which is what re-spawns a crashed repair worker; the reaper's use of
+#     the same verdict is what hands the head to a peer. One verdict, two callers, opposite
+#     correctness -- which is why the settlement has to be scoped to the REAPER (agent-infra#4136),
+#     not to `claim_orphan_reason`.
 #   * A lease long enough to cover the worker is required either way: a shorter one expires under a
 #     live lane and hands the same head to a peer, which is the duplicate this whole block removes.
 CLAIMS_SH_ENV = "PRD_CLAIMS_SH"
