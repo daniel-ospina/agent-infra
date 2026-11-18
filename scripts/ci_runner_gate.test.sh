@@ -666,6 +666,8 @@ _derive_shipped() { # <knob-name> -> the gate's shipped default
   # records this same correction for GH_THRESHOLD_DEFAULT (#3261).
   sed -n "s/.*CI_GATE_$1:-\([0-9][0-9]*\)}.*/\1/p" "${GATE_UNDER_TEST:-$GATE}" | head -1
 }
+FALLBACK_ARM_MAX_SHIPPED="$(sed -n 's/.*CI_GATE_FALLBACK_ARM_MAX:-\([a-zA-Z0-9]*\)}.*/\1/p' "${GATE_UNDER_TEST:-$GATE}" | head -1)"
+[ -n "$FALLBACK_ARM_MAX_SHIPPED" ] || { echo "❌ fixture cannot derive the arm bound" >&2; exit 3; }
 CENSUS_BACKOFF_SHIPPED="$(_derive_shipped CENSUS_READ_BACKOFF_S)"
 CENSUS_ATTEMPTS_SHIPPED="$(_derive_shipped CENSUS_READ_ATTEMPTS)"
 BLIND_DEFECT_AFTER_SHIPPED="$(_derive_shipped BLIND_DEFECT_AFTER)"
@@ -797,6 +799,7 @@ PYDROP
     # DERIVED values; arms that test the operand pass `ENV=...` afterwards and still override.
     export CI_GATE_CENSUS_READ_BACKOFF_S="$CENSUS_BACKOFF_SHIPPED"
     export CI_GATE_CENSUS_READ_ATTEMPTS="$CENSUS_ATTEMPTS_SHIPPED"
+    export CI_GATE_FALLBACK_ARM_MAX="$FALLBACK_ARM_MAX_SHIPPED"
     export CI_GATE_BLIND_DEFECT_AFTER="$BLIND_DEFECT_AFTER_SHIPPED"
     export CI_GATE_BLIND_DEFECT_EVERY_S="$BLIND_DEFECT_EVERY_SHIPPED"
     export CI_GATE_BLIND_STREAK_RESET_S="$BLIND_STREAK_RESET_SHIPPED"
@@ -2096,6 +2099,25 @@ assert_contains "$(put_body_for 104)" 'self-hosted-arm64' "(cap3) a runner outsi
 assert_not_contains "$(put_body_for 104)" 'ubuntu-latest' "(cap3) …and does NOT carry ubuntu-latest after the sweep"
 assert_contains "$(cat "$GH_LOG")" "runners/101/labels" "(cap3) an id INSIDE the arm was written"
 assert_eq "$RC" "0" "(cap3) exit 0 (the cap is a bound, not a failure)"
+
+assert_eq "$FALLBACK_ARM_MAX_SHIPPED" "all" \
+  "the gate SHIPS the whole pool as the arm bound — owner ruling 2026-11-18: the fleet is paid capacity, not 3 boxes"
+
+# (all) THE DEFAULT ARMS EVERY MANAGED RUNNER (refs #4085): it must actually WRITE them — logging five
+# ids while engaging three IS the #2589 symptom this change removes, so the PUT bodies are asserted.
+run_gate arm-all-default GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "(all) an uncapped engage completes the pass"
+assert_contains "$OUT" "armed_ids=[101,102,103,104,105]" "(all) the DEFAULT arms every managed runner"
+assert_contains "$OUT" "disarming=[]" "(all) nothing is outside the arm, so the disarm set is EMPTY"
+assert_contains "$OUT" "bound=all" "(all) the log names the bound it applied"
+assert_contains "$OUT" "set_labels ok=5 fail=0 engagement=on" "(all) ALL FIVE are written, not just logged"
+assert_contains "$(put_body_for 105)" 'ubuntu-latest' "(all) id 105 — outside the old cap of 3 — carries the label"
+
+# (all-junk) `all` is EXPLICIT; a typo is still refused, so the bound can never fail OPEN.
+run_gate arm-junk GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=al --
+assert_not_contains "$OUT" "engagement=on" "(all-junk) 'al' is NOT read as 'all' — no engagement on a typo"
 
 # (cap2) the bound is the value the ruling names, not a constant the test re-states: at 2, at most two.
 run_gate arm-cap2 GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \

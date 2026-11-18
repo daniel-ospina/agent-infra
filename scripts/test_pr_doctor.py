@@ -64,6 +64,13 @@ _REAL_GH_TOKEN = getattr(pr, "_gh_token", None)
 # it to "capable" so a pass test is not decided by whatever `$O` copy this box happens to have. The
 # tests that drive the guard restore this.
 _REAL_KIND_SUPPORT = getattr(pr, "dispatcher_kind_support", None)
+# …and the CROSS-BOX CLAIM (agent-infra#2557), captured for the same reason: the autouse fixture
+# stubs the gate to "free, and this box took it" so ~40 dispatch tests are not decided by a git
+# remote. ⛔ THAT STUB IS A DECLARATION, NOT A CONVENIENCE: the tests that drive the claim itself
+# restore this value and run the REAL `claims.sh` against a real bare remote (``_claim_fleet``
+# below), so the gate is proved in both directions rather than stubbed away.
+_REAL_CLAIM_GATE = getattr(pr, "pr_claim_gate", None)
+_REAL_CLAIM_RELEASE = getattr(pr, "pr_claim_release", None)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
@@ -141,6 +148,17 @@ def _clean_env(monkeypatch, tmp_path_factory):
     for _name, _val in (("REPO", ""), ("REPO_DIR", ""), ("REPO_DIR_ERROR", ""),
                         ("WORKTREE_ROOT", ""), ("_WORKER_TAG", "")):
         monkeypatch.setattr(pr, _name, _val, raising=False)
+    # ⛔ EXCEPT THE CHECKOUT, WHICH IS WHAT A DISPATCHING BOX HAS (agent-infra#4134 F1).
+    # `dispatch()` now refuses a pass with NO checkout BEFORE the claim gate (#4134 F1: the gate ran
+    # first and, with `CLAIM_REPO` guessed from the cwd, either pushed a claim into the repo the
+    # caller happened to sit in or blamed the registry for a missing `REPO=`). Leaving this empty
+    # made 21 rows that DRIVE `dispatch()` fail for that refusal instead of the thing they test --
+    # every one of them models a box that DOES have a checkout and stubs the step that would use it
+    # (`materialise_worktree`). The value is still freshened per test, which is the leak this block
+    # exists to prevent; the no-checkout refusal itself is driven by its OWN rows, which set it empty
+    # deliberately (`apply_repo(_REPO_A, "")`, and `test_dispatch_with_NO_checkout_never_claims…`).
+    monkeypatch.setattr(pr, "REPO_DIR", str(tmp_path_factory.mktemp("pr-doctor-checkout")),
+                        raising=False)
     # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
     # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
     # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
@@ -149,6 +167,15 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # fail for a reason none of them is about. Stub it to "capable"; the guard itself is driven directly,
     # in both directions, by `test_a_stale_dispatcher_refuses_the_pass*` below.
     monkeypatch.setattr(pr, "dispatcher_kind_support", lambda: "", raising=False)
+    # ⛔ AND THE CROSS-BOX CLAIM IS STUBBED FREE-AND-TAKEN, NOT ABSENT (agent-infra#2557).
+    # `dispatch()` now takes `refs/claims/<pr>-<sha12>` before it prepares anything, and a unit test
+    # has no remote to take it from -- refusing here (the honest answer to "no registry") would make
+    # every existing dispatch test fail for a reason none of them is about. The stub returns a
+    # COMMIT, not an empty string, so `_give_back` still runs on every failure path and the release
+    # wiring stays exercised. The gate's own polarity is driven against the real `claims.sh` in the
+    # `_claim_fleet` tests below.
+    monkeypatch.setattr(pr, "pr_claim_gate", lambda p, dry=False: (None, "0" * 40), raising=False)
+    monkeypatch.setattr(pr, "pr_claim_release", lambda p, commit: True, raising=False)
 
 
 # ── 1. the machine's config reaches capacity() ────────────────────────────────────────────
@@ -1099,6 +1126,779 @@ def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp
     assert ok is False
     assert "worktree add failed" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
+
+
+# ── THE CROSS-BOX CLAIM, DRIVEN AGAINST THE REAL REGISTRY (agent-infra#2557) ──────────────────────
+#
+# Every test below runs the SHIPPED `scripts/orchestrator-harness/claims.sh` against a REAL bare
+# remote and two REAL checkouts (box A / box B), with `CLAIM_OWNER_HOST` and `CLAIM_STATE_DIR` per
+# box so the two are honestly different boxes to the registry. That is deliberate: the defect this
+# closes was two boxes dispatching one PR, and a stub of the registry cannot reproduce it -- the
+# loser's refusal has to come from the CAS.
+
+def _git(*args, cwd):
+    r = subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True)
+    assert r.returncode == 0, (args, r.stdout, r.stderr)
+    return r.stdout.strip()
+
+
+def _claim_fleet(tmp_path):
+    """A bare origin plus two boxes' clones of it at ONE head. Returns (origin, head, boxa, boxb)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _git("init", "-q", cwd=src)
+    (src / "f.txt").write_text("head\n")
+    _git("add", "f.txt", cwd=src)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "head", cwd=src)
+    head = _git("rev-parse", "HEAD", cwd=src)
+    origin = tmp_path / "origin.git"
+    _git("init", "-q", "--bare", str(origin), cwd=tmp_path)
+    _git("push", "-q", str(origin), "HEAD:refs/heads/main", cwd=src)
+    boxes = {}
+    for name in ("boxa", "boxb"):
+        d = tmp_path / name
+        _git("clone", "-q", str(origin), str(d), cwd=tmp_path)
+        _git("checkout", "-q", head, cwd=d)
+        boxes[name] = d
+    return origin, head, boxes["boxa"], boxes["boxb"]
+
+
+def _as_box(monkeypatch, box, tmp_path, name):
+    """Point pr-doctor at ONE box: its checkout, its registry module, its identity, its state dir.
+
+    `CLAIM_OWNER_HOST` is the claims.sh SEAM (the shipped way to simulate a second box), and the
+    state dir is separated because `claim_host_record` remembers a box's FORMER host names -- shared
+    between two simulated boxes it would make box A look like one of box B's own old names, and the
+    orphan rule would then correctly reclaim a live claim, which is not what these tests measure.
+    """
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    monkeypatch.setattr(pr, "REPO_DIR", str(box))
+    monkeypatch.setenv(pr.CLAIMS_SH_ENV, str(_HARNESS / "claims.sh"))
+    monkeypatch.setenv("CLAIM_OWNER_HOST", name)
+    monkeypatch.setenv("CLAIM_STATE_DIR", str(tmp_path / ("state-" + name)))
+    for k in ("CLAIM_KNOWN_HOSTS", "CLAIM_DEAD_HOSTS", "CLAIM_NS"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def _claimed_refs(origin):
+    out = subprocess.run(["git", "ls-remote", str(origin), "refs/claims/*"],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return [line.split("\t")[1] for line in out.stdout.splitlines() if line.strip()]
+
+
+def test_a_second_box_cannot_spawn_a_lane_for_a_head_the_first_has_claimed(monkeypatch, tmp_path):
+    """THE MEASURED INCIDENT (2026-11-17): one PR, two boxes, two live `prd-` lanes on one head.
+
+    ⛔ NAMING THE MUTANT. Delete the `pr_claim_gate()` call in `dispatch()` (i.e. dispatch as before
+    this change) and this test goes RED at `assert ok is False` -- box B spawns happily on a head box
+    A owns. Nothing else in the suite reddens for that edit, because the autouse fixture stubs the
+    gate to free-and-taken; this is the row that proves the gate is WIRED, not merely present.
+    """
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    # box A takes the claim through the REAL gate...
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    hold, commit = _REAL_CLAIM_GATE(pr_)
+    assert hold is None, hold
+    assert commit, "the CAS must hand back the commit a fenced release needs"
+    assert _claimed_refs(origin) == ["refs/claims/13126-%s" % head[:12]], \
+        "the key must be the SAME per-head ref the issue/fixer path uses"
+    # ...then box B tries the same head, through `dispatch()`.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)      # undo the autouse stub
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    prepared, spawned = [], []
+    monkeypatch.setattr(pr, "materialise_worktree",
+                        lambda p, dry=False: prepared.append(p["number"]) or (str(tmp_path), ""))
+    # ⛔ `spawn_argv`, NOT `sh_err`: the claim bridge goes through `sh_err` too, and stubbing it
+    # would make the registry answer empty -- i.e. it would stub out the very thing under test.
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: spawned.append(a) or ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert pr.claim_hold_token(detail) == "holder-on-foreign-box", detail
+    assert "boxA:" in detail, "the skip must NAME the holder: %r" % (detail,)
+    assert not prepared, "a claimed head must cost this box NOTHING -- no worktree is prepared"
+    assert not spawned, "no spawn may be attempted for a head a peer holds"
+    assert _claimed_refs(origin) == ["refs/claims/13126-%s" % head[:12]], \
+        "box B must not have disturbed box A's claim"
+
+
+def test_an_unreadable_registry_is_SKIPPED_and_reported_with_its_token(monkeypatch, tmp_path):
+    """⛔ NAMING THE MUTANT. Return `(None, ...)` on the abstention branch -- i.e. treat an
+    unreadable registry as freedom -- and this test goes RED at `assert ok is False`: the dispatch
+    proceeds on a head this box cannot prove is free, which is the duplicate the owner's decision
+    exists to prevent. The token assertion reddens too, which is why the SKIP is reported rather
+    than silent.
+
+    ⛔ NO MINT-COUNT ASSERTION HERE, AND THAT IS DELIBERATE (#3442 rule 3). This row makes the
+    registry unreadable by RE-POINTING box A's `origin` at `gone.git`, and `_claim_run` hands
+    `claims.sh` `CLAIM_REPO` = box A -- so NO path in this diff can address `tmp_path/origin.git`,
+    and an assertion read off that remote cannot vary under any mutation of the change: dead
+    weight (a review found it as exactly that). The "a run that cannot claim mints nothing" half is
+    carried by `test_a_dry_run_reports_a_held_head_without_minting_a_claim` (:1327), which keeps
+    the registry addressable while it counts refs. What THIS row owns is the pair R2 names: the
+    abstention is a SKIP, and the skip is reported with its token.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)      # undo the autouse stub
+    # The registry becomes unreadable: `git ls-remote`/`push` cannot reach the origin at all. This is
+    # a GIT-only failure -- exactly the class `orch-loop.sh` warns must not be softened on the
+    # assumption that a `gh` outage took the registry down too.
+    _git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=boxa)
+    logged = []
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    # (no `sh_err` stub: the registry answer is what this test measures -- see the note in the
+    # two-box test above.)
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert pr.claim_hold_token(detail) == pr.CLAIM_UNREADABLE_TOKEN, detail
+    assert any("verdict=claims-unreadable" in m for m in logged), \
+        "a silent skip is indistinguishable from a bug: %r" % (logged,)
+
+
+def test_the_claim_is_KEPT_when_the_spawn_is_UNCONFIRMED(monkeypatch, tmp_path):
+    """The OTHER polarity, on the DOMINANT path: "could not tell" must NOT publish the head free.
+
+    ⛔ NAMING THE MUTANT. Change this arm back to `return _give_back(detail)` -- which is exactly what
+    the first version shipped -- and this test goes RED on `refs == [claim]` while the peer-box
+    assertion below shows box B taking the same head. That mutation reddened NOTHING in the other
+    351 tests, which is why this row exists: the arm was the only claim-path exit with no coverage.
+
+    ⛔ WHY `unconfirmed` MEANS "MAYBE ALIVE": `_confirm()` polls for `CONFIRM_WINDOW_S` = 1 s and
+    then accepts `--status == running` with no `[agent] provider=` line -- and that marker is written
+    AFTER the capability gate (5-25 s measured on a healthy box). A live worker that is about to
+    deliver is the NORMAL input to this arm, so releasing here re-created #2557 within a second of
+    every spawn; the reviewer reproduced it end to end against the real registry and a bare remote.
+    """
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    ref = "refs/claims/13126-%s" % head[:12]
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    # ⛔ `sh_err` is the claim bridge's transport TOO, so it may only be stubbed for the SPAWN argv
+    # (stubbing it wholesale is what makes a registry test silently stub out the registry).
+    real_sh_err = pr.sh_err
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda argv, **k: ("", "", 0) if argv == ["/bin/true"]
+                        else real_sh_err(argv, **k))
+    monkeypatch.setattr(pr, "_confirm", lambda name: ("unconfirmed", "PENDING: no verdict yet"))
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "UNCONFIRMED" in detail or "PENDING" in detail, detail
+    assert _claimed_refs(origin) == [ref], \
+        "an UNCONFIRMED spawn must keep the claim -- releasing it publishes the head free"
+    # …and the property that matters: a PEER box is now refused this head.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    peer_hold, peer_commit = _REAL_CLAIM_GATE(pr_)
+    assert peer_hold is not None and not peer_commit, (peer_hold, peer_commit)
+    assert pr.claim_hold_token(peer_hold) == "holder-on-foreign-box", peer_hold
+
+
+def test_the_claim_is_released_when_the_spawn_never_launches(monkeypatch, tmp_path):
+    """A gate-refused spawn must give the claim back, or the head is held for a whole lease.
+
+    ⛔ NAMING THE MUTANT. Delete the `pr_claim_release()` call from `_give_back()` and this test goes
+    RED on the `_claimed_refs(...) == []` assertion: the box refuses to spawn and then owns the PR for
+    its entire lease with every peer refusing it -- the abandoned-claim class.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(42, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[load-gate] REFUSED bg: load=99 >= max_load=40" >> "$2"; return 75; }\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    _git("init", "-q", cwd=wt)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and "75" in detail, detail
+    # The refusal is a GATE refusal, not a claim hold -- the two classes must not be confused.
+    assert pr.claim_hold_token(detail) == ""
+    assert _claimed_refs(origin) == [], "the refused spawn must give the claim back"
+
+
+def test_dispatch_with_NO_checkout_never_claims_and_names_the_MISSING_CHECKOUT(monkeypatch, tmp_path):
+    """#4134 F1 (P2): `REPO_DIR == ""` is a MISSING INPUT, not "claim in whatever repo we sit in".
+
+    `REPO_DIR == ""` is a SUPPORTED state (`apply_repo` logs `checkout NONE -- queue only` and the
+    pass still classifies PRs and calls `dispatch()` for each), and before this fix the claim gate
+    ran BEFORE `materialise_worktree`'s refusal. Two wrong outcomes followed from
+    `CLAIM_REPO = REPO_DIR or os.getcwd()`: a pass launched from a checkout pushed
+    `refs/claims/<pr>-<sha12>` into a repo nobody named, and a launchd-shaped pass (cwd = $HOME) was
+    reported as `claims-unreadable` / `next=repair-claim-registry` -- sending an operator to
+    `git ls-remote` and `$O/claims.sh` when the actual fault is a missing `REPO=`.
+
+    ⛔ NAMING THE MUTANT. Delete the `if not REPO_DIR:` guard at the top of `dispatch()` and this row
+    goes RED four ways at once: the claim bridge IS asked, the detail is a claim verdict
+    (`claims-unreadable`), it names `repair-claim-registry`, and it never says "no checkout of …".
+    """
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    # ⛔ THE FIXTURE SUPPLIES A CHECKOUT (a dispatching box has one), so THIS row must remove it
+    # EXPLICITLY: the state under test is the launchd/queue-only pass that has none.
+    monkeypatch.setattr(pr, "REPO_DIR", "")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    # The LOCAL liveness guard sits above the claim gate; answer it so the mutant reaches the gate
+    # rather than dying on an unreadable status and reddening for the wrong reason.
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    asked = []
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "_claim_run",
+                        lambda bridge, extra: asked.append((bridge, list(extra)))
+                        or ({"rc": "2"}, "no registry"))
+
+    for dry in (False, True):
+        ok, detail, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=dry)
+        assert ok is False and record is False, (dry, ok, detail, record)
+        assert "no checkout of %s" % _TEST_REPO in detail, (dry, detail)
+        assert pr.claim_hold_token(detail) == "", \
+            "a missing checkout is not a claim verdict: %r" % (detail,)
+        assert "repair-claim-registry" not in detail, \
+            "the operator must not be sent to the registry for a missing REPO=: %r" % (detail,)
+    assert asked == [], \
+        "no checkout means nothing to mint against -- the claim bridge must never be asked: %r" % (
+            asked,)
+
+
+def test_the_claim_bridge_is_never_handed_a_GUESSED_repo(monkeypatch):
+    """The other half of #4134 F1: `CLAIM_REPO` is `REPO_DIR`, never `REPO_DIR or os.getcwd()`.
+
+    ⛔ NAMING THE MUTANT. Restore `REPO_DIR or os.getcwd()` on `_claim_run`'s env line and this row
+    goes RED: with no checkout the bridge is handed THIS process's cwd, so a claim is minted in (or
+    blamed on) a repository the pass was never told to grade.
+
+    ⛔ WHY THE EXPECTED VALUE IS EMPTY. `claims.sh` treats a SET-BUT-EMPTY `CLAIM_REPO` as a
+    REFUSAL that names the missing input (`CLAIM_REPO is SET BUT EMPTY (cwd=…) — set CLAIM_REPO (or
+    REPO) to the checkout`), never as a default. Passing the empty value through is therefore the
+    fail-closed answer: the registry says what is missing instead of a guess being pushed.
+    """
+    monkeypatch.setattr(pr, "REPO_DIR", "")
+    monkeypatch.setenv(pr.CLAIMS_SH_ENV, str(_HARNESS / "claims.sh"))   # any existing path
+    seen = []
+    monkeypatch.setattr(pr, "claim_sh_err",
+                        lambda args, timeout=180, env=None: seen.append(env)
+                        or ("rc=2\n", "not a work tree", 0))
+    pr._claim_run("true", [])
+    assert seen, "the bridge must be invoked at all for this row to mean anything"
+    assert seen[0].get("CLAIM_REPO") == "", \
+        "CLAIM_REPO must be the CHECKOUT the pass was given, empty included -- never the cwd: %r" % (
+            seen[0].get("CLAIM_REPO"),)
+    assert seen[0].get("CLAIM_REPO") != os.getcwd(), "a guessed repo is how a claim lands in the wrong origin"
+
+
+def test_a_pass_with_NO_CHECKOUT_is_its_OWN_verdict_and_never_blames_the_dispatch_chain(monkeypatch):
+    """#4134 F1's own class, ONE LEVEL UP: the DETAIL is now accurate, the VERDICT is not.
+
+    `dispatch()`'s new no-checkout guard is a GATE-class refusal: it returns BEFORE the claim gate,
+    before the brief, before the worktree and before `$O/nonblocking-dispatch.sh` is exec'd. The
+    per-order detail says exactly that ("no checkout of <repo> … pass REPO=<checkout>"), but
+    `_finish` counts it on the `undeliverable` axis with no cause of its own, so the PASS LINE -- the
+    only surface the beat reads (`objective.py::pr_doctor_last_run` cuts at 110 chars) -- still
+    printed `VERDICT=UNDELIVERED next=repair-chain` and resolved the chain path beside it. That is
+    the #4009 mis-attribution, measured again: an operator sent to repair a healthy dispatcher when
+    the fault was a missing `REPO=`.
+
+    ⛔ NAMING THE MUTANT. Remove the `no_checkout_refused(detail)` arm from `run_pass()`'s refusal
+    chain and this row goes RED at `side["verdict"] == "NO-CHECKOUT"` (measured: `UNDELIVERED`, and
+    the pass line carries `next=repair-chain`).
+
+    ⛔ AND THE PER-ORDER SENTENCE IS ASSERTED, NOT ONLY THE VERDICT LINE (harness review of #4134,
+    F1: a coverage gap, not a behaviour bug). Every assertion in the first version of this row was
+    satisfied by the VERDICT-line sentence, which independently carries `REPO=<checkout>` and
+    `NEVER INVOKED`; the `REFUSING: … given NO CHECKOUT` block in `_finish` could therefore be
+    DELETED with this row and the whole suite still green. That block IS this change's
+    operator-facing product -- on the measured launchd shape it is the only line that says "no
+    checkout" AT THE ORDER -- so the mutant that removes it must be red here: with the block gone,
+    the fallback prints `REFUSING: nothing was dispatched and 1 order(s) could not be placed`,
+    which neither assertion below accepts.
+    """
+    written = []
+    rc, joined = _refused_pass(monkeypatch, pr.no_checkout_note(_pr(1, "a" * 40)), written=written)
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+
+    # 1. THE REFUSAL IS PRESERVED (#3105): a pass that delivered nothing may not read clean.
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    # 2. THE ATTRIBUTION CHANGED -- the whole point of this row.
+    assert side["verdict"] == "NO-CHECKOUT", side["reason"]
+    assert "VERDICT=NO-CHECKOUT" in joined and "next=supply-checkout" in joined, joined
+    assert "repair-chain" not in joined, joined
+    # 3. AND NOTHING IS BLAMED ON THE TRANSPORT: no order ever reached it.
+    assert "no worker accepted" not in joined, joined
+    # 4. THE SENTENCE NAMES THE INPUT TO SUPPLY, and says the chain was never invoked.
+    assert "NEVER INVOKED" in joined, joined
+    assert "REPO=<checkout>" in joined, joined
+    # 4b. THE PER-ORDER LINE, WHICH IS THE PRODUCT OF THIS PR (harness review F1): the cause is
+    #     named AT THE ORDER, not only in the verdict's prose. Deleting `_finish`'s no-checkout
+    #     `elif` prints the generic "nothing was dispatched and N could not be placed" instead.
+    assert ("REFUSING: 1 order(s) could not be placed because this pass was given NO CHECKOUT"
+            in joined), joined
+    assert "nothing was dispatched and 1 order(s) could not be placed" not in joined, joined
+    # 5. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT.
+    assert "next=supply-checkout" in side["reason"][:110], side["reason"]
+    # 6. NOTHING WAS CONSUMED -- PROVED ON THE WRITER (harness review of #4134, F2). The first
+    #    version asserted `pr.load_state() == {}` while `_refused_pass` stubs BOTH sides
+    #    (`load_state -> {}`, `save_state -> no-op`): a stub's constant compared to `{}`, which no
+    #    mutant of this diff could redden -- vacuous, and labelled as the proof of exactly the
+    #    property the no-checkout arm introduces. The rows captured here are what `run_pass`
+    #    actually handed the writer; a cooldown row written inside the no-checkout arm lands in
+    #    them and reddens this assertion.
+    assert written, "the pass must still persist its state for this proof to mean anything"
+    for st in written:
+        assert set(st) <= {"_updated"}, f"a no-checkout refusal must write NO row: {st!r}"
+
+
+def test_a_NO_CHECKOUT_refusal_ON_A_MIXED_pass_is_not_reported_as_a_transport_drop(monkeypatch):
+    """#4134 F1's related gap: the residue subtraction in `_transport` (:6561) is covered by NO row.
+
+    `_finish` computes the transport residue once, as `undeliv - carried - rubric - claim-unreadable
+    - no-checkout`, and TWO branches read it: the `unread and undeliv` sentence below and the
+    `_held` one. Every existing row is a NO-CHECKOUT-ONLY pass, so it matches the dedicated
+    `_no_ck` arm first and `_transport` is never read -- dropping `- _no_ck` from `_transport`
+    reddened nothing in the whole suite.
+
+    This row is the shape that reads it: ONE unreadable PR (a blind checks read, counted on the
+    `unread` axis and never dispatched) sharing the pass with ONE order refused for the missing
+    checkout. The residue is therefore 0 and the sentence must NOT claim a transport failure over
+    an order that never reached the transport -- which is exactly what #4009/#2291 are about.
+
+    ⛔ NAMING THE MUTANT. Drop `- _no_ck` from `_transport` (`pr-doctor.py:6561`) and this row goes
+    RED at `"no worker accepted" not in joined`: the residue becomes 1 and the pass asserts that a
+    worker refused an order the chain was never asked to carry.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", dict)
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    # PR #1's checks cannot be READ (`k is None` is the classifier's blind-read contract); PR #2 is
+    # real work that this pass cannot place because it holds no checkout.
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: ((None, "checks unreadable", []) if p["number"] == 1
+                                   else ("fix-ci", "why", [])))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry, *_rest: (False, pr.no_checkout_note(p), False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+
+    # The MIXED shape really did build -- otherwise this row proves nothing about `_transport`.
+    # ⛔ rc 2 IS THE MEASURED ANSWER HERE, not rc 3: a pass that ALSO held a blind PR is REFUSING
+    # (`next=restore-read`) by the pre-existing `unread` arm, and this change does not touch that
+    # precedence. The property under test is the SENTENCE, not the verdict.
+    assert rc == pr.EXIT_REFUSING == 2, joined
+    assert side["verdict"] == "REFUSING", side["reason"]
+    assert "1 PR(s) were UNREADABLE" in joined, joined
+    assert "no-checkout=1" in joined, joined
+    # ⛔ THE POINT: the no-checkout refusal is subtracted from the residue, so no transport claim.
+    assert "no worker accepted" not in joined, joined
+    assert "repair-chain" not in joined, joined
+    # …and the cause is named AT THE ORDER by `run_pass`, which is the operator-facing product.
+    assert "this pass was given NO CHECKOUT" in joined, joined
+
+
+def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_path):
+    """`--dry-run` must not publish a claim for work it will not do (it would hold a real box)."""
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(9, head=head)
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    logged = []
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    # a FREE head, seen from box B: reported as spawnable, and NOT claimed.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    assert pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=True)[0] is True
+    assert _claimed_refs(origin) == [], "a dry run must mint nothing"
+    # box A claims it; the same dry run from box B must now report the HOLD, still minting nothing.
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    assert _REAL_CLAIM_GATE(pr_)[0] is None
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    ok, detail, _ = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=True)
+    assert ok is False and pr.claim_hold_token(detail) == "holder-on-foreign-box", detail
+    assert any("would NOT spawn" in m for m in logged), logged
+    assert len(_claimed_refs(origin)) == 1, "the dry run must not have changed the registry"
+
+
+def test_a_dry_run_whose_preflight_NEVER_ANSWERED_reports_an_UNREADABLE_registry(monkeypatch):
+    """⛔ P3 (harness review of #4134): an outage must not be read as "a peer holds this head".
+
+    `_claim_run` stamps `rc=2` when the bridge child itself did not answer (killed, `bash` absent,
+    `sh_err` timed out). The dry arm hard-coded `rc="1"` and defaulted `loaded`/`stale` to the
+    healthy values, so that stamp was discarded and the answer fell through `claim_verdict_token`'s
+    catch-all rung to `claim-holder-unverifiable` — "presence, no probeable holder" — about a
+    registry NOTHING had read. The non-dry arm mapped the same fields correctly, which is what made
+    this a dry-run-only defect; a `--dry-run` is where a lane decides whether it MAY work, so
+    reporting a phantom peer there is the direction this gate may not fail in.
+
+    ⛔ NAMING THE MUTANT. Put `"rc": "1"` back into the dry arm's field map and this test goes RED
+    at the token assertion (it comes back `claim-holder-unverifiable`).
+    """
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "claims_sh", lambda: "/shipped/claims.sh")
+    monkeypatch.setattr(pr, "REPO", _TEST_REPO)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    seen = []
+
+    def _bridge(script, *a, **k):
+        seen.append(script)
+        assert script == pr._CLAIM_PREFLIGHT_BRIDGE, "a dry run may only use the read-only arm"
+        return ({"rc": "2", "result": "the claim bridge exited 143: term"}, "")
+
+    monkeypatch.setattr(pr, "_claim_run", _bridge)
+    hold, commit = pr.pr_claim_gate(_pr(9), dry=True)
+    assert seen, "the dry arm must ASK the registry rather than assume"
+    assert hold is not None and commit == "", (hold, commit)
+    assert pr.claim_hold_token(hold) == pr.CLAIM_UNREADABLE_TOKEN, hold
+    assert "claim-holder-unverifiable" not in str(hold), \
+        "an unanswered registry is not evidence that a peer holds the head: %s" % (hold,)
+    # …and an ANSWERED preflight still maps to its holder, so the fix does not blind the mapping.
+    monkeypatch.setattr(pr, "_claim_run",
+                        lambda script, *a, **k: ({"hrc": "1", "loaded": "1", "stale": "0",
+                                                  "me": "boxB",
+                                                  "hresult": "held by boxA:42 until 9999"}, ""))
+    hold2, _ = pr.pr_claim_gate(_pr(9), dry=True)
+    assert pr.claim_hold_token(hold2) == "holder-on-foreign-box", hold2
+
+
+def test_an_acquire_that_may_have_LANDED_is_released_fenced(monkeypatch, tmp_path):
+    """rc=2 with a commit in hand is a RELEASE path, not just a refusal (fresh-review finding).
+
+    ⛔ NAMING THE MUTANT. Drop `fields.get("commit")` from `pr_claim_gate()`'s refusal return (i.e.
+    return `""` like the first version did) and this test goes RED at the `released` assertion: the
+    claim this box may have pushed is left holding the head for its whole lease while every peer
+    reads it as taken -- the abandoned-claim class `claims.sh` documents, arrived at from here.
+
+    ⛔ WHY THE COMMIT CAN EXIST ON A REFUSAL: `claims.sh` sets `CLAIM_COMMIT` on the create/reclaim
+    paths whose PUSH MAY HAVE LANDED and only the read-back failed, so the caller is expected to
+    attempt a FENCED release. `orch-loop.sh:9517-9525` does exactly that for issue dispatch, and
+    this test holds the PR path to the same contract.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(77, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    # Mint a REAL claim this box owns, then hand its commit back as an rc=2 answer -- exactly the
+    # shape of "the push landed, the read-back failed".
+    hold, commit = _REAL_CLAIM_GATE(pr_)
+    assert hold is None and commit, (hold, commit)
+    assert _claimed_refs(origin) == ["refs/claims/77-%s" % head[:12]]
+    real_run = pr._claim_run
+
+    def _rc2_for_acquire_only(script, *a, **k):
+        """Only the ACQUIRE answers rc=2 -- the release still has to reach the real registry."""
+        if script == pr._CLAIM_ACQUIRE_BRIDGE:
+            return ({"loaded": "1", "stale": "0", "me": "boxA", "rc": "2", "result": "",
+                     "commit": commit, "hresult": ""}, "")
+        return real_run(script, *a, **k)
+
+    monkeypatch.setattr(pr, "_claim_run", _rc2_for_acquire_only)
+    hold2, commit2 = pr.pr_claim_gate(pr_)
+    assert hold2 is not None, "a failed read-back is still a refusal -- never a licence to spawn"
+    assert pr.claim_hold_token(hold2) == pr.CLAIM_UNREADABLE_TOKEN, hold2
+    assert commit2 == commit, "the commit the push may have created must travel back with the hold"
+    # …and `dispatch()` must give it back before it skips.
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert _claimed_refs(origin) == [], \
+        "a claim this box may have created must be released (fenced), not left for its lease"
+
+
+def test_an_exception_between_the_claim_and_the_spawn_gives_the_claim_back(monkeypatch, tmp_path):
+    """An OSError while PREPARING the spawn must not leak the claim (fresh-review finding).
+
+    ⛔ NAMING THE MUTANT. Remove the `try/except` around the brief write + `materialise_worktree`
+    and this test REDS with `LEAKED CLAIM [...]`: the exception propagates out of `dispatch()` (the
+    pass does not guard it), the claim stays minted, and every peer refuses that head for the whole
+    lease while nothing is working it. ENOSPC on the brief write is the realistic trigger -- it is
+    the condition this box's own rc=77 disk gate exists for.
+
+    ⛔ AND THE WINDOW ENDS BEFORE THE SPAWN, deliberately: an exception after a worker has actually
+    started must NOT release that worker's claim, so the guard covers preparation only.
+    """
+    origin, head, boxa, _boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(4242, head=head)
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    spawned = []
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: spawned.append(a) or ["/bin/true"])
+
+    def _boom(_p, dry=False):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pr, "materialise_worktree", _boom)
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "OSError" in detail, detail
+    assert not spawned, "nothing may be spawned after a failed preparation"
+    refs = _claimed_refs(origin)
+    assert refs == [], "LEAKED CLAIM %r -- the claim must be given back on the exception path" % refs
+
+
+def test_the_claim_verdict_mapping_covers_the_published_tokens(monkeypatch):
+    """Every branch of the mapping, driven directly -- the tokens are a CLOSED, published set.
+
+    The two vocabularies meeting here are `claims.sh`'s (rc + its own `held-by-*` words) and
+    `docs/ops/fleet-liveness.md`'s six. A seventh word, or a wrong rung, is what this pins: the
+    same-host arm is the one a fixer/reviewer lane on THIS box produces (its pid is live), and the
+    foreign arm is the measured #2557 incident.
+    """
+    def tok(**kw):
+        base = {"loaded": "1", "stale": "0", "me": "boxB", "rc": "1",
+                "result": "", "hresult": ""}
+        base.update(kw)
+        t = pr.claim_verdict_token(base)
+        assert t == "" or t in pr.CLAIM_TOKENS, t
+        return t
+
+    live_own = "held by boxB:123 until 9999999999 (100s left; held-by-live)"
+    live_foreign = "a claim on PR #5 at abc is held by boxA:9 until 9999999999 (100s left; held-by-live)"
+    assert tok(rc="2") == "claims-unreadable"
+    assert tok(rc="1", hrc="2") == "claims-unreadable"
+    assert tok(loaded="0") == "claims-unreadable"
+    assert tok(stale="1") == "claims-unreadable"          # too old to expose claim_acquire
+    assert tok(result=live_own) == "claim-held"
+    assert tok(hresult=live_foreign) == "holder-on-foreign-box"
+    assert tok(result="held by ? until 9999999999 (x; held-by-live)") == "claim-owner-unparseable"
+    assert tok(result="held by boxA:9 (no parseable lease -- held-by-unreadable-lease; ...)") \
+        == "claim-holder-unverifiable"
+    assert tok(result="could not mint a claim: the LOCAL CLOCK is unreadable ... "
+                      "held-by-unreadable-clock") == "claim-holder-unverifiable"
+    assert tok(result="lost the reclaim race for refs/claims/5-abc (another box took it: a -> b)") \
+        == "claim-held"
+    assert tok(result="something this reader has never seen") == "claim-holder-unverifiable"
+    # …and the acquiring answer is NOT a refusal.
+    assert tok(rc="0") == ""
+
+
+def test_a_peer_held_head_does_not_refuse_the_pass(monkeypatch):
+    """A peer repairing a PR is NOT a fault of this pass -- it must not exit 3/2.
+
+    ⛔ NAMING THE MUTANT. Count a `claim-held` skip as `undeliverable` in `run_pass()`'s refusal
+    arm and this test goes RED (rc 3): every healthy fleet would then read UNDELIVERED on every
+    pass, which is the false alarm that would get the gate switched off.
+    """
+    rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_PEER_TOKENS[1])
+    assert rc == 0, (rc, reason)
+    assert "holder-on-foreign-box=1" in reason, reason
+    assert "no worker accepted" not in reason, reason
+
+
+def test_a_pass_that_dispatched_and_stood_down_NAMES_an_UNREADABLE_registry(monkeypatch):
+    """⛔ P2 (harness review of #4134): the count printed NOWHERE, on a line that blamed the chain.
+
+    `claims-unreadable` rides the `undeliverable` axis deliberately (rc 3: no waiting on the star
+    clears it, and the pass may not read clean while it places nothing). But `_finish` computed
+    `placed_and_refused = undeliv - carried - rubric`, so on a pass that dispatched one order and
+    stood down from an unreadable registry the pass line read `1 order(s) no worker accepted` — a
+    TRANSPORT failure, for an order where `nonblocking-dispatch.sh` was never invoked — while the
+    `claims-unreadable` count appeared nowhere (the stall loop runs only when NOTHING was dispatched,
+    and the `_peers` block covers only the peer tokens). Same shape #2291 and #4009 each split.
+
+    ⛔ NAMING THE MUTANT. Drop `- _claim_unread` from `placed_and_refused` in `_finish` and this test
+    goes RED at the `"no worker accepted" not in` assertion (the clause reappears, with 1); drop the
+    `if _claim_unread:` clause as well and it reddens at the token assertion instead.
+    """
+    unreadable = pr._ClaimHold("cross-box claim registry: verdict=claims-unreadable",
+                               token=pr.CLAIM_UNREADABLE_TOKEN)
+
+    def _dispatch(p, action, text, dry, *_rest):
+        if p["number"] == 2:
+            return (False, unreadable, False)
+        return (True, "spawned", False)
+
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "red", []),
+                                      dispatch=_dispatch)
+    # ⛔ rc 0, NOT 3: a pass that DELIVERED is not punished for an order it could not place (the
+    # `not dispatched` guard on every rc-3 arm is deliberate -- see
+    # `test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed`). The defect this
+    # row pins is the SENTENCE, and the sentence is now the only place the cause is named.
+    assert rc == 0, (rc, joined)
+    reason = payload.get("reason", "")
+    assert payload.get("dispatched") == 1, payload  # the pass DID deliver one order
+    assert "no worker accepted" not in reason, reason
+    assert "CLAIM REGISTRY could not answer" in reason, reason
+    assert "%s=1" % pr.CLAIM_UNREADABLE_TOKEN in reason, reason
+
+
+def test_a_pass_that_dispatched_and_stood_down_NAMES_the_peer_held_heads(monkeypatch):
+    """⛔ P2 (harness review of #4134): the ONLY report a dispatched-and-skipped pass has.
+
+    The stall counters are printed only when NOTHING went out, so on a pass that placed one order and
+    stood down from a claimed head, `_finish`'s `_peers` block is the sole surface naming the skip —
+    and a skip that says nothing is indistinguishable from a bug (the owner's 2026-11-17 decision).
+
+    ⛔ NAMING THE MUTANT. Delete the `_peers` block in `_finish` and NO row went red (measured by the
+    reviewer, and the reason this test exists). With it in place, this row is the one that does.
+    """
+    monkeypatch.setenv("MAX_FIX", "4")
+    monkeypatch.setenv("MAX_REVIEW", "4")
+    held = pr._ClaimHold("cross-box claim registry: verdict=holder-on-foreign-box",
+                         token="holder-on-foreign-box")
+
+    def _dispatch(p, action, text, dry, *_rest):
+        if p["number"] == 2:
+            return (False, held, False)
+        return (True, "spawned", False)
+
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "red", []),
+                                      dispatch=_dispatch)
+    assert rc == 0, joined                       # a peer holding a head is not a fault of this pass
+    assert payload.get("dispatched") == 1, payload
+    assert payload.get("prs") == [1], payload
+    assert "1 PR(s) SKIPPED -- a peer holds the head (holder-on-foreign-box=1)" \
+        in payload.get("reason", ""), payload
+
+
+def test_an_unreadable_registry_refuses_the_pass(monkeypatch):
+    """…but a registry this box cannot read IS a failed order, and 0 is reserved for a real pass.
+
+    ⛔ NAMING THE MUTANT. Drop the `undeliverable += 1` from the `claims-unreadable` arm and this
+    test goes RED (rc 0): a box that can see no claim on anything would report a clean pass while
+    placing no order at all -- the false PASS shape this file exists to remove.
+
+    ⛔ AND THE SENTENCE AND THE REMEDY NAME THE REGISTRY, NOT THE TRANSPORT (harness review of
+    #4134, P2). `no worker accepted` is a claim about `nonblocking-dispatch.sh`, which was never
+    invoked for an order the claim gate returned before, and `next=repair-chain` named that same
+    healthy chain from the verdict line; the first version of this row asserted both, so it pinned
+    the false remedy alongside the right exit code. The verdict is now its own token
+    (`CLAIM-UNREADABLE` / `next=repair-claim-registry`), the way #4009 split `RUBRIC`.
+    """
+    rc, reason = _drive_claim_pass(monkeypatch, pr.CLAIM_UNREADABLE_TOKEN)
+    assert rc == pr.EXIT_UNDELIVERED, (rc, reason)
+    assert "claims-unreadable=1" in reason, reason
+    assert "CLAIM REGISTRY could not answer" in reason, reason
+    assert "no worker accepted" not in reason, reason
+    # ⛔ AND THE REMEDY MUST SURVIVE THE BEAT'S 110-CHAR CUT, or the operator reads only the token.
+    assert "VERDICT=CLAIM-UNREADABLE" in reason, reason
+    assert "next=repair-claim-registry" in reason[:110], reason
+    assert "repair-chain" not in reason, reason
+
+
+def _drive_claim_pass(monkeypatch, token):
+    """One pass whose only PR is refused by the claim gate; returns (rc, recorded reason)."""
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(5)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_r: (False, pr._ClaimHold(
+                            "cross-box claim registry: verdict=%s" % token, token=token), False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    monkeypatch.setenv("MAX_FIX", "4")
+    monkeypatch.setenv("MAX_REVIEW", "4")
+    return pr.main(), (pr.LAST_PASS.get("reason") or "")
+
+
+def _registry_ceiling() -> int:
+    """`claims.sh`'s OWN `CLAIM_TTL_MAX`, read from the registry rather than re-typed here.
+
+    ⛔ THIS IS THE POINT OF THE HELPER. The first version of `CLAIM_LEASE_MAX_S` mirrored a number
+    from memory (9600) that the registry had MOVED (#4034 -> 43200), so every repair lease was
+    clamped 7 h 20 m inside the worker's own bound -- the duplicate-head hazard #2888 describes, and
+    the very defect #2557 removes. A test that re-types the ceiling cannot catch that; this one
+    asks the registry, so the day `claims.sh` moves again this goes red instead of the fleet.
+    """
+    out = subprocess.run(
+        ["bash", "-c", 'set -u; . "$1" >/dev/null 2>&1; printf "%s" "${CLAIM_TTL_MAX:-}"',
+         "-", str(_HARNESS / "claims.sh")],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0 and out.stdout.strip().isdigit(), (out.stdout, out.stderr)
+    return int(out.stdout.strip())
+
+
+def test_the_claim_lease_never_exceeds_the_keyings_ceiling(monkeypatch):
+    """The lease must be the worker's own term, and must not exceed the registry's real ceiling.
+
+    ⛔ MEASURED WHY THIS EXISTS (fresh-review finding, then reproduced against the shipped
+    `claims.sh`): `SPAWN_TIMEOUT_S` is 36000 s, so `backstop + pad` is 37200 s. An earlier version of
+    this file capped at 9600 s on the belief that the ceiling still was 9600 -- `claims.sh:249`
+    says `${CLAIM_TTL_MAX:-43200}`, moved by #4034 exactly so the fixer's 37200 s lease is not
+    clamped. Measured mutation: with the 9600 cap, `claim_lease()` is 9600 s = 2 h 40 m, so the
+    claim of a live repair lane expires 7 h 20 m INSIDE that lane's own 21600 s of headroom -- a
+    peer takes the head while the first box is still working it, which is bug #2557 itself.
+    """
+    for k in (pr.CLAIM_LEASE_ENV, pr.CLAIM_LEASE_MAX_ENV):
+        monkeypatch.delenv(k, raising=False)
+    ceiling = _registry_ceiling()
+    assert pr.claim_lease() == min(pr.SPAWN_TIMEOUT_S + pr.CLAIM_LEASE_PAD_S,
+                                   pr.CLAIM_LEASE_MAX_S)
+    assert pr.claim_lease() <= ceiling, (
+        "the lease (%s) exceeds claims.sh's CLAIM_TTL_MAX (%s) -- the mint would be clamped, and a "
+        "claim expiring under a live worker hands the head to a peer" % (pr.claim_lease(), ceiling))
+    assert pr.claim_lease() >= pr.SPAWN_TIMEOUT_S, (
+        "the lease must cover the worker's own backstop (%s) -- a shorter one expires under a live "
+        "lane, which is the duplicate this gate exists to prevent" % pr.SPAWN_TIMEOUT_S)
+    # a SHORTER explicit lease is honoured (an operator may know the work is small)…
+    monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "1800")
+    assert pr.claim_lease() == 1800
+    # …a typo never shortens it, and never unbinds it
+    monkeypatch.setenv(pr.CLAIM_LEASE_ENV, "not-a-number")
+    assert pr.claim_lease() == min(pr.SPAWN_TIMEOUT_S + pr.CLAIM_LEASE_PAD_S,
+                                   pr.CLAIM_LEASE_MAX_S)
+    # the ceiling itself is a seam, so a box that raised CLAIM_TTL_MAX can raise it in step
+    monkeypatch.setenv(pr.CLAIM_LEASE_MAX_ENV, "20000")
+    assert pr.claim_lease() == 20000
+    # ⛔ AND THE MIRRORED DEFAULT IS THE REGISTRY'S, not a number this file likes the look of.
+    monkeypatch.delenv(pr.CLAIM_LEASE_MAX_ENV, raising=False)
+    assert pr.CLAIM_LEASE_MAX_S == ceiling, (
+        "CLAIM_LEASE_MAX_S (%s) has DRIFTED from claims.sh's CLAIM_TTL_MAX (%s) -- re-read the "
+        "coupling note in pr-doctor.py before changing either" % (pr.CLAIM_LEASE_MAX_S, ceiling))
+
+
+def test_every_claim_token_is_from_the_published_closed_set():
+    """The mapping may only emit words `docs/ops/fleet-liveness.md` publishes (no seventh token)."""
+    sys.path.insert(0, str(_REPO / "tools" / "fleet"))
+    try:
+        import liveness  # noqa: WPS433 -- the published vocabulary, read from its owner
+    finally:
+        sys.path.pop(0)
+    assert set(pr.CLAIM_TOKENS) == set(liveness.CLAIM_REASONS)
+    assert set(pr.CLAIM_PEER_TOKENS) < set(liveness.CLAIM_REASONS)
+    assert pr.CLAIM_UNREADABLE_TOKEN in liveness.CLAIM_REASONS
+
 
 
 def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
@@ -3678,8 +4478,15 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     assert "REFUSING" not in joined, joined  # …but the pass is not a refusal
 
 
-def _refused_pass(monkeypatch, detail, logs=None):
-    """Drive ONE `main()` pass whose only order is refused with `detail` (the real shapes)."""
+def _refused_pass(monkeypatch, detail, logs=None, written=None):
+    """Drive ONE `main()` pass whose only order is refused with `detail` (the real shapes).
+
+    ⛔ PASS `written` WHEN THE ROW CLAIMS "NO COOLDOWN ROW WAS WRITTEN" (harness review of #4134,
+    F2). `save_state` is stubbed to a no-op by default so a row cannot touch disk, but that also
+    makes any `load_state() == {}` assertion VACUOUS: both the reader and the writer are replaced,
+    so nothing the code under test does can change the answer. A row that means to prove "nothing
+    was consumed" must capture what `run_pass()` actually handed the writer.
+    """
     logs = [] if logs is None else logs
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40)])
@@ -3687,7 +4494,12 @@ def _refused_pass(monkeypatch, detail, logs=None):
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "log", logs.append)
-    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    if written is None:
+        monkeypatch.setattr(pr, "save_state", lambda st: None)
+    else:
+        # A COPY per call: the real `save_state` mutates `st` (`_updated`), and one dict object
+        # appended twice would show only its FINAL contents.
+        monkeypatch.setattr(pr, "save_state", lambda st: written.append(dict(st)))
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (False, detail, False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -5975,7 +6787,7 @@ def test_a_stale_sibling_objective_is_a_RECORDED_refusal(tmp_path):
 # unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
 
 def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("pr-doctor.py",),
-                state=None, live=False):
+                state=None, live=False, dispatch=None):
     """Run one pass against a synthetic world; return (rc, joined log, status payload).
 
     ⛔ THE TRANSPORT IS THE WORKER ONE (#1890): `dispatch(pr, action, text, dry)` returns
@@ -6002,8 +6814,14 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
-                                              else (False, "dispatcher exited rc=78", False)))
+                        # ⛔ A CALLABLE LETS ONE PASS CARRY DIFFERENT OUTCOMES PER PR. Without it
+                        # every PR in a pass shares one `launched` verdict, so the dispatched-
+                        # AND-skipped pass -- the only shape that reaches `_finish`'s `_peers`
+                        # block -- could not be built by this helper at all (P2, harness review of
+                        # #4134: that block had no test, and deleting it reddened nothing).
+                        dispatch if dispatch is not None else
+                        (lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
+                                              else (False, "dispatcher exited rc=78", False))))
     monkeypatch.setattr(pr, "log", logs.append)
     # The repo-resolution tests are their OWN section; every other pass test names the repo it
     # grades so it keeps testing the thing it is about (a pass with no resolvable repo now REFUSES
@@ -8050,7 +8868,9 @@ def test_a_rubric_refusal_is_its_OWN_verdict_and_never_blames_the_dispatch_chain
 
     Fails on the pre-#4009 tree: the same pass printed `VERDICT=UNDELIVERED next=repair-chain`.
     """
-    rc, joined = _refused_pass(monkeypatch, pr.rubric_refusal_note("no rubric declared for o/r"))
+    written = []
+    rc, joined = _refused_pass(monkeypatch, pr.rubric_refusal_note("no rubric declared for o/r"),
+                               written=written)
     side = json.loads(pathlib.Path(pr.STATUS).read_text())
 
     # 1. THE REFUSAL IS PRESERVED (#3105). Not 0, not "nothing to do".
@@ -8067,8 +8887,12 @@ def test_a_rubric_refusal_is_its_OWN_verdict_and_never_blames_the_dispatch_chain
     # 4. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT (`objective.py::pr_doctor_last_run`).
     assert "next=supply-rubric" in side["reason"][:110], side["reason"]
     # 5. No cooldown, no budget slot: a rubric refusal consumed nothing, so a row here would hold a
-    #    real 45-minute cooldown for work that never ran.
-    assert pr.load_state() == {}, pr.load_state()
+    #    real 45-minute cooldown for work that never ran. ⛔ PROVED ON THE WRITER, NOT ON A STUBBED
+    #    READER (the vacuity the harness review of #4134 found in the no-checkout row, which copied
+    #    THIS shape): `written` is what `run_pass()` actually handed `save_state`.
+    assert written, "the pass must still persist its state for this proof to mean anything"
+    for st in written:
+        assert set(st) <= {"_updated"}, f"a rubric refusal must write NO row: {st!r}"
 
 
 def test_a_broken_chain_is_NAMED_BY_RESOLVED_PATH_and_never_left_to_the_reader(monkeypatch, tmp_path):
