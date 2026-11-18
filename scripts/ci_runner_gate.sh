@@ -362,7 +362,16 @@ FALLBACK_LABEL="ubuntu-latest"
 # those two readings attached to daniel-ospina/tortoise#9878; drop it if either regresses. A value of 0 (or any
 # cap that resolves to no runner on a non-empty pool) means the fallback is DISARMED: the pool is
 # released and the engaging pass refuses, rather than reporting a successful engage carrying nothing.
-FALLBACK_ARM_MAX="${CI_GATE_FALLBACK_ARM_MAX:-3}"
+# ⛔ DEFAULT `all`, NOT 3 (owner ruling 2026-11-18, agent-infra#4085). The fleet runs 23 runners across
+# machines as PAID CAPACITY; a default of 3 barred 20 idle x64 runners from `ubuntu-latest` by CAP
+# rather than by capability — the #2589 symptom reproduced by design (measured:
+# `set_labels runner=28/29/30`, the three lowest ids, all ARM64, while 20 x64 sat idle and ~250 runs
+# queued). The containment pair this block used to require before raising the bound now gates a
+# CHANGE TO THE BOUND, not the shipped default.
+# OVERRIDES: the #2327 blast-radius cap of 3 — a fallback pulls CI onto boxes that then contend with
+# their other work, and this fleet accepts that trade to use the hardware it pays for. The
+# strip-in-`mode=github` half of #2327 is untouched.
+FALLBACK_ARM_MAX="${CI_GATE_FALLBACK_ARM_MAX:-all}"
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
 # architectures, and each runner carries the marker for ITS OWN: `ARM64` runners keep
 # `self-hosted-arm64`, `X64` runners keep `self-hosted-x64`. Writing one pool-wide body to every
@@ -1832,7 +1841,14 @@ arm_ids() { # $1 = rows, $2 = on|off
   done <<<"$rows"
   # A cap that is not a number would make the cap read as no cap — the bound fail-OPEN, the one
   # direction a blast-radius cap must never fail. Refuse the pass instead.
-  case "$FALLBACK_ARM_MAX" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `all` IS AN EXPLICIT VALUE, NOT "THE CAP COULD NOT BE READ" (owner ruling 2026-11-18). The
+  # fail-closed rule that mattered is preserved: anything that is neither `all` nor a number is still
+  # REFUSED, so a typo can never silently mean "no cap". The DISARM direction (`arm_ids <rows> off`)
+  # is unrelated and still uncapped by design.
+  case "$FALLBACK_ARM_MAX" in
+    all) printf '%s\n' $ids | awk '!seen[$0]++' | sort -n; return $? ;;
+    ''|*[!0-9]*) return 1 ;;
+  esac
   # ⛔ `awk NR<=n`, NOT `head -n n` (review P1). `head` exits the pipeline early, so on the launchd
   # host's BSD `head` a cap of 0 exits 1 and — under `set -uo pipefail` — reports "bound UNREADABLE"
   # for a LEGAL value, while on GNU `head` the same 0 yields an empty arm and a SUCCESSFUL "engage"
