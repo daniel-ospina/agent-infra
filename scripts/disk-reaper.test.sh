@@ -2139,6 +2139,37 @@ OUT="$(inst55 --install 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58 an escaped quote parses, so the mismatch refused is the VALUE (not a parse error)"
 assert_absent "$OUT" "cannot evaluate" "T58 ... and the refusal does not blame the parser for a legal line"
 rm -f "$T/t55/units/eldato-disk-reaper.service.d/75-escaped.conf"
+# ⛔ AND A DIRECTIVE THAT MOVES THE ENVIRONMENT BEHIND `Environment=` IS NOT A VERIFIED HOME (round-2
+# re-review, F1/F3 — the drainer's --status was MEASURED at rc 0 through both). `EnvironmentFile=` is the
+# LATER source in systemd.exec(5)'s precedence list, so its variables OVERRIDE `Environment=`, and a
+# C-style escape or a `%`-specifier rewrites a NAME. This read-back compiles `Environment=` and nothing
+# else, so it would print "verify: … read back" over a service whose HOME `gh` never sees — the same
+# false PASS the `!unparseable:` arm above removes, one construct over. The list is the shared lib's, so
+# both installers inherit ONE definition of what systemd compiles.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/76-envfile.conf" <<DROPIN
+[Service]
+EnvironmentFile=/tmp/tmp.deadbeef/bg/home/.pi/agent/state/gh.env
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a drop-in that sets EnvironmentFile= is refused, not verified as a HOME"
+assert_contains "$OUT" "BEHIND the" "T58 ... and the refusal names the class (a directive applied over Environment=)"
+assert_contains "$OUT" "EnvironmentFile=" "T58 ... and quotes the directive it found"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/76-envfile.conf"
+# ...and the raw-text spelling of the same class: `Environment=\\x48OME=…` is `HOME=…` to systemd
+# (systemd.syntax(7): `\\x48` is `H`) and an unknown name to every reader here, so it must refuse too.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/77-escape.conf" <<'DROPIN'
+[Service]
+Environment=\x48OME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a C-style escape in an Environment= line is refused (it can spell HOME)"
+assert_contains "$OUT" "x48OME" "T58 ... and quotes the line it could not certify"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/77-escape.conf"
+# Positive control: the SAME install is clean once those drop-ins are gone, so the two refusals above are
+# about the artifact and not about a second install on this fixture.
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 ... and removing them restores a clean install (the gate is about the artifact)"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T58 ... verified, not skipped"
 # gh resolvability is REPORTED, never assumed: with no gh on the rendered PATH the worktree class
 # fails closed every pass, and the operator must see that at install time.
 # ASK THE QUESTION IN THE ENVIRONMENT UNDER TEST. `command -v gh` in the suite's own shell answers

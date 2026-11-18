@@ -176,9 +176,25 @@ test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => 
 });
 
 test("implicit no-dir → exit 0 (consumer repos without a skills tree)", () => {
-  const r = runLint([], os.tmpdir());
-  assert.equal(r.status, 0);
-  assert.match(r.stdout, /No skills directory found/);
+  // Hermetic: a FRESH unique dir, never os.tmpdir() itself. The shared temp root is
+  // ambient state — on the self-hosted runner a leftover `<tmp>/skills` from another
+  // job made the implicit resolution SUCCEED, so this arm read "0 SKILL.md files
+  // checked" instead of the no-directory message and `ci / unit-test` went red at
+  // #4116's head while the same suite was green on a clean box (measured 2026-11-17).
+  // Node's documented practice is a unique subdirectory per `fs.mkdtemp` (fs docs).
+  //
+  // The two fixes for this landed independently (#4103, #4116) and agree on the cause and the
+  // mechanism; this merge keeps main's wording and adds #4103's `try/finally` so the unique dir is
+  // also REMOVED — one `mkdtemp` per run that is never cleaned is a slow leak on a long-lived runner,
+  // and a temporary test dir must not become host state in the very test that exists to avoid it.
+  const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), "skill-lint-empty-"));
+  try {
+    const r = runLint([], emptyCwd);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /No skills directory found/);
+  } finally {
+    fs.rmSync(emptyCwd, { recursive: true, force: true });
+  }
 });
 
 // ── (d) the exact O/I case ──────────────────────────────────────────────────

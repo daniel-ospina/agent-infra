@@ -938,7 +938,7 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # legacy volatile home) or `/home/cmux` as a default, so a farm that omitted this file would leave
 # every consumer on its named `$HOME` fallback — and, worse, would leave the RESOLVER absent while the
 # consumers that source it look healthy. Farm it with them.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh systemd-unit-parse.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0

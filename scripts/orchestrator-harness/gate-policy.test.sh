@@ -346,6 +346,769 @@ else
   skip "behavioural: extensions/review-enforcer/index.test.ts NOT run here — @earendil-works/pi-coding-agent is not installed in a fresh worktree (no node_modules); CI installs it, and the wiring arm above asserts the step exists"
 fi
 
+# ── 5. NO SCHEDULED-JOB DECLARATION MAY CARRY THE HATCH (agent-infra#4002) ─────────────────────
+# §1-4 grade what a CARRIER does to its own process. This one grades the OTHER route the hatch takes:
+# a unit/service/plist whose `Environment=`/`EnvironmentVariables` sets it, which hands the hatch to
+# every process the job ever spawns and which no spawned lane can undo. The measured case (#4002) was a
+# cell's drainer started by a hand-written wrapper exporting all four flags — an UNATTENDED dispatcher
+# with the review gate, the verification gate and hub-discipline off.
+# ⛔ WHY THIS IS A TEMPLATE CENSUS **AND** A RENDER: the templates are clean today, so a
+# templates-only grep is a green that cannot fail until someone reintroduces the line — and the line can
+# also arrive from a SUBSTITUTION, which only the rendered bytes show. So the arms are: every shipped
+# declaration (census), the bytes the installer would actually install (render), and a MUTANT the grader
+# must REFUSE (discrimination). Without the mutant, a scan whose regex silently stopped matching would
+# still print PASS.
+echo
+echo "== unit declarations (#4002) =="
+# ⛔ DECLARATIONS THAT LIVE *OUTSIDE* `templates/` ARE SHIPPED DECLARATIONS TOO (fresh code review of PR
+# #4020 at `4f9ff9b3e`, P2). The root set used to be `templates/` only, so
+# `scripts/orchestrator-harness/launchd.plist.template` — which `install.sh` renders into
+# `~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`, an `EnvironmentVariables` dict whose own
+# comment says "a pin placed here reaches every lane on the box" — was graded by NOTHING while the header
+# claimed every shipped declaration was. The sweep below is tree-wide (depth 2, which is where this repo's
+# declarations live) rather than a hand-listed file, so the NEXT one is graded without anyone remembering
+# to extend a list. ⛔ THE COMMENT LIVES OUT HERE, NOT INSIDE THE SUBSTITUTION: a `(` or an unbalanced
+# quote inside a `$( … )` body desynchronises the bash 3.2 scanner and the file stops parsing on the
+# platform the harness actually runs (`scripts/check-bash32-parse.sh`, #2930) — measured on this very
+# block, which is why it reads as prose above the assignment.
+DECL_LIST="$( { ls "$REPO"/templates/systemd/*.service "$REPO"/templates/systemd/*.timer 2>/dev/null
+               find "$REPO/templates/launchd" -name '*.plist' -type f 2>/dev/null
+               find "$REPO/scripts" -maxdepth 2 -type f \
+                    \( -name '*.plist' -o -name '*.plist.template' -o -name '*.service' -o -name '*.timer' \) 2>/dev/null; } | LC_ALL=C sort )"
+DECL_SEEN=0; DECL_VETOED=""; DECL_SEEN_REL=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  DECL_SEEN=$((DECL_SEEN+1))
+  DECL_SEEN_REL="$DECL_SEEN_REL ${f#"$REPO"/}"
+  bash "$POLICY" --unit-veto "$f" "${f#"$REPO"/}" >/dev/null 2>&1 \
+    || DECL_VETOED="$DECL_VETOED ${f#"$REPO"/}"
+done <<EOF
+$DECL_LIST
+EOF
+# ⛔ COVERAGE IS COMPARED AGAINST GIT'S INDEX, NOT AGAINST THIS ARM ITSELF (fresh review of PR #4020,
+# note a). The first version compared `DECL_SEEN` (incremented per non-empty line of `$DECL_LIST`) with
+# `DECL_FILES` (`grep -c .` of the SAME lines) — two counts of one list, so it was TRUE BY CONSTRUCTION and
+# could never be the reason this arm reddens, while the comment and the PR body read as a coverage check.
+# Git is a genuinely SECOND source, and it catches the hole the counters could not see:
+# `ls templates/systemd/*.service` does not descend, while git's pathspec does — so a future
+# `templates/systemd/<sub>/*.service` would be graded by NOTHING and this arm would have reported PASS.
+DECL_TRACKED="$(git -C "$REPO" ls-files 'templates/systemd/*.service' 'templates/systemd/*.timer' \
+                 'templates/launchd/*.plist' 'templates/launchd/**/*.plist' \
+                 'scripts/*.plist' 'scripts/*.plist.template' 'scripts/*.service' 'scripts/*.timer' \
+                 'scripts/*/*.plist' 'scripts/*/*.plist.template' 'scripts/*/*.service' 'scripts/*/*.timer' 2>/dev/null | LC_ALL=C sort -u)"
+DECL_TRACKED_N="$(printf '%s\n' "$DECL_TRACKED" | sed '/^$/d' | grep -c . || true)"
+DECL_SEEN_SORTED="$(printf '%s\n' "$DECL_SEEN_REL" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+DECL_MISSED="$(comm -13 <(printf '%s\n' "$DECL_SEEN_SORTED") <(printf '%s\n' "$DECL_TRACKED" | sed '/^$/d') | tr '\n' ' ')"
+# NON-VACUITY FIRST: an empty scan is never a clean scan, and a scan that cannot see the index cannot
+# claim coverage — `git` failing here is RED, because "I could not cover the tree" is not "I covered it".
+[ "$DECL_SEEN" -gt 0 ] && [ "$DECL_TRACKED_N" -gt 0 ] && [ -z "$DECL_MISSED" ] \
+  && ok "(5a) census: graded $DECL_SEEN of the $DECL_TRACKED_N declarations git tracks under templates/ (nothing missed)" \
+  || bad "(5a) census: graded $DECL_SEEN declaration(s) against $DECL_TRACKED_N tracked by git — MISSED:$DECL_MISSED (the glob is not the tree)"
+[ -z "$DECL_VETOED" ] \
+  && ok "(5a) census: none of the $DECL_SEEN declarations names a gate-bypass flag in its environment" \
+  || bad "(5a) census: a shipped declaration hands the hatch to everything it spawns:$DECL_VETOED"
+# ⛔ AND THE FILE THAT WAS INVISIBLE IS NAMED, not just counted (fresh code review of PR #4020 at
+# `4f9ff9b3e`, P2). `scripts/orchestrator-harness/install.sh` renders
+# `scripts/orchestrator-harness/launchd.plist.template` into the macOS controller loop's LaunchAgent — an
+# unattended dispatcher — and it lives under `scripts/`, so the first root set could not see it at all. A
+# sweep that slips by one file is a count a reader cannot act on, so the file itself is asserted here as
+# well as covered by the two sets above.
+if grep -qx 'scripts/orchestrator-harness/launchd.plist.template' <<<"$DECL_SEEN_SORTED"; then
+  ok "(5a) census: the macOS controller plist template (scripts/orchestrator-harness/launchd.plist.template) IS graded — a declaration under scripts/ is no longer invisible"
+else
+  bad "(5a) census: scripts/orchestrator-harness/launchd.plist.template is NOT in the graded set — an EnvironmentVariables hatch on the controller loop would install with no refusal while this arm printed PASS"
+fi
+
+# (5b) THE RENDERED UNIT — the bytes the installer would put on a box, not the template.
+INST="$HERE/install-drainer-timer.sh"
+RD="$TMP/render"; mkdir -p "$RD/bin"
+cat >"$RD/bin/systemctl" <<'RD_SC'
+#!/bin/sh
+case "$*" in *is-active*) echo active ;; esac
+exit 0
+RD_SC
+chmod +x "$RD/bin/systemctl"
+RD_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$RD/units" DRAINER="$HERE/ai-drainer.sh" \
+         DRAINER_STATE="$RD/state" DRAINER_O="$RD" bash "$INST" --dry-run 2>&1)"; RD_RC=$?
+printf '%s\n' "$RD_OUT" >"$RD/rendered.txt"
+# The render must have HAPPENED, or the veto below is grading an error message.
+grep -q '^[[:space:]]*ExecStart=' "$RD/rendered.txt" && [ "$RD_RC" -eq 0 ] \
+  && ok "(5b) render: install-drainer-timer.sh --dry-run produced a real unit (ExecStart present)" \
+  || bad "(5b) render: --dry-run produced no ExecStart (rc=$RD_RC) — the arm below would grade nothing"
+bash "$POLICY" --unit-veto "$RD/rendered.txt" "rendered eldato-ai-drainer.service" >"$RD/veto.log" 2>&1 \
+  && ok "(5b) render: the RENDERED drainer unit carries no gate-bypass Environment= entry" \
+  || bad "(5b) render: the RENDERED drainer unit carries a bypass: $(head -1 "$RD/veto.log")"
+
+# (5c) MUTATION — inject the measured wrapper's hatch into a copy of the template and require the
+# install to REFUSE (and to say which flag), and the census to redden on the same file.
+MUT="$TMP/mutant"; mkdir -p "$MUT/tpl"
+cp "$REPO/templates/systemd/eldato-ai-drainer.service" "$MUT/tpl/"
+cp "$REPO/templates/systemd/eldato-ai-drainer.timer" "$MUT/tpl/"
+printf 'Environment=AGENT_SKIP_REVIEW_GATE=1\n' >>"$MUT/tpl/eldato-ai-drainer.service"
+bash "$POLICY" --unit-veto "$MUT/tpl/eldato-ai-drainer.service" mutant >/dev/null 2>&1; MUT_VETO=$?
+[ "$MUT_VETO" -eq 1 ] \
+  && ok "(5c) mutation: the census VETOES a declaration carrying AGENT_SKIP_REVIEW_GATE=1 (rc=1)" \
+  || bad "(5c) mutation: the census did not veto the injected hatch (rc=$MUT_VETO) — its scan cannot discriminate"
+MUT_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$MUT/units" TEMPLATES_DIR="$MUT/tpl" \
+           DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$MUT/state" DRAINER_O="$MUT" \
+           bash "$INST" 2>&1)"; MUT_RC=$?
+[ "$MUT_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$MUT_OUT" \
+  && ok "(5c) mutation: the INSTALLER REFUSES it and names the flag (rc=$MUT_RC)" \
+  || bad "(5c) mutation: the installer installed a bypassing unit (rc=$MUT_RC): $(printf '%s' "$MUT_OUT" | tail -1)"
+[ ! -f "$MUT/units/eldato-ai-drainer.service" ] \
+  && ok "(5c) mutation: …and nothing was written to the unit dir (a refused install leaves no artefact)" \
+  || bad "(5c) mutation: a refused install still wrote $MUT/units/eldato-ai-drainer.service"
+
+# (5c2) THE MISSING-JUDGE REFUSAL, and it must be the RIGHT refusal (fresh review of #4002, P2). This is
+# the one guard in the installer whose WHOLE point is the fail-closed answer when the CHECKER is absent, and
+# nothing exercised it: delete the preflight and every other arm stays green. ⛔ The two states are
+# distinguishable and it matters which one an operator gets — WITHOUT the preflight the install still stops,
+# but `bash ""` exits 127 and `if ! bash "$GP_GUARD" …` reports a GATE BYPASS it never found, i.e. a wrong
+# diagnosis for a missing checker.
+# ⛔ AND THE FIXTURE MUST LET THE RUN REACH `render()`, OR THIS WHOLE ARM IS A CONSTANT (fresh review of
+# PR #4020, finding 1's second half — measured). `DRAINER_O` is checked at `:262`, AFTER the judge
+# preflight and BEFORE `render()`; the first version of this fixture never created `$MG`, so the run died on
+# `DRAINER_O=... does not exist` with the preflight present OR ABSENT. Every (5c2) arm was therefore green
+# in both states for a reason that had nothing to do with the judge — the same permanently-passing row the
+# arm exists to prevent, one layer down. Creating the dirs is what makes the two states distinguishable and
+# the mutation below meaningful: with the preflight gone, control now reaches `render()` → `bash ""` exits
+# 127 → the installer prints its GATE-BYPASS message it never found.
+MG="$TMP/nogr"; mkdir -p "$MG" "$MG/state"
+MG_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$MG/units" DRAINER="$HERE/ai-drainer.sh" \
+          DRAINER_STATE="$MG/state" DRAINER_O="$MG" GP_GUARD=/nonexistent/absent.sh \
+          bash "$INST" 2>&1)"; MG_RC=$?
+[ "$MG_RC" -ne 0 ] && grep -q 'gate-policy.sh not found' <<<"$MG_OUT" \
+  && ok "(5c2) install path: an unresolvable JUDGE refuses by name — 'cannot vet' is never a silent install" \
+  || bad "(5c2) install path: a missing judge answered rc=$MG_RC · $(printf '%s' "$MG_OUT" | tail -1)"
+# ⛔ `GATE.BYPASS` — A DOT, NOT EITHER SPELLING (fresh review of PR #4020, finding 1). The two files that
+# emit this phrase disagree on it: `gate-policy.sh:146` says `GATE BYPASS` (SPACE) and
+# `install-drainer-timer.sh:209` says `GATE-BYPASS` (HYPHEN) — and the hyphen form is the ONE reachable
+# here, because `GP_GUARD=/nonexistent/absent.sh` means `gate-policy.sh` never runs at all. This arm used
+# to grep the SPACE form, so it was GREEN in BOTH states and pinned nothing — a permanently-passing row
+# whose whole reason for existing is the state where the preflight is gone. A `.` matches either
+# spelling, so the two files can never drift apart into a green that reads as coverage.
+# Measured: with the `--install | --dry-run` preflight deleted from the installer, this arm printed PASS
+# before the fix and prints FAIL (naming the phantom bypass) after it.
+grep -q 'GATE.BYPASS' <<<"$MG_OUT" \
+  && bad "(5c2) install path: a missing judge was reported as a GATE BYPASS/GATE-BYPASS it never found — wrong diagnosis" \
+  || ok "(5c2) install path: …and it does NOT claim a bypass it could not have seen"
+[ ! -f "$MG/units/eldato-ai-drainer.service" ] \
+  && ok "(5c2) install path: …and nothing is written (an unvetted unit is not a clean one)" \
+  || bad "(5c2) install path: a refused install still wrote $MG/units/eldato-ai-drainer.service"
+# ⛔ (5c3) A PRESENT-BUT-STALE OR UNGRADABLE JUDGE IS A REFUSAL, BUT NOT A BYPASS ACCUSATION (fresh review
+# of PR #4020, P3). The preflight above only tests `-f`, so two OTHER answers reach `render()` and both used
+# to be reported as "the rendered unit carries a GATE-BYPASS Environment= entry (named above)" — with
+# NOTHING named above, because the judge never graded anything:
+#   * rc 64 — a `gate-policy.sh` that PREDATES `--unit-veto` (a stale farmed/ambient copy, which the
+#     resolver above accepts). Reachable on a box whose `AGENT_INFRA_PATH` points at an old checkout.
+#   * rc 2  — the judge could not grade the rendered bytes.
+# The verdict is fail-closed either way, so this is a wrong-DIAGNOSIS defect (the operator is told to hunt a
+# hatch that no line in the unit names). Ported from the sibling installer's T13, which pins the same split;
+# the two installers' refusals are the same refusal and must not tell two different stories about it.
+# Both arms REDDEN on the pre-fix installer: it printed the GATE-BYPASS accusation for both, and neither of
+# the two cause-specific sentences existed at all.
+for _jcase in stale ungradable; do
+  JD="$TMP/judge-$_jcase/run"; mkdir -p "$JD/state" "$TMP/judge-$_jcase"
+  if [ "$_jcase" = stale ]; then
+    # A judge from BEFORE the flag: anything but `--probe` is a usage error (rc 64), exactly as an older
+    # copy of this repo answers.
+    printf '#!/usr/bin/env bash\ncase "${1:-}" in --probe) printf "review_satisfiable=0 vgate_satisfiable=0 missing=- note=-\\n"; exit 1 ;; esac\nprintf "usage: gate-policy.sh --probe\\n" >&2\nexit 64\n' \
+      >"$TMP/judge-$_jcase/gate-policy.sh"
+  else
+    # A judge that exists and is executable but cannot answer (rc 2 = ungradable).
+    printf '#!/usr/bin/env bash\nexit 2\n' >"$TMP/judge-$_jcase/gate-policy.sh"
+  fi
+  J_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$JD/units" TEMPLATES_DIR="$REPO/templates/systemd" \
+            DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$JD/state" DRAINER_O="$JD" \
+            GP_GUARD="$TMP/judge-$_jcase/gate-policy.sh" bash "$INST" 2>&1)"; J_RC=$?
+  [ "$J_RC" -ne 0 ] \
+    && ok "(5c3) install path: a $_jcase judge still REFUSES the install (fail-closed — an unvetted unit is never installed)" \
+    || bad "(5c3) install path: a $_jcase judge installed the unit anyway (rc=$J_RC) — the refusal is not fail-closed"
+  ! grep -q 'GATE.BYPASS' <<<"$J_OUT" \
+    && ok "(5c3) install path: …and does NOT accuse it of a GATE-BYPASS/GATE BYPASS it never found" \
+    || bad "(5c3) install path: a $_jcase judge was reported as a GATE-BYPASS/GATE BYPASS (false accusation): $(printf '%s' "$J_OUT" | grep -m1 'GATE.BYPASS')"
+  if [ "$_jcase" = stale ]; then
+    grep -q 'predates the flag' <<<"$J_OUT" \
+      && ok "(5c3) install path: a STALE judge names its own cause (rc 64 — a copy that predates --unit-veto)" \
+      || bad "(5c3) install path: a stale judge's refusal does not say the judge predates the flag — the operator is sent hunting a hatch instead: $(printf '%s' "$J_OUT" | tail -1)"
+  else
+    grep -q 'could not GRADE' <<<"$J_OUT" \
+      && ok "(5c3) install path: an UNGRADABLE judge names its own cause (rc 2 — nothing was graded)" \
+      || bad "(5c3) install path: an ungradable judge's refusal does not say it could not grade — the operator is sent hunting a hatch instead: $(printf '%s' "$J_OUT" | tail -1)"
+  fi
+  [ ! -f "$JD/units/eldato-ai-drainer.service" ] \
+    && ok "(5c3) install path: …and nothing is written (a $_jcase judge never certifies an install)" \
+    || bad "(5c3) install path: a $_jcase judge still wrote $JD/units/eldato-ai-drainer.service"
+done
+
+printf '[Service]\nEnvironment="O=/x ELDATO_SKIP_VGATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted.service"
+# ⛔ EXACTLY rc 1, NOT "non-zero" (fresh review of PR #4020, round 3; every sibling arm below asserts a
+# specific code). `&& bad || ok` accepted 2 (ungradable) and 64 (usage) as "vetoed", so this arm printed
+# PASS on the PRE-FIX tree — where `--unit-veto` does not exist and answers 64 — and it would still pass
+# if a regression made the quoted form ungradable. The one direction §5d exists to protect was the one it
+# could not see.
+QRC=0; bash "$POLICY" --unit-veto "$TMP/quoted.service" quoted >/dev/null 2>&1 || QRC=$?
+[ "$QRC" -eq 1 ] \
+  && ok "(5d) edges: a quoted multi-variable Environment= carrying a hatch IS vetoed (rc=1)" \
+  || bad "(5d) edges: a quoted multi-variable Environment= carrying ELDATO_SKIP_VGATE answered rc=$QRC (want 1) — not vetoed, or not gradeable"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE_DISABLED=1\nExecStart=/bin/true\n' >"$TMP/superset.service"
+bash "$POLICY" --unit-veto "$TMP/superset.service" superset >/dev/null 2>&1 \
+  && ok "(5d) edges: a LONGER name that only contains a hatch name is not vetoed (whole-word match)" \
+  || bad "(5d) edges: AGENT_SKIP_REVIEW_GATE_DISABLED=1 was vetoed — the match is a substring, not a name"
+# ⛔ A BACKSLASH-CONTINUED `Environment=` IS ONE DIRECTIVE (fresh review of #4002, P1 — reproduced as a
+# fail-open on the evidence head). systemd joins a line ending in an unescaped `\` with the following one
+# (`systemd.syntax(7)`), so this sets the hatch while every PHYSICAL line looks innocent:
+#     Environment=FOO=1 \
+#         AGENT_SKIP_REVIEW_GATE=1
+# The census answered CLEAN for it until the fold was added — in the census AND on the install path. This
+# arm is the regression guard, and it is the reason §5c's mutation had to move off a single physical line.
+printf '[Service]\nEnvironment=FOO=1 \\\n    AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/continued.service"
+bash "$POLICY" --unit-veto "$TMP/continued.service" continued >/dev/null 2>&1; CONT_RC=$?
+[ "$CONT_RC" -eq 1 ] \
+  && ok "(5d) edges: a BACKSLASH-CONTINUED Environment= carrying a hatch IS vetoed (one logical directive, not one physical line)" \
+  || bad "(5d) edges: a backslash-continued Environment= answered rc=$CONT_RC — the fold is gone and the census fails OPEN"
+# …and the fold must not create false positives in either direction: a clean continuation is clean, and a
+# WRAPPED COMMENT swallows its continuation exactly as systemd does (so the flag below is not a declaration).
+# ⛔ THE CONTINUATION LINE CARRIES A HATCH-SHAPED NAME ON PURPOSE (fresh review of #4002, P2). A fixture
+# whose value names no hatch at all (`BAR=2`) answers rc=0 under EVERY mutant — the judge could drop the
+# whole-word match, or veto any name it merely spots, and this arm still printed `ok`. `_DISABLED` is the
+# name that must NOT be graded: `-w` treats `_` as a word character, so this is a real over-block control
+# on a real continuation, and it reddens when the match degrades from a name to a substring.
+printf '[Service]\nEnvironment=FOO=1 \\\n    AGENT_SKIP_REVIEW_GATE_DISABLED=1\nExecStart=/bin/true\n' >"$TMP/cleancont.service"
+bash "$POLICY" --unit-veto "$TMP/cleancont.service" cleancont >/dev/null 2>&1 \
+  && ok "(5d) edges: a clean continuation whose value only CONTAINS a hatch name is still clean (a name, not a substring — and the fold is not matching everything)" \
+  || bad "(5d) edges: the continued superset name AGENT_SKIP_REVIEW_GATE_DISABLED was vetoed — the match is a substring, not a name"
+# ⛔ THIS ARM USED TO ASSERT THE DEFECT (fresh review of #4002, P1 — reproduced end-to-end: the hatch was
+# INSTALLED, `ai-drainer scheduled`, rc=0). It pinned "a comment line that wraps is folded too, so the
+# joined line still STARTS with `#`" — which is the opposite of systemd. `conf-parser.c:359-361` checks a
+# line's first non-blank character against `#;` and `continue`s BEFORE the escape scan, so a comment line
+# can never START a continuation: line 2 below is a live `Environment=` directive and systemd sets the
+# hatch. Requiring rc=1 here is the correct verdict; as written the arm would have RED a correct fix, and
+# the cheapest green for the next fixer would be to restore the fail-open.
+printf '[Service]\n# a comment wrapping \\\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/commentwrap.service"
+CW_RC=0; bash "$POLICY" --unit-veto "$TMP/commentwrap.service" commentwrap >/dev/null 2>&1 || CW_RC=$?
+[ "$CW_RC" -eq 1 ] \
+  && ok "(5d) edges: a WRAPPED COMMENT never starts a continuation — the line after it IS a declaration (systemd's rule), so it is vetoed" \
+  || bad "(5d) edges: a wrapped comment swallowed the declaration after it (rc=$CW_RC, want 1) — this is the fail-open the review reproduced"
+# ⛔ A COMMENT INSIDE A CONTINUATION DOES NOT CLOSE IT (fresh review of #4002, P1 — the fail-open direction).
+# `conf-parser.c:359-361` skips the comment line WITHOUT touching `continuation`, and `:372-387` then appends
+# the next real line to it, so this is ONE `Environment=` directive in which the hatch IS set
+# (`systemd.syntax(7)` `[Section C]`). The awk fold printed on the comment and ended the join, leaving the
+# hatch on a physical line that no longer started with `Environment=` — CLEAN, and the installer installed it.
+# All three comment spellings (`#`, `;`, and a multi-line block) are the same rule, so all three are graded.
+for cshape in hash semi block; do
+  case "$cshape" in
+    hash) note='# hatch deliberately disabled below' ;;
+    semi) note='; hatch deliberately disabled below' ;;
+    block) note='# first ignored line' ;;
+  esac
+  if [ "$cshape" = block ]; then
+    printf '[Service]\nEnvironment=FOO=1 \\\n# first ignored line\n; second ignored line\n    # third, indented\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/comment-inside.service"
+  else
+    printf '[Service]\nEnvironment=FOO=1 \\\n%s\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' "$note" >"$TMP/comment-inside.service"
+  fi
+  CIN_RC=0; bash "$POLICY" --unit-veto "$TMP/comment-inside.service" "comment-inside-$cshape" >/dev/null 2>&1 || CIN_RC=$?
+  [ "$CIN_RC" -eq 1 ] \
+    && ok "(5d) edges: a '$cshape' comment INSIDE a continued Environment= does not close it — the hatch on the next line IS set, so it is vetoed" \
+    || bad "(5d) edges: a '$cshape' comment inside a continuation ended the join (rc=$CIN_RC, want 1) — the hatch lands on a line that no longer starts with Environment="
+done
+# …and the BLANK line is the same trap with the opposite rule: a blank line is NOT a comment, so the pending
+# continuation ENDS there (`conf-parser.c:372-409` — the accumulator's last character is the space the `\`
+# became). Skipping it instead joins the FOLLOWING line into the previous directive, and
+# `ExecStart=/bin/true \` + (blank) + `Environment=<hatch>` is a hatch systemd DOES set — buried in an
+# `ExecStart=` the judge never extracts. This arm is what separates a faithful flush from the sibling
+# `logical_lines()` accumulator, which skips blank lines: substituting that convention verbatim answers CLEAN here.
+printf '[Service]\nExecStart=/bin/true \\\n\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\n' >"$TMP/blank-inside.service"
+BLK_RC=0; bash "$POLICY" --unit-veto "$TMP/blank-inside.service" blank-inside >/dev/null 2>&1 || BLK_RC=$?
+[ "$BLK_RC" -eq 1 ] \
+  && ok "(5d) edges: a BLANK line ends a pending continuation, so the Environment= after it is a live declaration — vetoed" \
+  || bad "(5d) edges: a blank line did not end the continuation (rc=$BLK_RC, want 1) — the next line was swallowed into ExecStart= and the hatch read CLEAN"
+# ⛔ ONLY AN UNESCAPED BACKSLASH CONTINUES (fresh review of #4002, P2 — the over-block direction, reproduced).
+# systemd's `escaped` flag is the PARITY of the trailing run (`conf-parser.c:389-399`), so `\\` ends the
+# line: this unit sets PATH with a literal backslash and mentions the hatch in a comment, and systemd reads
+# it as clean. The awk fold joined it anyway and VETOED it, i.e. the operator could not install a correct
+# unit.
+# ⛔ THIS PAIR PINS THE COMMENT RULE, NOT PARITY (fresh review of PR #4020, P2 — measured: BOTH arms stay
+# GREEN under a parity regression). In both fixtures the only hatch-shaped text is inside a COMMENT, and the
+# comment rule (:158-161) drops `#`/`;` lines regardless of parity before the trailing-run scan, so the
+# hatch never reaches the extraction whatever the parity branch does. They do discriminate — against the
+# comment rule — which is how round 8 measured them reddening under the pre-fix fold (that fold treated a
+# comment as content). What they cannot see is `gate-policy.sh:164-166`, the branch that decides CLEAN vs
+# VETO for every declaration whose environment ends in a backslash run. The PARITY DISCRIMINATOR pair below
+# is the arm for that, and it is the one that reddens when the parity test degrades to `>= 1`.
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped.service"
+bash "$POLICY" --unit-veto "$TMP/escaped.service" escaped >/dev/null 2>&1 \
+  && ok "(5d) edges: a line ending in an ESCAPED backslash does not continue, so its following COMMENT is not part of the declaration" \
+  || bad "(5d) edges: an escaped trailing backslash was joined with the next line — a clean unit is refused on the install path"
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped-twin.service"
+ESC_TWIN_RC=0; bash "$POLICY" --unit-veto "$TMP/escaped-twin.service" escaped-twin >/dev/null 2>&1 || ESC_TWIN_RC=$?
+[ "$ESC_TWIN_RC" -eq 0 ] \
+  && ok "(5d) edges: …and the ONE-backslash twin of that fixture is also clean (the comment is dropped, so no hatch reaches the declaration)" \
+  || bad "(5d) edges: the one-backslash twin answered rc=$ESC_TWIN_RC (want 0) — the comment rule no longer drops a commented mention"
+# ⛔ THE PARITY DISCRIMINATOR (fresh review of PR #4020, P2 — the pair above carried NO parity signal, and
+# this one is MEASURED to carry it). The hatch sits on a line of its OWN, not in a comment, so the ONLY
+# thing that can put it inside an `Environment=` directive is the join:
+#   correct (`\\` escaped -> the line ends):  the bare `AGENT_SKIP_REVIEW_GATE=1` line is an unknown key in
+#                                              [Service], it sets NOTHING  => CLEAN (rc 0)
+#   parity degraded (`>= 1` -> any trailing run joins): it becomes
+#                                              `Environment=PATH=/opt/bin\ AGENT_SKIP_REVIEW_GATE=1` => VETO (rc 1)
+# Measured both ways against a copy of the judge: rc 1 -> 0 under none, 0 -> 1 under the parity mutant.
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\\\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/parity-disc.service"
+PD_RC=0; bash "$POLICY" --unit-veto "$TMP/parity-disc.service" parity-disc >/dev/null 2>&1 || PD_RC=$?
+[ "$PD_RC" -eq 0 ] \
+  && ok "(5d) edges: an ESCAPED trailing backslash ends the line, so the hatch on the NEXT line is not part of the declaration — CLEAN (this is the arm the parity branch can redden)" \
+  || bad "(5d) edges: the escaped-backslash declaration was vetoed (rc=$PD_RC, want 0) — the fold joined a line systemd keeps whole, so the parity test is not reading parity"
+# …and its ONE-backslash twin is a REAL continuation, so the joined directive DOES name the hatch: this is
+# the control that the pair measures parity and not "the fold stopped folding" (that mutant leaves the arm
+# above green and reddens this one).
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/parity-disc-twin.service"
+PDT_RC=0; bash "$POLICY" --unit-veto "$TMP/parity-disc-twin.service" parity-disc-twin >/dev/null 2>&1 || PDT_RC=$?
+[ "$PDT_RC" -eq 1 ] \
+  && ok "(5d) edges: …and its ONE-backslash twin IS a continuation, so the joined declaration names the hatch and is vetoed" \
+  || bad "(5d) edges: the one-backslash parity twin answered rc=$PDT_RC (want 1) — the fold is gone and a hatch on a continued line reads CLEAN"
+# ⛔ A CRLF DECLARATION IS BYTE-IDENTICAL TO ITS LF TWIN TO systemd (fresh review of PR #4020, P2 —
+# reproduced: rc 0 at the reviewed head, 1 for the LF twin). `read_line` never appends the terminator
+# (`src/basic/fileio.c`: `categorize_eol` marks `\r` as an EOL; the append is on the `eol == EOL_NONE` path
+# only), so the escape scan sees the trailing `\` and joins. `bash read` splits on `\n` alone and keeps the
+# `\r`, so without the strip in the fold this unit read CLEAN while systemd set the hatch — the exact
+# fail-open class #4002 exists to close, and nothing else in the suite covers a CRLF fixture.
+printf '[Service]\r\nEnvironment=FOO=1 \\\r\n   AGENT_SKIP_REVIEW_GATE=1\r\n' >"$TMP/crlf.service"
+CRLF_RC=0; bash "$POLICY" --unit-veto "$TMP/crlf.service" crlf >/dev/null 2>&1 || CRLF_RC=$?
+[ "$CRLF_RC" -eq 1 ] \
+  && ok "(5d) edges: a CRLF declaration's backslash-continued Environment= IS joined (systemd drops the CR), so the hatch is vetoed" \
+  || bad "(5d) edges: the CRLF twin of the continued declaration answered rc=$CRLF_RC (want 1) — the fold kept the CR, so the parity scan saw no trailing backslash and the hatch read CLEAN"
+# …and the CR strip must not create an over-block of its own: the CRLF spelling of the ESCAPED fixture is
+# still clean, so a CRLF template cannot be refused for being CRLF.
+printf '[Service]\r\nEnvironment=PATH=/opt/bin\\\\\r\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\r\nExecStart=/bin/true\r\n' >"$TMP/crlf-clean.service"
+CRLFC_RC=0; bash "$POLICY" --unit-veto "$TMP/crlf-clean.service" crlf-clean >/dev/null 2>&1 || CRLFC_RC=$?
+[ "$CRLFC_RC" -eq 0 ] \
+  && ok "(5d) edges: …and a CRLF spelling of the ESCAPED fixture is still CLEAN (stripping the CR does not veto a CRLF template)" \
+  || bad "(5d) edges: the clean CRLF fixture answered rc=$CRLFC_RC (want 0) — the CR strip turned a CRLF unit into a false positive"
+# ⛔ A CR-ONLY FILE IS A NORMAL MULTI-LINE FILE TO systemd (fresh code review of PR #4020 at `4f9ff9b3e`,
+# P3 — REPRODUCED as a fail-open: rc 0 while the hatch was live). `categorize_eol` classifies `\r` as an EOL
+# (`src/basic/fileio.c` — `EOL_THIRTEEN`), so systemd reads `[Service]` and
+# `Environment=AGENT_SKIP_REVIEW_GATE=1` as TWO lines; `bash read` splits on `\n` only, so the fold used to
+# see ONE line starting with `[Service]` and never extracted the declaration at all. The hatch is on a line
+# of its OWN — no continuation and no comment — which is what makes this a real discriminator rather than a
+# second spelling of an arm that already exists.
+printf '[Service]\rEnvironment=AGENT_SKIP_REVIEW_GATE=1\rExecStart=/bin/true\r' >"$TMP/cronly.service"
+CRONLY_RC=0; bash "$POLICY" --unit-veto "$TMP/cronly.service" cronly >/dev/null 2>&1 || CRONLY_RC=$?
+[ "$CRONLY_RC" -eq 1 ] \
+  && ok "(5d) edges: a CR-ONLY declaration's Environment= line IS a declaration (a lone \\r is an EOL to systemd) — vetoed" \
+  || bad "(5d) edges: the CR-only declaration answered rc=$CRONLY_RC (want 1) — the file is read as ONE line, so a hatch on any line but the first is invisible"
+# …and its clean twin must stay clean: a CR-only file must not be refused for being CR-only.
+printf '[Service]\rEnvironment=PATH=/opt/bin\rExecStart=/bin/true\r' >"$TMP/cronly-clean.service"
+bash "$POLICY" --unit-veto "$TMP/cronly-clean.service" cronly-clean >/dev/null 2>&1 \
+  && ok "(5d) edges: …and a CR-only declaration with no hatch is still CLEAN (the split does not veto a CR-only file)" \
+  || bad "(5d) edges: the clean CR-only fixture was vetoed — the CR split turned a valid declaration into a false positive"
+# …and the LAUNCHD half of the grader must be able to REDDEN (fresh review of #4002, P2). 5a passes if the
+# `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
+# "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the
+# template: the census above grades the real ones.
+# ⛔ THE MUTATION CARRIES A VALUE TOO (`<string>1</string>`), and without it the arm is VACUOUS now that the
+# grader is value-aware: renaming the key alone leaves a plist that sets
+# `AGENT_SKIP_REVIEW_GATE={{PATH}}` — inert, correctly CLEAN — and the arm would be pinning a refusal the
+# judge no longer issues (measured: it reddened against the value-aware judge until the value moved).
+PLIST_SRC="$REPO/templates/launchd/com.eldato.pi-cache-reap.plist"
+if [ -f "$PLIST_SRC" ]; then
+  sed -e 's|<key>PATH</key>|<key>AGENT_SKIP_REVIEW_GATE</key>|' \
+      -e 's|<string>{{PATH}}</string>|<string>1</string>|' "$PLIST_SRC" >"$TMP/mut.plist"
+  MUTPLIST_RC=0; bash "$POLICY" --unit-veto "$TMP/mut.plist" mutplist >/dev/null 2>&1 || MUTPLIST_RC=$?
+  [ "$MUTPLIST_RC" -eq 1 ] \
+    && ok "(5d) edges: a launchd plist carrying the hatch as its own <key> IS vetoed (a shipped plist mutated in \$TMP)" \
+    || bad "(5d) edges: the plist branch answered rc=$MUTPLIST_RC for a hatch-bearing plist — that half of the grader cannot redden"
+else
+  bad "(5d) edges: $PLIST_SRC is gone, so the launchd half of the grader has no discriminating arm"
+fi
+# ⛔ A `<key>` SPLIT ACROSS LINES IS A LIVE DECLARATION TO launchd AND WAS READ AS CLEAN HERE (fresh code
+# review of PR #4020 at `921aeed45`, P3 — REPRODUCED). The launchd match ran LINE-ANCHORED against the raw
+# file, so `<key>` + newline + `AGENT_SKIP_REVIEW_GATE` + newline + `</key>` matched nothing while launchd
+# honours it. Every in-tree producer emits the one-line form, which makes this a HOLE rather than a live
+# bypass — the reason to close it is that the hole is one formatting decision wide, and the fix is a flatten.
+# It is a DISCRIMINATOR PAIR, not one arm: the split-but-inert twin must stay CLEAN, so an arm that merely
+# flattens and vetoes on the name cannot pass both halves.
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>\n      AGENT_SKIP_REVIEW_GATE\n    </key>\n    <string>1</string>\n  </dict>\n</dict></plist>\n' >"$TMP/splitkey.plist"
+SK_RC=0; bash "$POLICY" --unit-veto "$TMP/splitkey.plist" splitkey >/dev/null 2>&1 || SK_RC=$?
+[ "$SK_RC" -eq 1 ] \
+  && ok "(5d) edges: a launchd <key> split across lines STILL names the hatch — vetoed (launchd honours it, so the grader must)" \
+  || bad "(5d) edges: the split <key> plist answered rc=$SK_RC (want 1) — the launchd match is line-anchored, so a plist whose key carries a newline is invisible while launchd sets the hatch"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>\n      AGENT_SKIP_REVIEW_GATE\n    </key>\n    <string>0</string>\n  </dict>\n</dict></plist>\n' >"$TMP/splitkey-clean.plist"
+bash "$POLICY" --unit-veto "$TMP/splitkey-clean.plist" splitkey-clean >/dev/null 2>&1 \
+  && ok "(5d) edges: …and its EXPLICITLY-OFF twin (=0) is CLEAN — the flatten vetoes name-with-a-bypassing-value, not the name" \
+  || bad "(5d) edges: the split <key> plist with =0 was vetoed — the launchd half grades the name alone, which is the same false block this round removed on the systemd half"
+# ⛔ THE VALUE DECIDES FOR THE `=== "1"` GATES, AND BOTH DIRECTIONS ARE PINNED (fresh code review of PR #4020
+# at `921aeed45`, P3 — MEASURED: both presence-only arms answered rc=1, and `install-drainer-timer.sh
+# --install` REFUSED a unit that says the gate is ON). One direction is a false block — an operator deletes
+# the truthful spelling instead of reading the refusal — and the other is a FAIL-OPEN, because `=1` behind a
+# quote or behind systemd's `cunescape` must never read clean. Both are exercised: the false-block arms go
+# GREEN here and RED on the pre-fix judge, the fail-open arms stay RED and would go green if the fix were
+# done naively (value compared as raw text).
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=0\nExecStart=/bin/true\n' >"$TMP/explicit0.service"
+E0_RC=0; bash "$POLICY" --unit-veto "$TMP/explicit0.service" explicit0 >/dev/null 2>&1 || E0_RC=$?
+[ "$E0_RC" -eq 0 ] \
+  && ok "(5d) edges: an EXPLICIT `Environment=AGENT_SKIP_REVIEW_GATE=0` is CLEAN — the gate tests `=== \"1\"`, so =0 is the truthful spelling of 'enabled', not a bypass" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=0` answered rc=$E0_RC (want 0) — a presence-only match refuses the unit that declares the gate ON, and the install path refuses it too"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE\nExecStart=/bin/true\n' >"$TMP/bareflag.service"
+BF_RC=0; bash "$POLICY" --unit-veto "$TMP/bareflag.service" bareflag >/dev/null 2>&1 || BF_RC=$?
+[ "$BF_RC" -eq 0 ] \
+  && ok "(5d) edges: …and a BARE name (`Environment=AGENT_SKIP_REVIEW_GATE`, no `=`) is CLEAN — it sets nothing (and is not valid systemd), so it cannot be a false accusation either" \
+  || bad "(5d) edges: a bare `Environment=AGENT_SKIP_REVIEW_GATE` answered rc=$BF_RC (want 0) — nothing is set, so the refusal accuses the unit of a hatch it does not carry"
+printf '[Service]\nEnvironment=GREETING=AGENT_SKIP_REVIEW_GATE\nExecStart=/bin/true\n' >"$TMP/nameasvalue.service"
+NAV_RC=0; bash "$POLICY" --unit-veto "$TMP/nameasvalue.service" nameasvalue >/dev/null 2>&1 || NAV_RC=$?
+[ "$NAV_RC" -eq 0 ] \
+  && ok "(5d) edges: …and the name as SOME OTHER variable's VALUE (`GREETING=AGENT_SKIP_REVIEW_GATE`) is CLEAN — it assigns no flag" \
+  || bad "(5d) edges: the name appearing as another variable's value answered rc=$NAV_RC (want 0) — the match is on the TEXT, not on an assignment, so a config value that merely mentions the hatch is refused"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=10\nExecStart=/bin/true\n' >"$TMP/falseprefix.service"
+FP_RC=0; bash "$POLICY" --unit-veto "$TMP/falseprefix.service" falseprefix >/dev/null 2>&1 || FP_RC=$?
+[ "$FP_RC" -eq 0 ] \
+  && ok "(5d) edges: …and `=10` is CLEAN — the value is compared WHOLE, so `1` is not a prefix match on the string 10" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=10` answered rc=$FP_RC (want 0) — a prefix match on the value treats any value starting with 1 as the honoured one"
+printf '[Service]\nEnvironment="AGENT_SKIP_REVIEW_GATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted1.service"
+Q1_RC=0; bash "$POLICY" --unit-veto "$TMP/quoted1.service" quoted1 >/dev/null 2>&1 || Q1_RC=$?
+[ "$Q1_RC" -eq 1 ] \
+  && ok "(5d) edges: …but the QUOTED spelling of the honoured value (`\"AGENT_SKIP_REVIEW_GATE=1\"`) is VETOED — making the match value-aware must not open the quoting route" \
+  || bad "(5d) edges: `Environment=\"AGENT_SKIP_REVIEW_GATE=1\"` answered rc=$Q1_RC (want 1) — the value test reads raw text while systemd splits with EXTRACT_UNQUOTE, so the quoted hatch installs"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=\\x31\nExecStart=/bin/true\n' >"$TMP/cunescape.service"
+CE_RC=0; bash "$POLICY" --unit-veto "$TMP/cunescape.service" cunescape >/dev/null 2>&1 || CE_RC=$?
+[ "$CE_RC" -eq 1 ] \
+  && ok "(5d) edges: …and a value that only DECODES to 1 (`\\x31`) is VETOED — an unprovable spelling is refused rather than trusted" \
+  || bad "(5d) edges: `Environment=AGENT_SKIP_REVIEW_GATE=\\x31` answered rc=$CE_RC (want 1) — systemd cunescapes the value, so `\\x31` IS 1 and a value-aware match must not read it as inert"
+printf '[Service]\nEnvironment=AGENT_STATE_MACHINE=0\nExecStart=/bin/true\n' >"$TMP/killswitch0.service"
+SM0_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitch0.service" killswitch0 >/dev/null 2>&1 || SM0_RC=$?
+[ "$SM0_RC" -eq 1 ] \
+  && ok "(5d) edges: …and `AGENT_STATE_MACHINE=0` is STILL VETOED — the kill switch fires on PRESENCE, so grading it by value would be a fail-open" \
+  || bad "(5d) edges: `Environment=AGENT_STATE_MACHINE=0` answered rc=$SM0_RC (want 1) — the existence-graded kill switch was put in the value-graded class, a FAIL-OPEN in the exact direction the hatch runs"
+printf '[Service]\nEnvironment=ELDATO_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/alias.service"
+ALIAS_RC=0; bash "$POLICY" --unit-veto "$TMP/alias.service" alias >/dev/null 2>&1 || ALIAS_RC=$?
+[ "$ALIAS_RC" -eq 1 ] \
+  && ok "(5d) edges: the DUAL-PREFIX alias ELDATO_SKIP_REVIEW_GATE (no AGENT_ variable present) IS vetoed" \
+  || bad "(5d) edges: ELDATO_SKIP_REVIEW_GATE=1 answered rc=$ALIAS_RC (want 1) — the dual-prefix alias bypasses the review gate"
+# …and the FOURTH hatch, which skips the head-bound admin-merge evidence gate. It is a bypass of a certifying
+# gate, which is the same #4002 shape as the other three (fresh review of #4002, round 3).
+# …and `PassEnvironment=`, which names a variable in the unit's OWN text rather than assigning it. It
+# forwards one the managing systemd instance holds, so it is the ambient-hatch route by another spelling, and
+# it answered CLEAN before this arm existed (fresh review of #4002, round 4).
+printf '[Service]\nPassEnvironment=AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE\nExecStart=/bin/true\n' >"$TMP/passenv.service"
+PASSENV_RC=0; bash "$POLICY" --unit-veto "$TMP/passenv.service" passenv >/dev/null 2>&1 || PASSENV_RC=$?
+[ "$PASSENV_RC" -eq 1 ] \
+  && ok "(5d) edges: PassEnvironment= naming a hatch IS vetoed (and EnvironmentFile= stays out by design)" \
+  || bad "(5d) edges: PassEnvironment=AGENT_SKIP_REVIEW_GATE answered rc=$PASSENV_RC (want 1) — the unit's own text names the hatch"
+# ⛔ THE FIXTURE'S PATH NAMES THE HATCH ON PURPOSE (fresh review of #4002, P2). With a hatch-free path
+# (`/etc/some.env`) this row answered rc=0 whether `EnvironmentFile=` was excluded or graded — the two
+# states were identical to it, so the arm pinned nothing while the PR body claimed it pinned the exclusion.
+# `EnvironmentFile=` takes a FILENAME, never a variable name (`systemd.exec(5)`), so the path is the only
+# place a hatch-shaped token could appear without being a declaration: exempt ⇒ rc=0, accidentally graded ⇒
+# `-w` matches inside the path (`/` and `.` are non-word) ⇒ rc=1 and this arm reddens.
+printf '[Service]\nEnvironmentFile=/etc/AGENT_SKIP_REVIEW_GATE.env\nExecStart=/bin/true\n' >"$TMP/envfile.service"
+bash "$POLICY" --unit-veto "$TMP/envfile.service" envfile >/dev/null 2>&1 \
+  && ok "(5d) edges: EnvironmentFile= is NOT graded (the declared limit: the unit names a file, not a variable)" \
+  || bad "(5d) edges: EnvironmentFile= was graded — the declared limit and the code disagree"
+printf '[Service]\nEnvironment=AGENT_ADMIN_MERGE_OVERRIDE=1\nExecStart=/bin/true\n' >"$TMP/adminovr.service"
+ADMINOVR_RC=0; bash "$POLICY" --unit-veto "$TMP/adminovr.service" adminovr >/dev/null 2>&1 || ADMINOVR_RC=$?
+[ "$ADMINOVR_RC" -eq 1 ] \
+  && ok "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE (skips the admin-merge evidence gate) IS vetoed" \
+  || bad "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE=1 answered rc=$ADMINOVR_RC (want 1) — it skips the head-bound admin-merge evidence gate"
+# ⛔ THE KILL SWITCH'S BOTH SPELLINGS (fresh review of #4002 at `921aeed45`, P1 — a MEASURED fail-open:
+# both answered rc=0 CLEAN while the hatch was live, and `install-drainer-timer.sh` would have installed
+# it). `extensions/shared/kill-switch.ts` reads `env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE`,
+# decides on EXISTENCE (`any non-empty value`, not `"1"`), and `isEnforcementBypassed()` is what every
+# gate asks — so this declaration switches off the sequence/workflow enforcement of every lane the job
+# spawns. It carries none of the hatch vocabulary (SKIP|ALLOW|OVERRIDE|BYPASS), which is why the list
+# missed it; §5f below now admits it by vocabulary and would redden if either spelling left the list.
+# BOTH names are graded: the `ELDATO_` form is the `??`'s second arm, not a variant spelling, so a list
+# carrying one and not the other is a half-open gate.
+for _sm in AGENT_STATE_MACHINE ELDATO_STATE_MACHINE; do
+  printf '[Service]\nEnvironment=%s=1\nExecStart=/bin/true\n' "$_sm" >"$TMP/killswitch.service"
+  SM_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitch.service" killswitch >/dev/null 2>&1 || SM_RC=$?
+  [ "$SM_RC" -eq 1 ] \
+    && ok "(5d) edges: $_sm (the sequence-enforcer kill switch) IS vetoed" \
+    || bad "(5d) edges: Environment=$_sm=1 answered rc=$SM_RC (want 1) — it bypasses ALL enforcement for every lane the job spawns"
+done
+# …and the EXISTENCE-graded form: any non-empty value bypasses, so a value that is not `1` must be vetoed
+# too (the other hatches test `=== "1"`; this one does not, and grading it like the others would leave the
+# `=yes` spelling live).
+printf '[Service]\nEnvironment=AGENT_STATE_MACHINE=yes\nExecStart=/bin/true\n' >"$TMP/killswitchyes.service"
+SMy_RC=0; bash "$POLICY" --unit-veto "$TMP/killswitchyes.service" killswitchyes >/dev/null 2>&1 || SMy_RC=$?
+[ "$SMy_RC" -eq 1 ] \
+  && ok "(5d) edges: …and its EXISTENCE-graded value (=yes) is vetoed too — the switch is set by presence, not by =1" \
+  || bad "(5d) edges: Environment=AGENT_STATE_MACHINE=yes answered rc=$SMy_RC (want 1) — the kill switch fires on ANY non-empty value"
+# …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
+bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
+[ "$ABSENT_RC" -eq 2 ] \
+  && ok "(5d) edges: an ungradable declaration answers 2 (not 0) — 'cannot check' is never a pass" \
+  || bad "(5d) edges: an absent declaration answered rc=$ABSENT_RC (a no-op gate reports clean)"
+# ⛔ rc 2 IS THE FILE PREFLIGHT, AND *ONLY* THAT — the boundary is pinned in both directions (recorded code
+# review of PR #4020 at `921aeed45`, P3). The contract used to advertise "an ungradable continuation" and
+# both installers repeated it, but the fold has no error branch (an error branch on that loop could never
+# fire, so it would be a NO-OP GATE), which means a continuation still pending at EOF is FOLDED AND GRADED.
+# This arm is the positive half of the claim above: content never yields 2. If a future fold grows an error
+# branch that answers 2 here, the operators' rc-2 sentence becomes describable again and this reddens.
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE=1 \\\n' >"$TMP/unterminated.service"
+UTR_RC=0; bash "$POLICY" --unit-veto "$TMP/unterminated.service" unterminated >/dev/null 2>&1 || UTR_RC=$?
+[ "$UTR_RC" -eq 1 ] \
+  && ok "(5d) edges: a declaration ENDING on a continuation is FOLDED and GRADED (rc=1), never answered 2 as 'cannot fold' — rc 2 is the file preflight alone" \
+  || bad "(5d) edges: a declaration ending on a continuation answered rc=$UTR_RC (want 1) — either the pending accumulator is dropped (fail-open) or rc 2 has grown a content cause the contract does not describe"
+
+# (5e) THE INSTALL PATH, NOT JUST THE CENSUS — because the installer is where the refusal is FELT, and
+# a hatch can arrive on the RENDERED bytes from a substitution while the template stays clean. §5d
+# proves the grader discriminates; this proves the thing that would put the unit on a box refuses it.
+# Measured pre-fold on the reviewed head: the installer returned 0 and printed "ai-drainer scheduled",
+# i.e. it installed a dispatcher that hands the review gate to every lane it spawns.
+CV="$TMP/continuation-install"; mkdir -p "$CV/tpl"
+cp "$REPO/templates/systemd/eldato-ai-drainer.service" "$REPO/templates/systemd/eldato-ai-drainer.timer" "$CV/tpl/"
+printf 'Environment=NORMAL=1 \\\n            AGENT_SKIP_REVIEW_GATE=1\n' >>"$CV/tpl/eldato-ai-drainer.service"
+CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/tpl" \
+          DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$CV/state" DRAINER_O="$CV" \
+          bash "$INST" 2>&1)"; CV_RC=$?
+[ "$CV_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$CV_OUT" \
+  && ok "(5e) install path: the INSTALLER REFUSES rendered bytes whose hatch is on a continued line, and names the flag" \
+  || bad "(5e) install path: the installer installed a unit whose hatch is on a continued line (rc=$CV_RC): $(printf '%s' "$CV_OUT" | tail -1)"
+[ ! -f "$CV/units/eldato-ai-drainer.service" ] \
+  && ok "(5e) install path: …and a refused install leaves no artefact (a refused unit is not on the box)" \
+  || bad "(5e) install path: a refused install still wrote $CV/units/eldato-ai-drainer.service"
+
+# ── 5f. THE LIST IS EXACTLY WHAT THE GATES HONOUR (agent-infra#4002, fresh reviews) ────────────────
+# The list is hand-maintained, and the honoured set is NOT a fixed vocabulary: two hatches are read through
+# `process.env["AGENT_" + n] ?? process.env["ELDATO_" + n]`, so each has two spellings and BOTH bypass the
+# gate. That is how the earlier cuts of the list missed `ELDATO_SKIP_REVIEW_GATE` (rounds 1-2) and then
+# `ADMIN_MERGE_OVERRIDE` entirely (round 3) — each a measured fail-open: the grader answered CLEAN for a unit
+# whose hatch was live, and the installer printed `scheduled`. ⛔ AND NO ARM COULD REDDEN ON EITHER, because
+# every arm exercised a name that was present.
+# ⛔ SO THE DERIVATION IS FROM THE CALL SITES, NOT FROM A HAND-WRITTEN ALTERNATION (a fixed
+# `(AGENT|ELDATO)_(SKIP_REVIEW_GATE|SKIP_VGATE|ALLOW_MAIN_EDITS)` pattern cannot see a stem it was not told
+# about — that was round 3's finding against the first version of this arm):
+#   * every `_getEnv("STEM")` call site, expanded to BOTH prefixes;
+#   * plus every direct `env.(AGENT|ELDATO)_*` / `process.env.(AGENT|ELDATO)_*` read whose name carries the
+#     hatch vocabulary (`SKIP|ALLOW|OVERRIDE|BYPASS|STATE_MACHINE`) — direct reads are unpaired, so they are
+#     matched on the vocabulary.
+# ⛔ THE THIRD READ FORM IS WHY THIS ARM WAS STILL BLIND (fresh review of #4002 at `921aeed45`, P1): a gate can
+# read a hatch through a PARAMETERISED env object — `env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE` in
+# `extensions/shared/kill-switch.ts`. Neither of the first two forms sees it, and the name carries none of the
+# hatch words either (`STATE_MACHINE` is the sequence enforcer's KILL SWITCH, decided on EXISTENCE). So the
+# vocabulary above gained `STATE_MACHINE` and the match is written against `\.(AGENT|ELDATO)_` — which covers
+# `env.X` and `process.env.X` alike — instead of only `process\.env\.`. Measured at the head that preceded
+# this fix: 7 names derived, 7 declared, EQUALITY PASS, and `--unit-veto` answering rc=0 for a unit carrying
+# `Environment=AGENT_STATE_MACHINE=1`. Both sides were missing the same two names — the equality was exact
+# over a set that was not the gates' set, which is what a drift arm must never be able to do.
+# The declared non-hatch stems are subtracted BY NAME with a reason, so a config variable cannot be mistaken
+# for a hatch and a new hatch cannot hide behind "it looked like config".
+# STATED LIMIT: a hatch whose stem carries none of the vocabulary words AND is read neither through `_getEnv`
+# nor as an `(AGENT|ELDATO)_*` name would still be invisible here — e.g. a name read as `process.env[key]`
+# from a computed string. That is the shape this arm cannot see, and it is written down rather than implied.
+# `AGENT_/ELDATO_SEQUENCE_MODE` carries none of the vocabulary and is NOT a hatch (its weakest licensed value,
+# `warn`, is already the default for every print session — see `extensions/shared/print-mode.ts`), so it is
+# correctly outside both sides rather than silently inside one.
+echo
+echo "== the list is what the gates honour (#4002) =="
+# ⛔ THE SCAN SET IS EVERY PRODUCTION `.ts` UNDER `extensions/`, NOT JUST THE SUBDIRECTORY INDEX FILES
+# (fresh review of #4002, rounds 4 and 10). Round 4 widened `extensions/*/index.ts` (18 files) to also reach the
+# top-level `extensions/*.ts` (`extensions/skill-enforcer.ts` honours `_getEnv("ALLOW_MAIN_EDITS")`). That was
+# still WRONG in the same direction: a SHELL glob does not cross `/`, so `extensions/shared/*.ts` — where the
+# gates' shared helpers live, `kill-switch.ts` among them — was read by nothing, and the arm printed "derived …
+# from ALL 34 extension files" while 32 of the 66 production files were never opened. It is now
+# `extensions/*/*.ts` beside `extensions/*/index.ts` and `extensions/*.ts` (66 files today, no deeper nesting in
+# the tree), and the arm BELOW asserts the file that carries the third read form is actually in the set, so the
+# glob cannot silently go blind again. `.test.ts`/`.d.ts` are excluded on purpose: a test that mentions a
+# variable is not a reader, and a declaration file declares nothing.
+NON_HATCH_STEMS="SESSION_TEAM SKILLS_PREFIX"   # select a team / a skills path (`loop-enforcer`, `skill-enforcer`); neither disables a gate
+FILES=""
+for _f in "$REPO"/extensions/*/index.ts "$REPO"/extensions/*/*.ts "$REPO"/extensions/*.ts; do
+  [ -f "$_f" ] || continue
+  case "$_f" in *.test.ts|*.d.ts) continue ;; esac
+  FILES="$FILES $_f"
+done
+# ⛔ DE-DUPLICATED: the globs OVERLAP (`extensions/*/index.ts` is also `extensions/*/*.ts`), and a count that
+# double-counts files is a non-vacuity test that can pass on a set narrower than it reports.
+FILES="$(printf '%s\n' $FILES | sed '/^$/d' | LC_ALL=C sort -u)"
+DECLARED="$(sed -n 's/^GP_UNIT_BYPASS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+STEMS="$(grep -ohE '_getEnv\("[A-Z_]+"\)' $FILES 2>/dev/null | sed -E 's/.*"([A-Z_]+)".*/\1/' | LC_ALL=C sort -u)"
+DUAL=""
+for _s in $STEMS; do
+  case " $NON_HATCH_STEMS " in *" $_s "*) continue ;; esac
+  DUAL="$DUAL$(printf 'AGENT_%s\nELDATO_%s\n' "$_s" "$_s")
+"
+done
+DIRECT="$(grep -ohE '\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS|STATE_MACHINE)[A-Z_]*' $FILES 2>/dev/null | sed -E 's/^.*\.((AGENT|ELDATO)_)/\1/' | LC_ALL=C sort -u)"
+DERIVED="$(printf '%s%s\n' "$DUAL" "$DIRECT" | sed '/^$/d' | LC_ALL=C sort -u)"
+DERIVED_N="$(grep -c . <<<"$DERIVED")"
+# ⛔ NON-VACUITY, AND WHAT WOULD HAVE CAUGHT FINDING 1 (fresh review at `921aeed45`): the derivation must SEE
+# the third read form, and the scan set must CONTAIN the file it lives in. Both are asserted separately, because
+# the two ways this arm can go blind are independent — a glob that stops crossing into `extensions/shared/`, and
+# a vocabulary that does not admit `STATE_MACHINE` — and each has its own mutant (drop `*/*.ts` from the glob;
+# drop `|STATE_MACHINE` from the vocabulary). Without these, the round-10 failure mode recurs silently: BOTH
+# sides lose the same two names and the equality passes EXACTLY over a set that is not the gates' set.
+# ⛔ NO `printf … | grep -q` HERE (#841/#864). The guard flags the SHAPE, and it is right to: under
+# `pipefail` a producer killed by SIGPIPE makes a PRESENT match read as ABSENT, so the one arm that proves
+# the scan set reaches `extensions/shared/kill-switch.ts` could go permanently green for the wrong reason.
+# A here-string carries the same list with no pipe to break. (Pre-existing on this branch and reddening
+# `sigpipe-grep` before this fix; the guard is the arbiter, and it names this line.)
+if grep -q '/extensions/shared/kill-switch\.ts$' <<<"$(printf '%s\n' $FILES)"; then
+  ok "(5f) scan set: the file whose PARAMETERISED env read carries the kill switch (extensions/shared/kill-switch.ts) is IN the graded set — the glob reaches extensions/shared/"
+else
+  bad "(5f) scan set: extensions/shared/kill-switch.ts is NOT in the graded set — the glob reads $(printf '%s\n' $FILES | grep -c .) files but not the one the third read form lives in, so a hatch there is invisible while this arm prints PASS"
+fi
+# The third read form (`env.NAME`, not `process.env.NAME`) is the ONLY way these two arrive — no `_getEnv` stem
+# produces them — so their presence in DERIVED IS the proof that form is recognised.
+SM_MISSING=""
+for _sm in AGENT_STATE_MACHINE ELDATO_STATE_MACHINE; do
+  grep -qx -- "$_sm" <<<"$DERIVED" || SM_MISSING="$SM_MISSING $_sm"
+done
+[ -z "$SM_MISSING" ] \
+  && ok "(5f) drift: the derivation RECOGNISES the third read form — the kill switch (env.AGENT_STATE_MACHINE ?? env.ELDATO_STATE_MACHINE) is derived from its call site, not declared by hand" \
+  || bad "(5f) drift: the derivation does not see$SM_MISSING — the parameterised env read (extensions/shared/kill-switch.ts) is invisible to it, so the equality can pass while the list omits a hatch the gates honour"
+[ -n "$STEMS" ] && [ "$DERIVED_N" -ge 2 ] \
+  && ok "(5f) drift: derived the honoured hatch set from ALL $(printf '%s\n' $FILES | grep -c .) extension files ($DERIVED_N names across $(printf '%s\n' $STEMS | grep -c .) _getEnv stems) — the equality is not vacuous" \
+  || bad "(5f) drift: derived only $DERIVED_N honoured name(s) from $(printf '%s\n' $FILES | grep -c .) files — the equality would pass on an empty set"
+if [ "$DECLARED" = "$DERIVED" ]; then
+  ok "(5f) drift: GP_UNIT_BYPASS_FLAGS EQUALS the set the gates honour — no dual-prefix alias can hide"
+else
+  only_decl="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
+  only_hon="$(comm -13 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
+  bad "(5f) drift: the declared list and the gates disagree — declared-but-not-honoured:[$only_decl] honoured-but-not-declared:[$only_hon]"
+fi
+# ⛔ THE FLAG LIST IS PARTITIONED, AND THE PARTITION IS ASSERTED (the two lists live in gate-policy.sh). The
+# split exists because the gates disagree about what a VALUE means: `=== "1"` for four of them, PRESENCE for
+# the kill switch. A name in NEITHER list is graded by nothing — invisible; a name in BOTH is graded by the
+# wrong rule for one of them, and each direction has its own failure mode (value-graded existence is a
+# FAIL-OPEN, presence-graded value is the false block this round removed). Neither shape is visible from the
+# equality arm above: it would pass on a correct `GP_UNIT_BYPASS_FLAGS` while both subsets were wrong.
+V1="$(sed -n 's/^GP_UNIT_VALUE1_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+EX="$(sed -n 's/^GP_UNIT_EXISTS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+BOTH="$(comm -12 <(printf '%s\n' "$V1") <(printf '%s\n' "$EX") | tr '\n' ' ')"
+GRADED_ANY="$(printf '%s\n%s\n' "$V1" "$EX" | sed '/^$/d' | LC_ALL=C sort -u)"
+NEITHER="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$GRADED_ANY") | tr '\n' ' ')"
+if [ -z "$BOTH" ] && [ -z "$NEITHER" ] && [ -n "$V1" ] && [ -n "$EX" ]; then
+  ok "(5f) drift: the flag list PARTITIONS into value-graded ($(printf '%s\n' "$V1" | grep -c .) names, gates testing `=== \"1\"`) and existence-graded ($(printf '%s\n' "$EX" | grep -c .) names, the kill switch) — every hatch is graded by the rule its own gate uses"
+else
+  bad "(5f) drift: the flag list does not partition — in BOTH:[$BOTH] in NEITHER:[$NEITHER] (a name graded by the wrong rule either refuses an inert declaration or lets a live hatch through)"
+fi
+
+# ── 5g. A DECLARATION THAT IS GENERATED INLINE IS GRADED TOO (fresh review of #4002, round 3) ──────
+# `scripts/install-lane-arm-timer.sh` does not render a template: `service_body()` is a heredoc that writes
+# the `Environment=` lines itself, and the installer IS farmed (`pi-bootstrap/setup.sh`'s fleet set), so it
+# is a LIVE install path on cells that no template census can see. An earlier revision of the census claimed
+# the opposite in prose. The bytes it would install are gradeable through its own `--dry-run`, so they are
+# graded here — and then a hatch is injected into those SAME bytes to prove the arm is reading a declaration
+# and not an error message.
+LARM="$REPO/scripts/install-lane-arm-timer.sh"
+LG="$TMP/lanearm"; mkdir -p "$LG/scripts" "$LG/home"
+cp "$REPO/scripts/lane-arm.sh" "$LG/scripts/" 2>/dev/null || true
+LG_OUT="$(LANE_ARM_SCRIPTS_DIR="$LG/scripts" LANE_ARM_STATE_DIR="$LG/state" HOME="$LG/home" \
+          SYSTEMD_UNIT_DIR="$LG/units" bash "$LARM" --dry-run 2>&1)"; LG_RC=$?
+printf '%s\n' "$LG_OUT" >"$LG/rendered.txt"
+# NON-VACUITY FIRST: a declaration was actually rendered (an Environment= and an ExecStart=), or the veto
+# below would be grading a usage message and the mutation would be mutating prose.
+if [ "$LG_RC" -eq 0 ] && grep -q '^[[:space:]]*Environment=' "$LG/rendered.txt" \
+   && grep -q '^[[:space:]]*ExecStart=' "$LG/rendered.txt"; then
+  ok "(5g) inline generator: install-lane-arm-timer.sh --dry-run rendered a real declaration (Environment= + ExecStart=)"
+else
+  bad "(5g) inline generator: --dry-run produced no gradeable declaration (rc=$LG_RC) — the arm below grades nothing"
+fi
+bash "$POLICY" --unit-veto "$LG/rendered.txt" "install-lane-arm-timer service_body" >/dev/null 2>&1 \
+  && ok "(5g) inline generator: its GENERATED declaration carries no gate-bypass Environment= entry" \
+  || bad "(5g) inline generator: the declaration install-lane-arm-timer.sh generates carries a bypass"
+{ cat "$LG/rendered.txt"; printf 'Environment=AGENT_ADMIN_MERGE_OVERRIDE=1\n'; } >"$LG/mutated.txt"
+# ⛔ EXACTLY rc 1, NOT "non-zero" (recorded code review of PR #4020 at `921aeed45`, P3). `&& bad || ok` is
+# satisfied by rc 2 (ungradable) and rc 64 (a judge predating the flag), so this arm printed PASS for a judge
+# that graded NOTHING — it could not tell "vetoed" from an error message, which is precisely what the
+# sentence below claims it tells apart. Same defect, same fix as §5d's quoted-form arm above (which was
+# fixed in round 3 and left this one behind).
+LGMR_RC=0; bash "$POLICY" --unit-veto "$LG/mutated.txt" "install-lane-arm-timer mutant" >/dev/null 2>&1 || LGMR_RC=$?
+[ "$LGMR_RC" -eq 1 ] \
+  && ok "(5g) inline generator: a hatch injected into those same bytes IS vetoed (rc=1 — the arm reads a declaration, not an error message)" \
+  || bad "(5g) inline generator: the injected hatch answered rc=$LGMR_RC (want 1) — either the bytes were not vetoed, or the judge never graded them and this arm cannot tell the two apart"
+
+# ── 5h. THE THIRD INLINE GENERATOR IS VETTED ON ITS INSTALL PATH (fresh review of PR #4020 at
+# `4f9ff9b3e`, P2) ────────────────────────────────────────────────────────────────────────────────
+# `scripts/install-runner-autoscale-timer.sh` composes a WHOLE `Environment=` line at render time
+# (`provisioner_env_for`: `Environment="RUNNER_AUTOSCALE_PROVISIONER=…"`, substituted into
+# `{{PROVISIONER_ENV}}`). The shipped templates carry only the placeholder, so the §5a census never sees an
+# `Environment=` line at all — and the installer IS farmed (`pi-bootstrap/setup.sh`'s `fleet_srcs`), so it
+# is a live install path. Before this arm the bytes were graded by NOTHING and refused by NOTHING: a hatch
+# typed onto that line, or any future installer written in the same "whole line from a seam" shape,
+# installed green. §5g is the same arm for the other inline generator.
+# ⛔ IT IS AN *INSTALL-PATH* ARM, NOT A DRY-RUN-ONLY ONE: the veto sits in `render()`, which `--dry-run`
+# and `--install` share, ABOVE the `--dry-run` branch — so a preview cannot show what an install would
+# refuse, and the refusal this arm measures is the install's own. (The installer's own suite covers
+# `--install` end to end; this arm exists so the CENSUS suite reddens when the call is deleted.)
+echo
+echo "== the third inline generator is vetted (#4002) =="
+RA="$REPO/scripts/install-runner-autoscale-timer.sh"
+RAG="$TMP/runner-autoscale"; mkdir -p "$RAG/bin" "$RAG/home/.pi/agent/state" "$RAG/tpl" "$RAG/units"
+cat >"$RAG/bin/systemctl" <<'RA_SC'
+#!/usr/bin/env bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  show-environment) exit 0 ;;
+  is-enabled) printf 'enabled\n'; exit 0 ;;
+  is-active)  printf 'active\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+RA_SC
+chmod +x "$RAG/bin/systemctl"
+: >"$RAG/home/converger.py"
+cp "$REPO/templates/systemd/eldato-runner-autoscale.service" "$REPO/templates/systemd/eldato-runner-autoscale.timer" "$RAG/tpl/"
+# The installer refuses an interpreter older than 3.12 (the pass refuses itself), so this arm needs a real
+# one — and where the host has none the arm is SKIPPED WITH ITS REASON, never green: `env -u` keeps an
+# ambient pin from deciding which case runs.
+RA_PY="$(type -P python3.12 2>/dev/null)" || RA_PY=""
+[ -n "$RA_PY" ] || { RA_PY="$(type -P python3 2>/dev/null)" || RA_PY=""; }
+RA_PY_VER=""
+[ -n "$RA_PY" ] && RA_PY_VER="$("$RA_PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || true
+case "$RA_PY_VER" in
+  3.12|3.1[3-9]|[4-9].*) RA_PY_OK=1 ;;
+  *) RA_PY_OK=0 ;;
+esac
+# ra_run <templates-dir> [extra env assignment…] — one hermetic invocation of the installer's PREVIEW path.
+ra_run() {
+  local tpl="$1"; shift
+  env -u GP_GUARD HOME="$RAG/home" PATH="$RAG/bin:$PATH" \
+      RUNNER_AUTOSCALE_SCRIPT="$RAG/home/converger.py" \
+      RUNNER_AUTOSCALE_PYTHON="$RA_PY" \
+      RUNNER_AUTOSCALE_STATE_DIR="$RAG/home/.pi/agent/state" \
+      RUNNER_AUTOSCALE_ARM_FILE="$RAG/home/.pi/agent/state/runner-autoscale.armed" \
+      RUNNER_AUTOSCALE_REPO="o/r" ELDATO_PLATFORM=Linux \
+      SYSTEMCTL="$RAG/bin/systemctl" LOGINCTL="$RAG/bin/systemctl" LAUNCHCTL="$RAG/bin/systemctl" \
+      SYSTEMD_UNIT_DIR="$RAG/units" RUNNER_AUTOSCALE_SCOPE_SCAN="$RAG/units" \
+      RUNNER_AUTOSCALE_PROVISIONER="$RAG/absent-provisioner.sh" SUDO=false TEMPLATES_DIR="$tpl" \
+      ${@+"$@"} bash "$RA" --dry-run 2>&1
+}
+if [ "$RA_PY_OK" != 1 ]; then
+  skip "(5h) inline generator: no python >= 3.12 on this host (found '${RA_PY_VER:-none}'), so install-runner-autoscale-timer.sh refuses before it renders — the arm that grades its generated declaration DID NOT RUN (a host limit, not a pass)"
+else
+  # NON-VACUITY FIRST: the render must have HAPPENED, or the veto below grades a usage message.
+  RA_OUT="$(ra_run "$RAG/tpl")"; RA_RC=$?
+  if [ "$RA_RC" -eq 0 ] && grep -q '^[[:space:]]*Environment=' <<<"$RA_OUT" && grep -q '^[[:space:]]*ExecStart=' <<<"$RA_OUT"; then
+    ok "(5h) inline generator: install-runner-autoscale-timer.sh --dry-run rendered a real declaration (Environment= + ExecStart=)"
+  else
+    bad "(5h) inline generator: --dry-run produced no gradeable declaration (rc=$RA_RC) — the arms below would grade nothing: $(printf '%s' "$RA_OUT" | tail -1)"
+  fi
+  # …and the ORDINARY path (a real checkout's templates, no seam) must resolve its judge without one being
+  # handed to it — or the enforcement exists only where a test arranges it.
+  RAD_OUT="$(ra_run "$REPO/templates/systemd")"; RAD_RC=$?
+  [ "$RAD_RC" -eq 0 ] \
+    && ok "(5h) inline generator: the ordinary checkout path resolves its own judge and installs a clean declaration (rc=0, no GP_GUARD handed to it)" \
+    || bad "(5h) inline generator: the ordinary checkout path answered rc=$RAD_RC — either the judge does not resolve where the templates live, or a clean declaration is refused: $(printf '%s' "$RAD_OUT" | tail -1)"
+  # THE MUTANT: a hatch on the template's declaration → the installer must REFUSE and name the flag.
+  # Pre-fix it rendered and exited 0 (no judge was wired into this installer at all), which is the
+  # "installs with no refusal" the review reproduced.
+  mkdir -p "$RAG/mut"
+  cp "$REPO/templates/systemd/eldato-runner-autoscale.service" "$REPO/templates/systemd/eldato-runner-autoscale.timer" "$RAG/mut/"
+  printf 'Environment=AGENT_SKIP_REVIEW_GATE=1\n' >>"$RAG/mut/eldato-runner-autoscale.service"
+  RMT_OUT="$(ra_run "$RAG/mut")"; RMT_RC=$?
+  [ "$RMT_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$RMT_OUT" && grep -q 'GATE.BYPASS' <<<"$RMT_OUT" \
+    && ok "(5h) inline generator: a hatch on the generated declaration is REFUSED, and the flag is named" \
+    || bad "(5h) inline generator: install-runner-autoscale-timer.sh accepted a hatch-bearing declaration (rc=$RMT_RC) — no judge is wired into its render path"
+  # THE MISSING JUDGE: fail-closed AND with its own diagnosis (the pre-fix installer had neither).
+  RMG_OUT="$(ra_run "$RAG/tpl" GP_GUARD=/nonexistent/absent.sh)"; RMG_RC=$?
+  [ "$RMG_RC" -ne 0 ] && grep -q 'gate-policy.sh not found' <<<"$RMG_OUT" \
+    && ok "(5h) inline generator: an unresolvable JUDGE refuses by name — an unvetted unit is never installed" \
+    || bad "(5h) inline generator: a missing judge answered rc=$RMG_RC — an unvetted declaration installs: $(printf '%s' "$RMG_OUT" | tail -1)"
+  grep -q 'GATE.BYPASS' <<<"$RMG_OUT" \
+    && bad "(5h) inline generator: a missing judge was reported as a GATE-BYPASS/GATE BYPASS it never found — wrong diagnosis" \
+    || ok "(5h) inline generator: …and it does NOT claim a bypass it could not have seen"
+fi
+
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
