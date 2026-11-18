@@ -701,6 +701,13 @@ has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a **push re-arms it**" "BOUND
 # next pass. Both the parkreason and the PR comment must carry the counter path.
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "psick-77-$sha12r" "BOUND 1's parkreason names the counter that actually holds the bound"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "psick-77-$sha12r" "…and so does the PR comment, so following it actually clears the bound"
+# ⛔ AND BOTH PUBLISHED LIFTS NAME `parkorigin-77` (fresh-context review, P2, agent-infra#4126 round 8).
+# This file is a THIRD writer of the park pair, so it stamps `parkorigin-<PR>` = `<head> harness` beside
+# the reason it writes (below) — and the controller's parked-guard lets a surviving `harness` stamp
+# OUTRANK a later hand-written reason at that same head. A published lift that omits the stamp is
+# therefore worse than no lift: the operator clears what it names, re-parks by hand, and the machine
+# park still wins. Driven from the SHIPPED body, so dropping the file from either string reds these.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "parkorigin-77" "BOUND 1's PR comment removes parkorigin-<PR> too (a surviving 'harness' stamp outranks the human park the recipe invites)"
 out="$(run_pass)"
 has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
@@ -761,6 +768,7 @@ has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "review-round ceiling" "…in th
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "PUSH DOES NOT RE-ARM IT" "…and names the TRUE remedy for THIS bound (the book is cumulative across heads)"
 no  "$(cat "$STATE/parkreason-77" 2>/dev/null)" "re-arms it" "…not the false 'a push re-arms it' (verified against merge-one.sh's [rrceiling] park)"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a push does NOT re-arm this one" "the ceiling's PR comment says a push does NOT re-arm the review-round book"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "parkorigin-77" "…and the ceiling's lift removes parkorigin-<PR> as well (same reason as BOUND 1: the stamp outranks a human park at that head)"
 no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "re-arms both the per-head attempt budget and the review round" "…and the one fixed paragraph that claimed a push re-arms BOTH bounds is gone"
 # ⛔ THE "WHAT HAPPENED" SENTENCE MUST MATCH THIS BOUND TOO (fresh-context review, P2, verified). The
 # ceiling returns BEFORE the brief and before the spawn — this very case asserts `spawns=0` two lines

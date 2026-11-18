@@ -923,6 +923,39 @@ drive_route 'FAILED:ai-review-gate' CONFLICTING    # the measured production cas
 [ "$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)" = "conflictcount" ] \
   && ok "…and the spawn BOOKED its spend record against the CONFLICT counter (the refund's only input)" \
   || bad "…no spend record names conflictcount at the head (state/spendcount-4242-abc1234=[$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)]) — a bail would refund the repair budget instead"
+# ⛔ A FAILED SPAWN LEAVES NO SPEND RECORD BEHIND — AND NOTHING OBSERVED THAT (fresh-context review,
+# P3, #4126 round 8). `spend_clear` was added to FOUR spawn-failure arms (red-fixer, CONFLICT,
+# review-gate, CI-red) to keep the booking from outliving a spawn that charged nothing, but no row
+# anywhere FAILED a spawn and checked the record: mutating `spend_clear`'s body to `:` left every suite
+# in this repo green. That is a guard no test can observe (agent-infra#3442 rule 1 — a mutant per NEW
+# GUARD), and the consequence is concrete: a leftover `spendcount-<PR>-<head>` makes `refund_bailed_fixer`
+# refund a budget THIS arm never charged, so a real repair attempt stays spent for ever.
+# The rig already supports it — `drive_route`'s 5th arg is `<spawn-ok>`, and `SPAWN_OK=0` walks
+# `cmux layout`'s failure into the arm's `else` — so no drive_route call passed `0` there before.
+# ⛔ `spawns` is 1 on a FAILED spawn (the launcher attempt is recorded before it fails); the assertion
+# that nothing ran is `acts=0`, not `spawns=0`.
+t5_clear
+[ ! -f "$TMP/O/state/spendcount-4242-abc1234" ] \
+  || { bad "the failed-spawn fixture did not start clean (spendcount survived t5_clear)"; }
+drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 0
+[ "$(acts)" = "0" ] && [ ! -f "$TMP/O/state/spendcount-4242-abc1234" ] && [ ! -f "$TMP/O/state/fixspend-4242-abc1234" ] \
+  && grep -q 'CONFLICTING, fixer spawn FAILED' "$TMP/d.log" 2>/dev/null \
+  && ok "CONFLICT: a FAILED spawn CLEARS the spend record it booked (spend_clear is observable, and a bail cannot refund a budget nothing charged)" \
+  || bad "CONFLICT: a FAILED spawn left a spend record behind (spendcount=[$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)] fixspend=[$(cat "$TMP/O/state/fixspend-4242-abc1234" 2>/dev/null)] acts=$(acts)) — the refund's only input survives a spawn that charged nothing"
+# …and the SAME for the two class arms, which book `fixcount` (the review-gate arm books the findings
+# proof as well — `fixspend` — so it must clear BOTH, which is what makes `spend_clear` differ from a
+# bare `rm -f spendcount-<PR>-<head>`).
+t5_clear; NEEDSFIX=1; drive 'FAILED:ai-review-gate' rail 0 0; unset NEEDSFIX
+[ "$(acts)" = "0" ] && [ ! -f "$TMP/O/state/spendcount-4242-abc1234" ] && [ ! -f "$TMP/O/state/fixspend-4242-abc1234" ] \
+  && grep -q 'fixer spawn FAILED (attempt not consumed, marker kept)' "$TMP/d.log" 2>/dev/null \
+  && ok "REVIEW-GATE: a FAILED spawn clears BOTH the spend record and the findings proof it booked" \
+  || bad "REVIEW-GATE: a FAILED spawn left spendcount=[$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)] fixspend=[$(cat "$TMP/O/state/fixspend-4242-abc1234" 2>/dev/null)] acts=$(acts) log=$(head -3 "$TMP/d.log" 2>/dev/null | tr '\n' ';') — a findings proof outliving a spawn that ran nothing manufactures a fixer authorisation"
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.t5b.spent.$RANDOM" 2>/dev/null || true
+t5_clear; drive 'FAILED:pipeline-compliance' rail 0 0
+[ "$(acts)" = "0" ] && [ ! -f "$TMP/O/state/spendcount-4242-abc1234" ] \
+  && grep -q 'CI-red, fixer spawn FAILED' "$TMP/d.log" 2>/dev/null \
+  && ok "CI-RED: a FAILED spawn clears the spend record too (all four spawn-failure arms are observed)" \
+  || bad "CI-RED: a FAILED spawn left spendcount=[$(cat "$TMP/O/state/spendcount-4242-abc1234" 2>/dev/null)] acts=$(acts)"
 # ⛔ THE CONFLICT BUDGET IS NOT THE REPAIR BUDGET (fresh-context review, P2 — agent-infra#4120). A PR
 # that spent `MAX_FIX_TRIES` on REVIEW/CI repairs used to arrive at the router already at cap and park
 # having attempted ZERO rebases — this drive is the measurement of that, and it is RED on the pre-fix
@@ -2281,10 +2314,11 @@ if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log" \
    && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
    && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log" \
    && grep -q -- '--expect-head abc1234' "$TMP/d.log" \
-   && grep -q 'LIFT THIS PARK' "$TMP/d.log"; then
+   && grep -q 'LIFT THIS PARK' "$TMP/d.log" \
+   && grep -q 'parkorigin-4242' "$TMP/d.log"; then
   ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK, the exact re-record command AND its --expect-head pin, AND the park-lift (a re-record alone is provably inert)"
 else
-  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, its command was eaten by a backtick substitution, or the printed remedy mints UNPINNED"
+  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, its command was eaten by a backtick substitution, the printed remedy mints UNPINNED, or the LIFT omits parkorigin-<PR>"
 fi
 clear_store; mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.spent.$RANDOM" 2>/dev/null || true
 

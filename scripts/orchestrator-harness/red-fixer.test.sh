@@ -639,6 +639,16 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
   && [ "$(cat "$TMP/rO/state/fixcount-4242" 2>/dev/null)" = "0" ] \
   && ok "(3) a FAILED spawn rolls BOTH counters back (red-fixer AND fixcount: nothing ran)" \
   || bad "(3) a failed spawn consumed an attempt: redfix=[$(cat "$TMP/rO/state/redfix-4242" 2>/dev/null)] fixcount=[$(cat "$TMP/rO/state/fixcount-4242" 2>/dev/null)]"
+# ⛔ AND IT LEAVES NO SPEND RECORD BEHIND (fresh-context review, P3, #4126 round 8). The spawn books
+# `state/spendcount-<PR>-<head>` BEFORE it runs (so a concurrent bail can refund the right budget), and
+# `spend_clear` removes it again when the spawn fails — but no row anywhere FAILED a spawn and checked
+# the record, so mutating `spend_clear`'s body to `:` left every suite in this repo green. A leftover
+# record makes `refund_bailed_fixer` refund a budget this arm never charged, which leaves a real repair
+# attempt spent for ever. `drive_route`'s 5th argument is `<spawn-ok>`; this is the same failed-spawn
+# drive as the row above, so ONLY the spend record distinguishes them.
+[ ! -f "$TMP/rO/state/spendcount-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] \
+  && ok "(3) …and the FAILED spawn CLEARS the spend record it booked (spend_clear is observable)" \
+  || bad "(3) a FAILED spawn left a spend record behind (spendcount=[$(cat "$TMP/rO/state/spendcount-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" 2>/dev/null)]) — a bail would refund a budget this spawn never charged"
 # ...and the rollback RESTORES the previous value rather than zeroing it (two gate refusals must not
 # silently clear a budget other arms already spent).
 rm -rf "$TMP/rO"; mkdir -p "$TMP/rO/state"; printf '2\n' > "$TMP/rO/state/fixcount-4242"

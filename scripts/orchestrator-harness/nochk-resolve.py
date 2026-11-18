@@ -388,8 +388,12 @@ def post_unresolvable(repo: str, pr: int, sha: str, detail: str, evidence: str,
         "cycles above. The controller has PARKED this head and will not spend further cycles on it.\n\n"
         "**To lift the park** (any of these): push a commit (the park is head-bound, so a new head\n"
         "re-arms it automatically), or clear it on the controller's side with\n"
-        f"`rm -f <controller-state>/parked-{pr} <controller-state>/parkreason-{pr}`\n"
+        f"`rm -f <controller-state>/parked-{pr} <controller-state>/parkreason-{pr} "
+        f"<controller-state>/parkorigin-{pr}`\n"
         "(the state dir is the orchestrator's `state/`), or close/reopen the PR and then clear it.\n"
+        "`parkorigin-{pr}` must go WITH the reason it names: it holds `<head> <author>`, and a\n"
+        "surviving `<head> harness` stamp outranks the prose of the next hand-written park at that\n"
+        "same head — so a lift that leaves it behind lets a rebase overrule a decision a human owns.\n"
     )
     rc, _, err = gh(["gh", "pr", "comment", str(pr), "--repo", repo, "--body", body], timeout=120.0)
     if rc != 0:
