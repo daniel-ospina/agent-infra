@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13537-1795018411-p1940816-dfd422ba",
+  "_sha": "086e064fd0e1385a1bd1fe362d0a309059161386",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13537.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/11609-p4-envelope-and-routes"
+    },
+    {
+      "kind": "sha",
+      "value": "7f9f8db1154f4b726eb6c1416f035173de4296cc"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13537"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 8858,
+  "ended_at": 1795027269,
+  "exit_code": 0,
+  "heartbeat_at": 1795027269,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13537-1795018411-p1940816-dfd422ba",
+  "lease_until": 1795063869,
+  "pid": 1940816,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795018411,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13537",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13537"
+}
