@@ -47,10 +47,11 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against ELEVEN mutated copies of the tool and requires each to go RED
+`--mutations` re-runs this suite against TWELVE mutated copies of the tool and requires each to go RED
 (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
-arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
-suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
+arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG, drop the
+#4108 refusal/deferral shapes from the completion allow-list). Prose cannot prove a suite has teeth;
+this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
 
 THE FIXTURES ARE INSULATED FROM THE AMBIENT ANCESTRY. `setsid --fork` makes each launcher a session
 leader reparented to init, so the chain is `pi → launcher → init` (`hostless`) whether the suite runs
@@ -610,10 +611,55 @@ def main() -> int:
     check(ok_still, "C6 VERIFY: the same row with a QUIET log still verifies (%r) — so C6 is not "
                     "always-false" % why_still)
 
+    # ── CONTROL: the completion ALLOW-LIST pins the two #4108 shapes, in BOTH directions ──
+    # `log_marker()` is fail-closed on a shape it does not recognise — it answers `absent`, and an
+    # absent marker authorises nothing, so the degradation is SILENT and lands where the log is the
+    # ONLY channel (a `--no-session` lane): a lane that finished stops being reapable and nothing
+    # says why. #4108's client half replaced `Hosted capture FAILED (` with a refusal shape and a
+    # deferral shape, so the allow-list moved with it and this control pins the move.
+    #
+    # Arm 1 drives the REAL function over a real file, so it is not a test of a restated tuple.
+    # Arm 2 couples that tuple to the EMITTER: a reword in `extensions/reflect-hook.ts` must fail
+    # HERE rather than degrade in production. Arm 2 is fail-closed on an unreadable emitter — a
+    # coupling that skips when it cannot read is a no-op gate, which is the class this suite is
+    # for. (`--mutations` copies the emitter into its temp tree for exactly this arm; see `one()`.)
+    shipped = ("[reflect-hook] Hosted capture REFUSED — capacity_saturated — NOT retried: capacity "
+               "is saturated. The session is kept in the spool at /tmp/pdne-rec.json.",
+               "[reflect-hook] Hosted capture DEFERRED (transient) — not blocking this session: "
+               "attempt 2/4 runs in a detached worker in 2000ms.")
+    for idx, line in enumerate(shipped):
+        mpath = os.path.join(root, "logs", "marker%d.log" % idx)
+        with open(mpath, "w", encoding="utf-8") as fh:
+            fh.write("the lane's report\n" + line + "\n")
+        kind, detail = tool.log_marker(mpath, 1)
+        check(kind == "hook-failed",
+              "C7 MARKERS: the shipped #4108 shape %d classifies as `hook-failed` — a refusal and a "
+              "deferral both mean the hook ran and did NOT land the capture, so neither may read as "
+              "a completion (got %r: %r)" % (idx, kind, detail))
+    emitter_path = os.path.join(HERE, os.pardir, os.pardir, "extensions", "reflect-hook.ts")
+    try:
+        emitter = open(emitter_path, encoding="utf-8").read()
+    except OSError as exc:
+        fail("C7 MARKERS: cannot read the emitter %s (%s) — an allow-list that cannot be coupled to "
+             "the emitter is exactly what this control exists to prevent"
+             % (os.path.realpath(emitter_path), exc))
+    hosted = [m for m in tool.COMPLETION_FAILED + tool.COMPLETION_OK if "Hosted capture" in m]
+    check(len(hosted) >= 2,
+          "C7 MARKERS: the allow-list carries the `Hosted capture` shapes at all (found %r) — an "
+          "empty list makes the coupling below vacuously true" % (hosted,))
+    for entry in hosted:
+        check(entry in emitter,
+              "C7 MARKERS: allow-list entry %r appears VERBATIM in extensions/reflect-hook.ts — a "
+              "reworded emitter shape must fail here instead of degrading to `absent`" % entry)
+    check("[reflect-hook] Hosted capture FAILED (" not in emitter,
+          "C7 MARKERS: the superseded single-attempt `Hosted capture FAILED (` shape is GONE from "
+          "the emitter, so the live allow-list carries no shape the extension no longer writes")
+
     cleanup()                     # kills the groups AND removes the root
     print("\nALL ASSERTIONS HELD (18 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
-          "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
+          "directions, the arming gate, the refusal bucket, the verify-time log re-read and the "
+          "#4108 marker allow-list against both the real classifier and the emitter)")
     return 0
 
 
@@ -674,6 +720,12 @@ def run_mutations() -> int:
         ("--pid binds only the requested subset",
          "    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)",
          "    binds, peers = bind_map(pool, rows, pids, opts.ref_s)"),
+        # A prose claim that the #4108 marker control has teeth is worth nothing: delete the two
+        # shapes from the allow-list and the suite must go RED at C7 arm 1.
+        ("the #4108 refusal/deferral shapes dropped from the completion allow-list",
+         '    "[reflect-hook] Hosted capture REFUSED — ",\n'
+         '    "[reflect-hook] Hosted capture DEFERRED (",\n',
+         ""),
     ]
     def one(label_old_new):
         label, old, new = label_old_new
@@ -687,6 +739,12 @@ def run_mutations() -> int:
                 shutil.copy(os.path.join(SCRIPTS, f), os.path.join(tmp, "scripts", f))
             shutil.copy(TOOL, os.path.join(tmp, "scripts", "orchestrator-harness",
                                            "pi-done-not-exited.py"))
+            # C7 arm 2 couples the allow-list to the EMITTER, and this tree is not the checkout: the
+            # control is fail-closed on a missing emitter (`fail()`), so a mutation run without this
+            # copy would go red for the wrong reason and be counted as a catch.
+            os.makedirs(os.path.join(tmp, "extensions"))
+            shutil.copy(os.path.join(HERE, os.pardir, os.pardir, "extensions", "reflect-hook.ts"),
+                        os.path.join(tmp, "extensions", "reflect-hook.ts"))
             shutil.copy(os.path.abspath(__file__), os.path.join(tmp, "scripts",
                                                                 "orchestrator-harness",
                                                                 "pi-done-not-exited.test.py"))

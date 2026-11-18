@@ -71,8 +71,13 @@ THE EVIDENCE, AND WHAT EACH CHANNEL CANNOT SEE
      line and which did not grow inside the window. Three attribution traps, all measured:
        * `[reflect-hook] Failed: …` is a HOOK FAILURE. So are the other shapes the extension writes
          — `Hosted capture REFUSED — …` / `Hosted capture DEFERRED (…)` (the #4108 shapes that
-         replaced `Hosted capture FAILED (…)`) and `Attribution resolution failed` — so the test is
-         case-insensitive `failed|error`, never a `\bFailed\b` match.
+         replaced `Hosted capture FAILED (…)`) and `Attribution resolution failed` — so the rule is
+         a POSITIVE ALLOW-LIST of exact prefixes: a line counts as a completion only when it
+         `startswith` one of `COMPLETION_OK`, and as a hook failure only when it `startswith` one of
+         `COMPLETION_FAILED`. The match is CASE-SENSITIVE and there is no `failed|error` regex — the
+         STARTUP line shares the `[reflect-hook]` prefix, so a keyword search called startup a
+         completion (cycle 2, P1), and on a `--no-session` lane the log channel is the only one.
+         A shape the list does not carry reads `absent`, which authorises nothing.
        * a launcher path is RE-USED by later dispatches (`> log` truncates the same inode): measured
          5 `pi` on `adv-cipressure.log`, 4 on `adv-reaping.log`. A log held by more than one
          candidate is `shared`, and authorises nothing.
