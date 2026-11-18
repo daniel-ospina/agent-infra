@@ -422,6 +422,14 @@ ck "…while a GREEN recorded AFTER a RED wins too (the rule is ORDER, not sever
 ck "L4: an un-classified un-owned PR is REVIEW work" \
    "$(drive_level '9001:shaA:fix/a' '9001	shaA	NOCHECKS
 ' - -)" "4 REVIEW_PR"
+# ⛔ A CONFLICTED ROW IS LEVEL 3's WORK, NOT LEVEL 4's (fresh-context review, P3 — agent-infra#4120).
+# The `[prclass]` block writes `CONFLICTED` for a PR GitHub refuses to run workflows on, and this
+# reader's allow-list admitted only the four CHECK classes — so the class the ordering ranks FIRST was
+# dropped by the level resolver and the PR counted as REVIEW work (level 4): the cascade then holds the
+# room for a review of a PR whose ONE remedy is a rebase. Pre-fix this drive reads "4 REVIEW_PR".
+ck "L3: a CONFLICTED un-owned PR is FIX work (a repair), not REVIEW work" \
+   "$(drive_level '9001:shaA:fix/a' '9001	shaA	CONFLICTED
+' - -)" "3 FIX_PR"
 ck "L5: no un-owned PR work left -> ISSUES" \
    "$(drive_level '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - 9001)" "5 ISSUES"

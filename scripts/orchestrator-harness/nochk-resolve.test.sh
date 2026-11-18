@@ -551,6 +551,15 @@ grep -q 'To lift the park' "$S/comments" 2>/dev/null \
 grep -q "parked-4242" "$S/comments" 2>/dev/null \
   && ok "…and names the exact state files to remove" \
   || bad "the lift does not name the park files"
+# ⛔ THE LIFT MUST NAME `parkorigin-<PR>` TOO (fresh-context review, P2, agent-infra#4126 round 8).
+# This recipe is PUBLISHED ON THE PR, so an operator follows it verbatim. The stamp holds `<head>
+# <author>`, and the controller's parked-guard lets a surviving `<head> harness` OUTRANK the prose of
+# the next hand-written park at that same head — so a lift that leaves it behind lets a rebase overrule
+# a human. Non-vacuity: the row above shows the same string names `parked-`, so only the omitted file
+# can red this one.
+grep -q "parkorigin-4242" "$S/comments" 2>/dev/null \
+  && ok "…and the published lift removes parkorigin-<PR> as well (a surviving 'harness' stamp outranks a human park at that head)" \
+  || bad "the published lift omits parkorigin-<PR>: following it leaves a 'harness' stamp that outranks the human park it invites"
 # ⛔ A VERDICT THAT COULD NOT BE POSTED MUST NOT PARK (the park is what makes the miss permanent).
 REPO_DIR="$TMP/norepair"
 reset "fail:error connecting to api.github.com"

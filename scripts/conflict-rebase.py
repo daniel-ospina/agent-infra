@@ -11,6 +11,15 @@ is where the conflicts are. A crew that rebases and walks away produces branches
 that conflict again before they land — which is why the number keeps coming back
 and why one lane per PR cannot outrun it.
 
+⛔ THE OTHER CONFLICTING CONSUMER IS IN THIS REPO TOO (fresh-context review of #4120, P3).
+`scripts/orchestrator-harness/orch-loop.sh`'s `[conflict-case]` router (agent-infra#2126, made
+reachable for EVERY check class by #4120) is the second one: it spawns a `fix-one.sh` lane per
+conflicting PR instead of rebasing from a timer. They are deliberately different mechanisms —
+this file refuses a content conflict and pushes nothing, the lane rebases with a human's judgement —
+so the repo owns BOTH, with this file's own test at `scripts/conflict-rebase.test.sh`. A change to
+one is not a change to "the" conflict machinery, and a claim that the other lives outside this repo
+(the form this was first written in) is false.
+
 So this is a *mechanism*, not a lane: each run it rebases the PRs whose ONLY
 blocker is CONFLICTING, and refuses the rest.
 

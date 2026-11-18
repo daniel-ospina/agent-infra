@@ -8,8 +8,10 @@ if [ "${1:-}" = "--argv" ]; then
   [ -f "$ARGV" ] || { echo "[fix] missing argv file: $ARGV" >&2; exit 1; }
   { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
   rm -f "$ARGV"
-  # Only a CONTROLLER dispatch books an attempt in fixcount-<PR>. See the refund in the load-refusal
-  # path below: a manual run must not decrement a counter it never incremented.
+  # Only a CONTROLLER dispatch books an attempt, in `fixcount-<PR>` (the review-gate / CI-red / red-fixer
+  # arms) or `conflictcount-<PR>` (the CONFLICT router) — WHICH one is recorded in
+  # `state/spendcount-<PR>-<HEAD>`. See the refund in the load-refusal path below: a manual run must not
+  # decrement a counter it never incremented.
   CTRL=1
 else
   REPO="$1"; OR="$2"; PR="$3"; BR="$4"; CTRL=0
@@ -142,7 +144,25 @@ refund_gate_attempt() {
   # agent ran. Without the refund, three refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a
   # human" having never had a single fixer run (agent-infra#1720). A manual (positional) run booked
   # nothing, so it must refund nothing.
-  local _cf="$O/state/fixcount-$PR" _nf
+  # ⛔ WHICH BUDGET THIS SPAWN CHARGED IS A FACT ON DISK, NOT A GUESS (fresh-context review, P2 —
+  # #4126 round 3). The controller books `state/conflictcount-<PR>` for a CONFLICT rebase and
+  # `state/fixcount-<PR>` for every other repair, and records which one it charged in
+  # `state/spendcount-<PR>-<HEAD>` (`spend_book` in orch-loop.sh) BEFORE this lane starts. Refunding
+  # `fixcount` unconditionally was silent in BOTH directions on a conflict spawn: the repair budget was
+  # decremented for an attempt nothing had booked on it (inventing a fixer round on a review), while the
+  # rebase attempt stayed spent for ever — so three gate refusals on a conflicting PR (a DISK refusal
+  # never clears by waiting, so this is deterministic) parked it as "still CONFLICTING after N rebases"
+  # with zero rebases ever attempted: the exact misdiagnosis class this refund exists to prevent.
+  # A record whose content is not one of the two counters falls back to `fixcount` — the budget every
+  # other booking site shares — so a corrupt record costs at most a repair round, never a rebase credit
+  # it never paid for.
+  local _budget="fixcount" _cf _nf
+  if [ -n "${HEAD:-}" ] && [ -f "$O/state/spendcount-$PR-$HEAD" ]; then
+    read -r _budget < "$O/state/spendcount-$PR-$HEAD" 2>/dev/null || true
+    case "$_budget" in fixcount|conflictcount) : ;; *) _budget="fixcount" ;; esac
+    rm -f "$O/state/spendcount-$PR-$HEAD" 2>/dev/null || true
+  fi
+  _cf="$O/state/$_budget-$PR"
   if [ -f "$_cf" ]; then
     _nf="$(cat "$_cf" 2>/dev/null || echo 0)"
     # `is_num`, not a hand-rolled `case`: the predicate is already in scope (spawn-gate.sh defines it,
@@ -151,7 +171,7 @@ refund_gate_attempt() {
     is_num "$_nf" || _nf=0
     if [ "$_nf" -gt 0 ]; then
       echo $((_nf - 1)) > "$_cf"
-      echo "[fix $PR] a gate refusal is not an attempt — fixcount refunded $_nf -> $((_nf - 1))" >> "$L.log"
+      echo "[fix $PR] a gate refusal is not an attempt — $_budget refunded $_nf -> $((_nf - 1))" >> "$L.log"
     fi
   fi
   # ⛔ THE SAME FACT FOR THE PER-HEAD BUDGET (agent-infra#2223, review P1 cycle 3). The controller's
