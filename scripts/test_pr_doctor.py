@@ -1411,6 +1411,42 @@ def test_the_claim_bridge_is_never_handed_a_GUESSED_repo(monkeypatch):
     assert seen[0].get("CLAIM_REPO") != os.getcwd(), "a guessed repo is how a claim lands in the wrong origin"
 
 
+def test_a_pass_with_NO_CHECKOUT_is_its_OWN_verdict_and_never_blames_the_dispatch_chain(monkeypatch):
+    """#4134 F1's own class, ONE LEVEL UP: the DETAIL is now accurate, the VERDICT is not.
+
+    `dispatch()`'s new no-checkout guard is a GATE-class refusal: it returns BEFORE the claim gate,
+    before the brief, before the worktree and before `$O/nonblocking-dispatch.sh` is exec'd. The
+    per-order detail says exactly that ("no checkout of <repo> … pass REPO=<checkout>"), but
+    `_finish` counts it on the `undeliverable` axis with no cause of its own, so the PASS LINE -- the
+    only surface the beat reads (`objective.py::pr_doctor_last_run` cuts at 110 chars) -- still
+    printed `VERDICT=UNDELIVERED next=repair-chain` and resolved the chain path beside it. That is
+    the #4009 mis-attribution, measured again: an operator sent to repair a healthy dispatcher when
+    the fault was a missing `REPO=`.
+
+    ⛔ NAMING THE MUTANT. Remove the `no_checkout_refused(detail)` arm from `run_pass()`'s refusal
+    chain and this row goes RED at `side["verdict"] == "NO-CHECKOUT"` (measured: `UNDELIVERED`, and
+    the pass line carries `next=repair-chain`).
+    """
+    rc, joined = _refused_pass(monkeypatch, pr.no_checkout_note(_pr(1, "a" * 40)))
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+
+    # 1. THE REFUSAL IS PRESERVED (#3105): a pass that delivered nothing may not read clean.
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    # 2. THE ATTRIBUTION CHANGED -- the whole point of this row.
+    assert side["verdict"] == "NO-CHECKOUT", side["reason"]
+    assert "VERDICT=NO-CHECKOUT" in joined and "next=supply-checkout" in joined, joined
+    assert "repair-chain" not in joined, joined
+    # 3. AND NOTHING IS BLAMED ON THE TRANSPORT: no order ever reached it.
+    assert "no worker accepted" not in joined, joined
+    # 4. THE SENTENCE NAMES THE INPUT TO SUPPLY, and says the chain was never invoked.
+    assert "NEVER INVOKED" in joined, joined
+    assert "REPO=<checkout>" in joined, joined
+    # 5. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT.
+    assert "next=supply-checkout" in side["reason"][:110], side["reason"]
+    # 6. Nothing was consumed: no cooldown row, no budget slot.
+    assert pr.load_state() == {}, pr.load_state()
+
+
 def test_a_dry_run_reports_a_held_head_without_minting_a_claim(monkeypatch, tmp_path):
     """`--dry-run` must not publish a claim for work it will not do (it would hold a real box)."""
     origin, head, boxa, boxb = _claim_fleet(tmp_path)

@@ -1333,6 +1333,11 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
                       # that cannot read `refs/claims/` refuses before the chain is exec'd, so the
                       # remedy is the registry's own transport.
                       "CLAIM-UNREADABLE": "repair-claim-registry",
+                      # ⛔ NOT `repair-chain` EITHER (agent-infra#4134 F1's own class, measured on
+                      # this branch): a no-checkout pass returns from `dispatch()` before the brief,
+                      # the worktree and `$O/nonblocking-dispatch.sh`, so the chain was never invoked
+                      # and the remedy is the missing input this pass was launched without.
+                      "NO-CHECKOUT": "supply-checkout",
                       "REFUSING": "restore-read", "SLOTS-FULL": "none"}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -2508,6 +2513,38 @@ def _is_spawn_target(path: str) -> bool:
     return False
 
 
+# ⛔ THE NO-CHECKOUT REFUSAL HAS A NAME, AND THE VERDICT LINE MUST BE ABLE TO SEE IT.
+# MEASURED on this branch (`dispatch()` refuses before the claim gate, so the DETAIL is now accurate)
+# while the PASS LINE was not -- one pass whose only order hit the guard printed:
+#
+#   VERDICT=UNDELIVERED next=repair-chain chain=/home/cmux/orchestrator/nonblocking-dispatch.sh;
+#   repair the dispatch chain NAMED BY `chain=` on this line -- this does NOT clear by waiting;
+#   1 order(s) no worker accepted
+#
+# Every clause of that is false about this pass: `nonblocking-dispatch.sh` was NEVER exec'd (the
+# guard returns before the brief, the worktree and the chain), so "no worker accepted" asserts a
+# transport failure over an order that never reached the transport, and `next=repair-chain` sends an
+# operator to repair a healthy dispatcher when the fault is a missing `REPO=`. That is #4009's class
+# (#2920 passes naming a chain that was never invoked) and the class the sibling harness review of
+# #4134 split for `CLAIM-UNREADABLE` -- arriving a third time because the guard added a FOURTH cause
+# to the `undeliverable` axis and `_finish` only had three. ⛔ IT STILL REFUSES: rc 3, never 0
+# (#3105 -- a pass that delivers nothing may not read as a quiet queue); only the ATTRIBUTION changes.
+NO_CHECKOUT_REFUSAL = "no-checkout: REFUSING TO DISPATCH"
+# The stall-counter key `_finish` prints and the verdict arm reads. A token, not prose: `run_pass`
+# classifies on the SAME string `dispatch()` produced, so the two cannot drift into disagreeing.
+NO_CHECKOUT_TOKEN = "no-checkout"
+
+
+def no_checkout_refused(detail) -> bool:
+    """True when `detail` is `no_checkout_note()` -- i.e. the pass was handed NO CHECKOUT.
+
+    ⛔ A MARKER, NOT A PROSE MATCH, for the same reason `rubric_refused()` is one: the note is
+    produced in ONE place and carried in the refusal's own detail, so the class `_finish` acts on is
+    the class `dispatch()` decided.
+    """
+    return NO_CHECKOUT_REFUSAL in (detail or "")
+
+
 def no_checkout_note(pr: dict) -> str:
     """The ONE wording for "this pass was given no checkout" (agent-infra#4134 F1, P2).
 
@@ -2515,10 +2552,14 @@ def no_checkout_note(pr: dict) -> str:
     built) and `dispatch()` (nothing can be claimed or spawned). The text is what an operator acts
     on, so it is produced here rather than copied -- and both are GATE-class refusals about THIS
     pass's own inputs, not facts about the PR, so neither records a cooldown row.
+
+    ⛔ THE MARKER PREFIX IS WHAT MAKES THE PASS LINE NAME THIS CAUSE (see `NO_CHECKOUT_REFUSAL`):
+    the sentence an operator reads is unchanged, and `run_pass()` can now tell a refusal that never
+    reached the transport from one that did, instead of calling both "no worker accepted".
     """
-    return ("no checkout of %s on this machine, so no worktree can be materialised for "
+    return ("%s -- no checkout of %s on this machine, so no worktree can be materialised for "
             "#%s -- pass REPO=<checkout> (or <owner/name>=<checkout> in PR_DOCTOR_REPOS)"
-            % (REPO or "the target repo", pr.get("number")))
+            % (NO_CHECKOUT_REFUSAL, REPO or "the target repo", pr.get("number")))
 
 
 def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
@@ -6513,7 +6554,11 @@ def run_pass(args, rubric_note: str = "") -> int:
             # invoked.
             _rub = stalls.get("rubric") or 0
             _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
-            _transport = undeliv - carried - _rub - _claim_unread
+            # ⛔ AND A PASS WITH NO CHECKOUT IS THE FIFTH CAUSE ON THIS SENTENCE (agent-infra#4134
+            # F1's class, measured on this branch): `dispatch()` returns at its no-checkout guard
+            # before the brief, the worktree and the chain, so no order reached the transport.
+            _no_ck = stalls.get(NO_CHECKOUT_TOKEN) or 0
+            _transport = undeliv - carried - _rub - _claim_unread - _no_ck
             # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
             # holds are appended rather than folded in: they are the same AXIS (a read that did not
             # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
@@ -6574,6 +6619,16 @@ def run_pass(args, rubric_note: str = "") -> int:
                         " not answer -- nothing was dispatched, and a head whose claim cannot be"
                         " READ is never proven free%s; not a clean pass"
                         % (undeliv - carried, _carried))
+                elif _no_ck and _no_ck == undeliv - carried:
+                    # ⛔ A MISSING CHECKOUT IS THE LAUNCHER'S INPUT, NOT A BROKEN DISPATCHER
+                    # (agent-infra#4134 F1's own class, one level up from the detail line).
+                    # `dispatch()` returns before `materialise_worktree` and before
+                    # `$O/nonblocking-dispatch.sh` is exec'd, so neither "no worker accepted" nor
+                    # "repair the dispatch chain" describes what happened.
+                    log("REFUSING: %d order(s) could not be placed because this pass was given NO"
+                        " CHECKOUT -- nothing was dispatched, no worktree could be materialised, and"
+                        " the dispatch chain was NEVER INVOKED; pass REPO=<checkout>%s; not a clean"
+                        " pass" % (undeliv - carried, _carried))
                 else:
                     # ⛔ ONLY ORDERS THAT ACTUALLY REACHED THE TRANSPORT MAY BE CALLED "no worker
                     # accepted" (harness review of #4134, P2). The residue is what is left after
@@ -6631,7 +6686,9 @@ def run_pass(args, rubric_note: str = "") -> int:
             # invoked -- the exact shape #2291 and #4009 each split. Split, so the count and the
             # cause agree.
             _claim_unread = stalls.get(CLAIM_UNREADABLE_TOKEN) or 0
-            placed_and_refused = undeliv - carried - _rub - _claim_unread
+            # ⛔ AND THE NO-CHECKOUT CAUSE, WHICH ALSO NEVER REACHED THE TRANSPORT (#4134 F1).
+            _no_ck = stalls.get(NO_CHECKOUT_TOKEN) or 0
+            placed_and_refused = undeliv - carried - _rub - _claim_unread - _no_ck
             if placed_and_refused:
                 parts.append("%d order(s) no worker accepted%s"
                              % (placed_and_refused,
@@ -6640,6 +6697,13 @@ def run_pass(args, rubric_note: str = "") -> int:
             if _rub:
                 parts.append("%d order(s) refused for the RUBRIC before any worktree or chain step"
                              % _rub)
+            if _no_ck and dispatched:
+                # Named on a DELIVERED pass too, by the `_claim_unread` block's own convention: the
+                # stall counters print only when nothing went out, so without this a count would
+                # appear nowhere on the one pass shape that could carry it.
+                parts.append("%d order(s) could not be placed: this pass was given NO CHECKOUT"
+                             " (no worktree could be materialised, the dispatch chain was NEVER"
+                             " INVOKED -- pass REPO=<checkout>)" % _no_ck)
             if _claim_unread and dispatched:
                 # ⛔ NAMED ON A PASS THAT DELIVERED TOO, not only the zero-dispatch one: the stall
                 # loop above prints it ONLY when nothing went out, so on a pass that dispatched two
@@ -6782,6 +6846,15 @@ def run_pass(args, rubric_note: str = "") -> int:
         elif (not dispatched and (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0)
               and undeliv == (stalls.get(CLAIM_UNREADABLE_TOKEN) or 0) + carried):
             code, verdict = EXIT_UNDELIVERED, "CLAIM-UNREADABLE"
+        # ⛔ AND A PASS LAUNCHED WITHOUT A CHECKOUT IS THE SAME CLASS ONE LAYER UP (#4134 F1).
+        # `dispatch()` returns at the no-checkout guard before the claim gate, the brief, the
+        # worktree or the chain, so `next=repair-chain` names a component that was never invoked and
+        # `no worker accepted` asserts a transport failure over orders that never reached it. Same
+        # equality guard as the two arms above: `no-checkout` + `carried` must be the WHOLE of
+        # `undeliv`, or a real transport drop would be hidden behind one asserted cause.
+        elif (not dispatched and (stalls.get(NO_CHECKOUT_TOKEN) or 0)
+              and undeliv == (stalls.get(NO_CHECKOUT_TOKEN) or 0) + carried):
+            code, verdict = EXIT_UNDELIVERED, "NO-CHECKOUT"
         # ⛔ THE REFUSAL TOKEN WINS ONLY WHEN THE WHOLE UNDELIVERABLE SET IS REFUSALS (#2291 merged
         # with #2710's `carried`). Both changes route a durable refusal to rc 3 -- #2710 through
         # `undeliverable`/`carried`, #2291 through its own `refused-cooldown` axis -- so the code is
@@ -6836,6 +6909,13 @@ def run_pass(args, rubric_note: str = "") -> int:
             head += ("; the dispatch chain was NEVER INVOKED -- supply this repo's own rubric through"
                      " the OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE seams named on this pass's `rubric:`"
                      " line; repairing the chain cannot help and this does NOT clear by waiting")
+        elif verdict == "NO-CHECKOUT":
+            # ⛔ THE REMEDY IS THE INPUT, NOT THE COMPONENT BESIDE IT (agent-infra#4134 F1's class).
+            # The operator supplies the checkout this pass was launched without; the dispatcher and
+            # its chain are healthy and were NEVER INVOKED, so repairing them cures nothing.
+            head += ("; this pass was given NO CHECKOUT -- supply it (REPO=<checkout>, or"
+                     " <owner/name>=<checkout> in PR_DOCTOR_REPOS); no worktree could be"
+                     " materialised and the dispatch chain was NEVER INVOKED")
         elif verdict == "CLAIM-UNREADABLE":
             # ⛔ THE OTHER COMPONENT THAT IS NOT THE CHAIN (harness review of #4134, P2). Same
             # measured shape as #4009: nothing was exec'd, so the old `next=repair-chain` sent an
@@ -7047,6 +7127,20 @@ def run_pass(args, rubric_note: str = "") -> int:
                 log("#%s (%s): spawn %s -- the pass is NOT told whether an agent started. This is a "
                     "third outcome, not a failure: re-read next pass (a live worker is nothing to do, "
                     "and a refusal has landed its exit status by then)."
+                    % (key, action, detail[:200]))
+                continue
+            # ⛔ A PASS WITH NO CHECKOUT IS THE SAME KIND OF REFUSAL, AND IT IS SEPARATED FIRST (see
+            # `NO_CHECKOUT_REFUSAL`). Counted on the `undeliverable` axis -- the pass placed nothing,
+            # so it may not read clean (#3105) -- but NOT as "no worker accepted" and NOT with
+            # `next=repair-chain`: the guard returns before the claim gate, the brief, the worktree
+            # and the chain. No row: a missing `REPO=` is THIS pass's own input, so a cooldown would
+            # hold a PR for a fault about the launcher.
+            if no_checkout_refused(detail):
+                stalled[NO_CHECKOUT_TOKEN] = stalled.get(NO_CHECKOUT_TOKEN, 0) + 1
+                undeliverable += 1
+                log("#%s (%s): not dispatched -- this pass was given NO CHECKOUT, so no worktree "
+                    "can be materialised and no order can be placed; nothing was consumed and the "
+                    "dispatch chain was NEVER INVOKED -- supply the checkout: %s"
                     % (key, action, detail[:200]))
                 continue
             # ⛔ THE RUBRIC IS A THIRD KIND OF REFUSAL AND IT IS NOT THE TRANSPORT (#4009). It is
