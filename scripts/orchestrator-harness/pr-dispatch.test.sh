@@ -185,6 +185,39 @@ sed -n '/# \[prclass:begin\]/,/# \[prclass:end\]/p' "$ORCH" | sed '1d;$d' > "$TM
   && ok "the class-cache write is extracted from the shipped loop" \
   || bad "the [prclass] block is missing or does not parse — the ordering's CONFLICTED rank is untested"
 
+# ── extraction 1e: the PR ROW split — the only production source of `MSTAT=CONFLICTING` ─────────
+# ⛔ DRIVEN, NOT GREPPED (review P3, #4126). Every T5b drive SETS `MSTAT` directly, so an INVERTED
+# `%% *`/`#* ` here would leave the whole suite green while the router never fired on a live box: this
+# is the only line that turns `gh`'s "<head> <mergeable>" into the pair the router reads.
+sed -n '/# \[prrow:begin\]/,/# \[prrow:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/prrow.sh"
+[ -s "$TMP/prrow.sh" ] && grep -q 'MSTAT=' "$TMP/prrow.sh" \
+  && ok "the PR-row split is extracted from the shipped loop" \
+  || bad "the [prrow] block is missing or does not parse — MSTAT=CONFLICTING could never be produced"
+# (a) the real two-field answer, split into head + mergeable.
+_prrow_drive() { # <gh-answer>
+  PR=4242; OR=o/r; _ROW="$1"
+  # `gh_bounded` receives (pr view ...), not the row: the row is read from `_ROW`, which the
+  # extracted block's own substitution inherits.
+  gh_bounded() { printf '%s\n' "$_ROW"; }
+  # shellcheck disable=SC1090
+  ( . "$TMP/prrow.sh"; printf '%s|%s\n' "$HEAD_N" "$MSTAT" )
+}
+[ "$(_prrow_drive 'abc1234 CONFLICTING')" = 'abc1234|CONFLICTING' ] \
+  && ok "a two-field row splits into HEAD=<sha> and MSTAT=<mergeable> — the live CONFLICTING path" \
+  || bad "the row split is INVERTED or mis-keyed: '$(_prrow_drive 'abc1234 CONFLICTING')' (want abc1234|CONFLICTING)"
+# (b) a one-field answer is a HEAD, never a mergeable (the `gh` UNKNOWN / error shape).
+[ "$(_prrow_drive 'deadbeef')" = 'deadbeef|' ] \
+  && ok "a one-field row is the head with NO mergeable — a short answer never fabricates a conflict" \
+  || bad "a one-field row produced '$(_prrow_drive 'deadbeef')' (want deadbeef|) — the split invented a mergeable"
+# (c) an empty answer sets neither (unreadable: the arms below handle an empty head).
+[ "$(_prrow_drive '')" = '|' ] \
+  && ok "an empty row sets NEITHER field — an unreadable answer is not a head and not a conflict" \
+  || bad "an empty row produced '$(_prrow_drive '')' (want |)"
+# (d) NON-VACUITY of (b): a mergeable that happens to contain no space is still never read as one.
+[ "$(_prrow_drive 'abc1234 MERGEABLE')" = 'abc1234|MERGEABLE' ] \
+  && ok "a MERGEABLE row keeps the mergeable (the split is not hardcoded to CONFLICTING)" \
+  || bad "a MERGEABLE row produced '$(_prrow_drive 'abc1234 MERGEABLE')' (want abc1234|MERGEABLE)"
+
 # ── extraction 1d: the PARKED guard (agent-infra#4120) ───────────────────────────────────────────
 # ⛔ A PARK IS A TERMINATOR THAT RUNS BEFORE EVERY ARM, so a conflicting head that inherits one is
 # unreachable no matter what the conflict router does — and the parks most often held on a conflicting
@@ -524,7 +557,9 @@ PY
     printf 'conflict\n' > "$TMP/route"
     if [ -n "${6:-}" ]; then
       printf '%s\n' "$6" > "$O/state/parked-$PR"
-      printf 'REVIEW-CAP: 3/3 review re-records at head=%s — the reviewer never produced a usable verdict\n' "$6" > "$O/state/parkreason-$PR"
+      # $7 overrides the reason so the HUMAN-park arm can be driven; the default is the REVIEW-side
+      # park the measured population actually inherited.
+      printf '%s\n' "${7:-REVIEW-CAP: 3/3 review re-records at head=$6 — the reviewer never produced a usable verdict}" > "$O/state/parkreason-$PR"
     fi
     for _once in 1; do
       if [ -s "$TMP/parked.sh" ]; then
@@ -929,6 +964,15 @@ t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234
 [ "$(cat "$TMP/route" 2>/dev/null)" = "conflict" ] && [ "$(acts)" = "1" ] \
   && ok "a CONFLICTING head parked REVIEW-CAP at that head is STILL rebased (the park does not outlive it)" \
   || bad "a REVIEW-CAP park at the conflicted head still hides it (route=$(cat "$TMP/route" 2>/dev/null) acts=$(acts)) — the fix would go inert after two cycles"
+# ⛔ BUT A HUMAN PARK STANDS (review P3, #4126). The exemption reads the REASON, not only
+# `mergeable`: a park a human wrote records a judgement about the PR that a rebase does NOT settle, so
+# rebasing it would resolve conflict hunks the human parked it for. Non-vacuity: the SAME head,
+# the SAME `CONFLICTING`, and only the reason differs from the drive above.
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off'
+[ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
+  && ok "a HUMAN park on a conflicting head is HONOURED (no rebase resolves a decision a human owns)" \
+  || bad "a human park was overridden by the conflict router (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — the harness rebased a PR a human parked"
 t5_clear; drive_route 'FAILED:ai-review-gate' MERGEABLE 0 0 1 abc1234
 [ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
   && ok "control: the SAME park still SKIPS a non-conflicting head (the guard is still a guard)" \

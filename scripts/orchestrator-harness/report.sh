@@ -318,13 +318,24 @@ EOF
 esac
 cap=3
 [ -n "${MAX_FIX_TRIES:-}" ] && case "$MAX_FIX_TRIES" in ''|*[!0-9]*) ;; *) cap="$MAX_FIX_TRIES" ;; esac
+# ⛔ BOTH BUDGETS, BECAUSE THE CONFLICT ROUTER HAS ITS OWN (review P3, #4126). `conflictcount-<PR>`
+# is a SEPARATE budget from `fixcount-<PR>` (a30ebf415) — two orthogonal failure modes must not share a
+# retry budget. Counting only `fixcount-*` made every PR the conflict router parks INVISIBLE in this
+# operator report: the population this change exists to unblock never appeared among "at fix-tries cap".
 atcap=0
+atcap_conflict=0
 for f in "$O"/state/fixcount-*; do
   [ -e "$f" ] || continue
   c=$(cat "$f" 2>/dev/null)
   [ -n "$c" ] && [ "$c" -ge "$cap" ] 2>/dev/null && atcap=$((atcap + 1))
 done
+for f in "$O"/state/conflictcount-*; do
+  [ -e "$f" ] || continue
+  c=$(cat "$f" 2>/dev/null)
+  [ -n "$c" ] && [ "$c" -ge "$cap" ] 2>/dev/null && atcap_conflict=$((atcap_conflict + 1))
+done
 echo "  at fix-tries cap:       $atcap"
+echo "  at conflict-tries cap:  $atcap_conflict"
 echo
 
 echo "── last 8 dispatch decisions ───────────────────────────────"

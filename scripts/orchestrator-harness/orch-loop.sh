@@ -6704,6 +6704,11 @@ while true; do
     # the separate `gh pr view --json mergeable` that used to run for every green PR. `mergeable` is
     # `UNKNOWN` while GitHub computes it lazily, and that reads as "not conflicting THIS cycle" — the
     # same allow-list polarity the old arm had (only the literal `CONFLICTING` ever fires).
+    # [prrow:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+    # ⛔ THE ONLY PRODUCTION PATH THAT EVER SETS `MSTAT=CONFLICTING`, SO IT IS DRIVEN (review P3,
+    # #4126). It used to be reachable only from the sweep itself, and the one drive that fed it a
+    # one-field `deadbeef` answer could not tell a correct `%% *`/`#* ` split from an INVERTED one —
+    # the router would then never fire on a live box while the whole suite stayed green.
     _pr_row="$(gh_bounded pr view "$PR" --repo "$OR" --json headRefOid,mergeable \
                  --jq '"\(.headRefOid) \(.mergeable // "")"' 2>/dev/null)"
     HEAD_N=""; MSTAT=""
@@ -6712,6 +6717,7 @@ while true; do
       *' '*) HEAD_N="${_pr_row%% *}"; MSTAT="${_pr_row#* }" ;;
       *)     HEAD_N="$_pr_row" ;;                # a one-field answer is the head, never a mergeable
     esac
+    # [prrow:end]
     # ── THE DURABLE CLAIM DECIDES BEFORE ANY ARM ACTS (agent-infra#2466) ──────────────────────
     # ⛔ THIS IS THE SELECTION POINT, and it is the one place where a second controller's work is
     # invisible: everything below (`redfix`, the parked guard, the spawn guards, the GREEN arm that
@@ -7128,10 +7134,34 @@ while true; do
     # inert for the rest of the head's life. The exemption is not a licence to ignore parks: the PR
     # still runs the conflict router, whose own cap (`MAX_FIX_TRIES`) re-parks it — a `wait` row and
     # no spawn — so a head parked by ANOTHER arm's cap cannot be rebased more often than any other.
-    # ⛔ THE PARK FILES ARE NOT DELETED HERE. This line only declines to SKIP the row; the router
-    # below decides, and it writes its own park when its cap binds — so the record stays auditable and
-    # `test-gates.sh`'s park drives still see the file they seeded.
-    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && [ "${MSTAT:-}" != "CONFLICTING" ] && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
+    # ⛔ THE PARK FILES ARE NOT DELETED HERE. This block only declines to SKIP the row; the router
+    # below decides, and it writes its OWN park when its cap binds — so at a conflicting head the
+    # stored reason is REPLACED by the router's, not preserved (review P3, #4126: the earlier "the
+    # record stays auditable" overstated it — `park_ctrl` OVERWRITES `parkreason-<PR>`, and
+    # `refund_bailed_fixer` deletes `parked-<PR>` outright). What IS unchanged is that the guard itself
+    # never deletes, and that `test-gates.sh`'s park drives still see the file they seeded.
+    # ⛔ A HUMAN PARK STILL STANDS (review P3, #4126 — the correction to the paragraph above). The
+    # exemption consults the REASON, not only `mergeable`: a park a human wrote ("needs a human
+    # decision") records a judgement about the PR that a rebase does NOT settle, so rebasing it would
+    # resolve conflict hunks the human parked it for. That is the same rule the red-fixer arm applies
+    # when it refuses to lift a park whose reason is not its own (the GREEN arm above). So the guard
+    # HONOURS a park whose reason is not one THIS harness wrote — an unrecognised reason fails closed
+    # (skip), exactly as the red-fixer's `case` does. Every review-side and rail-side reason is
+    # listed, because those ARE the parks a rebase makes obsolete.
+    _pk_why="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
+    _pk_rebase_settles=1
+    case "$_pk_why" in
+      '') _pk_rebase_settles=1 ;;                    # the rail's own park (no reason written)
+      *'RED TREE'*) _pk_rebase_settles=1 ;;
+      *'still CONFLICTING'*) _pk_rebase_settles=1 ;; # this router's own, head-bound
+      *'still needs fixes'*|*'REVIEW-CAP'*|*'REVIEW-CEILING'*|*'REVIEW-AT-HEAD-STUCK'*|*'review-round budget'*|*'review budget record'*) _pk_rebase_settles=1 ;;
+      *'CI still red'*) _pk_rebase_settles=1 ;;
+      *'NOCHECKS-UNRESOLVABLE'*) _pk_rebase_settles=1 ;;
+      *) _pk_rebase_settles=0 ;;                      # not one of ours — a human decision stands
+    esac
+    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] \
+      && { [ "${MSTAT:-}" != "CONFLICTING" ] || [ "$_pk_rebase_settles" = "0" ]; } \
+      && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
     # [parked-guard:end]
     # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
     # spawns — the one action worse than doing nothing here would be acting on a contract this
@@ -7305,7 +7335,15 @@ while true; do
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
               echo "#$PR PARKED (still CONFLICTING after $NFC rebases)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/conflictcount-$PR'"
+            # ⛔ THE PARK REASON MUST NOT CLAIM A REMEDY THAT DOES NOT EXIST (review P3, #4126).
+            # `conflictcount-<PR>` is deliberately NOT head-keyed (it is a PR-lifetime budget, the same
+            # shape as `fixcount-<PR>`), so — unlike every other park here — a PUSH does NOT re-arm
+            # this budget: once `MAX_FIX_TRIES` rebases are spent, the next conflicting head arrives AT
+            # CAP and is parked again immediately. Leading with "a push re-arms it" sent an operator to
+            # the one action that cannot help. The sibling red-fixer park below states the same fact
+            # honestly ("in total … across heads"), so this one does too, and names the ONLY re-arm
+            # (`rm -f` the counter).
+            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases in total (MAX_FIX_TRIES=$MAX_FIX_TRIES, counted across heads: conflictcount-$PR is NOT head-keyed, so a PUSH does not re-arm it) — a human must decide, or re-arm the rebase budget explicitly: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/conflictcount-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC rebases — needs a human"
           elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it

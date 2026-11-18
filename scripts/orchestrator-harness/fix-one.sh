@@ -8,8 +8,10 @@ if [ "${1:-}" = "--argv" ]; then
   [ -f "$ARGV" ] || { echo "[fix] missing argv file: $ARGV" >&2; exit 1; }
   { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
   rm -f "$ARGV"
-  # Only a CONTROLLER dispatch books an attempt in fixcount-<PR>. See the refund in the load-refusal
-  # path below: a manual run must not decrement a counter it never incremented.
+  # Only a CONTROLLER dispatch books an attempt, in `fixcount-<PR>` (the review-gate / CI-red / red-fixer
+  # arms) or `conflictcount-<PR>` (the CONFLICT router) — WHICH one is recorded in
+  # `state/spendcount-<PR>-<HEAD>`. See the refund in the load-refusal path below: a manual run must not
+  # decrement a counter it never incremented.
   CTRL=1
 else
   REPO="$1"; OR="$2"; PR="$3"; BR="$4"; CTRL=0
