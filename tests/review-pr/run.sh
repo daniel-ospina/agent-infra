@@ -4208,6 +4208,61 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "ONE canonical cell reused in an otherwise AUTHORED row still records (rc=$(rc_of)) - the floor is two, and it is enforced on the output"
 [ -f "$TMP/comment.md" ]; ck $? "  …because that artifact WAS posted (no refusal was taken)"
 unset _bq_cell4
+# ⛔ DISTINCT CELLS, NOT OCCURRENCES (P3 from the fresh-context review at 40d18e1a9). The rule this arm
+# states is "ONE can appear honestly … two cannot" — a count of DISTINCT canonical cells. The helper
+# prints one line per OCCURRENCE, so a canon that ships two rows sharing a distinctive cell (or one row
+# that repeats one) listed that cell twice, and an AUTHORED row citing it ONCE counted two and was
+# refused with exit 11: a false block whose cause is the harness's own example text, never the
+# reviewer's claim. The fixture below is a fake gate on the seam's FIRST ladder rung serving exactly
+# that canon (`tests/review-pr/run.sh` as a cell of BOTH data rows) and accepting any body that carries
+# the heading, so the only thing under test is the count. The MUTANT that drops the dedupe must refuse
+# the same transcript — otherwise this asserts the fixture, not the fix.
+DED="$TMP/ded"; rm -rf "$DED"; mkdir -p "$DED/dist"
+cp "$SRC" "$DED/dist/review-pr.sh"; chmod +x "$DED/dist/review-pr.sh"
+cat > "$DED/dist/brief-gate.sh" <<'DEDGATE'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --mutation-section)
+    cat <<'CANNON'
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `tests/review-pr/run.sh` | `mv a b` | §DED-ONE | `RED`, rc=1 |
+| `tests/review-pr/run.sh` | `mv c d` | §DED-TWO | `RED`, rc=1 |
+CANNON
+    ;;
+  --mutation-missing)
+    _f="${2:-}"
+    if [ "$_f" = "-" ]; then cat >/dev/null 2>&1; printf 'MUTATION-ATTRIBUTION\n'; exit 0; fi
+    grep -q 'MUTATION ATTRIBUTION' "$_f" 2>/dev/null && exit 0
+    printf 'MUTATION-ATTRIBUTION\n' ;;
+esac
+exit 0
+DEDGATE
+chmod +x "$DED/dist/brief-gate.sh"
+_bq_ded_row='| `tests/review-pr/run.sh` | `mv x y` | §BQ (distinct) | `RED`, rc=1 |'
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_ded_row" > "$TMP/reviewer-out"
+run "$DED/dist/review-pr.sh" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a canon whose TWO rows share a distinctive cell does not double-count ONE honest citation (rc=$(rc_of), want 0)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …so the record is written: the arms judge the claim, not the harness's example text"
+# …and the FIRST rung really was the fake gate (otherwise the shipped canon answered and this proves
+# nothing about the shipped script). The canon cell must not be one the REAL contract also ships, or
+# the count would be <= 1 anyway and the assertion would pass on the pre-fix code.
+_canon_ded="$(bash "$DED/dist/brief-gate.sh" --mutation-section | grep -c 'tests/review-pr/run.sh')"
+[ "$_canon_ded" = "2" ]; ck $? "  …the fixture really serves the cell TWICE (occurrences=$_canon_ded), so the pre-fix count was two"
+DEDM="$DED/dist/review-pr-nodedupe.sh"
+sed 's/ | sort -u)"/)"/' "$SRC" > "$DEDM"; chmod +x "$DEDM"
+if cmp -s "$SRC" "$DEDM"; then
+  fail "the dedupe mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  printf '## MUTATION ATTRIBUTION\n\n%s\n%s\n%s\n\nCLEAN\n' "$_bq_hdr" "$_bq_rule" "$_bq_ded_row" > "$TMP/reviewer-out"
+  run "$DEDM" 2284
+  [ "$(rc_of)" = "11" ]; ck $? "the MUTANT without the dedupe REFUSES that honest citation (rc=$(rc_of), want 11) - so the dedupe is what keeps the arm's stated floor"
+  no_record; ck $? "  …and nothing was recorded on the false block"
+fi
+unset _bq_ded_row _canon_ded
 # The internal mutant: WIDEN the cell arm's floor in a COPY, leaving everything else intact (the
 # comparison, the projection and both other provenance arms). If the refusals above came from this arm,
 # the copy must RECORD the cell-edited paste-back while the recorder's parser still accepts the artifact
@@ -4393,8 +4448,13 @@ if grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; then
   # declaration BY THE RECORDER (its anchor is `(^|[^[:alnum:]])outcome`, which `an outcome:` satisfies),
   # so the mirror refusing it is faithful rather than a widening. Asserting the two AGREE is the property
   # — a bare `-n` would also pass if the mirror refused everything.
+  # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864, the same idiom the seam's own arm was
+  # caught on): under `pipefail` the quiet grep exits at its first match, the writer takes SIGPIPE and
+  # the pipeline reports 141 — so the agreement probe could read the recorder as NOT matching and
+  # assert the mirror is faithful to the wrong answer. (`run.sh` is outside
+  # `scripts/check-no-sigpipe-grep.sh`'s default roots, so nothing else would redden this.)
   _v2_prose='the review discussed an outcome: it was blocking, 2 P1 remain open'
-  printf '%s' "$_v2_prose" | grep -qiE "$_RECORDER_OC_DECL_RE"; _v2_rec=$?
+  grep -qiE "$_RECORDER_OC_DECL_RE" <<<"$_v2_prose"; _v2_rec=$?
   { [ -n "$(v2hit "$_v2_prose")" ] && [ "$_v2_rec" -eq 0 ]; }; ck $? "the mirror AGREES with the recorder's own anchor on prose carrying an 'outcome:' label (recorder matches: $([ "$_v2_rec" -eq 0 ] && echo yes || echo no)) — not a widening"
   unset -f v2hit
 fi

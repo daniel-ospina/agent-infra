@@ -2877,7 +2877,15 @@ _mutation_canon_cells() { # <text> -> the DISTINCTIVE cells of its DATA rows, no
 mutation_pasteback_cells() { # <section-text> -> the canonical cells the section REPRODUCES (empty =
                              # authored); printed one per line, at most the two that decided it
   local _canon _sec _c _hits="" _n=0
-  _canon="$(_mutation_canon_cells "$MUTATION_SECTION")"
+  # ⛔ THE CANON IS DEDUPED, SO THE COUNT IS OF DISTINCT CELLS AND NOT OF OCCURRENCES (found by a
+  # fresh-context review of #3987). `_mutation_canon_cells` prints ONE LINE PER OCCURRENCE, so a canon
+  # whose rows share a distinctive cell — or one row that repeats it — listed that cell twice, and an
+  # AUTHORED row citing it ONCE counted two and was refused with exit 11. That is a false block whose
+  # cause is the harness's own example text, not the reviewer's claim, and it contradicts the floor the
+  # arm states in as many words: "ONE can appear honestly … two cannot". `sort -u` makes the code match
+  # that sentence; the reviewer's side needs no dedupe because it is only ever ASKED whether a cell is
+  # present (`grep -Fxq`), never counted.
+  _canon="$(_mutation_canon_cells "$MUTATION_SECTION" | sort -u)"
   _sec="$(_mutation_canon_cells "${1:-}")"
   [ -n "$_canon" ] && [ -n "$_sec" ] || return 0
   while IFS= read -r _c; do
