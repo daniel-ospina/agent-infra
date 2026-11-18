@@ -1221,6 +1221,15 @@ def test_an_unreadable_registry_is_SKIPPED_and_reported_with_its_token(monkeypat
     proceeds on a head this box cannot prove is free, which is the duplicate the owner's decision
     exists to prevent. The token assertion reddens too, which is why the SKIP is reported rather
     than silent.
+
+    ⛔ NO MINT-COUNT ASSERTION HERE, AND THAT IS DELIBERATE (#3442 rule 3). This row makes the
+    registry unreadable by RE-POINTING box A's `origin` at `gone.git`, and `_claim_run` hands
+    `claims.sh` `CLAIM_REPO` = box A -- so NO path in this diff can address `tmp_path/origin.git`,
+    and an assertion read off that remote cannot vary under any mutation of the change: dead
+    weight (a review found it as exactly that). The "a run that cannot claim mints nothing" half is
+    carried by `test_a_dry_run_reports_a_held_head_without_minting_a_claim` (:1327), which keeps
+    the registry addressable while it counts refs. What THIS row owns is the pair R2 names: the
+    abstention is a SKIP, and the skip is reported with its token.
     """
     origin, head, boxa, _boxb = _claim_fleet(tmp_path)
     pr_ = _pr(13126, head=head)
@@ -1241,7 +1250,6 @@ def test_an_unreadable_registry_is_SKIPPED_and_reported_with_its_token(monkeypat
     ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False and record is False, (ok, detail, record)
     assert pr.claim_hold_token(detail) == pr.CLAIM_UNREADABLE_TOKEN, detail
-    assert _claimed_refs(origin) == [], "nothing may be minted on an unreadable registry"
     assert any("verdict=claims-unreadable" in m for m in logged), \
         "a silent skip is indistinguishable from a bug: %r" % (logged,)
 
