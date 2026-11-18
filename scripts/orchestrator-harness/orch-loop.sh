@@ -7332,17 +7332,19 @@ while true; do
             # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
             # a park left by a previous head must be REFRESHED or the new head never parks. The log
             # line stays novel-only (evaluated BEFORE the write) so the log does not repeat.
-            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
-              echo "#$PR PARKED (still CONFLICTING after $NFC rebases)" >>"$LOG"
-            fi
             # ⛔ THE PARK REASON MUST NOT CLAIM A REMEDY THAT DOES NOT EXIST (review P3, #4126).
             # `conflictcount-<PR>` is deliberately NOT head-keyed (it is a PR-lifetime budget, the same
             # shape as `fixcount-<PR>`), so — unlike every other park here — a PUSH does NOT re-arm
             # this budget: once `MAX_FIX_TRIES` rebases are spent, the next conflicting head arrives AT
             # CAP and is parked again immediately. Leading with "a push re-arms it" sent an operator to
             # the one action that cannot help. The sibling red-fixer park below states the same fact
-            # honestly ("in total … across heads"), so this one does too, and names the ONLY re-arm
-            # (`rm -f` the counter).
+            # honestly ("in total ... across heads"), so this one does too, and names the ONLY re-arm
+            # (`rm -f` the counter). ⛔ THE REASON STAYS ON THE LINE IMMEDIATELY AFTER THE LOG LINE:
+            # `test-gates.sh` drives this park by extracting a fixed window around that anchor, so a
+            # comment wedged between them makes the park unpinned rather than failing to compile.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (still CONFLICTING after $NFC rebases)" >>"$LOG"
+            fi
             park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC rebases in total (MAX_FIX_TRIES=$MAX_FIX_TRIES, counted across heads: conflictcount-$PR is NOT head-keyed, so a PUSH does not re-arm it) — a human must decide, or re-arm the rebase budget explicitly: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/conflictcount-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC rebases — needs a human"
           elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then

@@ -3623,7 +3623,14 @@ GHFAIL2
   # wrong reason and, worse, would have stopped constraining the ORDER the moment the form changed
   # again. Both forms are accepted so the property (write strictly precedes spawn, within 3 lines) is
   # what is pinned, not the launcher's name.
-  _fs_w="$(grep -n '^ *: > "$O/state/fixspend-$PR-$HEAD_N"$' "$ORCH" | head -1 | cut -d: -f1)"
+  # ⛔ THE PRODUCER IS NOW `spend_book … fixcount 1` (review P2, #4126 round 3), NOT A BARE REDIRECT.
+  # The write moved into the shipped `spend_book` because the SAME record must also name the counter
+  # that spawn charged, and a `: > fixspend-…` beside a `spend_book … fixcount 0` would have made the
+  # findings-restore proof and the budget attribution two unsynchronised facts. The PROPERTY this pin
+  # stands for is unchanged — the record is written strictly BEFORE the spawn, within 3 lines — so the
+  # pattern follows the shipped form instead of being retired. The `1` is load-bearing: it is the
+  # argument that re-asserts `fixspend-<PR>-<HEAD>` at all, so it is part of the pattern.
+  _fs_w="$(grep -n '^ *spend_book "\$PR" "\$HEAD_N" fixcount 1$' "$ORCH" | head -1 | cut -d: -f1)"
   _fs_s=""
   if [ -n "${_fs_w:-}" ]; then
     _fs_s="$(awk -v w="$_fs_w" 'NR>w && (/if tmux new-session -d -s "fix-\$PR"/ || /if wt_spawn "fix-\$PR"/){print NR; exit}' "$ORCH")"
@@ -3632,6 +3639,25 @@ GHFAIL2
     echo "  ❌ the fixspend record is not written immediately BEFORE the fixer spawn (write=${_fs_w:-<none>} spawn=${_fs_s:-<none>}) — a concurrent fix-one.sh can record its bail first and the findings marker is then withheld"; FAIL=$((FAIL+1))
   else
     echo "  ✅ the spend record is written BEFORE the spawn (write line $_fs_w, spawn line $_fs_s) — a concurrent bail cannot race it"; PASS=$((PASS+1))
+  fi
+  # (11b) ⛔ AND THE PRODUCER'S `1` REALLY RE-ASSERTS THE FINDINGS PROOF, DRIVEN — the pin above would
+  # stay green if `spend_book` ignored its 4th argument, which is exactly the restore authorisation the
+  # whole `fixspend` marker exists to carry. Both directions: `1` writes it, anything else clears it.
+  ex spend_book > "$TMP/fn_spend_book.sh"
+  if grep -q '^spend_book() {' "$TMP/fn_spend_book.sh"; then
+    mkdir -p "$TMP/sbO/state"
+    ( O="$TMP/sbO"; . "$TMP/fn_spend_book.sh"
+      spend_book 71 cafe0001 fixcount 1
+      spend_book 72 cafe0001 fixcount 0 )
+    if [ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] \
+       && [ ! -f "$TMP/sbO/state/fixspend-72-cafe0001" ] \
+       && [ "$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)" = "fixcount" ]; then
+      echo "  ✅ spend_book's 4th argument decides the findings proof (1 writes it, 0 CLEARS it), and the record names the counter"; PASS=$((PASS+1))
+    else
+      echo "  ❌ spend_book did not honour its 4th argument or did not record the counter (71 spends=$([ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] && echo yes || echo no) 72 spends=$([ -f "$TMP/sbO/state/fixspend-72-cafe0001" ] && echo yes || echo no) rec=[$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)])"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract spend_book from orch-loop.sh"; FAIL=$((FAIL+1))
   fi
   # (12) ⛔ THE ORPHAN PRUNE, DRIVEN (review round 5, residual 1 — it was unpinned and a future edit
   # that dropped the row-count guard would turn "unreadable listing" into "delete every marker").
