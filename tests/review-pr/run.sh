@@ -4422,18 +4422,24 @@ no_record; ck $? "  …nothing recorded"
 case "$(cat "$TMP/comment.md" 2>/dev/null)" in *ADVERSARIAL-BOUND*) rc=1;; *) rc=0;; esac
 ck $rc "  …and NOTHING was posted: the artifact record-review.sh would reject is not on the PR"
 
-# (2) ARM (1a)/(1c): THE `Outcome:` DECLARATIONS. ⛔ DRIVEN AS A UNIT, DELIBERATELY. Any end-to-end
+# (2) ARM (1b)/(1c): THE `Outcome:` DECLARATIONS. ⛔ DRIVEN AS A UNIT, DELIBERATELY. Any end-to-end
 # fixture carrying a blocking declaration of the shape the recorder reads also carries a COUNT of
 # "blocking findings", which the seam's OWN prose findings-scanner sees several hundred lines upstream —
 # the verdict flips to `issues` (rc=7) and the pre-post scan never runs, so the end-to-end arm would
 # measure the WRONG GATE. `recorder_veto2_hit` is the exact function the seam calls, extracted from the
-# script under test, so this asserts the mirror's decision and (3) below asserts the wiring is
+# script under test, so this asserts the mirror's decision and (4) below asserts the wiring is
 # load-bearing. On the pre-fix script the function does not exist, so the extraction fails here.
+# ⛔ AND THE ENGINE IS THE RECORDER'S OWN FUNCTION (P1, fresh review at 092295501): the unit points
+# `MIRROR_SH` at the recorder in the tree under test, which is what the seam's preflight resolves and
+# canaries. Extracting a re-spelling instead would be measuring the copy this fix deleted.
 V2="$TMP/veto2-unit.sh"
 {
-  grep -E '^_RECORDER_(OC_NBSP|OC_DECL_RE|VETO2_(NONCLEAN|BLOCKING|FIXED)_RE|AB_TOKEN_RE|AB_FIELD_RE)=' "$SRC"
+  grep -E '^_RECORDER_(OC_NBSP|OC_DECL_RE|VETO2_(NONCLEAN|HEADER_NOTCLEAN)_RE|AB_TOKEN_RE|AB_FIELD_RE)=' "$SRC"
+  sed -n '/^recorder_outcome_blocking_line_from() {/,/^}$/p' "$SRC"
+  sed -n '/^recorder_outcome_blocking_line() {/,/^}$/p' "$SRC"
   sed -n '/^recorder_veto2_hit() {/,/^}$/p' "$SRC"
 } > "$V2" 2>/dev/null
+MIRROR_SH="$ROOT/scripts/record-review.sh"
 grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; ck $? "the mirror is a callable unit in the script under test (on the pre-fix script there is none)"
 if grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; then
   # shellcheck disable=SC1090
@@ -4441,13 +4447,59 @@ if grep -q '^recorder_veto2_hit() {' "$V2" 2>/dev/null; then
   v2hit() { printf '%s\n' "$1" > "$TMP/v2case.txt"; recorder_veto2_hit "$TMP/v2case.txt"; }
   [ -n "$(v2hit '**Outcome: 2 blocking findings remain open.**')" ]; ck $? "arm (1c): a blocking-noun Outcome: declaration is REFUSED"
   [ -n "$(v2hit '**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**')" ]; ck $? "arm (1c): a live P1 count is REFUSED too (the severity spelling, measured ADMITTED before #3902's fix)"
-  [ -n "$(v2hit '**Outcome: not-clean**')" ]; ck $? "arm (1a): a non-clean Outcome: declaration is REFUSED"
+  [ -n "$(v2hit '**Outcome: not-clean**')" ]; ck $? "arm (1b): a non-clean Outcome: declaration is REFUSED"
+  # ⛔ P1(a) AT 092295501: arm (1b)'s SECOND ALTERNATIVE carries NO `Outcome:` label, so the old
+  # label-anchored mirror never looked at it. The recorder has always refused this header; the seam
+  # posted it and the record step then refused with exit 9. MEASURED on the pre-fix head.
+  [ -n "$(v2hit 'Review — NOT CLEAN')" ]; ck $? "arm (1b): a 'Review — NOT CLEAN' HEADER (no Outcome: label) is REFUSED — P1(a) at 092295501"
+  [ -n "$(v2hit '### Review - not clean')" ]; ck $? "  …and its plain-hyphen heading form is refused too (the recorder's own class: em/en/plain dash)"
+  [ -n "$(v2hit 'the reviewer opened with Review — NOT CLEAN and listed three')" ]; ck $? "  …including mid-line (the recorder's boundary class: start, space, `>`, `*`, `-`)"
+  # ⛔ P1(b) AT 092295501: the recorder's escape is PER-COUNT and lives inside `outcome_declares_blocking`;
+  # the deleted local mirror tested `fixed|resolved|closed|addressed` on the LINE, so a line that resolves
+  # one count while another stays live was ADMITTED here and REFUSED by the recorder. These three are the
+  # review's own measured bodies — every one of them RECORDS on the pre-fix script and is refused here.
+  [ -n "$(v2hit '**Outcome: 2 blocking findings were fixed; 1 blocking finding remains open.**')" ]; ck $? "arm (1c) escape: a RESOLVED count beside a LIVE one is REFUSED (P1(b) at 092295501 — the line-local escape admitted it)"
+  [ -n "$(v2hit '**Outcome: CLEAN — 1 blocking issue was addressed, 2 remain.**')" ]; ck $? "  …and 'CLEAN — 1 addressed, 2 remain' is refused (P1(b))"
+  [ -n "$(v2hit '**Outcome: 3 P1 findings — one was fixed.**')" ]; ck $? "  …and '3 P1 findings — one was fixed' is refused (P1(b))"
   [ -z "$(v2hit '**Outcome: clean**')" ]; ck $? "NO FALSE BLOCK: the artifact's own '**Outcome: clean**' passes — the mirror cannot refuse every review"
-  [ -z "$(v2hit '**Outcome: CLEAN — 2 blocking findings were fixed**')" ]; ck $? "NO FALSE BLOCK: the recorder's ESCAPE — a count followed by 'fixed' is admitted — is carried by the mirror"
-  # ⛔ THIS ONE IS AN AGREEMENT TEST, NOT A BARE "REFUSE": prose carrying an `outcome:` label is read as a
-  # declaration BY THE RECORDER (its anchor is `(^|[^[:alnum:]])outcome`, which `an outcome:` satisfies),
-  # so the mirror refusing it is faithful rather than a widening. Asserting the two AGREE is the property
-  # — a bare `-n` would also pass if the mirror refused everything.
+  [ -z "$(v2hit '**Outcome: CLEAN — 2 blocking findings were fixed**')" ]; ck $? "NO FALSE BLOCK: the recorder's ESCAPE — a count followed by 'fixed' is admitted — is carried by the mirror (now by the recorder's own per-count arm)"
+  [ -z "$(v2hit 'An earlier pass reviewed this — not cleanly worded, but it is clean now.')" ]; ck $? "NO FALSE BLOCK: prose that merely says 'not cleanly worded' is not a header and is admitted"
+  [ -z "$(v2hit '**Outcome: clean**')" ]; ck $? "NO FALSE BLOCK: the artifact's own '**Outcome: clean**' passes — the mirror cannot refuse every review"
+  [ -z "$(v2hit '**Outcome: CLEAN — 2 blocking findings were fixed**')" ]; ck $? "NO FALSE BLOCK: the recorder's ESCAPE — a count followed by 'fixed' is admitted — is carried by the mirror (now by the recorder's own per-count arm)"
+  # ⛔ THE PROPERTY, NOT ANOTHER SPELLING (P1's own ask at 092295501): the mirror's verdict and the
+  # RECORDER's must agree on a shared corpus, in BOTH directions and in BOTH polarities. Delegation
+  # makes it true by construction; this arm is what keeps a future "optimisation" that re-inlines a
+  # local heuristic from reading as covered. The recorder's decision is taken by running its own
+  # `outcome_declares_blocking` (the function the record step runs), never by grepping this suite.
+  _v2_corpus_yes=0; _v2_corpus_no=0; _v2_disagree=0
+  for _v2_body in \
+    '**Outcome: 2 blocking findings remain open.**' \
+    '**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**' \
+    '**Outcome: not-clean**' \
+    '**Outcome: 2 blocking findings were fixed; 1 blocking finding remains open.**' \
+    '**Outcome: CLEAN — 1 blocking issue was addressed, 2 remain.**' \
+    '**Outcome: 3 P1 findings — one was fixed.**' \
+    '**Outcome: 3 findings — 2 blocking (P1)**' \
+    '**Outcome: clean**' \
+    '**Outcome: CLEAN — 2 blocking findings were fixed**' \
+    '**Outcome: 2 blocking findings were fixed**' \
+    'A P3 nit about naming, nothing else.' \
+    'the review discussed an outcome: it was blocking, 2 P1 remain open' ; do
+    _v2_rec_line="$(recorder_outcome_blocking_line_from "$ROOT/scripts/record-review.sh" "$_v2_body")"
+    _v2_mir_line="$(v2hit "$_v2_body")"
+    if [ -n "$_v2_rec_line" ]; then _v2_corpus_yes=$((_v2_corpus_yes+1)); else _v2_corpus_no=$((_v2_corpus_no+1)); fi
+    # recorder-refuse => mirror-refuse. The other direction is NOT asserted for arm (1b)'s header and
+    # arm (a) reads (the mirror legitimately refuses shapes arm (1c) alone admits), so this is the
+    # implication that matters: the mirror may never be the looser of the two on arm (1c)'s subject.
+    if [ -n "$_v2_rec_line" ] && [ -z "$_v2_mir_line" ]; then _v2_disagree=$((_v2_disagree+1)); fi
+  done
+  unset _v2_body
+  [ "$_v2_corpus_yes" -ge 6 ] && [ "$_v2_corpus_no" -ge 3 ]; ck $? "the shared corpus is NOT vacuous: it carries $_v2_corpus_yes recorder-REFUSED and $_v2_corpus_no recorder-ADMITTED bodies (a corpus of one polarity would pin nothing)"
+  [ "$_v2_disagree" -eq 0 ]; ck $? "PROPERTY: recorder-refuse => mirror-refuse over the whole corpus ($_v2_disagree disagreement(s)) — the #3987 defect is that the mirror was the looser one"
+  # ⛔ THIS NEXT ONE IS AN AGREEMENT TEST, NOT A BARE "REFUSE": prose carrying an `outcome:` label is
+  # read as a declaration BY THE RECORDER (its anchor is `(^|[^[:alnum:]])outcome`, which `an outcome:`
+  # satisfies), so the mirror refusing it is faithful rather than a widening. Asserting the two AGREE is
+  # the property — a bare `-n` would also pass if the mirror refused everything.
   # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864, the same idiom the seam's own arm was
   # caught on): under `pipefail` the quiet grep exits at its first match, the writer takes SIGPIPE and
   # the pipeline reports 141 — so the agreement probe could read the recorder as NOT matching and
@@ -4504,6 +4556,97 @@ SEAM_OC_PAT="$(eval "$SEAM_OCL"; printf '%s' "${_RECORDER_OC_DECL_RE:-}")"
 [ -n "$SEAM_OC_PAT" ] && [ "$SEAM_OC_PAT" = "$REC_OC_PAT" ]; ck $? "…and the seam's expanded copy is IDENTICAL to it (seam='$SEAM_OC_PAT')"
 grep -qF '\[ADVERSARIAL-BOUND\]' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…the adversarial-bound token the mirror refuses is still one the recorder triggers on"
 grep -qF 'residuals=[[:space:]]*' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…and 'residuals=' is still the field its arm (iii) demands (the recorder still extracts `residuals=[[:space:]]*…`), so the mirror's refusal condition still matches"
+# ⛔ ARM (1b)'s HEADER SHAPE IS PINNED THE SAME WAY (P1(a) at 092295501). The seam's copy must still be
+# the recorder's OWN literal: if the recorder rewords its alternative, this reddens instead of the seam
+# silently re-grading a refusal. Extracted from the seam as the literal it assigns, then required to be
+# present byte-for-byte in the recorder.
+SEAM_HDR="$(grep -E '^_RECORDER_VETO2_HEADER_NOTCLEAN_RE=' "$SRC" 2>/dev/null | sed "s/^[^=]*='//; s/'\$//")"
+[ -n "$SEAM_HDR" ]; ck $? "the seam carries arm (1b)'s header alternative as its own literal (a copy, so it can be pinned)"
+[ -n "$SEAM_HDR" ] && grep -qF -- "$SEAM_HDR" "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…and that literal is BYTE-IDENTICAL to the recorder's own arm (1b) alternative (drift tripwire)"
+
+# (6) ⛔ P1(a) END TO END: A `Review — NOT CLEAN` HEADER PUBLISHED IN THE VERBATIM SECTION (P1, fresh
+# review at 092295501). The unit arms in (2) prove the FUNCTION refuses it; this proves the WIRING does —
+# the artifact is never posted, so the record step cannot refuse it after the money is spent. Non-vacuity
+# is (7): with the delegation neutered the same scenario records.
+reset; FIXTURE_NO_MUTATION=1
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n| `tests/q.sh:3` — the guard reads the header | `mv g q` | `q.test.sh` §A | `RED`, rc=1 |\n\nReview — NOT CLEAN\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "11" ]; ck $? "a 'Review — NOT CLEAN' header in the reviewer's own text refuses PRE-POST (rc=$(rc_of), want 11) — the recorder's arm (1b) would refuse it AFTER it was published"
+no_comment; ck $? "  …nothing posted as a review artifact"
+no_record; ck $? "  …and no record minted on it"
+err_has "NOT CLEAN"; ck $? "  …and the refusal quotes the colliding line, so the operator is not sent to read the recorder"
+reset
+
+# (7) NON-VACUITY FOR THE DELEGATION (P1(b), fresh review at 092295501). The three bodies in (2) are
+# refused by the RECORDER'S OWN per-count arm; with that call neutered they must be ADMITTED by the
+# mirror again, which is what makes the delegation — and not some other scan — the thing that refuses
+# them. Driven as a unit for the same reason (2) is: end-to-end they flip the seam's own verdict first.
+BT2="$TMP/mutant-no-recorder-arm.sh"
+sed 's|^  _l2="$(recorder_outcome_blocking_line "$_f" 2>/dev/null)"|  _l2=""|' "$SRC" > "$BT2"
+if cmp -s "$SRC" "$BT2"; then
+  fail "the recorder-arm mutation did not apply - this control proves NOTHING"
+else
+  V2M="$TMP/veto2-mutant.sh"
+  {
+    grep -E '^_RECORDER_(OC_NBSP|OC_DECL_RE|VETO2_(NONCLEAN|HEADER_NOTCLEAN)_RE|AB_TOKEN_RE|AB_FIELD_RE)=' "$BT2"
+    sed -n '/^recorder_outcome_blocking_line_from() {/,/^}$/p' "$BT2"
+    sed -n '/^recorder_outcome_blocking_line() {/,/^}$/p' "$BT2"
+    sed -n '/^recorder_veto2_hit() {/,/^}$/p' "$BT2"
+  } > "$V2M" 2>/dev/null
+  if grep -q '^recorder_veto2_hit() {' "$V2M" 2>/dev/null; then
+    # ⛔ SOURCED INTO THIS SHELL, NOT A SUBSHELL: `ck` increments the suite's counters, and a subshell's
+    # increments would vanish — the arms would print PASS/FAIL and change neither tally (the false-PASS
+    # shape). (2)'s unit is re-sourced afterwards to give the same names back to the unmutated script.
+    MIRROR_SH="$ROOT/scripts/record-review.sh"
+    # shellcheck disable=SC1090
+    . "$V2M"
+    v2mhit() { printf '%s\n' "$1" > "$TMP/v2mcase.txt"; recorder_veto2_hit "$TMP/v2mcase.txt"; }
+    [ -z "$(v2mhit '**Outcome: 2 blocking findings were fixed; 1 blocking finding remains open.**')" ]; ck $? "the MUTANT without the recorder's arm ADMITS the resolved-count body (so (2)'s refusal is the delegation's doing)"
+    [ -z "$(v2mhit '**Outcome: CLEAN — 1 blocking issue was addressed, 2 remain.**')" ]; ck $? "  …and admits 'a addressedd, 2 remain' too"
+    [ -n "$(v2mhit 'Review — NOT CLEAN')" ]; ck $? "  …while the HEADER arm still refuses (it is a separate scan, not the delegation — so (6) is not this mutant's arm)"
+    unset -f v2mhit
+    # shellcheck disable=SC1090
+    . "$V2"
+  else
+    fail "the mutated mirror did not extract - this control proves NOTHING"
+  fi
+fi
+reset
+
+# (8) ⛔ THE MIRROR'S ENGINE IS RESOLVED *AND PROVED* BEFORE A REVIEW IS PAID FOR (P1, fresh review at
+# 092295501). Delegating to "the recorder" is only safe if the recorder is REACHABLE and ANSWERABLE: a
+# box with no recorder beside the seam, or with a copy that predates the arm, would otherwise leave the
+# mirror INERT while every assertion above stayed green — the #3442 shape this file keeps paying for.
+MIRS="$TMP/mirror-skew"; rm -rf "$MIRS"
+for _mk in none nofn; do
+  mkdir -p "$MIRS/$_mk/scripts/orchestrator-harness" "$MIRS/run-$_mk"
+  cp "$GATE_SH" "$MIRS/$_mk/scripts/orchestrator-harness/brief-gate.sh"; chmod +x "$MIRS/$_mk/scripts/orchestrator-harness/brief-gate.sh"
+  cp "$SRC" "$MIRS/run-$_mk/review-pr.sh"; chmod +x "$MIRS/run-$_mk/review-pr.sh"
+done
+# a recorder copy that predates `outcome_declares_blocking` (the stale farmed shape)
+printf '#!/usr/bin/env bash\nexit 0\n' > "$MIRS/nofn/scripts/record-review.sh"; chmod +x "$MIRS/nofn/scripts/record-review.sh"
+for _mk in none nofn; do
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+    REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AGENT_INFRA_PATH="$MIRS/$_mk" \
+    env -u REVIEW_PR_MIRROR_SH bash "$MIRS/run-$_mk/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+  [ "$(rc_of)" = "9" ]; ck $? "mirror '$_mk': the run refuses before paying for a review (rc=$(rc_of), want 9)"
+  no_reviewer; ck $? "  …no reviewer was spawned ($_mk)"
+  no_record; ck $? "  …nothing recorded ($_mk)"
+done
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AGENT_INFRA_PATH="$MIRS/none" \
+  env -u REVIEW_PR_MIRROR_SH bash "$MIRS/run-none/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+err_has "record-review.sh could not be resolved for the pre-post veto mirror"; ck $? "  …naming the unresolved mirror and every root it looked in"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AGENT_INFRA_PATH="$MIRS/nofn" \
+  env -u REVIEW_PR_MIRROR_SH bash "$MIRS/run-nofn/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+err_has "could not be PROVED"; ck $? "  …and a recorder copy that cannot answer the canary is refused as skew, naming the answered values"
+err_has "HARNESS SKEW"; ck $? "  …classified as the provisioning fault it is, not as a review defect"
+unset _mk
+reset
 # ══ end §BT ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
