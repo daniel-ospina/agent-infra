@@ -727,7 +727,22 @@ async function partB() {
     // test would need nine different gate geometries (push-delete, cross-checkout
     // write, compound, worktree, …). Fails loudly with line numbers if a new
     // site appears without the caveat.
-    const srcLines = readFileSync(join(HERE, "index.ts"), "utf8").split("\n");
+    // ⛔ BOTH PRINTING MODULES (#4101 review, P2). This sweep read `index.ts`
+    // ALONE and reported green while `classify-git.mjs` printed two caveat-less
+    // offers (`_worktreeAddInTreeReason`, `_unjudgeableTargetReason`, both
+    // reachable through the #1919 worktree-in-tree gate) — a verifier asserting a
+    // universal property it could only check in one file, i.e. a false PASS of
+    // the Review Scope Contract's R6. Measured with this exact function: index.ts
+    // `[]`, classify-git.mjs `[10830, 10885]`. The property covers the code that
+    // PRINTS, so the sweep covers every module that prints; the caveat text
+    // itself is one mirror pair, pinned equal by B9g.
+    const sweepTargets = [
+      ["index.ts", readFileSync(join(HERE, "index.ts"), "utf8").split("\n")],
+      ["classify-git.mjs", readFileSync(join(HERE, "classify-git.mjs"), "utf8").split("\n")],
+    ];
+    const srcLines = sweepTargets[0][1]; // the caveat/B9b/B9c source (index.ts)
+    const caveatOf = (lines) =>
+      (lines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/) ?? [])[1] ?? "";
     // ⛔ KEYED ON THE HATCH ITSELF, NOT ON ONE PHRASE (#4101 review, P2). This
     // sweep used to key on the literal `Or set AGENT_ALLOW_MAIN_EDITS`, so it
     // could not see three live sites that offer the hatch in their own words —
@@ -777,8 +792,8 @@ async function partB() {
       });
       return found;
     };
-    check("B9 (#1239): every printed offer of the env hatch carries the session-start caveat",
-      hatchSweep(srcLines), []);
+    check("B9 (#1239): every printed offer of the env hatch carries the session-start caveat (BOTH printing modules)",
+      sweepTargets.flatMap(([file, lines]) => hatchSweep(lines).map((n) => `${file}:${n}`)), []);
     // ⛔ AND THE SWEEP MUST BE ABLE TO FAIL — a source scan that cannot flag a
     // caveat-less offer is the same no-op gate it replaced. Measured: the previous
     // version passed on a tree with three offending sites.
@@ -797,6 +812,25 @@ async function partB() {
         '      `   this does not lift the arm — it suppresses the whole gate.`,',
         '      `   Work in a worktree instead.`,',
       ]), [1]);
+    // B9i (#4101 review, P2) — the sweep must be able to flag the SHAPE the
+    // index-only scan could not see: the `(session start)` LABEL is not the
+    // caveat. The sweep's own acceptance rule wants a `session START` + `CANNOT`
+    // pair, and the two classify-git.mjs sites carried only the label. Without
+    // this row, narrowing `sweepTargets` back to one file would leave the sweep
+    // green over the very sites this fix adds the caveat to.
+    check("B9i the sweep FLAGS a `(session start)`-labelled offer that carries no caveat (the shape classify-git.mjs printed twice)",
+      hatchSweep([
+        '    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,',
+        '  ].join("\\n");',
+      ]), [1]);
+    // B9g (#4101 review, P2) — ONE shared text, not two that happen to start out
+    // equal. index.ts mirrors the array in classify-git.mjs (the module-load
+    // contract keeps index.ts's imports explicit, and the caveat has to print
+    // even if the classifier failed to load), so drift between the two is caught
+    // here rather than by a reader noticing one refusal reads differently.
+    check("B9g the hatch caveat is ONE text in both printing modules (a one-sided edit reddens this)",
+      caveatOf(sweepTargets[0][1]).length > 0 &&
+      caveatOf(sweepTargets[0][1]) === caveatOf(sweepTargets[1][1]), true);
     const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
     checkD("B9b the caveat names session START and says an inline/export CANNOT set it",
       /session START/.test(caveat?.[1] ?? "") && /CANNOT/.test(caveat?.[1] ?? ""), caveat?.[1]);
@@ -864,10 +898,17 @@ async function partB() {
     // refused by the read side — telling that reader "the stamp did not take"
     // sends them to re-check permissions on a file they can see.
     const agentDir = join(tmp, ".pi", "agent");
+    const auditFile = join(agentDir, "audit", "gate-events.jsonl");
+    const auditRowsFrom = (offset) => {
+      try { return readFileSync(auditFile, "utf8").split("\n").filter(Boolean).slice(offset).map((l) => JSON.parse(l)); }
+      catch { return []; }
+    };
+    const auditLen = () => { try { return readFileSync(auditFile, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
     rmSync(agentDir, { recursive: true, force: true });
     mkdirSync(join(tmp, "real-agent"), { recursive: true });
     symlinkSync(join(tmp, "real-agent"), agentDir);
     try {
+      const auditBefore = auditLen();
       const b12 = await drive(`touch ${markerPath}  # recovery: symlinked agent dir`);
       check("B12 a marker touch behind a SYMLINKED ~/.pi/agent is REFUSED (the read side never trusts a link)",
         b12 !== null, true);
@@ -875,11 +916,39 @@ async function partB() {
       checkD("B12c …and it says the file WAS written instead of claiming the stamp did not take",
         /was WRITTEN but cannot open a window/.test(b12?.reason ?? "") &&
         !/was NOT created/.test(b12?.reason ?? ""), b12?.reason);
-      checkD("B12d …and it states the audit row was appended (the write really happened)",
-        /gate_bypass/.test(b12?.reason ?? ""), b12?.reason);
+      // ⛔ THE AUDIT ARTEFACT FOLLOWS THE VERDICT (#4101 review, P3). B12d used to
+      // accept a refusal that merely SAID `gate_bypass` — which it did, because the
+      // row was appended inside `_stampMarker`, BEFORE the read-back that refuses
+      // this mint. `gate_bypass` is the record an operator queries to answer "why
+      // did an escape window exist"; after the 15-min TTL nothing distinguishes
+      // such a row from a real one, so the guard recorded a bypass it had just
+      // established was never granted. Asserted in BOTH halves below: the text and
+      // the log.
+      checkD("B12d …and it names the INERT-mint audit event, not a `gate_bypass` row",
+        /marker_minted_inert/.test(b12?.reason ?? "") && /NO .?gate_bypass.? row/.test(b12?.reason ?? ""), b12?.reason);
+      const b12Rows = auditRowsFrom(auditBefore).filter((r) => r.marker_path === markerPath);
+      check("B12d2 …and the AUDIT LOG carries no `gate_bypass` row for a mint that never opened a window",
+        b12Rows.filter((r) => r.event === "gate_bypass").length, 0);
+      check("B12d3 …and it carries the `marker_minted_inert` row instead, with the cause",
+        b12Rows.filter((r) => r.event === "marker_minted_inert" && r.cause === "symlinked").length, 1);
     } finally {
       try { unlinkSync(agentDir); } catch { /* best-effort */ }
       mkdirSync(agentDir, { recursive: true });
+    }
+    // B12g — the CONTROL that makes B12d2/B12d3 mean something: a mint the read
+    // side ACCEPTS still appends `gate_bypass` and logs the open window, so the
+    // rows above cannot pass for "this suite never writes audit rows at all".
+    setMarker(false);
+    {
+      const auditBefore = auditLen();
+      const okTouch = await drive(`touch ${markerPath}  # recovery: verified mint control`);
+      check("B12g control: a VERIFIED mint is ALLOWED (so the inert rows are not vacuous)", okTouch, null);
+      const rows = auditRowsFrom(auditBefore).filter((r) => r.marker_path === markerPath);
+      check("B12g2 …and it appends exactly one `gate_bypass` row, for the window that really opened",
+        rows.filter((r) => r.event === "gate_bypass").length, 1);
+      check("B12g3 …and no `marker_minted_inert` row (the event names the OUTCOME, not the attempt)",
+        rows.filter((r) => r.event === "marker_minted_inert").length, 0);
+      setMarker(false);
     }
 
     // ── B12e/B12f — the OTHER direction of the same sentence.
@@ -910,6 +979,47 @@ async function partB() {
     } finally {
       rmSync(markerPath, { recursive: true, force: true });
     }
+
+    // ── B13 (#4101 review, P3) — a marker that is a DANGLING SYMLINK ──────
+    //
+    // `existsSync` FOLLOWS links, so a dangling marker link reported cause
+    // `absent` and `_inertMarkerLines()` returns [] for `absent` — the shape got
+    // no diagnosis at all, while `symlinked` is one of the causes the README
+    // advertises and the refusal text has a paragraph for. The verdict was always
+    // safe (no window opened); only the DIAGNOSIS was missing, which is the
+    // #3620 class this branch exists to close ("I stamped it and nothing
+    // happened"). Measured before the fix: BLOCKED with no INERT paragraph.
+    mkdirSync(agentDir, { recursive: true });
+    rmSync(markerPath, { recursive: true, force: true });
+    symlinkSync(join(tmp, "no-such-marker-target"), markerPath);
+    try {
+      const dangling = await drive("git restore wip.txt");
+      check("B13 a DANGLING-symlink marker is BLOCKED (the read side trusts no link)", dangling !== null, true);
+      checkD("B13b …and it is diagnosed `symlinked`, not `absent` (an lstat probe, not a link-following one)",
+        /INERT \[symlinked\]/.test(dangling?.reason ?? ""), dangling?.reason);
+    } finally {
+      try { unlinkSync(markerPath); } catch { /* best-effort */ }
+    }
+
+    // ── B14 (#4101 review, P3) — an id-less reader must not be told to re-touch ──
+    //
+    // `unscoped` (a file fact: no string session_id) was decided BEFORE
+    // `no-session-id` (a READER fact), so an id-less lane that found a pre-fix
+    // `{"session_id": null}` stamp was told "Re-touch it from THIS session" — a
+    // step its own pre-stamp check then refuses, for the very reason the first
+    // message already had. Two steps, and the second one is the right answer.
+    writeFileSync(markerPath, JSON.stringify({ session_id: null, reason: "pre-fix lane stamp", ts: new Date().toISOString() }) + "\n");
+    const idlessUnscoped = await driveWith(null, "git restore wip.txt");
+    check("B14 an id-less lane with a `{session_id:null}` marker is BLOCKED (unchanged protection)",
+      idlessUnscoped !== null, true);
+    checkD("B14b …and the FILE's own cause is still named (unscoped)",
+      /INERT \[unscoped\]/.test(idlessUnscoped?.reason ?? ""), idlessUnscoped?.reason);
+    checkD("B14c …and it does NOT prescribe a re-touch this session's own pre-stamp check vetoes",
+      !/Re-touch it from THIS session/.test(idlessUnscoped?.reason ?? ""), idlessUnscoped?.reason);
+    checkD("B14d …and it says an id-less reader must recover from a session that HAS an id, or a terminal",
+      /id-less session/.test(idlessUnscoped?.reason ?? "") && /human terminal/.test(idlessUnscoped?.reason ?? ""),
+      idlessUnscoped?.reason);
+    setMarker(false);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

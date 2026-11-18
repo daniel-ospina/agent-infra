@@ -358,6 +358,15 @@ let _currentHatchActive = false;
 // this, so a marker that is present but inert is explained rather than
 // re-prescribed. Fail-safe default: inactive/absent (nothing to explain).
 let _currentMarkerDiagnosis: { active: boolean; cause: string } = { active: false, cause: "absent" };
+// #4101 review (P3) — can THIS session ever hold an active marker? Same read, same
+// ctx id as `_currentMarkerDiagnosis`, and it exists because the two facts are not
+// the same one: the CAUSE describes the FILE, this describes the READER. An
+// id-less lane that finds a pre-fix `{"session_id": null}` stamp on disk is
+// diagnosed `unscoped` (correct about the file) and was then told to RE-TOUCH —
+// which its own pre-stamp check refuses, a two-step dead end whose second step is
+// the right answer. A reader with no id gets the no-id advice whatever the file
+// says. Fail-safe default: true (the pre-existing advice is the least surprising).
+let _currentReaderHasId = true;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
@@ -583,6 +592,12 @@ function _isAllowMainEdits(): boolean {
 // The env hatch stays (it is a real route for a session the DISPATCHER hatched),
 // but every message that offers it now says which route it is. The reachable
 // one — the TTL marker — is named by the recovery texts above.
+//
+// ⛔ THIS TEXT IS MIRRORED IN `classify-git.mjs` (#4101 review, P2), because THAT
+// module prints refusals too (the #1919 `worktree add|move` pair) and the sweep
+// that asserts the property now reads both files. The two arrays are pinned
+// byte-identical by the sweep's B9g row, so a one-sided edit fails a test instead
+// of leaving a module quietly caveat-less.
 const _ENV_HATCH_CAVEAT = [
   "   \u26a0\ufe0f That env is read at session START: an inline `AGENT_ALLOW_MAIN_EDITS=1",
   "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
@@ -614,15 +629,27 @@ function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => strin
 // inert) marker: readAllowMarkerState stays false → blocked. A failed stamp
 // never weakens the gate (and a later guard-observed touch re-stamps over it).
 //
-// ⛔ IT RETURNS WHETHER IT LANDED (#3620 follow-up), because the refusal built
-// from the post-stamp diagnosis must not INFER that. A cause describing an
-// EXISTING file (`unreadable`, `expired`, `session-mismatch`, …) can accompany a
-// stamp that threw before writing anything — e.g. the marker path is a
-// directory, or the file is not writable — and inferring "written" from the
-// cause then claims a `gate_bypass` row was appended when none was. That is a
-// false claim about the audit trail, which is the artifact a reader trusts when
-// auditing why an escape window existed.
-function _stampMarker(path: string, sessionId: string | null, reason: string | null): boolean {
+// ⛔ IT RETURNS WHAT IT WROTE (null when it did not land) (#3620 follow-up),
+// because the refusal built from the post-stamp diagnosis must not INFER that. A
+// cause describing an EXISTING file (`unreadable`, `expired`, `session-mismatch`,
+// …) can accompany a stamp that threw before writing anything — e.g. the marker
+// path is a directory, or the file is not writable — and inferring "written"
+// from the cause then claims a `gate_bypass` row was appended when none was.
+// That is a false claim about the audit trail, which is the artifact a reader
+// trusts when auditing why an escape window existed. The returned bytes are also
+// what the audit row records as `marker_content`, so the row and the file agree.
+//
+// ⛔ AND IT WRITES ONLY THE FILE (#4101 review, P3). The audit row and the
+// `🔓 marker active` log line used to be emitted HERE — before the caller's
+// read-back — so a mint the read side then REFUSED (a symlinked `~/.pi/agent`, a
+// stamp that reads back `unscoped`/`expired`) still appended `gate_bypass` and
+// logged a window as open. The message half of that was fixed one level up; the
+// ARTIFACT was not, and `gate_bypass` is exactly what an operator queries to
+// answer "why did an escape window exist" — after the TTL nothing distinguished
+// such a row from a real one, so a bypass was recorded that was never granted.
+// The emitting half now lives in `_auditMarkerMint`/`_auditMarkerInert`, called
+// AFTER the read-back, each with its own event name.
+function _stampMarker(path: string, sessionId: string | null, reason: string | null): string | null {
   try {
     // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
     // (and thus the whole touch path) silently dead.
@@ -633,7 +660,20 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
       ts: new Date().toISOString(),
     });
     writeFileSync(path, content + "\n", { flag: "w" });
-    const expiresAt = new Date(Date.now() + ALLOW_MAIN_EDITS_MARKER_TTL_MS).toISOString();
+    return content;
+  } catch (e) {
+    console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
+    return null;
+  }
+}
+
+/** The AUDIT + LOG half of a mint that the read side confirmed (#4101 review, P3).
+ *  Called only after `diagnoseAllowMarkerState(...).active` is true, so every
+ *  `gate_bypass` row and every `🔓 marker active` line describes a window that
+ *  really opened. Best-effort: an audit write must never change a verdict. */
+function _auditMarkerMint(path: string, sessionId: string | null, reason: string | null, content: string): void {
+  const expiresAt = new Date(Date.now() + ALLOW_MAIN_EDITS_MARKER_TTL_MS).toISOString();
+  try {
     appendJsonl({
       event: "gate_bypass",
       extension: "main-worktree-guard",
@@ -644,14 +684,31 @@ function _stampMarker(path: string, sessionId: string | null, reason: string | n
       expires_at: expiresAt,
       marker_content: content, // bare touch still records a timestamped creation (F10d)
     });
-    console.log(
-      `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
-    );
-    return true;
-  } catch (e) {
-    console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
-    return false;
-  }
+  } catch { /* fail-silent: auditing never alters the gate */ }
+  console.log(
+    `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
+  );
+}
+
+/** The audit + log half of a mint the read side REFUSED: the bytes landed, but no
+ *  window opened. Recorded under its OWN event name (#4101 review, P3) — a
+ *  `gate_bypass` row for this shape is a bypass recorded that was never granted,
+ *  and nothing after the TTL would distinguish it from a real one. */
+function _auditMarkerInert(path: string, sessionId: string | null, cause: string): void {
+  try {
+    appendJsonl({
+      event: "marker_minted_inert",
+      extension: "main-worktree-guard",
+      reason: "main_edits_marker_inert",
+      session_id: sessionId,
+      marker_path: path,
+      cause,
+      ttl_ms: ALLOW_MAIN_EDITS_MARKER_TTL_MS,
+    });
+  } catch { /* fail-silent: auditing never alters the gate */ }
+  console.warn(
+    `[main-worktree-guard] ⚠️ Escape marker written but INERT [${cause}] — no window opened; recorded as marker_minted_inert (NOT gate_bypass).`
+  );
 }
 
 // ── #3620: the marker mint is VERIFIED, and an inert marker is DIAGNOSED ─────
@@ -715,7 +772,12 @@ function _inertMarkerLines(): string[] {
   const lines = [
     `     ⚠️ A marker file EXISTS at ${_markerPath()} but is INERT [${d.cause}] — ${why}.`,
   ];
-  if (d.cause === "no-session-id") {
+  if (d.cause === "no-session-id" || !_currentReaderHasId) {
+    // ⛔ AND `!_currentReaderHasId` IS PART OF THE SAME CASE (#4101 review, P3).
+    // The pre-stamp check refuses a touch from a session with no resolvable id, so
+    // telling such a reader to re-touch is advice the guard itself vetoes — the
+    // two-step dead end ("unscoped → re-touch → refused for the reason the first
+    // message already had"). The file cause is still named in the line above.
     lines.push(
       `        No marker can ever be active for an id-less session, so this is not`,
       `        something a re-touch fixes: recover from a session that HAS an id, or`,
@@ -814,15 +876,17 @@ function _markerTouchBlockReason(
           `⛔ The escape marker was WRITTEN but cannot open a window (#3620).`,
           `   Diagnosis: ${why}.`,
           // ⛔ NAME THE ROUTE, NOT A ROW (#4101 review, P3). `stampLanded` witnesses
-          // that `_stampMarker` did not throw; the `gate_bypass` append inside it is
-          // best-effort (`appendJsonl` swallows its own write failures), so "an audit
-          // row was appended" can assert a row that does not exist — the false-claim-
-          // about-the-audit-trail class this branch already closed one level up.
+          // that `_stampMarker` did not throw; the audit append is a SEPARATE,
+          // best-effort step, so "an audit row was appended" can assert a row that
+          // does not exist — the false-claim-about-the-audit-trail class this
+          // branch already closed one level up.
           `   The stamp landed — the file exists at ${_markerPath()} — so "the stamp`,
           `   did not take" would be the wrong direction. The READ side refuses THAT`,
           `   file, so this \`touch\` is refused rather than reported as an open window`,
-          `   (no false PASS). The mint routes through the audited \`gate_bypass\` path;`,
-          `   that append is best-effort, so this sentence names the route, not a row.`,
+          `   (no false PASS). Because the read back refuses it, NO \`gate_bypass\` row is`,
+          `   appended: the mint is audited as \`marker_minted_inert\`, so an operator`,
+          `   asking "why did an escape window exist" cannot find a bypass that was`,
+          `   never granted.`,
         ]
       : [
           `⛔ The escape marker was NOT created — the stamp did not take (#3620).`,
@@ -2313,10 +2377,13 @@ function _catFileRevertStateBlock(
   //
   // The #1060 residual is preserved rather than special-cased: an UNRESOLVABLE
   // component (`> "$SOME_ENV_VAR/f"`) keeps its literal segment through
-  // `resolve(writeCwd, rel)` above — which anchors a RELATIVE spelling at
-  // `writeCwd` (its ancestor walk lands there and it is still probed) and an
-  // ABSOLUTE one at its own outermost existing directory (`resolve` does not
-  // re-root an absolute path: `/tmp/$X/f` walks to `/tmp`).
+  // `_writeLandingSpelling(t.cwd, …)` above — which anchors a RELATIVE spelling at
+  // the cwd its own `cd` chain reached (its ancestor walk lands there and it is
+  // still probed) and an ABSOLUTE one at its own outermost existing directory
+  // (`resolve` does not re-root an absolute path: `/tmp/$X/f` walks to `/tmp`).
+  // `writeCwd` survives only as MESSAGE attribution (`Target:`/`Checkout:`), not as
+  // a resolution input — the stale sentence that described it as the anchor of this
+  // path was deleted with the call site (#4101 review, P3).
   const candidates = new Set<string>();
   let hardlinked: string | null = null;
   // A link chain longer than the kernel would follow: the landing site could not
@@ -6408,9 +6475,11 @@ export default function (pi: ExtensionAPI) {
     // empty in production (pi sets PI_SESSION_ID only in bash CHILDREN) — so the
     // hatch-active paragraph was unreachable on exactly the surfaces a stranded
     // lane hits.
+    const hatchSid = _currentSessionId(_ctx);
+    _currentReaderHasId = hatchSid !== null;
     _currentMarkerDiagnosis = _isAllowMainEdits()
       ? { active: true, cause: "env-hatch" }
-      : diagnoseAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+      : diagnoseAllowMarkerState(_markerPath(), hatchSid);
     _currentHatchActive = _currentMarkerDiagnosis.active;
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
@@ -6683,7 +6752,8 @@ export default function (pi: ExtensionAPI) {
         if (markerSid === null) {
           return { block: true, reason: _markerTouchBlockReason(null, null, false, _isAllowMainEdits()) };
         }
-        const stampLanded = _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
+        const stampContent = _stampMarker(_markerPath(), markerSid, extractMarkerReason(command));
+        const stampLanded = stampContent !== null;
         // (b) read back what we just minted, with the same id the read side will
         // use. A stamp that did not land (unwritable/symlinked ~/.pi/agent, a
         // disk error) leaves an empty or absent file: the touch is refused with
@@ -6691,12 +6761,19 @@ export default function (pi: ExtensionAPI) {
         // fail-safe; only the REPORTING changes).
         const minted = diagnoseAllowMarkerState(_markerPath(), markerSid);
         if (!minted.active) {
+          // ⛔ THE AUDIT ARTEFACT FOLLOWS THE VERDICT (#4101 review, P3). The
+          // `gate_bypass` row and the `🔓 marker active` log line used to be
+          // emitted inside `_stampMarker`, i.e. BEFORE this read-back — so a mint
+          // the read side refuses (a symlinked `~/.pi/agent`, a stamp reading
+          // back `unscoped`/`expired`) recorded a bypass that was never granted.
+          if (stampLanded) _auditMarkerInert(_markerPath(), markerSid, minted.cause);
           _currentMarkerDiagnosis = minted;
           return {
             block: true,
             reason: _markerTouchBlockReason(minted.cause, markerSid, stampLanded, _isAllowMainEdits()),
           };
         }
+        _auditMarkerMint(_markerPath(), markerSid, extractMarkerReason(command), stampContent ?? "");
         _currentMarkerDiagnosis = minted;
         return undefined;
       }

@@ -2236,12 +2236,26 @@ prints a one-line log at stamp time:
 [main-worktree-guard] 🔓 Escape marker active for session <id> until <expires_at> (reason: <reason>)
 ```
 
+⛔ **Both of those describe a window that OPENED, so both are emitted after the
+read-back** (#4101 review, P3). A mint whose bytes land but which the read side
+refuses (a symlinked `~/.pi/agent`, a stamp that reads back `unscoped`/`expired`)
+records a different event — `marker_minted_inert` — and a `⚠️ … no window opened`
+log line, and the refusal says so. `gate_bypass` is the row an operator queries to
+answer *"why did an escape window exist"*, so a refused mint must never occupy
+it: after the 15-minute TTL nothing would distinguish such a row from a real one.
+
+```json
+{"ts":"…","event":"marker_minted_inert","extension":"main-worktree-guard","reason":"main_edits_marker_inert","session_id":"…","marker_path":"…","cause":"symlinked","ttl_ms":900000}
+```
+
 ### Fail-safe semantics
 
 Absent / unreadable / expired / unparseable / unscoped / mismatched /
 **symlinked** (the pinned `realpathSync(path) !== resolve(path)` check rejects
-any symlink indirection) marker → treated as absent → **blocked**. A
-`printf`/`echo`/redirect that writes the marker path is **out-of-contract**:
+any symlink indirection) marker → treated as absent → **blocked**. A **dangling**
+symlink counts as symlinked, not as absent: the existence probe is `lstat`, because
+`existsSync` follows the link and would report the shape as missing (#4101 review,
+P3). A `printf`/`echo`/redirect that writes the marker path is **out-of-contract**:
 it clobbers the guard's stamp, the marker becomes unscoped, and the guard
 blocks. The env hatch is unchanged — the marker is an additional OR branch,
 never a replacement.
@@ -2274,7 +2288,10 @@ just done. Two changes, **neither of which widens the hatch**:
 A refusal that runs while an *inert* marker is on disk now says so and names the
 cause — `absent` / `symlinked` / `expired` / `unparseable` / `unscoped` /
 `no-session-id` / `session-mismatch` / `unreadable` — so "I stamped it and
-nothing happened" cannot recur silently.
+nothing happened" cannot recur silently. The ADVICE follows the READER, not just
+the file: a session with no resolvable id is never told to re-touch (its own
+pre-stamp check would refuse that touch), whatever the file's cause is; it is
+routed to a session that has an id, or to a human terminal (#4101 review, P3).
 
 ## The script backdoor — closed since #1484 (shell + #627 interpreters)
 

@@ -10,8 +10,27 @@
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
+import { existsSync, lstatSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
+
+// ── #1239 / #3620: the env-hatch caveat, for the refusals THIS module prints ──
+//
+// `AGENT_ALLOW_MAIN_EDITS=1` is read from the PROCESS env at session start, so a
+// blocked agent cannot set it: an inline prefix sets it in the child shell the
+// guard never inspects, and an `export` cannot reach the running process. A
+// refusal that prints the hatch as THE remedy is therefore a dead end.
+//
+// ⛔ TWO MODULES PRINT REFUSALS (#4101 review, P2). This file's own #1919
+// refusals offered the hatch with the label `(session start)` and no caveat —
+// the label is not the caveat — while the sweep that asserts the property read
+// `index.ts` alone, so it reported green over them (a verifier asserting a
+// universal property it could only check in one file). The text below is a
+// VERBATIM MIRROR of index.ts's `_ENV_HATCH_CAVEAT`, and the two are pinned
+// equal by the sweep's B9g row: drift fails a test instead of a reader.
+export const _ENV_HATCH_CAVEAT = [
+  "   \u26a0\ufe0f That env is read at session START: an inline `AGENT_ALLOW_MAIN_EDITS=1",
+  "      <cmd>` prefix, or an `export` in a running session, CANNOT set it (#1239).",
+];
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -7795,7 +7814,19 @@ export function readAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs 
  */
 export function diagnoseAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
   try {
-    if (!existsSync(path)) return { active: false, cause: "absent" };
+    // ⛔ lstat, NOT existsSync (#4101 review, P3). `existsSync` FOLLOWS links, so
+    // a marker that is a DANGLING symlink reported `absent` — never `symlinked` —
+    // and `_inertMarkerLines()` returns [] for `absent`, so that shape got no
+    // diagnosis at all while `symlinked` is one of the causes the README
+    // advertises and the table above lists. A dangling link is a LINK (the guard trusts no link,
+    // pinned F6), not a missing file. The symlink test below is unchanged and
+    // still the sole defense; this only stops the existence probe from hiding it.
+    try {
+      lstatSync(path);
+    } catch (e) {
+      if (e?.code === "ENOENT") return { active: false, cause: "absent" };
+      return { active: false, cause: "unreadable" };
+    }
     // The SOLE symlink defense (pinned F6/round-2 F3): realpath inequality.
     if (!isAllowMarkerRealpath(path)) return { active: false, cause: "symlinked" };
     const stats = statSync(path);
@@ -10828,6 +10859,11 @@ function _judgeResolvedTarget(sub, target, execCwd) {
     `     IGNORES (the fleet's sanctioned layout is the gitignored .worktrees/:`,
     `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+    ..._ENV_HATCH_CAVEAT,
+    `   ⛔ The TTL escape MARKER does NOT lift this gate: a stranded lane may recover`,
+    `     with it, it may not manufacture the deadlock. So the route above (outside`,
+    `     the checkout, or under the ignored .worktrees/) IS the reaching-session`,
+    `     remedy here — it needs no hatch at all.`,
   ].join("\n");
 }
 
@@ -10882,7 +10918,13 @@ function _unjudgeableTargetReason(sub, targetText, execCwd, why) {
     `   git op that could move it out again — the deadlock cannot repair itself.`,
     `   → Spell the target literally so it can be judged, and put the worktree`,
     `     OUTSIDE the checkout or under a path that checkout IGNORES.`,
+    `   → Worktree targets under a path the checkout ALREADY ignores need no hatch`,
+    `     at all (that is the sanctioned .worktrees/ layout) — so the route above is`,
+    `     the one a running session can take.`,
     `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+    ..._ENV_HATCH_CAVEAT,
+    `   ⛔ The TTL escape MARKER does NOT lift this gate: a stranded lane may recover`,
+    `     with it, it may not manufacture the deadlock.`,
   ].join("\n");
 }
 
