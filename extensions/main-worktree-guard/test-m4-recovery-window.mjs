@@ -716,6 +716,40 @@ async function partB() {
       /INERT/.test(activeWholeTree?.reason ?? ""), false);
     setMarker(false);
 
+    // ── B15 (#4101 review, P3): EVERY refusal that OFFERS the marker must also
+    // diagnose an inert one — the #1144 sync refusal and the #607
+    // hidden-branch-state refusal were the two arms still handing a reader a
+    // remedy with no cause, so `_inertMarkerLines()` was spliced into both. The
+    // file below is on disk and inert (another session's), exactly the state
+    // that made the old text a loop.
+    // ⛔ THE HUB MUST BE CLEAN FOR THESE TWO ARMS TO BE REACHED AT ALL: on a
+    // dirty hub the M4 hub-state gate answers first (and it already carried the
+    // diagnosis), so a row driven there would pass for the wrong arm — MEASURED
+    // as a vacuous pass before this was fixed: both rows stayed green with BOTH
+    // splices removed. The dirt is restored immediately after.
+    writeFileSync(markerPath, JSON.stringify({ session_id: "some-other-session", reason: "elsewhere", ts: new Date().toISOString() }) + "\n");
+    git(hub, "git checkout -- wip.txt");
+    // …and B6w3's `copy.txt` is untracked dirt that would keep M4 in front of both
+    // arms; it is restored byte-for-byte afterwards for the rows that follow.
+    const b15Copy = existsSync(join(hub, "copy.txt")) ? readFileSync(join(hub, "copy.txt")) : null;
+    if (b15Copy !== null) unlinkSync(join(hub, "copy.txt"));
+    try {
+      const b15 = await drive("git pull");
+      checkD("B15 the #1144 sync refusal still BLOCKS on a CLEAN shared main",
+        b15 !== null && /#1144/.test(b15?.reason ?? ""), b15?.reason);
+      checkD("B15b …and it DIAGNOSES the inert marker it prescribes instead of re-offering it blind",
+        /INERT \[session-mismatch\]/.test(b15?.reason ?? ""), b15?.reason);
+      const b15c = await drive(`echo "$(git branch -Mq main victim)"`);
+      checkD("B15c the #607 hidden-branch-state refusal still BLOCKS",
+        b15c !== null && /#607/.test(b15c?.reason ?? ""), b15c?.reason);
+      checkD("B15d …and it too carries the inert diagnosis",
+        /INERT \[session-mismatch\]/.test(b15c?.reason ?? ""), b15c?.reason);
+    } finally {
+      writeFileSync(join(hub, "wip.txt"), ""); // restore the incident's dirt for the rows below
+      if (b15Copy !== null) writeFileSync(join(hub, "copy.txt"), b15Copy);
+      setMarker(false);
+    }
+
     // ── B9 (#1239): no refusal may offer the env hatch as an AVAILABLE remedy ──
     //
     // `AGENT_ALLOW_MAIN_EDITS=1` is read from the process env at session start.

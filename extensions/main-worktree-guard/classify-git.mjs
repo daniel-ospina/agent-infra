@@ -11440,11 +11440,27 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const out = [];
   const seen = new Set();
   const base0 = resolve(sessionCwd || process.cwd());
-  const push = (raw, cwd, via, site = "top") => {
+  const push = (raw, cwd, via, site = "top", bareTilde) => {
     const t = _stripQuotes(String(raw ?? "").trim());
     if (!t || t === "/dev/null" || t.startsWith("/dev/")) return;
     const resolved = resolve(cwd, t);
-    const key = `${via}:${resolved}`;
+    // ⛔ THE DEDUPE KEY IS THE OPERAND AND ITS SITE CWD — NEVER THE LEXICAL
+    // ANSWER (#4101 review, P2 — REPRODUCED). `resolve()` collapses `..`
+    // LEXICALLY, while the kernel applies it to the directory a symlink
+    // RESOLVED to, so two spellings that bash sends to two different files can
+    // share one key and the second is dropped before any link-aware probe:
+    //
+    //     ln -s <dirty wt>/sub /tmp/ld
+    //     git show HEAD:dirty.txt > /tmp/dirty.txt 1> /tmp/ld/../dirty.txt
+    //
+    // reported ONE target (`/tmp/dirty.txt`) — the arm probed `/tmp`, found no
+    // checkout and ALLOWED — while bash writes `<wt>/dirty.txt` through the
+    // second spelling and truncates its uncommitted content (then `git status`
+    // reads clean, so the loss is silent). The key is the PAIR the caller keeps
+    // for exactly this reason (`raw` + `cwd`), so two spellings are two
+    // landing questions; only a REPEAT of the same spelling from the same site
+    // is deduped, which is what this set is for.
+    const key = `${via}:${resolve(cwd)}:${t}`;
     if (seen.has(key)) return;
     seen.add(key);
     // #618/#621: carry the SITE cwd (the dir the write executes from) so the
@@ -11461,7 +11477,27 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // instead of re-anchoring a `relative(...)` string at whatever cwd it
     // happens to hold (the #4101 P0: a plain `cd` chain yielded no execution
     // cwd, so `../f` was measured against the SESSION checkout).
-    out.push({ resolvedPath: resolved, raw: t, via, site, cwd: resolve(cwd) });
+    out.push({
+      resolvedPath: resolved,
+      raw: t,
+      via,
+      site,
+      cwd: resolve(cwd),
+      // ⛔ WHETHER THE SHELL WOULD EXPAND A LEADING `~` (#4101 review, P3).
+      // `readWord` hands back the DE-QUOTED text, so `> "~/x"` (which writes
+      // `<cwd>/~/x`) and `> ~/x` (which writes `$HOME/x`) are the same string
+      // here — and only the second is a tilde word. The raw source character is
+      // the only place that survives, so the redirect sites record it and
+      // `_writeLandingSpelling` (index.ts) expands `~` only when it is set.
+      // `undefined` keeps the pre-#4101 behaviour for non-redirect callers.
+      bareTilde: bareTilde === undefined ? undefined : !!bareTilde,
+    });
+  };
+  // A redirect operand, with the tilde fact its de-quoted spelling lost.
+  // `at` is the operand's first RAW source character.
+  const _pushRedir = (w, at, cwd) => {
+    const rt = { raw: w, cwd, bareTilde: s[at] === "~" };
+    redirs.push(rt, ...forkTwins(rt));
   };
   // Bash cwd semantics (probe-verified):
   //  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),
@@ -12916,7 +12952,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (s[p2] === ">") p2++;
         p2 = skipWs(p2);
         const operand = readWord(p2);
-        if (operand.w && !/^-?[0-9]*$/.test(operand.w)) { const _rt1 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt1, ...forkTwins(_rt1)); }
+        if (operand.w && !/^-?[0-9]*$/.test(operand.w)) _pushRedir(operand.w, p2, f().cwd);
         i = operand.k;
         continue;
       }
@@ -12993,9 +13029,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (s[k] === ">" && s[k + 1] === "&") {
         // `N>&M` / `N>&-` is a dup/close (no file). Legacy `>&file` (target not
         // an fd) DOES write the file, so keep it.
-        const tgt = readWord(skipWs(k + 2));
+        const tgtAt = skipWs(k + 2);
+        const tgt = readWord(tgtAt);
         if (/^[0-9-]*$/.test(tgt.w)) { i = tgt.k; continue; }
-        const _rtd = { raw: tgt.w, cwd: f().cwd }; redirs.push(_rtd, ...forkTwins(_rtd));
+        _pushRedir(tgt.w, tgtAt, f().cwd);
         i = tgt.k; continue;
       }
       // `N>f` / `N>>f` / `N>|f` opens f with O_TRUNC for ANY fd — a tracked-file
@@ -13008,7 +13045,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (n1 === ">" || n1 === "|") { op += n1; p = k + 2; }
       p = skipWs(p);
       const operand = readWord(p);
-      const _rt2 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt2, ...forkTwins(_rt2));        // pre-cd (pending not applied)
+      _pushRedir(operand.w, p, f().cwd);        // pre-cd (pending not applied)
       i = operand.k;
       continue;
     }
@@ -13602,7 +13639,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               p2++;
               p2 = skipWs(p2);
               const opnd = readWord(p2);
-              if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+              if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
               k = opnd.k;
               continue;
             }
@@ -13617,13 +13654,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               // >& file — legacy redirect-ALL: the operand IS a content write
               p2 = skipWs(p2);
               const opnd = readWord(p2);
-              if (opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt4 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt4, ...forkTwins(_rt4)); }
+              if (opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
               k = opnd.k;
               continue;
             }
             p2 = skipWs(p2);
             const opnd = readWord(p2);
-            if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+            if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) _pushRedir(opnd.w, p2, f().cwd);
             k = opnd.k;
             continue;
           }
@@ -13786,7 +13823,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
   }
   applyPending();
-  for (const r of redirs) push(r.raw, r.cwd, "redirect", "site");
+  for (const r of redirs) push(r.raw, r.cwd, "redirect", "site", r.bareTilde);
   for (const v of verbToks) push(v.raw, v.cwd, v.via, "site");
   for (const t of tees) {
     // cycle-36 B: the collection must stop at the first top-level `;`/`&`/`|`/`)`

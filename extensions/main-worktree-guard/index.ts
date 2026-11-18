@@ -2258,15 +2258,27 @@ function _resolveThroughDanglingLinks(p: string): string | null {
  *  path, which `realpathSync` cannot do (see the ⛔ there). `~user` is left
  *  literal: this process cannot know another user's home, and a literal `~user`
  *  directory is what the shell writes when no such user exists. */
-function _writeLandingSpelling(cwd: string, raw: string): string {
+function _writeLandingSpelling(cwd: string, raw: string, bareTilde?: boolean): string {
+  // ⛔ ONLY A WORD THAT REALLY STARTS WITH AN UNQUOTED `~` IS EXPANDED (#4101
+  // review, P3). `bashWriteTargetsResolved` carries the DE-QUOTED operand, so
+  // `> "~/x"` — which the shell writes as `<cwd>/~/x`, quoting suppressing the
+  // expansion — arrives here indistinguishable from `> ~/x`. Expanding both
+  // probed `$HOME/x` for the quoted spelling, which is a false block when
+  // `$HOME/x` sits in a dirty checkout AND a fail-open when a literal `~`
+  // directory inside a dirty checkout holds the tracked target the shell really
+  // writes. The walker records the raw source fact per target (`bareTilde`),
+  // and `undefined` (a non-redirect caller) keeps the historical expansion.
+  const expandTilde = bareTilde !== false;
   // ⛔ SCONCAT, NOT `join`: `join` normalises, so `~/a/../b` would lose the `..`
   // lexically and reintroduce the very defect this function exists to avoid,
   // one segment further in.
-  const withHome = raw === "~"
-    ? homedir()
-    : raw.startsWith("~/")
-      ? `${homedir().replace(/\/+$/, "")}/${raw.slice(2)}`
-      : raw;
+  const withHome = !expandTilde
+    ? raw
+    : raw === "~"
+      ? homedir()
+      : raw.startsWith("~/")
+        ? `${homedir().replace(/\/+$/, "")}/${raw.slice(2)}`
+        : raw;
   if (isAbsolute(withHome)) return withHome;
   return `${cwd.replace(/\/+$/, "")}/${withHome}`;
 }
@@ -2322,7 +2334,7 @@ function _kernelResolve(p: string): string | null {
 
 function _catFileRevertStateBlock(
   d: { form: string; scope: string; pathspecs: string[] },
-  writeTargets: { raw: string; cwd: string }[],
+  writeTargets: { raw: string; cwd: string; bareTilde?: boolean }[],
   writeCwd: string,
   command: string,
   scriptDir: string | null,
@@ -2348,7 +2360,7 @@ function _catFileRevertStateBlock(
   // walker the discard-verb arm already trusts (`classify-git.mjs` cdChain) —
   // so the pair (site cwd, raw operand) comes from IT, and the substitution
   // still happens on the OPERAND, never on a resolved absolute path.
-  const targets = writeTargets.map((t) => _writeLandingSpelling(t.cwd, _wtSubstituteVars(t.raw, vars)));
+  const targets = writeTargets.map((t) => _writeLandingSpelling(t.cwd, _wtSubstituteVars(t.raw, vars), t.bareTilde));
 
   // Candidate checkouts: each target's nearest EXISTING ancestor (the landing
   // site), then the checkout the discard was READ FROM when it came from a
@@ -5107,12 +5119,16 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
     // chain itself. `writeCwd` is the EXECUTION cwd (`commandExecutionCwd`, null
     // for a plain `cd`), and anchoring relative targets there is precisely the
     // mis-resolution this arm had.
-    let writeTargets: { raw: string; cwd: string }[] = [];
+    let writeTargets: { raw: string; cwd: string; bareTilde?: boolean }[] = [];
     if (set.discs.some((d) => d.form === "cat-file-revert")) {
       try {
         const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
+        // ⛔ `bareTilde` MUST SURVIVE THIS PROJECTION (#4101 review, P3). Dropping
+        // it here put the de-quoted spelling back in front of
+        // `_writeLandingSpelling` with no tilde fact, so a QUOTED `> "~/x"` was
+        // expanded again — the fix was in the walker and the arm never saw it.
         writeTargets = bashWriteTargetsResolved(src, set.baseCwd)
-          .map((t) => ({ raw: t.raw ?? t.resolvedPath, cwd: t.cwd }));
+          .map((t) => ({ raw: t.raw ?? t.resolvedPath, cwd: t.cwd, bareTilde: t.bareTilde }));
       } catch { /* best-effort — a miss only means no extra block */ }
     }
 
@@ -6226,10 +6242,18 @@ function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: a
     "     (a fast-forward cannot move the tip backwards or rewrite a commit).",
     "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
     "   → Or stamp the ~/.pi/agent/.allow-main-edits marker (15-min TTL) —",
-    "     reachable from an ALREADY-RUNNING session — or set",
-    "     AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for deliberate",
-    "     solo sessions.",
+    "     reachable from an ALREADY-RUNNING session with a resolvable session id —",
+    "     or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
+    "     deliberate solo sessions.",
     ..._ENV_HATCH_CAVEAT,
+    // ⛔ THE CLOBBER HAZARD ABOVE IS ONE BRANCH; THE INERT MARKER IS ANOTHER
+    // (#4101 review, P3). `_inertMarkerLines()` was spliced only into
+    // `_dirtyRecoveryBody` and the M5 discard arm, so THIS refusal — like #607's
+    // below — could prescribe stamping the marker to a reader holding one that
+    // is on disk and cannot open a window, which is the recurrence the README
+    // claims is impossible. Every printed offer of the marker must carry the
+    // diagnosis.
+    ..._inertMarkerLines(),
   ].join("\n");
 }
 
@@ -7039,6 +7063,10 @@ export default function (pi: ExtensionAPI) {
             "   Hatch, if this is deliberate solo work in the hub:",
             "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
             ..._ENV_HATCH_CAVEAT,
+            // Same rule as the #1144 refusal above (#4101 review, P3): an offer
+            // of the marker must carry the inert-marker diagnosis, or a reader
+            // holding a marker on disk is told to do what they already did.
+            ..._inertMarkerLines(),
           ].join("\n"),
         };
       };

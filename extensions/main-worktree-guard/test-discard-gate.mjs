@@ -87,7 +87,7 @@ function skipped(name, why) {
 console.log("── Part A: extraction + effect decision (classify-git.mjs) ──");
 
 const cg = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
-const { extractWorkingTreeDiscards, discardDestroysWip } = cg;
+const { extractWorkingTreeDiscards, discardDestroysWip, bashWriteTargetsResolved } = cg;
 
 /** first descriptor for `cmd` (or null). */
 const first = (cmd) => extractWorkingTreeDiscards(cmd)[0] ?? null;
@@ -3112,6 +3112,94 @@ async function partD() {
         try { gg("branch -D feat3", hub); } catch { /* fixture teardown */ }
       }
       gg("checkout -q -- dirty.txt", wt2);
+      hubClean();
+    }
+
+    // ── D19 (#4101 review, P2 — REPRODUCED as a fail-open at the head that
+    // carried it): ONE redirect, TWO spellings, and the walker DEDUPED them on
+    // their LEXICAL resolution — so the twin that lands on tracked dirt was
+    // dropped before any link-aware probe ran.
+    //
+    // `push()` keyed `seen` on `${via}:${resolve(cwd, raw)}`. `resolve()` cancels
+    // `..` LEXICALLY while the kernel applies it to the directory a symlink
+    // RESOLVED to, so `<tmp>/a.txt` and `<tmp>/ld/../a.txt` (ld -> <dirty wt>/sub)
+    // shared one key and only the first survived: the arm probed `<tmp>` (no
+    // checkout ⇒ allow) while bash wrote the SECOND, truncating `<wt>/dirty.txt`
+    // and leaving `git status` clean. The key is now the operand + its site cwd,
+    // so the two spellings are two landing questions.
+    let ldTwin = null;
+    try {
+      ldTwin = join(tmpd, "ld-twin");
+      rmSync(ldTwin, { force: true });
+      symlinkSync(join(wt2, "sub"), ldTwin);
+      writeFileSync(join(wt2, "dirty.txt"), "MUTANT-TWIN\n");
+      hubClean();
+      // The pre-fix shape, MEASURED at the walker level: one target, not two.
+      const twinTargets = bashWriteTargetsResolved(
+        `git show HEAD:dirty.txt > ${tmpd}/dirty.txt 1> ${ldTwin}/../dirty.txt`, hub,
+      ).filter((t) => t.via === "redirect");
+      expectTrue("D19a non-vacuity: the twin-spelling redirect reports TWO write targets (pre-fix it reported one)",
+        twinTargets.length === 2, `got ${twinTargets.length}: ${JSON.stringify(twinTargets.map((t) => t.raw))}`);
+      const twin = await bash(`git -C ${hub} show HEAD:dirty.txt > ${tmpd}/dirty.txt 1> ${ldTwin}/../dirty.txt`, hub);
+      expectTrue("D19 (#4101 P2) a SECOND spelling of the same redirect (`> a 1> <ld>/../f`) is still probed at its own landing site — BLOCKED",
+        blocked(twin), `was allowed: ${JSON.stringify(reason(twin)).slice(0, 200)}`);
+      expectTrue("D19b …and it names the WORKTREE the second spelling's bytes land in",
+        /Checkout: .*\/wt2\b/.test(reason(twin)), `reason=${JSON.stringify(reason(twin)).slice(0, 240)}`);
+      gg("checkout -q -- dirty.txt", wt2);
+      // Control: the same PAIR with the `..`-after-link spelling landing outside
+      // every checkout destroys nothing, so it must stay admitted — the fix
+      // probes both spellings, it does not refuse them.
+      const ldNowhere = join(tmpd, "ld-twin-clean");
+      rmSync(ldNowhere, { force: true });
+      symlinkSync(join(tmpd, "notacheckout"), ldNowhere);
+      expectTrue("D19c control: the same twin spelling landing OUTSIDE every checkout is ALLOWED",
+        allowed(await bash(`git -C ${hub} show HEAD:dirty.txt > ${tmpd}/a.txt 1> ${ldNowhere}/../b.txt`, hub)), "was blocked");
+      rmSync(ldNowhere, { force: true });
+    } finally {
+      if (ldTwin !== null) { try { rmSync(ldTwin, { force: true }); } catch { /* fixture teardown */ } }
+      gg("checkout -q -- dirty.txt", wt2);
+      hubClean();
+    }
+
+    // ── D20 (#4101 review, P3 — both directions): a leading `~` is expanded by
+    // the SHELL only when it is UNQUOTED, and the walker hands the arm a
+    // DE-QUOTED operand, so `> "~/x"` (which writes `<cwd>/~/x`) and `> ~/x`
+    // (which writes `$HOME/x`) arrive identical. Expanding both made the arm
+    // probe `$HOME` for the QUOTED spelling: a FALSE BLOCK whenever `$HOME`
+    // holds a dirty checkout, and a narrow FAIL-OPEN whenever a literal `~`
+    // directory inside a dirty checkout holds the tracked file the shell really
+    // writes. Both directions are pinned here.
+    let ht2 = null;
+    try {
+      ht2 = join(home, "ht2");
+      gg(`worktree add -q -b feat4 "${ht2}"`, hub);
+      writeFileSync(join(ht2, "dirty.txt"), "MUTANT-HT2\n");
+      // (a) FALSE BLOCK: the quoted spelling writes a literal `~` dir under the
+      // CWD (the hub), touching nothing in the dirty `$HOME` checkout.
+      const quotedTilde = await bash(`git -C ${hub} show HEAD:dirty.txt > "~/ht2/dirty.txt"`, hub);
+      expectTrue("D20 a QUOTED `~` is NOT a tilde word: `> \"~/ht2/dirty.txt\"` is ALLOWED even though $HOME/ht2 is tracked-dirty",
+        allowed(quotedTilde), `was blocked: ${JSON.stringify(reason(quotedTilde)).slice(0, 300)}`);
+      // (b) FAIL-OPEN: from inside a dirty worktree, the quoted spelling writes
+      // a literal `~` directory IN THAT CHECKOUT, replacing tracked content.
+      mkdirSync(join(wt2, "~"), { recursive: true });
+      writeFileSync(join(wt2, "~", "dirty.txt"), "v-tilde\n");
+      gg("add -- '~/dirty.txt'", wt2);
+      gg("commit -qm 4101-tilde-literal", wt2);
+      writeFileSync(join(wt2, "~", "dirty.txt"), "MUTANT-TILDE\n");
+      expectTrue("D20b …and in a DIRTY checkout `> \"~/dirty.txt\"` is BLOCKED — it writes `<wt>/~/dirty.txt`, whose tracked content would be lost",
+        blocked(await bash(`cd ${wt2} && git -C ${hub} show HEAD:dirty.txt > "~/dirty.txt"`, wt2)),
+        "was allowed (probed $HOME, not the literal `~` dir)");
+      // Control: the UNQUOTED spelling is still a tilde word and still blocks.
+      expectTrue("D20c control: the UNQUOTED spelling `> ~/ht2/dirty.txt` is still BLOCKED (the tilde is still expanded)",
+        blocked(await bash(`git -C ${hub} show HEAD:dirty.txt > ~/ht2/dirty.txt`, hub)), "was allowed");
+    } finally {
+      try { gg("checkout -q -- dirty.txt", wt2); } catch { /* fixture teardown */ }
+      try { gg("clean -qfd -- '~'", wt2); } catch { /* fixture teardown */ }
+      try { gg("reset -q --hard HEAD~1", wt2); } catch { /* fixture teardown */ }
+      if (ht2 !== null) {
+        try { gg(`worktree remove --force "${ht2}"`, hub); } catch { /* fixture teardown */ }
+        try { gg("branch -D feat4", hub); } catch { /* fixture teardown */ }
+      }
       hubClean();
     }
 

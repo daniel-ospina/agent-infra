@@ -345,7 +345,7 @@ blocked with *"it would destroy uncommitted work"*, a claim that is false of the
 target. The scope is **"inside a checkout"**, never "outside the cwd of this
 invocation": a target in another — even foreign — dirty checkout still blocks.
 
-Three consequences are deliberate and pinned by tests:
+Four consequences are deliberate and pinned by tests:
 
 1. A write target anchored to a **same-command** `NAME=<literal>` assignment
    (`MAIN_REPO=<hub>` above) is resolved before the probe, so the fail-open
@@ -362,6 +362,21 @@ Three consequences are deliberate and pinned by tests:
 3. The reason line names the **redirect** — what is discarded — never the
    source pathspec: `git show HEAD:clean > <dirty-target>` used to report
    `clean`.
+4. A redirect that lands inside a **different, CLEAN checkout** while THIS
+   session's own checkout is dirty is **ADMITTED** (#4101 review, P3 — the
+   admission was real but undisclosed). Dropping the unconditional `writeCwd`
+   seed admits it arithmetically: `git show origin/main:f >
+   <other-clean/checkout>/f` probes that landing checkout, finds it clean, and
+   allows. The write DOES replace a tracked file there — but from committed
+   content, in a checkout with no uncommitted work, so `git checkout --`
+   restores it byte-for-byte: nothing is lost that git cannot reproduce. That
+   is consistent with the arm's question (*does this redirect land on content
+   that would be lost?*) and with #3620's refusal of the cwd-only probe, so it
+   is disclosed here rather than blocked: the two shapes that must stay refused
+   — a landing site that is **dirty**, and one this walk cannot resolve (a
+   hardlink, an over-long link chain, an unreadable status) — still are. What
+   the "one shape becomes admissible" summary in #4101's description omitted is
+   this second shape; it is recoverable by construction, not by luck.
 
 **M4's disorder early-return no longer shadows M5.** On a disordered hub the M4
 arm returned for every sanctioned/read-only non-push BEFORE the discard arm
