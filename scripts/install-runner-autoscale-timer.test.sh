@@ -2373,6 +2373,41 @@ assert_eq "$RC" 0 "a launchd re-install that cannot resolve a pin succeeds"
 assert_eq "$(plist_env "$D2/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PROV3" \
     "and KEEPS the pin (deleting the launchd adoption left this green before)"
 
+# ── T68: THE JUDGE'S THREE ANSWERS ARE THREE DIAGNOSES — THE THIRD COPY ──────────────────────────────
+# (P3, the finding PR #4020 fixed TWICE and missed here.) The drainer's `vet_unit` and the sibling
+# `install-conflict-rebase-timer.sh` both got the rc split AND a stale/ungradable-judge arm (T13), but this
+# installer's copy — ported in the same PR — kept the collapsed rc-2 sentence naming a cause
+# `gate-policy.sh` cannot produce (`"or a declaration it cannot fold"`). `return 2` is reachable ONLY from
+# the judge's FILE PREFLIGHT (no file named / not readable / a directory): the fold has no error branch by
+# design, and a continuation still pending at EOF is folded and graded, never deferred. So the old sentence
+# sent an operator hunting a fold failure that cannot happen — the exact wrong-diagnosis defect this PR
+# closed in the other two installers, and the wording is what it closed; these arms redden on it.
+echo "== T68: a judge that cannot answer is refused by ITS diagnosis, not as a bypass it never found =="
+D9="$T/t68"; fresh "$D9"
+printf '#!/usr/bin/env bash\nexit 2\n' >"$T/ungradable-judge.sh"; chmod +x "$T/ungradable-judge.sh"
+ENVV=(GP_GUARD="$T/ungradable-judge.sh")
+OUT="$(run_install Linux "$D9" --dry-run)"; RC=$?
+ENVV=()
+assert_eq "$RC" 1 "T68 an ungradable declaration is still REFUSED (an ungradable unit is not a clean one)"
+assert_contains "$OUT" 'could not GRADE' "T68 …and the refusal names the grading failure as the cause"
+assert_absent "$OUT" 'GATE-BYPASS' "T68 …and it does not accuse the unit of a bypass no line named"
+assert_contains "$OUT" 'preflight' "T68 …and it names the cause that is REACHABLE (the judge's file preflight)"
+assert_absent "$OUT" 'cannot fold' "T68 …and NOT a content cause the judge cannot produce ('cannot fold' is unreachable)"
+# rc 64 — a resolved `gate-policy.sh` that predates `--unit-veto` (a stale farmed or ambient copy): the
+# refusal must report the rc it got and say the unit was never vetted, not that a hatch was found.
+printf '#!/usr/bin/env bash\nexit 64\n' >"$T/stale-judge.sh"; chmod +x "$T/stale-judge.sh"
+ENVV=(GP_GUARD="$T/stale-judge.sh")
+OUT="$(run_install Linux "$D9" --dry-run)"; RC=$?
+ENVV=()
+assert_eq "$RC" 1 "T68 a judge that does not know --unit-veto still REFUSES the install (fail-closed)"
+assert_contains "$OUT" 'rc=64' "T68 …and it reports the rc it actually got"
+assert_contains "$OUT" 'NEVER vetted' "T68 …and says the unit was never vetted, not that a hatch was found"
+assert_absent "$OUT" 'GATE-BYPASS' "T68 …and it does NOT claim a GATE-BYPASS entry no line named"
+# CONTROL: the real judge still vets the shipped templates clean, so the arms above red on the DIAGNOSIS
+# and not because the resolver quietly stopped finding a judge at all.
+OUT="$(run_install Linux "$D9" --dry-run)"; RC=$?
+assert_eq "$RC" 0 "T68 control: with the real judge the same invocation is clean (the shipped templates carry no hatch)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

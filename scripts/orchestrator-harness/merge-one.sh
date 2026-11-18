@@ -1123,15 +1123,11 @@ rail_attempt() {
     echo "${HEAD:-}" > "$O/state/parked-$PR"
     # ⛔ THIS PARK CARRIES NO REASON, SO IT MUST CARRY ITS AUTHOR (#4126 P2): the guard's `''` arm —
     # "the rail's own park, which writes no reason at all" — is the state this site creates, and a
-    # previous head's reason may still be sitting beside it.
-    # ⛔ STAMPED UNCONDITIONALLY, NOW THAT THE STAMP NAMES THE HEAD (review P3, #4126). The old
-    # `[ -s parkreason ] ||` guard tried to protect a surviving HUMAN reason from being relabelled —
-    # but a PR-lifetime stamp cannot make that promise in either direction: it outlived the reason it
-    # described and attributed LATER, hand-written parks to this machine. The stamp is now `<head>
-    # harness` and the guard trusts it only at that head, so writing it here can only ever describe THIS
-    # park; the README/ARCHITECTURE rows state the two-field form. `pr-sickness.sh`'s escalations write
-    # the same marker.
-    printf '%s %s\n' "${HEAD:-}" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
+    # previous head's reason may still be sitting beside it. Stamped only when no reason survives, so a
+    # HUMAN reason left at an earlier head is never relabelled as this harness's. `pr-sickness.sh`'s
+    # escalations write the same marker. `<head> harness`, not a bare token (#4126 round 7): the guard
+    # trusts a stamp only for the head it names, so this one cannot outlive the park it describes.
+    [ -s "$O/state/parkreason-$PR" ] || [ -z "${HEAD:-}" ] || printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     exit 0
   fi
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
@@ -1344,11 +1340,10 @@ park() { # park <reason…>
     # stamped beside the reason, so a wording added here can never silently become "a human decided".
     # ⛔ AND IT IS WRITTEN WITH THE REASON, NEVER WITHOUT IT (the guarded block above): the first
     # reason wins when there is no head to key a new park to, and stamping the author then would
-    # attribute the SURVIVING reason — possibly a human's — to this worker.
-    # ⛔ THE STAMP NAMES THE HEAD IT DESCRIBES (`<head> harness`, review P2, #4126): a PR-lifetime
-    # `harness` stamp outlived the park it described, so a later hand-written park at a new head was
-    # still read as the machine's. The guard trusts the author only at the head it names.
-    printf '%s %s\n' "${HEAD:-}" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
+    # attribute the SURVIVING reason — possibly a human's — to this worker. `<head> harness` (#4126
+    # round 7): the guard trusts the stamp only for the head it names, and a park with no head has
+    # nothing to name, so it writes no marker at all rather than a head-less one.
+    [ -n "${HEAD:-}" ] && printf '%s %s\n' "$HEAD" 'harness' > "$O/state/parkorigin-$PR" 2>/dev/null || true
     printf '%s\n' "$why" > "$O/state/parkreason-$PR"
   fi
   [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"

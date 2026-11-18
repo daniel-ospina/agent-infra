@@ -1890,11 +1890,7 @@ refund_bailed_fixer() {
     echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n [budget state/$cnt-$pr]" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
-  # ⛔ THE AUTHOR GOES WITH THE REASON (review P2/P3, #4126). This deleted `parked-<PR>` alone and left
-  # `parkreason-<PR>` and `parkorigin-<PR>` behind, so a `harness` stamp survived the bail and attributed
-  # the NEXT park at this PR — the one a human would write — to the machine. Every site that drops a
-  # park now drops the pair that describes it.
-  rm -f "$O/state/parked-$pr" "$O/state/parkreason-$pr" "$O/state/parkorigin-$pr" 2>/dev/null || true
+  rm -f "$O/state/parked-$pr"
   return 0
 }
 
@@ -4291,9 +4287,10 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…> — returns non-zero when the 
   # guard has to fail closed on, and the marker is only trustworthy when it was written with the
   # reason it describes. A partial write therefore does not land the park at all, which is what this
   # function's return contract already promises its callers.
-  # ⛔ AND IT NAMES THE HEAD IT DESCRIBES (`<head> harness`), because a PR-lifetime stamp outlives the
-  # park it describes: the guard trusts it only when its head IS the live head, so a later hand-written
-  # park at a new head is honoured instead of being attributed to this machine (review P2, #4126).
+  # ⛔ AND IT NAMES THE HEAD IT DESCRIBES (fresh-context review, P2, #4126 round 7): `<head> harness`.
+  # The guard trusts a stamp only when that head is the row's head, so a stamp can never outlive its
+  # own park and outrank a later hand-written one. Written in ONE `printf`, not two, so the two
+  # fields cannot disagree. The human counterpart is `scripts/orchestrator-harness/park-human.sh`.
   printf '%s %s\n' "$2" 'harness' > "$O/state/parkorigin-$1" \
     && printf '%s\n' "$3" > "$O/state/parkreason-$1" \
     && printf '%s\n' "$2" > "$O/state/parked-$1"
@@ -6705,6 +6702,13 @@ while true; do
     # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
+      # ⛔ THE PARK'S AUTHOR DIES WITH THE PR TOO (fresh-context review, P2, #4126 round 7). The
+      # attribution was in NO sweep family and no park remedy removed it, so it was append-only for
+      # the PR's life and after it — a stale `harness` beside a later hand-written park is exactly
+      # the inversion the marker exists to prevent. Only the MARKER is swept here, not the
+      # `parked-<PR>`/`parkreason-<PR>` pair it accompanies: the sweep's contract for that pair is
+      # unchanged by this round, and widening it is a separate change with its own readers.
+      rm -f "$O/state/parkorigin-$PR" 2>/dev/null || true
       rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
@@ -7173,10 +7177,7 @@ while true; do
     # exemption consults the AUTHOR of the park, not only `mergeable`: a park a human wrote ("needs a
     # human decision") records a judgement about the PR that a rebase does NOT settle, so rebasing it
     # would resolve conflict hunks the human parked it for. That is the same rule the red-fixer arm
-    # applies when it refuses to lift a park whose reason is not its own (the GREEN arm above). The
-    # author is `<head> human` — and because the stamp names the head, a human park at a NEW head is
-    # honoured even when an earlier machine park left its stamp behind (those files are not always
-    # deleted, so that state is the common one, not a corner).
+    # applies when it refuses to lift a park whose reason is not its own (the GREEN arm above).
     # ⛔ THE AUTHOR IS A MARKER, NOT A SUBSTRING OF THE PROSE (fresh-context review, P2, #4126). This
     # used to be a `case` over the REASON TEXT with a fail-closed default, and the text is written by
     # THREE files (`park_ctrl` here, `merge-one.sh`'s `park()`/rail cap, `pr-sickness.sh`). Seven
@@ -7186,45 +7187,51 @@ while true; do
     # `FAILED:ai-review-gate`) went through it. So for those heads the router never ran and the only
     # exit was an operator hand-deleting the park — the P0-ish "secretary at the keyboard" state
     # #4120 was filed to remove. A negative test over free prose cannot be kept in sync across three
-    # writers, so the author is now a FACT each writer stamps: `parkorigin-<PR>` = `<head> harness` for a
-    # machine park and `<head> human` for a hand-written one (the head matters — see the head-keying
-    # paragraph below).
+    # writers, so the author is now a FACT each writer stamps: `parkorigin-<PR>` = `harness` for a
+    # machine park, `human` for a hand-written one.
+    # ⛔ THE MARKER IS KEYED TO THE HEAD IT DESCRIBES (fresh-context review, P2, #4126 — round 7).
+    # Stamping the author alone left the marker PER-PR while the park it describes is PER-HEAD, so a
+    # `harness` stamp outlived its own park and outranked a LATER HAND-WRITTEN one — the guard's
+    # "a human decision stands" invariant inverted for exactly the population it meets. The write is
+    # now `<head> <author>` and is trusted only when that head IS the row's head. Anything else is a
+    # stale stamp, which is read by the prose list below (and fails closed there), never by the marker.
+    # ⛔ AND THE MARKER HAS A HUMAN PRODUCER (same finding): a hand-written park used to have to be
+    # written by `printf` into the state dir, which stamped NO author — so the `human` arm below had no
+    # writer anywhere in the repo and a hand-written park agreed with the marker only by accident.
+    # `scripts/orchestrator-harness/park-human.sh <PR> <reason…>` writes all three files, this one
+    # included, at the LIVE head. Both directions are therefore reachable: a machine park stamps
+    # `harness`, a deliberate freeze stamps `human`, and an operator who types the files by hand gets
+    # the fail-closed prose path (a stale `harness` for THIS head is the one residual, and the recipe
+    # this file prints names `park-human.sh`, not `printf`).
     # ⛔ NO MARKER IS NOT FREEDOM — it fails CLOSED (a human decision stands), with ONE exception that
     # is a migration path, not a rule: a park written before this marker existed (an upgrading box)
     # carries no author, and its prose is all there is. Falling through to "human" there would strand
     # every head those parks hold — reintroducing the exact inertness this fix removes, once, at
     # upgrade time. So the pre-marker wordings stay recognised, now including every `merge-one.sh`
     # form, and the branch self-retires: the next park at that PR is stamped and never consults it.
-    # ⛔ THE MARKER IS KEYED TO THE HEAD IT DESCRIBES, NOT TO THE PR (fresh-context review, P2, #4126).
-    # A PR-lifetime `harness` stamp is STICKY: every documented lift recipe deletes `parked-<PR>` and
-    # `parkreason-<PR>` but not the author, and `refund_bailed_fixer` deleted only `parked-<PR>` — so
-    # once a machine had parked a PR, a LATER hand-written park at a new head was still read as the
-    # machine's and the router rebased a head a human had frozen. That is the one direction this marker
-    # must never be wrong in, and it was reachable on exactly the population this change exists for.
-    # Every writer now stamps `<head> <author>`, and the author is trusted only when the stored head IS
-    # this head: a stamp left at an earlier head has no authority and the park falls through to the
-    # prose list, then to "a human decision stands". The residual is a human re-writing the REASON in
-    # place at the very same head a machine parked, without running the documented lift recipe —
-    # strictly smaller than "any hand-written park after any machine park", and the recipe (and the
-    # README's operator section) now removes the stamp too.
-    _pk_head=""; _pk_why=""; _pk_origin=""; _pk_ohead=""; _pk_rebase_settles=0
+    # A bare one-field marker (`harness`, the round-6 shape, or `human`) parses as a head that is not
+    # this row's, so it lands on that same migration path — deliberately: it is a stamp WITH an age we
+    # cannot see, and the prose list recognises every machine wording it could accompany.
+    _pk_head=""; _pk_why=""; _pk_origin=""; _pk_rebase_settles=0
     # ⛔ THE READS ARE `-f`-GUARDED (review note 2, #4126): this runs for EVERY PR on EVERY cycle, and
     # the loop budgets forks per PR per cycle as a dispatch gate (#2293). An unguarded `$(cat)` costs
-    # a double fork per file per PR to read a file that usually does not exist.
+    # a double fork per file per PR to read a file that usually does not exist. The marker is read with
+    # ONE `read` builtin for the same reason — it is now two fields, and parsing them must not cost a
+    # second fork.
     [ -f "$O/state/parked-$PR" ] && _pk_head="$(cat "$O/state/parked-$PR" 2>/dev/null)"
     if [ -n "${HEAD_N:-}" ] && [ "$_pk_head" = "$HEAD_N" ]; then
       [ -f "$O/state/parkreason-$PR" ] && _pk_why="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
-      # `read` (not `cat`) because the stamp is two fields; a one-field file (any pre-#4120 shape, or a
-      # hand edit that dropped the head) leaves `_pk_origin` empty and is treated exactly like no
-      # marker: the prose list decides, then a human decision stands.
       if [ -f "$O/state/parkorigin-$PR" ]; then
-        read -r _pk_ohead _pk_origin < "$O/state/parkorigin-$PR" 2>/dev/null || { _pk_ohead=""; _pk_origin=""; }
+        # <head> <author>, and NOTHING else: a third field is corruption, so the marker is ignored
+        # (fail closed through the prose list) rather than half-read.
+        _pk_orghead=""; _pk_orgauthor=""; _pk_orgextra=""
+        { read -r _pk_orghead _pk_orgauthor _pk_orgextra < "$O/state/parkorigin-$PR"; } 2>/dev/null || true
+        [ "${_pk_orghead:-}" = "$HEAD_N" ] && [ -z "${_pk_orgextra:-}" ] && _pk_origin="${_pk_orgauthor:-}"
       fi
-      [ "$_pk_ohead" = "$HEAD_N" ] || _pk_origin=""   # a stamp from ANOTHER head attributes nothing here
       case "$_pk_origin" in
-        harness) _pk_rebase_settles=1 ;;   # a machine park: the rebase router's own cap bounds it
-        human) _pk_rebase_settles=0 ;;     # a POSITIVE human marker: it outranks the prose, by design
-        *)                                  # no marker, or one written before the marker existed
+        harness) _pk_rebase_settles=1 ;;   # a machine park at THIS head: the router's own cap bounds it
+        human) _pk_rebase_settles=0 ;;     # a POSITIVE human marker (park-human.sh): it outranks the prose, by design
+        *)                                  # a park written before the marker existed (the upgrade path)
           case "$_pk_why" in
             '') _pk_rebase_settles=1 ;;   # the rail's own park writes no reason at all
             *'RED TREE'*) _pk_rebase_settles=1 ;;

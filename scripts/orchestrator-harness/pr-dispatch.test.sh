@@ -496,12 +496,17 @@ PY
     done
   ) >/dev/null 2>&1
 }
-# ── drive_route <V> <mergeable> [<conflictcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>]
-# `<parkorigin>` is `harness` (the default — what every machine park now stamps), `human`, or `none` for
-# NO marker file at all (a park written before the marker existed: the upgrade path). The stamp is written
-# as `<parkhead> <origin>`, because the shipped guard trusts an author ONLY at the head it names;
-# `PARK_STAMP_HEAD` overrides the head the stamp carries (a stamp left at an EARLIER head — the state
-# every park that skipped the lift recipe leaves behind).
+# ── drive_route <V> <mergeable> [<fixcount:0>] [<lanes-in-use:0>] [<spawn-ok:1>] [<parkhead>] [<parkreason>] [<parkorigin>] [<head_n>]
+# `<head_n>` defaults to the suite's opaque token `abc1234`. It exists because `parkorigin-<PR>` and
+# `park-human.sh` are keyed on a FULL 40-char sha — the live `headRefOid` the guard compares in
+# production — so the rows that drive the producer need a head of that shape.
+# `<parkorigin>` is the marker's AUTHOR: `harness` (the default — what every machine park now stamps),
+# `human` (what `park-human.sh` stamps), `none` for NO marker file at all (a park written before the
+# marker existed: the upgrade path), or `stale` for a `harness` stamp KEYED TO A DIFFERENT HEAD than the
+# park it sits beside — the state a per-PR stamp left behind when the PR moved (agent-infra#4126 r7).
+# ⛔ THE MARKER IS `<head> <author>`, NOT A BARE TOKEN. The guard trusts a stamp only when the head it
+# names is THIS row's head, so the driver composes both fields exactly as every writer does; a drive
+# that seeded a bare token would grade the migration path on every row and never the marker at all.
 # THE CONTROLLER'S OWN ORDER, DRIVEN AS ONE LOOP (agent-infra#4120). The swept row runs the
 # `[conflict-case]` block and then the `[acting-case]` block inside the same `while read`, and the
 # conflict block ends in `continue` — so "did the acting case run for this PR" is a fact of the
@@ -520,7 +525,7 @@ drive_route() {
   : > "$TMP/lanes"; _i=0
   while [ "$_i" -lt "${4:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; echo "merge-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   (
-    PR=4242; BR=fix/thing; HEAD_N=abc1234; OR=daniel-ospina/agent-infra; REPO=/nonexistent
+    PR=4242; BR=fix/thing; HEAD_N="${9:-abc1234}"; OR=daniel-ospina/agent-infra; REPO=/nonexistent
     SPAWN_CWD="$TMP/O"; O="$TMP/O"; LOG="$TMP/d.log"
     V="$1"; MSTAT="${2:-}"; MERGE_AUTHORITY=rail; AUTHORITY_UNKNOWN=0
     MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
@@ -584,14 +589,16 @@ PY
       # park the measured population actually inherited.
       printf '%s\n' "${7:-REVIEW-CAP: 3/3 review re-records at head=$6 — the reviewer never produced a usable verdict}" > "$O/state/parkreason-$PR"
       # ⛔ THE AUTHOR IS SEEDED TOO (fresh-context review, P2, #4126). Every machine park stamps
-      # `parkorigin-<PR>` with `<head> harness`; `human` is a hand-written park, and `none` is a park
-      # written BEFORE the marker existed — the upgrade path the legacy prose allow-list still serves. A
-      # drive that seeded only `parked`/`parkreason` would grade the migration arm on every row and would
-      # not notice the marker being ignored, and it would also hide the head key: `PARK_STAMP_HEAD` lets
-      # a row stamp a head OTHER than the parked one, which is what every skipped lift recipe produces.
+      # `parkorigin-<PR>` = `<head> harness`; `human` is a park `park-human.sh` wrote, and `none` is a
+      # park written BEFORE the marker existed — the upgrade path the legacy prose allow-list still
+      # serves. A drive that seeded only `parked`/`parkreason` would grade the migration arm on every
+      # row and would not notice the marker being ignored.
+      # `stale` is the marker keyed to ANOTHER head (`deadbee`, this suite's "a different head" token):
+      # a `harness` stamp that outlived the park it described, sitting beside the park at THIS head.
       case "${8:-harness}" in
         none) : ;;
-        *) printf '%s %s\n' "${PARK_STAMP_HEAD:-$6}" "${8:-harness}" > "$O/state/parkorigin-$PR" ;;
+        stale) printf '%s %s\n' deadbee 'harness' > "$O/state/parkorigin-$PR" ;;
+        *) printf '%s %s\n' "$6" "${8:-harness}" > "$O/state/parkorigin-$PR" ;;
       esac
     fi
     for _once in 1; do
@@ -1061,34 +1068,83 @@ t5_clear; drive_route 'FAILED:ai-review-gate' MERGEABLE 0 0 1 deadbee
 [ "$(cat "$TMP/route" 2>/dev/null)" = "arm" ] \
   && ok "a park recorded at a DIFFERENT head still skips nothing (unchanged: the row reaches the class arms)" \
   || bad "a stale park at another head blocked the row (route=$(cat "$TMP/route" 2>/dev/null)) — the guard must compare the HEAD, not just the file"
-# ⛔ AND THE AUTHOR IS KEYED TO THE HEAD TOO (fresh-context review, P2, #4126). The stamp used to be a
-# PR-LIFETIME `harness`: nothing deleted it on the operator path (the documented lift removes only
-# `parked-<PR>` + `parkreason-<PR>`), so after the harness had ever parked a PR, a human's LATER park at
-# a new head was read as the machine's and the router rebased a head a human had frozen. Non-vacuity:
-# the SAME head, the SAME `CONFLICTING`, the SAME human reason as the row above — and a pre-fix guard
-# (single-token `harness`, no head) routes it `conflict`, spawning a rebase onto the frozen PR.
-t5_clear; PARK_STAMP_HEAD=deadbee drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
-  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off' harness
+# ⛔ AND THE MARKER IS KEYED TO A HEAD (fresh-context review, P2, #4126 round 7). The stamp used to be
+# per-PR while the park it describes is per-head, so a `harness` stamp OUTLIVED its own park and outranked
+# a LATER hand-written one — the inversion this row pins. Here the park is at THIS head with prose no
+# machine wording claims, and the stamp says `harness` for ANOTHER head (`deadbee`): a stamp we cannot
+# date must not decide, so the prose list fails closed and the human's park stands. The mutant is the
+# missing head comparison in the reader (`[ "${_pk_orghead:-}" = "$HEAD_N" ]`), which REDS this row as
+# `route=conflict` and leaves every other marker row green — the head key is otherwise unobservable.
+t5_clear; drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 abc1234 \
+  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off' stale
 [ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
-  && ok "a stale 'harness' stamp at ANOTHER head does not overrule a human park at THIS one (the author is head-keyed)" \
-  || bad "a machine stamp left at an earlier head overruled a human park (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — the marker is PR-lifetime again"
-# ⛔ THE MARKER'S **WRITERS** ARE PINNED, NOT ONLY ITS READER (#3442 rule 1). Every row above SEEDS
-# `parkorigin-<PR>` itself, so a future edit that dropped the stamp from `park_ctrl` — or reverted it to
-# the PR-lifetime one-field form — stayed green while production parks stopped naming their author. The
-# drive below runs the SHIPPED `park_ctrl` and grades what it leaves on disk.
+  && ok "…and a 'harness' stamp keyed to ANOTHER head does NOT rebase this one — a stale stamp cannot decide" \
+  || bad "a stamp left over from another head overruled a human park (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — the marker outlived its own park"
+# ⛔ THE STATE AN OPERATOR ACTUALLY PRODUCES, END TO END (fresh-context review, P2, #4126 round 7).
+# NOTHING in the repo wrote `parkorigin` = `human` — the value existed only where a test driver seeded
+# it — so "a human park stands" was unreachable on a PR the harness had ever parked: the operator did
+# the only thing available (`printf` the reason and the head into the state dir), and the machine's own
+# stamp, still sitting there, overruled them. `park-human.sh` is that missing producer; this row runs the
+# SHIPPED tool over a machine park's stamp and then asks the SHIPPED guard what it does with the result.
 t5_clear
-( O="$TMP/O"; . "$TMP/parkctrl.sh"; park_ctrl 4343 cafe0001 'a machine-written reason' ) >/dev/null 2>&1
-[ "$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)" = "cafe0001 harness" ] \
-  && ok "the shipped park_ctrl stamps its author WITH the head it parks (parkorigin-4343 = '<head> harness')" \
-  || bad "park_ctrl's stamp is '$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)' — expected 'cafe0001 harness' (a one-field stamp is PR-lifetime and overrules a later human park)"
-# ⛔ AND A PARK AT A NEW HEAD REPLACES IT: the guard trusts a stamp only at the head it names, so the
-# writer must OVERWRITE the earlier head's stamp when it parks a new one (a stale-name stamp would be
-# inert but a wrong-HEAD one would mis-attribute the next human park).
-( O="$TMP/O"; . "$TMP/parkctrl.sh"; park_ctrl 4343 d00dfeed 'a later machine reason' ) >/dev/null 2>&1
-[ "$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)" = "d00dfeed harness" ] \
-  && ok "…and a park at a NEW head rewrites it, so the stamp always names the park it describes (no accumulation)" \
-  || bad "a second park left the earlier head's stamp ('$(cat "$TMP/O/state/parkorigin-4343" 2>/dev/null)') — the migration path is now the only one the guard can read"
-rm -f "$TMP/O/state/parked-4343" "$TMP/O/state/parkreason-4343" "$TMP/O/state/parkorigin-4343"
+H40=0123456789abcdef0123456789abcdef01234567
+mkdir -p "$TMP/O/state"
+printf '%s\n' "$H40" > "$TMP/O/state/parked-4242"
+printf '%s\n' 'REVIEW-CAP: 3/3 review re-records at head=0123456 — the reviewer never produced a usable verdict' > "$TMP/O/state/parkreason-4242"
+printf '%s %s\n' "$H40" harness > "$TMP/O/state/parkorigin-4242"
+PARK_STATE_DIR="$TMP/O/state" PARK_HEAD="$H40" bash "$HERE/park-human.sh" 4242 \
+  'needs a human decision: this PR changes the release contract — do not rebase until legal signs off' >/dev/null 2>&1
+[ "$(cat "$TMP/O/state/parkorigin-4242" 2>/dev/null)" = "$H40 human" ] \
+  && ok "park-human.sh stamps the AUTHOR and the HEAD over a machine park's own stamp (the human arm now has a producer)" \
+  || bad "park-human.sh did not write '<head> human' (marker=$(cat "$TMP/O/state/parkorigin-4242" 2>/dev/null || printf none)) — the human arm is still unreachable"
+drive_route 'FAILED:ai-review-gate' CONFLICTING 0 0 1 "" "" "" "$H40"
+[ "$(cat "$TMP/route" 2>/dev/null)" = "parked" ] && [ "$(spawns)" = "0" ] \
+  && ok "…and the head that operator froze is NOT rebased (harness stamp + human park at the SAME head: the reported defect)" \
+  || bad "a park written by the human producer was rebased (route=$(cat "$TMP/route" 2>/dev/null) spawns=$(spawns)) — a human decision was overridden on a PR the harness had parked"
+# ⛔ AND THE PRODUCER REFUSES A HEAD IT CANNOT KEY (fail-closed, not a silent no-op). A park keyed to a
+# wrong or short head freezes NOTHING (the guard compares stored head to the live one), so writing one
+# would look like a freeze and act like a no-op. Non-vacuity for the row above: the tool is only trusted
+# because it refuses here.
+t5_clear
+rm -rf "$TMP/phref" 2>/dev/null || true
+rc=0; PARK_STATE_DIR="$TMP/phref" PARK_HEAD=abc1234 bash "$HERE/park-human.sh" 4242 'a reason' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "0" ]; then
+  bad "park-human.sh accepted a 7-char head (rc=$rc) — the park would freeze nothing"
+else
+  [ -e "$TMP/phref/parked-4242" ] \
+    && bad "park-human.sh refused (rc=$rc) but still wrote a park marker — a half-park is worse than none" \
+    || ok "park-human.sh REFUSES a head it cannot key to (rc=$rc) and writes NOTHING — a park that freezes nothing is never landed"
+fi
+# ⛔ THE MARKER'S **WRITERS** ARE PINNED, NOT JUST ITS READER (fresh-context review, P3, #4126 round 7;
+# the #3442 rule-1 test). Every row above seeds the marker with the DRIVER's own `printf`, so dropping the
+# stamp from a production park site left the whole section green — the round-6 defect again (a park
+# degrades to the legacy prose path and the next new wording strands a conflicted head). So the two
+# writers this suite can drive are driven THROUGH their extracted bodies, and the assertions are on what
+# they wrote, not on a file the driver planted.
+( set -u; PR=4242; O="$TMP/writerO"; mkdir -p "$O/state"; . "$TMP/parkctrl.sh"; park_ctrl "$PR" abc1234 'still CONFLICTING after 3 fixes' ) >/dev/null 2>&1
+[ "$(cat "$TMP/writerO/state/parkorigin-4242" 2>/dev/null)" = "abc1234 harness" ] \
+  && ok "orch-loop.sh::park_ctrl STAMPS '<head> harness' — the machine writer names its author and its head" \
+  || bad "park_ctrl wrote no '<head> harness' marker (marker=$(cat "$TMP/writerO/state/parkorigin-4242" 2>/dev/null || printf none)) — a machine park degrades to the legacy prose path"
+[ "$(cat "$TMP/writerO/state/parkorigin-4242" 2>/dev/null)" = "$(cat "$TMP/writerO/state/parked-4242" 2>/dev/null) harness" ] \
+  && ok "…and the head it stamps is the head it parks" \
+  || bad "the marker names a different head than parked-<PR> (marker=$(cat "$TMP/writerO/state/parkorigin-4242" 2>/dev/null) parked=$(cat "$TMP/writerO/state/parked-4242" 2>/dev/null))"
+MERGE="$HERE/merge-one.sh"
+sed -n '/^park() {/,/^}/p' "$MERGE" > "$TMP/parkfn.sh"
+[ -s "$TMP/parkfn.sh" ] && grep -q 'parkorigin-' "$TMP/parkfn.sh" \
+  || { bad "merge-one.sh::park() is not extractable — the review chain's writer is untested"; }
+if [ -s "$TMP/parkfn.sh" ]; then
+  ( set -u; PR=4242; HEAD=abc1234; O="$TMP/writerM"; L="$TMP/writerM.log"; mkdir -p "$O/state"; : > "$L"; . "$TMP/parkfn.sh"; park 'Review attempts at head=abc1234 are exhausted' ) >/dev/null 2>&1
+  [ "$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null)" = "abc1234 harness" ] \
+    && ok "merge-one.sh::park() STAMPS it too — the review chain's parks cannot lose their author either" \
+    || bad "merge-one.sh::park() wrote no '<head> harness' marker (marker=$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null || printf none)) — the seven-wording population goes unattributed again"
+  # …and a park with NO head writes NO marker: there is no head to name, and stamping one would
+  # attribute the SURVIVING reason (possibly a human's) to this worker. Same subshell, an earlier park
+  # already in place so the `[ -n HEAD ] || [ ! -s parked ]` guard takes its skip branch.
+  ( set -u; PR=4242; HEAD=""; O="$TMP/writerM"; L="$TMP/writerM.log"; . "$TMP/parkfn.sh"; park 'a transient gh failure' ) >/dev/null 2>&1
+  [ "$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null)" = "abc1234 harness" ] \
+    && ok "…and a head-less park does NOT rewrite the author (the surviving reason keeps its own)" \
+    || bad "a head-less park rewrote the marker (marker=$(cat "$TMP/writerM/state/parkorigin-4242" 2>/dev/null || printf none)) — it can attribute a human's reason to the harness"
+fi
 t5_clear
 mv "$TMP/O/state/parked-4242" "$TMP/park.t5b.end.$RANDOM" 2>/dev/null || true
 mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.t5b.end.$RANDOM" 2>/dev/null || true
