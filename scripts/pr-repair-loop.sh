@@ -39,10 +39,12 @@
 #      checkout is `/tmp/cell-t3` cannot use `pr-doctor`'s macOS default path, and pointing it at one
 #      is #1974's exact defect.
 #      ⛔ THE CROSS-BOX CLAIM IS TAKEN ONE LAYER DOWN, PER PR, AND THAT IS WHERE IT BELONGS
-#      (agent-infra#2557). This file spawns NO lane: `pr-doctor.py`'s `dispatch()` is the only spawn
-#      path in the fleet (`git grep 'nonblocking-dispatch'` — every other hit is a READER of the
-#      `$O/bg/*.started` marker or the dispatcher's own docs), and it now takes
-#      `refs/claims/<pr>-<sha12>` via `claims.sh`'s `claim_acquire` BEFORE the lane is spawned. So a
+#      (agent-infra#2557). This file spawns NO lane: `pr-doctor.py`'s `dispatch()` is the only
+#      **PR-repair** spawn path in the fleet, and it now takes `refs/claims/<pr>-<sha12>` via
+#      `claims.sh`'s `claim_acquire` BEFORE the lane is spawned. (The dispatcher itself is NOT the
+#      fleet's only launcher, and this comment used to say it was: `mcp-servers/orchestrator/server.py`
+#      `lane.spawn` and `scripts/orchestrator-harness/ai-drainer.sh` both launch lanes through
+#      `nonblocking-dispatch.sh` too — neither is a PR-repair path, which is the claim this file needs.) So a
 #      claim taken HERE would be one claim for a whole pass over N PRs -- the wrong granularity, and
 #      a second lock for one question. The measured defect was two CELLS dispatching one PR
 #      (pi-cell-2 and pi-cell-5, 2026-11-17); that is decided per PR, at the PR. What this file still
