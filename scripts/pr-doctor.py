@@ -5030,13 +5030,28 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     if verdict == "unconfirmed":
         # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
         # checked before every spawn: if the worker did start, the next pass sees it running.
-        # ⛔ BUT THE CLAIM IS STILL GIVEN BACK (#2557): an unconfirmed spawn is not evidence that a
-        # lane exists, and holding the head for a worker nothing can see is the abandoned-claim
-        # class. If the worker DID start, its own pushes move the head and re-key the claim -- and
-        # the next pass's `worker_live_for()` guard is what stops a second local lane in that window.
-        log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; liveness is re-checked next pass"
-            % (name, wt, detail))
-        return _give_back(detail)
+        # ⛔ THE CLAIM IS KEPT, AND THE FIRST VERSION OF THIS ARM RELEASED IT -- WHICH PUT BACK THE
+        # MEASURED DEFECT ON THE DOMINANT PATH (fresh-review round 2, reproduced against the real
+        # registry and a bare remote). `_confirm()` polls for `CONFIRM_WINDOW_S` = 1 s and then reads
+        # `--status` + the `[agent] provider=` marker, but THAT MARKER IS WRITTEN AFTER THE
+        # CAPABILITY GATE (5-25 s measured on a healthy box), so a worker that is alive and about to
+        # deliver is exactly what `unconfirmed` looks like. Releasing here therefore published the
+        # head free within a second of every spawn: a peer box's `pr_claim_gate` answered
+        # `hold=None` and it spawned a second live lane on the same head -- #2557 itself.
+        # ⛔ AND NOTHING REPAIRED IT LATER, which is what made the arm's own justification false:
+        # this pass writes no row, and the NEXT pass returns at the pre-claim liveness guard
+        # (`worker_live_for` → "one worker per PR") BEFORE it could ever re-claim the head -- so no
+        # pass mints the claim again while the lane runs, and "its own pushes re-key the claim" only
+        # moves the hole to the new head rather than closing it.
+        # The polarity is therefore the one this change's own OVERRIDES line records -- we choose
+        # idle capacity over duplicate writers -- and the cost is bounded by construction: a worker
+        # that never existed holds ONE head for ONE lease, while a released claim holds nothing and
+        # lets a peer write the same branch underneath a live lane. `refused` (no agent started) and
+        # every pre-spawn exit still give the claim back; only "could not tell" keeps it.
+        log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; the claim is KEPT (the worker may be "
+            "alive: the provider marker lands after the capability gate) and liveness is re-checked "
+            "next pass" % (name, wt, detail))
+        return False, detail, False
     # ✅ THE CLAIM IS KEPT: a lane is live on this head, and the whole point of the CAS is that no
     # peer may take it while this worker runs. It is released by its LEASE (the worker's own backstop
     # plus the pad) -- the worker is a `pi` process with a brief, not a claim-taking lane, so there is

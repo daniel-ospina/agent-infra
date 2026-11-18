@@ -1246,6 +1246,50 @@ def test_an_unreadable_registry_is_SKIPPED_and_reported_with_its_token(monkeypat
         "a silent skip is indistinguishable from a bug: %r" % (logged,)
 
 
+def test_the_claim_is_KEPT_when_the_spawn_is_UNCONFIRMED(monkeypatch, tmp_path):
+    """The OTHER polarity, on the DOMINANT path: "could not tell" must NOT publish the head free.
+
+    ⛔ NAMING THE MUTANT. Change this arm back to `return _give_back(detail)` -- which is exactly what
+    the first version shipped -- and this test goes RED on `refs == [claim]` while the peer-box
+    assertion below shows box B taking the same head. That mutation reddened NOTHING in the other
+    351 tests, which is why this row exists: the arm was the only claim-path exit with no coverage.
+
+    ⛔ WHY `unconfirmed` MEANS "MAYBE ALIVE": `_confirm()` polls for `CONFIRM_WINDOW_S` = 1 s and
+    then accepts `--status == running` with no `[agent] provider=` line -- and that marker is written
+    AFTER the capability gate (5-25 s measured on a healthy box). A live worker that is about to
+    deliver is the NORMAL input to this arm, so releasing here re-created #2557 within a second of
+    every spawn; the reviewer reproduced it end to end against the real registry and a bare remote.
+    """
+    origin, head, boxa, boxb = _claim_fleet(tmp_path)
+    pr_ = _pr(13126, head=head)
+    ref = "refs/claims/13126-%s" % head[:12]
+    _as_box(monkeypatch, boxa, tmp_path, "boxA")
+    monkeypatch.setattr(pr, "pr_claim_gate", _REAL_CLAIM_GATE)        # undo the autouse stub
+    monkeypatch.setattr(pr, "pr_claim_release", _REAL_CLAIM_RELEASE)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    monkeypatch.setattr(pr, "spawn_argv", lambda *a: ["/bin/true"])
+    # ⛔ `sh_err` is the claim bridge's transport TOO, so it may only be stubbed for the SPAWN argv
+    # (stubbing it wholesale is what makes a registry test silently stub out the registry).
+    real_sh_err = pr.sh_err
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda argv, **k: ("", "", 0) if argv == ["/bin/true"]
+                        else real_sh_err(argv, **k))
+    monkeypatch.setattr(pr, "_confirm", lambda name: ("unconfirmed", "PENDING: no verdict yet"))
+    ok, detail, record = pr.dispatch(pr_, "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "UNCONFIRMED" in detail or "PENDING" in detail, detail
+    assert _claimed_refs(origin) == [ref], \
+        "an UNCONFIRMED spawn must keep the claim -- releasing it publishes the head free"
+    # …and the property that matters: a PEER box is now refused this head.
+    _as_box(monkeypatch, boxb, tmp_path, "boxB")
+    peer_hold, peer_commit = _REAL_CLAIM_GATE(pr_)
+    assert peer_hold is not None and not peer_commit, (peer_hold, peer_commit)
+    assert pr.claim_hold_token(peer_hold) == "holder-on-foreign-box", peer_hold
+
+
 def test_the_claim_is_released_when_the_spawn_never_launches(monkeypatch, tmp_path):
     """A gate-refused spawn must give the claim back, or the head is held for a whole lease.
 
