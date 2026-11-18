@@ -1890,7 +1890,17 @@ refund_bailed_fixer() {
     echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n [budget state/$cnt-$pr]" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
-  rm -f "$O/state/parked-$pr"
+  # ⛔ AND THE WHOLE PARK GOES WITH IT (fresh-context review, P2, #4126 round 9). This IS a park lift,
+  # but it removed only `parked-<pr>`, so `parkreason-<pr>` and the `parkorigin-<pr>` author stamp
+  # survived it. The parked-guard trusts a `harness` stamp keyed to THIS head OVER the reason's prose,
+  # so a bail followed by a hand-written human park at the same head (`printf` into `state/` — the
+  # documented residual path for a hand park) read as machine-authored and the router REBASED a head a
+  # human had frozen: the one inversion this marker must never be wrong in, through the one lift
+  # neither round 7 nor round 8 touched (86d4efdd6 fixed the four PRINTED recipes; this one is a
+  # programmatic `rm`). The green-surface lift at the red-fixer arm (:6886) already removes all three
+  # files — a lift that leaves the attribution behind attributes the NEXT park at this PR, a human's,
+  # to the harness — and so must this one.
+  rm -f "$O/state/parked-$pr" "$O/state/parkreason-$pr" "$O/state/parkorigin-$pr" 2>/dev/null || true
   return 0
 }
 

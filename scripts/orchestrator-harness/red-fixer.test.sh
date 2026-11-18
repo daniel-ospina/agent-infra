@@ -700,11 +700,25 @@ printf 'head=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\nclass=red-tree\nreason=ad
   > "$TMP/rO/state/railrefusal-4242"
 printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$TMP/rO/state/parked-4242"
 printf 'rail refused a RED TREE and 2 red-fixer attempt(s) at this head did not clear it\n' > "$TMP/rO/state/parkreason-4242"
+# ⛔ THE AUTHOR STAMP IS PART OF THE PARK (fresh-context review, P3, #4126 round 9). The green-surface
+# lift is the one place a machine park is withdrawn, and the `parkorigin-<PR>` stamp it must remove is
+# what the parked-guard trusts OVER the prose — so a lift that left `<head> harness` behind turns the
+# NEXT hand-written human park at this same head into a licence to rebase a head a human froze. This
+# seed is what makes that removal observable: without it, deleting `parkorigin-$PR` from the lift at
+# `orch-loop.sh:6886` reddens no row in this suite (or any other). The reason is asserted gone too —
+# it was equally unasserted, and the lift removes it in the same `rm`.
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef harness\n' > "$TMP/rO/state/parkorigin-4242"
 printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 3\n' > "$TMP/rO/state/railcount-4242"
 SURF=GREEN GH_STATE=SUCCESS KEEP=1 drive_route none deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 1 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 [ ! -f "$TMP/rO/state/parked-4242" ] \
   && ok "(4b) a green surface LIFTS the park its own cap wrote (else the next guard strands the PR)" \
   || bad "(4b) the park survived a green surface — the PR is never re-railed"
+[ ! -f "$TMP/rO/state/parkorigin-4242" ] \
+  && ok "(4b) ...and the AUTHOR STAMP goes with it, so a later hand-written human park at this head is not read as machine-authored" \
+  || bad "(4b) parkorigin survived the lift — the guard would now rebase a head a human froze"
+[ ! -f "$TMP/rO/state/parkreason-4242" ] \
+  && ok "(4b) ...and so does the reason it described" \
+  || bad "(4b) parkreason survived the lift — a stale machine reason outlives the park it described"
 [ ! -f "$TMP/rO/state/railcount-4242" ] \
   && ok "(4b) ...and the head's rail retry budget is reset, so the re-rail gets a real attempt" \
   || bad "(4b) railcount survived at the cap — the re-railed head would park on its first refusal"

@@ -2711,6 +2711,23 @@ if need "$TMP/refund-all.sh" "spend_book/spend_clear/refund_bailed_fixer/is_num 
      && [ ! -f "$O/state/fixspend-77-abc" ]; then rc=0
   else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no) spend=$([ -f "$O/state/fixspend-77-abc" ] && echo yes || echo no)"; fi
   ck "a bailed fixer refunds the attempt AND restores the findings marker (spend consumed)" $rc
+  # (a3) ⛔ THE BAIL LIFT DROPS THE WHOLE PARK, NOT JUST `parked-<pr>` (fresh-context review, P2,
+  # #4126 round 9). `refund_bailed_fixer` is a park LIFT, yet it removed only `parked-<pr>`: the reason
+  # and the `parkorigin-<pr>` author stamp survived. The parked-guard trusts a `harness` stamp keyed to
+  # THIS head OVER the reason's prose, so a bail followed by a HAND-WRITTEN human park at the same head
+  # (printf into `state/`, the documented residual for a hand park) read as machine-authored and the
+  # router REBASED a head a human had frozen — the inversion the marker exists to prevent, through the
+  # one lift no round had touched. All three files are seeded and all three are asserted GONE, so a
+  # revert of either removal reddens this row (not vacuous).
+  rm -f "$O/state/parked-71" "$O/state/parkreason-71" "$O/state/parkorigin-71"
+  echo 1 > "$O/state/fixcount-71"; : > "$O/state/fixbail-71-abc"
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$O/state/parked-71"
+  printf 'rail refused a RED TREE and 2 fixer attempt(s) have been spent on this PR in total\n' > "$O/state/parkreason-71"
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa harness\n' > "$O/state/parkorigin-71"
+  refund_bailed_fixer 71 abc 0
+  if [ ! -f "$O/state/parked-71" ] && [ ! -f "$O/state/parkreason-71" ] && [ ! -f "$O/state/parkorigin-71" ]; then rc=0
+  else rc=1; echo "      parked=$([ -f "$O/state/parked-71" ] && echo LEFT || echo gone) reason=$([ -f "$O/state/parkreason-71" ] && echo LEFT || echo gone) origin=$([ -f "$O/state/parkorigin-71" ] && echo LEFT || echo gone) — a bail left park residue, which attributes the NEXT (human) park at this PR to the harness"; fi
+  ck "a bail LIFTS the whole park — reason and author attribution die with parked-<pr>" $rc
   # (a2) ⛔ A BAIL WITH NO SPEND MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). The
   # bail may have been written by the CI-red or CONFLICTING arm, which never delete a findings marker;
   # refunded on a later gate-red cycle, an unconditional touch invented a fixer authorisation for a
