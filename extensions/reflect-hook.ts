@@ -548,8 +548,16 @@ async function main() {
     const status = res.status;
     const outcome = classify(status);
     if (outcome === "landed") {
-      log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " LANDED (HTTP " + status + ") — capture filed; staged request body removed");
+      // ⛔ UNLINK FIRST, THEN LOG. The exit line is the completion signal a reader awaits
+      // (reflect-hook.test.ts polls this log every 50 ms and then asserts the staged body is
+      // gone), so writing the line before cleanup() makes that assertion race a preemption
+      // window between two syscalls — a flake, not a defect of the worker. The line's own text
+      // ("staged request body removed") is only true after the unlink anyway. cleanup() is
+      // try/catch, so a failing unlink still reaches this line.
+      // ⚠️ NO BACKTICKS AND NO DOLLAR-BRACE IN THESE COMMENTS — this block is a template
+      // literal in the parent file, so either one terminates or interpolates it right here.
       cleanup();
+      log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " LANDED (HTTP " + status + ") — capture filed; staged request body removed");
       return;
     }
     let parsed = null;
@@ -569,16 +577,20 @@ async function main() {
     log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " REFUSED (HTTP " + status +
         (code ? " code=" + code : "") + (advertisedNow !== null ? " retry_after=" + advertisedNow + "s" : "") + " class=" + outcome + ")");
     if (outcome !== "retryable") {
-      log("capture retry TERMINAL — class=" + outcome + " is not retryable (waiting cannot fix it); the durable record stays at " + LOCAL_RECORD);
+      // Same ordering rule as LANDED above: no exit line is written while the staged body
+      // is still on disk.
       cleanup();
+      log("capture retry TERMINAL — class=" + outcome + " is not retryable (waiting cannot fix it); the durable record stays at " + LOCAL_RECORD);
       return;
     }
     advertised = advertisedNow;
   }
+  // Unlink before the exit line (see LANDED): the tests read the staged dir as soon as they
+  // observe this line.
+  cleanup();
   log("capture retry EXHAUSTED after " + MAX_ATTEMPTS + " attempts — last: " + last() +
       "; the capture is NOT lost — the record stays in the spool at " + LOCAL_RECORD +
       " and tortoise's session-events drain treats a retryable refusal as transient and files it later");
-  cleanup();
 }
 
 main().catch(function (err) { log("capture retry ABORTED — " + String(err)); cleanup(); });
@@ -853,10 +865,16 @@ export async function captureToHosted(
       deps,
     });
     if (handoff.scheduled) {
+      // "SCHEDULED", not "runs": the spawn has returned but nothing confirms the child
+      // actually exec'd the program — the worker's own `STARTED` line goes to the retry log,
+      // which nothing reads back. So the line states what is true (a detached worker was
+      // scheduled, its progress lands in the retry log) and says where a failure to start is
+      // reported, instead of promising a retry the lane cannot confirm. The spool record is
+      // durable either way, so this is a disclosure, not a loss.
       console.warn(
-        `[reflect-hook] Hosted capture DEFERRED (${label}) — not blocking this session: attempt 2/${maxAttempts} runs in a detached worker in ${Math.round(
+        `[reflect-hook] Hosted capture DEFERRED (${label}) — not blocking this session: attempt 2/${maxAttempts} is scheduled in a detached worker in ${Math.round(
           handoff.delayMs / 1000,
-        )}s (log: ${handoff.logPath}). The session stays in the spool at ${localRecordPath}, so an exhausted retry is recoverable by tortoise's session-events drain.`,
+        )}s (its progress is appended to ${handoff.logPath}; a worker that cannot be started is reported on this channel). The session stays in the spool at ${localRecordPath}, so an exhausted retry is recoverable by tortoise's session-events drain.`,
       );
       return;
     }

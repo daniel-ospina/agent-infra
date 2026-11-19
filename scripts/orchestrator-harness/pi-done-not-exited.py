@@ -169,6 +169,15 @@ COMPLETION_FAILED = (            # the same extension's failure/deferral shapes
     # allow-list — an unrecognised shape would report as `absent` and say less.
     "[reflect-hook] Hosted capture REFUSED — ",
     "[reflect-hook] Hosted capture DEFERRED (",
+    # #4108's async spawn-failure line (`child.on("error")`, emitted when the detached
+    # retry worker cannot be exec'd): the hook DID run and did NOT land the capture, and
+    # it can be the LAST line of a lane log — the DEFERRED warn is written first and the
+    # error event fires on the next tick, while pi's shutdown still has awaits to run.
+    # Without an entry here the line reads `absent`, which on the log-only arm
+    # (`marker == "ok"` is the only decider) leaves a finished lane UNATTRIBUTABLE
+    # instead of `hook-failed` — the same silent degradation the RETIRED tuple below
+    # exists to prevent. Found by the review at f58b85111 (P2).
+    "[reflect-hook] Capture retry worker could not start (",
     "[reflect-hook] Attribution resolution failed",
 )
 # ⛔ RETIRED FROM THE EMITTER, DELIBERATELY STILL RECOGNISED. `extensions/reflect-hook.ts` at this
