@@ -96,6 +96,35 @@ below grows with the suite, so this header never claims a case that does not exi
      budget; discarding it fell back to an allowance LOOSER than a >8 GB install.
      T42 — an ABSENT gate record is absence ("nothing writes one here — a cell"), not a read fault.
 
+  10. THE RESTART LOOP — 116 RESTARTS / 24 h, ZERO REPAIRS, EVERY ROUND KILLING FOUR JOBS
+     (agent-infra#4153, measured on pi-cell-4 2026-11-19). Its own journal: one offline read → DEAD →
+     `systemctl restart` (the job is gone) → 60 s wait → re-register → `already configured` (refused)
+     → next tick, same. Three defects, three cases, and the third is the one that made a SHIPPED heal
+     a no-op:
+     T63 — `config.sh` decides "already configured" from `IsConfigured() = .runner OR
+     .runner_migrated`, and every measured install carries `.runner_migrated` from its v2-flow
+     migration, so clearing `.runner`/`.credentials*` left the answer TRUE. The fixture's `config.sh`
+     now answers as the real one does, so this case fails if the migrated pair drops out of the
+     cleared set.
+     T64/T65 — a runner this tool restarted is not restarted again inside the cooldown (the pass's own
+     restart is what the next pass read as DEAD), AND a runner still dead after the cooldown IS
+     repaired: both halves, so the guard cannot freeze a dead slot.
+     T66/T67 — one offline read is not a death: the second sample must agree (a BUSY/ONLINE answer
+     holds the runner, and nothing is re-registered), and an UNREADABLE second sample restarts nothing
+     while the pass goes RED rather than reporting `converged` over a slot it never repaired.
+     T32/T32b — the sample is only as fresh as the moment it was taken, and everything after it is
+     slow, so the answer that justifies the restart is asked FRESH for that runner immediately before
+     it (a job that arrived in between costs nothing: no restart at all), and the register-path
+     re-check keeps its own case for the window that remains. T68 — neither seam can be DISABLED: `0`,
+     a negative, `nan`, `inf`, an out-of-range value and garbage all fall back to the default and say
+     so (a PR that relaxes the bound keeps every other case green while switching the reconnect
+     window off). T69 — the cooldown's own state file: an unreadable/corrupt history is REPORTED (it
+     used to return `{}` silently while the docstring claimed the caller said something), an entry of
+     the wrong TYPE is reported too (valid JSON reads as "no stamp" otherwise), and a recovered
+     runner's stamp is pruned on the pass that sees it recover, so its NEXT death is not held on a
+     restart from an hour earlier. T70 — the per-runner read that justifies the restart has its own
+     fail-closed arm: unreadable ⇒ nothing restarted, the hold is published, and the pass is RED.
+
 ⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
 and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
 mutants report `CONTROL RED` and fails the run, because a red case scores CAUGHT for every mutant
@@ -355,6 +384,12 @@ CONFIG_STUB = r"""#!/usr/bin/env bash
 # The runner's own `config.sh`. `refusals` (a number) makes the first N calls answer with the
 # MEASURED server-side refusal; `local_state` records whether the local config was present at call
 # time, which is exactly what fix 2 has to change.
+#
+# ⛔ AND IT REFUSES WHILE `.runner_migrated` IS STILL THERE, WITHOUT A COUNTER — because the real one
+# does (actions/runner v2.338.2: `IsConfigured()` is `.runner` OR `.runner_migrated`). That is the
+# measured cell-4 state of agent-infra#4153: the clear removed the three documented files, the
+# migrated copy kept `IsConfigured()` TRUE, and the repair answered `action-failed` on every pass.
+# A stub that only checked `.runner` would have passed the whole time.
 FIX="__FIX__"
 n=0
 [ -f "$FIX/config.count" ] && n="$(cat "$FIX/config.count")"
@@ -363,7 +398,16 @@ n=$(( n + 1 )); printf '%s\n' "$n" > "$FIX/config.count"
   printf 'call %s argv=%s\n' "$n" "$*"
   if [ -f "__DIR__/.runner" ]; then printf 'call %s local_runner=present\n' "$n"
   else printf 'call %s local_runner=absent\n' "$n"; fi
+  if [ -f "__DIR__/.runner_migrated" ]; then printf 'call %s migrated=present\n' "$n"
+  else printf 'call %s migrated=absent\n' "$n"; fi
 } >> "$FIX/config-calls.log"
+if [ -f "__DIR__/.runner_migrated" ]; then
+  cat >&2 <<'ERR'
+Cannot configure the runner because it is already configured. To reconfigure the runner, run
+'./config.sh remove' first.
+ERR
+  exit 1
+fi
 refuse="$(cat "$FIX/config.refusals" 2>/dev/null || echo 0)"
 if [ "$n" -le "$refuse" ]; then
   cat >&2 <<'ERR'
@@ -459,6 +503,12 @@ class Box:
             "RUNNER_AUTOSCALE_DU": os.path.join(self.dir, "du"),
             "RUNNER_AUTOSCALE_ONLINE_WAIT_S": "0",
             "RUNNER_AUTOSCALE_POLL_S": "0",
+            # ⛔ THE DEAD GUARD'S TWO SEAMS (agent-infra#4153). The confirmation sample is a REAL
+            # sleep in production (120 s), so every case pays a millisecond instead — and it is still
+            # a SECOND POOL READ, which is the behaviour under test. The cooldown stays at its
+            # production default unless a case is ABOUT it: a fixture box restarts each name once per
+            # case, so the default cannot make an unrelated assertion pass for the wrong reason.
+            "RUNNER_AUTOSCALE_DEAD_CONFIRM_S": "0.001",
             "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
             "RUNNER_AUTOSCALE_RETRY_BACKOFF_S": "0",
             # 1 ms: a positive value inside the seam's accepted range (0 is REFUSED — it would mean
@@ -488,14 +538,22 @@ class Box:
     def busy(self, dirs):
         self._write(os.path.join(self.dir, "busy.txt"), "\n".join(dirs) + ("\n" if dirs else ""))
 
-    def install(self, dirname: str, name: str, repo="daniel-ospina/tortoise") -> str:
-        """One runner install: the `.runner` config the runner itself writes, plus a `config.sh`."""
+    def install(self, dirname: str, name: str, repo="daniel-ospina/tortoise", migrated=True) -> str:
+        """One runner install: the `.runner` config the runner itself writes, plus a `config.sh`.
+
+        ⛔ `migrated=True` WRITES `.runner_migrated` TOO, because every install measured on cell 4 has
+        it (written by the runner's own v2-flow migration) and the runner's `IsConfigured()` counts it.
+        A fixture that omitted it modelled an install that no longer exists and could not see
+        agent-infra#4153 — the defect where the clear healed nothing and the repair failed for ever.
+        """
         path = os.path.join(self.root, dirname)
         os.makedirs(path, exist_ok=True)
         cfg = json.dumps(
             {"agentName": name, "gitHubUrl": f"https://github.com/{repo}", "workFolder": "_work"}
         )
         self._write(os.path.join(path, ".runner"), cfg)
+        if migrated:
+            self._write(os.path.join(path, ".runner_migrated"), cfg)
         self._write(os.path.join(path, ".credentials"), "creds")
         self._write(os.path.join(path, ".credentials_rsaparams"), "params")
         self._write(
@@ -507,6 +565,26 @@ class Box:
         )
         self.installs[dirname] = path
         return path
+
+    def stateful_ps(self, install_path: str, *, worker_from: int):
+        """A `ps` that answers "no worker" for the first `worker_from - 1` calls and "a worker" after.
+
+        ⛔ NO busy-dirs SEAM HERE, on purpose: that path is UNCACHED, so it could not show the stale
+        cache the busy re-checks exist to refuse. The call COUNT is how a fixture expresses "a job
+        started between two of this pass's own reads" — and because the pass now reads twice before
+        touching a runner (classification, then the fresh pre-restart read) plus once before
+        `--replace`, the threshold is what selects WHICH guard a case exercises.
+        """
+        counter = os.path.join(self.dir, "ps-count")
+        self._write(
+            os.path.join(self.dir, "ps"),
+            "#!/usr/bin/env bash\n"
+            f'n=$(cat "{counter}" 2>/dev/null || echo 0)\n'
+            f'echo $((n+1)) > "{counter}"\n'
+            f'if [ "$n" -ge {worker_from - 1} ]; then echo "Runner.Worker {install_path}/bin/Runner.Listener"; fi\n',
+            0o755,
+        )
+        self.env["RUNNER_AUTOSCALE_PS"] = os.path.join(self.dir, "ps")
 
     def pool(self, entries):
         """entries: [(name, status, busy, [labels])] → the `gh api … --jq` TSV the tool parses."""
@@ -1115,6 +1193,12 @@ def t7_unread_pool_after_restart():
             box.pool_seq(
                 [
                     "ok",  # the pass's FIRST read: offline, so a restart is due
+                    # the DEAD CONFIRMATION sample (agent-infra#4153) also reads the pool; it must
+                    # succeed or the pass never gets as far as restarting, and the case would be
+                    # measuring the confirmation instead of the racing read it is about
+                    "ok",
+                    # …and so does the FRESH pre-restart read (review finding P1) — same reason
+                    "ok",
                     "err:dial tcp 10.0.0.1:443: i/o timeout",  # …and every later read fails this way
                 ]
             )
@@ -1126,8 +1210,9 @@ def t7_unread_pool_after_restart():
                 f"the cause must name the racing read: {record}",
             )
             check(
-                box.pool_reads() == 4,
-                f"expected 1 initial read + 3 bounded attempts, got {box.pool_reads()} pool reads",
+                box.pool_reads() == 6,
+                f"expected 1 initial + 1 confirmation + 1 pre-restart + 3 bounded attempts, got "
+                f"{box.pool_reads()} pool reads",
             )
             blob = " ".join(record["notes"]) + " " + str(record.get("error"))
             contains(blob, "i/o timeout", "the record")
@@ -1154,12 +1239,20 @@ def t8_deterministic_pool_error_is_not_retried():
             box.install("gh-runner-x64", "r-dead")
             box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
             box.alive([])
-            box.pool_seq(["ok", "err:gh: Not Found (HTTP 404) — repos//actions/runners"])
+            box.pool_seq(
+                [
+                    "ok",  # classification
+                    "ok",  # the DEAD confirmation sample (agent-infra#4153) — still offline
+                    "ok",  # the fresh pre-restart read (review finding P1) — still offline
+                    "err:gh: Not Found (HTTP 404) — repos//actions/runners",
+                ]
+            )
             record = converge(box, want=0)
             check(record["verdict"] == "unmeasurable", f"verdict must be unmeasurable: {record}")
             check(
-                box.pool_reads() == 2,
-                f"a 404 must NOT be retried (1 initial + 1 attempt), got {box.pool_reads()} reads",
+                box.pool_reads() == 4,
+                f"a 404 must NOT be retried (1 initial + 1 confirmation + 1 pre-restart + 1 attempt), "
+                f"got {box.pool_reads()} reads",
             )
             blob = " ".join(record["notes"]) + " " + str(record.get("error"))
             contains(blob, "repos//actions/runners", "the record")
@@ -2982,7 +3075,12 @@ def t4b_retry_is_confined_to_replace():
     with Env():
         box = Box("replace-false")
         try:
-            path = box.install("gh-runner-x64", "r-dead")
+            # ⛔ `migrated=False` ON PURPOSE (agent-infra#4153 review, non-blocking note): with
+            # `.runner_migrated` present the fixture's `config.sh` refuses on its own — exactly as the
+            # real one does — which would make `refusals(1)` INERT and leave this case's refusal
+            # coming from something its docstring does not describe. The migrated-file leg has its own
+            # case (T63); this one keeps testing the arm it was written for.
+            path = box.install("gh-runner-x64", "r-dead", migrated=False)
             before = {
                 name: Path(path, name).read_bytes()
                 for name in (".runner", ".credentials", ".credentials_rsaparams")
@@ -3848,13 +3946,21 @@ def t31_fill_adds_one_runner():
             box.destroy()
 
 
-@test("T32 a runner that came up with a JOB during the restart wait is NOT re-registered")
+@test("T32 a runner that came up with a JOB before the restart is NOT restarted — and not re-registered")
 def t32_busy_reread_before_replace():
     """`wait_online` re-reads the POOL only — the view that already called the runner offline — and
     `--replace` DELETES a registration. A runner that comes up at the last second and takes a job
     would therefore lose it, against this file's own invariant ("a BUSY, SERVING, OTHER-REPO or
-    CONFIG-LOST runner is never restarted"). The re-check has to be FRESH, too: the classification value
-    is cached, and a cached `False` would certify exactly what the re-check exists to refuse."""
+    CONFIG-LOST runner is never restarted"). The re-check has to be FRESH: the classification value
+    is cached, and a cached `False` would certify exactly what the re-check exists to refuse.
+
+    ⛔ THE GUARD NOW FIRES **BEFORE** THE RESTART (agent-infra#4153, review finding P1): the DEAD
+    confirmation is sampled once per pass, and everything after it is slow, so the answer that
+    justifies the destructive command is asked fresh for THAT runner immediately before it. A job
+    that arrives in the meantime therefore costs nothing — where this case used to settle for "not
+    re-registered", it now asserts the stronger fact: **no restart was issued at all**, so the job is
+    never killed. (T32b keeps the register-path re-check honest for the window that remains.)
+    """
     with Env():
         box = Box("busy-reread")
         try:
@@ -3863,19 +3969,14 @@ def t32_busy_reread_before_replace():
             box.alive([])
             # ⛔ NO busy-dirs seam here: that path is UNCACHED, so it could not show the stale cache
             # this case is about. A stateful `ps` answers "no worker" while the runner is judged and
-            # "a worker" from then on — exactly a job starting during the wait.
+            # "a worker" from the SECOND call on — a job starting during the confirmation sample.
             del box.env["RUNNER_AUTOSCALE_BUSY_DIRS"]
-            counter = os.path.join(box.dir, "ps-count")
-            box._write(
-                os.path.join(box.dir, "ps"),
-                "#!/usr/bin/env bash\n"
-                f'n=$(cat "{counter}" 2>/dev/null || echo 0)\n'
-                f'echo $((n+1)) > "{counter}"\n'
-                f'if [ "$n" -ge 1 ]; then echo "Runner.Worker {path}/bin/Runner.Listener"; fi\n',
-                0o755,
-            )
-            box.env["RUNNER_AUTOSCALE_PS"] = os.path.join(box.dir, "ps")
+            box.stateful_ps(path, worker_from=2)
             record = converge(box, want=0)
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "a runner that took a job must not be restarted — that restart is the job kill",
+            )
             argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
             check(argv == [], f"a runner serving a job must NOT be re-registered: {argv}")
             check(
@@ -3888,6 +3989,36 @@ def t32_busy_reread_before_replace():
             check(
                 not any("re-registering with --replace" in a for a in record["actions"]),
                 f"the record must not assert an action that was not taken: {record['actions']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T32b a job that arrives AFTER the restart still stops the --replace (the register-path re-check)")
+def t32b_busy_reread_before_replace_after_restart():
+    """The register-path re-check's own window, kept reachable now that the pre-restart guard absorbs
+    the earlier one (agent-infra#4153 review: two guards, two cases — a guard no fixture can reach is
+    a guard nobody is testing). The worker appears on the THIRD `ps` call: classification (1) and the
+    pre-restart read (2) see none, so the restart is issued; the re-read before `--replace` (3) sees
+    the job and refuses to delete its registration."""
+    with Env():
+        box = Box("busy-reread-late")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            del box.env["RUNNER_AUTOSCALE_BUSY_DIRS"]
+            box.stateful_ps(path, worker_from=3)
+            record = converge(box, want=0)
+            check(
+                len([c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]) == 1,
+                "the restart is issued — the job arrives only after it",
+            )
+            argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
+            check(argv == [], f"a runner serving a job must NOT be re-registered: {argv}")
+            check(
+                any("came up with a JOB" in n for n in record["notes"]),
+                f"…and the pass must say so: {record['notes']}",
             )
         finally:
             box.destroy()
@@ -4092,9 +4223,14 @@ def t45_failed_restart_is_not_offline():
         try:
             box.install("gh-runner-x64", "r-dead")
             box.alive([])
-            # Classification sees it offline; from the SECOND read on the pool reports it ONLINE.
+            # Classification sees it offline, so do the DEAD confirmation sample and the fresh
+            # pre-restart read; from the FOURTH read on the pool reports it ONLINE — i.e. it
+            # reconnected during the restart wait. THREE "ok" steps are what keep this case about the
+            # FAILED RESTART COMMAND and the `online` guard rather than about the samples that now run
+            # first (agent-infra#4153).
             box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
             box.pool_then([("r-dead", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.pool_seq(["ok", "ok", "ok", "swap"])
             box.systemctl_rc(1)  # `systemctl restart` exits 1 and never reaches the manager
             record = converge(box, nproc="2")
             check(
@@ -5265,13 +5401,6 @@ MUTATIONS = [
         "a slot a peer had merely taken (agent-infra#4004 P1-a)",
     ),
     Mutation(
-        "T32",
-        "            alive = _worker_alive(runner, fresh=True)",
-        "            alive = _worker_alive(runner)  # MUTATION: the cached value",
-        "the busy re-check reads the value cached at CLASSIFICATION, so a runner that came up and "
-        "took a job during the restart wait has its registration deleted under the running job",
-    ),
-    Mutation(
         "T9b",
         "            pool, queued = sample()\n"
         "            busy = sum(1 for e in pool.values() if e.busy)\n"
@@ -5722,8 +5851,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T42",
-        "    except FileNotFoundError:",
-        "    except ZeroDivisionError:",
+        "        mode = Path(path).read_text(encoding=\"utf-8\").strip()\n    except FileNotFoundError:",
+        "        mode = Path(path).read_text(encoding=\"utf-8\").strip()\n    except ZeroDivisionError:",
         "an ABSENT gate record is reported as unreadable, sending an operator after permissions on a cell",
     ),
     Mutation(
@@ -5846,6 +5975,100 @@ MUTATIONS = [
         "dies with `AttributeError` — outside the `Unmeasurable` contract every other unreadable "
         "config goes through, so the pass aborts on a traceback the log reader is not looking for "
         "instead of the named cause",
+    ),
+    Mutation(
+        "T32",
+        "                    serving_now = _worker_alive(runner, fresh=True)",
+        "                    serving_now = _worker_alive(runner)  # MUTATION: the cached value",
+        "the PRE-restart re-check reads the value cached at CLASSIFICATION, so a runner that took a "
+        "job during the confirmation sample is restarted anyway — that restart is the job kill "
+        "agent-infra#4153 is about, and it is issued on an answer the pass itself already knows is "
+        "stale",
+    ),
+    Mutation(
+        "T32b",
+        "            alive = _worker_alive(runner, fresh=True)",
+        "            alive = _worker_alive(runner)  # MUTATION: the cached value",
+        "the busy re-check reads the value cached at CLASSIFICATION, so a runner that came up and "
+        "took a job during the restart wait has its registration deleted under the running job",
+    ),
+    Mutation(
+        "T68",
+        "    if not math.isfinite(value) or not 0 < value <= maximum:",
+        "    if not math.isfinite(value) or not 0 <= value <= maximum:  # MUTATION: zero is allowed",
+        "`RUNNER_AUTOSCALE_DEAD_CONFIRM_S=0` then becomes the value IN FORCE, `time.sleep(0)` returns "
+        "at once and the \"second sample\" is another read in the same instant — the reconnect window "
+        "the guard exists for is switched off by an environment variable, with every case and "
+        "mutation green",
+    ),
+    Mutation(
+        "T69",
+        "    except (OSError, ValueError) as exc:\n        return {}, (",
+        "    except (OSError, ValueError) as exc:\n        return {}, \"\"  # MUTATION: the corrupt history is silent again\n        return {}, (",
+        "an unreadable history is read as \"no restart has ever happened here\", so a corrupt state "
+        "file silently drops the cooldown and the very next pass restarts a runner this tool "
+        "restarted minutes ago — the measured 116-restarts/24 h loop, one corrupted JSON away",
+    ),
+    Mutation(
+        "T69",
+        "    if restart_history:\n        pruned = {n: t for n, t in restart_history.items() if n in still_dead}\n        if pruned != restart_history:\n            restart_history = pruned\n            history_dirty = True",
+        "    if False:  # MUTATION: a recovered runner keeps its stamp\n        restart_history = restart_history",
+        "a stamp is never pruned, so a runner that recovered and then died AGAIN is held for the rest "
+        "of the cooldown — a genuinely dead slot left unrepaired while the published reason asserts "
+        "\"one offline read after OUR OWN restart is not a new death\" about a restart from an hour ago",
+    ),
+    Mutation(
+        "T70",
+        "            except Unmeasurable as exc:\n                # ⛔ AN UNREADABLE READ IS NOT PERMISSION.",
+        "            except ZeroDivisionError as exc:  # MUTATION: an unreadable read escapes the pass\n                # ⛔ AN UNREADABLE READ IS NOT PERMISSION.",
+        "the pre-restart read's own fail-closed arm is unreachable, so an `Unmeasurable` from it "
+        "propagates out of `converge` instead of holding the runner: the record loses `actions` and "
+        "`restart_holds` for a pass that may already have restarted a runner earlier in the loop",
+    ),
+    Mutation(
+        "T69",
+        "            except (OverflowError, TypeError):\n                usable = False",
+        "            except ZeroDivisionError:  # MUTATION: an unrepresentable stamp escapes the pass\n                usable = False",
+        "a JSON integer too large to be a float (`10**400`) raises `OverflowError` out of "
+        "`read_restart_history`, which is neither `OSError` nor `ValueError`, so it escapes the pass: "
+        "exit 2, `verdict=unmeasurable`, and ZERO repairs on every tick until a human deletes the file "
+        "— the opposite of the contract that a broken state dir removes only the cooldown",
+    ),
+    Mutation(
+        "T69",
+        "            dropped.append(f\"{name!r}={repr(stamp)[:24]}\")",
+        "            pass  # MUTATION: an unusable entry is silently dropped",
+        "a history entry of the wrong TYPE parses as valid JSON, so it reads as \"this runner has no "
+        "stamp\" and the cooldown quietly stops applying to THAT runner — the same silent hole the "
+        "corrupt-file fix closed, one shape over, with no note in the record",
+    ),
+    # ── agent-infra#4153: the restart loop, one mutation per guard (each MUST turn its case red) ──
+    Mutation(
+        "T63",
+        '    ".runner_migrated",\n    ".credentials_migrated",',
+        "    # MUTATION: the migrated pair is left behind — IsConfigured() stays TRUE",
+        "the runner's own `IsConfigured()` is `.runner` OR `.runner_migrated`, so an install that has "
+        "been migrated to the v2 flow (every install on the measured box) keeps refusing with "
+        "'already configured' after the clear: the repair can never converge, the job the restart "
+        "killed is never replaced, and the pass reports `action-failed` on every tick for ever — the "
+        "116-restarts/24 h loop of #4153, with the heal shipped and green",
+    ),
+    Mutation(
+        "T64",
+        "            if stamp is not None and (now - stamp) < cooldown_s:",
+        "            if False:  # MUTATION: no cooldown — our own restart re-arms the next pass",
+        "a runner restarted by THIS tool is restartable by the next pass 10 minutes later, which is "
+        "before the measured >94 s (minutes under load) re-registration: the pass's own restart is "
+        "what makes the next pass classify it DEAD, so the loop is self-sustaining and every round "
+        "kills the job that runner had picked up",
+    ),
+    Mutation(
+        "T66",
+        "                    if seen is not None and (seen.online or seen.busy):",
+        "                    if False:  # MUTATION: one offline read is a death again",
+        "the second sample is measured and then ignored, so a runner the pool reports BUSY/ONLINE one "
+        "confirmation interval after the first read is restarted anyway — the measured job kill of "
+        "#4153 (the four units came back BUSY four minutes after every restart)",
     ),
 ]
 
@@ -6059,6 +6282,357 @@ def t58_provisioner_receives_repo_and_root():
             check(
                 box.calls("provisioner-calls.log")[-1] == "--count 2 --fallback auto",
                 f"argv unchanged, got {box.calls('provisioner-calls.log')[-1]!r}",
+            )
+        finally:
+            box.destroy()
+
+
+# ── agent-infra#4153: THE RESTART LOOP, AND THE ONE READ THAT FED IT ───────────────────────────
+# Measured on pi-cell-4, 2026-11-19: 116 restarts / 24 h of four healthy runner units, 0 successful
+# repairs, 22 `action-failed` — while 159–162 runs queued. Every restart kills the job that runner is
+# serving. Two independent defects, one case each, plus the heal that could never fire on a migrated
+# install.
+@test("T63 #4153 the migrated config is part of 'local config': the heal works where the runner counts it")
+def t63_migrated_config_is_cleared():
+    """THE DEEPEST DEFECT OF THE LOOP, and the one that made a shipped, tested heal a no-op.
+
+    actions/runner v2.338.2 defines `IsConfigured()` as `.runner` OR `.runner_migrated`, and every
+    install on the measured box carries `.runner_migrated` beside `.runner` since its v2-flow
+    migration. Clearing only `.runner`/`.credentials*` therefore left `IsConfigured()` TRUE and
+    `config.sh --replace` answered the same "already configured" refusal — the pass destroyed the
+    runner's job, failed the repair, and reported `action-failed`, on every tick, for ever.
+    The fixture's `config.sh` now refuses while the migrated copy exists (as the real one does), so
+    this case fails if the migrated pair is dropped from `_LOCAL_CONFIG_FILES`.
+    """
+    with Env():
+        box = Box("4153-migrated")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")  # writes `.runner_migrated` too
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            record = converge(box, want=0)
+
+            calls = box.calls("config-calls.log")
+            argv = [c for c in calls if "argv=" in c]
+            check(len(argv) == 1, f"expected ONE attempt — the clear must make it work: {calls}")
+            check(
+                "call 1 migrated=absent" in calls,
+                "`.runner_migrated` must be cleared too: the runner's own IsConfigured() counts it, "
+                f"so leaving it turns the heal into a no-op and the repair fails for ever. calls={calls}",
+            )
+            check(not record["problems"], f"the repair must succeed: {record['problems']}")
+            check(
+                any(a.startswith("registered r-dead") for a in record["actions"]),
+                f"the runner must end RE-REGISTERED: {record['actions']}",
+            )
+            check(
+                os.path.exists(os.path.join(path, ".runner")),
+                "the install must be configured again after the repair",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T64 #4153 the pass's own restart is not re-issued by the next pass (cooldown)")
+def t64_restart_cooldown_holds_the_next_pass():
+    """The loop, as measured: the pass restarts a runner, the runner needs minutes to re-register,
+    the NEXT pass (10 min later) reads it offline and restarts it again — 29 times a day on one unit,
+    each time destroying the job it had picked up. One restart, then a cooldown."""
+    with Env():
+        box = Box("4153-cooldown")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            converge(box, want=0)
+            first = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(len(first) == 1, f"the first pass restarts the DEAD runner once, got {first}")
+
+            record = converge(box, want=0)
+            restarts = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(
+                len(restarts) == 1,
+                "a second pass inside the cooldown must NOT restart the runner it just restarted: "
+                f"that restart is what killed the job, and it is what made the next pass call it DEAD. "
+                f"got {restarts}",
+            )
+            check(
+                record["restart_holds"] == ["r-dead"],
+                f"the hold must be published machine-readably: {record.get('restart_holds')}",
+            )
+            check(
+                any("cooldown" in n and "r-dead" in n for n in record["notes"]),
+                f"the reason must name the cooldown: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T65 #4153 the cooldown EXPIRES: a runner still dead minutes later is repaired")
+def t65_cooldown_expires():
+    """The other half of the guard, and the one a naive "never restart twice" would fail: a genuinely
+    dead runner must still be repairable. With the cooldown elapsed the pass restarts it again."""
+    with Env():
+        box = Box("4153-cooldown-expiry")
+        try:
+            box.env["RUNNER_AUTOSCALE_RESTART_COOLDOWN_S"] = "0.001"
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            converge(box, want=0)
+            converge(box, want=0)
+            restarts = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(
+                len(restarts) == 2,
+                "once the cooldown has elapsed a still-DEAD runner must be restarted again — "
+                f"otherwise the guard freezes a dead slot for ever. got {restarts}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T66 #4153 ONE offline read is not a death: the second sample must agree")
+def t66_second_sample_must_agree():
+    """The measured self-sustaining loop: the pool says `offline` for a runner that is reconnecting
+    (it needs >94 s, minutes under load), and the pass restarts it — killing the job it had picked up.
+    Here the second sample answers BUSY, so nothing is touched at all."""
+    with Env():
+        box = Box("4153-confirm")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.pool_then([("r-dead", "online", True, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "a runner the second sample reports BUSY must NOT be restarted — that is the job kill "
+                "that started the loop",
+            )
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                "…and it must not be re-registered either: it is serving a job",
+            )
+            check(
+                record["restart_holds"] == ["r-dead"],
+                f"the hold must be published: {record.get('restart_holds')}",
+            )
+            check(
+                any("reconnecting, not dead" in n for n in record["notes"]),
+                f"the reason must say what the second sample measured: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T67 #4153 an UNREADABLE second sample never restarts — and the pass is RED, not 'converged'")
+def t67_unreadable_second_sample_is_red():
+    """Fail-closed, and loudly. A confirmation that cannot be read is not a confirmation, so nothing is
+    restarted — but a pass that then reported `converged` while its only DEAD runner was never repaired
+    would be the false PASS this file's verdicts exist to prevent."""
+    with Env():
+        box = Box("4153-confirm-unread")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.pool_seq(["ok", "err:dial tcp 10.0.0.1:443: i/o timeout"])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "an unconfirmed offline read must not restart anything",
+            )
+            check(
+                record["verdict"] != "converged",
+                f"a DEAD runner that nothing could confirm is not `converged`: {record['verdict']}",
+            )
+            check(
+                any("confirmation" in p and "i/o timeout" in p for p in record["problems"]),
+                f"the failure must carry gh's own words: {record['problems']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T68 #4153 the two restart seams cannot be DISABLED — every unusable value falls back, loudly")
+def t68_seam_bounds_cannot_be_disabled():
+    """`float()` accepts `0`, `-1`, `nan` and `inf`, and every one of them would remove a guard
+    silently: `sleep(0)` returns at once (so the "second sample" is taken back-to-back in the same
+    instant the pool already called the runner offline), and `inf` raised `OverflowError` out of the
+    pass in review. So a value outside `(0, maximum]`, or one that is not a number at all, falls back
+    to the default AND says so — it never becomes the value in force. Pinned here because otherwise a
+    PR that relaxes the bound to `>= 0` keeps every case and mutation green while switching the
+    reconnect window off (agent-infra#4153 review, finding P2)."""
+    with Env():
+        cases = (
+            ("RUNNER_AUTOSCALE_DEAD_CONFIRM_S", ra.DEAD_CONFIRM_DEFAULT_S, ra.DEAD_CONFIRM_MAX_S,
+             ("0", "-1", "nan", "inf", "-inf", str(ra.DEAD_CONFIRM_MAX_S + 1), "garbage")),
+            ("RUNNER_AUTOSCALE_RESTART_COOLDOWN_S", float(ra.RESTART_COOLDOWN_DEFAULT_S),
+             24 * 3600.0, ("0", "-1", "nan", "inf", str(24 * 3600.0 + 1), "garbage")),
+        )
+        for name, default, maximum, bad_values in cases:
+            for bad in bad_values:
+                os.environ[name] = bad
+                notes: list[str] = []
+                got = ra._seam_seconds(name, default, maximum=maximum, notes=notes)
+                check(
+                    got == default,
+                    f"{name}={bad!r} must fall back to {default} — a guard that a value can switch "
+                    f"off is a guard that will; got {got}",
+                )
+                check(len(notes) == 1, f"{name}={bad!r} must be SAID, got notes={notes}")
+            # …and a usable value IS honoured (the fallback must not be a hard-coded default).
+            os.environ[name] = "7.5"
+            notes = []
+            check(
+                ra._seam_seconds(name, default, maximum=maximum, notes=notes) == 7.5 and not notes,
+                f"{name}=7.5 is in range and must be used as-is",
+            )
+            # …and an ABSENT value is the default, silently (that is the shipped configuration).
+            del os.environ[name]
+            notes = []
+            check(
+                ra._seam_seconds(name, default, maximum=maximum, notes=notes) == default and not notes,
+                f"an unset {name} must be the default with no note",
+            )
+
+
+@test("T69 #4153 the restart history is REPORTED when unreadable, and pruned the pass a runner recovers")
+def t69_history_is_reported_and_pruned():
+    """Two review findings on the cooldown's own state file (agent-infra#4153 P2 #2 and #3):
+    (a) an unreadable/corrupt history returned `{}` SILENTLY, so a corrupt file dropped the cooldown
+        and the next pass restarted the runner again with `problems: []` and `notes: []`;
+    (b) the history was only read when something was DEAD, so a RECOVERED runner kept its stamp until
+        the next DEAD runner appeared — and the next GENUINE death was then held for the cooldown
+        while the note claimed "one offline read after OUR OWN restart is not a new death" about a
+        restart from an hour earlier.
+    """
+    with Env():
+        box = Box("4153-history")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+
+            # (a) A CORRUPT history is said out loud, and the pass still restarts (the guard degrades
+            # to the two-sample confirmation — the loop defence is lost, never the job protection).
+            box.apply()  # the seam resolves to THIS fixture's state dir only once applied
+            hist = ra.restart_history_path()
+            hist.parent.mkdir(parents=True, exist_ok=True)
+            hist.write_text("{ this is not json", encoding="utf-8")
+            record = converge(box, want=0)
+            check(
+                any("restart history" in n and "could not be read" in n for n in record["notes"]),
+                f"a corrupt history must be REPORTED: {record['notes']}",
+            )
+            check(
+                len([c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]) == 1,
+                "a corrupt history removes the COOLDOWN only — the runner is still repaired",
+            )
+
+            # (a2) VALID JSON with an UNUSABLE ENTRY is the same silent hole one shape over: it parses,
+            # so it reads as "this runner has no stamp" and the cooldown quietly stops applying to it.
+            hist.write_text(json.dumps({"r-dead": "not-a-timestamp"}), encoding="utf-8")
+            record = converge(box, want=0)
+            check(
+                any("unusable entr" in n for n in record["notes"]),
+                f"a history entry of the wrong TYPE must be reported too: {record['notes']}",
+            )
+
+            # (a3) …AND AN INT TOO LARGE TO BE A FLOAT (round-3 review finding P2, reproduced):
+            # `math.isfinite(10**400)` raises `OverflowError`, which is neither `OSError` nor
+            # `ValueError`, so the naive filter let it ESCAPE the pass — `rc=2`, `verdict=unmeasurable`,
+            # and ZERO restarts on every tick until a human deleted the file. A broken state dir must
+            # remove the cooldown, never the repair.
+            before_restarts = len(
+                [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            )
+            hist.write_text(json.dumps({"r-dead": 10**400}), encoding="utf-8")
+            record = converge(box, want=0)
+            check(
+                any("unusable entr" in n for n in record["notes"]),
+                f"an unrepresentable stamp must be REPORTED, not raise: {record['notes']}",
+            )
+            check(record["verdict"] != "unmeasurable", f"…and must not kill the pass: {record}")
+            check(
+                len([c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")])
+                == before_restarts + 1,
+                "…and the runner must still be REPAIRED (the cooldown is what is lost, not the pass)",
+            )
+
+            # (b) PASS 1 restarts and stamps; PASS 2 sees the runner SERVING; PASS 3 is a GENUINE new
+            # death, which must be repaired — not held on a stamp from the earlier life.
+            box2 = Box("4153-history-prune")
+            try:
+                box2.install("gh-runner-x64", "r-2")
+                box2.alive([box2.installs["gh-runner-x64"]])
+                box2.pool([("r-2", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                converge(box2, want=0)
+                stamped = json.loads(ra.restart_history_path().read_text(encoding="utf-8"))
+                check("r-2" in stamped, f"the restart must be stamped: {stamped}")
+
+                box2.pool([("r-2", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                converge(box2, want=0)  # SERVING — recovery, nothing to repair
+                pruned = json.loads(ra.restart_history_path().read_text(encoding="utf-8"))
+                check(
+                    "r-2" not in pruned,
+                    "a recovered runner's stamp must be dropped on the pass that sees it recover, "
+                    f"or its NEXT death is held for the cooldown: {pruned}",
+                )
+
+                box2.pool([("r-2", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                record2 = converge(box2, want=0)  # a genuine new death
+                restarts = [c for c in box2.calls("systemctl-calls.log") if c.startswith("restart ")]
+                check(
+                    len(restarts) == 2,
+                    f"a genuine death after a recovery must be repaired, got {restarts} and "
+                    f"holds={record2['restart_holds']}",
+                )
+            finally:
+                box2.destroy()
+        finally:
+            box.destroy()
+
+
+@test("T70 #4153 an UNREADABLE read before the restart holds the runner, and REDDENS the pass")
+def t70_unreadable_pre_restart_read_is_fail_closed():
+    """The per-runner fresh read that justifies a restart has its own fail-closed arm (agent-infra#4153
+    review round 2, non-blocking → pinned here): an unreadable read is NOT permission, nothing is
+    restarted, and the pass cannot report `converged` over a DEAD slot it never repaired. Without
+    this case, a refactor folding that arm into `serving_now = False` would restart on an unreadable
+    read with every other case and mutation still green."""
+    with Env():
+        box = Box("4153-prerestart-unread")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            # classification ok → confirmation ok → the PRE-RESTART read is the one that fails.
+            box.pool_seq(["ok", "ok", "err:dial tcp 10.0.0.1:443: i/o timeout"])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "an unreadable pre-restart read must not restart anything — the runner may be "
+                "serving the job the restart would kill",
+            )
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                "…and it must not be re-registered either",
+            )
+            check(
+                "r-dead" in record["restart_holds"],
+                f"the hold must be published: {record.get('restart_holds')}",
+            )
+            check(
+                any("pre-restart read failed" in p and "i/o timeout" in p for p in record["problems"]),
+                f"the failure must carry gh's own words: {record['problems']}",
+            )
+            check(
+                record["verdict"] != "converged",
+                f"a DEAD runner nothing could confirm is not `converged`: {record['verdict']}",
             )
         finally:
             box.destroy()
