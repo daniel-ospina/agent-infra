@@ -1683,10 +1683,25 @@ def read_restart_history() -> tuple[dict[str, float], str]:
     out: dict[str, float] = {}
     dropped: list[str] = []
     for name, stamp in raw.items():
-        if isinstance(name, str) and isinstance(stamp, (int, float)) and math.isfinite(stamp):
+        # ⛔ THE TYPE FILTER MUST BE TOTAL (round-3 review finding P2, reproduced). `math.isfinite`
+        # converts an int to a float, so a JSON integer too large to be one — `10**400` — raises
+        # `OverflowError`, which is NEITHER `OSError` nor `ValueError` and therefore escaped this
+        # function's handler, escaped `converge`, and exited the pass **2/unmeasurable with zero
+        # restarts**, every tick, until a human deleted the file. That is the exact failure this
+        # docstring promises cannot happen (a broken state dir must remove the COOLDOWN, never the
+        # repair), one value over from the shape the round-2 fix closed.
+        usable = isinstance(name, str) and isinstance(stamp, (int, float))
+        if usable:
+            try:
+                usable = math.isfinite(stamp)
+            except (OverflowError, TypeError):
+                usable = False
+        if usable:
             out[name] = float(stamp)
         else:
-            dropped.append(f"{name!r}={stamp!r}")
+            # The repr is CAPPED: a 400-digit int in a note is unreadable, and the point is to name
+            # the entry, not to paste it into the journal.
+            dropped.append(f"{name!r}={repr(stamp)[:24]}")
     if dropped:
         # ⛔ A VALID-JSON FILE WITH AN UNUSABLE ENTRY IS THE SAME SILENT HOLE ONE SHAPE OVER (round-2
         # review, non-blocking → fixed here because the cost is a sentence): `{"r-dead": "x"}` parses

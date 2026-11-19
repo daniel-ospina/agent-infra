@@ -6027,8 +6027,17 @@ MUTATIONS = [
     ),
     Mutation(
         "T69",
-        "            out[name] = float(stamp)\n        else:\n            dropped.append(f\"{name!r}={stamp!r}\")",
-        "            out[name] = float(stamp)\n        else:\n            pass  # MUTATION: an unusable entry is silently dropped",
+        "            except (OverflowError, TypeError):\n                usable = False",
+        "            except ZeroDivisionError:  # MUTATION: an unrepresentable stamp escapes the pass\n                usable = False",
+        "a JSON integer too large to be a float (`10**400`) raises `OverflowError` out of "
+        "`read_restart_history`, which is neither `OSError` nor `ValueError`, so it escapes the pass: "
+        "exit 2, `verdict=unmeasurable`, and ZERO repairs on every tick until a human deletes the file "
+        "— the opposite of the contract that a broken state dir removes only the cooldown",
+    ),
+    Mutation(
+        "T69",
+        "            dropped.append(f\"{name!r}={repr(stamp)[:24]}\")",
+        "            pass  # MUTATION: an unusable entry is silently dropped",
         "a history entry of the wrong TYPE parses as valid JSON, so it reads as \"this runner has no "
         "stamp\" and the cooldown quietly stops applying to THAT runner — the same silent hole the "
         "corrupt-file fix closed, one shape over, with no note in the record",
@@ -6530,6 +6539,27 @@ def t69_history_is_reported_and_pruned():
             check(
                 any("unusable entr" in n for n in record["notes"]),
                 f"a history entry of the wrong TYPE must be reported too: {record['notes']}",
+            )
+
+            # (a3) …AND AN INT TOO LARGE TO BE A FLOAT (round-3 review finding P2, reproduced):
+            # `math.isfinite(10**400)` raises `OverflowError`, which is neither `OSError` nor
+            # `ValueError`, so the naive filter let it ESCAPE the pass — `rc=2`, `verdict=unmeasurable`,
+            # and ZERO restarts on every tick until a human deleted the file. A broken state dir must
+            # remove the cooldown, never the repair.
+            before_restarts = len(
+                [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            )
+            hist.write_text(json.dumps({"r-dead": 10**400}), encoding="utf-8")
+            record = converge(box, want=0)
+            check(
+                any("unusable entr" in n for n in record["notes"]),
+                f"an unrepresentable stamp must be REPORTED, not raise: {record['notes']}",
+            )
+            check(record["verdict"] != "unmeasurable", f"…and must not kill the pass: {record}")
+            check(
+                len([c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")])
+                == before_restarts + 1,
+                "…and the runner must still be REPAIRED (the cooldown is what is lost, not the pass)",
             )
 
             # (b) PASS 1 restarts and stamps; PASS 2 sees the runner SERVING; PASS 3 is a GENUINE new
