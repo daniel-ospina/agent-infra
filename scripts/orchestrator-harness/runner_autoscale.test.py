@@ -119,9 +119,11 @@ below grows with the suite, so this header never claims a case that does not exi
      a negative, `nan`, `inf`, an out-of-range value and garbage all fall back to the default and say
      so (a PR that relaxes the bound keeps every other case green while switching the reconnect
      window off). T69 — the cooldown's own state file: an unreadable/corrupt history is REPORTED (it
-     used to return `{}` silently while the docstring claimed the caller said something), and a
-     recovered runner's stamp is pruned on the pass that sees it recover, so its NEXT death is not
-     held on a restart from an hour earlier.
+     used to return `{}` silently while the docstring claimed the caller said something), an entry of
+     the wrong TYPE is reported too (valid JSON reads as "no stamp" otherwise), and a recovered
+     runner's stamp is pruned on the pass that sees it recover, so its NEXT death is not held on a
+     restart from an hour earlier. T70 — the per-runner read that justifies the restart has its own
+     fail-closed arm: unreadable ⇒ nothing restarted, the hold is published, and the pass is RED.
 
 ⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
 and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
@@ -6015,6 +6017,22 @@ MUTATIONS = [
         "of the cooldown — a genuinely dead slot left unrepaired while the published reason asserts "
         "\"one offline read after OUR OWN restart is not a new death\" about a restart from an hour ago",
     ),
+    Mutation(
+        "T70",
+        "            except Unmeasurable as exc:\n                # ⛔ AN UNREADABLE READ IS NOT PERMISSION.",
+        "            except ZeroDivisionError as exc:  # MUTATION: an unreadable read escapes the pass\n                # ⛔ AN UNREADABLE READ IS NOT PERMISSION.",
+        "the pre-restart read's own fail-closed arm is unreachable, so an `Unmeasurable` from it "
+        "propagates out of `converge` instead of holding the runner: the record loses `actions` and "
+        "`restart_holds` for a pass that may already have restarted a runner earlier in the loop",
+    ),
+    Mutation(
+        "T69",
+        "            out[name] = float(stamp)\n        else:\n            dropped.append(f\"{name!r}={stamp!r}\")",
+        "            out[name] = float(stamp)\n        else:\n            pass  # MUTATION: an unusable entry is silently dropped",
+        "a history entry of the wrong TYPE parses as valid JSON, so it reads as \"this runner has no "
+        "stamp\" and the cooldown quietly stops applying to THAT runner — the same silent hole the "
+        "corrupt-file fix closed, one shape over, with no note in the record",
+    ),
     # ── agent-infra#4153: the restart loop, one mutation per guard (each MUST turn its case red) ──
     Mutation(
         "T63",
@@ -6505,6 +6523,15 @@ def t69_history_is_reported_and_pruned():
                 "a corrupt history removes the COOLDOWN only — the runner is still repaired",
             )
 
+            # (a2) VALID JSON with an UNUSABLE ENTRY is the same silent hole one shape over: it parses,
+            # so it reads as "this runner has no stamp" and the cooldown quietly stops applying to it.
+            hist.write_text(json.dumps({"r-dead": "not-a-timestamp"}), encoding="utf-8")
+            record = converge(box, want=0)
+            check(
+                any("unusable entr" in n for n in record["notes"]),
+                f"a history entry of the wrong TYPE must be reported too: {record['notes']}",
+            )
+
             # (b) PASS 1 restarts and stamps; PASS 2 sees the runner SERVING; PASS 3 is a GENUINE new
             # death, which must be repaired — not held on a stamp from the earlier life.
             box2 = Box("4153-history-prune")
@@ -6535,6 +6562,48 @@ def t69_history_is_reported_and_pruned():
                 )
             finally:
                 box2.destroy()
+        finally:
+            box.destroy()
+
+
+@test("T70 #4153 an UNREADABLE read before the restart holds the runner, and REDDENS the pass")
+def t70_unreadable_pre_restart_read_is_fail_closed():
+    """The per-runner fresh read that justifies a restart has its own fail-closed arm (agent-infra#4153
+    review round 2, non-blocking → pinned here): an unreadable read is NOT permission, nothing is
+    restarted, and the pass cannot report `converged` over a DEAD slot it never repaired. Without
+    this case, a refactor folding that arm into `serving_now = False` would restart on an unreadable
+    read with every other case and mutation still green."""
+    with Env():
+        box = Box("4153-prerestart-unread")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            # classification ok → confirmation ok → the PRE-RESTART read is the one that fails.
+            box.pool_seq(["ok", "ok", "err:dial tcp 10.0.0.1:443: i/o timeout"])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "an unreadable pre-restart read must not restart anything — the runner may be "
+                "serving the job the restart would kill",
+            )
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                "…and it must not be re-registered either",
+            )
+            check(
+                "r-dead" in record["restart_holds"],
+                f"the hold must be published: {record.get('restart_holds')}",
+            )
+            check(
+                any("pre-restart read failed" in p and "i/o timeout" in p for p in record["problems"]),
+                f"the failure must carry gh's own words: {record['problems']}",
+            )
+            check(
+                record["verdict"] != "converged",
+                f"a DEAD runner nothing could confirm is not `converged`: {record['verdict']}",
+            )
         finally:
             box.destroy()
 

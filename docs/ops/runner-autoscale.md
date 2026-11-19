@@ -121,7 +121,9 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
 
 A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
 which guard held it. The distinction matters — the guard exists so that a **job survives**, and a
-red pass over a runner the pool says is fine would be the alarm crying wolf.
+red pass over a runner the pool says is fine would be the alarm crying wolf. **One hold is not
+benign**: an UNREADABLE read before a restart holds the runner AND lands in `problems`, because a
+DEAD slot that pass could not repair must not report `converged`.
 
 ## DISARMED by default — arming is a dated owner step
 

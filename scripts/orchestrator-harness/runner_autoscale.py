@@ -1681,9 +1681,22 @@ def read_restart_history() -> tuple[dict[str, float], str]:
             "COOLDOWN is not in force this pass (the two-sample DEAD confirmation still is)"
         )
     out: dict[str, float] = {}
+    dropped: list[str] = []
     for name, stamp in raw.items():
         if isinstance(name, str) and isinstance(stamp, (int, float)) and math.isfinite(stamp):
             out[name] = float(stamp)
+        else:
+            dropped.append(f"{name!r}={stamp!r}")
+    if dropped:
+        # ⛔ A VALID-JSON FILE WITH AN UNUSABLE ENTRY IS THE SAME SILENT HOLE ONE SHAPE OVER (round-2
+        # review, non-blocking → fixed here because the cost is a sentence): `{"r-dead": "x"}` parses
+        # fine, so the file reads as "this runner has no stamp" and the cooldown quietly stops applying
+        # to it. The rest of the file is still honoured — one bad entry must not discard the others.
+        return out, (
+            f"the restart history at {path} carries {len(dropped)} unusable entr(y/ies) "
+            f"({', '.join(dropped[:3])}{'…' if len(dropped) > 3 else ''}) — those runners' restart "
+            "COOLDOWN is not in force this pass (the two-sample DEAD confirmation still is)"
+        )
     return out, ""
 
 
