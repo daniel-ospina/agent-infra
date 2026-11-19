@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13819-1795111532-p3610453-3c36f224",
+  "_sha": "c07f01b054a8e91edd5b00969f2d3953f8e01c94",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13819.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13674-warmup-budget"
+    },
+    {
+      "kind": "sha",
+      "value": "0096e8c59e22a3939d2b119f479514d82c7d3707"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-13819"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 4898,
+  "ended_at": 1795116430,
+  "exit_code": 0,
+  "heartbeat_at": 1795116430,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13819-1795111532-p3610453-3c36f224",
+  "lease_until": 1795153030,
+  "pid": 3610453,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795111532,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13819",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-13819"
+}
