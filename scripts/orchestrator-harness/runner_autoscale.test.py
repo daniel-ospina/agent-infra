@@ -6666,13 +6666,27 @@ def t71_doc_cites_the_shipped_unit_timeout():
     service = next(body for name, body in rendered.items() if name.endswith(".service"))
     rendered_bound = re.search(r"^TimeoutStartSec=(\d+)$", service, re.MULTILINE)
     check(rendered_bound is not None, "the render must carry its own bound")
-    cited = re.findall(r"TimeoutStartSec=(\d+)", doc)
+    # ⛔ A PASSAGE THAT NAMES ANOTHER UNIT IS OUT OF THIS CASE'S SCOPE, DELIBERATELY (#4153 review
+    # round 6, finding 3). The confusion this case documents is best EXPLAINED by naming the unit the
+    # 900 actually belongs to, and pinning every mention to 5400 would then report a *correct* doc as
+    # a defect — the same failure class (a claim no artifact backs) with the sign flipped. So the
+    # contract is: a citation that does NOT name another unit must equal this unit's shipped bound;
+    # one that does is left to a human reader. `scripts/install-lane-arm-timer.sh` is named as the
+    # other carrier so the reason a mention may legitimately differ is recorded here, not guessed.
+    other_unit = ("eldato-lane-arm", "install-lane-arm-timer.sh")
+    mentions = [(m.group(1), m.start()) for m in re.finditer(r"TimeoutStartSec=(\d+)", doc)]
     check(
-        cited,
+        mentions,
         "the doc must name the bound concretely (`TimeoutStartSec=<N>`) so this case can read it — a "
         "prose '5400 s' is exactly what let the wrong number survive",
     )
-    for value in cited:
+    for value, at in mentions:
+        # Blank lines delimit the passage this citation lives in, which is the unit of a doc claim.
+        start = doc.rfind("\n\n", 0, at)
+        end = doc.find("\n\n", at)
+        passage = doc[start if start >= 0 else 0 : end if end >= 0 else len(doc)]
+        if any(marker in passage for marker in other_unit):
+            continue
         check(
             value == shipped.group(1) == rendered_bound.group(1),
             f"the doc cites TimeoutStartSec={value}, but the artifacts ship {shipped.group(1)} "
