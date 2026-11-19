@@ -79,6 +79,20 @@ O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
 # still a comparison, still a refusal path (driven in spawn-gate.test.sh §12, which owns the floor's
 # arithmetic and asserts the shipped default under `env -u`).
 export MEM_MIN_AVAIL_MB=1
+# ⛔ THE BOX'S CREDENTIALS FILE'S NEUTRALISER (the third member of this family, agent-infra#4153).
+# `lane.sh` dots `lane-env.sh`, which dots `${ENV_FILE:-$HOME/keys.env}` under `set -a` — so a box file
+# carrying `export MAX_LOAD=20` (this fleet's own "CAPACITY CEILING = 2.5 x cores" line) REPLACES the
+# ceiling an arm states on the command line. §1 states `MAX_LOAD=0` to drive the LOAD gate; the file
+# won, the gate admitted the spawn with the box's 20, and the arm reached the CREATION gate instead —
+# measured on a box with that keys.env: rc=74 and `gate=land`, so §1's three checks reddened and the
+# suite reported a capacity-transfer regression that is not one.
+# ⛔ THE PRECEDENCE IS DELIBERATE AND IS NOT WHAT THIS FIXES (lane-env.sh's PRECEDENCE paragraph: "the
+# file wins, exactly as on the controller path"). A fixture must therefore declare that its arms run
+# with no box file — through the seam the cell supervisor itself uses (`${ENV_FILE:-$CELL_HOME/keys.env}`)
+# — rather than assert a ceiling the ambient box is entitled to override. Pointing it at a path that
+# does not exist takes lane-env.sh's "no readable … relying on the inherited environment" branch, which
+# is the honest description of a fixture whose `pi` is stubbed and whose key gate is off by argv.
+export ENV_FILE="$TMP/no-such-keys-env"
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
