@@ -120,10 +120,15 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
   load, so that window usually expires. Expiry is not a verdict: immediately before the destructive
   step the pass re-reads the pool and the local listener, and a runner that is alive, BUSY or ONLINE
   is held with a note instead of being `--replace`d. What stops the loop is the **cooldown**, one pass
-  later — a runner this tool restarted is not restarted again inside it. The unit's
+  later — a runner this tool restarted is not restarted again inside it; the unit's
   `TimeoutStartSec=5400` (`templates/systemd/eldato-runner-autoscale.service`, the same value
-  `--install-unit` renders) is **not** the binding constraint and must not be cited as one: that
-  template's own comment carries the worst-case sum the bound was sized against.
+  `--install-unit` renders) is not what stops it. But that bound is not decorative either, and this is
+  the only place it can be said: the pass's OTHER bounds already account for ≈3540 s of the 5400
+  (provisioner 1800, `config.sh` 600 × 2, `svc.sh`/`enable` 180 × 2, a restart 180 — the arithmetic
+  `T47` pins, and the template's own comment derives), so a raise has ≈1860 s left to share across the
+  `wait_online` window of every runner restarted in one pass. Four runners at a 465 s wait is the
+  ceiling; past it systemd SIGTERMs a pass mid-`register()` and the install is left without its
+  `.runner` or key. Size a raise against that sum, not against the bound alone.
 
 A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
 which guard held it. The distinction matters — the guard exists so that a **job survives**, and a

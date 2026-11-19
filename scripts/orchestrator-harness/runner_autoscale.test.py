@@ -6685,10 +6685,17 @@ def t71_doc_cites_the_shipped_unit_timeout():
         # finding 1). A tight Markdown list has NO blank lines between its items, so a `\n\n` slice
         # here spanned four independent bullets: an unrelated mention of `eldato-lane-arm` in bullet
         # 1 would exempt a WRONG number in bullet 4 — measured, GREEN, on exactly the edit most
-        # likely to be made. The slice therefore starts at the later of the blank line and the last
-        # list-item marker (`\n* `), and ends at the first of the next one and the next blank line.
-        start = max(doc.rfind("\n\n", 0, at), doc.rfind("\n* ", 0, at))
-        stops = [i for i in (doc.find("\n* ", at), doc.find("\n\n", at)) if i >= 0]
+        # likely to be made.
+        # ⛔ AND EVERY LIST FORM COUNTS, NOT JUST `*` (round-3 review, finding 2): this doc already
+        # carries a numbered list, and a `-`-bulleted one renders identically for a reader, so an
+        # item boundary derived from `\n* ` alone left both forms exempting a wrong number — measured,
+        # GREEN. `LIST_MARKER` is the whole family (`,`, `-`, `+`, `1.`, `1)`).
+        LIST_MARKER = re.compile(r"\n(?:[*+-] |\d+[.)] )")
+        marker_before = [m.start() for m in LIST_MARKER.finditer(doc, 0, at)]
+        start = max(doc.rfind("\n\n", 0, at), marker_before[-1] if marker_before else -1)
+        marker_after = LIST_MARKER.search(doc, at)
+        blank_after = doc.find("\n\n", at)
+        stops = [i for i in (marker_after.start() if marker_after else -1, blank_after) if i >= 0]
         end = min(stops) if stops else len(doc)
         item = doc[start if start >= 0 else 0 : end]
         if any(marker in item for marker in other_unit):
