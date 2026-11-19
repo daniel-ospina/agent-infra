@@ -6689,7 +6689,7 @@ def t71_doc_cites_the_shipped_unit_timeout():
         # ⛔ AND EVERY LIST FORM COUNTS, NOT JUST `*` (round-3 review, finding 2): this doc already
         # carries a numbered list, and a `-`-bulleted one renders identically for a reader, so an
         # item boundary derived from `\n* ` alone left both forms exempting a wrong number — measured,
-        # GREEN. `LIST_MARKER` is the whole family (`,`, `-`, `+`, `1.`, `1)`).
+        # GREEN. `LIST_MARKER` is the whole family (`*`, `-`, `+`, `1.`, `1)`).
         LIST_MARKER = re.compile(r"\n(?:[*+-] |\d+[.)] )")
         marker_before = [m.start() for m in LIST_MARKER.finditer(doc, 0, at)]
         start = max(doc.rfind("\n\n", 0, at), marker_before[-1] if marker_before else -1)
