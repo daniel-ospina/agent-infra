@@ -15131,6 +15131,12 @@ rm -f "$(Q2 425505)"
 ci_record "$RECORD" 425505 "$CI_C5" "$CI_C6"
 [ "$RECORD_RC" = "3" ] && ok "21.5 a .ts comment-only delta REFUSES (no confident normaliser ⇒ fail closed)" || bad "21.5 a .ts comment-only delta (rc=$RECORD_RC, want 3)"
 [ ! -f "$(Q2 425505)" ] && ok "21.5 no record written for the un-normalisable delta" || bad "21.5 a record was written over an un-normalisable delta"
+# ⛔ AND THE REFUSAL IS DIAGNOSABLE (review of this change): the helper names WHY it
+# refused, and that reason must reach the recorder's stderr. Swallowing it is how a
+# laner is told "the head moved, review again" with no way to tell a too-narrow
+# stripper from a real code change — the cost #4105 exists to remove.
+assert_contains "$RECORD_ERR" "code-identity: no confident normaliser" \
+    "21.5b the arm's refusal reaches stderr: the lane is told WHICH file could not be normalised, and why"
 
 # 21.6 MUTATION PIN — the normalisation itself is load-bearing. A copy that
 #      compares the RAW blobs (what the recorder did before this change) must

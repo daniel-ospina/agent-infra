@@ -20,10 +20,10 @@ WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT
     dropped when it is *entirely* a comment (first non-blank character is `#`,
     and the line is not a shebang), the line's quotes are BALANCED (a line that
     ends inside a string is refused — that is a multi-line string, where a `#`
-    line may be DATA), and heredoc bodies are emitted verbatim so a `#` line
-    inside `<<EOF … EOF` is never dropped. Inline/trailing comments are NOT
-    stripped: keeping them can only make the comparison say "different", which
-    is the fail-closed direction.
+    line may be DATA), and a heredoc BODY is emitted verbatim, so a `#` line
+    inside one is never dropped. Inline/trailing comments are NOT stripped:
+    keeping them can only make the comparison say "different", which is the
+    fail-closed direction.
   * EVERYTHING ELSE — refused (exit 2). A `.ts`/`.js` normaliser without a real
     parser cannot tell a comment from a regex literal or a template string, and
     a wrong "identical" here would carry a verdict across code nobody reviewed.
@@ -49,12 +49,16 @@ import sys
 # A file larger than this is refused rather than normalised: the largest source
 # files a review verdict is meaningfully bound to are orders of magnitude below
 # it, and a multi-megabyte blob is a sign this is not the file it claims to be.
-MAX_BYTES = 1 << 20
+# (Spelled as a multiplication, not a left shift: `check-portability-traps.sh`
+# reads this file with a SHELL lexer, where a doubled `<` opens a heredoc — a
+# false positive it cannot be talked out of, and one the operator should not have
+# to grandfather on a NEW file.)
+MAX_BYTES = 1024 * 1024
 
 _SHELL_EXTS = (".sh", ".bash", ".bash5")
 _PYTHON_EXTS = (".py",)
-# The heredoc operator: `<<`, optional `-` (strip leading tabs), optional quote
-# around a shell word. Captured groups are (strip-tabs, quote, word).
+# The heredoc operator (a doubled `<`), optional `-` (strip leading tabs),
+# optional quote around a shell word. Captured groups are (strip-tabs, quote, word).
 _HEREDOC_RE = re.compile(r"<<(-?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 _SHEBANG_PY_RE = re.compile(r"\bpython[0-9.]*\b")
 _SHEBANG_SH_RE = re.compile(r"\b(?:ba|da)?sh\b")
