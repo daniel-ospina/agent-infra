@@ -1,0 +1,30 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1795095212-p1019042-6659273e",
+  "_sha": "f1170cc8c57d4d68918950e9fc4f18ab00043325",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.Asr9tIRU2b/fix.log"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 52,
+  "ended_at": 1795095264,
+  "exit_code": 0,
+  "heartbeat_at": 1795095264,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1795095212-p1019042-6659273e",
+  "lease_until": 1795095869,
+  "pid": 1019042,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1795095212,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/tmp/ct-main"
+}
