@@ -655,6 +655,33 @@ def main() -> int:
           "C7 MARKERS: the superseded single-attempt `Hosted capture FAILED (` shape is GONE from "
           "the emitter, so the live allow-list carries no shape the extension no longer writes")
 
+    # ── Arm 3: the RETIRED shape is still recognised, and still cannot be re-emitted ──
+    # Note 4 of the review at 31e29ed50: the pre-#4108 line was DROPPED from the allow-list rather than
+    # kept as a dead prefix. The extension reaches a box through a SYNC step that is not atomic with
+    # this tool's rollout, so in the window between them the INSTALLED copy still prints the old line.
+    # Recognising a shape the emitter no longer writes costs one tuple entry; NOT recognising it costs
+    # the lane its `hook-failed` verdict silently (`absent` — fail-closed, but it drops the lane out of
+    # the `marker in ("ok", "hook-failed")` re-verify set) on the ONE channel a `--no-session` lane
+    # has. This arm drives the REAL classifier over the real pre-fix line, so it reddens on any tool
+    # whose lookup stops consulting the retired set (mutation 13 proves the teeth).
+    retired_line = ("[reflect-hook] Hosted capture FAILED (HTTP 429) — a manual-recovery JSONL "
+                    "record was kept at /tmp/pdne-retired.jsonl")
+    rpath = os.path.join(root, "logs", "marker-retired.log")
+    with open(rpath, "w", encoding="utf-8") as fh:
+        fh.write("the lane's report\n" + retired_line + "\n")
+    rkind, rdetail = tool.log_marker(rpath, 1)
+    check(rkind == "hook-failed",
+          "C7 MARKERS: the RETIRED pre-#4108 `Hosted capture FAILED (` shape still classifies as "
+          "`hook-failed` — an installed copy can still print it during a sync window, and `absent` "
+          "would drop the lane out of the re-verify set (got %r: %r)" % (rkind, rdetail))
+    for entry in tool.RETIRED_COMPLETION_FAILED:
+        check(entry not in emitter,
+              "C7 MARKERS: retired allow-list entry %r is ABSENT from extensions/reflect-hook.ts — a "
+              "retired shape the emitter grows BACK must fail here instead of silently becoming live "
+              "again" % entry)
+    check(len(tool.RETIRED_COMPLETION_FAILED) >= 1,
+          "C7 MARKERS: the retired set is non-empty, so the loop above is not vacuously true")
+
     cleanup()                     # kills the groups AND removes the root
     print("\nALL ASSERTIONS HELD (18 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
@@ -726,6 +753,12 @@ def run_mutations() -> int:
          '    "[reflect-hook] Hosted capture REFUSED — ",\n'
          '    "[reflect-hook] Hosted capture DEFERRED (",\n',
          ""),
+        # Note 4 of the review at 31e29ed50: the RETIRED pre-#4108 shape stays on the lookup so a box
+        # mid-sync keeps its `hook-failed` verdict. Stop consulting the retired set and arm 3 must go
+        # RED — otherwise that arm is a prose claim, not a control.
+        ("the retired pre-#4108 `Hosted capture FAILED (` prefix dropped from the lookup",
+         "    if any(last.startswith(f) for f in COMPLETION_FAILED + RETIRED_COMPLETION_FAILED):",
+         "    if any(last.startswith(f) for f in COMPLETION_FAILED):"),
     ]
     def one(label_old_new):
         label, old, new = label_old_new

@@ -309,11 +309,18 @@ const RETRY_LOG_PATH = join(homedir(), ".tortoise", "capture-retry.log");
 const RETRY_LOG_MAX_BYTES = 1_048_576;
 /**
  * Age at which a STAGED request body is treated as an orphan and removed. A live
- * worker holds its staged body for at most `RETRY_MAX_ATTEMPTS` waits (≈210 s at
- * the defaults), deletes it on every one of its own exits (`LANDED`, `TERMINAL`,
- * `EXHAUSTED`, `ABORTED`) — so anything this old belongs to a worker that was
- * killed mid-wait (reboot, SIGKILL, OOM) and would otherwise retain a full
- * transcript in `~/.tortoise/capture-retry/` forever.
+ * worker holds its staged body across at most `RETRY_MAX_ATTEMPTS - 1` = 3 waits,
+ * each clamped INDEPENDENTLY to `RETRY_MAX_WAIT_MS`, so the bound is 3 × 120 s =
+ * **≤360 s** (the backoff path alone sums to 30+60+120 = 210 s — that figure is the
+ * no-advertised-delay case, NOT the policy bound; a server advertising
+ * `Retry-After: 120` on every refusal reaches the full 360 s). It deletes the body on
+ * every one of its own exits (`LANDED`, `TERMINAL`, `EXHAUSTED`, `ABORTED`) — so
+ * anything this old belongs to a worker that was killed mid-wait (reboot, SIGKILL,
+ * OOM) and would otherwise retain a full transcript in
+ * `~/.tortoise/capture-retry/` forever.
+ *
+ * The gap is deliberate and harmless: the 6 h bound is 60× the 360 s worst case,
+ * so no live retry can ever be swept.
  */
 const RETRY_STAGED_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 

@@ -74,7 +74,8 @@ THE EVIDENCE, AND WHAT EACH CHANNEL CANNOT SEE
          replaced `Hosted capture FAILED (…)`) and `Attribution resolution failed` — so the rule is
          a POSITIVE ALLOW-LIST of exact prefixes: a line counts as a completion only when it
          `startswith` one of `COMPLETION_OK`, and as a hook failure only when it `startswith` one of
-         `COMPLETION_FAILED`. The match is CASE-SENSITIVE and there is no `failed|error` regex — the
+         `COMPLETION_FAILED` or of `RETIRED_COMPLETION_FAILED` (shapes the emitter has stopped
+         writing but an installed copy can still print during a sync window — see the tuple). The match is CASE-SENSITIVE and there is no `failed|error` regex — the
          STARTUP line shares the `[reflect-hook]` prefix, so a keyword search called startup a
          completion (cycle 2, P1), and on a `--no-session` lane the log channel is the only one.
          A shape the list does not carry reads `absent`, which authorises nothing.
@@ -169,6 +170,21 @@ COMPLETION_FAILED = (            # the same extension's failure/deferral shapes
     "[reflect-hook] Hosted capture REFUSED — ",
     "[reflect-hook] Hosted capture DEFERRED (",
     "[reflect-hook] Attribution resolution failed",
+)
+# ⛔ RETIRED FROM THE EMITTER, DELIBERATELY STILL RECOGNISED. `extensions/reflect-hook.ts` at this
+# head writes the two #4108 shapes and NOT this one — but the extension reaches a box by a SYNC step
+# that is not atomic with this tool's rollout (`pi-bootstrap`/`cell-install` copy the tree), so in the
+# window between them the INSTALLED copy still prints the pre-#4108 line. Two different clocks
+# produce two live shapes, which is why the accepted practice for a renamed log field is a dual-read
+# grace window longer than the deploy lag rather than a same-commit swap.
+# ⛔ WHAT DROPPING IT COSTS (measured by the review at 31e29ed50): that line then reads `absent` —
+# fail-closed, so it authorises nothing, but the lane silently drops OUT of the
+# `marker in ("ok", "hook-failed")` re-verify set and stops being reapable, on the one channel a
+# `--no-session` lane has. Keeping it costs a tuple entry the emitter no longer writes.
+# ⛔ It CANNOT rot into a live shape: the C7 control pins every entry here ABSENT from the emitter, so
+# a future emitter that grows this prefix back fails HERE instead of silently re-enabling it.
+RETIRED_COMPLETION_FAILED = (
+    "[reflect-hook] Hosted capture FAILED (",
 )
 STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
 # ⛔ PRINT MODE, read from the LAUNCHER's CODE. An interactive `pi` waiting at a human's prompt also
@@ -483,7 +499,7 @@ def log_marker(log: Optional[str], holders: int) -> Tuple[str, str]:
     last = lines[-1]
     if last.startswith(STARTUP):
         return "startup", "the last line is the STARTUP capture status, not a completion: %s" % last[:120]
-    if any(last.startswith(f) for f in COMPLETION_FAILED):
+    if any(last.startswith(f) for f in COMPLETION_FAILED + RETIRED_COMPLETION_FAILED):
         return "hook-failed", last[:160]
     if any(last.startswith(c) for c in COMPLETION_OK):
         return "ok", last[:160]
