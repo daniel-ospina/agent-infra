@@ -6638,17 +6638,18 @@ def t70_unreadable_pre_restart_read_is_fail_closed():
             box.destroy()
 
 
-@test("T71 #4153 the doc's cited TimeoutStartSec is the one the repo SHIPS — 900 belonged to no artifact")
+@test("T71 #4153 the doc's cited TimeoutStartSec is the one THIS unit SHIPS — 900 is the lane-arm timer's")
 def t71_doc_cites_the_shipped_unit_timeout():
     """The operator doc is the only place a reader learns WHY `ONLINE_WAIT_S` stays at 60 s, and it
-    argued that raising it "would exceed the unit's `TimeoutStartSec=900`" — a number the repo does
-    not ship (agent-infra#4153 review round 5, finding 1). Both artifacts that DO carry the bound say
-    5400, and four runners × a 420 s wait is 1680 s, so the cited reason reproduced as FALSE on the
-    first check while the decision it justified was sound. `grep TimeoutStartSec templates/` returns
-    5400 and nothing else, so a reader following the doc learns a bound that exists nowhere — and a
-    future pass sized against 900 would be short of the unit's real worst case.
+    argued that raising it "would exceed the unit's `TimeoutStartSec=900`" — a bound that belongs to
+    a DIFFERENT service (agent-infra#4153 review round 5, finding 1): the autoscaler's own two
+    carriers both say 5400, and the 900 in the tree is
+    `scripts/install-lane-arm-timer.sh:172`'s `eldato-lane-arm` unit. So the doc quoted the wrong
+    timer's bound, and the arithmetic it rested on (four runners x a 420 s wait = 1680 s) never
+    exceeded it: the only in-repo reason recorded for the decision read as false on the first check
+    while the decision itself was sound.
 
-    The claim is pinned against BOTH carriers of the number (the shipped template and the
+    The claim is pinned against BOTH carriers of THIS unit's number (the shipped template and the
     `--install-unit` render), so this also catches a render that drifts from the file the installer
     renders. Proven non-vacuous on the pre-fix doc: it cited 900 against a shipped 5400."""
     root = Path(__file__).resolve().parents[2]
