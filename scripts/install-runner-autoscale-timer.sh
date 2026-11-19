@@ -151,6 +151,37 @@ if [ -z "${LAUNCHD_TEMPLATES_DIR:-}" ]; then
     done
 fi
 LAUNCHD_TEMPLATES_DIR="${LAUNCHD_TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd/runner-autoscale}"
+# ⛔ THE DECLARATION CENSUS'S ONE JUDGE (agent-infra#4002; fresh review of PR #4020 at `4f9ff9b3e`, P2).
+# A unit that sets a gate-bypass flag in its `Environment=` hands that hatch to EVERY process the job ever
+# spawns, and a spawned lane cannot un-inherit it. This installer composes a WHOLE `Environment=` line at
+# render time from `provisioner_env_for()` (`Environment="RUNNER_AUTOSCALE_PROVISIONER=…"`, substituted
+# into `{{PROVISIONER_ENV}}`), and the shipped templates carry only the placeholder — so the template
+# census sees no `Environment=` line at all, and until this call existed those bytes were graded by nothing
+# and refused by nothing. It is one of the THREE inline generators; its siblings ask this same judge
+# (`install-conflict-rebase-timer.sh` `vet_unit`, `install-drainer-timer.sh` `vet_unit`), and the family's
+# claim ("a declaration that is GENERATED INLINE is graded like any other") is only true when all three do.
+# `gate-policy.sh` owns the flag list, so this installer asks it rather than keeping a second copy that
+# drifts. Resolved from the SAME roots the templates come from, which is what makes a missing judge
+# impossible on a box that can install: the template tree this installer renders from is a checkout, and a
+# checkout carries `scripts/orchestrator-harness/gate-policy.sh`. The template-root derivation is the
+# load-bearing one — it ties the judge to the exact tree that supplied `TEMPLATES_DIR`, not to
+# `dirname $0` (which on a FARMED copy is `~/.pi/agent/scripts`, where no such sibling exists).
+GP_GUARD="${GP_GUARD:-}"
+if [ -z "$GP_GUARD" ]; then
+    # The template-root derivation comes FIRST and is the one that binds. The two flat candidates after it
+    # are the farmed/deployed shapes a box that renders from a tree WITHOUT the judge would still have
+    # (`install.sh`/`cloud-cell-supervisor.sh` seed `gate-policy.sh` FLAT into `$O`, and the drainer's own
+    # resolver names `~/.pi/agent/scripts/`). They can only ever be reached when the derivation failed, so
+    # they cannot override the tree that supplied the templates — and a stale copy that answers rc 64 still
+    # REFUSES (see `vet_unit`), so a fallback cannot become a silent pass.
+    for _root in "$(dirname "$(dirname "$TEMPLATES_DIR")")" "$INFRA_ROOT" "${AGENT_INFRA_PATH:-}" "${O:-${HOME:-}/orchestrator}" "${HOME:-}/.pi/agent"; do
+        [ -n "$_root" ] || continue
+        _judge="$_root/scripts/orchestrator-harness/gate-policy.sh"
+        [ -f "$_judge" ] || _judge="$_root/gate-policy.sh"
+        [ -f "$_judge" ] || _judge="$_root/scripts/gate-policy.sh"
+        [ -f "$_judge" ] && { GP_GUARD="$_judge"; break; }
+    done
+fi
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
 UNIT_NAME="eldato-runner-autoscale"
 # The launchd label is the unit name in reverse-DNS form, so `--status` can name ONE job on a Mac
@@ -815,6 +846,50 @@ mode_arg_for() {
     flag="$(mode_flag)"
     [ -n "$flag" ] && printf '%s' "        <string>$flag</string>"
     return 0
+}
+
+# vet_unit <rendered-artifact> <label> — does the DECLARATION about to be installed hand a gate bypass to
+# everything the job spawns? (agent-infra#4002; fresh review of PR #4020 at `4f9ff9b3e`, P2.)
+# ⛔ ASKED ON THE BYTES THAT WOULD BE INSTALLED, after every substitution this script makes and ABOVE the
+# `--dry-run` branch: a preview prints the artifact an install would write, so a preview that skips the
+# veto is a preview of something this installer would refuse.
+# ⛔ A MISSING JUDGE IS A REFUSAL, not a warning: a checker that was simply absent while the install
+# printed `installed:` is the false-PASS class this installer already refuses for a missing `ExecStart=`
+# and a non-parsing plist. And EVERY NON-ZERO rc IS A REFUSAL, BUT THE THREE ARE NOT THE SAME DIAGNOSIS
+# (ported from the sibling's `vet_unit`): rc 1 = a hatch was FOUND and named above; rc 2 = the judge could
+# not grade it at all — its FILE PREFLIGHT refused the file (no file named, unreadable, or a directory),
+# ⛔ NEVER the CONTENT of a declaration, which the fold always grades; rc 64/127 = the resolved
+# `gate-policy.sh` predates `--unit-veto` or could not run, so the artifact was never vetted. Collapsing
+# them tells an operator to hunt a hatch no line names.
+# ⛔ THE rc-2 SENTENCE BELOW ONCE NAMED A THIRD CAUSE — "or a declaration it cannot fold" — AND THAT CAUSE
+# IS UNREACHABLE (agent-infra#4002). This copy was ported from the sibling before `gate-policy.sh`'s rc-2
+# contract was pinned to the file preflight (PR #4020 at `a3c13deec` fixed the drainer's and the
+# sibling's copy; this third one was missed), so an operator whose judge refused rc 2 was pointed at a
+# fold failure that the function cannot produce — the fold has no error branch by design, and a
+# continuation still pending at EOF is folded and graded. The set in the message is the reachable one, and
+# `install-runner-autoscale-timer.test.sh`'s ungradable-judge arm reddens on the wider claim.
+vet_unit() { # <rendered-artifact> <label>
+    local f="$1" label="$2" rc=0
+    # ⛔ `--disarm` IS EXEMPT — AND ONLY `--disarm` (same key as `refuse_adopted_provisioner`: the flag is
+    # set and this is NOT the `--report-only` WRITING verb). The reasoning is that function's, MEASURED:
+    # `--disarm` forces a DISARMED render (where any pin is inert) and its refusal leaves the arming record
+    # KEPT (`STILL ARMED … the record was NOT removed`), i.e. it strands the audit datum on a box nobody can
+    # disarm without hand-editing. So a disarm is never blocked here; a template that regrew an
+    # `Environment=` hatch is caught before it can ship by the census (`gate-policy.test.sh` §5a/§5h), and
+    # every other verb — `--install`, `--dry-run`, `--report-only`, `--arm` — refuses on the same bytes.
+    if [ -n "$FORCE_MODE_FLAG" ] && [ "${REPORT_ONLY:-0}" != 1 ]; then return 0; fi
+    { [ -n "$GP_GUARD" ] && [ -f "$GP_GUARD" ]; } \
+        || { err "REFUSING: gate-policy.sh not found (looked beside $TEMPLATES_DIR, in $INFRA_ROOT and in \${AGENT_INFRA_PATH}) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted. Point GP_GUARD at a gate-policy.sh copy."; return 1; }
+    bash "$GP_GUARD" --unit-veto "$f" "$label" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 1 ]; then
+        err "REFUSING: the rendered $label carries a GATE-BYPASS environment entry (named above) — a scheduled job that hands the hatch to every lane it spawns defeats #2319/#623 for ever, and no spawned lane can un-inherit it (agent-infra#4002)"
+    elif [ "$rc" -eq 2 ]; then
+        err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — its preflight refused the file: unreadable, or not a regular file; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
+    else
+        err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (agent-infra#4002) or it could not run at all, so the rendered $label was NEVER vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
+    fi
+    return 1
 }
 
 # ── rendering ────────────────────────────────────────────────────────────────────────────────
@@ -1583,6 +1658,11 @@ do_install_systemd() {
     if [ "$TARGET" = "user" ]; then
         sed -i.bak '/^User=/d' "$tmpd/$UNIT_NAME.service" && rm -f "$tmpd/$UNIT_NAME.service.bak"
     fi
+    # ⛔ THE DECLARATION IS VETTED ON THE BYTES THAT WOULD BE INSTALLED (agent-infra#4002; fresh review of
+    # PR #4020 at `4f9ff9b3e`, P2) — after the `User=` strip above and ABOVE the `--dry-run` branch, so
+    # nothing can add an `Environment=` line downstream of the judge and a preview cannot show what an
+    # install would refuse.
+    vet_unit "$tmpd/$UNIT_NAME.service" "$UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and enable $UNIT_NAME.timer"
@@ -1716,6 +1796,11 @@ except ET.ParseError as e:
         err "  hint: an XML comment must not contain a doubled dash — keep option flags out of comments"
         rm -rf "$tmpd"; return 1
     fi
+    # ⛔ THE SAME VETO ON THE launchd DIALECT (agent-infra#4002; fresh review of PR #4020 at `4f9ff9b3e`,
+    # P2): `provisioner_env_for` writes a WHOLE `<key>RUNNER_AUTOSCALE_PROVISIONER</key><string>…</string>`
+    # into `EnvironmentVariables` at render time, so the plist is a declaration that can name a hatch.
+    # Graded after it validates and above the `--dry-run` branch, exactly as on the systemd path.
+    vet_unit "$tmpd/$LABEL.plist" "$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and bootstrap $LABEL"

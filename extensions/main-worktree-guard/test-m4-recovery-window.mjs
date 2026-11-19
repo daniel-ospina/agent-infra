@@ -317,7 +317,7 @@ async function partB() {
   // uses), so this suite never touches the operator's file at all. The sibling
   // suite in this directory does the same (test-discard-gate.mjs).
   const { homedir } = await import("node:os");
-  const { readFileSync, existsSync, unlinkSync, mkdirSync } = await import("node:fs");
+  const { readFileSync, existsSync, unlinkSync, mkdirSync, utimesSync, symlinkSync } = await import("node:fs");
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "m4-recovery-window-")));
   const savedHomedir = process.env.HOME;
   process.env.HOME = tmp;
@@ -352,15 +352,28 @@ async function partB() {
     writeFileSync(join(hub, "wip.txt"), ""); // truncated to 0 bytes, as the incident
     process.chdir(hub);
 
-    const drive = async (command) => {
+    // #3620 — the ctx's session id is a PARAMETER: a `pi -p --no-session` lane
+    // resolves to null, which is the population whose marker mint is inert.
+    const driveWith = async (sessionId, command, envId) => {
       const mod = await import(pathToFileURL(join(HERE, "index.ts")).href);
       const handlers = new Map();
       mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
-      delete process.env.PI_SESSION_ID; // production: the id comes from ctx, not env
-      const ctx = { sessionManager: { getSessionId: () => TID } };
-      const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
-      return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
+      // production: the id comes from ctx, not env — `envId` exists ONLY for the
+      // B2b row, which is about what a SET-but-EMPTY env does to that resolution.
+      delete process.env.PI_SESSION_ID;
+      if (envId !== undefined) process.env.PI_SESSION_ID = envId;
+      const ctx = { sessionManager: { getSessionId: () => sessionId } };
+      try {
+        const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
+        return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
+      } finally {
+        delete process.env.PI_SESSION_ID;
+      }
     };
+    const drive = (command) => driveWith(TID, command);
+    // Like check(), but a FAILURE carries the refusal text (these cases assert on
+    // message content, and "got false" alone would say nothing about why).
+    const checkD = (name, cond, detail) => check(cond ? name : `${name} — ${String(detail ?? "").slice(0, 400)}`, cond, true);
 
     // B1 — the acceptance test for the incident: with the MARKER the named-path
     // restore is PERMITTED (nothing in the chain refuses it: before the M5
@@ -371,6 +384,20 @@ async function partB() {
     check("B1 dirty hub + marker ⇒ `git checkout -- <path>` PERMITTED end-to-end", b1, null);
     const b1b = await drive("git restore wip.txt");
     check("B2 dirty hub + marker ⇒ `git restore <path>` PERMITTED end-to-end", b1b, null);
+    // ── B2b (#4101 review, P2): a SET-but-EMPTY `PI_SESSION_ID` is NOT an id ──
+    // `_currentSessionId` used `??`, so `PI_SESSION_ID=` (an exported-but-empty
+    // var, or a `PI_SESSION_ID= pi …` launch) became the ANSWER and shadowed the
+    // ctx's real id. The read side treats `""` as no-id, so the marker went INERT
+    // — and the refusal said "none from the session manager", which is FALSE of
+    // the very process it was printed in. Empty is absent now, so the id resolves
+    // from ctx and the marker stays scoped to the right session.
+    process.env.PI_SESSION_ID = "";
+    try {
+      const b2b = await driveWith(TID, "git checkout -- wip.txt", "");
+      check("B2b an EMPTY `PI_SESSION_ID` does not shadow the ctx id (marker stays effective)", b2b, null);
+    } finally {
+      delete process.env.PI_SESSION_ID;
+    }
 
     // B3 — WITHOUT the marker: still blocked (protection unchanged, both gates).
     setMarker(false);
@@ -598,6 +625,435 @@ async function partB() {
     check("B6g3 inline-payload still BLOCKED", b6g3 !== null, true);
     check("B6g4 …and it does NOT prescribe the branch switch as recovery",
       /recovery: git checkout main/.test(b6g3?.reason ?? ""), false);
+
+    // ── B7/B8 (#3620): the marker mint must be VERIFIED, not assumed ─────────
+    //
+    // The defect: the guard's mint is `_stampMarker` (try/catch fail-silent)
+    // writing `{session_id: <id>, …}`. When the session's id does not resolve —
+    // `pi -p --no-session`, the fleet's own lanes, whose ctx sessionManager has
+    // no id and whose env carries no PI_SESSION_ID — it writes
+    // `{"session_id": null}`, logs `🔓 Escape marker active for session null`,
+    // audits a gate_bypass row, and the READ side then refuses it because it
+    // requires a string id. Measured end-to-end before the fix: touch ALLOWED,
+    // marker file present and byte-fresh, recovery op still BLOCKED.
+    //
+    // That is a FALSE PASS on the escape hatch — the guard reports the window
+    // open while the window is shut — which is the shape the #3620 report hit
+    // ("the three remedies are all inert"). It is NOT a request to widen the
+    // hatch: `test.mjs` pins null-id → inactive as DELIBERATE and B7 keeps it.
+    setMarker(false);
+    mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+    const noSessTouch = await driveWith(null, `touch ${markerPath}  # recovery: stranded main`);
+    check("B7 a NO-SESSION lane's marker touch is REFUSED (the window can never open for it)",
+      noSessTouch !== null, true);
+    checkD("B7b …the refusal names the missing session id as the cause",
+      /session id/i.test(noSessTouch?.reason ?? ""), noSessTouch?.reason);
+    // The misleading log line was `🔓 Escape marker active …`; the refusal must
+    // state the window is CLOSED, not merely avoid the word "active" (it quotes
+    // the old log line to explain what used to happen).
+    checkD("B7c …and it states the window CANNOT be opened (no false PASS)",
+      /cannot be opened/i.test(noSessTouch?.reason ?? "") && !/IS active/.test(noSessTouch?.reason ?? ""), noSessTouch?.reason);
+    check("B7d …and no marker file is left behind that LOOKS honoured",
+      existsSync(markerPath), false);
+    const noSessRestore = await driveWith(null, "git restore wip.txt");
+    check("B7e …and the recovery op still stays BLOCKED end-to-end (the pin is intact)",
+      noSessRestore !== null, true);
+    // …AND the refusal must not offer the session-start env as though the reader
+    // could use it (#1239): a running session cannot set it, so a message that
+    // presents it as THE remedy is a second dead end.
+    checkD("B7f …and it says the session-start env cannot be set from a running session",
+      /session-start/i.test(noSessRestore?.reason ?? "") && /cannot/i.test(noSessRestore?.reason ?? ""),
+      noSessRestore?.reason);
+
+    // ── B7g/B7h (#4101 review, P2): the PRE-STAMP id refusal must not tell an
+    // env-HATCHED, id-less process that it holds nothing.
+    //
+    // The mint check sits OUTSIDE the `if (!_isAllowMainEdits())` block by design
+    // (the touch is guard-stamped for EVERY session), so it also fires for
+    // `AGENT_ALLOW_MAIN_EDITS=1 pi -p --no-session` — the fleet lane shape this
+    // PR names at the sibling suite — a process that already carries a FULL
+    // bypass. Measured before the fix: the refusal printed
+    // "`AGENT_ALLOW_MAIN_EDITS=1` is NOT an alternative here", which is false in
+    // that very process and is the mirror of the #3620 dead end (a reader that
+    // HOLDS a bypass is told it holds nothing). The block itself is right — an
+    // id-less stamp would clobber a sibling's live marker — so only the text
+    // changes, and the row asserts BOTH halves.
+    process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+    try {
+      const hatchedTouch = await driveWith(null, `touch ${markerPath}  # recovery: hatched id-less lane`);
+      check("B7g an env-HATCHED, id-less lane's marker touch is still REFUSED (a null-id stamp would clobber a sibling's marker)",
+        hatchedTouch !== null, true);
+      checkD("B7h …and the refusal names the hatch as ALREADY ACTIVE instead of unavailable",
+        /IS ALREADY ACTIVE/.test(hatchedTouch?.reason ?? "") &&
+        !/NOT a remedy/.test(hatchedTouch?.reason ?? "") &&
+        !/NOT an alternative/.test(hatchedTouch?.reason ?? ""),
+        hatchedTouch?.reason);
+    } finally {
+      delete process.env.AGENT_ALLOW_MAIN_EDITS;
+    }
+
+    // B8 — a REAL session, with a marker that exists but is INERT (here: it
+    // belongs to another session). The refusal used to tell this reader to
+    // stamp the marker it already has; it must instead say the file is inert
+    // and why, so "I stamped it and nothing happened" cannot recur silently.
+    writeFileSync(markerPath, JSON.stringify({ session_id: "some-other-session", reason: "elsewhere", ts: new Date().toISOString() }) + "\n");
+    const inertMismatch = await drive("git restore wip.txt");
+    check("B8 a present-but-INERT marker (other session) is BLOCKED", inertMismatch !== null, true);
+    checkD("B8b …and the refusal DIAGNOSES it as inert, naming the session mismatch",
+      /INERT \[session-mismatch\]/.test(inertMismatch?.reason ?? ""), inertMismatch?.reason);
+    // B8c — an EXPIRED marker is the same class (mtime past the 15-min TTL) and
+    // must be diagnosed as expired, not as absent.
+    writeFileSync(markerPath, JSON.stringify({ session_id: TID, reason: "stale", ts: new Date().toISOString() }) + "\n");
+    utimesSync(markerPath, new Date(Date.now() - 20 * 60 * 1000), new Date(Date.now() - 20 * 60 * 1000));
+    const inertStale = await drive("git restore wip.txt");
+    checkD("B8c an EXPIRED marker is diagnosed as expired",
+      /INERT \[expired\]/.test(inertStale?.reason ?? ""), inertStale?.reason);
+    // B8d — the ACTIVE case must stay silent about inertness (the diagnosis is
+    // about a present-but-inert file, never a blanket paragraph).
+    setMarker(true);
+    const activeWholeTree = await drive("git checkout -- .");
+    check("B8d marker ACTIVE ⇒ no INERT paragraph (the diagnosis is conditional)",
+      /INERT/.test(activeWholeTree?.reason ?? ""), false);
+    setMarker(false);
+
+    // ── B15 (#4101 review, P3): EVERY refusal that OFFERS the marker must also
+    // diagnose an inert one — the #1144 sync refusal and the #607
+    // hidden-branch-state refusal were the two arms still handing a reader a
+    // remedy with no cause, so `_inertMarkerLines()` was spliced into both. The
+    // file below is on disk and inert (another session's), exactly the state
+    // that made the old text a loop.
+    // ⛔ THE HUB MUST BE CLEAN FOR THESE TWO ARMS TO BE REACHED AT ALL: on a
+    // dirty hub the M4 hub-state gate answers first (and it already carried the
+    // diagnosis), so a row driven there would pass for the wrong arm — MEASURED
+    // as a vacuous pass before this was fixed: both rows stayed green with BOTH
+    // splices removed. The dirt is restored immediately after.
+    writeFileSync(markerPath, JSON.stringify({ session_id: "some-other-session", reason: "elsewhere", ts: new Date().toISOString() }) + "\n");
+    git(hub, "git checkout -- wip.txt");
+    // …and B6w3's `copy.txt` is untracked dirt that would keep M4 in front of both
+    // arms; it is restored byte-for-byte afterwards for the rows that follow.
+    const b15Copy = existsSync(join(hub, "copy.txt")) ? readFileSync(join(hub, "copy.txt")) : null;
+    if (b15Copy !== null) unlinkSync(join(hub, "copy.txt"));
+    try {
+      const b15 = await drive("git pull");
+      checkD("B15 the #1144 sync refusal still BLOCKS on a CLEAN shared main",
+        b15 !== null && /#1144/.test(b15?.reason ?? ""), b15?.reason);
+      checkD("B15b …and it DIAGNOSES the inert marker it prescribes instead of re-offering it blind",
+        /INERT \[session-mismatch\]/.test(b15?.reason ?? ""), b15?.reason);
+      const b15c = await drive(`echo "$(git branch -Mq main victim)"`);
+      checkD("B15c the #607 hidden-branch-state refusal still BLOCKS",
+        b15c !== null && /#607/.test(b15c?.reason ?? ""), b15c?.reason);
+      checkD("B15d …and it too carries the inert diagnosis",
+        /INERT \[session-mismatch\]/.test(b15c?.reason ?? ""), b15c?.reason);
+    } finally {
+      writeFileSync(join(hub, "wip.txt"), ""); // restore the incident's dirt for the rows below
+      if (b15Copy !== null) writeFileSync(join(hub, "copy.txt"), b15Copy);
+      setMarker(false);
+    }
+
+    // ── B9 (#1239): no refusal may offer the env hatch as an AVAILABLE remedy ──
+    //
+    // `AGENT_ALLOW_MAIN_EDITS=1` is read from the process env at session start.
+    // An already-blocked agent cannot set it — an inline `VAR=1 cmd` prefix sets
+    // it in a child shell the guard never inspects, and an `export` cannot reach
+    // the running process — so a refusal that prints it as THE remedy is a dead
+    // end. A SOURCE SCAN rather than nine fixtures: the property is "every site
+    // that prints the line also prints what it cannot do", and a behavioural
+    // test would need nine different gate geometries (push-delete, cross-checkout
+    // write, compound, worktree, …). Fails loudly with line numbers if a new
+    // site appears without the caveat.
+    // ⛔ BOTH PRINTING MODULES (#4101 review, P2). This sweep read `index.ts`
+    // ALONE and reported green while `classify-git.mjs` printed two caveat-less
+    // offers (`_worktreeAddInTreeReason`, `_unjudgeableTargetReason`, both
+    // reachable through the #1919 worktree-in-tree gate) — a verifier asserting a
+    // universal property it could only check in one file, i.e. a false PASS of
+    // the Review Scope Contract's R6. Measured with this exact function: index.ts
+    // `[]`, classify-git.mjs `[10830, 10885]`. The property covers the code that
+    // PRINTS, so the sweep covers every module that prints; the caveat text
+    // itself is one mirror pair, pinned equal by B9g.
+    const sweepTargets = [
+      ["index.ts", readFileSync(join(HERE, "index.ts"), "utf8").split("\n")],
+      ["classify-git.mjs", readFileSync(join(HERE, "classify-git.mjs"), "utf8").split("\n")],
+    ];
+    const srcLines = sweepTargets[0][1]; // the caveat/B9b/B9c source (index.ts)
+    const caveatOf = (lines) =>
+      (lines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/) ?? [])[1] ?? "";
+    // ⛔ KEYED ON THE HATCH ITSELF, NOT ON ONE PHRASE (#4101 review, P2). This
+    // sweep used to key on the literal `Or set AGENT_ALLOW_MAIN_EDITS`, so it
+    // could not see three live sites that offer the hatch in their own words —
+    // `index.ts` M5's "Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1" (the text
+    // the #3620 report actually hit), the fast-forward refusal, and the
+    // hidden-branch-state refusal — plus two banner warnings. A phrase-keyed
+    // sweep answers "does one wording carry the caveat", which is not the
+    // property; the property is "no text a blocked reader can act on offers an
+    // env var that a RUNNING session cannot set".
+    //
+    // What is exempt, and why each exemption is safe:
+    //  · comments — they are never printed;
+    //  · the caveat block itself;
+    //  · a site carrying `hatch-sweep-exempt: <reason>` within 2 lines — the
+    //    EXPLICIT, per-site form a site whose own text is the OPPOSITE claim ("the
+    //    hatch is NOT the remedy", "the hatch is ALREADY ACTIVE here") has to use;
+    //  · `_ENV_HATCH_CAVEAT` inside its 8-line window;
+    //  · a `session START` / `CANNOT` pair inside that window (the fixed-width
+    //    banner boxes cannot hold the shared array).
+    //
+    // ⛔ NO BLANKET NEGATION EXEMPTION (#4101 review, P3). This sweep used to
+    // release any site whose NEXT THREE LINES contained `not|NOT|cannot|CANNOT`,
+    // which is the commonest word in these refusal texts: 6 of the file's ~30
+    // occurrences were released by it rather than by a caveat, and a caveat-less
+    // offer placed next to an unrelated "this does not lift the arm" passed. The
+    // property is "every PRINTED OFFER carries the caveat", so the exemption is
+    // now either the caveat itself or a marker a reader can audit — never the
+    // absence of the word "not". B9e/B9f pin that a bare negation NO LONGER
+    // releases a site.
+    const hatchSweep = (lines) => {
+      const whole = lines.join("\n");
+      const cavDef = whole.match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
+      const cavStart = cavDef ? whole.slice(0, cavDef.index).split("\n").length : 0;
+      const cavEnd = cavDef ? cavStart + cavDef[0].split("\n").length - 1 : 0;
+      const found = [];
+      lines.forEach((ln, i) => {
+        const lineNo = i + 1;
+        const t = ln.trim();
+        if (!ln.includes("AGENT_ALLOW_MAIN_EDITS")) return;
+        if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return;
+        if (cavStart > 0 && lineNo >= cavStart && lineNo <= cavEnd) return;
+        if (lines.slice(Math.max(0, i - 2), i + 3).join("\n").includes("hatch-sweep-exempt:")) return;
+        const window = lines.slice(i, i + 8).join("\n");
+        if (window.includes("_ENV_HATCH_CAVEAT")) return;
+        if (/session[ -]?start/i.test(window) && /(?:CANNOT|cannot)/.test(window)) return;
+        found.push(lineNo);
+      });
+      return found;
+    };
+    check("B9 (#1239): every printed offer of the env hatch carries the session-start caveat (BOTH printing modules)",
+      sweepTargets.flatMap(([file, lines]) => hatchSweep(lines).map((n) => `${file}:${n}`)), []);
+    // ⛔ AND THE SWEEP MUST BE ABLE TO FAIL — a source scan that cannot flag a
+    // caveat-less offer is the same no-op gate it replaced. Measured: the previous
+    // version passed on a tree with three offending sites.
+    check("B9e the sweep is not vacuous — a caveat-less offering is FLAGGED",
+      hatchSweep([
+        '            `   → Set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1).`,',
+        '          ].join("\\n"),',
+      ]), [1]);
+    // B9f (#4101 review, P3) — the NEGATION exemption this sweep used to carry is
+    // gone, so an unrelated "not" in the next lines must NOT release an offer.
+    // Measured before the narrowing: this snippet returned [] (released), because
+    // line 3 contains "does not". The real tree had 6 sites released that way.
+    check("B9f an unrelated negation near a caveat-less offer NO LONGER releases it",
+      hatchSweep([
+        '      `   → Set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1).`,',
+        '      `   this does not lift the arm — it suppresses the whole gate.`,',
+        '      `   Work in a worktree instead.`,',
+      ]), [1]);
+    // B9i (#4101 review, P2) — the sweep must be able to flag the SHAPE the
+    // index-only scan could not see: the `(session start)` LABEL is not the
+    // caveat. The sweep's own acceptance rule wants a `session START` + `CANNOT`
+    // pair, and the two classify-git.mjs sites carried only the label. Without
+    // this row, narrowing `sweepTargets` back to one file would leave the sweep
+    // green over the very sites this fix adds the caveat to.
+    check("B9i the sweep FLAGS a `(session start)`-labelled offer that carries no caveat (the shape classify-git.mjs printed twice)",
+      hatchSweep([
+        '    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,',
+        '  ].join("\\n");',
+      ]), [1]);
+    // B9g (#4101 review, P2) — ONE shared text, not two that happen to start out
+    // equal. index.ts mirrors the array in classify-git.mjs (the module-load
+    // contract keeps index.ts's imports explicit, and the caveat has to print
+    // even if the classifier failed to load), so drift between the two is caught
+    // here rather than by a reader noticing one refusal reads differently.
+    check("B9g the hatch caveat is ONE text in both printing modules (a one-sided edit reddens this)",
+      caveatOf(sweepTargets[0][1]).length > 0 &&
+      caveatOf(sweepTargets[0][1]) === caveatOf(sweepTargets[1][1]), true);
+    const caveat = srcLines.join("\n").match(/const _ENV_HATCH_CAVEAT = \[([\s\S]*?)\];/);
+    checkD("B9b the caveat names session START and says an inline/export CANNOT set it",
+      /session START/.test(caveat?.[1] ?? "") && /CANNOT/.test(caveat?.[1] ?? ""), caveat?.[1]);
+    // B9c (#3620 review, P3) — the `unavailable` cause is the DEGRADED-IMPORT stub:
+    // nothing was stat'ed, so "A marker file EXISTS at …" would assert a fact this
+    // process does not have. Behavioural reproduction needs a half-loaded
+    // classifier, which the fail-safe defaults make all-or-nothing, so the
+    // property is pinned at the source: the special case must EXIST and must
+    // precede the wording that claims a file was seen.
+    const inertSrc = (srcLines.join("\n").match(/function _inertMarkerLines\(\)[\s\S]*?\n}/) ?? [""])[0];
+    check("B9c the INERT paragraph handles `unavailable` WITHOUT claiming a file exists",
+      inertSrc.indexOf('d.cause === "unavailable"') !== -1 &&
+      inertSrc.indexOf("A marker file EXISTS") > inertSrc.indexOf('d.cause === "unavailable"'), true);
+
+    // ── B10 (#3620 review, P2) — the #1484 SCRIPT-CONTENT arm's refusal ──────
+    //
+    // The report this issue came from measured TWO dead ends, and this arm — the
+    // one the plan comment named as in-scope for the message commit — still
+    // printed only `set the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a
+    // solo session`: no session-start caveat (an inline prefix or an `export`
+    // cannot set it, #1239), no reachable route, and no mention that the TTL
+    // MARKER does not lift this arm at all (M4 stays active under it, D3) — so a
+    // reader who reached for the marker hit a silent second dead end. The B9
+    // sweep could not see the site either (it keys on the literal `Or set
+    // AGENT_ALLOW_MAIN_EDITS`), which is why this is asserted end-to-end.
+    setMarker(false);
+    const evilScript = join(tmp, "evil-4101.sh");
+    writeFileSync(evilScript, "#!/bin/bash\ngit reset --hard\n");
+    const b10 = await drive(`bash ${evilScript}`);
+    check("B10 a script whose CONTENT holds a non-sanctioned git op is BLOCKED (#1484)", b10 !== null, true);
+    checkD("B10b …and the refusal carries the session-START caveat (#1239)",
+      /read at session START/.test(b10?.reason ?? "") && /CANNOT set it/.test(b10?.reason ?? ""), b10?.reason);
+    checkD("B10c …and it says the TTL MARKER does not lift THIS arm (D3), instead of leaving the marker as a silent second dead end",
+      /MARKER does NOT lift/.test(b10?.reason ?? ""), b10?.reason);
+    checkD("B10d …and it names routes a blocked session can actually take",
+      /human terminal/.test(b10?.reason ?? "") && /START the/.test(b10?.reason ?? ""), b10?.reason);
+    // B10e/B10g — B10c pins the SENTENCE, not the FACT it asserts. The refusal
+    // claims "the TTL escape MARKER does NOT lift this arm (M4 stays active under
+    // it, D3)" and that the env hatch is the only one; nothing measured either.
+    // If the marker ever started lifting the arm, B10b–B10d would stay green over
+    // a refusal that names a dead end the reader can escape — the very shape
+    // #3620 exists to close, so the claim is pinned in both directions: the
+    // MARKER leaves the arm intact, the session-start ENV hatch lifts it (which
+    // is what makes the marker assertion non-vacuous — a drive that can never
+    // allow could not tell the two hatches apart).
+    setMarker(true);
+    const b10e = await drive(`bash ${evilScript}`);
+    check("B10e an ACTIVE TTL MARKER does NOT lift the #1484 script arm (the claim the refusal text makes)",
+      b10e !== null, true);
+    checkD("B10f …and the marker does not change WHICH arm answers — it is the same script-content refusal",
+      /script content contains a blocked git operation \(#1484\)/.test(b10e?.reason ?? ""), b10e?.reason);
+    setMarker(false);
+    process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+    try {
+      const b10g = await drive(`bash ${evilScript}`);
+      check("B10g control: the session-start ENV hatch DOES lift the script arm, so B10e is not vacuous",
+        b10g, null);
+    } finally { delete process.env.AGENT_ALLOW_MAIN_EDITS; }
+
+    // ── B12 (#3620 review, P3) — the mint refusal must state the RIGHT direction
+    //
+    // `_stampMarker` has already run when the refusal is built, so "the escape
+    // marker was NOT created" is only true when no file resulted. A marker path
+    // reached through a SYMLINKED `~/.pi/agent` is written (and audited) and then
+    // refused by the read side — telling that reader "the stamp did not take"
+    // sends them to re-check permissions on a file they can see.
+    const agentDir = join(tmp, ".pi", "agent");
+    const auditFile = join(agentDir, "audit", "gate-events.jsonl");
+    const auditRowsFrom = (offset) => {
+      try { return readFileSync(auditFile, "utf8").split("\n").filter(Boolean).slice(offset).map((l) => JSON.parse(l)); }
+      catch { return []; }
+    };
+    const auditLen = () => { try { return readFileSync(auditFile, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
+    rmSync(agentDir, { recursive: true, force: true });
+    mkdirSync(join(tmp, "real-agent"), { recursive: true });
+    symlinkSync(join(tmp, "real-agent"), agentDir);
+    try {
+      const auditBefore = auditLen();
+      const b12 = await drive(`touch ${markerPath}  # recovery: symlinked agent dir`);
+      check("B12 a marker touch behind a SYMLINKED ~/.pi/agent is REFUSED (the read side never trusts a link)",
+        b12 !== null, true);
+      checkD("B12b …and the refusal names the SYMLINK cause", /\[?symlinked/.test(b12?.reason ?? ""), b12?.reason);
+      checkD("B12c …and it says the file WAS written instead of claiming the stamp did not take",
+        /was WRITTEN but cannot open a window/.test(b12?.reason ?? "") &&
+        !/was NOT created/.test(b12?.reason ?? ""), b12?.reason);
+      // ⛔ THE AUDIT ARTEFACT FOLLOWS THE VERDICT (#4101 review, P3). B12d used to
+      // accept a refusal that merely SAID `gate_bypass` — which it did, because the
+      // row was appended inside `_stampMarker`, BEFORE the read-back that refuses
+      // this mint. `gate_bypass` is the record an operator queries to answer "why
+      // did an escape window exist"; after the 15-min TTL nothing distinguishes
+      // such a row from a real one, so the guard recorded a bypass it had just
+      // established was never granted. Asserted in BOTH halves below: the text and
+      // the log.
+      checkD("B12d …and it names the INERT-mint audit event, not a `gate_bypass` row",
+        /marker_minted_inert/.test(b12?.reason ?? "") && /NO .?gate_bypass.? row/.test(b12?.reason ?? ""), b12?.reason);
+      const b12Rows = auditRowsFrom(auditBefore).filter((r) => r.marker_path === markerPath);
+      check("B12d2 …and the AUDIT LOG carries no `gate_bypass` row for a mint that never opened a window",
+        b12Rows.filter((r) => r.event === "gate_bypass").length, 0);
+      check("B12d3 …and it carries the `marker_minted_inert` row instead, with the cause",
+        b12Rows.filter((r) => r.event === "marker_minted_inert" && r.cause === "symlinked").length, 1);
+    } finally {
+      try { unlinkSync(agentDir); } catch { /* best-effort */ }
+      mkdirSync(agentDir, { recursive: true });
+    }
+    // B12g — the CONTROL that makes B12d2/B12d3 mean something: a mint the read
+    // side ACCEPTS still appends `gate_bypass` and logs the open window, so the
+    // rows above cannot pass for "this suite never writes audit rows at all".
+    setMarker(false);
+    {
+      const auditBefore = auditLen();
+      const okTouch = await drive(`touch ${markerPath}  # recovery: verified mint control`);
+      check("B12g control: a VERIFIED mint is ALLOWED (so the inert rows are not vacuous)", okTouch, null);
+      const rows = auditRowsFrom(auditBefore).filter((r) => r.marker_path === markerPath);
+      check("B12g2 …and it appends exactly one `gate_bypass` row, for the window that really opened",
+        rows.filter((r) => r.event === "gate_bypass").length, 1);
+      check("B12g3 …and no `marker_minted_inert` row (the event names the OUTCOME, not the attempt)",
+        rows.filter((r) => r.event === "marker_minted_inert").length, 0);
+      setMarker(false);
+    }
+
+    // ── B12e/B12f — the OTHER direction of the same sentence.
+    //
+    // `written` was inferred from the CAUSE the read side reports, not from the
+    // stamp itself. Those are not the same fact: when the WRITE fails while a
+    // path already exists at the marker location, the cause describes what the
+    // read side saw (`unreadable`), so the refusal said "the file exists at … and
+    // a `gate_bypass` audit row was appended" although `_stampMarker` threw and
+    // NO row was appended. That is a false claim about the audit trail — the
+    // artifact a reader trusts when auditing why an escape window existed.
+    //
+    // Construction: the marker path is a DIRECTORY. `writeFileSync` raises
+    // EISDIR inside the fail-silent stamp (no row), and
+    // `diagnoseAllowMarkerState` sees an existing, realpath-clean path whose
+    // `readFileSync` throws → cause `unreadable` — the exact shape the inference
+    // mislabelled as a landed stamp. No operator file is touched: HOME is
+    // repointed at the fixture.
+    mkdirSync(agentDir, { recursive: true });
+    rmSync(markerPath, { recursive: true, force: true });
+    mkdirSync(markerPath, { recursive: true });
+    try {
+      const b12e = await drive(`touch ${markerPath}  # recovery: unwritable marker path`);
+      check("B12e a stamp that CANNOT land (an unreadable path exists at the marker) is REFUSED",
+        b12e !== null, true);
+      checkD("B12f …and the refusal reports that the stamp did NOT take, without claiming an audit row the failed write never appended",
+        /did not take/.test(b12e?.reason ?? "") && !/gate_bypass/.test(b12e?.reason ?? ""), b12e?.reason);
+    } finally {
+      rmSync(markerPath, { recursive: true, force: true });
+    }
+
+    // ── B13 (#4101 review, P3) — a marker that is a DANGLING SYMLINK ──────
+    //
+    // `existsSync` FOLLOWS links, so a dangling marker link reported cause
+    // `absent` and `_inertMarkerLines()` returns [] for `absent` — the shape got
+    // no diagnosis at all, while `symlinked` is one of the causes the README
+    // advertises and the refusal text has a paragraph for. The verdict was always
+    // safe (no window opened); only the DIAGNOSIS was missing, which is the
+    // #3620 class this branch exists to close ("I stamped it and nothing
+    // happened"). Measured before the fix: BLOCKED with no INERT paragraph.
+    mkdirSync(agentDir, { recursive: true });
+    rmSync(markerPath, { recursive: true, force: true });
+    symlinkSync(join(tmp, "no-such-marker-target"), markerPath);
+    try {
+      const dangling = await drive("git restore wip.txt");
+      check("B13 a DANGLING-symlink marker is BLOCKED (the read side trusts no link)", dangling !== null, true);
+      checkD("B13b …and it is diagnosed `symlinked`, not `absent` (an lstat probe, not a link-following one)",
+        /INERT \[symlinked\]/.test(dangling?.reason ?? ""), dangling?.reason);
+    } finally {
+      try { unlinkSync(markerPath); } catch { /* best-effort */ }
+    }
+
+    // ── B14 (#4101 review, P3) — an id-less reader must not be told to re-touch ──
+    //
+    // `unscoped` (a file fact: no string session_id) was decided BEFORE
+    // `no-session-id` (a READER fact), so an id-less lane that found a pre-fix
+    // `{"session_id": null}` stamp was told "Re-touch it from THIS session" — a
+    // step its own pre-stamp check then refuses, for the very reason the first
+    // message already had. Two steps, and the second one is the right answer.
+    writeFileSync(markerPath, JSON.stringify({ session_id: null, reason: "pre-fix lane stamp", ts: new Date().toISOString() }) + "\n");
+    const idlessUnscoped = await driveWith(null, "git restore wip.txt");
+    check("B14 an id-less lane with a `{session_id:null}` marker is BLOCKED (unchanged protection)",
+      idlessUnscoped !== null, true);
+    checkD("B14b …and the FILE's own cause is still named (unscoped)",
+      /INERT \[unscoped\]/.test(idlessUnscoped?.reason ?? ""), idlessUnscoped?.reason);
+    checkD("B14c …and it does NOT prescribe a re-touch this session's own pre-stamp check vetoes",
+      !/Re-touch it from THIS session/.test(idlessUnscoped?.reason ?? ""), idlessUnscoped?.reason);
+    checkD("B14d …and it says an id-less reader must recover from a session that HAS an id, or a terminal",
+      /id-less session/.test(idlessUnscoped?.reason ?? "") && /human terminal/.test(idlessUnscoped?.reason ?? ""),
+      idlessUnscoped?.reason);
+    setMarker(false);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

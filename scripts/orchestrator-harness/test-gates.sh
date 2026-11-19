@@ -776,7 +776,21 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 # ⛔ #2126: the extracted range END is the guard LINE, not the literal `&& continue` — the guard now
 # records the refusal inside the same `&& { … }`, so a literal-end sed would truncate the extraction
 # and this drive would silently grade a half block (the "a test that cannot run" shape).
-sed -n '/^    HEAD_N="\$(gh\(_bounded\)\? pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
+# ⛔ agent-infra#4120: THE START ANCHOR MOVED WITH THE ROW'S `gh pr view`, AND THE ANCHOR IS WHY.
+# `HEAD_N` is no longer read on its own — the row reads `headRefOid,mergeable` in ONE call and parses
+# both out of it — so the old anchor matched nothing and this drive went red with "could not extract
+# the shipped AUTHORITY_UNKNOWN block". A drive whose anchor is a shipped line must track that line:
+# the block still starts at the row's head read and still ends at the authority guard.
+# The mock below answers a bare `deadbeef` (no space), which the shipped parser reads as the head with
+# an empty MSTAT — the same shape an UNKNOWN/unreadable mergeable produces on a live box.
+# ⛔ AND THE PATTERN IS ERE, WHICH IS THE PORTABILITY FIX, NOT A RESTYLE. It was a BRE at 779 with
+# `\?` for the optional group, and `\?` IS NOT POSIX BRE: GNU sed honours it, BSD/macOS sed does not,
+# so on a macOS host this extraction matched ZERO lines for BOTH spellings (measured 2026-11-17:
+# 0 lines from origin/main's own anchor and from the new one) and the drive failed with a message
+# blaming the shipped guard — a red dev-host gate over a green CI one, and the reason this lane could
+# not verify its own anchor the first time. `-E` parses identically on BSD and GNU, so the anchor is
+# now checkable on the host that runs the suite.
+sed -nE '/^    _pr_row="\$\(gh(_bounded)? pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
   _au_run() { # _au_run <flag> [<claim-verdict rc>] -> prints how many PRs passed the guard
@@ -3609,7 +3623,14 @@ GHFAIL2
   # wrong reason and, worse, would have stopped constraining the ORDER the moment the form changed
   # again. Both forms are accepted so the property (write strictly precedes spawn, within 3 lines) is
   # what is pinned, not the launcher's name.
-  _fs_w="$(grep -n '^ *: > "$O/state/fixspend-$PR-$HEAD_N"$' "$ORCH" | head -1 | cut -d: -f1)"
+  # ⛔ THE PRODUCER IS NOW `spend_book … fixcount 1` (review P2, #4126 round 3), NOT A BARE REDIRECT.
+  # The write moved into the shipped `spend_book` because the SAME record must also name the counter
+  # that spawn charged, and a `: > fixspend-…` beside a `spend_book … fixcount 0` would have made the
+  # findings-restore proof and the budget attribution two unsynchronised facts. The PROPERTY this pin
+  # stands for is unchanged — the record is written strictly BEFORE the spawn, within 3 lines — so the
+  # pattern follows the shipped form instead of being retired. The `1` is load-bearing: it is the
+  # argument that re-asserts `fixspend-<PR>-<HEAD>` at all, so it is part of the pattern.
+  _fs_w="$(grep -n '^ *spend_book "\$PR" "\$HEAD_N" fixcount 1$' "$ORCH" | head -1 | cut -d: -f1)"
   _fs_s=""
   if [ -n "${_fs_w:-}" ]; then
     _fs_s="$(awk -v w="$_fs_w" 'NR>w && (/if tmux new-session -d -s "fix-\$PR"/ || /if wt_spawn "fix-\$PR"/){print NR; exit}' "$ORCH")"
@@ -3618,6 +3639,39 @@ GHFAIL2
     echo "  ❌ the fixspend record is not written immediately BEFORE the fixer spawn (write=${_fs_w:-<none>} spawn=${_fs_s:-<none>}) — a concurrent fix-one.sh can record its bail first and the findings marker is then withheld"; FAIL=$((FAIL+1))
   else
     echo "  ✅ the spend record is written BEFORE the spawn (write line $_fs_w, spawn line $_fs_s) — a concurrent bail cannot race it"; PASS=$((PASS+1))
+  fi
+  # (11b) ⛔ AND THE PRODUCER'S `1` REALLY RE-ASSERTS THE FINDINGS PROOF, DRIVEN — the pin above would
+  # stay green if `spend_book` ignored its 4th argument, which is exactly the restore authorisation the
+  # whole `fixspend` marker exists to carry. Both directions, ON ONE KEY: `1` writes it, and a SECOND
+  # booking at the SAME (PR, head) with `0` CLEARS it.
+  # ⛔ THE TWO DIRECTIONS MUST SHARE THE KEY (fresh-context review, P3 — #4126). This row used to book
+  # PR `71` with `1` and PR `72` with `0`, then assert `[ ! -f fixspend-72-… ]`. Nothing ever created
+  # `72`'s file, so the CLEAR half could not fail: mutating `spend_book` to drop its
+  # `rm -f "$O/state/fixspend-$pr-$head"` left this row GREEN while the behaviour the message claims
+  # ("0 CLEARS it") was gone. And no other suite covers it — `selftest.sh` (b2)/(b3) and
+  # `red-fixer.test.sh` (3c2) all READ `spendcount`, none seeds a `fixspend` and books a second time at
+  # the same key. That clear is not decoration: it is the round-4 P3 fix this PR carries — a record
+  # left by an EARLIER spawn at this head would make `refund_bailed_fixer … 1` restore a findings marker
+  # for a bail that consumed none, a manufactured fixer authorisation (agent-infra#2132). So the
+  # transition is what is driven, and its first half is recorded from inside the run so the WRITE
+  # direction keeps its own attributable mutant.
+  ex spend_book > "$TMP/fn_spend_book.sh"
+  if grep -q '^spend_book() {' "$TMP/fn_spend_book.sh"; then
+    mkdir -p "$TMP/sbO/state"
+    : > "$TMP/sb.steps"
+    ( O="$TMP/sbO"; . "$TMP/fn_spend_book.sh"
+      spend_book 71 cafe0001 fixcount 1
+      if [ -f "$O/state/fixspend-71-cafe0001" ]; then printf 'wrote\n' >> "$TMP/sb.steps"; fi
+      spend_book 71 cafe0001 fixcount 0 )
+    if grep -qx 'wrote' "$TMP/sb.steps" \
+       && [ ! -f "$TMP/sbO/state/fixspend-71-cafe0001" ] \
+       && [ "$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)" = "fixcount" ]; then
+      echo "  ✅ spend_book's 4th argument decides the findings proof (1 writes it, a second booking with 0 CLEARS it at the SAME key), and the record names the counter"; PASS=$((PASS+1))
+    else
+      echo "  ❌ spend_book did not honour its 4th argument, did not record the counter, or did not CLEAR the findings proof on a re-booking (wrote=$([ -s "$TMP/sb.steps" ] && echo yes || echo no) left=$([ -f "$TMP/sbO/state/fixspend-71-cafe0001" ] && echo yes || echo no) rec=[$(cat "$TMP/sbO/state/spendcount-71-cafe0001" 2>/dev/null)])"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract spend_book from orch-loop.sh"; FAIL=$((FAIL+1))
   fi
   # (12) ⛔ THE ORPHAN PRUNE, DRIVEN (review round 5, residual 1 — it was unpinned and a future edit
   # that dropped the row-count guard would turn "unreadable listing" into "delete every marker").

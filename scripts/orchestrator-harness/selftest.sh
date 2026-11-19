@@ -350,7 +350,14 @@ fi
 # heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
 # OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
 # made this whole block report a red it could not explain. Capture the ONE assignment line.
-grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE SHIPPED READ IS `gh_bounded pr checks` (#2293's bounded wrapper, which budgets forks and
+# never silently retries a mutating call). This pin extracted only `gh pr checks`, so after that
+# migration it matched ZERO lines and the whole block below — the one assertion that drives the
+# classifier's bash substitution and could catch a backtick escaping from a comment — reported its
+# `need` failure and then did nothing. That is the no-op-gate direction: measured RED on this box at
+# `origin/main` and at every head since, while the guard it names read as present. Both spellings are
+# accepted, and the driver supplies the wrapper the shipped line actually calls.
+grep -m1 -E '^    V="[$][(]gh(_bounded)? pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -369,6 +376,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # The shipped assignment calls `gh_bounded` (the bounded gh wrapper). The driver stands it in for
+    # the PATH shim below, so the SHELL still runs the real line and the shim counts the calls.
+    printf '%s\n' 'gh_bounded() { gh "$@"; }'
     # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
     # SHIPPED file so the shell runs the real classifier, not a missing path.
     printf '%s\n' "_CK_PY='$HERE/check-class.py'"
@@ -2677,8 +2687,11 @@ fi
 # the attempt at spawn and (on the reviewer-findings arm) deleted the findings marker there, so
 # before this refund three refusals PARKED a PR no fixer ever touched, with the reviewer's findings
 # gone. The function is EXTRACTED and DRIVEN, not grepped (P2, second review round, 2026-10-14).
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
-if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted from the shipped orch-loop.sh"; then
+# ⛔ `spend_book` / `spend_clear` ARE EXTRACTED TOO (fresh-context review, P2 — #4126 round 3): the
+# booking record is what attributes a refund to a budget, so the drive must build it through the SHIPPED
+# producer — a fixture that hand-writes the file asserts the reader against its own copy of the format.
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^spend_book() {/,/^}/p' "$LOOP"; sed -n '/^spend_clear() {/,/^}/p' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
+if need "$TMP/refund-all.sh" "spend_book/spend_clear/refund_bailed_fixer/is_num are extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/RB/state"; O="$TMP/RB"; LOG="$TMP/RB/loop.log"; : > "$LOG"
   # shellcheck disable=SC1090
   . "$TMP/refund-all.sh"
@@ -2698,6 +2711,23 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
      && [ ! -f "$O/state/fixspend-77-abc" ]; then rc=0
   else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no) spend=$([ -f "$O/state/fixspend-77-abc" ] && echo yes || echo no)"; fi
   ck "a bailed fixer refunds the attempt AND restores the findings marker (spend consumed)" $rc
+  # (a3) ⛔ THE BAIL LIFT DROPS THE WHOLE PARK, NOT JUST `parked-<pr>` (fresh-context review, P2,
+  # #4126 round 9). `refund_bailed_fixer` is a park LIFT, yet it removed only `parked-<pr>`: the reason
+  # and the `parkorigin-<pr>` author stamp survived. The parked-guard trusts a `harness` stamp keyed to
+  # THIS head OVER the reason's prose, so a bail followed by a HAND-WRITTEN human park at the same head
+  # (printf into `state/`, the documented residual for a hand park) read as machine-authored and the
+  # router REBASED a head a human had frozen — the inversion the marker exists to prevent, through the
+  # one lift no round had touched. All three files are seeded and all three are asserted GONE, so a
+  # revert of either removal reddens this row (not vacuous).
+  rm -f "$O/state/parked-71" "$O/state/parkreason-71" "$O/state/parkorigin-71"
+  echo 1 > "$O/state/fixcount-71"; : > "$O/state/fixbail-71-abc"
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$O/state/parked-71"
+  printf 'rail refused a RED TREE and 2 fixer attempt(s) have been spent on this PR in total\n' > "$O/state/parkreason-71"
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa harness\n' > "$O/state/parkorigin-71"
+  refund_bailed_fixer 71 abc 0
+  if [ ! -f "$O/state/parked-71" ] && [ ! -f "$O/state/parkreason-71" ] && [ ! -f "$O/state/parkorigin-71" ]; then rc=0
+  else rc=1; echo "      parked=$([ -f "$O/state/parked-71" ] && echo LEFT || echo gone) reason=$([ -f "$O/state/parkreason-71" ] && echo LEFT || echo gone) origin=$([ -f "$O/state/parkorigin-71" ] && echo LEFT || echo gone) — a bail left park residue, which attributes the NEXT (human) park at this PR to the harness"; fi
+  ck "a bail LIFTS the whole park — reason and author attribution die with parked-<pr>" $rc
   # (a2) ⛔ A BAIL WITH NO SPEND MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). The
   # bail may have been written by the CI-red or CONFLICTING arm, which never delete a findings marker;
   # refunded on a later gate-red cycle, an unconditional touch invented a fixer authorisation for a
@@ -2714,6 +2744,37 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   refund_bailed_fixer 88 abc 0
   [ "$(cat "$O/state/fixcount-88" 2>/dev/null)" = "0" ] && [ ! -f "$O/state/needsfix-88-abc" ] && rc=0 || rc=1
   ck "a bail on an arm that deleted no findings marker does not invent one" $rc
+  # (b2) ⛔ THE REFUND GOES TO THE BUDGET THE BAILED SPAWN SPENT (fresh-context review, P2 —
+  # agent-infra#4120). The CONFLICT router books `state/conflictcount-<PR>` and records it through
+  # `spend_book`; the review/CI arms book `fixcount`. A refund that always decremented `fixcount` would
+  # either consume the review budget for a rebase that never ran, or leave a real conflict attempt spent
+  # for ever. Both directions are asserted: conflictcount drops, fixcount is UNTOUCHED, and the spend
+  # record is consumed.
+  rm -f "$O/state/spendcount-89-abc" "$O/state/conflictcount-89" "$O/state/fixbail-89-abc"
+  echo 2 > "$O/state/conflictcount-89"; echo 3 > "$O/state/fixcount-89"
+  : > "$O/state/fixbail-89-abc"; spend_book 89 abc conflictcount 0
+  refund_bailed_fixer 89 abc 0
+  if [ "$(cat "$O/state/conflictcount-89" 2>/dev/null)" = "1" ] \
+     && [ "$(cat "$O/state/fixcount-89" 2>/dev/null)" = "3" ] \
+     && [ ! -f "$O/state/spendcount-89-abc" ] && [ ! -f "$O/state/needsfix-89-abc" ]; then rc=0
+  else rc=1; echo "      conflict=$(cat "$O/state/conflictcount-89" 2>/dev/null) fix=$(cat "$O/state/fixcount-89" 2>/dev/null) spend=$([ -f "$O/state/spendcount-89-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-89-abc" ] && echo yes || echo no)"; fi
+  ck "a bailed CONFLICT dispatch refunds the CONFLICT budget and leaves the repair budget alone" $rc
+  # (b3) ⛔ THE ATTRIBUTION IS THE *LAST* CHARGE AT THIS HEAD, NOT "WHICH OF TWO FILES EXISTS"
+  # (fresh-context review, P2 — #4126 round 3). A conflict spawn's record survived its own SUCCESSFUL
+  # spawn, so a later repair spawn AT THE SAME HEAD (a rebase that pushed nothing, or a `gh` mergeable
+  # flap back to MERGEABLE) left it in place — and the bail that repair wrote was then refunded against
+  # `conflictcount`, wrong in both directions at once. The two bookings below are the shipped producer's
+  # own calls, in the production order, and only the SECOND may be refunded.
+  rm -f "$O/state/spendcount-90-abc" "$O/state/conflictcount-90" "$O/state/fixcount-90" "$O/state/fixbail-90-abc"
+  echo 1 > "$O/state/conflictcount-90"; echo 2 > "$O/state/fixcount-90"
+  spend_book 90 abc conflictcount 0     # the rebase spawn (its attempt is a real, kept charge)
+  spend_book 90 abc fixcount 0          # a later repair spawn at the SAME head
+  : > "$O/state/fixbail-90-abc"        # ...and the repair's own bail is what the controller refunds
+  refund_bailed_fixer 90 abc 0
+  if [ "$(cat "$O/state/fixcount-90" 2>/dev/null)" = "1" ] \
+     && [ "$(cat "$O/state/conflictcount-90" 2>/dev/null)" = "1" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-90" 2>/dev/null) (want 1) conflict=$(cat "$O/state/conflictcount-90" 2>/dev/null) (want 1, untouched) — a STALE record attributed the bail to the wrong budget"; fi
+  ck "a stale conflict record at a head where the LAST spawn charged fixcount does not steal the refund" $rc
   # (c) NO bail marker -> nothing to refund. Non-vacuity: the refund is conditional on a real bail.
   echo 3 > "$O/state/fixcount-99"; refund_bailed_fixer 99 abc 1
   [ "$(cat "$O/state/fixcount-99" 2>/dev/null)" = "3" ] && [ ! -f "$O/state/needsfix-99-abc" ] && rc=0 || rc=1
@@ -4589,7 +4650,7 @@ ck "…while the one act that ADDS a run to the queue — the CI rerun — is st
 ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
-grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
+grep -qE 'gh(_bounded)? pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
 ck "the cheap merge path stays ungated" $rc
 
 # ── refresh-candidates.sh: the pool is ordered by SEVERITY, not by issue number ─────
@@ -5079,8 +5140,13 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # `sleep` in the reap decision, and an uncoerced typo makes that test ERROR — which reads FALSE, i.e.
 # "not idle", so the reaper would spare every worker for ever. That is the inert-enforcer direction
 # rather than the fail-open one, and it is still a bound silently disarmed by a typo.
-[ "$_ngrd_n" = "22" ] && rcn=0 || { rcn=1; echo "      expected 22 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 22 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 22 -> 23 for agent-infra#3009 (`QUEUE_STATE_MAX_AGE_MIN`: the cycle record's "which rung idled" read
+# declines to name a stale queue record, and an uncoerced typo there makes the comparison ERROR — a
+# bound that silently stops naming its rung, the inert-instrument direction). Its coercion shipped in
+# #3909 with this count left at 22, so this pin had been RED on `main` since that merge: the count is
+# what caught it, which is the row working as designed rather than a row to relax.
+[ "$_ngrd_n" = "23" ] && rcn=0 || { rcn=1; echo "      expected 23 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 23 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -6337,6 +6403,26 @@ if [ -f "$CSS" ]; then
   bash "$CSS" --o "$CSD/execmissing" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a deployed copy missing an EXECUTED file exited $rc"; }
   ck "check-single-source: the EXECUTED presence arm refuses a copy missing one" $rc
+  # ⛔ `park-human.sh` IS PRESENCE-REQUIRED ON BOTH DEPLOY LISTS AND NOTHING OBSERVED IT (fresh-context
+  # review of #4126, P3). It is the ONLY producer of `parkorigin-<PR>` = `human`, so a `$O` without it
+  # silently loses the human arm and the parked-guard falls back to the prose path — the inertness the
+  # marker exists to remove. The arm above proves the MECHANISM by removing `merged-not-closed.sh`, which
+  # left dropping `park-human.sh` from EXECUTED completely green (the reviewer's mutation reddened
+  # nothing). Non-vacuity: the copy is byte-identical apart from that one name, and the row above shows an
+  # otherwise-identical copy PASSES.
+  rm -rf "$CSD/exec-ph"; mkdir -p "$CSD/exec-ph"
+  cp -a "$HERE"/. "$CSD/exec-ph"/; rm -f "$CSD/exec-ph/park-human.sh"
+  bash "$CSS" --o "$CSD/exec-ph" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 1 ]; then rc=0; else echo "      a deployed copy missing park-human.sh exited $rc (want 1) — the human producer of parkorigin can vanish with this gate still green"; rc=1; fi
+  ck "check-single-source: a copy missing park-human.sh is a DIVERGENCE (the human park producer is presence-required)" $rc
+  rm -rf "$CSD/exec-ph"
+  # …and the list `install.sh` COPIES from must carry it too: that loop is what puts the file on a box,
+  # so dropping the name there loses the same arm one step earlier and reds nothing otherwise. Pinned on
+  # the LOOP LINE, not a bare `grep park-human`, because the three prose mentions above that loop would
+  # satisfy a bare grep with the entry deleted.
+  grep -qE '^for f in .* park-human\.sh; do$' "$INST" && rc=0 \
+    || { rc=1; echo "      install.sh's deploy loop does not name park-human.sh — a fresh \$O is installed without the only 'human' park producer"; }
+  ck "install.sh's deploy loop carries park-human.sh (a \$O without it loses the only 'human' producer)" $rc
   env -u O bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --require-target with nothing to compare exited $rc"; }
   ck "check-single-source: --require-target with nothing to compare is UNKNOWN (rc 2)" $rc

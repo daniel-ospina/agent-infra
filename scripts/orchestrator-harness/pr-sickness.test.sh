@@ -685,6 +685,10 @@ out="$(run_pass)"
 has "$out" "skip #77: review-fix budget exhausted (2/2 fixer attempts at head=$sha12r)" "the third pass hits the cap and NAMES it"
 eq "$(spawns)" "2" "and nothing is spawned past the cap"
 eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is PARKED (the harness's own 'needs a human' state)"
+# ⛔ AND THE PARK NAMES ITS AUTHOR, WITH THE HEAD (agent-infra#4120 review, P3): this file is one of
+# the three writers the controller's parked-guard reads, and a stamp that does not name its head is
+# PR-LIFETIME — it would still be read at a LATER head and attribute a human's park to the machine.
+eq "$(cat "$STATE/parkorigin-77" 2>/dev/null)" "$sha_red harness" "…and it stamps its author as '<head> harness' (the guard trusts it only at that head)"
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "still unfixed after 2 fixer attempt(s)" "the park reason says what happened, in the operator's words"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "exactly ONE escalation comment was posted on the PR"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" "…tagged by head, so a repeat pass cannot duplicate it"
@@ -697,6 +701,13 @@ has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a **push re-arms it**" "BOUND
 # next pass. Both the parkreason and the PR comment must carry the counter path.
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "psick-77-$sha12r" "BOUND 1's parkreason names the counter that actually holds the bound"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "psick-77-$sha12r" "…and so does the PR comment, so following it actually clears the bound"
+# ⛔ AND BOTH PUBLISHED LIFTS NAME `parkorigin-77` (fresh-context review, P2, agent-infra#4126 round 8).
+# This file is a THIRD writer of the park pair, so it stamps `parkorigin-<PR>` = `<head> harness` beside
+# the reason it writes (below) — and the controller's parked-guard lets a surviving `harness` stamp
+# OUTRANK a later hand-written reason at that same head. A published lift that omits the stamp is
+# therefore worse than no lift: the operator clears what it names, re-parks by hand, and the machine
+# park still wins. Driven from the SHIPPED body, so dropping the file from either string reds these.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "parkorigin-77" "BOUND 1's PR comment removes parkorigin-<PR> too (a surviving 'harness' stamp outranks the human park the recipe invites)"
 out="$(run_pass)"
 has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
@@ -740,6 +751,31 @@ out="$(run_pass)"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "the retry posts the escalation exactly once"
 eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "…and only THEN is the head parked"
 
+# (v4d) A PARTIAL PARK WRITE LANDS **NO** PARK (fresh-context review, P3, agent-infra#4126 round 9).
+# Both bounds used to write the three park files INDEPENDENTLY, with the author FIRST and the reason LAST
+# (`2>/dev/null || true` on each, and this file is `set -u` only), so a failed reason write left
+# `parkorigin-<head> harness` over whatever reason was ALREADY on disk — possibly a HUMAN's — plus a
+# `parked-<PR>` at this head. The controller's parked-guard then reads `harness` at this head and REBASES
+# A HEAD A HUMAN FROZE: the marker's one forbidden direction, reached through the very `state/` hazard
+# this file prints remedies for. Driven by making the reason path unwritable (a stray DIRECTORY at its
+# name). Non-vacuity: (v4)/(v5) drive the same calls with writable paths and the three files DO land, so
+# only the failure path can red these rows.
+for _bound in cap ceiling; do
+  reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+  if [ "$_bound" = "cap" ]; then printf '2\n' > "$STATE/psick-77-$sha12r"; else printf '10\n' > "$STATE/reviewround-77"; fi
+  mkdir -p "$STATE/parkreason-77"          # the reason CANNOT be written; author+head still can
+  out="$(run_pass)"
+  [ -e "$STATE/parkorigin-77" ] \
+    && bad "($_bound) a failed reason write still stamped parkorigin-77=[$(cat "$STATE/parkorigin-77" 2>/dev/null)] — a surviving human reason would be attributed to the harness and its head rebased" \
+    || ok "($_bound) a park whose reason CANNOT be written lands NO author stamp (a half-park would outrank the reason it never wrote)"
+  [ -e "$STATE/parked-77" ] \
+    && bad "($_bound) a failed reason write still PARKED the head ($(cat "$STATE/parked-77" 2>/dev/null)) — the park is in force with a stale reason" \
+    || ok "($_bound) …and it does not park the head either (a park with no reason of its own is never landed)"
+  has "$out" "NO park was landed" "($_bound) and the skip line SAYS the park did not land, instead of implying it did"
+  has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" \
+    "($_bound) the PR-visible escalation is still posted — the park failed, the operator still hears about it"
+done
+
 # (v5) THE CEILING IS THE RECORDED ONE (`state/reviewround-<PR>`, agent-infra#3441), not an invented
 # bound: at the ceiling a fixer would push a head whose review is refused by that same ceiling, so no
 # fixer is spent — and it says so.
@@ -757,6 +793,7 @@ has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "review-round ceiling" "…in th
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "PUSH DOES NOT RE-ARM IT" "…and names the TRUE remedy for THIS bound (the book is cumulative across heads)"
 no  "$(cat "$STATE/parkreason-77" 2>/dev/null)" "re-arms it" "…not the false 'a push re-arms it' (verified against merge-one.sh's [rrceiling] park)"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a push does NOT re-arm this one" "the ceiling's PR comment says a push does NOT re-arm the review-round book"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "parkorigin-77" "…and the ceiling's lift removes parkorigin-<PR> as well (same reason as BOUND 1: the stamp outranks a human park at that head)"
 no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "re-arms both the per-head attempt budget and the review round" "…and the one fixed paragraph that claimed a push re-arms BOTH bounds is gone"
 # ⛔ THE "WHAT HAPPENED" SENTENCE MUST MATCH THIS BOUND TOO (fresh-context review, P2, verified). The
 # ceiling returns BEFORE the brief and before the spawn — this very case asserts `spawns=0` two lines

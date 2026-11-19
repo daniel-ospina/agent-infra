@@ -161,6 +161,28 @@
 #   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
 #      read for blocking findings, so a clean verdict cannot be certified — NOT recorded,
 #      and NOT read as clean (a failed scan is not an empty one)
+#   11 the reviewer concluded CLEAN but the artifact this run would post carries no valid MUTATION
+#      ATTRIBUTION block (agent-infra#3987 / #3442) — `record-review.sh` REFUSES to mint a clean
+#      record over such a comment, so posting it would buy a review that can never be recorded.
+#      Nothing was posted AS A REVIEW ARTIFACT (no clean artifact a recorder could accept exists on
+#      the PR) and NO record was written. ⛔ IT IS NOT "nothing was posted", AND THE DIFFERENCE IS
+#      OBSERVABLE: a CLEAN run that carried P3 notes posts the NON-BLOCKING NOTES comment BEFORE
+#      this gate (§BK pins that it may), so the refusal can leave that notes comment on the PR. It
+#      cites no verdict comment — a notes comment is a `follow_up` disposition, never evidence — so
+#      what the narrower sentence at the refusal itself says ("NOTHING was posted as a review
+#      artifact") is the accurate one, and this line used to overstate it. The cause is a REVIEWER
+#      OMISSION (it was told the shape — the prompt carries `brief-gate.sh --mutation-section`), so
+#      the remedy is a re-run, not a code change. Distinct from 6/7 because the reviewer DID conclude clean and DID print
+#      the marker: the only missing thing is the non-vacuity block, and it is named by token.
+#      ⛔ THREE MORE CAUSES RIDE THIS SAME CODE, all of them reviewer-side text the parser would
+#      otherwise ACCEPT (each one names itself in the refusal, so 11 is never a bare "vacuous"):
+#        (i)   the section is a PASTE-BACK of the contract's own worked example row (`--mutation-section`
+#              hands a filled row, and `--mutation-missing` answers empty for it — measured);
+#        (ii)  the reviewer's own text contains one of `record-review.sh`'s UNCONDITIONAL veto phrases,
+#              which would refuse the artifact AFTER it was posted (a wording collision, not a finding);
+#        (iii) the non-vacuity validator cannot refuse anything, so its empty answer is not a pass.
+#      All three refuse BEFORE anything is published, for the reason 11 exists: a clean comment the
+#      recorder rejects is a false artifact on the PR and a paid review reported as a success.
 #
 # TEST SEAMS (the fixtures in tests/review-pr/run.sh drive exactly these; they are
 # not operational knobs and no production path sets them):
@@ -179,6 +201,7 @@ set -uo pipefail
 
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
+E_VACUOUS=11
 
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -276,6 +299,40 @@ if [ -z "$RECORDER" ]; then
 fi
 [ -f "$RECORDER" ] && [ -x "$RECORDER" ] \
   || die "$E_RECORD" "recorder '$RECORDER' is not a regular executable file — refusing to pay for a review whose record step cannot run"
+
+# ── THE NON-VACUITY VALIDATOR — resolved and PROVED before a review is paid for (agent-infra#3987)
+# A CLEAN record cannot be minted unless the artifact carries a MUTATION ATTRIBUTION block, and
+# `brief-gate.sh` owns BOTH halves of that contract: `--mutation-section` renders the shape the
+# reviewer must produce (it is pasted into the prompt below, so the shape taught and the shape
+# demanded are ONE text — the drift #3442 was filed over) and `--mutation-missing` is the predicate
+# `record-review.sh` itself runs on the artifact. Resolving it HERE, in the preflight, is what turns
+# "the recorder refused after a ten-minute review" into "the review was never paid for": a box whose
+# gate is missing, stale (a copy that predates #3442 answers 78 for the verb) or unreadable is a
+# HARNESS provisioning fault, and paying for a review whose record step is already known to be
+# unreachable is the waste this whole preflight section exists to prevent.
+# ⛔ THE LADDER IS `record-review.sh`'s, VERBATIM (self-adjacent, then `orchestrator-harness`, then
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness`, then `$HOME/.pi/agent/scripts`). Two different
+# ladders would let this file demand a shape from one copy while the recorder validates with another.
+BRIEF_GATE=""
+_bg_self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+for _bg_d in "$_bg_self" "$_bg_self/orchestrator-harness" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness" "${HOME:-}/.pi/agent/scripts"; do
+  [ -n "$_bg_d" ] && [ -f "$_bg_d/brief-gate.sh" ] && { BRIEF_GATE="$_bg_d/brief-gate.sh"; break; }
+done
+unset _bg_d _bg_self
+[ -n "$BRIEF_GATE" ] \
+  || die "$E_RECORD" "brief-gate.sh not found (looked beside this script, in ./orchestrator-harness, in \$AGENT_INFRA_PATH/scripts/orchestrator-harness and in \$HOME/.pi/agent/scripts) — it is the ONE definition of the MUTATION ATTRIBUTION block that record-review.sh demands of a clean artifact (agent-infra#3442/#3987), so without it this command can only buy a review it cannot record. Nothing was paid for. Provision the harness (bash scripts/orchestrator-harness/install.sh), then re-run."
+MUTATION_SECTION="$(bash "$BRIEF_GATE" --mutation-section 2>/dev/null)"; _ms_rc=$?
+if [ "$_ms_rc" -ne 0 ] || [ -z "${MUTATION_SECTION//[[:space:]]/}" ]; then
+  die "$E_RECORD" "the non-vacuity validator '$BRIEF_GATE' could not render the canonical MUTATION ATTRIBUTION block (--mutation-section rc=$_ms_rc, a copy that predates agent-infra#3442 answers 78 for it) — the reviewer could not be told the shape, so the artifact could not be recorded. This is HARNESS SKEW, not a review defect: refresh that copy (bash scripts/orchestrator-harness/install.sh, or \$AGENT_INFRA_PATH), then re-run. Nothing was paid for."
+fi
+# ⛔ NO SECOND PROBE HERE FOR `--mutation-missing`, AND THAT IS DELIBERATE (found by running §Q's
+# scanner-stub arm). Both verbs are answered by the SAME awk program, so a preflight probe would
+# preempt this file's own FINDINGS-scanner refusal — measured: with a broken `awk` on PATH the arm
+# that pins "a scanner that cannot run is never a clean scan" (exit 10) instead exited 9 from here, so
+# one failure got a second, differently-named refusal. The two verbs ship together (#3442 added both),
+# so `--mutation-section` answering already rules out a stale copy; what remains — a copy that answers
+# one and not the other — is caught by the PRE-POST check below, which refuses (exit 11) rather than
+# posting. Keep the preflight to the one question that only it can answer.
 
 # ── 1) EVIDENCE: repo + head, from the PR object itself ───────────────────────
 # `env -u GH_REPO` is load-bearing, not hygiene: an ambient GH_REPO is a global
@@ -735,12 +792,48 @@ prove it); a claim in the PR body the diff does not deliver; regressions;
 fail-open paths; and violations of the repo's own stated rules.
 Do NOT report style preferences, missing refactors, or "consider adding tests".
 
+## REQUIRED for a CLEAN verdict — the MUTATION ATTRIBUTION block (agent-infra#3442)
+The caller EXTRACTS this section from your output and publishes it in the review comment that
+\`record-review.sh\` reads, and that recorder REFUSES to mint a clean record over a comment with no
+such block (exit 3) — so a CLEAN verdict that omits it cannot be recorded and the PR cannot merge.
+Print it AFTER your per-line findings and IMMEDIATELY BEFORE your verdict line (the caller cuts the
+section there), and do not wrap it in a fence. ⛔ THE CONTRACT BELOW IS A SHAPE, NOT A TEMPLATE TO
+COPY BACK — it carries a FILLED worked row as an example of the columns. Write YOUR OWN rows about
+THIS diff, or your own \`NO NEW ASSERTIONS: <why>\` line, at COLUMN 0 outside any fence and outside
+any indent. A copy is refused FOUR ways, all of them measured, and a refusal discards the review:
+  • the recorder reads a fenced block as QUOTED MATERIAL, never as your claim;
+  • it reads four-or-more columns of indent as an indented code block, same thing;
+  • and the caller refuses a section that REPUBLISHES the contract's own worked example row, fenced
+    or not — that row is the shape you were handed, so it can never be evidence about this diff;
+  • and the caller ALSO refuses a \`NO NEW ASSERTIONS:\` line that repeats the contract's example
+    REASON — that reason names the contract's own example files, so it says nothing about THIS diff.
+If the diff genuinely adds no assertion, the exemption line is still YOURS to type: the contract
+shows it indented on purpose, and an indented copy is refused as quoted material — but an UNINDENTED
+copy of its example reason is refused too, so write why THIS diff adds none, naming the files you
+actually read.
+⛔ WHEN THIS PROMPT ALSO ASKS FOR A \`diff-tail:\` LINE, the order is: your findings, then the
+\`diff-tail:\` line, then this section, then your verdict line — the section is the LAST thing
+before the verdict line, and \`diff-tail:\` goes BEFORE it, not between it and the verdict.
+The contract below is the recorder's OWN text, printed by
+\`brief-gate.sh --mutation-section\` — the parser it feeds reads those labels literally, so keep them
+EXACT: do not re-word its heading, its column names, or the \`NO NEW ASSERTIONS:\` label. ⛔ THAT IS A
+RULE ABOUT LABELS ONLY — the row PAYLOAD is always YOURS. Never reproduce its worked example row or
+its example reason; write your own rows about THIS diff, or type your own reason naming the files you
+actually read (see the two refusals above):
+
+$MUTATION_SECTION
+
 ## Output format — the caller PARSES this, so it is a contract
-One finding per line, graded by whether it BLOCKS a merge, then the verdict line, then
-the REQUIRED structured marker block described immediately below it:
+One finding per line, graded by whether it BLOCKS a merge, then the MUTATION ATTRIBUTION section
+above (REQUIRED when your verdict is CLEAN), then the verdict line, then the REQUIRED structured
+marker block described immediately below it:
   [P0|P1|P2] <file>:<line> — <what is wrong> — <why it matters>   <- BLOCKING
   [P3] <file>:<line> — a non-blocking note                        <- does NOT block
   ...
+  diff-tail: <digest>        <- ONLY when the prompt asked for it, and BEFORE the section below
+  ## MUTATION ATTRIBUTION   <- one row per NEW assertion, or 'NO NEW ASSERTIONS: <why>' at
+                               COLUMN 0 when the diff adds none (see the section above); the
+                               LAST thing before the verdict line, never fenced, never pasted
   CLEAN        <- NO P0/P1/P2 finding above: nothing blocks the merge. P3 notes may
                   still be listed; the caller posts them as non-blocking notes.
   ISSUES <n>   <- n BLOCKING (P0/P1/P2) findings above; n = their count, not the P3s
@@ -769,7 +862,10 @@ $(if [ -n "$t" ]; then cat <<TAIL
 
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
 The diff inlined above is NOT the whole change. Fetch the remainder yourself, then print ONE
-line immediately BEFORE your verdict line, and nothing else on it:
+line giving the digest below, and nothing else on it. Position: AFTER your per-line findings,
+IMMEDIATELY BEFORE your \`## MUTATION ATTRIBUTION\` section when this prompt asks you for one (that
+section is the last thing before the verdict line), or IMMEDIATELY BEFORE your verdict line when it
+does not. Never put it BETWEEN the section and the verdict:
   diff-tail: <the SHA-256 of THIS RUN'S NONCE followed immediately by the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>
 This run has a fresh random nonce, different on every run:
   run-nonce: $DIFF_NONCE
@@ -2424,6 +2520,151 @@ if [ "$VERDICT" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
   exit "$E_ISSUES"
 fi
 
+# ── 5a2) THE NON-VACUITY BLOCK — extracted from the reviewer's OWN output (agent-infra#3987) ──
+# THE BUG THIS CLOSES, MEASURED. `record-review.sh` refuses to mint a FRESH `clean` over an artifact
+# carrying no MUTATION ATTRIBUTION block (its #3442 arm), and THIS file composes the artifact — from a
+# fixed template that contains no reviewer text at all. So every clean review this seam produced was
+# refused BY CONSTRUCTION: the comment said `Outcome: clean`, the recorder answered
+# `carries no MUTATION ATTRIBUTION block … a CLEAN verdict requires it`, and a correct change blocked
+# on the one seam the skill tells a lander to run (issue #3987; live on #4095, and #4038 before it).
+# The gate is right and is NOT weakened — the PRODUCER is fixed, in three places:
+#   1. the prompt now carries the canonical shape (`brief-gate.sh --mutation-section`, resolved and
+#      proved in the preflight above — one text, so the shape taught and the shape demanded cannot
+#      drift);
+#   2. the reviewer's own section is EXTRACTED here and published inside the artifact, verbatim, so
+#      the claim in the comment is the reviewer's, not this script's;
+#   3. the composed artifact is RE-VALIDATED with the recorder's own predicate (`--mutation-missing`)
+#      BEFORE it is posted, and the run refuses (exit 11, naming the missing block) rather than
+#      posting a verdict the recorder will reject. A silent refusal downstream of a paid review is
+#      the defect; a loud refusal here is the fix.
+# ⛔ WHAT THIS MUST NOT DO: invent the block. `review-pr.sh` cannot decide that a diff "adds no
+# assertions" — that is a review judgement, and a tool that wrote `NO NEW ASSERTIONS:` on its own
+# would be fabricating exactly the claim the block exists to make (a false PASS, the class #3442 was
+# filed over). The exemption line is only ever the REVIEWER's, and an absent one is a refusal.
+# ⛔ THE "NO ASSERTIONS" CASE IS THE PARSER'S, NOT A DIFF CLASSIFIER (the issue warns not to guess):
+# `record-review.sh` never inspects the diff. It asks `brief-gate.sh --mutation-missing` whether the
+# ARTIFACT carries the table OR a `NO NEW ASSERTIONS: <why>` line, so the docs-only class this issue
+# measured satisfies it with that one line — and this file asks the identical question of the
+# identical text. No second opinion about what "adds an assertion" means exists here.
+mutation_section_from() { # <transcript> [--state] -> the reviewer's section on stdout (empty when
+                          # absent); with --state ONE token instead: none | quoted | live.
+                          # ⛔ --state EXISTS SO THE REFUSAL CAN NAME THE CAUSE IT MEASURED (P3,
+                          # same class as the MUTATION-EXEMPTION-INDENTED sentence below): an empty
+                          # extraction has TWO causes — no heading at all (the reviewer omission) and
+                          # a heading that is PRESENT BUT QUOTED (the paste this PR made one keystroke
+                          # away). They share this one quoting pass, so the classifier cannot drift
+                          # from the extractor — a second reader with a second grammar is the defect
+                          # this whole function was just repaired for.
+  if [ ! -r "$1" ]; then [ "${2:-}" = "--state" ] && printf 'none\n'; return 0; fi
+  local _ms_mode=""
+  [ "${2:-}" = "--state" ] && _ms_mode=state
+  # The section is the LAST **LIVE** `## MUTATION ATTRIBUTION` heading in the transcript (a reviewer
+  # that quotes the canonical shape and then writes its own claim must be read for its claim),
+  # running to the line before the verdict/marker block that follows it — the caller publishes the
+  # claim, not a second copy of the verdict.
+  #
+  # ⛔ QUOTED MATERIAL IS NEVER THE CLAIM — AND THIS EXTRACTOR HAS TO AGREE, OR IT LAUNDERS AN ECHO
+  # INTO A LIVE CLAIM (P1, fresh review). It used to open at "the last heading wherever that line
+  # sits", i.e. it was FENCE-BLIND and INDENT-BLIND, while the parser it feeds (`brief-gate.sh
+  # --mutation-missing`) refuses both. So a reviewer that merely echoed the canonical block this
+  # prompt now hands it (`## MUTATION ATTRIBUTION` inside a fence, its opening ``` falling OUTSIDE
+  # the extracted range) had its QUOTE promoted to the live claim and republished with the closing
+  # fence stripped back off — and the parser, seeing an unfenced heading plus the harness's own
+  # worked row, ACCEPTED it (rc=0, empty output). That is the false-PASS class #3442 exists for,
+  # newly reachable because this PR hands the reviewer a complete copyable row. A heading inside an
+  # unclosed fence was harvested the same way. So the two quoting rules the parser already enforces
+  # are enforced HERE, on the same definitions:
+  #   • a fence is opened by ``` or ~~~ and closed only by ITS OWN character, in a run AT LEAST as
+  #     long, with no info string — the CommonMark 4.5 rules (spec fetched: "The closing code fence
+  #     must use the same character as the opening fence", "must be at least as long as the opening
+  #     fence", "Closing code fences cannot have info strings");
+  #   • four or more COLUMNS of indent is an indented code block (CommonMark 4.4), so it is quoted
+  #     too — and a fence line indented four columns is quoted code, never a fence.
+  # INDENT IS MEASURED IN COLUMNS, not characters, because a TAB is the next 4-column stop.
+  # An UNBALANCED fence swallows the rest of the transcript, so no live heading is found and the run
+  # refuses — the fail-closed direction, stated so it is not a surprise.
+  #
+  # ⛔ THE CUT GRAMMAR IS THE SEAM'S OWN VERDICT GRAMMAR, NOT A SECOND OPINION (P3, fresh reviews).
+  # The cut used to be a home-made `clean|issues` prefix test, which the verdict readers do NOT use:
+  # `**Verdict:** CLEAN` (accepted by VD_LABEL) and a backtick-decorated `` `REVIEW_VERDICT`: ``
+  # (accepted by VD_MK_VERDICT via MD_DEC) matched neither arm, so the "verbatim reviewer section"
+  # ran past the verdict to EOF and published the verdict line, the marker block and this script's
+  # own status line inside a block captioned as the reviewer's claim. Two readers with two grammars
+  # in one file is the drift this whole seam keeps paying for, so the seam's patterns are passed in
+  # by value and matched here. The old prefix test is kept as an EXTRA arm: the cut can only ever
+  # over-cut into a refusal, never under-cut into an invented claim, so a redundant arm is the safe
+  # side.
+  # ⛔ NO INTERVAL EXPRESSIONS ARE ADDED HERE, AND THE SEAM'S STRINGS ARE PASSED VERBATIM THROUGH
+  # `ENVIRON`, NOT `-v`. Two measured reasons, both from running this program before committing it:
+  #   • `awk -v vd="$VD_CLEAN"` APPLIES ITS OWN ESCAPE PROCESSING to the value, so `\*` collapses to
+  #     `*` and `[\[]` to `[[` — the patterns stopped being valid regexps entirely (`fatal: invalid
+  #     regexp: Unmatched ( or \(`) on every transcript that reached the cut. ENVIRON is a plain
+  #     string table with no escape processing, so what the seam defines is what awk matches.
+  #   • `#{1,6}` is an interval expression, which some `awk` builds (notably an older mawk, the
+  #     default `awk` on a stock ubuntu runner) do not accept. It is `?`-optional in every seam
+  #     pattern that uses it, so a build that cannot parse it still matches the undecorated and
+  #     bold forms; the hash-decorated `### CLEAN` spelling is covered by this program's own
+  #     interval-free prefix arm below. Nothing here depends on an interval being understood.
+  MS_MODE="$_ms_mode" \
+  VD_CLEAN="$VD_CLEAN" VD_CLEAN_URL="$VD_CLEAN_URL" VD_ISSUES="$VD_ISSUES" \
+  VD_LABEL="$VD_LABEL" VD_MK_VERDICT="$VD_MK_VERDICT" VD_MK_COUNT="$VD_MK_COUNT" \
+  awk '
+    BEGIN { mode = ENVIRON["MS_MODE"]
+            vd_clean = ENVIRON["VD_CLEAN"]; vd_clean_url = ENVIRON["VD_CLEAN_URL"]
+            vd_issues = ENVIRON["VD_ISSUES"]; vd_label = ENVIRON["VD_LABEL"]
+            vd_mk_verdict = ENVIRON["VD_MK_VERDICT"]; vd_mk_count = ENVIRON["VD_MK_COUNT"] }
+    { n++; L[n] = $0 }
+    END {
+      # ── PASS 1: mark every QUOTED line (fenced, or an indented code block) ──
+      fence = 0; fencec = ""; fencelen = 0
+      for (i = 1; i <= n; i++) {
+        s = L[i]; col = 0; ln = length(s); q = 1
+        while (q <= ln) {
+          c = substr(s, q, 1)
+          if (c == " ") { col++; q++; continue }
+          if (c == "\t") { col += 4 - (col % 4); q++; continue }
+          break
+        }
+        rest = substr(s, q)
+        quoted[i] = fence
+        if (col >= 4) { quoted[i] = 1; continue }   # indented code block: quoted, and never a fence
+        if (match(rest, /^(```|~~~)/)) {
+          fc = substr(rest, 1, 1); fl = 0
+          while (substr(rest, fl + 1, 1) == fc) fl++
+          tail = substr(rest, fl + 1)
+          quoted[i] = 1
+          if (!fence) { fence = 1; fencec = fc; fencelen = fl }
+          else if (fc == fencec && fl >= fencelen && tail ~ /^[ \t]*$/) fence = 0
+          continue
+        }
+      }
+      # ── PASS 2: the LAST LIVE heading (and whether ANY heading exists, quoted or not) ──
+      start = 0; any = 0
+      for (i = 1; i <= n; i++) {
+        s = L[i]; sub(/^[ \t]+/, "", s)
+        if (tolower(s) !~ /^#+[ \t]*mutation[ -]attribution/) continue
+        any = 1
+        if (!quoted[i]) start = i
+      }
+      # The classifier reads the SAME two passes as the extraction, so "empty" and "quoted" can
+      # never disagree about this transcript.
+      if (mode == "state") { print (start ? "live" : (any ? "quoted" : "none")); exit }
+      if (!start) exit
+      # ── PASS 3: cut at the first LIVE verdict/marker line after it ──
+      end = n
+      for (i = start + 1; i <= n; i++) {
+        if (quoted[i]) continue
+        s = L[i]; sub(/^[ \t]+/, "", s); tl = tolower(s)
+        if (tl ~ /^#*[ \t]*(\*\*|__)?[ \t]*(clean|issues)([^[:alnum:]_]|$)/) { end = i - 1; break }
+        if (tl ~ /^[ \t]*(\*\*|__)?[ \t]*(review_verdict|findings_blocking)([^[:alnum:]_]|$)/) { end = i - 1; break }
+        if (match(s, vd_clean) || match(s, vd_clean_url) || match(s, vd_issues) || match(s, vd_label) || match(s, vd_mk_verdict) || match(s, vd_mk_count)) { end = i - 1; break }
+      }
+      while (end > start && L[end] ~ /^[ \t]*$/) end--
+      for (i = start; i <= end; i++) print L[i]
+    }
+  ' "$1"
+}
+
 # ⛔ THE STRUCTURED MARKER GATE, ON THE SAME ONE PATH, AND AFTER THE FINDINGS ARMS (issue #2670).
 # A prose CLEAN alone is no longer a verdict: the marker makes "reports findings" a field comparison
 # instead of a grammar over the reviewer's English, which is the class twelve fix rounds of prose
@@ -2434,7 +2675,410 @@ fi
 # refused for the missing marker (exit 6).
 if [ "$VERDICT" = clean ]; then
   require_verdict_marker
+  MUTATION_SECTION_SEEN="$(mutation_section_from "$LOG")"
 fi
+
+# ── 5a3) …AND THE CONTRACT'S OWN WORKED ROW IS NEVER THE REVIEWER'S CLAIM (agent-infra#3987) ──
+# ⛔ THE FALSE PASS THE SECTION ABOVE LEAVES OPEN, MEASURED (P1, fresh review at a8767f401). The two
+# quoting rules close the FENCED and FOUR-COLUMN-INDENTED echo, and both are formatting rules — so
+# they cannot close the echo a literal-minded reviewer actually makes: the prompt hands it a LIVE,
+# already-valid row at COLUMN 0 and tells it not to fence anything, so "here is the shape I was
+# given" is one keystroke away, arrives UNQUOTED, and is indistinguishable from a claim BY FORMAT.
+# Measured at the head before this arm: `brief-gate.sh --mutation-missing` on an artifact carrying the
+# contract's own `scripts/x.sh:120` row answers EMPTY (accepted) while the same artifact with that
+# row deleted answers `MUTATION-ROWS` — i.e. the harness's own worked example satisfied the recorder
+# and a `clean` record could be minted on a row about nothing in the diff. That is the same
+# false-PASS class #3442 exists for, reachable through the very text #3987 added to the prompt.
+# ⛔ THE FIX IS PROVENANCE, NOT ANOTHER FORMATTING RULE (a fourth spelling test would leave the fifth
+# spelling open). THIS RUN KNOWS THE EXACT TEXT IT HANDED THE REVIEWER — `$MUTATION_SECTION` — so a
+# row that is the contract's own worked row is measured against it and refused. Markdown decoration
+# (backticks, emphasis) and whitespace are normalised away on both sides, because a reviewer that
+# re-decorates the row while copying it has still copied it; the row's TEXT is the discriminator.
+# ⛔ THE HEADER AND THE `|---|` RULE ARE EXEMPT FROM THE COMPARISON: the contract TELLS the reviewer
+# the column names, so every honest table reproduces them, and matching those would refuse every
+# review that did its job. Only DATA rows are compared.
+# STATED LIMIT, in kind with the parser's own: this is an exact-text test MODULO DECORATION (see the
+# projection note above `MUT_DEC_AWK`), so a reviewer who REWRITES
+# the example row's wording into a different row has authored a row — at which point the row is
+# theirs to defend, which is what the block asks for.
+# ⛔ AND "REWORDED" IS NOT "EDITED": a copy that keeps the example's cells and adds one, drops one or
+# carries a word in front of the row is NOT reworded, and this whole-row equality test never saw it —
+# measured at head 7bff1388d and closed by the CELL-level arm below (`mutation_pasteback_cells`). The
+# two are one provenance test at two granularities, not two spellings of one rule: this one names the
+# row verbatim (the best diagnosis when it fires), that one catches the copies this one cannot.
+# ⛔ THE DECORATION IS NOT THE DEFENCE — THE CLAIM IS READ THROUGH THE RECORDER'S OWN DECORATION
+# GRAMMAR, IN ONE HOME (measured at c43c996c5, the third and fourth spelling of the same defect).
+# The parser (`brief-gate.sh --mutation-missing`) does not test the raw line: it expands indent in
+# COLUMNS, skips 4+ columns as a quoted code block, tracks ``` / ~~~ fences with the CommonMark
+# closer rules, and then — in this order — strips BLOCKQUOTE markers repeatedly, strips leading
+# whitespace, and strips ONE bullet, before it decides whether a line is a live exemption or a table
+# row. Both normalisers below used to test the raw line instead (a `^|` prefix test for rows, and a
+# single `^[-+>]+` strip for the exemption), and that divergence is a FALSE PASS, measured:
+#   • `> | assertion | mutant | … |` + the contract's worked row (`>`-quoted table): the parser
+#     strips the marker and counts the row — ACCEPTED — while `_mutation_norm_rows` skipped every
+#     line not starting with `|`, so the paste-back arm saw no rows at all;
+#   • `> - NO NEW ASSERTIONS: docs-only — the diff touches `docs/ops/*.md` …` (the contract's worked
+#     reason behind a blockquote AND a bullet): the parser strips both and reads a LIVE exemption —
+#     ACCEPTED — while the one-shot `[-+>]+` strip consumed the `>` and stopped at the space, so the
+#     line never reached the comparison.
+# In both, `clean` was minted on the harness's OWN example text, for a diff the example says nothing
+# about: the same false-PASS class agent-infra#3442 exists for, through decorations the parser eats
+# and the arm did not. So the strip is written ONCE, as a mirror of that grammar, and both arms read
+# through it — the same one-home discipline this file applies to the veto list and the verdict
+# grammar. Fenced and indented material is marked QUOTED here for the same reason: the parser refuses
+# it on its own, and refusing an honest reviewer that quotes the SHAPE in a fence and then writes its
+# own row would be a false block.
+# STATED LIMIT, narrowed by measurement: this mirrors the parser's decoration grammar, and then
+# compares on the CLAIM'S LETTERS AND DIGITS ONLY. `tests/review-pr/run.sh` §BO drives a decoration
+# MATRIX through both and fails if any form the parser ACCEPTS is missed here, so a future spelling
+# of this bug cannot land silently.
+# ⛔ MIRRORING THE GRAMMAR WAS STILL SPELLING-LIMITED, AND THE GAP WAS OUTSIDE IT (measured at
+# head d04490cca, the FIFTH and SIXTH spelling of this false PASS). The parser's test is a SHAPE test,
+# so it accepts decorations it has no rule for — a QUOTE-WRAPPED copy is the ordinary one ("here is
+# the answer, quoted"):
+#   • `NO NEW ASSERTIONS: "<the contract's worked reason>"` — the parser reads the label, strips one
+#     layer of quotes for its slot test, and ACCEPTS (rc=0, empty);
+#   • `"| <the contract's worked row> |"` under a live header — the `"` characters become leading and
+#     trailing CELLS, which do not stop `hdr`/`row` being set, so the parser ACCEPTS (rc=0, empty).
+# Both are copies of the harness's own example text, and BOTH were MISSED by the arms, because a
+# mirror of the parser's grammar strips only what the parser strips while the copy added something it
+# does not: the `"` cell was part of the compared value, so the row never equalled its canonical
+# original, and the quoted reason carried `"` on both ends. So the comparison is taken one step
+# further than the grammar, on both sides of it, symmetrically: every character that is not a letter
+# or a digit is dropped before the two are compared. Decoration cannot launder a copy, and REWORDING
+# still does — a reviewer that writes its own claim in its own words is authored, which is what the
+# block asks for. The two arms below apply the projection at the END, after the shape decisions
+# (header, `|---|` rule, the `NO NEW ASSERTIONS:` label) that must still read the decorated line.
+MUT_DEC_AWK='
+BEGIN { _fence = 0; _fencec = ""; _fencelen = 0 }
+# leading whitespace -> text after it; indent in COLUMNS (a TAB is the next 4-column stop)
+function _ws(l,   col, q, ln, c) {
+  col = 0; ln = length(l); q = 1
+  while (q <= ln) {
+    c = substr(l, q, 1)
+    if (c == " ") { col++; q++; continue }
+    if (c == "\t") { col += 4 - (col % 4); q++; continue }
+    break
+  }
+  _col = col
+  return substr(l, q)
+}
+# the parser’s cell read: split on |, undress each cell, drop empties, and drop a leading blockquote
+# marker that the parser itself leaves standing when the `>` follows the bullet (`- > | … |`) — that
+# character is decoration, never a cell of the reviewer’s claim.
+function _cells(l,   n, i, x, out, k, arr) {
+  n = split(l, arr, "|"); k = 0; out = ""
+  for (i = 1; i <= n; i++) {
+    x = arr[i]
+    gsub(/^[ \t`*_]+/, "", x); gsub(/[ \t`*_]+$/, "", x)
+    if (length(x) == 0) continue
+    x = tolower(x)
+    if (k == 0 && x == ">") continue
+    k++; out = out (k > 1 ? "|" : "") x
+  }
+  return out
+}
+# per-line preparation, in the parser’s own ORDER: indent -> fence state -> quoted? -> strip
+# blockquotes (repeatedly) -> strip leading whitespace -> strip ONE bullet.
+function _prep(line,   lrest, fc, flen, tail, k, r, bq) {
+  sub(/\r$/, "", line)
+  lrest = _ws(line); _ind = _col
+  if (_ind >= 4) { _quoted = 1; _claim = lrest; return }
+  if (match(lrest, /^(```|~~~)/)) {
+    fc = substr(lrest, RLENGTH - 2, 1); flen = 0
+    for (k = RLENGTH - 2; substr(lrest, k, 1) == fc; k++) flen++
+    tail = substr(lrest, k)
+    if (!_fence) { _fence = 1; _fencec = fc; _fencelen = flen }
+    else if (fc == _fencec && flen >= _fencelen && tail ~ /^[ \t]*$/) _fence = 0
+    _quoted = 1; _claim = ""; return
+  }
+  if (_fence) { _quoted = 1; _claim = lrest; return }
+  _quoted = 0
+  r = lrest
+  bq = 1
+  while (bq) bq = sub(/^[ \t]*>[ \t]?/, "", r)
+  sub(/^[ \t]+/, "", r)
+  sub(/^[-*+][ \t]+/, "", r)
+  _claim = r
+}
+'
+_mutation_norm_rows() { # <text> -> normalised table DATA rows (header/rule dropped), lowercased
+  printf '%s\n' "${1:-}" | awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      if (_quoted) next                       # fenced / indented code: the parser refuses it itself
+      if (_claim !~ /\|/) next                # a table row (outer pipes are optional, as in GFM)
+      t = _cells(_claim)
+      if (t == "") next
+      sep = t; gsub(/[|: -]/, "", sep)
+      if (sep == "") next                     # the |---| rule is never a data row
+      # the COLUMN-NAMING header is shared by every honest table (the contract teaches those names)
+      if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
+      # …and the COMPARISON is decoration-agnostic (see the measured note above `MUT_DEC_AWK`): a
+      # quoted copy adds cells the parser does not count as cells, so the projection is what makes
+      # `" <row> "` and `<row>` the same claim. Applied AFTER the shape decisions above.
+      gsub(/[^a-z0-9]+/, "", t)
+      if (t == "") next
+      print t }'
+}
+mutation_pasteback_rows() { # <section-text> -> the section rows that ARE the contract's worked row
+  local canon sec
+  canon="$(_mutation_norm_rows "$MUTATION_SECTION")"
+  sec="$(_mutation_norm_rows "${1:-}")"
+  [ -n "$canon" ] && [ -n "$sec" ] || return 0
+  printf '%s\n' "$sec" | grep -Fxf <(printf '%s\n' "$canon") 2>/dev/null || return 0
+}
+
+# ⛔ THE WHOLE-ROW COMPARISON ABOVE IS STILL ONE GRANULARITY TOO COARSE, AND THE GAP IS THE SAME FALSE
+# PASS IN THREE MORE SPELLINGS (measured at head 7bff1388d). It refuses a copy only while the copy
+# reproduces the row's text EXACTLY; the parser is far looser — it asks for a header naming the three
+# columns plus at least one row of >= 3 cells — so ONE edited cell keeps the shape. Measured on that
+# head, each of these is ACCEPTED by `brief-gate.sh --mutation-missing` (rc=0, EMPTY = the "accepted" answer) AND
+# missed by the whole-row arm, so each mints `clean` on the harness's own worked example, for a diff
+# that example says nothing about:
+#   • the worked row with one cell APPENDED (`| … | also verified |`) — a reviewer annotating the shape
+#     it was handed, which is exactly what the prompt invites it to think about;
+#   • the worked row with its last cell DROPPED — the ordinary outcome of pasting a 4-column example
+#     into a 3-column table (GFM requires the header and delimiter rows to carry the SAME number of
+#     cells, so a narrower table is the natural way a reviewer normalises the shape to its own);
+#   • the worked row PREFIXED with a word (`See: | `scripts/x.sh:120` … |`) — the leading text becomes
+#     the first cell, and the row is still >= 3 cells.
+# ⛔ THE DISCRIMINATOR IS PROVENANCE AT THE UNIT A REVIEWER ACTUALLY COPIES — THE CELL — NOT THE ROW'S
+# WHOLE TEXT. The contract's worked row has four cells and a copy keeps them, whatever it adds, drops
+# or re-decorates around them. So the canonical row's DISTINCTIVE CELLS (>= 12 letters/digits, which
+# drops the decoration-only ones such as `§A (i)`) are counted inside the reviewer's own cells, and TWO
+# of them is a copy. ONE can appear honestly — a reviewer may cite the example's file while saying why
+# it is not a claim — two cannot, and that floor is what keeps this a provenance test rather than a ban
+# on mentioning the contract at all. Rewording is still authored (the stated limit above is unchanged):
+# cells are compared on letters and digits, so decoration cannot launder a copy, and a cell the reviewer
+# reworded is the reviewer's.
+# ⛔ NO ENVIRONMENT KNOB: the two bounds are literals, not `$VAR`s with defaults, because a gate that
+# an ambient variable can widen is a gate an agent can defeat without touching this file (the
+# disable-it-by-ambient-env bypass class). The suite proves the arm is what refuses by MUTATING this
+# script's own thresholds in a copy, which is the shape §BP already uses.
+_mutation_canon_cells() { # <text> -> the DISTINCTIVE cells of its DATA rows, normalised, one per line
+  printf '%s\n' "${1:-}" | awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      if (_quoted) next                       # fenced / indented code: the parser refuses it itself
+      if (_claim !~ /\|/) next                # a table row (outer pipes are optional, as in GFM)
+      t = _cells(_claim)
+      if (t == "") next
+      sep = t; gsub(/[|: -]/, "", sep)
+      if (sep == "") next                     # the |---| rule is never a data row
+      # the COLUMN-NAMING header is shared by every honest table, so it is never evidence (the same
+      # exemption the whole-row arm makes)
+      if (t ~ /assertion/ && t ~ /mutant/ && t ~ /redden/) next
+      n = split(t, C, "|")
+      for (i = 1; i <= n; i++) {
+        c = C[i]; gsub(/[^a-z0-9]+/, "", c)
+        if (length(c) >= 12) print c           # decoration-only cells (`§A (i)`) never qualify
+      } }'
+}
+
+mutation_pasteback_cells() { # <section-text> -> the canonical cells the section REPRODUCES (empty =
+                             # authored); printed one per line, at most the two that decided it
+  local _canon _sec _c _hits="" _n=0
+  # ⛔ THE CANON IS DEDUPED, SO THE COUNT IS OF DISTINCT CELLS AND NOT OF OCCURRENCES (found by a
+  # fresh-context review of #3987). `_mutation_canon_cells` prints ONE LINE PER OCCURRENCE, so a canon
+  # whose rows share a distinctive cell — or one row that repeats it — listed that cell twice, and an
+  # AUTHORED row citing it ONCE counted two and was refused with exit 11. That is a false block whose
+  # cause is the harness's own example text, not the reviewer's claim, and it contradicts the floor the
+  # arm states in as many words: "ONE can appear honestly … two cannot". `sort -u` makes the code match
+  # that sentence; the reviewer's side needs no dedupe because it is only ever ASKED whether a cell is
+  # present (`grep -Fxq`), never counted.
+  _canon="$(_mutation_canon_cells "$MUTATION_SECTION" | sort -u)"
+  _sec="$(_mutation_canon_cells "${1:-}")"
+  [ -n "$_canon" ] && [ -n "$_sec" ] || return 0
+  while IFS= read -r _c; do
+    [ -n "$_c" ] || continue
+    # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864): under `pipefail` the quiet grep exits at
+    # its first match, the writer takes SIGPIPE, and the pipeline reports 141 — so the arm would answer
+    # "not a copy" for a copy that IS one, which is a false CLEAN in this very gate. The guard
+    # (`scripts/check-no-sigpipe-grep.sh`, the `sigpipe-grep` check) caught the piped form here.
+    if grep -Fxq -- "$_c" <<<"$_sec" 2>/dev/null; then
+      _n=$((_n + 1))
+      _hits="$_hits$_c"$'\n'
+      # ⛔ THE FLOOR IS ENFORCED ON THE OUTPUT, NOT ON THE LOOP: `_hits` must stay EMPTY below two, or
+      # the arm refuses a reviewer that reproduces ONE canonical cell — the count is the discriminator,
+      # and emitting at n=1 would make the documented floor a comment rather than a rule (measured: it
+      # did exactly that in the first draft of this arm, which the widened-threshold mutant caught).
+      [ "$_n" -ge 2 ] && { printf '%s' "$_hits"; return 0; }
+    fi
+  done <<< "$_canon"
+  return 0
+}
+
+# ⛔ THE EXEMPTION LINE IS THE SECOND PASTE-BACK DOOR, AND PROVENANCE HAS TO COVER IT TOO (measured
+# at head 3d14cdab5). The arm above compares TABLE rows, so the contract's OTHER answer — the
+# `NO NEW ASSERTIONS: <why>` line — was left unguarded, and it is the one the contract shows FILLED
+# IN: `NO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and no executable assertion.`
+# The contract indents it so that a pasted BLOCK cannot exempt the artifact, and the prompt tells a
+# reviewer not to paraphrase "the exemption line" — a LITERAL reviewer therefore retypes it at
+# COLUMN 0, which is a LIVE exemption carrying the harness's own example reason, and
+# `brief-gate.sh --mutation-missing` answers EMPTY (accepted) for it. MEASURED on the pre-fix head,
+# with no table row anywhere in the transcript: rc=0, artifact posted, `clean` minted — a clean
+# record on a reason about a docs-only diff, minted for a diff that adds executable assertions. That
+# is the same false-PASS class as the example row, reachable through the other half of the contract.
+# The discriminator is provenance again, not a fifth spelling test: this run KNOWS the canonical
+# text, so a LIVE exemption line whose payload IS the contract's payload is a copy, and is refused.
+# ⛔ THE CANONICAL COPY IN `$MUTATION_SECTION` IS INDENTED (the parser treats it as QUOTED), so the
+# extractor takes quoted lines from the CANON side and only LIVE ones from the REVIEWER side: the
+# question asked of the reviewer's text is "is this line a live claim at all", and the question
+# asked of the canon is "what did this run hand out" — indentation is not protection against a copy
+# that drops it. Fences are not tracked here and do not need to be: a fenced exemption is QUOTED to
+# the parser, which refuses it on its own (no live claim / MUTATION-EXEMPTION-INDENTED).
+# STATED LIMIT, identical in kind to the table-row arm's: an exact-text test modulo decoration (a
+# quoted or emphasised retype is still a copy). A reviewer who writes
+# its OWN reason — naming the files THIS diff touches — has authored the claim, which is what the
+# block asks for, and the prompt now says so in as many words.
+# ⛔ AND THE LIMIT HAS A MEASURED EDGE THAT THIS ARM DOES NOT CROSS, ON PURPOSE (measured through THIS
+# SEAM at f4a345126, not through one helper): an exemption reason that is the worked example with an
+# INTERIOR edit — a word deleted, the first word changed, a word substituted, its opening dropped — or
+# TRUNCATED RECORDS (exit 0, `clean` minted), because every rule that would refuse those also refuses
+# the natural way an honest docs-only reviewer writes the SAME claim
+# (`docs-only — the diff touches docs/ops/<this diff's file>.md and no executable assertion.`), and a
+# word-run rule ("six contiguous canonical words is a copy") refuses exactly that sentence. The
+# residual is narrower than it looks: the exemption names NO assertion, so an edited copy still claims
+# only "this diff adds no assertion" — the reviewer's judgement either way — while a pasted ROW mints a
+# SPECIFIC false claim about an assertion this diff does not contain. The boundary is PINNED BOTH WAYS
+# by `tests/review-pr/run.sh` §BS (the four edits record, the two honest phrasings record, the verbatim
+# line refuses), so a future round can neither close it silently nor close it into a false block.
+_mutation_norm_exempt() { # <text> [--live-only] -> normalised `NO NEW ASSERTIONS:` payloads
+  local _live=""
+  [ "${2:-}" = "--live-only" ] && _live=1
+  printf '%s\n' "${1:-}" | _ME_LIVE="$_live" awk "$MUT_DEC_AWK"'
+    { _prep($0)
+      # quoted (fenced / 4+ columns of indent) is not a live claim TO THE PARSER, so on the review-
+      # er’s side it is not one here either — while the CANON side reads it, because indentation is
+      # no protection against a copy that drops it.
+      if (ENVIRON["_ME_LIVE"] == "1" && _quoted) next
+      l = _claim
+      gsub(/[`*_]/, "", l)                               # markdown decoration is not the claim
+      gsub(/[ \t]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l)
+      low = tolower(l)
+      # ⛔ NO `[-+>]+` SHORTHAND HERE: the blockquote/bullet strip is `_prep`’s, in the parser’s own
+      # order. The one-shot form this replaces is what let `> - <the contract’s reason>` through.
+      if (low !~ /^no new assertions[ \t]*:/) next
+      sub(/^no new assertions[ \t]*:[ \t]*/, "", low)
+      if (low == "") next
+      # the same decoration-agnostic projection as the row arm: a QUOTE-wrapped retype of the
+      # contract reason is a copy, and the parser accepts it (measured at head d04490cca)
+      gsub(/[^a-z0-9]+/, "", low)
+      if (low == "") next
+      print low }'
+}
+
+mutation_pasteback_exempt() { # <section-text> -> the reviewer's LIVE exemption lines that ARE the
+                              # contract's own worked exemption (empty when it authored its own)
+  local canon sec _ec _eh
+  canon="$(_mutation_norm_exempt "$MUTATION_SECTION")"
+  sec="$(_mutation_norm_exempt "${1:-}" --live-only)"
+  [ -n "$canon" ] && [ -n "$sec" ] || return 0
+  # ⛔ CONTAINMENT, NOT EQUALITY — the same granularity gap the row arm was measured to have: an
+  # EXTENDED copy (`"<the contract's reason>" — plus one more clause of its own`) is the canonical
+  # payload with more text after it, so an equality test misses it while the parser accepts the line
+  # (it only asks for a non-placeholder reason). Containment is safe in THIS direction and only this
+  # one: a reviewer's honest reason would have to contain the contract's ENTIRE example reason
+  # verbatim, which is a copy. The reverse test (a TRUNCATED copy) is deliberately NOT applied: a
+  # genuine reason that ends in the contract's own generic tail ("… and no executable assertion") is
+  # an authored sentence naming the files of THIS diff, and refusing it is a false block — the
+  # direction that costs a review, and the direction this file protects in every other arm.
+  # A payload shorter than 16 letters/digits is compared EXACTLY instead, because a short one could
+  # occur inside honest prose; the contract's own reason is 54.
+  while IFS= read -r _ec; do
+    [ -n "$_ec" ] || continue
+    if [ "${#_ec}" -ge 16 ]; then
+      _eh="$(printf '%s\n' "$sec" | grep -F -- "$_ec" 2>/dev/null)" || true
+    else
+      _eh="$(printf '%s\n' "$sec" | grep -Fx -- "$_ec" 2>/dev/null)" || true
+    fi
+    if [ -n "$_eh" ]; then printf '%s\n' "$_eh"; return 0; fi
+  done <<< "$canon"
+  return 0
+}
+
+# ── 5a4) THE RECORDER'S UNCONDITIONAL VETO ARMS ARE SCANNED HERE, BEFORE ANYTHING IS POSTED ────
+# ⛔ THE REVIEWER'S OWN PROSE NOW RIDES INSIDE THE EVIDENCE BODY (P3, fresh review at a8767f401). The
+# MUTATION ATTRIBUTION section is published VERBATIM in the comment `record-review.sh` reads, and that
+# recorder's arm (1) is an UNCONDITIONAL substring scan for lane Step-8 markers (`unresolved issues`,
+# `<n> issues remain`, `auto-fix stalled`, `requires human attention`, `test review capped`,
+# `[NO-LOOP-BUDGET]`). A reviewer row that happens to use one of those phrases — entirely possible in
+# a mutation table, where "N issues remain" is ordinary English — makes the recorder refuse a
+# genuinely clean verdict with exit 9 AFTER the review was paid for and AFTER the artifact was
+# posted, which is the #1964 false-diagnosis class in the one place this file controls.
+# The seam cannot rewrite the section (its caption says "quoted verbatim") and cannot weaken the
+# recorder (that arm is what keeps a lane from minting `clean` by naming its own aborted Step-8
+# comment). What it CAN do is refuse PRE-POST with the cause named, so nothing false is published and
+# the operator is told the wording collided instead of being sent to read the recorder. The phrase
+# list is the recorder's own, copied once and pinned by a tripwire in tests/review-pr/run.sh, which
+# fails if `record-review.sh` gains a token this list does not carry — a mirror that cannot silently
+# drift is the only acceptable second copy.
+RECORDER_VETO_RE='auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[NO-LOOP-BUDGET\]'
+
+# ── 5a4b) THE RECORDER'S TWO OTHER BODY-SCANNING ARMS, MIRRORED PRE-POST ─────────────────────────
+# ⛔ THE 5a4 MIRROR COPIES ONE ARM AND THE RECORDER SCANS WITH THREE (P3, fresh review at a8767f401).
+# `record-review.sh` also triggers on, and can then REFUSE, two shapes this seam would still publish:
+#
+#   (a) `[ADVERSARIAL-BOUND]` — `record-review.sh:2091` fires on the token ALONE and then demands a
+#       parseable disclosure; its arm (iii) REFUSES a marker line carrying no `residuals=` field. A
+#       reviewer's mutation row that merely NAMES the token (very natural: a row about a disclosure
+#       guard) is then refused AFTER the review was paid for and AFTER the artifact was posted.
+#   (b) an `Outcome:` declaration that is non-clean, or that names blocking findings. `record-review.sh`
+#       reads these with `OC_DECL_RE` in arm (1a) and arm (1c). A row
+#       quoting such a declaration is lexically identical to a declaration — the recorder's own F5
+#       residual says so — so IT refuses, and the seam's job is to refuse PRE-POST instead.
+#       ⛔ CITED BY SYMBOL, NOT BY LINE (a fresh review at 40d18e1a9 measured this sentence's `:1618`
+#       pointing into arm (1c)'s own comment block five lines above its grep — the exact rot the
+#       harness warns about elsewhere). Arm names do not move; line numbers do.
+#
+# ⛔ WHY THIS IS A SECOND MIRROR AND NOT A WIDENING OF `RECORDER_VETO_RE`. That variable is pinned
+# BYTE-IDENTICAL to the recorder's arm-(1) regex by a tripwire in tests/review-pr/run.sh, which is what
+# makes the copy unfalsifiable. Widening it would either break that pin or force the tripwire to compare
+# a substring — trading a live drift check for one saved variable. Each arm keeps its own copy, and each
+# copy gets its own pin.
+#
+# ⛔ THE MIRROR MUST NOT FALSE-BLOCK, and that is why it is not the naive `outcome.*blocking`. The
+# recorder's arm (1c) evaluates ESCAPE (a): a count that is zeroed or negated, and a count followed by
+# `fixed`/`resolved`/`closed`/`addressed`, is ADMITTED (`Outcome: CLEAN — 2 blocking findings were
+# fixed` records). A mirror blind to that escape would refuse an artifact the recorder ACCEPTS — the
+# over-block direction this file protects against everywhere else, and here it costs a paid review.
+# `_RECORDER_VETO2_FIXED_RE` carries the escape. The residue that remains is stated, not hidden: a
+# declaration naming a LIVE count in wording this escape does not recognise is refused pre-post where
+# the recorder might have parsed it as zeroed — the safe polarity, and it costs a re-worded re-run
+# rather than a false `clean`.
+#
+# ⛔ AND IT CANNOT FIRE ON A WELL-FORMED ARTIFACT. A CLEAN artifact's own outcome line is the seam's
+# `**Outcome: clean**` (no blocking noun, no P0/P1 tag), and a legitimate capped review discloses
+# `[ADVERSARIAL-BOUND] cycles=N threats=K covered=K residuals=…` WITH the `residuals=` field. Both pass.
+# Only a collision in the reviewer's own verbatim text is caught, which is the whole point.
+_RECORDER_OC_NBSP=$'\xc2\xa0'                                                    # record-review.sh's OCR_NBSP
+_RECORDER_OC_DECL_RE="(^|[^[:alnum:]])outcome[[:space:]${_RECORDER_OC_NBSP}]*[*_[:space:]${_RECORDER_OC_NBSP}]*([:]|[：])" # = record-review.sh's OC_DECL_RE, byte-for-byte
+_RECORDER_VETO2_NONCLEAN_RE='(not|non|no)[[:space:]_-]*clean'                        # arm (1a)
+_RECORDER_VETO2_BLOCKING_RE='block(ing|ers?)|[pP][01]([^0-9]|$)'                     # arm (1c), noun or severity
+_RECORDER_VETO2_FIXED_RE='(were|was|been|already|is|are)?[[:space:]]*(fixed|resolved|closed|addressed)'
+_RECORDER_AB_TOKEN_RE='\[ADVERSARIAL-BOUND\]'                                       # record-review.sh:2091
+_RECORDER_AB_FIELD_RE='residuals='                                                    # arm (iii)'s mandatory field (record-review.sh extracts `residuals=[[:space:]]*…`)
+
+# recorder_veto2_hit <file> -> the colliding LINE on stdout (empty = nothing the recorder refuses)
+recorder_veto2_hit() { # <file>
+  local _f="${1:-}" _l
+  [ -n "$_f" ] && [ -f "$_f" ] || return 0
+  # (b) an `Outcome:` DECLARATION that is non-clean or names blocking findings. Anchored on the
+  # declaration label the way the recorder anchors it, so prose ABOUT an outcome stays untouched.
+  while IFS= read -r _l; do
+    grep -qiE "$_RECORDER_OC_DECL_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_VETO2_NONCLEAN_RE" <<<"$_l" && { printf '%s\n' "$_l"; return 0; }
+    grep -qiE "$_RECORDER_VETO2_BLOCKING_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_VETO2_FIXED_RE" <<<"$_l" && continue
+    printf '%s\n' "$_l"; return 0
+  done < "$_f"
+  # (a) the adversarial-bound token with NO `residuals=` field — arm (iii)'s unconditional refusal.
+  while IFS= read -r _l; do
+    grep -qiE "$_RECORDER_AB_TOKEN_RE" <<<"$_l" || continue
+    grep -qiE "$_RECORDER_AB_FIELD_RE" <<<"$_l" && continue
+    printf '%s\n' "$_l"; return 0
+  done < "$_f"
+  return 0
+}
 
 # ── 5b) clean => CONFIRM THE HEAD HAS NOT MOVED, **BEFORE** ANY ARTIFACT EXISTS ──
 # ⛔ THIS RUNS BEFORE THE COMMENT (P2, seventh fresh review). It used to run after the
@@ -2605,6 +3249,18 @@ if [ "$VERDICT" = clean ]; then
       printf 'The reviewer also left %s non-blocking note(s), quoted verbatim in comment %s on this PR — the `follow_up` disposition, not a verdict input (a note may repeat a severity label the reviewer quoted; it never blocks).\n' \
         "$(printf '%s\n' "$FINDINGS" | grep -c . )" "$NOTES_CID"
     fi
+    # ── THE NON-VACUITY BLOCK, IN THE ARTIFACT (agent-infra#3987) ───────────────────────────
+    # `record-review.sh` will not mint a clean record over an artifact without it (#3442), and this
+    # template is the artifact — so the reviewer's own section is published here, VERBATIM, with its
+    # provenance stated. Nothing is re-worded and nothing is invented: the row claims are the
+    # reviewer's, and the next check (after this block) is the recorder's own predicate run on these
+    # exact bytes. An empty section is not silently dropped — the check below refuses the run.
+    if [ -n "${MUTATION_SECTION_SEEN:-}" ]; then
+      printf '### Non-vacuity — the reviewer’s own MUTATION ATTRIBUTION block (agent-infra#3442)\n\n'
+      printf 'Quoted verbatim from the reviewer’s output for this revision; the recorder validates its shape\n'
+      printf '(presence of a mutant per new assertion, or an explicit exemption), never its substance.\n\n'
+      printf '%s\n' "$MUTATION_SECTION_SEEN"
+    fi
   } > "$COMMENT_FILE"
 else
   {
@@ -2623,6 +3279,170 @@ else
 fi
 
 POST_CID=""
+
+# ⛔ THE PRE-POST GATE THAT MAKES THE DOWNSTREAM REFUSAL UNREACHABLE (agent-infra#3987). The artifact
+# above is exactly what `record-review.sh --evidence` will read, so the recorder's OWN predicate is
+# run on these exact bytes (`brief-gate.sh --mutation-missing`, the same parser the recorder calls)
+# BEFORE they are published. A non-empty answer means the recorder would refuse the artifact it is
+# about to be handed — so the run stops here, naming the block, with NOTHING posted: a `CLEAN`
+# comment the recorder rejects is a false artifact on the PR and a paid review reported as a success
+# that never happened. ⛔ A CANNOT-VERIFY IS NEVER A PASS (this file's posture everywhere else, and
+# record-review.sh's `ma_rc` arm): a validator that does not answer refuses the run rather than
+# waving the artifact through, because the only thing silence could mean here is "the check did not
+# run" — and the failure it would hide is a merge permanently blocked by a missing paragraph.
+if [ "$VERDICT" = clean ]; then
+  # ⛔ THE VALIDATOR IS PROVED TO BE ABLE TO REFUSE BEFORE ITS SILENCE IS READ AS A PASS (P3, fresh
+  # review). `_mv_miss` being EMPTY is the "accepted" answer, so a copy that answers empty for
+  # EVERYTHING clears this gate for any artifact — the check is inert while looking green, which is
+  # exactly the "silence could mean the check did not run" case argued against one line above.
+  # The canary is a body the predicate MUST refuse, so it cannot be satisfied by the same bug that
+  # makes the real answer empty. It sits HERE and not in the preflight, deliberately: the preflight
+  # carried a sibling probe once and it PREEMPTED this file's own FINDINGS-scanner refusal (measured:
+  # with a broken `awk` the §Q arm that must exit 10 exited 9 from the probe instead, giving one
+  # failure two differently-named refusals). By this point the scan has already run, so nothing is
+  # preempted.
+  _mv_canary=""; _mv_canary_rc=0
+  _mv_canary="$(printf 'x\n' | bash "$BRIEF_GATE" --mutation-missing - 2>/dev/null)" || _mv_canary_rc=$?
+  if [ "$_mv_canary_rc" -ne 0 ] || [ -z "${_mv_canary//[[:space:]]/}" ]; then
+    err "$PROG: the non-vacuity validator '$BRIEF_GATE' answered NOTHING for a body it MUST refuse (--mutation-missing on a block-less body: rc=$_mv_canary_rc, output '${_mv_canary:-<empty>}') — so its empty answer on the artifact proves nothing, and the pre-post gate would wave through any comment at all."
+    err "  This is HARNESS SKEW, not a review defect and not a reviewer error: refresh that copy (bash scripts/orchestrator-harness/install.sh), then re-run."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the non-vacuity validator cannot refuse anything — its silence is not a pass"
+  fi
+  # ⛔ VALIDATE THE BYTES THAT WILL ACTUALLY BE POSTED, NOT THE FILE THEY WERE COMPOSED FROM (P3,
+  # fresh review). `post_comment` publishes `redact_file`'s output (`$RUN_DIR/comment-post.md`), not
+  # `$COMMENT_FILE`, so validating the un-redacted file checked bytes the recorder never reads: a
+  # redaction edit that touched the block (a `SECRET_VALUES` substring replacement, the private-key
+  # range collapse, the trailing-newline collapse) was invisible to this gate while `record-review.sh`
+  # read the posted bytes. `redact_file` is a pure function of (source, environment), so the same
+  # input yields the same output on the `post_comment` side — the validated bytes ARE the posted
+  # bytes. If the body cannot be built, nothing is posted anyway, so that is exit 9, not 11.
+  MV_BODY="$RUN_DIR/comment-validate.md"
+  redact_file "$COMMENT_FILE" "$MV_BODY" \
+    || die "$E_RECORD" "could not build the redacted comment body from $COMMENT_FILE, so the bytes that would be posted could not be validated — NOTHING was posted and NO record was written (transcript: $TRANSCRIPT)"
+  _mv_rc=0
+  _mv_miss="$(bash "$BRIEF_GATE" --mutation-missing "$MV_BODY" 2>/dev/null)" || _mv_rc=$?
+  # ⛔ THE CONTRACT'S OWN WORKED ROW IS NOT EVIDENCE (P1, fresh review — see 5a3 for the measurement).
+  # The parser ACCEPTS a live copy of it, so this is the only arm that can refuse it: the section's
+  # data rows are compared against the canonical text THIS RUN handed the reviewer, and a row that is
+  # the contract's own example is a paste-back, not an attribution for this diff.
+  _pb_rows="$(mutation_pasteback_rows "${MUTATION_SECTION_SEEN:-}")"
+  _pb_exempt="$(mutation_pasteback_exempt "${MUTATION_SECTION_SEEN:-}")"
+  # ⛔ THE CELL-GRANULARITY ARM (see `mutation_pasteback_cells` for the measurement): a copy that ADDS
+  # a cell, DROPS its last cell, or is PREFIXED with a word is still the contract's worked row to the
+  # recorder's parser, and only a whole-row equality test sits below it. It runs AFTER `_pb_rows` so
+  # the more specific refusal (the row verbatim) wins the diagnosis when both would fire.
+  _pb_cells="$(mutation_pasteback_cells "${MUTATION_SECTION_SEEN:-}")"
+  if [ -n "$_pb_exempt" ]; then
+    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED \`NO NEW ASSERTIONS:\` LINE — the example reason this run handed it in the shape it asked it to fill in:"
+    printf '%s\n' "$_pb_exempt" | while IFS= read -r _pb_l; do err "    NO NEW ASSERTIONS: $(printf '%s' "$_pb_l" | cut -c1-200)"; done
+    err "  That reason names the contract's example files, not this diff — and it was GIVEN to the reviewer by this run, so it is a PASTE-BACK, never the reviewer's claim. The recorder's parser answers EMPTY (accepted) for a live copy, which is exactly why it cannot be left to the parser: minting \`clean\` on the harness's own example exemption is the false-PASS class agent-infra#3442 exists for."
+    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt says the exemption line is the reviewer's to write about THIS diff."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact's exemption line is the contract's own worked example, pasted back — the parser accepts that shape, so refusing it is this run's job"
+  fi
+  if [ -n "$_pb_rows" ]; then
+    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPUBLISHES THE CONTRACT'S OWN WORKED EXAMPLE ROW — the row the prompt handed it as the shape to fill in:"
+    printf '%s\n' "$_pb_rows" | while IFS= read -r _pb_l; do err "    $(printf '%s' "$_pb_l" | cut -c1-200)"; done
+    err "  That row names an assertion that has nothing to do with this diff, and it was GIVEN to the reviewer by this run — so it is a PASTE-BACK, never the reviewer's claim. The recorder's parser accepts the shape (`brief-gate.sh --mutation-missing` answers empty for it), which is exactly why it cannot be left to the parser: minting `clean` on the harness's own example is the false-PASS class agent-infra#3442 exists for, and agent-infra#3987 is what put a complete copyable row into the prompt."
+    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact's attribution row is the contract's own worked example, pasted back — the parser accepts that shape, so refusing it is this run's job"
+  fi
+  if [ -n "$_pb_cells" ]; then
+    err "$PROG: the reviewer's MUTATION ATTRIBUTION section REPRODUCES THE CONTRACT'S OWN WORKED EXAMPLE ROW cell for cell — the row this run handed it as the shape to fill in, with a cell added, dropped or a word in front of it:"
+    printf '%s\n' "$_pb_cells" | while IFS= read -r _pb_c; do [ -n "$_pb_c" ] && err "    canonical cell: $(printf '%s' "$_pb_c" | cut -c1-120)"; done
+    err "  Those cells ARE the contract's example (the assertion, the mutant and the observation it prints), and they were GIVEN to the reviewer by this run — so this is a PASTE-BACK, never a claim about THIS diff. The recorder's parser accepts it (it asks only for a header naming the three columns and one row of three cells), which is exactly why it cannot be left to the parser: minting \`clean\` on the harness's own example is the false-PASS class agent-infra#3442 exists for, and a whole-row equality test misses every copy that edits one cell."
+    err "  This is a REVIEWER-SIDE paste, not a code defect: the review has to be re-run, and the prompt already says the contract is a SHAPE, not a template to copy back."
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_VACUOUS" "the CLEAN artifact reproduces the contract's own worked example row (two or more of its distinctive cells) — the parser accepts that shape, so refusing it is this run's job"
+  fi
+  MS_CAUSE=""   # set by the empty-extraction arm below; `set -u` means it must exist before use
+  if [ "$_mv_rc" -ne 0 ] || [ -n "$_mv_miss" ]; then
+    if [ -z "${MUTATION_SECTION_SEEN:-}" ]; then
+      # ⛔ NAME THE CAUSE OF THE EMPTY EXTRACTION INSTEAD OF ASSERTING ONE (P3, same class as the
+      # INDENTED sentence two arms down). "Its output carries NO '## MUTATION ATTRIBUTION' section" is
+      # FALSE for the likeliest paste this PR created: a reviewer that echoes the canonical block
+      # inside a fence, or inside a whole-block indent, HAS written one — every such heading is
+      # QUOTED, so the extractor (correctly) finds no LIVE one and the statement above libels the
+      # review. Two causes, measured by the extractor's own quoting pass rather than guessed: a paste
+      # (quoted → `quoted`) and a genuine omission (`none`). The remedy differs — a paste needs the
+      # reviewer told not to fence it, an omission needs the reviewer told it is missing — so the
+      # sentence is chosen by measurement, like the INDENTED and REDACTION arms below it.
+      _ms_state="$(mutation_section_from "$LOG" --state 2>/dev/null)"
+      MS_CAUSE=""
+      if [ "$_ms_state" = "quoted" ]; then
+        MS_CAUSE="quoted-material"
+        err "$PROG: the reviewer concluded CLEAN and DID write a '## MUTATION ATTRIBUTION' heading — but it sits inside QUOTED MATERIAL (a fenced block, or four-or-more-column indent), so it is the canonical shape this run handed it PASTED BACK, not the reviewer's own claim. record-review.sh reads quoted material as quoted, never as the claim (agent-infra#3442), so the comment this run would post could never be recorded."
+        err "  This is a REVIEWER-SIDE PASTE, not a code defect and not a failure of this script's extraction: refusing it is the point — publishing a quote as the live claim is exactly the false-PASS class #3987 exists for (the harness's own worked row would be minted as the reviewer's evidence). Re-run the review, and ask for the block at COLUMN 0, OUTSIDE any fence or indent."
+      else
+        err "$PROG: the reviewer concluded CLEAN but its output carries NO '## MUTATION ATTRIBUTION' section, so the comment this run would post could never be recorded: record-review.sh refuses a clean artifact without that block (agent-infra#3442), which is why agent-infra#3987 exists."
+        err "  This is a REVIEWER OMISSION, not a code defect — the prompt this run composed carries the canonical shape (\`bash $BRIEF_GATE --mutation-section\`), so the review is intact and a re-run is the remedy."
+      fi
+    else
+      err "$PROG: the reviewer DID write a MUTATION ATTRIBUTION section but the composed artifact does not satisfy the recorder's parser ($(printf '%s' "$_mv_miss" | tr '\n' ' ')) — refusing to post an artifact record-review.sh would reject."
+      # ⛔ NAME THE CAUSE INSTEAD OF ASSERTING ONE (P3, fresh review). This used to say, unconditionally,
+      # "a defect in THIS script's section extraction, not a reviewer error" — and the LIKELIEST such
+      # mismatch is not a script defect at all: the canonical block shows the exemption line as an
+      # INDENTED code block, so a reviewer who copies the shape faithfully writes an indented
+      # `NO NEW ASSERTIONS:` and the parser skips it as QUOTED material (`MUTATION-EXEMPTION-INDENTED`).
+      # That sent the operator to re-read this script instead of re-running the reviewer. The token
+      # decides the sentence, and the byte-level comparison below separates the one remaining cause
+      # (redaction) from extraction.
+      case "$(printf '%s' "$_mv_miss" | tr '\n' ' ')" in
+        *MUTATION-EXEMPTION-INDENTED*)
+          err "  Cause: the exemption line is INDENTED four or more columns (MUTATION-EXEMPTION-INDENTED). To the parser that is an indented CODE BLOCK — quoted material, never a live claim — so the section reads as block-less. That is a REVIEWER-SIDE paste, not a script defect: re-run the review and ask for \`NO NEW ASSERTIONS: <why>\` at COLUMN 0, outside any indent." ;;
+        *)
+          # The un-redacted artifact passing while the posted bytes fail isolates redaction, and this is
+          # the only place both files exist, so the distinction is measured rather than guessed.
+          _mv_raw=""; _mv_raw_rc=0
+          _mv_raw="$(bash "$BRIEF_GATE" --mutation-missing "$COMMENT_FILE" 2>/dev/null)" || _mv_raw_rc=$?
+          if [ "$_mv_raw_rc" -eq 0 ] && [ -z "$_mv_raw" ]; then
+            err "  Cause: THE REDACTION STEP broke the block — the composed artifact satisfies the parser, the body that would be POSTED does not. A credential shape or a known secret value inside the block was replaced, or the private-key range collapse / trailing-newline collapse rewrote it. That is neither a reviewer error nor an extraction defect: re-run, and if it recurs the reviewer's block quotes a secret shape that must be removed from its output."
+          else
+            err "  Cause not isolated by the parser's token: either this script's section extraction cut the section somewhere the parser does not accept, or the reviewer's block is malformed. The reviewer's section is in $LOG — compare it before reading this script."
+          fi ;;
+      esac
+    fi
+    err "  Recorded: one row per NEW assertion — assertion | mutant (the edit that reverts the fix) | reddened row | observed — or the single line 'NO NEW ASSERTIONS: <why>' at COLUMN 0 when the diff adds none. A CLEAN verdict without it is INCOMPLETE, not clean."
+    err "  The exact shape: bash $BRIEF_GATE --mutation-section"
+    err "  NOTHING was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    # The summary line names the same cause the detail lines above measured — "carries no block" is a
+    # false statement of the QUOTED case, and the operator reads the die line in logs far more often
+    # than the lines above it.
+    _mv_what="the CLEAN artifact carries no MUTATION ATTRIBUTION block"
+    [ -n "$MS_CAUSE" ] && _mv_what="the CLEAN artifact carries no LIVE MUTATION ATTRIBUTION block — the heading is present but QUOTED ($MS_CAUSE), so a paste-back was never the reviewer's claim"
+    die "$E_VACUOUS" "$_mv_what ($(printf '%s' "${_mv_miss:-validator-unanswerable rc=$_mv_rc}" | tr '\n' ' ')) — record-review.sh would refuse it, so it was never posted; re-run the review"
+  fi
+  # ⛔ THE RECORDER'S UNCONDITIONAL VETO ARMS, READ ON THE BYTES ABOUT TO BE POSTED (P3, fresh review —
+  # see 5a4 for why this is a pre-post refusal and not a rewrite of the section). A hit means the
+  # recorder would refuse this artifact with exit 9 after it was published, which is a false
+  # "evidence could not be verified" diagnosis on a review that concluded clean. Named here, before
+  # posting, with the colliding phrase and its remedy.
+  _vt_hit=""
+  _vt_hit="$(grep -oiE "$RECORDER_VETO_RE" "$MV_BODY" 2>/dev/null | head -1)" || true
+  if [ -n "$_vt_hit" ]; then
+    err "$PROG: the CLEAN artifact contains '$_vt_hit', which is one of the UNCONDITIONAL veto phrases record-review.sh scans its evidence body for (arm 1: a lane's Step-8 stalled/capped/human-input marker). That arm refuses a clean mint on the phrase ALONE, so posting this artifact would buy a review whose record step is already known to reject it."
+    err "  The phrase is inside the reviewer's OWN text — the MUTATION ATTRIBUTION section is published verbatim, and a mutation row legitimately uses words like 'unresolved issues' or 'N issues remain'. This is a WORDING COLLISION, not a code defect and not a finding: the recorder's arm is right to be unconditional (that is what stops a lane minting `clean` off its own aborted Step-8 comment), and this run may not weaken it or re-word the reviewer's claim."
+    err "  Nothing is posted and NOTHING was recorded. Re-run the review; if the same phrase comes back, the reviewer has to state the row without it."
+    die "$E_VACUOUS" "the CLEAN artifact carries the recorder's unconditional veto phrase '$_vt_hit' in the reviewer's own text — record-review.sh would refuse it, so it was never posted"
+  fi
+  # ⛔ THE RECORDER'S TWO REMAINING BODY-SCANNING ARMS (P3, fresh review at a8767f401 — see 5a4b for
+  # the whole rationale and for the escape this mirror carries). The 5a4 scan above copies ONE arm; a
+  # reviewer row that merely NAMES `[ADVERSARIAL-BOUND]`, or that quotes an `Outcome:` declaration
+  # naming blocking findings, is refused by the recorder AFTER the money is spent and AFTER the
+  # artifact is published — which is the exact failure 5a4 exists to move in front of the post.
+  _vt2_line=""
+  _vt2_line="$(recorder_veto2_hit "$MV_BODY" 2>/dev/null | head -1)" || true
+  if [ -n "$_vt2_line" ]; then
+    err "$PROG: the CLEAN artifact carries a shape record-review.sh's OTHER body-scanning arms refuse — one of (i) an [ADVERSARIAL-BOUND] marker line with no 'residuals=' field, or (ii) an 'Outcome:' declaration that is non-clean or names blocking findings:"
+    err "    $(printf '%s' "$_vt2_line" | cut -c1-220)"
+    err "  It is inside the reviewer's OWN text — the MUTATION ATTRIBUTION section is published verbatim, so a row that NAMES the disclosure token, or quotes a blocking Outcome: declaration, is lexically the thing those arms refuse. This is a WORDING COLLISION, not a code defect: the recorder is right to read a declaration literally, and this run may not weaken it or re-word the reviewer's claim."
+    err "  Nothing is posted and NOTHING was recorded. Re-run the review; if the same wording comes back, the row has to describe the shape without reproducing it."
+    die "$E_VACUOUS" "the CLEAN artifact carries a shape record-review.sh's adversarial-bound or Outcome: arm would refuse — record-review.sh would refuse it, so it was never posted"
+  fi
+fi
+
 if post_comment "$COMMENT_FILE"; then
   CID="$POST_CID"
 else

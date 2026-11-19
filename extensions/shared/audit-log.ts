@@ -8,7 +8,7 @@
  *
  * Schema per line: { ts, event, extension, reason?, session_cwd, ...extra }
  *   ts          — ISO-8601 timestamp (stamped here)
- *   event       — "gate_bypass" | "review_dispatch" | "merge_gate_block" | "merge_gate_pass" | "review_record_collision" | "gate_block" | "gate_pass"
+ *   event       — "gate_bypass" | "review_dispatch" | "merge_gate_block" | "merge_gate_pass" | "review_record_collision" | "gate_block" | "gate_pass" | "marker_minted_inert"
  *   extension   — name of the extension that emitted the event
  *   reason      — short tag (escape_hatch, per_command_escape_hatch, no_review_record, no_reviewers_dispatch, ...)
  *   session_cwd — process.cwd() at emit time (the session's working directory)
@@ -105,6 +105,12 @@ export const GATE_EVENT_NAMES = [
   // report, not only by whoever scrolls back through the session prose. This is the ONE surface
   // that knows a session ran unguarded, so it may not be a `console.warn` nobody reads.
   "guard_degraded",
+  // #4101 review (P3): an escape-marker MINT whose bytes landed but which the READ side refused —
+  // the marker is inert, so no window opened. Recorded under its OWN name rather than
+  // `gate_bypass`, because `gate_bypass` is the row an operator queries to answer "why did an
+  // escape window exist": a bypass row for a refused mint is a bypass recorded that was never
+  // granted, and nothing after the TTL would distinguish it from a real one.
+  "marker_minted_inert",
 ] as const;
 export type GateEventName = (typeof GATE_EVENT_NAMES)[number];
 // Resolved lazily per call (not at module load) so a $HOME change — tests,

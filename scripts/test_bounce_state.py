@@ -787,6 +787,14 @@ def test_turn_end_actually_NUDGES_a_lane_whose_bounce_went_stale(monkeypatch, tm
     monkeypatch.setattr(te, "session_path", lambda _sid: None)
     monkeypatch.setattr(te.bs, "bounce_view",
                         lambda _r, _n, _run: bs.parse(INCIDENT))
+    # ⛔ THE ROUTER IS A SEPARATE GATE AND IT IS DRIVEN IN ITS OWN SUITE. `main()` consults
+    # `_triage` (#4046) BEFORE this loop, so leaving it to the BOX made this leg answer as a
+    # FAILURE wherever the farmed router is installed: `liveness`/`triage` import from
+    # `$HOME/.pi/agent/scripts/fleet`, the fake lane-status row below carries no transcript for
+    # the router to grade, it answers "not continue", and the nudge never prints. Measured on
+    # one commit: RED on a farmed box, green on a bare one — a suite whose verdict is a property
+    # of the host. Pinning it off states the environment this test is about (the LABEL guard).
+    monkeypatch.setattr(te, "_triage", None)
     assert te.main(["--dry-run"]) == 0
     assert "WOULD NUDGE L1" in capsys.readouterr().out
 
@@ -812,6 +820,11 @@ def test_turn_end_still_withholds_the_nudge_for_a_CURRENT_bounce(monkeypatch, tm
     monkeypatch.setattr(te, "session_path", lambda _sid: None)
     monkeypatch.setattr(te.bs, "bounce_view",
                         lambda _r, _n, _run: bs.parse(INCIDENT[:9]))
+    # Pinned off for the reason given in the leg above, and here it is worse than a false RED:
+    # with a live router this control passed VACUOUSLY — nothing was printed because the router
+    # refused the row, not because the label guard withheld the nudge — so the pair could not
+    # tell the two apart on any farmed box.
+    monkeypatch.setattr(te, "_triage", None)
     assert te.main(["--dry-run"]) == 0
     assert "WOULD NUDGE" not in capsys.readouterr().out
 
