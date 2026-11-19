@@ -124,6 +124,11 @@ below grows with the suite, so this header never claims a case that does not exi
      runner's stamp is pruned on the pass that sees it recover, so its NEXT death is not held on a
      restart from an hour earlier. T70 — the per-runner read that justifies the restart has its own
      fail-closed arm: unreadable ⇒ nothing restarted, the hold is published, and the pass is RED.
+     T71 — the operator doc's "why the wait stays at 60 s" cited `TimeoutStartSec=900`, a bound that
+     belongs to a DIFFERENT unit (`scripts/install-lane-arm-timer.sh`'s `eldato-lane-arm`); this
+     unit's own two carriers both say 5400, so the reason read as false on the first check. The case
+     pins the doc's cited number against BOTH carriers (template + render), which also catches a
+     render that drifts from the file the installer renders.
 
 ⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
 and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
