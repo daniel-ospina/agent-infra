@@ -5217,6 +5217,16 @@ MUTATIONS = [
         "with no actions field, after a registration may already have been destroyed",
     ),
     Mutation(
+        "T71",
+        '            "TimeoutStartSec=5400",',
+        '            "TimeoutStartSec=3600",  # MUTATION: the render drifts from the documented bound',
+        "`render_unit`'s literal no longer matches the bound the operator doc cites and the shipped "
+        "template carries, so the one arm that pins the RENDER carrier — the copy of the number "
+        "`--install-unit` actually writes — reports a pass while an installed unit ships a bound the "
+        "doc contradicts. (The doc's own claims cannot be mutated from here: the harness rewrites the "
+        "module, and T71's other artifact is the doc.)",
+    ),
+    Mutation(
         "T47",
         '            "TimeoutStartSec=5400",',
         '            "TimeoutStartSec=1800",  # MUTATION: shorter than a legitimate pass',
@@ -6690,7 +6700,12 @@ def t71_doc_cites_the_shipped_unit_timeout():
         # carries a numbered list, and a `-`-bulleted one renders identically for a reader, so an
         # item boundary derived from `\n* ` alone left both forms exempting a wrong number — measured,
         # GREEN. `LIST_MARKER` is the whole family (`*`, `-`, `+`, `1.`, `1)`).
-        LIST_MARKER = re.compile(r"\n(?:[*+-] |\d+[.)] )")
+        # ⛔ AND INDENTATION IS PART OF THE MARKER (round-6 review, finding 1): a NESTED item is
+        # written `  - ` / `  1. `, so a column-0-only marker derived the WHOLE outer bullet as the
+        # item and let a sibling nested item that names another unit exempt a wrong number — measured,
+        # GREEN, both shapes. The leading `[ \t]*` is what closes that, and the shipped doc is
+        # unaffected (its bullets are column-0 with two-space continuation lines).
+        LIST_MARKER = re.compile(r"\n[ \t]*(?:[*+-] |\d+[.)] )")
         marker_before = [m.start() for m in LIST_MARKER.finditer(doc, 0, at)]
         start = max(doc.rfind("\n\n", 0, at), marker_before[-1] if marker_before else -1)
         marker_after = LIST_MARKER.search(doc, at)
