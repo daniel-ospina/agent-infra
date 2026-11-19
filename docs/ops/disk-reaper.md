@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-18
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, worktrees, systemd
+aboutObjects: agent-infra, issue-2032, issue-4168, disk-reclaim, uv-cache, runner-cache, lane-venvs, worktrees, systemd
 ---
 
 # Disk reaper (#2032)
@@ -30,6 +30,7 @@ only code that deletes:
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 | `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
 the shipped 3600 s was half of it — see the class note below), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
+| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB) and age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d) |
 
 ## Why one entry point
 
@@ -785,6 +786,106 @@ source of truth.
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
 `open-pr`/`dirty` proofs) and everything the ceiling and the pass's time bound leave for the next run.
 
+### `class=runner-cache` — the CI runners' per-install PACKAGE CACHE (#4168)
+
+**MEASURED (2026-11-19, five cells).** Every runner install keeps its own unbounded `.cache` under the
+install root, and nothing reaped it:
+
+```
+cell-4  /opt/gh-runner-x64/.cache        40.7 GB
+        /opt/gh-runner-cell4/.cache      38.1 GB
+        /opt/gh-runner-x64-4/.cache      23.5 GB
+cell-2  /opt/gh-runner-x64-4/.cache      50.1 GB   ← single largest
+cell-1  five installs, 17.3 / 27.1 / 21.6 / 19.8 / 13.4 GB
+cell-3  one install, 42.7 GB
+cell-5  four installs, 17.9–36.3 GB
+```
+
+A one-pass `rm -rf /opt/gh-runner-*/.cache` reclaimed **≈445 GB across five boxes** (cell-4 went
+2.3 GB → 116 GB free) and **no work was lost**: a package cache is content-addressed and regenerates.
+
+⛔ **IT IS A PIPELINE DEFECT, NOT TIDINESS.** The runner ceiling on a cell is DISK-BOUND —
+`per_runner_disk_mb ≈ 8409` and `DISK_RESERVE_MB = 20480` in
+`scripts/orchestrator-harness/runner_autoscale.py` — so a box needs ~20 GB reserve plus ~8.4 GB per
+runner, and at 2–8 GB free `by_disk` pins the ceiling to **1**. The box therefore freezes its own
+growth (#4004 is the same symptom arriving from a wedged directory instead of a cache). None of the
+five classes above matched the sink: `uv` bounds the MACHINE-global caches, `venv` the lane envs,
+`worktree` the checkouts, `duplicate-install` surplus install COPIES, and `runner-work` the `_work`
+checkouts — so 445 GB sat in none of the traffic classes while the hourly pass reported
+`ignored-artifact:89 … live-process:2` and reclaimed **187 MB**: correct by its own rules, and
+irrelevant to a 40 GB cache.
+
+**What is reclaimed, and what is never touched.** A directory is an INSTALL only when it carries
+`bin/Runner.Listener` — the marker, never the glob. A seam one component short has already swept a
+runner install tree in this family (`REAPED …/gh-runner-x//bin`), so the candidate set is decided by a
+marker, and a wide default costs a `stat` and no delete surface.
+
+| path | rule |
+|---|---|
+| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) |
+| `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
+| `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) |
+| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, and only when NO install on the box has a job running |
+
+⛔ The install tree itself is never a candidate: not `bin/`, `config/`, `externals/`, not
+`_work/<checkout>` (that is `class=runner-work`'s sink, with its own mtime floor), and not `_tool`,
+`_actions` or `_update` (the runner's cross-job caches — reaping those makes every later CI run
+re-download, which is a different trade and not this class's to make).
+
+**The one correctness property: never delete a cache a live job is using.** A cache deleted mid-job
+fails the job, so an install with a job in flight is skipped WHOLE and reported — `skipped-live`, with
+the witness named — never partially reaped. The verdict comes from the process table, the only witness
+that can answer it:
+
+* `bin/Runner.Worker` in the install's process list → **a job is running** (`reason=worker-running`);
+* `bin/Runner.Listener` present **and** content under `_work` written within
+  `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is running or has just started
+  (`reason=listener+busy-work`) — the conservative direction, and it is bounded by that knob;
+* a listener with no worker and nothing fresh under `_work` → the install is BETWEEN jobs: the cache
+  is idle and the next job re-downloads what it needs.
+
+⛔ **AN UNREADABLE PROCESS CENSUS IS NOT "NOBODY IS RUNNING".** If `ps` cannot answer, every install's
+liveness is UNKNOWN: nothing is removed and the pass exits 3 (`census=unreadable`) — the same
+fail-closed answer `reap-lane-venvs.sh` gives when its probe is missing. The probe is **re-asked
+immediately before every removal** (`reason=toctou:…`), because classification can be minutes old on a
+box whose `du` is slow.
+
+**The record.** `freed_mb_runner_cache=`, `would_free_mb_runner_cache=`, `candidates_runner_cache=`,
+`reaped_runner_cache=`, **`skipped_live_runner_cache=`** (how many installs were NOT touched because a
+job was running — the count that answers *"why is my 40 GB cache still here"*),
+`unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took),
+`capped_runner_cache=` (the per-pass cap stopped it; the next tick continues),
+`verdict_runner_cache=` and `note_runner_cache=`. The class line prints, per install,
+`INSTALL <dir> cache_mb=<n> live=<yes|no|unknown> reason=<witness>` and, per filesystem,
+`free_mb_before`/`free_mb_after` — a gate that acts without printing the number it read is a wish
+(#2344).
+
+**The durable fix, not only the guard.** `scripts/ci_runner_pool.sh` exports **one** cache path per box
+— `XDG_CACHE_HOME=$RUNNER_CACHE_ROOT` (default `$RUNNER_ROOT/_cache`, created at start and announced on
+the `cache-root=` line) — for every listener it starts, so N slots no longer hold N copies of the same
+content. Override it with `RUNNER_CACHE_ROOT`, and name the same path in
+`DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` (two tools, one directory). A listener that survived a reboot
+keeps the environment it was exec'd with — the documented residual, identical to the private `TMPDIR`
+one (#7815).
+
+**Cadence: TWO clocks, and neither replaces the other.** The hourly pass runs this class with the
+others. A second unit, `templates/systemd/eldato-disk-reaper-cache.{service,timer}`, runs every **10
+minutes** with `--size-trigger`: it measures free space, does **nothing** while the box is above
+`DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` (default 40960 MB = 40 GB), and below it runs this class
+**alone**, capped at `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB` (default 20480 MB) so a pass that can fire
+144 times a day cannot itself become the load problem. The two reasons:
+
+* **Hourly is slower than the write rate.** A busy cell writes tens of GB of cache per hour; the
+  measured failure is a pass that was *correct* and could not hold a reserve (187 MB reclaimed while a
+  40 GB cache sat untouched).
+* **The other five classes must NOT be fired harder.** Their gates are about AGE and emptiness, and
+  sweeping them more often under pressure is exactly the "reclaim harder" instinct that deletes live
+  work. So the fast clock runs ONE class, and it is self-gating.
+
+The trigger pass writes its **own** record (`$STATE_DIR/disk-reaper-cache.status`) so it can never
+overwrite the hourly pass's; `--print-status` still answers for the full pass. Both passes take the
+same canonical lock, so the second one defers (rc 6, green) rather than deleting concurrently.
+
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
 Every subprocess that reads the filesystem runs under a wall-clock bound, because a
@@ -1039,6 +1140,11 @@ the backlog the veto was holding, and then keeps pace. A daily cadence would hav
 in one burst; an hourly one never faces more than a few GB. `Persistent=true` matters on these cells
 for the same reason — a suspended cell must run a pass as soon as it resumes instead of waiting out an
 interval at the threshold.
+
+`templates/systemd/eldato-disk-reaper-cache.{service,timer}` — **every 10 minutes**,
+`--size-trigger` (see `class=runner-cache` above for why a cache needs a second clock and why the other
+five classes must NOT get one), installed by the same verb. It fires nothing while the box is above
+`DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`, so a tick costs one `df`.
 
 `templates/systemd/eldato-disk-reaper.{service,timer}` — hourly
 (`OnCalendar=hourly`, `Persistent=true`), installed and enabled by
@@ -1556,6 +1662,17 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | L | a live process that names the tree through a **symlinked** spelling still protects it — sub-path, alias-to-tree, and `--flag=<abs>` (argv tokens are canonicalised) | `_lp_rel "$_cand" "$path"` → `_lp_rel "" "$path"` |
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
+
+`class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
+(**4 case runs + 5 mutants + 1 scope case**), covering the four arms #4168 names:
+
+| case | proves | mutant that must turn it red |
+|---|---|---|
+| A | two installs, one with a **job in flight** and one idle: the idle `.cache` is reaped, the live one is **skipped whole** and named (`skipped-live`), and the per-install reading (`cache_mb=… live=yes`) is printed | `if [ "$live" = 0 ]; then` → `if false; then` |
+| B | **no churn**: a cache below the size bound and scratch younger than the age bound are KEPT and named, while an aged entry in the same install IS reaped | `elif [ -n "$sz" ] && [ "$sz" -lt "$MIN_CACHE_MB" ]; then` → `elif false; then` |
+| C | the **size trigger, both directions**, through `disk-reaper.sh`: above the threshold no class runs (record `verdict_runner_cache=not-run`, with the reading); below it the class runs, and a pass STOPS at the per-pass cap leaving the rest (`reason=pass-cap`, `capped_runner_cache=1`) | `[ "$mb" -lt "$RUNNER_CACHE_TRIGGER_FREE_MB" ]` → `-gt` (trigger inverted); separately the cap test → `false` |
+| D | an **unreadable process census** removes nothing and exits 3 (`census=unreadable`) | the census gate deleted |
+| E | a directory the glob matches but which carries **no install marker** is untouched, while the real install in the same run is reaped | — (scope case; the marker test is what the case pins) |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

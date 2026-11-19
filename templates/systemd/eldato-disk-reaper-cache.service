@@ -1,0 +1,64 @@
+[Unit]
+# eldato disk reaper — the SIZE-TRIGGERED runner-cache pass (agent-infra#4168).
+#
+# ⛔ WHY THIS EXISTS BESIDE THE HOURLY PASS, AND WHY NEITHER REPLACES THE OTHER.
+# `eldato-disk-reaper.timer` runs the FULL pass hourly. That is the right cadence for the five classes
+# whose gates are about AGE and emptiness (worktrees, lane venvs, runner `_work`, duplicate installs) —
+# firing them harder under pressure is exactly the "reclaim harder" instinct that deletes live work.
+# It is the WRONG cadence for a PACKAGE CACHE, because a cache is bounded by WRITE RATE, not by age:
+# measured 2026-11-19, a busy cell carries **40.7 GB in one install** (`/opt/gh-runner-x64/.cache`),
+# **50.1 GB** in the largest, ≈**445 GB across five boxes**, and one pass reclaimed 187 MB while the
+# box fell to 2.3 GB free. An hourly sweep cannot hold a reserve against that.
+#
+# So this pass runs every 10 minutes and DOES NOTHING while the box has space: it measures free space,
+# and above `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` (default 40960 MB = 40 GB) it exits without
+# running a class at all — the cost of a tick is one `df`. BELOW the threshold it runs the
+# `runner-cache` class ALONE, capped at `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB` (default 20480 MB) so a
+# frequent pass cannot itself become the load problem; it reports `capped=1 remaining=<n>` and the next
+# tick continues where it stopped.
+#
+# The class never touches an install with a JOB IN FLIGHT: `scripts/reap-runner-cache.sh` proves
+# liveness from the process table (`Runner.Worker` present, or a listener with content written under
+# `_work` inside its freshness window) and SKIPS that install whole (`skipped_live=`). A cache deleted
+# mid-job fails the job, so that skip is the one correctness property the class has.
+#
+# This pass writes its OWN record (`disk-reaper-cache.status`), so it can never overwrite the hourly
+# pass's record; `disk-reaper.sh --print-status` still answers for the full pass.
+Description=eldato disk reaper — size-triggered runner-cache pass (fires only below the free-space threshold)
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/disk-reaper.md
+After=local-fs.target
+# A reaper must never hold up a boot or a login, and it must not be a reason to keep a box up.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=DISK_REAPER_STATE_DIR={{STATE_DIR}}
+Environment=DISK_REAPER_REPOS={{REPOS}}
+# The bounded-execution helper is PINNED for the same reason the delegates are: it is resolved from
+# `$(dirname $0)/lib/`, and that arm is empty when the script is fed through a pipe. A pin is
+# authoritative and fails CLOSED at startup if it is gone, which is what a deletion tool wants.
+Environment=BOUNDED_LIB={{BOUNDED_LIB}}
+# The class owner, pinned to the INSTALLED copy for the same reason every other delegate is pinned:
+# a unit whose HOME happens to contain an older farmed copy would silently run THAT policy.
+Environment=RUNNER_CACHE_REAPER={{REAPER_DIR}}/reap-runner-cache.sh
+Environment=DISK_REAPER={{REAPER_DIR}}/disk-reaper.sh
+# ── the two knobs this unit exists for ────────────────────────────────────────────────────────
+# The threshold is the SIZE TRIGGER and the cap bounds the work a single tick may do. Both are
+# rendered here (rather than left to the script's defaults) so the numbers a box runs with are readable
+# in the artifact — arming and thresholds belong in the unit, never hidden in a default.
+Environment=DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB={{CACHE_TRIGGER_FREE_MB}}
+Environment=DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB={{CACHE_PASS_CAP_MB}}
+# Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
+Nice=10
+IOSchedulingClass=idle
+# {{MODE_FLAG}} is the ARMING DECISION rendered by the installer (--apply by default; --report-only
+# renders --dry-run). `--size-trigger` is what makes this the frequent, self-gating pass.
+ExecStart=/bin/bash {{REAPER}} {{MODE_FLAG}} --size-trigger
+# Same exit vocabulary as the hourly pass: 0 ok · 3 fail-closed · 4 a removal failed · 6 deferred
+# (another pass holds the lock — the routine state of a busy box, and the alarm channel is the record,
+# not the unit's colour). {{MODE_SUCCESS_EXIT}} is rendered from the mode for the same reason it is
+# there: in a dry run 5 ("here is the work I would do") is a success, and in an apply pass it is not.
+SuccessExitStatus={{MODE_SUCCESS_EXIT}}

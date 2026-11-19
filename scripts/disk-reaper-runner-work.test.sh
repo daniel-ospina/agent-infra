@@ -620,7 +620,9 @@ case_e() { # <entry-point>
     # ⛔ THE VALID LIST, NOT THE OFFENDING TOKEN. Grepping the text after `unknown --only class` matched
     # the ARGUMENT ('runner-work') and so passed even with the class removed from the valid list —
     # measured: the (e) mutation survived its first run. The full list is the falsifiable fact.
-    case_check "$(grep -qF 'valid: uv, venv, worktree, duplicate-install, runner-work' <<<"$out" && echo 0 || echo 1)" \
+    # ⛔ THE LIST IS THE CURRENT ONE (#4168 added `runner-cache`); the ASSERTION is unchanged — the
+    # printed list must NAME runner-work, so an operator can find the spelling from the error itself.
+    case_check "$(grep -qF 'valid: uv, venv, worktree, duplicate-install, runner-work, runner-cache' <<<"$out" && echo 0 || echo 1)" \
                "and the VALID list it prints names runner-work (an operator can find the spelling from the error)"
     # A NEAR-MISS SPELLING IS NOT A MATCH: `runner` (the typo an operator actually types) must be refused
     # too, so the class cannot be selected by a prefix and then silently run something else.
@@ -1619,7 +1621,7 @@ MUT_V_NOTE='s/nothing under them was measured or removed/nothing under them was 
 # shape this suite exists to catch.
 MUT_C='/|retain|/d; s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
 MUT_D='s/^want_class runner-work && { WANT_RW=1;/true \&\& { WANT_RW=1;/'
-MUT_E='s/valid: uv, venv, worktree, duplicate-install, runner-work/valid: uv, venv, worktree, duplicate-install/g'
+MUT_E='s/valid: uv, venv, worktree, duplicate-install, runner-work, runner-cache/valid: uv, venv, worktree, duplicate-install, runner-cache/g'
 MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
 # (f)'s THIRD arm, and it is the P1 a review measured: the shipped DEFAULT list named the actions-runner
 # roots in a FLAT form (`/tmp/actions-runner*/_work`) that cannot match the POOLED layout this repo's own

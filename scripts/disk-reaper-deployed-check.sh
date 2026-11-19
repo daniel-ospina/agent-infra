@@ -57,9 +57,14 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # impossible to miss, one library later. It is also the one library whose absence silently changes a
 # DELETE policy (it supplies `CELL_HOME_LEGACY`, the home the gitless guard protects), which is the
 # #3278 shape.
+# ⛔ `reap-runner-cache.sh` IS THE SAME CLASS ONE MORE TIME (#4168). It holds the delete rule for the
+# runners' per-install PACKAGE CACHE (≈445 GB measured across five boxes) and it is pinned in the fast
+# unit (`Environment=RUNNER_CACHE_REAPER=`) — so a cell carrying an earlier farmed copy, or NO copy,
+# would run a different delete policy (or none) while this checker certified `deployed ok` over a set
+# that never mentioned it.
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh
-lib/cell-home.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh reap-runner-cache.sh
+lib/bounded.sh lib/cell-home.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF
