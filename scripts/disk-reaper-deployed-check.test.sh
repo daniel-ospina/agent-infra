@@ -236,10 +236,14 @@ mkdir -p "$MUT_T/scripts"
 awk 'BEGIN{d=0} /^FILES="/{d=1} d{ line=$0; gsub(/reap-runner-cache\.sh/,"",line); print line; if ($0 ~ /"$/) d=0; next } {print}' \
     "$CHECK" >"$MUT_T/scripts/disk-reaper-deployed-check.sh"
 chmod +x "$MUT_T/scripts/disk-reaper-deployed-check.sh"
-if grep -q 'reap-runner-cache\.sh' "$MUT_T/scripts/disk-reaper-deployed-check.sh"; then
-    ok "D15 mutant: the rewrite APPLIED (the checker no longer pins reap-runner-cache.sh)"
+# ⛔ THE GREP MUST BE SCOPED TO THE `FILES` BLOCK. Grepping the whole mutant file proves nothing: the
+# checker's own COMMENT block legitimately names `reap-runner-cache.sh`, so a whole-file grep answered
+# `found` whether the rewrite applied or not — an assertion that cannot go red, which is the vacuity
+# this very block exists to exclude (measured: it passed while the rewrite was a no-op).
+if sed -n '/^FILES="/,/"$/p' "$MUT_T/scripts/disk-reaper-deployed-check.sh" | grep -q 'reap-runner-cache\.sh'; then
+    bad "D15 mutant: the rewrite DID NOT APPLY — the checker's FILES still pins reap-runner-cache.sh"
 else
-    bad "D15 mutant: the rewrite DID NOT APPLY — the non-vacuity arm is unverified"
+    ok "D15 mutant: the rewrite APPLIED (the checker's FILES no longer pins reap-runner-cache.sh)"
 fi
 OUT="$(bash "$MUT_T/scripts/disk-reaper-deployed-check.sh" --stamp --dir "$T/deployed" --record "$T/mut.record" 2>&1)"; RC=$?
 if [ "$RC" = "0" ] && ! grep -qF '  reap-runner-cache.sh' "$T/mut.record"; then
