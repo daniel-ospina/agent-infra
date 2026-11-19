@@ -115,9 +115,14 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
   every install on that box carries `.runner_migrated` since its v2-flow migration — so the clear
   that makes `--replace` possible left the answer TRUE. The migrated pair is now part of the local
   config that is cleared and stashed (and restored, at its original mode, on a failed repair).
-* **The wait is shorter than reality.** `RUNNER_AUTOSCALE_ONLINE_WAIT_S` stays at 60 s: raising it
-  per runner would exceed the unit's `TimeoutStartSec=900` (four runners × minutes) and SIGTERM a
-  pass mid-`config.sh`. The cooldown is what makes that wait unnecessary.
+* **The wait is shorter than reality.** `RUNNER_AUTOSCALE_ONLINE_WAIT_S` stays at 60 s, and the reason
+  is the **cooldown**, not the unit's timeout: a restart that has not come back ONLINE yet is not
+  re-diagnosed as DEAD, so no pass has to *wait out* a slow re-registration — it reads the stamp and
+  holds (see the cooldown bullet above). Raising the wait per runner would spend the pass's wall clock
+  on an answer the cooldown already makes unnecessary. The unit's `TimeoutStartSec=5400`
+  (`templates/systemd/eldato-runner-autoscale.service`, the same value `--install-unit` renders) is
+  **not** the binding constraint and must not be cited as one: four runners × a 420 s wait is 1680 s,
+  well inside it.
 
 A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
 which guard held it. The distinction matters — the guard exists so that a **job survives**, and a
