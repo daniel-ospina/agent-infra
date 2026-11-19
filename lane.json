@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13802-1795115568-p1879539-bc9bb08d",
+  "_sha": "c086161417a6c96fb311b133edd4fbe2c15d2462",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13802.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13746-residual-attribution"
+    },
+    {
+      "kind": "sha",
+      "value": "f9daa103948d04763113b3f89e1a345ca344fa67"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13802"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 2126,
+  "ended_at": 1795117694,
+  "exit_code": 0,
+  "heartbeat_at": 1795117694,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13802-1795115568-p1879539-bc9bb08d",
+  "lease_until": 1795125494,
+  "pid": 1879539,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795115568,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13802",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13802"
+}
