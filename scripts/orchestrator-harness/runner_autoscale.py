@@ -1653,25 +1653,38 @@ def restart_history_path() -> Path:
     return _state_dir() / "runner-restarts.json"
 
 
-def read_restart_history() -> dict[str, float]:
-    """`{agentName: epoch seconds of the last restart THIS TOOL issued}`.
+def read_restart_history() -> tuple[dict[str, float], str]:
+    """`({agentName: epoch of the last restart THIS TOOL issued}, problem-or-"")`.
 
-    ⛔ AN UNREADABLE FILE IS AN EMPTY HISTORY, NOT A FAILED PASS. This is the LOOP defence, and the
-    two-sample confirmation below does not depend on it, so a lost stamp costs one extra restart at
-    worst — while raising here would refuse every repair on a box whose state dir is broken, which
-    is a strictly worse failure. The caller records the problem so it is not silent.
+    ⛔ AN UNREADABLE FILE STILL RETURNS AN EMPTY HISTORY — BUT IT ALSO SAYS SO (review finding P2).
+    This is the LOOP defence, and the two-sample confirmation does not depend on it, so raising here
+    would refuse every repair on a box whose state dir is broken: a strictly worse failure. But the
+    previous version returned `{}` SILENTLY while this docstring claimed the caller reported it, and
+    nothing did — so replacing `{"r-dead": <stamp>}` with `{ this is not json` dropped the cooldown
+    and the next pass restarted the runner again, with `problems: []` and `notes: []` (reproduced).
+    An ABSENT file is normal (no restart has ever been issued here) and reports nothing.
     """
+    path = restart_history_path()
     try:
-        raw = json.loads(restart_history_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, ""
+    except (OSError, ValueError) as exc:
+        return {}, (
+            f"the restart history at {path} could not be read ({exc}) — the restart COOLDOWN is not in "
+            "force this pass (the two-sample DEAD confirmation still is), so a runner this tool "
+            "restarted minutes ago can be restarted again"
+        )
     if not isinstance(raw, dict):
-        return {}
+        return {}, (
+            f"the restart history at {path} is not a JSON object ({type(raw).__name__}) — the restart "
+            "COOLDOWN is not in force this pass (the two-sample DEAD confirmation still is)"
+        )
     out: dict[str, float] = {}
     for name, stamp in raw.items():
         if isinstance(name, str) and isinstance(stamp, (int, float)) and math.isfinite(stamp):
             out[name] = float(stamp)
-    return out
+    return out, ""
 
 
 def write_restart_history(history: dict[str, float]) -> str | None:
@@ -3559,8 +3572,25 @@ def converge(
         maximum=DEAD_CONFIRM_MAX_S,
         notes=record["notes"],
     )
+    # ⛔ READ ONCE, PRUNE ALWAYS, AND NEVER SILENTLY (review findings P2 #2 and #3). Three facts:
+    #   * the history is read on EVERY pass, not only when a runner is DEAD — otherwise a runner that
+    #     RECOVERED keeps its stamp until the next DEAD runner appears, and its next genuine death is
+    #     then held for the cooldown while the note asserts "one offline read after OUR OWN restart is
+    #     not a new death" about a restart that happened an hour ago (reproduced: pass 1 restart,
+    #     pass 2 SERVING, pass 3 a real death ⇒ `restart_holds: ['r-dead']`, unrepaired);
+    #   * an unreadable/corrupt file is REPORTED — the previous version returned `{}` while the
+    #     docstring claimed the caller said something, so `{"r-dead": …}` replaced by junk silently
+    #     dropped the cooldown and the very next pass restarted the runner (reproduced);
+    #   * a stamp for a runner that is no longer DEAD is dropped HERE, before any hold is decided.
+    restart_history, history_problem = read_restart_history()
+    if history_problem:
+        record["notes"].append(history_problem)
+    if restart_history:
+        pruned = {n: t for n, t in restart_history.items() if n in still_dead}
+        if pruned != restart_history:
+            restart_history = pruned
+            history_dirty = True
     if still_dead:
-        restart_history = read_restart_history()
         now = time.time()
         for c in classified:
             if c["state"] != "DEAD":
@@ -3643,6 +3673,44 @@ def converge(
             record["would_repair"].append(f"would repair {c['name']} ({c['state']})")
             continue
         if c["state"] == "DEAD":
+            # ⛔ THE SAMPLE THAT JUSTIFIED THIS RESTART IS ALREADY OLD (review finding P1, reproduced).
+            # The confirmation is taken ONCE for the whole pass, and everything after it is slow by
+            # design: the `DEAD_CONFIRM_S` sleep itself, a `wait_online` (60 s) plus a possible
+            # `config.sh` per preceding runner. Measured on the fixture: with two DEAD installs, the
+            # pass's own post-restart read saw the SECOND one BUSY — its job — and restarted it anyway,
+            # recording nothing and ending `converged`. So the answer that justifies the destructive
+            # command is asked FRESH, for THIS runner, immediately before it — the same rule the
+            # register path below has always had (`serving = alive or pool_busy or pool_online`).
+            try:
+                fresh = read_pool_retrying(repo).get(c["name"])
+                serving_now = bool(fresh is not None and (fresh.online or fresh.busy))
+                if not serving_now:
+                    serving_now = _worker_alive(runner, fresh=True)
+            except Unmeasurable as exc:
+                # ⛔ AN UNREADABLE READ IS NOT PERMISSION. Nothing is restarted on a question that could
+                # not be asked, and the pass stops: the box state from here is unknown, so no fill
+                # decision may be taken on a stale count (the same fail-closed rule as the register
+                # path). It is a `problem` — a DEAD slot this pass could not repair must not report
+                # `converged`.
+                record["problems"].append(
+                    f"{c['name']}: NOT restarted — the pre-restart read failed ({exc}); a restart "
+                    "kills the job the runner may be serving, so it is never issued on an unread pool"
+                )
+                record["restart_holds"].append(c["name"])
+                stop_pass = True
+                break
+            if serving_now:
+                seen = (
+                    "it came up with a JOB (a live Runner.Worker)"
+                    if fresh is None or not (fresh.online or fresh.busy)
+                    else ("the pool reports it BUSY" if fresh.busy else "the pool reports it ONLINE")
+                )
+                record["notes"].append(
+                    f"{c['name']}: NOT restarted — {seen} since this pass's DEAD sample; it is "
+                    "serving again, so the restart would kill that job"
+                )
+                record["restart_holds"].append(c["name"])
+                continue
             ok, detail = restart_runner(runner)
             restart_ok = ok
             record["actions"].append(f"restart {c['name']}: {detail}")
@@ -3786,15 +3854,9 @@ def converge(
             record["problems"].append(f"{c['name']}: {exc}")
             record["actions"].append(f"repair {c['name']} FAILED: {exc}")
 
-    # ⛔ PRUNE, THEN PERSIST (agent-infra#4153). A stamp exists only while its runner is DEAD: the
-    # cooldown protects the re-registration window after a restart, and a runner that came back
-    # (BUSY/SERVING) must not carry a stale stamp into its NEXT death — that would refuse a repair the
-    # box genuinely needs, which is the same defect in the opposite direction.
-    if restart_history:
-        pruned = {n: t for n, t in restart_history.items() if n in still_dead}
-        if pruned != restart_history:
-            restart_history = pruned
-            history_dirty = True
+    # ⛔ PRUNE, THEN PERSIST (agent-infra#4153). The prune itself runs BEFORE the repair loop (a stamp
+    # for a recovered runner must not survive into its next death); what is left to do here is write
+    # the stamps this pass issued.
     if history_dirty and not dry_run:
         problem = write_restart_history(restart_history)
         if problem:

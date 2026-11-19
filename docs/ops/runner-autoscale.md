@@ -94,16 +94,22 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
 * **ONE offline read is not a death.** The pool reports `offline` for a runner that is reconnecting,
   and a restart is the most destructive thing this tool does. A second sample must agree, taken
   `RUNNER_AUTOSCALE_DEAD_CONFIRM_S` later (default 120 s, refused outside `(0, 600]`). The sample is
-  paid **once per pass**, not once per runner. A BUSY/ONLINE answer holds the runner and says so in
-  `restart_holds` and `notes`; an **unreadable** second sample restarts nothing and is a RED pass
+  paid **once per pass**, not once per runner — and because everything after it is slow (that sleep, a
+  `wait_online` and a possible `config.sh` per preceding runner) the answer that justifies the
+  destructive command is asked **fresh, per runner, immediately before the restart**: a runner that
+  answers ONLINE/BUSY then — or has a live `Runner.Worker` — is held, and the pass records that its
+  job arrived instead of killing it. A BUSY/ONLINE answer at the sample holds the runner and says so
+  in `restart_holds` and `notes`; an **unreadable** second sample restarts nothing and is a RED pass
   (a DEAD slot nothing could confirm is not `converged`).
 * **The pass's own restart is not a new death.** A runner this tool restarted is not restarted again
-  for `RUNNER_AUTOSCALE_RESTART_COOLDOWN_S` (default 1800 s), stamped in
-  `$RUNNER_AUTOSCALE_STATE_DIR/runner-restarts.json` (atomic write; an unreadable file removes only
-  the loop defence, never the two-sample one). Re-registration takes >94 s and minutes under load, so
-  without the cooldown the next pass reads the runner it just restarted as DEAD and the loop runs
-  for ever. A stamp is written when the restart is *issued*, and pruned as soon as the runner is no
-  longer DEAD, so a genuine death minutes later is still repaired.
+  for `RUNNER_AUTOSCALE_RESTART_COOLDOWN_S` (default 1800 s; a value outside `(0, 86400]`, or one that
+  is not a number, falls back to the default **and says so** — a guard that a value can switch off is a
+  guard that will), stamped in `$RUNNER_AUTOSCALE_STATE_DIR/runner-restarts.json` (atomic write; an
+  unreadable or corrupt file is REPORTED in `notes` and removes only the loop defence, never the
+  two-sample one). Re-registration takes >94 s and minutes under load, so without the cooldown the
+  next pass reads the runner it just restarted as DEAD and the loop runs for ever. A stamp is written
+  when the restart is *issued*, and pruned on the first pass that sees the runner no longer DEAD — so
+  a genuine death after a recovery is still repaired.
 * **The repair could never converge on a migrated install.** `config.sh` decides "already
   configured" from `IsConfigured() = .runner OR .runner_migrated` (actions/runner v2.338.2), and
   every install on that box carries `.runner_migrated` since its v2-flow migration — so the clear
