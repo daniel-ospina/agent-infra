@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13723.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13669-approval-label-contract"
+    },
+    {
+      "kind": "sha",
+      "value": "4ade9a372ffe3fa5f15ffd6822d495b58379f3f9"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-13723"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 670,
+  "ended_at": 1795093956,
+  "exit_code": 0,
+  "heartbeat_at": 1795093956,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13723-1795093286-p2428544-b764d289",
+  "lease_until": 1795130556,
+  "pid": 2428544,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795093286,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-13723",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-13723"
+}
