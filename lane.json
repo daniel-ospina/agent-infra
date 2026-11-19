@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-13710-1795087859-p3940969-43852b40",
+  "_sha": "ecb6dc90fc7724b865552f03b9122528bae6bc9e",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-13710.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13699-substrate-ambient-read"
+    },
+    {
+      "kind": "sha",
+      "value": "f2c20b74dfe647f934a3d2bbd16719e9de42b9a5"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13634"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7256,
+  "ended_at": 1795095115,
+  "exit_code": 143,
+  "heartbeat_at": 1795095115,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-13710-1795087859-p3940969-43852b40",
+  "lease_until": 1795102915,
+  "pid": 3940969,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795087859,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-13710",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13634"
+}
