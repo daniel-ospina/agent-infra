@@ -7691,13 +7691,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4994 :6720 :9094 :9268, plus a comment mention at :4863; `14.1c-CITE` below
+#     CITE-CHECK: :4994 :6832 :9298 :9472, plus a comment mention at :4863; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4972) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
 #     predicate line beside it (CITE-CHECK: :4994) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9094). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9298). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7723,7 +7723,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:9094` / `:9268` — CITE-CHECK: :9094 :9268 — re-derived by the
+#     this head the predicates are `:9298` / `:9472` — CITE-CHECK: :9298 :9472 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8632,7 +8632,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6720 :9094 :9268 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6832 :9298 :9472 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -14942,6 +14942,229 @@ git checkout -q attr_lane >/dev/null 2>&1 || true
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
 if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every dispatched cell behaved as its vector predicted — the guard-load-bearing cells AND M1b, which deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because the empty-diff arm already refuses it); the other delta arms are pinned by refusal vectors only, not by a mutant"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. agent-infra#4105 — A VERDICT ABOUT UNCHANGED **CODE** SURVIVES A
+#     DOCSTRING/COMMENT-ONLY HEAD MOVE
+#
+# The stale-sha guard refuses a record at a sha that is not the PR head unless an
+# arm can prove the reviewed artifact unchanged. diff/patch/lane all prove the
+# RENDERED artifact; a docstring rewrite moves the diff text without touching an
+# executable line, so all three refuse. MEASURED on tortoise#13104: 12 commits, 4
+# docstring-only, 3 fresh-context reviews discarded by that guard.
+#
+# These vectors drive the real recorder against a REAL git fixture (the arm reads
+# `git diff --raw` and real blobs, so a fabricated diff would exercise nothing),
+# with the check surface empty (not red — clause E permits the carry) and the
+# evidence artifact dated after the REVIEWED head's commit date.
+#
+# ⛔ EACH ACCEPT VECTOR IS PAIRED WITH ITS OWN REFUSAL SO THE PAIR CANNOT GO GREEN
+# TOGETHER: 「records」 alone would also pass if the arm carried ANY head move, and
+# 「refuses」 alone would also pass if the arm never fired at all.
+echo "── 21. #4105 code-identity carry: docstring/comment-only delta ──"
+CI_REPO="$T/code-identity-4105"
+git init -q "$CI_REPO"
+git -C "$CI_REPO" config user.email "t@example.test"
+git -C "$CI_REPO" config user.name "t"
+# The checkout must BE this repo: the arm normalises ONLY inside a clone whose
+# origin identifies itself as the PR's repo (the same identity guard #1398's local
+# fallback applies), so the fixture names it exactly.
+git -C "$CI_REPO" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
+mkdir -p "$CI_REPO/pkg"
+cat > "$CI_REPO/pkg/mod.py" <<'CIEOF'
+"""Module docstring (v1)."""
+
+
+def add(x):
+    """Add one (v1)."""
+    return x + 1
+CIEOF
+cat > "$CI_REPO/run.sh" <<'CIEOF'
+#!/bin/bash
+# step one (v1)
+set -eu
+echo hello
+CIEOF
+printf 'binary payload v1\000\001\002\n' > "$CI_REPO/data.bin"
+cat > "$CI_REPO/tool.ts" <<'CIEOF'
+export const answer = 41
+CIEOF
+git -C "$CI_REPO" add -A
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -m "base"
+CI_C1="$(git -C "$CI_REPO" rev-parse HEAD)"
+# C2 — DOCSTRING-ONLY in a .py file (the shape the issue measured).
+python3 - "$CI_REPO/pkg/mod.py" <<'CIEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read().replace('"""Add one (v1)."""', '"""Add one (v2).\n\n    Rewritten prose. No executable line moves.\n    """')
+open(path, "w").write(text)
+CIEOF
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "docstring only"
+CI_C2="$(git -C "$CI_REPO" rev-parse HEAD)"
+# C3 — COMMENT-ONLY in a .sh file.
+python3 - "$CI_REPO/run.sh" <<'CIEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read().replace("# step one (v1)\n", "# step one (v2, reworded)\n# and a second comment line\n")
+open(path, "w").write(text)
+CIEOF
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "shell comment only"
+CI_C3="$(git -C "$CI_REPO" rev-parse HEAD)"
+# C4 — ONE EXECUTABLE LINE CHANGED.
+python3 - "$CI_REPO/pkg/mod.py" <<'CIEOF'
+import sys
+path = sys.argv[1]
+open(path, "w").write(open(path).read().replace("return x + 1", "return x + 2"))
+CIEOF
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "executable line"
+CI_C4="$(git -C "$CI_REPO" rev-parse HEAD)"
+# C5 — BINARY PAYLOAD CHANGED.
+printf 'binary payload v2\000\001\003\n' > "$CI_REPO/data.bin"
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "binary"
+CI_C5="$(git -C "$CI_REPO" rev-parse HEAD)"
+# C6 — COMMENT-ONLY IN A LANGUAGE WITH NO CONFIDENT STRIPPER.
+python3 - "$CI_REPO/tool.ts" <<'CIEOF'
+import sys
+path = sys.argv[1]
+open(path, "w").write("// a comment, and nothing else\n" + open(path).read())
+CIEOF
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "ts comment only"
+CI_C6="$(git -C "$CI_REPO" rev-parse HEAD)"
+
+if [ "$CI_C1" != "$CI_C2" ] && [ "$CI_C3" != "$CI_C4" ]; then
+    ok "21 fixture: five real commits, and the pairs below name two of them"
+else
+    bad "21 fixture: the commit chain did not build distinct revisions"
+fi
+# The fixture's own delta really is what each vector claims: (C1,C2) is one .py
+# file whose AST is identical after docstring stripping, and (C3,C4) touches an
+# executable line. Asserted on GIT's view, not on the recorder's, so a fixture that
+# drifted (a .py edit becoming a code edit) reddens here instead of passing as a
+# carry.
+if [ "$(git -C "$CI_REPO" diff --name-only "$CI_C1" "$CI_C2")" = "pkg/mod.py" ]; then
+    ok "21 fixture: C1→C2 changes exactly one Python file (the docstring-only delta)"
+else
+    bad "21 fixture: C1→C2 touched $(git -C "$CI_REPO" diff --name-only "$CI_C1" "$CI_C2" | tr '\n' ' ')"
+fi
+if difflines="$(git -C "$CI_REPO" diff -U0 "$CI_C1" "$CI_C2")" && ! grep -qE '^[+-][^+-]' <<<"$difflines"; then
+    bad "21 fixture: C1→C2 has no changed line at all — the vector would be vacuous"
+else
+    ok "21 fixture: C1→C2 does move diff text (so refusing it is a genuine cost, not a no-op)"
+fi
+
+ci_record() { # <record-script> <pr> <reviewed-sha> <head-sha> → $RECORD_RC $RECORD_ERR
+    local rec="$1" pr="$2" reviewed="$3" head="$4"
+    local rcfile="$T/rc-ci" errfile="$T/err-ci"
+    rm -f "$rcfile" "$errfile"; : > "$LOG"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_HEAD_SHA="$head" STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export RECORD_REVIEW_LOCAL_REPO="$CI_REPO" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1
+        rc=0
+        bash "$rec" "$pr" "$reviewed" clean daniel-ospina/agent-infra --evidence "comment:$(( pr * 10 + 1 ))" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    )
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+
+# 21.1 DOCSTRING-ONLY delta ⇒ RECORDS at the new head, evidence names the old sha.
+ci_record "$RECORD" 425501 "$CI_C1" "$CI_C2"
+CI_R1="$(cat "$(Q2 425501)" 2>/dev/null || true)"
+[ "$RECORD_RC" = "0" ] && ok "21.1 docstring-only delta RECORDS (rc 0)" || bad "21.1 docstring-only delta (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "#4105 code-identity carry" "21.1 the arm that fired names itself"
+assert_contains "$CI_R1" '"head_sha":"'"$CI_C2"'"' "21.1 the record is bound to the CURRENT head"
+assert_contains "$CI_R1" '"carried_from":"'"$CI_C1"'"' "21.1 the record names the REVIEWED head it came from"
+assert_contains "$CI_R1" '"carry_arm":"code"' "21.1 the record names the arm that proved it"
+assert_contains "$CI_R1" 'code identical to '"$CI_C1"', docstring/comment-only delta' "21.1 the EVIDENCE names the reviewed sha and what the delta was"
+assert_contains "$CI_R1" '"evidence":"comment:' "21.1 the caller's review artifact is recorded (not swallowed by the carry)"
+
+# 21.2 COMMENT-ONLY delta in a .sh file ⇒ RECORDS (the shell normaliser's arm).
+ci_record "$RECORD" 425502 "$CI_C2" "$CI_C3"
+CI_R2="$(cat "$(Q2 425502)" 2>/dev/null || true)"
+[ "$RECORD_RC" = "0" ] && ok "21.2 comment-only delta in a shell file RECORDS (rc 0)" || bad "21.2 shell comment-only delta (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$CI_R2" '"carry_arm":"code"' "21.2 the shell delta is carried by the same arm"
+assert_contains "$CI_R2" 'code identical to '"$CI_C2"', docstring/comment-only delta' "21.2 the evidence names the reviewed sha"
+
+# 21.3 ONE CHANGED EXECUTABLE LINE ⇒ REFUSES, with today's message and no record.
+rm -f "$(Q2 425503)"
+ci_record "$RECORD" 425503 "$CI_C3" "$CI_C4"
+[ "$RECORD_RC" = "3" ] && ok "21.3 a real code change REFUSES (exit 3)" || bad "21.3 a real code change (rc=$RECORD_RC, want 3)"
+[ ! -f "$(Q2 425503)" ] && ok "21.3 no record written on the refusal" || bad "21.3 a record was written over an unreviewed code change"
+assert_contains "$RECORD_ERR" "stale-sha guard: provided sha" "21.3 the refusal is the EXISTING one — the guard was refined, not relaxed"
+assert_not_contains "$RECORD_ERR" "#4105 code-identity carry" "21.3 the code arm did not fire on the code change"
+
+# 21.4 a CHANGED BINARY file ⇒ REFUSES (fail closed: no comment syntax exists in a
+#      binary, so "identical after stripping" is undefined).
+rm -f "$(Q2 425504)"
+ci_record "$RECORD" 425504 "$CI_C4" "$CI_C5"
+[ "$RECORD_RC" = "3" ] && ok "21.4 a changed binary file REFUSES (exit 3)" || bad "21.4 a changed binary (rc=$RECORD_RC, want 3)"
+[ ! -f "$(Q2 425504)" ] && ok "21.4 no record written for the binary delta" || bad "21.4 a record was written over a changed binary"
+
+# 21.5 a COMMENT-ONLY delta in a language with NO confident stripper (.ts) ⇒ REFUSES.
+#      This is the arm's declared boundary: without a real parser a comment cannot be
+#      told from a regex literal or a template string, so the honest answer is
+#      "cannot normalise", and the caller must treat it as CHANGED.
+rm -f "$(Q2 425505)"
+ci_record "$RECORD" 425505 "$CI_C5" "$CI_C6"
+[ "$RECORD_RC" = "3" ] && ok "21.5 a .ts comment-only delta REFUSES (no confident normaliser ⇒ fail closed)" || bad "21.5 a .ts comment-only delta (rc=$RECORD_RC, want 3)"
+[ ! -f "$(Q2 425505)" ] && ok "21.5 no record written for the un-normalisable delta" || bad "21.5 a record was written over an un-normalisable delta"
+
+# 21.6 MUTATION PIN — the normalisation itself is load-bearing. A copy that
+#      compares the RAW blobs (what the recorder did before this change) must
+#      REFUSE 21.1's and 21.2's deltas: if it still recorded, these vectors would
+#      be proving nothing about the stripper.
+CI_MUT="$T/mut-4105-raw"
+mkdir -p "$CI_MUT/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT/lib/diff-normalize.py"
+cp "$SCRIPT_DIR/lib/code-identity.py" "$CI_MUT/lib/code-identity.py"
+python3 - "$RECORD" "$CI_MUT/record-review.sh" <<'CIEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = ('        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null 2>&1; then')
+new = ('        # MUTATION (#4105): the pre-fix comparison — raw blob bytes, no stripping.\n'
+       '        if ! command cmp -s "$tmp/a" "$tmp/b"; then')
+assert old in text, "mutation anchor not found"
+open(dst, "w").write(text.replace(old, new, 1))
+CIEOF
+if bash -n "$CI_MUT/record-review.sh" 2>/dev/null && ! cmp -s "$CI_MUT/record-review.sh" "$RECORD"; then
+    ok "21.6 mutation: the raw-blob copy parses and differs from the recorder"
+else
+    bad "21.6 mutation: the raw-blob copy is unusable (identical to the recorder or unparseable)"
+fi
+rm -f "$(Q2 425506)" "$(Q2 425507)"
+ci_record "$CI_MUT/record-review.sh" 425506 "$CI_C1" "$CI_C2"
+[ "$RECORD_RC" = "3" ] && ok "21.6 mutation: with the normalisation reverted, the DOCSTRING delta is REFUSED (21.1 is load-bearing)" || bad "21.6 mutation: the raw-blob copy still carried the docstring delta (rc=$RECORD_RC) — 21.1 tests nothing"
+ci_record "$CI_MUT/record-review.sh" 425507 "$CI_C2" "$CI_C3"
+[ "$RECORD_RC" = "3" ] && ok "21.6 mutation: with the normalisation reverted, the SHELL COMMENT delta is REFUSED (21.2 is load-bearing)" || bad "21.6 mutation: the raw-blob copy still carried the shell comment delta (rc=$RECORD_RC) — 21.2 tests nothing"
+[ ! -f "$(Q2 425506)" ] && [ ! -f "$(Q2 425507)" ] && ok "21.6 mutation: the mutant wrote no record for either delta" || bad "21.6 the mutant wrote a record"
+
+# 21.7 the STRIPPER ITSELF, at its own boundary (no gh, no recorder): identical
+#      after stripping ⇒ 0, one executable line ⇒ 1, unknown language / binary /
+#      unparseable ⇒ 2 (never 0). Driven directly so a future refactor of the
+#      recorder cannot quietly lose these cases.
+CI_CI="$SCRIPT_DIR/lib/code-identity.py"
+printf 'def f():\n    """a"""\n    return 1\n' > "$T/ci-a.py"
+printf 'def f():\n    """b, much longer\n    and reworded"""\n    # a comment\n    return 1\n' > "$T/ci-b.py"
+printf 'def f():\n    """a"""\n    return 2\n' > "$T/ci-c.py"
+if python3 "$CI_CI" "pkg/mod.py" "$T/ci-a.py" "$T/ci-b.py"; then ok "21.7 the stripper reports IDENTICAL for a docstring+comment-only delta"; else bad "21.7 the stripper reported a docstring-only delta as different (rc=$?)"; fi
+CI_RC=0; python3 "$CI_CI" "pkg/mod.py" "$T/ci-a.py" "$T/ci-c.py" || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.7 the stripper reports DIFFERENT for a changed executable line (rc 1)" || bad "21.7 stripper rc=$CI_RC for a real code change (want 1)"
+CI_RC=0; python3 "$CI_CI" "tool.ts" "$T/ci-a.py" "$T/ci-b.py" || CI_RC=$?
+[ "$CI_RC" = "2" ] && ok "21.7 an unknown language is refused (rc 2), never reported identical" || bad "21.7 unknown language rc=$CI_RC (want 2)"
+printf 'def f(:\n  broken\n' > "$T/ci-bad.py"
+CI_RC=0; python3 "$CI_CI" "pkg/mod.py" "$T/ci-a.py" "$T/ci-bad.py" || CI_RC=$?
+[ "$CI_RC" = "2" ] && ok "21.7 an unparseable .py is refused (rc 2), never reported identical" || bad "21.7 unparseable .py rc=$CI_RC (want 2)"
+CI_RC=0; python3 "$CI_CI" "data.bin" "$T/ci-a.py" "$T/ci-bad.py" || CI_RC=$?
+[ "$CI_RC" = "2" ] && ok "21.7 a binary/unknown blob pair is refused (rc 2)" || bad "21.7 binary rc=$CI_RC (want 2)"
+# A heredoc body is DATA: a `#` line inside it must NOT be stripped (the one
+# false-identical the shell stripper could produce), so the pair is DIFFERENT.
+printf '#!/bin/bash\ncat <<%sEOF%s\n# kept\nEOF\n' "'" "'" > "$T/ci-h1.sh"
+printf '#!/bin/bash\ncat <<%sEOF%s\n# changed\nEOF\n' "'" "'" > "$T/ci-h2.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-h1.sh" "$T/ci-h2.sh" || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.7 a '#' line inside a heredoc BODY is data, not a comment (rc 1)" || bad "21.7 heredoc body '# 'line was stripped — rc=$CI_RC (want 1)"
+
 
 cd "$ORIG_PWD" 2>/dev/null || cd "$T" || true
 echo ""
