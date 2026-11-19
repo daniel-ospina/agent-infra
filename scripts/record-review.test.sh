@@ -15011,10 +15011,17 @@ CIEOF
 git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "shell comment only"
 CI_C3="$(git -C "$CI_REPO" rev-parse HEAD)"
 # C4 — ONE EXECUTABLE LINE CHANGED.
+# ⛔ `text = open(path).read()` must happen BEFORE the write opens the file: the
+# one-liner `open(path, "w").write(open(path).read().replace(…))` TRUNCATES the
+# file first, so the read returns '' and the commit EMPTIES it. That still
+# refuses (correctly), which is why this was silent: the vector claimed "one
+# executable line" while measuring "file emptied". The fixture assertions below
+# now pin the CONTENT each commit is supposed to carry.
 python3 - "$CI_REPO/pkg/mod.py" <<'CIEOF'
 import sys
 path = sys.argv[1]
-open(path, "w").write(open(path).read().replace("return x + 1", "return x + 2"))
+text = open(path).read().replace("return x + 1", "return x + 2")
+open(path, "w").write(text)
 CIEOF
 git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "executable line"
 CI_C4="$(git -C "$CI_REPO" rev-parse HEAD)"
@@ -15026,10 +15033,25 @@ CI_C5="$(git -C "$CI_REPO" rev-parse HEAD)"
 python3 - "$CI_REPO/tool.ts" <<'CIEOF'
 import sys
 path = sys.argv[1]
-open(path, "w").write("// a comment, and nothing else\n" + open(path).read())
+text = open(path).read()
+open(path, "w").write("// a comment, and nothing else\n" + text)
 CIEOF
 git -C "$CI_REPO" -c commit.gpgsign=false commit -q -am "ts comment only"
 CI_C6="$(git -C "$CI_REPO" rev-parse HEAD)"
+# ⛔ WHAT EACH REFUSAL VECTOR'S COMMIT ACTUALLY CARRIES. Without these, a fixture
+# bug (e.g. the truncating write above) turns "one changed executable line" into
+# "empty file", and the refusal still passes — a vector green for the wrong
+# reason is exactly what this suite's own M-cases exist to catch.
+if git -C "$CI_REPO" show "$CI_C4:pkg/mod.py" | grep -qF 'return x + 2'; then
+    ok "21 fixture: C4 really changes ONE executable line (the file is not empty)"
+else
+    bad "21 fixture: C4 does not carry 'return x + 2' — the vector measures the wrong thing"
+fi
+if git -C "$CI_REPO" show "$CI_C6:tool.ts" | grep -qF 'export const answer'; then
+    ok "21 fixture: C6 is a comment PREPENDED to real .ts code (the file is not empty)"
+else
+    bad "21 fixture: C6 does not carry the original .ts code — the vector measures the wrong thing"
+fi
 
 if [ "$CI_C1" != "$CI_C2" ] && [ "$CI_C3" != "$CI_C4" ]; then
     ok "21 fixture: five real commits, and the pairs below name two of them"
