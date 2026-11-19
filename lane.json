@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-13665-1795050597-p4052809-62e1e164",
+  "_sha": "cec0028f1e82daedaca7cc797a8147061c5ff9d4",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-13665.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13665-readpath-intermittent"
+    },
+    {
+      "kind": "sha",
+      "value": "70577f58cda2b77259c80f36cd222e4996722c2b"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-13665"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 13471,
+  "ended_at": 1795064068,
+  "exit_code": 0,
+  "heartbeat_at": 1795064068,
+  "host": "cmux",
+  "issue": 13665,
+  "kind": "lane",
+  "lane_id": "cmux.klane-13665-1795050597-p4052809-62e1e164",
+  "lease_until": 1795100668,
+  "pid": 4052809,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795050597,
+  "state": "DONE",
+  "tag": "13665",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-13665"
+}
