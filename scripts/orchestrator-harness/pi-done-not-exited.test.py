@@ -47,10 +47,11 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against TWELVE mutated copies of the tool and requires each to go RED
-(fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
+`--mutations` re-runs this suite against a set of mutated copies of the tool and requires each to go
+RED (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
 arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG, drop the
-#4108 refusal/deferral shapes from the completion allow-list). Prose cannot prove a suite has teeth;
+#4108 refusal/deferral shapes from the completion allow-list, drop the async spawn-failure shape
+from it, drop the retired pre-#4108 prefix from the lookup). Prose cannot prove a suite has teeth;
 this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
 
 THE FIXTURES ARE INSULATED FROM THE AMBIENT ANCESTRY. `setsid --fork` makes each launcher a session
@@ -66,6 +67,7 @@ import atexit
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -626,7 +628,12 @@ def main() -> int:
     shipped = ("[reflect-hook] Hosted capture REFUSED — capacity_saturated — NOT retried: capacity "
                "is saturated. The session is kept in the spool at /tmp/pdne-rec.json.",
                "[reflect-hook] Hosted capture DEFERRED (transient) — not blocking this session: "
-               "attempt 2/4 runs in a detached worker in 2000ms.")
+               "attempt 2/4 runs in a detached worker in 2000ms.",
+               # The hand-off's ASYNC spawn-failure line (review P2 at 027c19401): the hook ran,
+               # nothing landed, the record stays in the spool. It was in NEITHER tuple, so a lane
+               # ending on it read `absent` — and on the log-only arm only `marker == "ok"` decides.
+               "[reflect-hook] Capture retry worker could not start (EAGAIN: resource temporarily "
+               "unavailable) — the session is kept in the spool at /tmp/pdne-rec.json.")
     for idx, line in enumerate(shipped):
         mpath = os.path.join(root, "logs", "marker%d.log" % idx)
         with open(mpath, "w", encoding="utf-8") as fh:
@@ -647,13 +654,37 @@ def main() -> int:
     check(len(hosted) >= 2,
           "C7 MARKERS: the allow-list carries the `Hosted capture` shapes at all (found %r) — an "
           "empty list makes the coupling below vacuously true" % (hosted,))
-    for entry in hosted:
+    for entry in tool.COMPLETION_FAILED + tool.COMPLETION_OK:
         check(entry in emitter,
               "C7 MARKERS: allow-list entry %r appears VERBATIM in extensions/reflect-hook.ts — a "
               "reworded emitter shape must fail here instead of degrading to `absent`" % entry)
     check("[reflect-hook] Hosted capture FAILED (" not in emitter,
           "C7 MARKERS: the superseded single-attempt `Hosted capture FAILED (` shape is GONE from "
           "the emitter, so the live allow-list carries no shape the extension no longer writes")
+
+    # ── Arm 2b: the coupling is BIDIRECTIONAL — an emitter shape the allow-list LACKS must go RED ──
+    # Arm 2 above runs allow-list → emitter, so it can only catch a REWORD. It cannot catch a shape the
+    # extension ADDS, and that is the direction the real defect took (review P2 at 027c19401): a new
+    # `[reflect-hook] …` console line shipped with no allow-list entry and classified `absent`, so a
+    # `--no-session` lane that finished read UNATTRIBUTABLE and stopped being reapable. The convergent
+    # practice for a log prefix vocabulary is the same shape: the emitter's vocabulary is declared, and
+    # a marker the consumer cannot classify must be SURFACED, never silently dropped — so a new
+    # `[reflect-hook]` line here is a DECISION (classify it, or say why not) rather than a silent
+    # degradation. The scan reads the leading literal chunk, which is all a `startswith` test sees.
+    shapes = emitter_marker_shapes(emitter)
+    check(len(shapes) >= 8,
+          "C7 MARKERS: the emitter scan found its `[reflect-hook]` console shapes at all (found %d: "
+          "%r) — a scan that reads nothing makes the loop below vacuously true" % (len(shapes), shapes))
+    for idx, shape in enumerate(shapes):
+        spath = os.path.join(root, "logs", "emitter%d.log" % idx)
+        with open(spath, "w", encoding="utf-8") as fh:
+            fh.write("the lane's report\n" + shape + "\n")
+        skind, sdetail = tool.log_marker(spath, 1)
+        check(skind in ("ok", "hook-failed"),
+              "C7 MARKERS: every `[reflect-hook]` shape the emitter prints through console.* is "
+              "classified by the allow-list (shape %r read as %r: %r) — an unclassified shape is "
+              "`absent`, which authorises nothing and drops the lane out of the re-verify set, "
+              "silently" % (shape, skind, sdetail))
 
     # ── Arm 3: the RETIRED shape is still recognised, and still cannot be re-emitted ──
     # Note 4 of the review at 31e29ed50: the pre-#4108 line was DROPPED from the allow-list rather than
@@ -682,12 +713,64 @@ def main() -> int:
     check(len(tool.RETIRED_COMPLETION_FAILED) >= 1,
           "C7 MARKERS: the retired set is non-empty, so the loop above is not vacuously true")
 
+    # ── Arm 4: the PRE-FIX direction — this really is the delta, not a no-op assertion ──
+    # Review P3 at 027c19401: the body claimed C7 drives the retired shape to `absent` "on the "
+    # pre-fix tuple", but only the post-fix direction was asserted, so that half was a one-off
+    # measurement. With the retired set emptied — i.e. the lookup the pre-fix tool had — the very
+    # same line must read `absent`. If it does not, arm 3 is measuring something that did not change.
+    saved_retired = tool.RETIRED_COMPLETION_FAILED
+    try:
+        tool.RETIRED_COMPLETION_FAILED = ()
+        prekind, predetail = tool.log_marker(rpath, 1)
+    finally:
+        tool.RETIRED_COMPLETION_FAILED = saved_retired
+    check(prekind == "absent",
+          "C7 MARKERS: without the retired set (the PRE-FIX lookup) the same line classifies "
+          "`absent` — so arm 3 measures this fix and not a classifier that was already unchanged "
+          "(got %r: %r)" % (prekind, predetail))
+
     cleanup()                     # kills the groups AND removes the root
     print("\nALL ASSERTIONS HELD (18 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
           "directions, the arming gate, the refusal bucket, the verify-time log re-read and the "
-          "#4108 marker allow-list against both the real classifier and the emitter)")
+          "#4108 marker allow-list against the real classifier, the emitter (allow-list → "
+          "emitter) AND the emitter's own shapes (emitter → allow-list)")
     return 0
+
+
+_CONSOLE_CALL = re.compile(r"console\.(?:log|warn|error)\(\s*")
+
+
+def emitter_marker_shapes(text: str) -> list:
+    """Every `console.*("[reflect-hook] …")` shape in the emitter, as its leading LITERAL chunk.
+
+    The chunk is the literal up to the first `${` or the closing quote, which is exactly what a
+    `startswith` allow-list test sees. Calls whose first argument is not a literal (the STARTUP line
+    is printed through `captureStatusLine(...)`) are skipped here and covered by the `STARTUP`
+    predicate's own arm — they are not completions and must not be read as one.
+    """
+    found: list = []
+    for match in _CONSOLE_CALL.finditer(text):
+        i = match.end()
+        quote = text[i:i + 1]
+        if quote not in ("`", '"', "'"):
+            continue
+        j = i + 1
+        chunk = []
+        while j < len(text):
+            ch = text[j]
+            if ch == "\\":
+                chunk.append(text[j:j + 2])
+                j += 2
+                continue
+            if ch == quote or (quote == "`" and text.startswith("${", j)):
+                break
+            chunk.append(ch)
+            j += 1
+        literal = "".join(chunk)
+        if literal.startswith("[reflect-hook] "):
+            found.append(literal)
+    return found
 
 
 def load_tool():
@@ -752,6 +835,11 @@ def run_mutations() -> int:
         ("the #4108 refusal/deferral shapes dropped from the completion allow-list",
          '    "[reflect-hook] Hosted capture REFUSED — ",\n'
          '    "[reflect-hook] Hosted capture DEFERRED (",\n',
+         ""),
+        # The shape the review P2 at 027c19401 found missing from BOTH tuples: drop it again and the
+        # suite must go RED at C7 arm 1 (its shipped-shape row) AND at arm 2b (the emitter scan).
+        ("the async spawn-failure shape dropped from the completion allow-list",
+         '    "[reflect-hook] Capture retry worker could not start (",\n',
          ""),
         # Note 4 of the review at 31e29ed50: the RETIRED pre-#4108 shape stays on the lookup so a box
         # mid-sync keeps its `hook-failed` verdict. Stop consulting the retired set and arm 3 must go

@@ -548,8 +548,13 @@ async function main() {
     const status = res.status;
     const outcome = classify(status);
     if (outcome === "landed") {
-      log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " LANDED (HTTP " + status + ") — capture filed; staged request body removed");
+      // ⛔ UNLINK BEFORE LOGGING (review P3 at 027c19401). The staged body is what the caller's
+      // tests poll for: they wait for this line and then assert the retry dir is empty, and a
+      // worker that logged first left a window in which the file still existed. The log line is
+      // the worker's LAST act on every terminal branch, so "the deciding line is present" implies
+      // "the staged body is already gone" — one order, no poll race.
       cleanup();
+      log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " LANDED (HTTP " + status + ") — capture filed; staged request body removed");
       return;
     }
     let parsed = null;
@@ -569,19 +574,19 @@ async function main() {
     log("capture retry: attempt " + spent + "/" + MAX_ATTEMPTS + " REFUSED (HTTP " + status +
         (code ? " code=" + code : "") + (advertisedNow !== null ? " retry_after=" + advertisedNow + "s" : "") + " class=" + outcome + ")");
     if (outcome !== "retryable") {
+      cleanup();                       // unlink before logging — see the LANDED branch
       log("capture retry TERMINAL — class=" + outcome + " is not retryable (waiting cannot fix it); the durable record stays at " + LOCAL_RECORD);
-      cleanup();
       return;
     }
     advertised = advertisedNow;
   }
+  cleanup();                           // unlink before logging — see the LANDED branch
   log("capture retry EXHAUSTED after " + MAX_ATTEMPTS + " attempts — last: " + last() +
       "; the capture is NOT lost — the record stays in the spool at " + LOCAL_RECORD +
       " and tortoise's session-events drain treats a retryable refusal as transient and files it later");
-  cleanup();
 }
 
-main().catch(function (err) { log("capture retry ABORTED — " + String(err)); cleanup(); });
+main().catch(function (err) { cleanup(); log("capture retry ABORTED — " + String(err)); });
 `;
 }
 

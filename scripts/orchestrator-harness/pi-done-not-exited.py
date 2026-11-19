@@ -169,6 +169,13 @@ COMPLETION_FAILED = (            # the same extension's failure/deferral shapes
     # allow-list — an unrecognised shape would report as `absent` and say less.
     "[reflect-hook] Hosted capture REFUSED — ",
     "[reflect-hook] Hosted capture DEFERRED (",
+    # The retry hand-off's ASYNC spawn-failure line (`child.on("error")` in `reflect-hook.ts`): the
+    # hook ran, the capture was NOT landed, and the record stays in the spool. Review P2 at
+    # `027c19401`: it was in NEITHER tuple, so a lane whose last line is this one read `absent` —
+    # and on the log-only arm (`--no-session`, no transcript) only `marker == "ok"` may decide, so
+    # the lane became UNATTRIBUTABLE and dropped out of the re-verify set: exactly the silent
+    # degradation the #4108 shapes were added to close.
+    "[reflect-hook] Capture retry worker could not start (",
     "[reflect-hook] Attribution resolution failed",
 )
 # ⛔ RETIRED FROM THE EMITTER, DELIBERATELY STILL RECOGNISED. `extensions/reflect-hook.ts` at this
