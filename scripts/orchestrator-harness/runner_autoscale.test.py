@@ -6681,11 +6681,17 @@ def t71_doc_cites_the_shipped_unit_timeout():
         "prose '5400 s' is exactly what let the wrong number survive",
     )
     for value, at in mentions:
-        # Blank lines delimit the passage this citation lives in, which is the unit of a doc claim.
-        start = doc.rfind("\n\n", 0, at)
-        end = doc.find("\n\n", at)
-        passage = doc[start if start >= 0 else 0 : end if end >= 0 else len(doc)]
-        if any(marker in passage for marker in other_unit):
+        # ⛔ THE PROSE UNIT OF A CLAIM IS THE LIST ITEM, NOT A BLANK-LINE BLOCK (round-2 review,
+        # finding 1). A tight Markdown list has NO blank lines between its items, so a `\n\n` slice
+        # here spanned four independent bullets: an unrelated mention of `eldato-lane-arm` in bullet
+        # 1 would exempt a WRONG number in bullet 4 — measured, GREEN, on exactly the edit most
+        # likely to be made. The slice therefore starts at the later of the blank line and the last
+        # list-item marker (`\n* `), and ends at the first of the next one and the next blank line.
+        start = max(doc.rfind("\n\n", 0, at), doc.rfind("\n* ", 0, at))
+        stops = [i for i in (doc.find("\n* ", at), doc.find("\n\n", at)) if i >= 0]
+        end = min(stops) if stops else len(doc)
+        item = doc[start if start >= 0 else 0 : end]
+        if any(marker in item for marker in other_unit):
             continue
         check(
             value == shipped.group(1) == rendered_bound.group(1),
