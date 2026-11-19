@@ -92,7 +92,7 @@ export MEM_MIN_AVAIL_MB=1
 # — rather than assert a ceiling the ambient box is entitled to override. Pointing it at a path that
 # does not exist takes lane-env.sh's "no readable … relying on the inherited environment" branch, which
 # is the honest description of a fixture whose `pi` is stubbed and whose key gate is off by argv.
-export ENV_FILE="$TMP/no-such-keys-env"
+# export ENV_FILE="$TMP/no-such-keys-env"  # TEMP probe
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
