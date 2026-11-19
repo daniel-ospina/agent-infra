@@ -5221,10 +5221,12 @@ MUTATIONS = [
         '            "TimeoutStartSec=5400",',
         '            "TimeoutStartSec=3600",  # MUTATION: the render drifts from the documented bound',
         "`render_unit`'s literal no longer matches the bound the operator doc cites and the shipped "
-        "template carries, so the one arm that pins the RENDER carrier — the copy of the number "
+        "template carries, so the arm that pins the doc's number to the RENDER — the copy "
         "`--install-unit` actually writes — reports a pass while an installed unit ships a bound the "
-        "doc contradicts. (The doc's own claims cannot be mutated from here: the harness rewrites the "
-        "module, and T71's other artifact is the doc.)",
+        "doc contradicts. (T47 pins that same literal independently, so this is not the only case that "
+        "reads it; what no other case reads is "
+        "templates/systemd/eldato-runner-autoscale.service and the doc-to-render equality. The doc's "
+        "own claims cannot be mutated from here: the harness rewrites the module.)",
     ),
     Mutation(
         "T47",
@@ -6679,11 +6681,20 @@ def t71_doc_cites_the_shipped_unit_timeout():
     # ⛔ A PASSAGE THAT NAMES ANOTHER UNIT IS OUT OF THIS CASE'S SCOPE, DELIBERATELY (#4153 review
     # round 6, finding 3). The confusion this case documents is best EXPLAINED by naming the unit the
     # 900 actually belongs to, and pinning every mention to 5400 would then report a *correct* doc as
-    # a defect — the same failure class (a claim no artifact backs) with the sign flipped. So the
-    # contract is: a citation that does NOT name another unit must equal this unit's shipped bound;
-    # one that does is left to a human reader. `scripts/install-lane-arm-timer.sh` is named as the
-    # other carrier so the reason a mention may legitimately differ is recorded here, not guessed.
+    # a defect — the same failure class (a claim no artifact backs) with the sign flipped.
+    # ⛔ AND THE EXEMPTED NUMBER IS STILL CHECKED — against the unit the passage NAMES (round-7
+    # review, findings 1-2). Leaving it unexamined was a hole with two measured shapes: a wrong
+    # number could hide behind `eldato-lane-arm` in a SIBLING nested item, and (once nesting became a
+    # boundary) a CORRECT "parent names the other unit / child cites that unit's 900" was a false RED.
+    # The rule is now positional AND value-checked: the passage that names another unit may cite
+    # EITHER shipped bound, and nothing else; every other citation must be THIS unit's.
     other_unit = ("eldato-lane-arm", "install-lane-arm-timer.sh")
+    lane_arm = (root / "scripts" / "install-lane-arm-timer.sh").read_text()
+    lane_arm_bound = re.search(r"^TimeoutStartSec=(\d+)$", lane_arm, re.MULTILINE)
+    check(
+        lane_arm_bound is not None,
+        "the lane-arm installer must carry its own bound — this case pins the two units apart",
+    )
     mentions = [(m.group(1), m.start()) for m in re.finditer(r"TimeoutStartSec=(\d+)", doc)]
     check(
         mentions,
@@ -6699,13 +6710,15 @@ def t71_doc_cites_the_shipped_unit_timeout():
         # ⛔ AND EVERY LIST FORM COUNTS, NOT JUST `*` (round-3 review, finding 2): this doc already
         # carries a numbered list, and a `-`-bulleted one renders identically for a reader, so an
         # item boundary derived from `\n* ` alone left both forms exempting a wrong number — measured,
-        # GREEN. `LIST_MARKER` is the whole family (`*`, `-`, `+`, `1.`, `1)`).
+        # GREEN. `LIST_MARKER` is the whole family (`*`, `-`, `+`, `1.`, `1)`), and `PARENT_MARKER`
+        # is the column-0 subset.
         # ⛔ AND INDENTATION IS PART OF THE MARKER (round-6 review, finding 1): a NESTED item is
-        # written `  - ` / `  1. `, so a column-0-only marker derived the WHOLE outer bullet as the
+        # written `  - ` / `  1. `, so a column-0-only boundary derived the WHOLE outer bullet as the
         # item and let a sibling nested item that names another unit exempt a wrong number — measured,
-        # GREEN, both shapes. The leading `[ \t]*` is what closes that, and the shipped doc is
-        # unaffected (its bullets are column-0 with two-space continuation lines).
+        # GREEN, both shapes.
         LIST_MARKER = re.compile(r"\n[ \t]*(?:[*+-] |\d+[.)] )")
+        PARENT_MARKER = re.compile(r"\n(?:[*+-] |\d+[.)] )")
+        NESTED_MARKER = re.compile(r"\n[ \t]+(?:[*+-] |\d+[.)] )")
         marker_before = [m.start() for m in LIST_MARKER.finditer(doc, 0, at)]
         start = max(doc.rfind("\n\n", 0, at), marker_before[-1] if marker_before else -1)
         marker_after = LIST_MARKER.search(doc, at)
@@ -6713,7 +6726,33 @@ def t71_doc_cites_the_shipped_unit_timeout():
         stops = [i for i in (marker_after.start() if marker_after else -1, blank_after) if i >= 0]
         end = min(stops) if stops else len(doc)
         item = doc[start if start >= 0 else 0 : end]
-        if any(marker in item for marker in other_unit):
+        # ⛔ A NESTED ITEM'S CLAIM IS ITS PARENT ITEM'S CLAIM (round-7 review, finding 1): "Compare
+        # `eldato-lane-arm` …:" followed by "  - that unit ships `TimeoutStartSec=900`" is a CORRECT
+        # doc whose subject lives one level up, so the bare nested item cut the name away and called
+        # it a defect. Widening back to the parent item is SAFE — and only because the VALUE is now
+        # checked too (below): a sibling that names the other unit can no longer exempt a number that
+        # no artifact ships (measured: `3600` next to `eldato-lane-arm` is RED).
+        passage = item
+        parent_starts = [m.start() for m in PARENT_MARKER.finditer(doc, 0, at)]
+        if parent_starts and NESTED_MARKER.search(doc, parent_starts[-1] + 1, at) is not None:
+            p = parent_starts[-1]
+            stops = [
+                m.start()
+                for m in (PARENT_MARKER.search(doc, p + 1),)
+                if m is not None
+            ]
+            nl = doc.find("\n\n", p + 1)
+            if nl >= 0:
+                stops.append(nl)
+            passage = doc[p : min(stops) if stops else len(doc)]
+        if any(marker in passage for marker in other_unit):
+            check(
+                value in (shipped.group(1), lane_arm_bound.group(1)),
+                f"the doc cites TimeoutStartSec={value} in a passage that names "
+                f"`{other_unit[0]}`, but the two shipped bounds are {shipped.group(1)} (this unit, "
+                f"templates/systemd/eldato-runner-autoscale.service) and {lane_arm_bound.group(1)} "
+                "(scripts/install-lane-arm-timer.sh) — a third number is backed by no artifact",
+            )
             continue
         check(
             value == shipped.group(1) == rendered_bound.group(1),
