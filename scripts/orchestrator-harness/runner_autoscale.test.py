@@ -6638,6 +6638,44 @@ def t70_unreadable_pre_restart_read_is_fail_closed():
             box.destroy()
 
 
+@test("T71 #4153 the doc's cited TimeoutStartSec is the one the repo SHIPS — 900 belonged to no artifact")
+def t71_doc_cites_the_shipped_unit_timeout():
+    """The operator doc is the only place a reader learns WHY `ONLINE_WAIT_S` stays at 60 s, and it
+    argued that raising it "would exceed the unit's `TimeoutStartSec=900`" — a number the repo does
+    not ship (agent-infra#4153 review round 5, finding 1). Both artifacts that DO carry the bound say
+    5400, and four runners × a 420 s wait is 1680 s, so the cited reason reproduced as FALSE on the
+    first check while the decision it justified was sound. `grep TimeoutStartSec templates/` returns
+    5400 and nothing else, so a reader following the doc learns a bound that exists nowhere — and a
+    future pass sized against 900 would be short of the unit's real worst case.
+
+    The claim is pinned against BOTH carriers of the number (the shipped template and the
+    `--install-unit` render), so this also catches a render that drifts from the file the installer
+    renders. Proven non-vacuous on the pre-fix doc: it cited 900 against a shipped 5400."""
+    root = Path(__file__).resolve().parents[2]
+    doc = (root / "docs" / "ops" / "runner-autoscale.md").read_text()
+    template = (root / "templates" / "systemd" / "eldato-runner-autoscale.service").read_text()
+    shipped = re.search(r"^TimeoutStartSec=(\d+)$", template, re.MULTILINE)
+    check(shipped is not None, "the shipped unit must carry its own bound")
+    rendered = ra.render_unit(repo="daniel-ospina/tortoise")
+    service = next(body for name, body in rendered.items() if name.endswith(".service"))
+    rendered_bound = re.search(r"^TimeoutStartSec=(\d+)$", service, re.MULTILINE)
+    check(rendered_bound is not None, "the render must carry its own bound")
+    cited = re.findall(r"TimeoutStartSec=(\d+)", doc)
+    check(
+        cited,
+        "the doc must name the bound concretely (`TimeoutStartSec=<N>`) so this case can read it — a "
+        "prose '5400 s' is exactly what let the wrong number survive",
+    )
+    for value in cited:
+        check(
+            value == shipped.group(1) == rendered_bound.group(1),
+            f"the doc cites TimeoutStartSec={value}, but the artifacts ship {shipped.group(1)} "
+            f"(templates/systemd/eldato-runner-autoscale.service) / {rendered_bound.group(1)} "
+            "(--install-unit render) — a reason built on a bound that is not the shipped one reads "
+            "as false and sizes a future pass against the wrong wall clock",
+        )
+
+
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     only = os.environ.get("RUNNER_AUTOSCALE_TEST_ONLY") or None
