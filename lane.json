@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1795090748-p3409428-9cba91df",
+  "_sha": "0e0c067a445b0c32fa1ec804f1ed9d2644b19311",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.OERGsFZLtd/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/4153-autoscaler-restart-loop"
+    },
+    {
+      "kind": "sha",
+      "value": "09c376fb4bec4843b63fac5d718cda716e2b22f0"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-4154"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 50,
+  "ended_at": 1795090798,
+  "exit_code": 0,
+  "heartbeat_at": 1795090798,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1795090748-p3409428-9cba91df",
+  "lease_until": 1795091403,
+  "pid": 3409428,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795090748,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4154"
+}
