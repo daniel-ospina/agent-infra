@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-fix-12244-1795063449-p3353213-bc390670",
+  "_sha": "9b6351bc3e19cddd71c8754d75119285aa5c70c1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/fix-12244.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12244-merge-collapse"
+    },
+    {
+      "kind": "sha",
+      "value": "fcb2911596a6ce25799a6a487cce4f2167f554e8"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-12244"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7243,
+  "ended_at": 1795070692,
+  "exit_code": 143,
+  "heartbeat_at": 1795070692,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-fix-12244-1795063449-p3353213-bc390670",
+  "lease_until": 1795078492,
+  "pid": 3353213,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795063449,
+  "state": "FAILED",
+  "tag": "fix-12244",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-12244"
+}
