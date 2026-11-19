@@ -69,9 +69,16 @@ THE EVIDENCE, AND WHAT EACH CHANNEL CANNOT SEE
      the window (growth is positive liveness and beats CPU). An abstention is not an ending.
   C. THE LOG — the file this process holds on fd 1/2, whose last line is a SUCCESSFUL completion
      line and which did not grow inside the window. Three attribution traps, all measured:
-       * `[reflect-hook] Failed: …` is a HOOK FAILURE. So are two other shapes the extension writes
-         — `Hosted capture FAILED (…)` and `Attribution resolution failed` — so the test is
-         case-insensitive `failed|error`, never a `\bFailed\b` match.
+       * `[reflect-hook] Failed: …` is a HOOK FAILURE. So are the other shapes the extension writes
+         — `Hosted capture REFUSED — …` / `Hosted capture DEFERRED (…)` (the #4108 shapes that
+         replaced `Hosted capture FAILED (…)`) and `Attribution resolution failed` — so the rule is
+         a POSITIVE ALLOW-LIST of exact prefixes: a line counts as a completion only when it
+         `startswith` one of `COMPLETION_OK`, and as a hook failure only when it `startswith` one of
+         `COMPLETION_FAILED` or of `RETIRED_COMPLETION_FAILED` (shapes the emitter has stopped
+         writing but an installed copy can still print during a sync window — see the tuple). The match is CASE-SENSITIVE and there is no `failed|error` regex — the
+         STARTUP line shares the `[reflect-hook]` prefix, so a keyword search called startup a
+         completion (cycle 2, P1), and on a `--no-session` lane the log channel is the only one.
+         A shape the list does not carry reads `absent`, which authorises nothing.
        * a launcher path is RE-USED by later dispatches (`> log` truncates the same inode): measured
          5 `pi` on `adv-cipressure.log`, 4 on `adv-reaping.log`. A log held by more than one
          candidate is `shared`, and authorises nothing.
@@ -153,10 +160,40 @@ COMPLETION_OK = (                # written by extensions/reflect-hook.ts AFTER t
     "[reflect-hook] Captured session ",
     "[reflect-hook] Skipped — empty session",
 )
-COMPLETION_FAILED = (            # the same extension's three failure shapes
+COMPLETION_FAILED = (            # the same extension's failure/deferral shapes
     "[reflect-hook] Failed: ",
-    "[reflect-hook] Hosted capture FAILED (",
+    # #4108 replaced the single-attempt `Hosted capture FAILED (…)` line with these
+    # two: a refusal that is NOT retried ("REFUSED —") and one deferred to the
+    # detached retry worker ("DEFERRED ("). Both mean the end-of-turn hook ran and
+    # did not land the capture, so both belong on the failure side of this
+    # allow-list — an unrecognised shape would report as `absent` and say less.
+    "[reflect-hook] Hosted capture REFUSED — ",
+    "[reflect-hook] Hosted capture DEFERRED (",
+    # #4108's async spawn-failure line (`child.on("error")`, emitted when the detached
+    # retry worker cannot be exec'd): the hook DID run and did NOT land the capture, and
+    # it can be the LAST line of a lane log — the DEFERRED warn is written first and the
+    # error event fires on the next tick, while pi's shutdown still has awaits to run.
+    # Without an entry here the line reads `absent`, which on the log-only arm
+    # (`marker == "ok"` is the only decider) leaves a finished lane UNATTRIBUTABLE
+    # instead of `hook-failed` — the same silent degradation the RETIRED tuple below
+    # exists to prevent. Found by the review at f58b85111 (P2).
+    "[reflect-hook] Capture retry worker could not start (",
     "[reflect-hook] Attribution resolution failed",
+)
+# ⛔ RETIRED FROM THE EMITTER, DELIBERATELY STILL RECOGNISED. `extensions/reflect-hook.ts` at this
+# head writes the two #4108 shapes and NOT this one — but the extension reaches a box by a SYNC step
+# that is not atomic with this tool's rollout (`pi-bootstrap`/`cell-install` copy the tree), so in the
+# window between them the INSTALLED copy still prints the pre-#4108 line. Two different clocks
+# produce two live shapes, which is why the accepted practice for a renamed log field is a dual-read
+# grace window longer than the deploy lag rather than a same-commit swap.
+# ⛔ WHAT DROPPING IT COSTS (measured by the review at 31e29ed50): that line then reads `absent` —
+# fail-closed, so it authorises nothing, but the lane silently drops OUT of the
+# `marker in ("ok", "hook-failed")` re-verify set and stops being reapable, on the one channel a
+# `--no-session` lane has. Keeping it costs a tuple entry the emitter no longer writes.
+# ⛔ It CANNOT rot into a live shape: the C7 control pins every entry here ABSENT from the emitter, so
+# a future emitter that grows this prefix back fails HERE instead of silently re-enabling it.
+RETIRED_COMPLETION_FAILED = (
+    "[reflect-hook] Hosted capture FAILED (",
 )
 STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
 # ⛔ PRINT MODE, read from the LAUNCHER's CODE. An interactive `pi` waiting at a human's prompt also
@@ -471,7 +508,7 @@ def log_marker(log: Optional[str], holders: int) -> Tuple[str, str]:
     last = lines[-1]
     if last.startswith(STARTUP):
         return "startup", "the last line is the STARTUP capture status, not a completion: %s" % last[:120]
-    if any(last.startswith(f) for f in COMPLETION_FAILED):
+    if any(last.startswith(f) for f in COMPLETION_FAILED + RETIRED_COMPLETION_FAILED):
         return "hook-failed", last[:160]
     if any(last.startswith(c) for c in COMPLETION_OK):
         return "ok", last[:160]
@@ -708,8 +745,8 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
                        why="turn ENDED (the transcript is the attribution); log evidence is %s" % marker)
         elif marker == "hook-failed":
             out.update(cls="DONE-NOT-EXITED",
-                       why="turn ENDED; the end-of-turn hook FAILED (%s) — nothing left to write"
-                       % mdetail)
+                       why="turn ENDED; the end-of-turn hook reported a capture problem (%s) — "
+                           "nothing left to write" % mdetail)
         elif marker == "ok":
             out.update(cls="DONE-NOT-EXITED",
                        why="turn ENDED; its own log ends with a completion line; cpu frozen")

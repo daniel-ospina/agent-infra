@@ -47,9 +47,10 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against ELEVEN mutated copies of the tool and requires each to go RED
-(fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
-arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
+`--mutations` re-runs this suite against FOURTEEN mutated copies of the tool and requires each to go
+RED (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
+arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG, drop the
+#4108 refusal/deferral/spawn-failure shapes from the completion allow-list). Prose cannot prove a
 suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
 
 THE FIXTURES ARE INSULATED FROM THE AMBIENT ANCESTRY. `setsid --fork` makes each launcher a session
@@ -65,6 +66,7 @@ import atexit
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -610,11 +612,134 @@ def main() -> int:
     check(ok_still, "C6 VERIFY: the same row with a QUIET log still verifies (%r) — so C6 is not "
                     "always-false" % why_still)
 
+    # ── CONTROL: the completion ALLOW-LIST pins the two #4108 shapes, in BOTH directions ──
+    # `log_marker()` is fail-closed on a shape it does not recognise — it answers `absent`, and an
+    # absent marker authorises nothing, so the degradation is SILENT and lands where the log is the
+    # ONLY channel (a `--no-session` lane): a lane that finished stops being reapable and nothing
+    # says why. #4108's client half replaced `Hosted capture FAILED (` with a refusal shape and a
+    # deferral shape, so the allow-list moved with it and this control pins the move.
+    #
+    # Arm 1 drives the REAL function over a real file, so it is not a test of a restated tuple.
+    # Arm 2 couples that tuple to the EMITTER: a reword in `extensions/reflect-hook.ts` must fail
+    # HERE rather than degrade in production. Arm 2 is fail-closed on an unreadable emitter — a
+    # coupling that skips when it cannot read is a no-op gate, which is the class this suite is
+    # for. (`--mutations` copies the emitter into its temp tree for exactly this arm; see `one()`.)
+    shipped = ("[reflect-hook] Hosted capture REFUSED — capacity_saturated — NOT retried: capacity "
+               "is saturated. The session is kept in the spool at /tmp/pdne-rec.json.",
+               "[reflect-hook] Hosted capture DEFERRED (transient) — not blocking this session: "
+               "attempt 2/4 is scheduled in a detached worker in 2000ms.",
+               # The async spawn-failure line (`child.on("error")`) — a THIRD emitted shape, and the
+               # one that reached production unlisted at f58b85111 because the emitter grew a line the
+               # allow-list never heard about.
+               "[reflect-hook] Capture retry worker could not start (spawn EAGAIN) — the session is "
+               "kept in the spool at /tmp/pdne-rec.json.")
+    for idx, line in enumerate(shipped):
+        mpath = os.path.join(root, "logs", "marker%d.log" % idx)
+        with open(mpath, "w", encoding="utf-8") as fh:
+            fh.write("the lane's report\n" + line + "\n")
+        kind, detail = tool.log_marker(mpath, 1)
+        check(kind == "hook-failed",
+              "C7 MARKERS: the shipped #4108 shape %d classifies as `hook-failed` — a refusal and a "
+              "deferral both mean the hook ran and did NOT land the capture, so neither may read as "
+              "a completion (got %r: %r)" % (idx, kind, detail))
+    emitter_path = os.path.join(HERE, os.pardir, os.pardir, "extensions", "reflect-hook.ts")
+    try:
+        emitter = open(emitter_path, encoding="utf-8").read()
+    except OSError as exc:
+        fail("C7 MARKERS: cannot read the emitter %s (%s) — an allow-list that cannot be coupled to "
+             "the emitter is exactly what this control exists to prevent"
+             % (os.path.realpath(emitter_path), exc))
+    # Arm 2 — allow-list → emitter, for EVERY live entry (not just the `Hosted capture` ones: the
+    # filter that used to sit here was itself a blind spot, because an entry that stops naming
+    # `Hosted capture` left the coupling without ever saying so).
+    live = tool.COMPLETION_FAILED + tool.COMPLETION_OK
+    check(len(live) >= 5,
+          "C7 MARKERS: the live allow-list carries entries at all (found %r) — an empty list makes "
+          "the coupling below vacuously true" % (live,))
+    for entry in live:
+        check(entry in emitter,
+              "C7 MARKERS: allow-list entry %r appears VERBATIM in extensions/reflect-hook.ts — a "
+              "reworded emitter shape must fail here instead of degrading to `absent`" % entry)
+    check("[reflect-hook] Hosted capture FAILED (" not in emitter,
+          "C7 MARKERS: the superseded single-attempt `Hosted capture FAILED (` shape is GONE from "
+          "the emitter, so the live allow-list carries no shape the extension no longer writes")
+
+    # ── Arm 2b: the coupling runs in the OTHER direction too ──
+    # Arm 2 asks "is every allow-list entry still emitted?". That question cannot see a shape the
+    # emitter ADDS, and that is the direction that actually degraded: #4108's own diff grew
+    # `Capture retry worker could not start (` and no tuple heard about it, so the line read
+    # `absent` and dropped a finished lane out of the re-verify set (review at f58b85111, P2).
+    # So: enumerate every `[reflect-hook] ` LITERAL the emitter can put at the START of a line,
+    # cut it at the first `${` interpolation (or at the literal's closing quote), and require the
+    # allow-list to RECOGNISE it. A new emitter shape now reddens HERE, at author time, instead of
+    # silently degrading on a box.
+    heads = emitter_heads(emitter)
+    check(len(heads) >= 5,
+          "C7 MARKERS: found %d `[reflect-hook] ` line literals in the emitter — a count that low "
+          "means the enumeration broke (a reworded print), not that the emitter shrank; the "
+          "reverse coupling would be vacuously true" % len(heads))
+    for head in heads:
+        recognised = head.startswith(tool.STARTUP) or any(
+            head.startswith(entry) or head.rstrip() == entry.rstrip() for entry in live)
+        check(recognised,
+              "C7 MARKERS: the emitter can print %r at the start of a line AND an allow-list entry "
+              "recognises it (an unlisted shape would answer `absent` for a lane whose last line "
+              "this is, and on a `--no-session` lane that silently drops the lane out of the "
+              "re-verify set)" % head)
+
+    # ── Arm 3: the RETIRED shape is still recognised, and still cannot be re-emitted ──
+    # Note 4 of the review at 31e29ed50: the pre-#4108 line was DROPPED from the allow-list rather than
+    # kept as a dead prefix. The extension reaches a box through a SYNC step that is not atomic with
+    # this tool's rollout, so in the window between them the INSTALLED copy still prints the old line.
+    # Recognising a shape the emitter no longer writes costs one tuple entry; NOT recognising it costs
+    # the lane its `hook-failed` verdict silently (`absent` — fail-closed, but it drops the lane out of
+    # the `marker in ("ok", "hook-failed")` re-verify set) on the ONE channel a `--no-session` lane
+    # has. This arm drives the REAL classifier over the real pre-fix line, so it reddens on any tool
+    # whose lookup stops consulting the retired set (mutation 13 proves the teeth).
+    retired_line = ("[reflect-hook] Hosted capture FAILED (HTTP 429) — a manual-recovery JSONL "
+                    "record was kept at /tmp/pdne-retired.jsonl")
+    rpath = os.path.join(root, "logs", "marker-retired.log")
+    with open(rpath, "w", encoding="utf-8") as fh:
+        fh.write("the lane's report\n" + retired_line + "\n")
+    rkind, rdetail = tool.log_marker(rpath, 1)
+    check(rkind == "hook-failed",
+          "C7 MARKERS: the RETIRED pre-#4108 `Hosted capture FAILED (` shape still classifies as "
+          "`hook-failed` — an installed copy can still print it during a sync window, and `absent` "
+          "would drop the lane out of the re-verify set (got %r: %r)" % (rkind, rdetail))
+    for entry in tool.RETIRED_COMPLETION_FAILED:
+        check(entry not in emitter,
+              "C7 MARKERS: retired allow-list entry %r is ABSENT from extensions/reflect-hook.ts — a "
+              "retired shape the emitter grows BACK must fail here instead of silently becoming live "
+              "again" % entry)
+    check(len(tool.RETIRED_COMPLETION_FAILED) >= 1,
+          "C7 MARKERS: the retired set is non-empty, so the loop above is not vacuously true")
+
     cleanup()                     # kills the groups AND removes the root
     print("\nALL ASSERTIONS HELD (18 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
-          "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
+          "directions, the arming gate, the refusal bucket, the verify-time log re-read and the "
+          "#4108 marker allow-list against both the real classifier and the emitter — allow-list → "
+          "emitter AND emitter → allow-list)")
     return 0
+
+
+def emitter_heads(source):
+    """Every `[reflect-hook] ` literal the emitter can print at the START of a line.
+
+    A hook line only decides a marker when it is the LAST line of the lane log, so a shape matters
+    exactly when it can BEGIN one — which is why the match is anchored to a quote/backtick
+    immediately before the prefix (a mid-string mention such as the worker's `" [reflect-hook] "`
+    log prefix can never start a line). The literal is cut at its first `${` interpolation (the
+    rest is runtime text) or at its closing quote, whichever comes first: that static head is what
+    an allow-list entry must be a prefix of.
+    """
+    heads = []
+    for m in re.finditer(r'(?<=[`"])' + re.escape("[reflect-hook] "), source):
+        i = m.end()
+        while i < len(source) and source[i] not in '`"\n' and not source.startswith("${", i):
+            i += 1
+        heads.append(source[m.start():i])
+    return heads
 
 
 def load_tool():
@@ -674,6 +799,24 @@ def run_mutations() -> int:
         ("--pid binds only the requested subset",
          "    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)",
          "    binds, peers = bind_map(pool, rows, pids, opts.ref_s)"),
+        # A prose claim that the #4108 marker control has teeth is worth nothing: delete the two
+        # shapes from the allow-list and the suite must go RED at C7 arm 1.
+        ("the #4108 refusal/deferral shapes dropped from the completion allow-list",
+         '    "[reflect-hook] Hosted capture REFUSED — ",\n'
+         '    "[reflect-hook] Hosted capture DEFERRED (",\n',
+         ""),
+        # Note 4 of the review at 31e29ed50: the RETIRED pre-#4108 shape stays on the lookup so a box
+        # mid-sync keeps its `hook-failed` verdict. Stop consulting the retired set and arm 3 must go
+        # RED — otherwise that arm is a prose claim, not a control.
+        ("the retired pre-#4108 `Hosted capture FAILED (` prefix dropped from the lookup",
+         "    if any(last.startswith(f) for f in COMPLETION_FAILED + RETIRED_COMPLETION_FAILED):",
+         "    if any(last.startswith(f) for f in COMPLETION_FAILED):"),
+        # The spawn-failure shape the emitter GREW at f58b85111 (review P2). Drop the entry and C7
+        # arm 1 must go RED on the shipped line, arm 2b on the emitter literal — so neither the
+        # classifier nor the reverse coupling is a prose claim.
+        ("the async spawn-failure `could not start (` shape dropped from the completion allow-list",
+         '    "[reflect-hook] Capture retry worker could not start (",\n',
+         ""),
     ]
     def one(label_old_new):
         label, old, new = label_old_new
@@ -687,6 +830,12 @@ def run_mutations() -> int:
                 shutil.copy(os.path.join(SCRIPTS, f), os.path.join(tmp, "scripts", f))
             shutil.copy(TOOL, os.path.join(tmp, "scripts", "orchestrator-harness",
                                            "pi-done-not-exited.py"))
+            # C7 arm 2 couples the allow-list to the EMITTER, and this tree is not the checkout: the
+            # control is fail-closed on a missing emitter (`fail()`), so a mutation run without this
+            # copy would go red for the wrong reason and be counted as a catch.
+            os.makedirs(os.path.join(tmp, "extensions"))
+            shutil.copy(os.path.join(HERE, os.pardir, os.pardir, "extensions", "reflect-hook.ts"),
+                        os.path.join(tmp, "extensions", "reflect-hook.ts"))
             shutil.copy(os.path.abspath(__file__), os.path.join(tmp, "scripts",
                                                                 "orchestrator-harness",
                                                                 "pi-done-not-exited.test.py"))
@@ -709,7 +858,7 @@ def run_mutations() -> int:
             if tmp in ROOT:
                 ROOT.remove(tmp)
 
-    # ⛔ THREE AT A TIME. Sequentially the control is ~11 x 90 s of wall clock; a control that
+    # ⛔ THREE AT A TIME. Sequentially the control is ~14 x 90 s of wall clock; a control that
     # cannot finish inside a CI step is a control that gets disabled. Each run owns its temp root and
     # its own fixtures, so they do not interact.
     from concurrent.futures import ThreadPoolExecutor
