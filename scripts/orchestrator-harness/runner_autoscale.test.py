@@ -124,6 +124,11 @@ below grows with the suite, so this header never claims a case that does not exi
      runner's stamp is pruned on the pass that sees it recover, so its NEXT death is not held on a
      restart from an hour earlier. T70 — the per-runner read that justifies the restart has its own
      fail-closed arm: unreadable ⇒ nothing restarted, the hold is published, and the pass is RED.
+     T71 — the operator doc's "why the wait stays at 60 s" cited `TimeoutStartSec=900`, a bound that
+     belongs to a DIFFERENT unit (`scripts/install-lane-arm-timer.sh`'s `eldato-lane-arm`); this
+     unit's own two carriers both say 5400, so the reason read as false on the first check. The case
+     pins the doc's cited number against BOTH carriers (template + render), which also catches a
+     render that drifts from the file the installer renders.
 
 ⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
 and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
@@ -5212,6 +5217,16 @@ MUTATIONS = [
         "with no actions field, after a registration may already have been destroyed",
     ),
     Mutation(
+        "T71",
+        '            "TimeoutStartSec=5400",',
+        '            "TimeoutStartSec=3600",  # MUTATION: the render drifts from the documented bound',
+        "`render_unit`'s literal no longer matches the bound the operator doc cites and the shipped "
+        "template carries, so the one arm that pins the RENDER carrier — the copy of the number "
+        "`--install-unit` actually writes — reports a pass while an installed unit ships a bound the "
+        "doc contradicts. (The doc's own claims cannot be mutated from here: the harness rewrites the "
+        "module, and T71's other artifact is the doc.)",
+    ),
+    Mutation(
         "T47",
         '            "TimeoutStartSec=5400",',
         '            "TimeoutStartSec=1800",  # MUTATION: shorter than a legitimate pass',
@@ -6636,6 +6651,77 @@ def t70_unreadable_pre_restart_read_is_fail_closed():
             )
         finally:
             box.destroy()
+
+
+@test("T71 #4153 the doc's cited TimeoutStartSec is the one THIS unit SHIPS — 900 is the lane-arm timer's")
+def t71_doc_cites_the_shipped_unit_timeout():
+    """The operator doc is the only place a reader learns WHY `ONLINE_WAIT_S` stays at 60 s, and it
+    argued that raising it "would exceed the unit's `TimeoutStartSec=900`" — a bound that belongs to
+    a DIFFERENT service (agent-infra#4153 review round 5, finding 1): the autoscaler's own two
+    carriers both say 5400, and the 900 in the tree is
+    `scripts/install-lane-arm-timer.sh:172`'s `eldato-lane-arm` unit. So the doc quoted the wrong
+    timer's bound, and the arithmetic it rested on (four runners x a 420 s wait = 1680 s) never
+    exceeded it: the only in-repo reason recorded for the decision read as false on the first check
+    while the decision itself was sound.
+
+    The claim is pinned against BOTH carriers of THIS unit's number (the shipped template and the
+    `--install-unit` render), so this also catches a render that drifts from the file the installer
+    renders. Proven non-vacuous on the pre-fix doc: it cited 900 against a shipped 5400."""
+    root = Path(__file__).resolve().parents[2]
+    doc = (root / "docs" / "ops" / "runner-autoscale.md").read_text()
+    template = (root / "templates" / "systemd" / "eldato-runner-autoscale.service").read_text()
+    shipped = re.search(r"^TimeoutStartSec=(\d+)$", template, re.MULTILINE)
+    check(shipped is not None, "the shipped unit must carry its own bound")
+    rendered = ra.render_unit(repo="daniel-ospina/tortoise")
+    service = next(body for name, body in rendered.items() if name.endswith(".service"))
+    rendered_bound = re.search(r"^TimeoutStartSec=(\d+)$", service, re.MULTILINE)
+    check(rendered_bound is not None, "the render must carry its own bound")
+    # ⛔ A PASSAGE THAT NAMES ANOTHER UNIT IS OUT OF THIS CASE'S SCOPE, DELIBERATELY (#4153 review
+    # round 6, finding 3). The confusion this case documents is best EXPLAINED by naming the unit the
+    # 900 actually belongs to, and pinning every mention to 5400 would then report a *correct* doc as
+    # a defect — the same failure class (a claim no artifact backs) with the sign flipped. So the
+    # contract is: a citation that does NOT name another unit must equal this unit's shipped bound;
+    # one that does is left to a human reader. `scripts/install-lane-arm-timer.sh` is named as the
+    # other carrier so the reason a mention may legitimately differ is recorded here, not guessed.
+    other_unit = ("eldato-lane-arm", "install-lane-arm-timer.sh")
+    mentions = [(m.group(1), m.start()) for m in re.finditer(r"TimeoutStartSec=(\d+)", doc)]
+    check(
+        mentions,
+        "the doc must name the bound concretely (`TimeoutStartSec=<N>`) so this case can read it — a "
+        "prose '5400 s' is exactly what let the wrong number survive",
+    )
+    for value, at in mentions:
+        # ⛔ THE PROSE UNIT OF A CLAIM IS THE LIST ITEM, NOT A BLANK-LINE BLOCK (round-2 review,
+        # finding 1). A tight Markdown list has NO blank lines between its items, so a `\n\n` slice
+        # here spanned four independent bullets: an unrelated mention of `eldato-lane-arm` in bullet
+        # 1 would exempt a WRONG number in bullet 4 — measured, GREEN, on exactly the edit most
+        # likely to be made.
+        # ⛔ AND EVERY LIST FORM COUNTS, NOT JUST `*` (round-3 review, finding 2): this doc already
+        # carries a numbered list, and a `-`-bulleted one renders identically for a reader, so an
+        # item boundary derived from `\n* ` alone left both forms exempting a wrong number — measured,
+        # GREEN. `LIST_MARKER` is the whole family (`*`, `-`, `+`, `1.`, `1)`).
+        # ⛔ AND INDENTATION IS PART OF THE MARKER (round-6 review, finding 1): a NESTED item is
+        # written `  - ` / `  1. `, so a column-0-only marker derived the WHOLE outer bullet as the
+        # item and let a sibling nested item that names another unit exempt a wrong number — measured,
+        # GREEN, both shapes. The leading `[ \t]*` is what closes that, and the shipped doc is
+        # unaffected (its bullets are column-0 with two-space continuation lines).
+        LIST_MARKER = re.compile(r"\n[ \t]*(?:[*+-] |\d+[.)] )")
+        marker_before = [m.start() for m in LIST_MARKER.finditer(doc, 0, at)]
+        start = max(doc.rfind("\n\n", 0, at), marker_before[-1] if marker_before else -1)
+        marker_after = LIST_MARKER.search(doc, at)
+        blank_after = doc.find("\n\n", at)
+        stops = [i for i in (marker_after.start() if marker_after else -1, blank_after) if i >= 0]
+        end = min(stops) if stops else len(doc)
+        item = doc[start if start >= 0 else 0 : end]
+        if any(marker in item for marker in other_unit):
+            continue
+        check(
+            value == shipped.group(1) == rendered_bound.group(1),
+            f"the doc cites TimeoutStartSec={value}, but the artifacts ship {shipped.group(1)} "
+            f"(templates/systemd/eldato-runner-autoscale.service) / {rendered_bound.group(1)} "
+            "(--install-unit render) — a reason built on a bound that is not the shipped one reads "
+            "as false and sizes a future pass against the wrong wall clock",
+        )
 
 
 def main(argv=None) -> int:

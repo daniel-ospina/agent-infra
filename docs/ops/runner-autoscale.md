@@ -115,9 +115,22 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
   every install on that box carries `.runner_migrated` since its v2-flow migration — so the clear
   that makes `--replace` possible left the answer TRUE. The migrated pair is now part of the local
   config that is cleared and stashed (and restored, at its original mode, on a failed repair).
-* **The wait is shorter than reality.** `RUNNER_AUTOSCALE_ONLINE_WAIT_S` stays at 60 s: raising it
-  per runner would exceed the unit's `TimeoutStartSec=900` (four runners × minutes) and SIGTERM a
-  pass mid-`config.sh`. The cooldown is what makes that wait unnecessary.
+* **The wait is shorter than reality — and the pass does not act on the expired wait.**
+  `RUNNER_AUTOSCALE_ONLINE_WAIT_S` stays at 60 s while re-registration takes >94 s and minutes under
+  load, so that window usually expires. Expiry is not a verdict: immediately before the destructive
+  step the pass re-reads the pool and the local listener, and a runner that is alive, BUSY or ONLINE
+  is held with a note instead of being `--replace`d. What stops the loop is the **cooldown**, one pass
+  later — a runner this tool restarted is not restarted again inside it.
+  The unit's `TimeoutStartSec=5400` (`templates/systemd/eldato-runner-autoscale.service`, the same
+  value `--install-unit` renders) is not what stops the loop, but it is not decorative either: the
+  wait is paid **per restarted runner**, on top of every other bound the pass already carries
+  (a provision, a restart, `config.sh` — possibly twice on the already-configured retry — and the
+  `svc.sh`/`enable` pair), and the case that pins the bound (`T47`) sizes it against **one** repair.
+  A pass that repairs several runners in one tick can therefore outlast this bound at any wait at
+  all, so a raise must be sized against the whole sum — and this bound raised with it — rather than
+  treated as free headroom. When the bound does fire, systemd SIGTERMs the pass; the install survives
+  (the stash is signal-safe, `T48`), the cost is a killed pass, and the `.runner`/key are lost only if
+  that restore itself fails — which the pass then reports.
 
 A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
 which guard held it. The distinction matters — the guard exists so that a **job survives**, and a
