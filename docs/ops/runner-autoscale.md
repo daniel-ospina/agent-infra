@@ -120,15 +120,17 @@ Four facts, four fixes, all in the pass (not in an operator's memory):
   load, so that window usually expires. Expiry is not a verdict: immediately before the destructive
   step the pass re-reads the pool and the local listener, and a runner that is alive, BUSY or ONLINE
   is held with a note instead of being `--replace`d. What stops the loop is the **cooldown**, one pass
-  later — a runner this tool restarted is not restarted again inside it; the unit's
-  `TimeoutStartSec=5400` (`templates/systemd/eldato-runner-autoscale.service`, the same value
-  `--install-unit` renders) is not what stops it. But that bound is not decorative either, and this is
-  the only place it can be said: the pass's OTHER bounds already account for ≈3540 s of the 5400
-  (provisioner 1800, `config.sh` 600 × 2, `svc.sh`/`enable` 180 × 2, a restart 180 — the arithmetic
-  `T47` pins, and the template's own comment derives), so a raise has ≈1860 s left to share across the
-  `wait_online` window of every runner restarted in one pass. Four runners at a 465 s wait is the
-  ceiling; past it systemd SIGTERMs a pass mid-`register()` and the install is left without its
-  `.runner` or key. Size a raise against that sum, not against the bound alone.
+  later — a runner this tool restarted is not restarted again inside it.
+  The unit's `TimeoutStartSec=5400` (`templates/systemd/eldato-runner-autoscale.service`, the same
+  value `--install-unit` renders) is not what stops the loop, but it is not decorative either: the
+  wait is paid **per restarted runner**, on top of every other bound the pass already carries
+  (a provision, a restart, `config.sh` — possibly twice on the already-configured retry — and the
+  `svc.sh`/`enable` pair), and the case that pins the bound (`T47`) sizes it against **one** repair.
+  A pass that repairs several runners in one tick can therefore outlast this bound at any wait at
+  all, so a raise must be sized against the whole sum — and this bound raised with it — rather than
+  treated as free headroom. When the bound does fire, systemd SIGTERMs the pass; the install survives
+  (the stash is signal-safe, `T48`), the cost is a killed pass, and the `.runner`/key are lost only if
+  that restore itself fails — which the pass then reports.
 
 A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
 which guard held it. The distinction matters — the guard exists so that a **job survives**, and a
