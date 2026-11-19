@@ -96,6 +96,23 @@ below grows with the suite, so this header never claims a case that does not exi
      budget; discarding it fell back to an allowance LOOSER than a >8 GB install.
      T42 — an ABSENT gate record is absence ("nothing writes one here — a cell"), not a read fault.
 
+  10. THE RESTART LOOP — 116 RESTARTS / 24 h, ZERO REPAIRS, EVERY ROUND KILLING FOUR JOBS
+     (agent-infra#4153, measured on pi-cell-4 2026-11-19). Its own journal: one offline read → DEAD →
+     `systemctl restart` (the job is gone) → 60 s wait → re-register → `already configured` (refused)
+     → next tick, same. Three defects, three cases, and the third is the one that made a SHIPPED heal
+     a no-op:
+     T63 — `config.sh` decides "already configured" from `IsConfigured() = .runner OR
+     .runner_migrated`, and every measured install carries `.runner_migrated` from its v2-flow
+     migration, so clearing `.runner`/`.credentials*` left the answer TRUE. The fixture's `config.sh`
+     now answers as the real one does, so this case fails if the migrated pair drops out of the
+     cleared set.
+     T64/T65 — a runner this tool restarted is not restarted again inside the cooldown (the pass's own
+     restart is what the next pass read as DEAD), AND a runner still dead after the cooldown IS
+     repaired: both halves, so the guard cannot freeze a dead slot.
+     T66/T67 — one offline read is not a death: the second sample must agree (a BUSY/ONLINE answer
+     holds the runner, and nothing is re-registered), and an UNREADABLE second sample restarts nothing
+     while the pass goes RED rather than reporting `converged` over a slot it never repaired.
+
 ⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
 and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
 mutants report `CONTROL RED` and fails the run, because a red case scores CAUGHT for every mutant
@@ -355,6 +372,12 @@ CONFIG_STUB = r"""#!/usr/bin/env bash
 # The runner's own `config.sh`. `refusals` (a number) makes the first N calls answer with the
 # MEASURED server-side refusal; `local_state` records whether the local config was present at call
 # time, which is exactly what fix 2 has to change.
+#
+# ⛔ AND IT REFUSES WHILE `.runner_migrated` IS STILL THERE, WITHOUT A COUNTER — because the real one
+# does (actions/runner v2.338.2: `IsConfigured()` is `.runner` OR `.runner_migrated`). That is the
+# measured cell-4 state of agent-infra#4153: the clear removed the three documented files, the
+# migrated copy kept `IsConfigured()` TRUE, and the repair answered `action-failed` on every pass.
+# A stub that only checked `.runner` would have passed the whole time.
 FIX="__FIX__"
 n=0
 [ -f "$FIX/config.count" ] && n="$(cat "$FIX/config.count")"
@@ -363,7 +386,16 @@ n=$(( n + 1 )); printf '%s\n' "$n" > "$FIX/config.count"
   printf 'call %s argv=%s\n' "$n" "$*"
   if [ -f "__DIR__/.runner" ]; then printf 'call %s local_runner=present\n' "$n"
   else printf 'call %s local_runner=absent\n' "$n"; fi
+  if [ -f "__DIR__/.runner_migrated" ]; then printf 'call %s migrated=present\n' "$n"
+  else printf 'call %s migrated=absent\n' "$n"; fi
 } >> "$FIX/config-calls.log"
+if [ -f "__DIR__/.runner_migrated" ]; then
+  cat >&2 <<'ERR'
+Cannot configure the runner because it is already configured. To reconfigure the runner, run
+'./config.sh remove' first.
+ERR
+  exit 1
+fi
 refuse="$(cat "$FIX/config.refusals" 2>/dev/null || echo 0)"
 if [ "$n" -le "$refuse" ]; then
   cat >&2 <<'ERR'
@@ -459,6 +491,12 @@ class Box:
             "RUNNER_AUTOSCALE_DU": os.path.join(self.dir, "du"),
             "RUNNER_AUTOSCALE_ONLINE_WAIT_S": "0",
             "RUNNER_AUTOSCALE_POLL_S": "0",
+            # ⛔ THE DEAD GUARD'S TWO SEAMS (agent-infra#4153). The confirmation sample is a REAL
+            # sleep in production (120 s), so every case pays a millisecond instead — and it is still
+            # a SECOND POOL READ, which is the behaviour under test. The cooldown stays at its
+            # production default unless a case is ABOUT it: a fixture box restarts each name once per
+            # case, so the default cannot make an unrelated assertion pass for the wrong reason.
+            "RUNNER_AUTOSCALE_DEAD_CONFIRM_S": "0.001",
             "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
             "RUNNER_AUTOSCALE_RETRY_BACKOFF_S": "0",
             # 1 ms: a positive value inside the seam's accepted range (0 is REFUSED — it would mean
@@ -488,14 +526,22 @@ class Box:
     def busy(self, dirs):
         self._write(os.path.join(self.dir, "busy.txt"), "\n".join(dirs) + ("\n" if dirs else ""))
 
-    def install(self, dirname: str, name: str, repo="daniel-ospina/tortoise") -> str:
-        """One runner install: the `.runner` config the runner itself writes, plus a `config.sh`."""
+    def install(self, dirname: str, name: str, repo="daniel-ospina/tortoise", migrated=True) -> str:
+        """One runner install: the `.runner` config the runner itself writes, plus a `config.sh`.
+
+        ⛔ `migrated=True` WRITES `.runner_migrated` TOO, because every install measured on cell 4 has
+        it (written by the runner's own v2-flow migration) and the runner's `IsConfigured()` counts it.
+        A fixture that omitted it modelled an install that no longer exists and could not see
+        agent-infra#4153 — the defect where the clear healed nothing and the repair failed for ever.
+        """
         path = os.path.join(self.root, dirname)
         os.makedirs(path, exist_ok=True)
         cfg = json.dumps(
             {"agentName": name, "gitHubUrl": f"https://github.com/{repo}", "workFolder": "_work"}
         )
         self._write(os.path.join(path, ".runner"), cfg)
+        if migrated:
+            self._write(os.path.join(path, ".runner_migrated"), cfg)
         self._write(os.path.join(path, ".credentials"), "creds")
         self._write(os.path.join(path, ".credentials_rsaparams"), "params")
         self._write(
@@ -1115,6 +1161,10 @@ def t7_unread_pool_after_restart():
             box.pool_seq(
                 [
                     "ok",  # the pass's FIRST read: offline, so a restart is due
+                    # the DEAD CONFIRMATION sample (agent-infra#4153) also reads the pool; it must
+                    # succeed or the pass never gets as far as restarting, and the case would be
+                    # measuring the confirmation instead of the racing read it is about
+                    "ok",
                     "err:dial tcp 10.0.0.1:443: i/o timeout",  # …and every later read fails this way
                 ]
             )
@@ -1126,8 +1176,9 @@ def t7_unread_pool_after_restart():
                 f"the cause must name the racing read: {record}",
             )
             check(
-                box.pool_reads() == 4,
-                f"expected 1 initial read + 3 bounded attempts, got {box.pool_reads()} pool reads",
+                box.pool_reads() == 5,
+                f"expected 1 initial + 1 confirmation + 3 bounded attempts, got {box.pool_reads()} "
+                "pool reads",
             )
             blob = " ".join(record["notes"]) + " " + str(record.get("error"))
             contains(blob, "i/o timeout", "the record")
@@ -1154,12 +1205,19 @@ def t8_deterministic_pool_error_is_not_retried():
             box.install("gh-runner-x64", "r-dead")
             box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
             box.alive([])
-            box.pool_seq(["ok", "err:gh: Not Found (HTTP 404) — repos//actions/runners"])
+            box.pool_seq(
+                [
+                    "ok",  # classification
+                    "ok",  # the DEAD confirmation sample (agent-infra#4153) — still offline
+                    "err:gh: Not Found (HTTP 404) — repos//actions/runners",
+                ]
+            )
             record = converge(box, want=0)
             check(record["verdict"] == "unmeasurable", f"verdict must be unmeasurable: {record}")
             check(
-                box.pool_reads() == 2,
-                f"a 404 must NOT be retried (1 initial + 1 attempt), got {box.pool_reads()} reads",
+                box.pool_reads() == 3,
+                f"a 404 must NOT be retried (1 initial + 1 confirmation + 1 attempt), got "
+                f"{box.pool_reads()} reads",
             )
             blob = " ".join(record["notes"]) + " " + str(record.get("error"))
             contains(blob, "repos//actions/runners", "the record")
@@ -4092,9 +4150,14 @@ def t45_failed_restart_is_not_offline():
         try:
             box.install("gh-runner-x64", "r-dead")
             box.alive([])
-            # Classification sees it offline; from the SECOND read on the pool reports it ONLINE.
+            # Classification sees it offline, and so does the DEAD confirmation sample; from the
+            # THIRD read on the pool reports it ONLINE — i.e. it reconnected during the restart
+            # wait. TWO "ok" steps are what keep this case about the FAILED RESTART COMMAND and the
+            # `online` guard, rather than about the confirmation sample that now runs first
+            # (agent-infra#4153).
             box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
             box.pool_then([("r-dead", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.pool_seq(["ok", "ok", "swap"])
             box.systemctl_rc(1)  # `systemctl restart` exits 1 and never reaches the manager
             record = converge(box, nproc="2")
             check(
@@ -5847,6 +5910,34 @@ MUTATIONS = [
         "config goes through, so the pass aborts on a traceback the log reader is not looking for "
         "instead of the named cause",
     ),
+    # ── agent-infra#4153: the restart loop, one mutation per guard (each MUST turn its case red) ──
+    Mutation(
+        "T63",
+        '    ".runner_migrated",\n    ".credentials_migrated",',
+        "    # MUTATION: the migrated pair is left behind — IsConfigured() stays TRUE",
+        "the runner's own `IsConfigured()` is `.runner` OR `.runner_migrated`, so an install that has "
+        "been migrated to the v2 flow (every install on the measured box) keeps refusing with "
+        "'already configured' after the clear: the repair can never converge, the job the restart "
+        "killed is never replaced, and the pass reports `action-failed` on every tick for ever — the "
+        "116-restarts/24 h loop of #4153, with the heal shipped and green",
+    ),
+    Mutation(
+        "T64",
+        "            if stamp is not None and (now - stamp) < cooldown_s:",
+        "            if False:  # MUTATION: no cooldown — our own restart re-arms the next pass",
+        "a runner restarted by THIS tool is restartable by the next pass 10 minutes later, which is "
+        "before the measured >94 s (minutes under load) re-registration: the pass's own restart is "
+        "what makes the next pass classify it DEAD, so the loop is self-sustaining and every round "
+        "kills the job that runner had picked up",
+    ),
+    Mutation(
+        "T66",
+        "                    if seen is not None and (seen.online or seen.busy):",
+        "                    if False:  # MUTATION: one offline read is a death again",
+        "the second sample is measured and then ignored, so a runner the pool reports BUSY/ONLINE one "
+        "confirmation interval after the first read is restarted anyway — the measured job kill of "
+        "#4153 (the four units came back BUSY four minutes after every restart)",
+    ),
 ]
 
 
@@ -6059,6 +6150,175 @@ def t58_provisioner_receives_repo_and_root():
             check(
                 box.calls("provisioner-calls.log")[-1] == "--count 2 --fallback auto",
                 f"argv unchanged, got {box.calls('provisioner-calls.log')[-1]!r}",
+            )
+        finally:
+            box.destroy()
+
+
+# ── agent-infra#4153: THE RESTART LOOP, AND THE ONE READ THAT FED IT ───────────────────────────
+# Measured on pi-cell-4, 2026-11-19: 116 restarts / 24 h of four healthy runner units, 0 successful
+# repairs, 22 `action-failed` — while 159–162 runs queued. Every restart kills the job that runner is
+# serving. Two independent defects, one case each, plus the heal that could never fire on a migrated
+# install.
+@test("T63 #4153 the migrated config is part of 'local config': the heal works where the runner counts it")
+def t63_migrated_config_is_cleared():
+    """THE DEEPEST DEFECT OF THE LOOP, and the one that made a shipped, tested heal a no-op.
+
+    actions/runner v2.338.2 defines `IsConfigured()` as `.runner` OR `.runner_migrated`, and every
+    install on the measured box carries `.runner_migrated` beside `.runner` since its v2-flow
+    migration. Clearing only `.runner`/`.credentials*` therefore left `IsConfigured()` TRUE and
+    `config.sh --replace` answered the same "already configured" refusal — the pass destroyed the
+    runner's job, failed the repair, and reported `action-failed`, on every tick, for ever.
+    The fixture's `config.sh` now refuses while the migrated copy exists (as the real one does), so
+    this case fails if the migrated pair is dropped from `_LOCAL_CONFIG_FILES`.
+    """
+    with Env():
+        box = Box("4153-migrated")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")  # writes `.runner_migrated` too
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            record = converge(box, want=0)
+
+            calls = box.calls("config-calls.log")
+            argv = [c for c in calls if "argv=" in c]
+            check(len(argv) == 1, f"expected ONE attempt — the clear must make it work: {calls}")
+            check(
+                "call 1 migrated=absent" in calls,
+                "`.runner_migrated` must be cleared too: the runner's own IsConfigured() counts it, "
+                f"so leaving it turns the heal into a no-op and the repair fails for ever. calls={calls}",
+            )
+            check(not record["problems"], f"the repair must succeed: {record['problems']}")
+            check(
+                any(a.startswith("registered r-dead") for a in record["actions"]),
+                f"the runner must end RE-REGISTERED: {record['actions']}",
+            )
+            check(
+                os.path.exists(os.path.join(path, ".runner")),
+                "the install must be configured again after the repair",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T64 #4153 the pass's own restart is not re-issued by the next pass (cooldown)")
+def t64_restart_cooldown_holds_the_next_pass():
+    """The loop, as measured: the pass restarts a runner, the runner needs minutes to re-register,
+    the NEXT pass (10 min later) reads it offline and restarts it again — 29 times a day on one unit,
+    each time destroying the job it had picked up. One restart, then a cooldown."""
+    with Env():
+        box = Box("4153-cooldown")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            converge(box, want=0)
+            first = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(len(first) == 1, f"the first pass restarts the DEAD runner once, got {first}")
+
+            record = converge(box, want=0)
+            restarts = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(
+                len(restarts) == 1,
+                "a second pass inside the cooldown must NOT restart the runner it just restarted: "
+                f"that restart is what killed the job, and it is what made the next pass call it DEAD. "
+                f"got {restarts}",
+            )
+            check(
+                record["restart_holds"] == ["r-dead"],
+                f"the hold must be published machine-readably: {record.get('restart_holds')}",
+            )
+            check(
+                any("cooldown" in n and "r-dead" in n for n in record["notes"]),
+                f"the reason must name the cooldown: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T65 #4153 the cooldown EXPIRES: a runner still dead minutes later is repaired")
+def t65_cooldown_expires():
+    """The other half of the guard, and the one a naive "never restart twice" would fail: a genuinely
+    dead runner must still be repairable. With the cooldown elapsed the pass restarts it again."""
+    with Env():
+        box = Box("4153-cooldown-expiry")
+        try:
+            box.env["RUNNER_AUTOSCALE_RESTART_COOLDOWN_S"] = "0.001"
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            converge(box, want=0)
+            converge(box, want=0)
+            restarts = [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")]
+            check(
+                len(restarts) == 2,
+                "once the cooldown has elapsed a still-DEAD runner must be restarted again — "
+                f"otherwise the guard freezes a dead slot for ever. got {restarts}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T66 #4153 ONE offline read is not a death: the second sample must agree")
+def t66_second_sample_must_agree():
+    """The measured self-sustaining loop: the pool says `offline` for a runner that is reconnecting
+    (it needs >94 s, minutes under load), and the pass restarts it — killing the job it had picked up.
+    Here the second sample answers BUSY, so nothing is touched at all."""
+    with Env():
+        box = Box("4153-confirm")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.pool_then([("r-dead", "online", True, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "a runner the second sample reports BUSY must NOT be restarted — that is the job kill "
+                "that started the loop",
+            )
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                "…and it must not be re-registered either: it is serving a job",
+            )
+            check(
+                record["restart_holds"] == ["r-dead"],
+                f"the hold must be published: {record.get('restart_holds')}",
+            )
+            check(
+                any("reconnecting, not dead" in n for n in record["notes"]),
+                f"the reason must say what the second sample measured: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T67 #4153 an UNREADABLE second sample never restarts — and the pass is RED, not 'converged'")
+def t67_unreadable_second_sample_is_red():
+    """Fail-closed, and loudly. A confirmation that cannot be read is not a confirmation, so nothing is
+    restarted — but a pass that then reported `converged` while its only DEAD runner was never repaired
+    would be the false PASS this file's verdicts exist to prevent."""
+    with Env():
+        box = Box("4153-confirm-unread")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.pool_seq(["ok", "err:dial tcp 10.0.0.1:443: i/o timeout"])
+            record = converge(box, want=0)
+
+            check(
+                not [c for c in box.calls("systemctl-calls.log") if c.startswith("restart ")],
+                "an unconfirmed offline read must not restart anything",
+            )
+            check(
+                record["verdict"] != "converged",
+                f"a DEAD runner that nothing could confirm is not `converged`: {record['verdict']}",
+            )
+            check(
+                any("confirmation" in p and "i/o timeout" in p for p in record["problems"]),
+                f"the failure must carry gh's own words: {record['problems']}",
             )
         finally:
             box.destroy()

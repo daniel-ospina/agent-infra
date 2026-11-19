@@ -74,6 +74,49 @@ declined to grow), while `5` is reserved for `--check-units` findings — a verb
 run, so it never appears here. The unit carries **no** `SuccessExitStatus=` and no `-` prefix on `ExecStart`, so every
 non-zero exit is a RED unit, not a green one.
 
+### A restart kills a job, so `DEAD` is confirmed and paced (#4153)
+
+Measured on pi-cell-4, 2026-11-19: the armed timer restarted that box's four live runner units
+**116 times in 24 h**, produced **zero** successful repairs, and reported `verdict=action-failed`
+**22 times** — while the pool sat at 159–162 queued runs. The pass's own journal shows the loop, and
+it is self-sustaining:
+
+```
+07:21:17  DEAD (×4)                     ← ONE offline read
+07:21:17  restart … rc=0                ← the job each of them was serving is gone
+07:21:17  still offline after 60 s      ← RUNNER_AUTOSCALE_ONLINE_WAIT_S
+07:21:17  re-register with --replace    ← refused: "already configured"
+07:25:05  BUSY (×4, nothing done)       ← the box needed minutes, not 60 s
+```
+
+Four facts, four fixes, all in the pass (not in an operator's memory):
+
+* **ONE offline read is not a death.** The pool reports `offline` for a runner that is reconnecting,
+  and a restart is the most destructive thing this tool does. A second sample must agree, taken
+  `RUNNER_AUTOSCALE_DEAD_CONFIRM_S` later (default 120 s, refused outside `(0, 600]`). The sample is
+  paid **once per pass**, not once per runner. A BUSY/ONLINE answer holds the runner and says so in
+  `restart_holds` and `notes`; an **unreadable** second sample restarts nothing and is a RED pass
+  (a DEAD slot nothing could confirm is not `converged`).
+* **The pass's own restart is not a new death.** A runner this tool restarted is not restarted again
+  for `RUNNER_AUTOSCALE_RESTART_COOLDOWN_S` (default 1800 s), stamped in
+  `$RUNNER_AUTOSCALE_STATE_DIR/runner-restarts.json` (atomic write; an unreadable file removes only
+  the loop defence, never the two-sample one). Re-registration takes >94 s and minutes under load, so
+  without the cooldown the next pass reads the runner it just restarted as DEAD and the loop runs
+  for ever. A stamp is written when the restart is *issued*, and pruned as soon as the runner is no
+  longer DEAD, so a genuine death minutes later is still repaired.
+* **The repair could never converge on a migrated install.** `config.sh` decides "already
+  configured" from `IsConfigured() = .runner OR .runner_migrated` (actions/runner v2.338.2), and
+  every install on that box carries `.runner_migrated` since its v2-flow migration — so the clear
+  that makes `--replace` possible left the answer TRUE. The migrated pair is now part of the local
+  config that is cleared and stashed (and restored, at its original mode, on a failed repair).
+* **The wait is shorter than reality.** `RUNNER_AUTOSCALE_ONLINE_WAIT_S` stays at 60 s: raising it
+  per runner would exceed the unit's `TimeoutStartSec=900` (four runners × minutes) and SIGTERM a
+  pass mid-`config.sh`. The cooldown is what makes that wait unnecessary.
+
+A pass that holds a restart is not a failed pass: `restart_holds` names each name and `notes` says
+which guard held it. The distinction matters — the guard exists so that a **job survives**, and a
+red pass over a runner the pool says is fine would be the alarm crying wolf.
+
 ## DISARMED by default — arming is a dated owner step
 
 Two separate acts, deliberately:

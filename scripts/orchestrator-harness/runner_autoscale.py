@@ -96,6 +96,15 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                never restarted, relabelled or removed — CONFIG-LOST because the agent name a
                re-registration needs is exactly what it lost, so the arm would act on an invented
                name.
+               ⛔ DEAD IS CONFIRMED, AND THE RESTART IS PACED (agent-infra#4153). A restart KILLS
+               the job its runner is serving, so: (a) ONE offline read is not a death — the pool
+               reports `offline` for a runner that is reconnecting, and a second sample taken
+               `RUNNER_AUTOSCALE_DEAD_CONFIRM_S` later must still say offline (a BUSY/ONLINE answer
+               holds the runner and is said out loud, in `restart_holds` + `notes`); (b) a runner
+               this tool restarted is not restarted again for `RUNNER_AUTOSCALE_RESTART_COOLDOWN_S`,
+               because re-registration takes >94 s and minutes under load, so without it the pass's
+               OWN restart is what the next pass classifies DEAD — measured 116 restarts/24 h, 0
+               repairs, every round destroying four jobs.
   6. FILL      while live < target: add ONE runner, printing `mem_available_mb` before and after,
                and stop if the next addition would leave < MEM_RESERVE_MB. A NEW install is
                created by the provisioner (`tools/install-ci-runner-x64.sh`, the one registration
@@ -160,6 +169,16 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_NO_SUDO        "1" → do not prefix with sudo (tests, rootless)
     RUNNER_AUTOSCALE_ONLINE_WAIT_S  seconds to wait for a restarted runner to report online (60)
     RUNNER_AUTOSCALE_POLL_S         poll interval while waiting (5)
+    RUNNER_AUTOSCALE_RESTART_COOLDOWN_S  a runner this tool restarted is not restarted AGAIN for
+                                   this long (1800). A just-restarted runner takes >94 s — minutes
+                                   under load — to re-register, so without this the pass's OWN
+                                   restart is what makes the next pass call it DEAD (agent-infra#4153,
+                                   measured: 116 restarts / 24 h, 0 repairs)
+    RUNNER_AUTOSCALE_DEAD_CONFIRM_S  the second offline sample that must precede a restart (120).
+                                   ONE offline read is not a death: the API says offline for a
+                                   runner that is reconnecting, and a restart kills the job it is
+                                   serving. A value that is not a finite number in (0, 600] is
+                                   REFUSED with a note rather than silently disabling the guard
     RUNNER_AUTOSCALE_DF           `df` for the DISK arm (default: the system one; a TEST seam)
     RUNNER_AUTOSCALE_DU           `du` for the measured per-runner footprint (same)
     RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS  attempts for ONE pool read while it races our own restart (3),
@@ -1597,6 +1616,90 @@ def restart_runner(runner: LocalRunner) -> tuple[bool, str]:
     return rc == 0, f"systemctl restart {runner.unit} rc={rc} {out[:200]}"
 
 
+# ── THE RESTART LOOP, AND THE ONE READ THAT FED IT (agent-infra#4153) ────────────────────────
+# MEASURED on pi-cell-4, 2026-11-19: the armed timer restarted this box's four live runner units
+# 116 times in 24 h, produced ZERO successful repairs, and reported `verdict=action-failed` 22
+# times — while the pool sat at 159–162 queued runs. Every restart KILLS the job that runner is
+# serving. The pass's own journal shows the self-sustaining loop:
+#
+#   07:21:17  DEAD  (×4)                       ← one offline read
+#   07:21:17  restart rc=0                     ← the job it was serving is gone
+#   07:21:17  still offline after 60 s         ← RUNNER_AUTOSCALE_ONLINE_WAIT_S
+#   07:21:17  re-register with --replace       ← refused (see _LOCAL_CONFIG_FILES)
+#   07:25:05  BUSY  (×4, nothing done to them) ← the box needed minutes, not 60 s
+#
+# So there are TWO guards here, and they answer two different questions:
+#   * `DEAD` from ONE offline read is not a death. The API reports `offline` for a runner that is
+#     reconnecting, and a restart is the single most destructive act this tool performs — it kills
+#     a job. A second sample, taken after the reconnect window has elapsed, must agree.
+#   * A runner THIS TOOL restarted is not restartable again for a cooldown. Without it the pass's
+#     own restart made the next pass classify the runner DEAD, which made the next restart, for ever.
+# The cooldown is persisted (the next pass is a DIFFERENT process, and may be on a box whose timer
+# fires more often than a runner reconnects), and losing that file cannot make the pass unsafe: it
+# only removes the loop defence, never the two-sample one.
+RESTART_COOLDOWN_DEFAULT_S = 1800
+DEAD_CONFIRM_DEFAULT_S = 120.0
+DEAD_CONFIRM_MAX_S = 600.0
+
+
+def _state_dir() -> Path:
+    """The tool's own state directory — the SAME resolution `_log` uses (one directory, one seam)."""
+    return Path(
+        os.environ.get("RUNNER_AUTOSCALE_STATE_DIR") or (Path.home() / ".pi" / "agent" / "state")
+    )
+
+
+def restart_history_path() -> Path:
+    return _state_dir() / "runner-restarts.json"
+
+
+def read_restart_history() -> dict[str, float]:
+    """`{agentName: epoch seconds of the last restart THIS TOOL issued}`.
+
+    ⛔ AN UNREADABLE FILE IS AN EMPTY HISTORY, NOT A FAILED PASS. This is the LOOP defence, and the
+    two-sample confirmation below does not depend on it, so a lost stamp costs one extra restart at
+    worst — while raising here would refuse every repair on a box whose state dir is broken, which
+    is a strictly worse failure. The caller records the problem so it is not silent.
+    """
+    try:
+        raw = json.loads(restart_history_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, stamp in raw.items():
+        if isinstance(name, str) and isinstance(stamp, (int, float)) and math.isfinite(stamp):
+            out[name] = float(stamp)
+    return out
+
+
+def write_restart_history(history: dict[str, float]) -> str | None:
+    """Persist the stamps atomically; RETURN a problem sentence if they could not be written.
+
+    ⛔ ATOMIC (write + `os.replace`), because the reader is a DIFFERENT pass: a half-written JSON
+    would be read as an empty history by the next pass, which is precisely the state that lets the
+    loop run one more round. The returned problem is recorded, not raised — see `read_restart_history`
+    for why a broken state dir must not stop repairs.
+    """
+    path = restart_history_path()
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(history, indent=0, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return (
+            f"the restart history could not be written ({path}: {exc}) — the restart COOLDOWN is "
+            "not in force for the next pass (the two-sample DEAD confirmation still is)"
+        )
+    return None
+
+
 # ── the pool read that races our own restart (fix 3, measured on cell 4) ─────────────────────────
 # THE MEASURED VERDICT: `action-failed` / `unverified_cause=pool-read-after-restart`, with the log line
 # "restart succeeded but the pool could not be READ" — and no reason. Failing closed is right; aborting
@@ -1687,6 +1790,37 @@ def _env_float(name: str, default: float, minimum: float | None = None) -> float
             f"{name}={raw!r} is not a finite value at or above {minimum} — refused rather than "
             "quietly applied to a bound"
         )
+    return value
+
+
+def _seam_seconds(name: str, default: float, *, maximum: float, notes: list[str]) -> float:
+    """A seconds seam that DEGRADES LOUDLY instead of killing the pass, and cannot be disabled.
+
+    ⛔ THE SAME ARGUMENT `_env_float` MAKES, ONE ARM FURTHER. A startup seam may refuse (nothing has
+    happened yet); a guard that runs MID-PASS may not, because `Unmeasurable` there aborts the pass and
+    a `--json`/`--status` caller sees an unmeasurable box instead of the repair the pass had already
+    planned. And the bound is CLOSED AT ZERO on purpose: `float()` accepts `0`, `-5`, `nan` and `inf`,
+    and every one of those would silently remove the guard (sleep(0) returns at once, and `inf`
+    overflowed the pass in review) — a "why forbid zero?" tidy is exactly how a confirmation sample
+    gets switched off.
+    """
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        notes.append(
+            f"{name}={raw!r} is not a number of seconds — using {default:.0f}s rather than an "
+            "unreadable value for a bound"
+        )
+        return default
+    if not math.isfinite(value) or not 0 < value <= maximum:
+        notes.append(
+            f"{name}={raw!r} is outside (0, {maximum:.0f}] — using {default:.0f}s; a value here that "
+            "could disable the guard is refused, not applied"
+        )
+        return default
     return value
 
 
@@ -1782,7 +1916,23 @@ def registration_token(repo: str) -> str:
 # case `--replace` exists for: "Failed to create a session. The runner registration has been deleted
 # from the server") could never be repaired by this tool. These are the three files `config.sh`
 # honours; clearing them is the LOCAL half of a re-registration and needs no server authority.
-_LOCAL_CONFIG_FILES = (".runner", ".credentials", ".credentials_rsaparams")
+# ⛔ THE MIGRATED PAIR IS PART OF THE LOCAL CONFIG, AND LEAVING IT OUT MADE THE HEAL A NO-OP
+# (measured on cell 4, 2026-11-19). The runner's own check is
+#     IsConfigured() = File.Exists(".runner") || File.Exists(".runner_migrated")
+# (actions/runner v2.338.2, src/Runner.Common/ConfigurationStore.cs), and every install on that box
+# carries `.runner_migrated` beside `.runner` since the v2-flow migration — so the clear removed the
+# three files the message names, `IsConfigured()` still answered TRUE, `config.sh --replace` refused
+# with the same "already configured" sentence, and the repair reported `action-failed` on EVERY pass.
+# That is the 116-restarts/24 h loop of agent-infra#4153: the heal below was written, tested and
+# shipped, and could not fire on a migrated install. The field evidence is the runner's own log —
+# `IsConfigured: True` one second after the clear — followed by the restore putting `.runner` back.
+_LOCAL_CONFIG_FILES = (
+    ".runner",
+    ".credentials",
+    ".credentials_rsaparams",
+    ".runner_migrated",
+    ".credentials_migrated",
+)
 _ALREADY_CONFIGURED = "already configured"
 
 
@@ -3141,6 +3291,11 @@ def converge(
         # notes. It is NOT `problems` (that would be a page on a lost race) and NOT silence (the
         # slot would then be re-asked for ever, which is the freeze P1-b describes).
         "slots_unusable": [],
+        # ⛔ A RUNNER THIS PASS REFUSED TO RESTART IS ITS OWN LIST (agent-infra#4153). The names are
+        # published so a fleet reader can tell "the box converged" from "the box had DEAD runners and
+        # this pass deliberately did not touch them" without parsing a note — the reason for each is
+        # in `notes`, and neither the cooldown nor an unconfirmed sample is a failure.
+        "restart_holds": [],
         "plan": [],
         "notes": [],
         "verdict": "",
@@ -3373,6 +3528,74 @@ def converge(
     for r in local:
         by_name.setdefault(r.name, []).append(str(r.directory))
     duplicates = {name: dirs for name, dirs in by_name.items() if len(dirs) > 1}
+    # ⛔ ONE OFFLINE READ IS NOT A DEATH, AND A RESTART KILLS A JOB (agent-infra#4153). Two guards,
+    # computed ONCE for the whole pass:
+    #   * the COOLDOWN — a runner this tool restarted is not restarted again until it has had time to
+    #     re-register. Measured on cell 4: >94 s idle, minutes under load, against a 60 s wait and a
+    #     10-minute cadence, so without this the pass's OWN restart is what the next pass reads as
+    #     DEAD. The stamps are persisted (`restart_history_path`) because the next pass is a different
+    #     process, and read ONCE so two reads cannot straddle a concurrent pass.
+    #   * the SECOND SAMPLE — the pool must still say offline after the reconnect window has elapsed.
+    #     The confirmation is paid ONCE per pass (a sleep per runner would multiply a pass by its DEAD
+    #     count) and it is what makes the FIRST restart safe even when no history exists at all: a
+    #     runner that is merely reconnecting answers BUSY/ONLINE to the second read.
+    # Neither guard is a failure, so neither goes in `problems` — EXCEPT an unreadable second sample,
+    # which is a measurement failure and must be as loud as the pass's other unread pool reads: the
+    # alternative is a pass that reports `converged` while four runners sit DEAD because nothing could
+    # confirm them (a false PASS, which is worse than a red pass).
+    restart_holds: dict[str, str] = {}
+    restart_history: dict[str, float] = {}
+    history_dirty = False
+    still_dead = {c["name"] for c in classified if c["state"] == "DEAD"}
+    cooldown_s = _seam_seconds(
+        "RUNNER_AUTOSCALE_RESTART_COOLDOWN_S",
+        float(RESTART_COOLDOWN_DEFAULT_S),
+        maximum=24 * 3600.0,
+        notes=record["notes"],
+    )
+    confirm_s = _seam_seconds(
+        "RUNNER_AUTOSCALE_DEAD_CONFIRM_S",
+        DEAD_CONFIRM_DEFAULT_S,
+        maximum=DEAD_CONFIRM_MAX_S,
+        notes=record["notes"],
+    )
+    if still_dead:
+        restart_history = read_restart_history()
+        now = time.time()
+        for c in classified:
+            if c["state"] != "DEAD":
+                continue
+            stamp = restart_history.get(c["name"])
+            if stamp is not None and (now - stamp) < cooldown_s:
+                restart_holds[c["name"]] = (
+                    f"NOT restarted — this tool restarted it {int(now - stamp)}s ago and a runner "
+                    f"needs minutes, not {int(confirm_s)}s, to re-register (cooldown "
+                    f"{int(cooldown_s)}s); one offline read after OUR OWN restart is not a new death"
+                )
+        candidates = [c for c in classified if c["state"] == "DEAD" and c["name"] not in restart_holds]
+        # ⛔ NO SECOND SAMPLE IN A DRY RUN: the sleep is real and a `--dry-run` changes nothing, so
+        # paying it would make the read-only arm the slow one.
+        if candidates and not dry_run:
+            if confirm_s > 0:
+                time.sleep(confirm_s)
+            try:
+                second = read_pool_retrying(repo)
+            except Unmeasurable as exc:
+                record["problems"].append(
+                    f"the DEAD confirmation read failed ({exc}) — no runner is restarted on an "
+                    "unconfirmed offline read (a restart kills the job the runner may be serving)"
+                )
+                for c in candidates:
+                    restart_holds[c["name"]] = f"NOT restarted — the second sample is unreadable ({exc})"
+            else:
+                for c in candidates:
+                    seen = second.get(c["name"])
+                    if seen is not None and (seen.online or seen.busy):
+                        restart_holds[c["name"]] = (
+                            "NOT restarted — the first sample said OFFLINE and a second one taken "
+                            f"{confirm_s:.0f}s later says "
+                            f"{'BUSY' if seen.busy else 'ONLINE'}: it was reconnecting, not dead"
+                        )
     # ⛔ THERE IS NO `""` GUARD HERE, AND ADDING ONE BACK WOULD BE DEAD CODE (#3355 review P2). It
     # reads like it prevents a CONFIG-LOST install from being deduplicated, but `_read_runner_config`
     # raises on an empty `agentName`/`gitHubUrl` (`_read_runner_config`'s `if not name or not repo:`
@@ -3407,6 +3630,15 @@ def converge(
         runner = next((r for r in local if str(r.directory) == c["dir"]), None)
         if runner is None:  # a classified entry always came FROM `local`; this cannot drift silently
             runner = next(r for r in local if r.name == c["name"])
+        # ⛔ THE HOLD IS CHECKED BEFORE THE DRY-RUN BRANCH (agent-infra#4153), because "would repair"
+        # is a claim about what this pass WOULD do: a runner the cooldown or an unconfirmed sample
+        # holds back is not a repair the plan contains, and a dry run that printed it while the real
+        # pass refused it would be the same class of lie the record's own `would_repair` exists to
+        # avoid. `restart_holds` only ever carries DEAD names, so ORPHANED repairs are untouched.
+        if c["name"] in restart_holds:
+            record["notes"].append(f"{c['name']}: {restart_holds[c['name']]}")
+            record["restart_holds"].append(c["name"])
+            continue
         if dry_run:
             record["would_repair"].append(f"would repair {c['name']} ({c['state']})")
             continue
@@ -3414,6 +3646,13 @@ def converge(
             ok, detail = restart_runner(runner)
             restart_ok = ok
             record["actions"].append(f"restart {c['name']}: {detail}")
+            # ⛔ THE STAMP IS WRITTEN WHEN THE RESTART IS ISSUED, NOT WHEN IT SUCCEEDS. A failed
+            # `systemctl restart` (a routine transient on a loaded box — the round-11 finding) also
+            # disturbs the listener, and the cooldown's job is to stop this tool from touching the
+            # same runner again before it has had time to re-register. Stamping only on success
+            # would re-arm the restart on the very next pass.
+            restart_history[c["name"]] = time.time()
+            history_dirty = True
             # ⛔ "we could not look" is NOT "it is still offline". An unreadable pool after a
             # restart proves nothing about the runner, and acting on it re-registers (with
             # --replace) a registration that may be reconnecting and picking up a job — the one
@@ -3546,6 +3785,20 @@ def converge(
         except (ActionFailed, Unmeasurable) as exc:
             record["problems"].append(f"{c['name']}: {exc}")
             record["actions"].append(f"repair {c['name']} FAILED: {exc}")
+
+    # ⛔ PRUNE, THEN PERSIST (agent-infra#4153). A stamp exists only while its runner is DEAD: the
+    # cooldown protects the re-registration window after a restart, and a runner that came back
+    # (BUSY/SERVING) must not carry a stale stamp into its NEXT death — that would refuse a repair the
+    # box genuinely needs, which is the same defect in the opposite direction.
+    if restart_history:
+        pruned = {n: t for n, t in restart_history.items() if n in still_dead}
+        if pruned != restart_history:
+            restart_history = pruned
+            history_dirty = True
+    if history_dirty and not dry_run:
+        problem = write_restart_history(restart_history)
+        if problem:
+            record["notes"].append(problem)
 
     # 6. FILL — one install at a time, at the NEXT FREE SLOT, and measured ---------------------
     # THE PROVISIONER ADDS AT MOST THE ONE INDEX IT WAS ASKED FOR. `install-ci-runner-x64.sh --count N`
