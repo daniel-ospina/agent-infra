@@ -2901,12 +2901,20 @@ else
   bad "the [prtail] block is missing — the incident's own line is unpinned"
 fi
 # (c) the DRAIN STALLED line.
-# ⛔ `O_WORK` IS PREPENDED, NOT ASSUMED (agent-infra#2095, found by this suite). The drain-health block
-# dispatches `"$O_WORK/stall-fix.sh"`, and `O_WORK` is declared far ABOVE the extracted range — so
-# without this binding the fragment ran `"/stall-fix.sh"` and every leg that pins WHAT the fixer is told
-# read "not-called" while the stub it was testing never ran. Binding it to the sandbox `O` is what the
-# drivers already intend, and it keeps the loop's real two-home rule (below) out of the fixture's way.
-{ echo 'O_WORK="${O_WORK:-$O}"'
+# ⛔ `O_WORK` IS BOUND TO THE SANDBOX, NOT DEFAULTED TO IT (agent-infra#2095, and measured again
+# 2026-11-20). The drain-health block dispatches `"$O_WORK/stall-fix.sh"`, and `O_WORK` is declared
+# far ABOVE the extracted range — so without a binding the fragment ran `"/stall-fix.sh"` and every
+# leg read "not-called" while the stub it was testing never ran. Binding it to the sandbox `O` is what
+# the drivers intend, and it keeps the loop's real two-home rule (below) out of the fixture's way.
+# ⛔ `${O_WORK:-$O}` WAS STILL BOX-DEPENDENT, AND THAT IS THE PART THIS FIX REMOVES: `orch-loop.sh`
+# EXPORTS `O_WORK` (`:95`), so every child of a live controller inherits it and the `:-` default never
+# applied — the block then ran the REAL `$O_WORK/stall-fix.sh` instead of this fixture's stub, and all
+# four legs below read "not-called". Measured on this tree at 2026-11-20: with an ambient
+# `O_WORK=/home/cmux/orchestrator`, the pre-fix form is 277 passed / 4 FAILED (the four drain legs
+# below) while the unconditional binding is 281 passed / 0 failed. A suite whose grade depends on the
+# box it runs on is the false-RED direction, and a lane box is exactly where these suites are run.
+# The sandbox binding is therefore UNCONDITIONAL.
+{ echo 'O_WORK="$O"'
   sed -n '/# \[drain-health:begin\]/,/# \[drain-health:end\]/p' "$ORCH" | sed '1d;$d'; } > "$TMP/dh.sh"
 if [ -s "$TMP/dh.sh" ]; then
   drain() {

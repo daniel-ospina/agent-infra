@@ -45,9 +45,40 @@ nothing, and it exits 0):
 
 1. **the target is a measurement, not a number.** Per tick:
 
-       target = min( cpu_ceiling , mem_ceiling )
-       cpu_ceiling = MAX_LANES = floor(ncpu × 5/2)          ← the fleet's 2026-10-17 lane ruling
-       mem_ceiling = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+       target = min( cpu_ceiling , mem_ceiling , disk_ceiling )
+       cpu_ceiling  = MAX_LANES = floor(ncpu × 5/2)         ← the fleet's 2026-10-17 lane ruling
+       mem_ceiling  = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+       disk_ceiling = floor( (free_disk − DISK_MIN_FREE_MB) ÷ DISK_LANE_NEED_MB )
+
+   The **disk** term was missing until agent-infra#2159, and its absence is what a 100 %-full box
+   looked like from inside this tick: `START: target=22 … dispatching 7` computed from memory and cores
+   alone, then the spawn gate refused the first lane (`DISK-NOHEADROOM … free=1.7GB, need=2.0GB`) and
+   the unit went RED — for a box fact, against a target the box could never reach. The per-lane
+   requirement is not a new constant: it is `spawn-gate.sh`'s own `disk_lane_costs` /
+   `disk_lane_need` classified against `SEED_REPO`, so the number that plans a lane and the number that
+   refuses it are the SAME number (#3395's two-seams defect). It is repo-class dependent — 2,064 MB
+   for a harness seed, 8,144 MB for a python one — and the `START:` line always prints `need=`.
+   `DISK_MIN_FREE_MB` is that module's floor, not a second one, and it is resolved by the **same rules**:
+   whole MB, at most 9 digits (the `is_limit` width cap — ≤999,999,999 MB ≈ 976 TB), and **no leading
+   zero** (the module's `is_num` rejects every `0*` shape, so `007` is 500 MB to the gate; resolving it
+   as 7 MB here would floor the plan on a number the gate disagrees with). An explicit
+   `DISK_LANE_NEED_MB=0` disables the term and says so. ⛔ **TWO POLARITIES, AND THEY DIFFER ON PURPOSE** — a state
+   directory with no usable module **DEGRADES**: one named `NOTE:`, `disk=off` on the line, and the
+   tick plans from cores and memory, which is the pre-#2159 behaviour. It does **not** fail closed,
+   because a new bound must not be able to take a box to ZERO because a file is missing (the
+   inert-unit class, #3194) — a drainer that dispatches nothing is worse than one without a disk
+   term. A **stated** `DISK_FREE_MB`/`DISK_LANE_NEED_MB` that is not whole megabytes, or is wider than
+   9 digits (the cap `spawn-gate.sh`'s own `is_limit` applies — ≤999,999,999 MB ≈ 976 TB), **fails
+   closed by name**: that is a fault in the reading the operator asserted, not an absent improvement.
+   A module that *answers* a non-number is not that case — it is indistinguishable from "could not
+   answer" and takes the degrade path above.
+   The disk is also re-asked immediately before **each** `git worktree add`, because the target is
+   computed once and the tick's own worktrees consume the free space it was planned from — a stop
+   there is logged as `STOP: disk floor …` and exits **0**, since a full volume is a fact about the
+   box, not a failed tick. ⚠️ **UNLESS `DISK_FREE_MB` IS STATED**: an injected reading IS the reading,
+   so it is used for the re-ask too (that is what keeps a test hermetic), and the in-loop guard is
+   then frozen at that value rather than measuring the shrinking volume. Say it plainly: setting
+   `DISK_FREE_MB` trades the live guard for a fixed one.
 
    `MIN_MEM_FREE_MB` (512) is the **same** floor the controller's own spawn gate uses, so the two
    cannot disagree; `MEM_BUDGET_PCT` (75) stops the target at the boundary instead of consuming the
@@ -76,10 +107,13 @@ nothing, and it exits 0):
      `[cap]` gate.)
 
    An unreadable **load / memory / swap / Darwin-pressure** probe **fails closed** — a guard that
-   could not be evaluated must not look like an idle box. A box whose platform cannot be identified is
+   could not be evaluated must not look like an idle box. (**Disk** is the second exception, and for
+   the opposite reason: its module can be absent on a box whose runtime dir was seeded without it, and
+   an inert drainer there is worse than a missing bound — see §1's degrade rule.) A box whose platform
+   cannot be identified is
    one of those cases: the two swap arms are different gates, so choosing one on a guess is refused by
    name (`DRAINER_OS` overrides `uname -s`; it is the suite's seam). The **cores**
-   probe is the one exception, and it does not fail closed: it is the CPU *ceiling* only, so an
+   probe is the other exception, and it does not fail closed: it is the CPU *ceiling* only, so an
    unreadable one warns and assumes 4 cores, which under-reports the ceiling (the conservative
    direction) instead of stopping the job.
 2. **top-up, not one-shot.** Each tick counts the lanes already alive and dispatches `target − alive`
