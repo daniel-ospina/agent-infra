@@ -412,8 +412,15 @@ case_i() { # <owner-script>
     case_check "$(grep -qF "REAPED $big/.cache" <<<"$out" && echo 0 || echo 1)" \
                "a 5MB cache against a 3MB cap IS reclaimed — NEVER refused on every tick (the measured 21-50GB population against the 20GB default)"
     case_check "$([ ! -e "$big/.cache" ] && echo 0 || echo 1)" "and it is really gone, not merely reported"
-    case_check "$([ "$(grep -c '^REAPED ' <<<"$out")" -le 2 ] && echo 0 || echo 1)" \
-               "the cap still bounds the pass (at most the two candidates, never a third tick's work)"
+    # ⛔ THE "the cap still bounds the pass" ROW THAT USED TO SIT HERE IS GONE (#4169 review, P3). It was
+    # `[ "$(grep -c '^REAPED ' <<<"$out")" -le 2 ]` over a fixture with exactly TWO candidates — true on
+    # the pre-fix owner and under every mutant in this file, i.e. a row that READS as coverage of the cap
+    # while asserting nothing (agent-infra#3442 rule 3). It cannot simply be given a third candidate
+    # either: the oversized-admission property this case DOES pin requires the big cache to be reached
+    # while less than the cap has been freed, so a small candidate ordered before it can consume the cap
+    # and defer it — the two properties are not simultaneously assertable on one fixture, and `compgen`
+    # decides the order. The cap's real bound is covered by `case_c`(2) ("exactly ONE 2MB cache was
+    # reclaimed against a 3MB cap"), whose `MUT_C2` reddens it.
     return $((CASE_FAIL > 0))
 }
 
@@ -444,9 +451,181 @@ case_j() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── K: an EXPLICIT glob that matched directories but NO INSTALL is a REFUSAL, not a measured zero ──
+# ⛔ This is the blocking finding from the #4169 review. The refusal gate asked "did any pattern match a
+# DIRECTORY", so a seam that matched a tree carrying no `bin/Runner.Listener` (a broken install, a
+# `gh-runner-*` leftover, a seam one component short) passed it, fell through to "measured empty
+# population", and exited 0 with `census=ok installs=0` — the record then read `verdict=ok` over the
+# sink the class exists to free. Both shapes of "matched no install" now refuse with `census=no-roots`,
+# which the entry point already maps to `misconfigured`.
+# Mutant: the `if [ "$RC_EXPLICIT" = 1 ]; then` refusal gate -> `if false; then`.
+case_k() { # <owner-script>
+    local owner="$1" base out rc
+    base="$(mktemp -d "$T/k.XXXXXX")"
+    mkdir -p "$base/gh-runner-broken/bin" "$base/gh-runner-broken/.cache/uv"
+    dd if=/dev/zero of="$base/gh-runner-broken/.cache/uv/blob" bs=1M count=2 >/dev/null 2>&1
+    mk_ps "$base/ps" "$base/gh-runner-broken" idle
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "a matched directory carrying NO install marker FAILS CLOSED (rc=$rc, want 3) — it used to exit 0 with census=ok"
+    case_check "$(grep -qF 'census=no-roots' <<<"$out" && echo 0 || echo 1)" \
+               "and publishes census=no-roots (the state the entry point maps to misconfigured)"
+    case_check "$(grep -qE 'matched [0-9]+ director(y|ies) \[' <<<"$out" && echo 0 || echo 1)" \
+               "the refusal NAMES what it matched and why it is not an install"
+    case_check "$(grep -qF 'bin/Runner.Listener' <<<"$out" && echo 0 || echo 1)" \
+               "and names the marker the directory is missing"
+    case_check "$(grep -qF 'NONE carries the install marker' <<<"$out" && grep -qF 'REAP_RC_GLOBS' <<<"$out" && echo 0 || echo 1)" \
+               "pointing at the seam, not at the box"
+    case_check "$([ -d "$base/gh-runner-broken/.cache/uv" ] && echo 0 || echo 1)" "nothing was removed"
+    return $((CASE_FAIL > 0))
+}
+
+# ── L: a SHARED root that IS — or CONTAINS — an install is REFUSED before any delete ─────────────
+# ⛔ The shared root is decided by a GLOB, so the one-token error it invites (`$RUNNER_ROOT` instead of
+# `$RUNNER_ROOT/_cache`) is a delete surface over the runner INSTALL tree — and the liveness gate does
+# not save it, because a runner between jobs is idle BY DESIGN. Two `stat`s, and a refusal that ends the
+# pass (rc 3, `census=refused`) instead of a partial sweep.
+# Mutant: the root-is-an-install guard -> `if false; then`.
+case_l() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/l.XXXXXX")"
+    inst="$base/gh-runner-l"
+    mk_install "$inst"; mk_cache "$inst" 2; idle_work "$inst"
+    printf 'old\n' >"$inst/_work/_temp/aged.sh"; age_path "$inst/_work/_temp/aged.sh" 9
+    mk_ps "$base/ps" "$inst" idle
+    # The seam names the INSTALL itself (the one-token error) as the shared cache root.
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$inst" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "a shared root that IS an install FAILS CLOSED (rc=$rc, want 3)"
+    case_check "$(grep -qF "REFUSED $inst reason=shared-root-is-an-install" <<<"$out" && echo 0 || echo 1)" \
+               "and it is REFUSED BY NAME with the reason (REFUSED … reason=shared-root-is-an-install)"
+    case_check "$(grep -qF 'census=refused' <<<"$out" && echo 0 || echo 1)" \
+               "the pass publishes census=refused (a state distinct from an abstention)"
+    case_check "$([ -f "$inst/bin/Runner.Listener" ] && echo 0 || echo 1)" \
+               "the install's MARKER survived (the pass never entered its entries)"
+    case_check "$([ -f "$inst/_work/_temp/aged.sh" ] && echo 0 || echo 1)" "and so did its scratch"
+    case_check "$(grep -qF 'refused=1' <<<"$out" && echo 0 || echo 1)" "the count is printed (refused=1), not implied"
+    return $((CASE_FAIL > 0))
+}
+
+# ── L2: a shared root that CONTAINS an install (the parent — the exact one-token error) ─────────
+# Mutant: the contains-an-install guard -> `if false; then`.
+case_l2() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/l2.XXXXXX")"
+    inst="$base/gh-runner-l2/inner"
+    mk_install "$inst"; idle_work "$inst"
+    mk_ps "$base/ps" "$inst" idle
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*/inner" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/gh-runner-l2" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "a shared root that CONTAINS an install FAILS CLOSED (rc=$rc, want 3)"
+    case_check "$(grep -qF 'reason=shared-root-contains-an-install' <<<"$out" && echo 0 || echo 1)" \
+               "and names the reason (reason=shared-root-contains-an-install) with the entry it found"
+    case_check "$([ -f "$inst/bin/Runner.Listener" ] && echo 0 || echo 1)" "the install underneath is INTACT"
+    return $((CASE_FAIL > 0))
+}
+
+# ── M: cache_mb is the CLASS'S total, so it includes the shared root ────────────────────────────
+# ⛔ The layout the durable half creates: every write goes to `XDG_CACHE_HOME` (the shared root), the
+# per-install `.cache` dirs stay empty. The reading then reported `cache_mb=0` beside a non-zero
+# `freed_mb` in the same record — a number contradicting itself in a class whose rule is "the numbers
+# are printed, not implied".
+# Mutant: the shared-root accumulate -> removed (the marker comment is what makes this surgical).
+case_m() { # <owner-script>
+    local owner="$1" base inst shared out rc
+    base="$(mktemp -d "$T/m.XXXXXX")"
+    inst="$base/gh-runner-m"; shared="$base/shared/_cache"
+    mk_install "$inst"; mk_cache "$inst" 0; idle_work "$inst"
+    mkdir -p "$shared/uv"; dd if=/dev/zero of="$shared/uv/blob" bs=1M count=3 >/dev/null 2>&1
+    mk_ps "$base/ps" "$inst" idle
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$shared" REAP_RC_MIN_CACHE_MB=1000 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$(grep -qE 'cache_mb=[1-9][0-9]*' <<<"$(grep -F 'SUMMARY class=runner-cache' <<<"$out")" && echo 0 || echo 1)" \
+               "cache_mb counts the SHARED root the durable half creates (it read 0 while the bytes were here)"
+    case_check "$(grep -qE 'INSTALL .*cache_mb=0 ' <<<"$out" && echo 0 || echo 1)" \
+               "while the per-install cache really is empty in the same pass — the two readings are not the same number by accident"
+    return $((CASE_FAIL > 0))
+}
+
+# ── N: the listener's CURRENT `_diag` log is KEPT; the aged closed ones are still reaped ─────────
+# ⛔ `_diag/Runner_<ts>-utc.log` is held OPEN by the listener, so unlinking it reclaims ~0 bytes while
+# the `du` taken before the delete credits FREED_MB for bytes no `df` will show — and the box loses the
+# diagnostics for the next failure.
+# Mutant: the newest-log keep -> `if false; then`.
+case_n() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/n.XXXXXX")"
+    inst="$base/gh-runner-n"
+    mk_install "$inst"; mk_cache "$inst" 0; idle_work "$inst"
+    printf 'older\n' >"$inst/_diag/Runner_20200101-utc.log"; age_path "$inst/_diag/Runner_20200101-utc.log" 20
+    printf 'current\n' >"$inst/_diag/Runner_20200102-utc.log"; age_path "$inst/_diag/Runner_20200102-utc.log" 9
+    # Both are AGED (past REAP_RC_LOG_DAYS=7); only the NEWEST is the listener's open one.
+    mk_ps "$base/ps" "$inst" idle
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_LOG_DAYS=7 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -f "$inst/_diag/Runner_20200102-utc.log" ] && echo 0 || echo 1)" \
+               "the NEWEST aged log is KEPT (a live listener holds it open: unlinking it frees no bytes)"
+    case_check "$(grep -qF 'reason=newest-log' <<<"$out" && echo 0 || echo 1)" "and it is named (reason=newest-log)"
+    case_check "$([ ! -f "$inst/_diag/Runner_20200101-utc.log" ] && echo 0 || echo 1)" \
+               "while an OLDER aged log in the same install WAS reaped (the age bound still binds)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── O: the `_work` freshness witness is ARGV-INDEPENDENT ────────────────────────────────────────
+# ⛔ It used to be gated BEHIND a literal `$inst/bin/Runner.Listener` / `$inst/run.sh` argv match, so an
+# install whose listener argv is `./run.sh` (or a canonicalised path, or a renamed run.sh) fell to
+# `no-listener` and had its cache reaped while a job was running. The witness is now asked first.
+# Mutant: the `_work` freshness gate -> `if false; then`.
+case_o() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/o.XXXXXX")"
+    inst="$base/gh-runner-o"
+    mk_install "$inst"; mk_cache "$inst" 2
+    # A JOB JUST STARTED: `_work` content is FRESH (mk_install made `_work/_temp` a moment ago).
+    printf '  4242 ./run.sh --startuptype service\n' >"$base/ps"           # argv the literal match misses
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -d "$inst/.cache" ] && echo 0 || echo 1)" \
+               "a FRESH `_work` keeps the cache even when the listener argv does not match the literal (argv-independent witness)"
+    case_check "$(grep -qF 'reason=skipped-live:busy-work' <<<"$out" && echo 0 || echo 1)" \
+               "and the skip names THAT witness (reason=skipped-live:busy-work)"
+    case_check "$(grep -qF 'live=yes' <<<"$out" && echo 0 || echo 1)" "the installation reading says live=yes"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
+MUT_K="$T/mut-k.sh"; MUT_L="$T/mut-l.sh"; MUT_L2="$T/mut-l2.sh"; MUT_M="$T/mut-m.sh"
+MUT_N="$T/mut-n.sh"; MUT_O="$T/mut-o.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -472,6 +651,28 @@ apply_mutation "$OWNER" "$MUT_J" 's/REAP_RC_LOG:-/REAP_RC_LOG_IGNORED:-/' \
     || { printf '  ❌ mutation J could not be applied (the log seam moved)\n'; mut_ok=0; }
 apply_mutation "$OWNER" "$MUT_I" 's/^    if \[ "\$pending" -gt "\$MAX_MB" \] && \[ "\$FREED_MB" -lt "\$MAX_MB" \]; then$/    if false; then/' \
     || { printf '  ❌ mutation I could not be applied (the oversized-candidate guard moved)\n'; mut_ok=0; }
+# ⛔ K — the EXPLICIT-seam refusal gate (the blocking #4169 finding). Without it a glob that matched a
+# directory but no install exits 0 with `census=ok installs=0`: an inert class reading healthy.
+apply_mutation "$OWNER" "$MUT_K" 's/^    if \[ "\$RC_EXPLICIT" = 1 \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation K could not be applied (the explicit-glob refusal gate moved)\n'; mut_ok=0; }
+# ⛔ L — the SHARED-root scope guards, one mutant each: the root that IS an install, and the root that
+# CONTAINS one (the parent — the exact one-token error the seam invites).
+apply_mutation "$OWNER" "$MUT_L" 's/^    if is_install "\$root"; then$/    if false; then/' \
+    || { printf '  ❌ mutation L could not be applied (the shared-root-is-an-install guard moved)\n'; mut_ok=0; }
+apply_mutation "$OWNER" "$MUT_L2" 's/^    if \[ -n "\$is_inst" \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation L2 could not be applied (the shared-root-contains-an-install guard moved)\n'; mut_ok=0; }
+# ⛔ M — the shared-root reading is REMOVED from the class total (the marker comment makes it surgical:
+# the same accumulate line exists in `sweep_install`, and a bare match would mutate both).
+apply_mutation "$OWNER" "$MUT_M" 's/^    case "\$sz" in .*shared-root reading joins the class total$/    :   # shared-root reading joins the class total/' \
+    || { printf '  ❌ mutation M could not be applied (the shared-root accumulate moved)\n'; mut_ok=0; }
+# ⛔ N — the newest `_diag` log is no longer kept (an open file's unlink reclaims nothing and loses the
+# diagnostics of the next failure).
+apply_mutation "$OWNER" "$MUT_N" 's/^        if \[ -n "\$newest_log" \] && \[ "\$f" = "\$newest_log" \]; then$/        if false; then/' \
+    || { printf '  ❌ mutation N could not be applied (the newest-log keep moved)\n'; mut_ok=0; }
+# ⛔ O — the ARGV-INDEPENDENT `_work` witness is deleted (the pre-fix shape: only a literal listener
+# argv could make a job visible).
+apply_mutation "$OWNER" "$MUT_O" 's/^    newest="\$(newest_mtime_under "\$d\/_work")"$/    newest=0/' \
+    || { printf '  ❌ mutation O could not be applied (the argv-independent _work witness moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -483,6 +684,12 @@ expect_pass "G the SHARED cache root re-probes the population too" case_g "$OWNE
 expect_pass "H a re-probe that cannot answer keeps the candidate and fails closed" case_h "$OWNER"
 expect_pass "I a candidate bigger than the whole cap is still taken, once" case_i "$OWNER"
 expect_pass "J the REAP_RC_LOG seam is honoured" case_j "$OWNER"
+expect_pass "K an EXPLICIT glob matching directories but NO install is a REFUSAL" case_k "$OWNER"
+expect_pass "L a shared root that IS an install is REFUSED before any delete" case_l "$OWNER"
+expect_pass "L2 a shared root that CONTAINS an install is REFUSED (the parent, one token short)" case_l2 "$OWNER"
+expect_pass "M cache_mb counts the SHARED root, not only the per-install .cache dirs" case_m "$OWNER"
+expect_pass "N the listener's CURRENT _diag log is kept; older aged logs are reaped" case_n "$OWNER"
+expect_pass "O a fresh _work keeps the cache without a literal listener argv match" case_o "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -499,6 +706,12 @@ expect_fail "G mutant: the re-probe stops RE-READING (shared root arm)"  case_g 
 expect_fail "H mutant: the re-probe stops RE-READING (unreadable arm)"  case_h "$MUT_F"
 expect_fail "I mutant: the oversized-candidate guard deleted"            case_i "$MUT_I"
 expect_fail "J mutant: the log seam is ignored"                         case_j "$MUT_J"
+expect_fail "K mutant: the explicit-glob refusal gate deleted"          case_k "$MUT_K"
+expect_fail "L mutant: a shared root that IS an install is swept"       case_l "$MUT_L"
+expect_fail "L2 mutant: a shared root CONTAINING an install is swept"   case_l2 "$MUT_L2"
+expect_fail "M mutant: the shared-root reading is not counted"          case_m "$MUT_M"
+expect_fail "N mutant: the newest (open) _diag log is reaped too"       case_n "$MUT_N"
+expect_fail "O mutant: the argv-independent _work witness deleted"      case_o "$MUT_O"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

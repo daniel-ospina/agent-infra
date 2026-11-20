@@ -155,7 +155,26 @@ export DISK_REAPER_RUNNER_GLOBS
 # (exit 3) by the class's own policy, which would turn every case here red for a fixture reason.
 # `MIN_MB=1` keeps the fixture caches (a few MB) inside the class's size bound; a case that needs the
 # 256 MB default pins it for itself.
-mkdir -p "$T/scratch/rc/gh-runner-fixture" "$T/scratch/rc/shared"
+# ⛔ THE FIXTURE MUST BE AN **INSTALL**, NOT MERELY A DIRECTORY (#4169 review, BLOCKING). The class
+# refuses an EXPLICIT glob list that matched no INSTALL (`census=no-roots`, rc 3), so a fixture that was
+# only a directory turned every full-pass case here red for a fixture reason — and it was hiding the
+# very defect the refusal exists for: a matched directory with no `bin/Runner.Listener` used to read
+# `census=ok installs=0` and pass. So the base fixture carries the marker.
+age_rc_install() { # <install-dir> — make a fixture install read IDLE
+    # The class treats `_work` content written inside `REAP_RC_JOB_WINDOW_S` (900 s) as a job in
+    # flight and skips the install WHOLE — and a `mkdir` a millisecond ago is exactly that. Only the
+    # direct children of `_work`/`_diag` are aged: they are what the freshness witness and the age
+    # gates read.
+    local d="$1" when
+    when=$(( $(date +%s) - 2 * 86400 ))
+    mkdir -p "$d/_work/_temp" "$d/_diag"
+    touch -d "@$when" "$d/_work/_temp" "$d/_diag" 2>/dev/null \
+        || touch -t "$(date -r "$when" +%Y%m%d%H%M 2>/dev/null || printf 202001010000)" \
+                   "$d/_work/_temp" "$d/_diag" 2>/dev/null || true
+}
+mkdir -p "$T/scratch/rc/gh-runner-fixture/bin" "$T/scratch/rc/shared"
+: >"$T/scratch/rc/gh-runner-fixture/bin/Runner.Listener"
+age_rc_install "$T/scratch/rc/gh-runner-fixture"
 DISK_REAPER_RUNNER_CACHE_GLOBS="$T/scratch/rc/gh-runner-*"
 DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS="$T/scratch/rc/shared"
 DISK_REAPER_RUNNER_CACHE_MIN_MB="${DISK_REAPER_RUNNER_CACHE_MIN_MB:-1}"
@@ -3523,6 +3542,7 @@ ENVNAME=t64
 PIN_INST="$T/scratch/rc/gh-runner-pin"
 mkdir -p "$PIN_INST/bin" "$PIN_INST/_work/_temp" "$PIN_INST/_diag" "$PIN_INST/.cache/uv"
 : >"$PIN_INST/bin/Runner.Listener"
+age_rc_install "$PIN_INST"   # IDLE: a fresh `_work` is a job in flight, and this fixture asserts a reap
 dd if=/dev/zero of="$PIN_INST/.cache/uv/blob" bs=1M count=3 >/dev/null 2>&1
 RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
 OUT="$(run_reaper --dry-run 2>&1)"
@@ -3532,8 +3552,11 @@ assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/opt/gh-runner" \
     "T64 and never inherits the box's real /opt install glob"
 assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/tmp/actions-runner" \
     "T64 nor the pool's real /tmp root"
-assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "installs=1" \
-    "T64 the pinned population is the fixture install — installs=1, not a measured zero"
+# TWO installs at this point: the base runner-cache fixture and this case's pin. The row is about the
+# pin being REACHED (a pinned-to-nowhere class reads a measured zero forever), so it asserts the
+# population that exists rather than a number that only happens to be 1.
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "installs=2" \
+    "T64 the pinned population is the fixture installs — installs=2, not a measured zero"
 # The armed half: the class still DOES its work, on the fixture. Without this row a pin to a path that
 # matches nothing would pass every assertion above and the class would be inert by construction.
 OUT="$(run_reaper --apply --only runner-cache 2>&1)"; RC=$?
@@ -3553,6 +3576,7 @@ ENVNAME=t65
 UNS_INST="$T/scratch/rc/gh-runner-unsized"
 mkdir -p "$UNS_INST/bin" "$UNS_INST/_work/_temp" "$UNS_INST/_diag" "$UNS_INST/.cache/uv"
 : >"$UNS_INST/bin/Runner.Listener"
+age_rc_install "$UNS_INST"   # IDLE, or the candidate is skipped-live before it can be `?`-sized
 printf 'x\n' >"$UNS_INST/.cache/uv/blob"
 OUT="$(REAP_RC_DU_BIN="$T/no-such-du-binary" run_reaper --dry-run --only runner-cache 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T65 a dry run holding an unsized candidate still reports work present (rc=5)"

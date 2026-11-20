@@ -33,11 +33,23 @@
 #
 #   <install>/.cache/            the whole package cache. Regenerates; the measured 445 GB.
 #   <install>/_work/_temp/*      entries older than REAP_RC_SCRATCH_DAYS (default 7).
-#   <install>/_diag/*.log        files older than REAP_RC_LOG_DAYS (default 7).
+#   <install>/_diag/*.log        files older than REAP_RC_LOG_DAYS (default 7) — ⛔ EXCEPT THE NEWEST
+#                                one per install: a listener holds its CURRENT log OPEN, so unlinking
+#                                it reclaims no bytes while crediting the `du` figure to the ledger and
+#                                costing the next failure its diagnostics (#4169 review).
 #
 # plus the SHARED per-box cache root (`XDG_CACHE_HOME` for pool-started runners, see
 # `scripts/ci_runner_pool.sh`), which is what stops the multiplication: N installs with a
-# `XDG_CACHE_HOME` each hold N copies of the same content, one per-box root holds one.
+# `XDG_CACHE_HOME` each hold N copies of the same content, one per-box root holds one. ⛔ THAT ROOT IS
+# GLOB-DECIDED, SO IT IS SCOPE-CHECKED BEFORE ANY DELETE: it must not BE an install and must not
+# CONTAIN one (`REFUSED … reason=shared-root-contains-an-install`), because the one-token error this
+# seam invites is naming the installs' PARENT — and the liveness gate cannot save it, since a runner
+# between jobs is idle BY DESIGN. A refused root ends the pass at `census=refused`/rc 3.
+#
+# `cache_mb=` IS THE CLASS'S TOTAL, SO IT INCLUDES THE SHARED ROOT. It used to sum only the installs'
+# `.cache` dirs, so on exactly the layout the durable half creates (writes go to `XDG_CACHE_HOME`, the
+# per-install caches stay empty) the record read `cache_mb=0` beside a non-zero `freed_mb` — a
+# self-contradicting number in a class whose rule is "the numbers are printed, not implied" (#4169).
 #
 # ⛔ THE INSTALL TREE ITSELF IS NEVER A CANDIDATE — not `bin/`, not `config/`, not `externals/`, not
 # `_work/<checkout>` (that is `reap-runner-work.sh`'s sink with its own mtime floor), not `_tool`,
@@ -52,8 +64,12 @@
 # verdict comes from the process table, which is the only witness that can answer it:
 #
 #   * `bin/Runner.Worker` in an install's process list  → a JOB IS RUNNING. Skip.
-#   * `bin/Runner.Listener` present AND content under `_work` written within REAP_RC_JOB_WINDOW_S
-#     (default 900 s) → a job is running or has just started. Skip.
+#   * CONTENT UNDER `_work` WRITTEN WITHIN REAP_RC_JOB_WINDOW_S (default 900 s) → a job is running or
+#     has just started. Skip. ⛔ THIS WITNESS IS ASKED FIRST AND IS ARGV-INDEPENDENT: it used to be
+#     gated BEHIND a literal `$d/bin/Runner.Listener` / `$d/run.sh` argv match, so an install whose
+#     listener argv is not that exact string (`./run.sh` from the install's own cwd, a canonicalised
+#     path reached through a symlinked parent, a renamed run.sh) took the `no-listener` arm and lost its
+#     cache WITHOUT the one witness that does not depend on argv ever being consulted (#4169 review).
 #   * a listener with no worker and nothing fresh under `_work` → the install is BETWEEN jobs. Its
 #     cache is not in use; the next job re-downloads what it needs. Reap.
 #
@@ -92,7 +108,11 @@
 #   0  the sweep ran; nothing is wrong (this INCLUDES a sweep that found nothing to do)
 #   2  usage
 #   3  FAIL-CLOSED — the process census could not be read, a glob list an operator SET matched no
-#      install, or a matched root was refused because it is not an install. Nothing was removed.
+#      install (no directory at all, or directories of which none carries the install marker), or a
+#      matched SHARED root was REFUSED because it is — or contains — an install. Nothing was removed.
+#      ⛔ EACH OF THOSE PUBLISHES ITS OWN CENSUS STATE (`census=no-roots` / `census=refused`) because the
+#      REMEDY differs; folding a refusal into a measured zero is how an operator widens a glob that was
+#      already matching instead of fixing the one token that is wrong.
 #   4  a removal FAILED (the path is still there after `rm`)
 #   5  DRY RUN with work present (the dry run's whole job is to say so)
 #
@@ -103,9 +123,13 @@
 #                          `${X:-default}` would substitute the WIDEST list for an operator who emptied
 #                          the seam to turn the class off, which is the delete direction.
 #   REAP_RC_SHARED_GLOBS   space-separated globs naming the ONE per-box cache root
-#                          (default: /tmp/actions-runner/_cache $HOME/actions-runner/_cache)
-#   REAP_RC_EXPLICIT       1 = REAP_RC_GLOBS was SET by the caller, so matching nothing is a REFUSAL
-#                          (an asserted layout that is not there) and not a measured-empty box
+#                          (default: /tmp/actions-runner/_cache $HOME/actions-runner/_cache
+#                          ${RUNNER_ROOT:-/tmp/actions-runner}/_cache — the third is DERIVED from the
+#                          same variable `ci_runner_pool.sh` derives its `XDG_CACHE_HOME` from, so the
+#                          two tools cannot disagree about the default on a `RUNNER_ROOT=/opt` box)
+#   REAP_RC_EXPLICIT       1 = REAP_RC_GLOBS was SET by the caller, so matching NO INSTALL is a REFUSAL
+#                          (an asserted layout that is not there, or a seam one component short) and not
+#                          a measured-empty box. `disk-reaper.sh` sets it from the operator seam.
 #   REAP_RC_MIN_CACHE_MB   the SIZE bound on a `.cache`: a cache smaller than this is KEPT, because
 #                          reaping a few MB of a content-addressed cache buys nothing and costs every
 #                          later job a re-download (default 256)
@@ -173,7 +197,14 @@ SHARED_GLOBS="${REAP_RC_SHARED_GLOBS-}"
 SHARED_GLOBS_SET=0
 [ -n "${REAP_RC_SHARED_GLOBS+set}" ] && SHARED_GLOBS_SET=1
 if [ "$SHARED_GLOBS_SET" = 0 ]; then
-    SHARED_GLOBS="/tmp/actions-runner/_cache $HOME/actions-runner/_cache"
+    # ⛔ ONE SOURCE FOR THE DEFAULT, BECAUSE TWO TOOLS SHARE ONE DIRECTORY (#4169 review, P1).
+    # `ci_runner_pool.sh` exports `XDG_CACHE_HOME=${RUNNER_CACHE_ROOT:-$RUNNER_ROOT/_cache}` (its own
+    # `RUNNER_ROOT` default is `/tmp/actions-runner`), and on the layout this repo documents as LIVE —
+    # `RUNNER_ROOT=/opt`, where all four installs on `pi-cell-4` sit (`ci_runner_pool.sh` records the
+    # measurement) — a hardcoded `/tmp/... $HOME/...` list matches NOTHING while the pool writes tens of
+    # GB into `/opt/_cache`. The class then reads `candidates=0 verdict=ok` over exactly the unbounded
+    # sink #4168 exists to free. The derived entry is the coupling: same variable, same default.
+    SHARED_GLOBS="/tmp/actions-runner/_cache $HOME/actions-runner/_cache ${RUNNER_ROOT:-/tmp/actions-runner}/_cache"
 fi
 MIN_CACHE_MB="${REAP_RC_MIN_CACHE_MB:-256}"
 SCRATCH_DAYS="${REAP_RC_SCRATCH_DAYS:-7}"
@@ -266,6 +297,9 @@ CAPPED=0
 REMAINING=0
 FREED_MB=0
 CACHE_TOTAL_MB=0
+# A REFUSED SCOPE IS ITS OWN OUTCOME (see the exit-code table): it is not an abstention (a gate that
+# could not ANSWER) and it is emphatically not a measured zero.
+REFUSED=0
 CENSUS="ok"
 CAND_NAMES=""
 # Per-install readings, printed on their own lines so an operator can see WHICH install holds the
@@ -366,11 +400,18 @@ install_live() {
     if proc_has "$d/bin/Runner.Worker" || proc_has "$d/bin/Runner.Worker.dll"; then
         LIVE_REASON="worker-running"; return 0
     fi
+    # ⛔ THE `_work` WITNESS IS ARGV-INDEPENDENT AND IS ASKED FIRST (#4169 review). It was gated BEHIND
+    # the literal listener-argv match below, so an install whose listener argv is not that exact string
+    # — `./run.sh` from the install's own cwd, a canonicalised path reached through a symlinked parent,
+    # a renamed `run.sh` — fell to the `no-listener` arm and its cache was reaped WITHOUT asking the one
+    # witness that does not depend on argv. Content under `_work` written inside the job window is a job
+    # running or just started whatever the process table spells; the conservative direction costs one
+    # pass, the other costs a job. The cost is one bounded listing per install (one level, never a walk).
+    newest="$(newest_mtime_under "$d/_work")"
+    if [ "${newest:-0}" -gt 0 ] && [ "$(( $(now) - newest ))" -le "$JOB_WINDOW_S" ]; then
+        LIVE_REASON="busy-work"; return 0
+    fi
     if proc_has "$d/bin/Runner.Listener" || proc_has "$d/run.sh"; then
-        newest="$(newest_mtime_under "$d/_work")"
-        if [ "${newest:-0}" -gt 0 ] && [ "$(( $(now) - newest ))" -le "$JOB_WINDOW_S" ]; then
-            LIVE_REASON="listener+busy-work"; return 0
-        fi
         # A listener with nothing fresh under `_work` is BETWEEN jobs: the cache is idle, and the next
         # job re-downloads what it needs. Reap.
         LIVE_REASON="idle-listener"; return 1
@@ -472,7 +513,7 @@ is_install() { [ -f "$1/bin/Runner.Listener" ] || [ -L "$1/bin/Runner.Listener" 
 
 SEEN_INSTALLS=" "
 sweep_install() { # <install-dir>
-    local d="$1" cache="$1/.cache" sz reading cutoff_s cutoff_l f fm
+    local d="$1" cache="$1/.cache" sz reading cutoff_s cutoff_l f fm newest_log newest_lm _lm
     INSTALLS=$((INSTALLS + 1))
     # ── the reading FIRST, so the line exists even for an install that is skipped ────────────────
     if [ -e "$cache" ] || [ -L "$cache" ]; then sz="$(du_mb "$cache")" || sz=""; else sz="0"; fi
@@ -548,6 +589,20 @@ sweep_install() { # <install-dir>
         reap_one "$f" "${sz:-?}" scratch "$d"
     done
     cutoff_l=$(( $(now) - LOG_DAYS * 86400 ))
+    # ⛔ THE NEWEST LOG IS THE LISTENER'S *CURRENT* ONE, AND UNLINKING IT RECLAIMS NOTHING and credits
+    # bytes that do not exist (#4169 review, P3). `_diag/Runner_<ts>-utc.log` is held OPEN by the
+    # listener for its whole lifetime: with no jobs its mtime ages past `REAP_RC_LOG_DAYS`, the age gate
+    # admits it, `rm` succeeds — and the inode survives through the open descriptor, so the `du -sk`
+    # taken before the delete went into `FREED_MB`/`REAPED` for bytes no `df` pair will ever show, while
+    # the box lost the diagnostics an operator needs for the NEXT failure. Exactly one file per install
+    # is kept — the newest, which is the one a live listener holds — and the older, closed logs under
+    # here are still reaped on the same age bound.
+    newest_log=""; newest_lm=-1
+    for f in "$d/_diag"/*.log; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        _lm="$(mtime_of "$f")" || continue
+        [ "$_lm" -gt "$newest_lm" ] && { newest_lm="$_lm"; newest_log="$f"; }
+    done
     for f in "$d/_diag"/*.log; do
         [ -e "$f" ] || [ -L "$f" ] || continue
         [ -L "$f" ] && { KEPT=$((KEPT + 1)); log_line "KEPT   $f reason=symlink (never followed in a delete path)"; continue; }
@@ -556,6 +611,11 @@ sweep_install() { # <install-dir>
         if [ "$fm" -gt "$cutoff_l" ]; then
             KEPT=$((KEPT + 1))
             log_line "KEPT   $f reason=too-young (newer than ${LOG_DAYS}d)"
+            continue
+        fi
+        if [ -n "$newest_log" ] && [ "$f" = "$newest_log" ]; then
+            KEPT=$((KEPT + 1))
+            log_line "KEPT   $f reason=newest-log (the listener's CURRENT log: held open, so unlinking it reclaims no bytes and costs the next failure its diagnostics; the aged-and-closed logs beside it are still reaped)"
             continue
         fi
         sz="$(du_mb "$f")" || sz=""
@@ -570,7 +630,7 @@ sweep_install() { # <install-dir>
 # answer it needs (`ANY_LIVE`) is already known.
 ANY_LIVE=0
 sweep_shared() {
-    local root="$1" sz
+    local root="$1" sz e sz2 is_inst
     [ -d "$root" ] || return 0
     # ⛔ `ANY_LIVE` IS THE CLASSIFICATION, NOT THE GATE. It was established by `sweep_install`, the one
     # place every install's liveness is read, and it is what reports the skip (and what makes cleanup
@@ -583,27 +643,54 @@ sweep_shared() {
         log_line "KEPT   $root reason=census-unreadable (the SHARED root is used by every install; liveness is UNKNOWN)"
         return 0
     fi
+    if [ -L "$root" ]; then
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $root reason=symlinked-cache (never followed in a delete path)"
+        return 0
+    fi
+    # ⛔ SCOPE, BEFORE ANY DELETE AND BEFORE ANY `du` (#4169 review, P2). The install arm is
+    # marker-gated (`is_install`) for the reason the header argues at length; this arm had NO equivalent,
+    # so the ONE-TONK error this seam invites — naming `$RUNNER_ROOT` instead of `$RUNNER_ROOT/_cache` —
+    # turned a delete surface over the runner INSTALL tree (`bin/`, `config.sh`, `.runner`, `_work/`).
+    # The liveness gate does not save it: a runner between jobs is `idle-listener` BY DESIGN, so every
+    # idle install under a mis-typed root is deletable. Two `stat`s close it — the root must not BE an
+    # install, and must not CONTAIN one — and a refusal is the whole pass's, so nothing is deleted
+    # before it (the shape `reap-runner-work.sh` already uses for a refused root).
+    if is_install "$root"; then
+        REFUSED=$((REFUSED + 1))
+        log_line "REFUSED $root reason=shared-root-is-an-install (a shared CACHE root must not be a runner INSTALL: the seam is one component short, e.g. '\$RUNNER_ROOT' for '\$RUNNER_ROOT/_cache'; sweeping it would delete bin/, config.sh and _work/ of a live install)"
+        return 0
+    fi
+    is_inst=""
+    for e in "$root"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        is_install "$e" && { is_inst="$e"; break; }
+    done
+    if [ -n "$is_inst" ]; then
+        REFUSED=$((REFUSED + 1))
+        log_line "REFUSED $root reason=shared-root-contains-an-install first=$is_inst (the glob named the installs' PARENT — the seam is one component short, e.g. '\$RUNNER_ROOT' for '\$RUNNER_ROOT/_cache'; nothing under it was touched)"
+        return 0
+    fi
+    # ⛔ THE ROOT'S READING IS TAKEN ONCE AND IS PART OF THE CLASS'S TOTAL (#4169 review, P2).
+    # `cache_mb_runner_cache=` is documented as "the total bytes held by the class's caches", and this
+    # root — the one the durable half creates, where every pooled install's writes land — was never
+    # summed: on a pool box the record read `cache_mb_runner_cache=0 … freed_mb_runner_cache=20480`, a
+    # number contradicting itself in a PR whose heading is "the numbers are printed, not implied".
+    sz="$(du_mb "$root")" || sz=""
+    case "$sz" in ''|*[!0-9]*) ;; *) CACHE_TOTAL_MB=$((CACHE_TOTAL_MB + sz)) ;; esac   # shared-root reading joins the class total
     if [ "$ANY_LIVE" = 1 ]; then
-        sz="$(du_mb "$root")" || sz=""
         SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
         log_line "SKIPPED-LIVE $root reason=skipped-live:an-install-has-a-job-running cache_mb=${sz:-?} (the SHARED cache is used by every install on this box)"
         READINGS="${READINGS}${READINGS:+
 }INSTALL ${root} cache_mb=${sz:-?} live=yes reason=shared-with-a-live-install"
         return 0
     fi
-    if [ -L "$root" ]; then
-        UNMEASURABLE=$((UNMEASURABLE + 1))
-        log_line "KEPT   $root reason=symlinked-cache (never followed in a delete path)"
-        return 0
-    fi
-    sz="$(du_mb "$root")" || sz=""
     READINGS="${READINGS}${READINGS:+
 }INSTALL ${root} cache_mb=${sz:-?} live=no reason=shared-root-no-job-running"
     # ⛔ THE SHARED ROOT IS RECLAIMED IN PLACE, NOT DELETED. It is the `XDG_CACHE_HOME` a running
     # listener was started with: removing the DIRECTORY itself is fine for an idle box, but keeping it
     # (and emptying it) means a listener that starts between this pass and its re-probe cannot land in
     # a missing directory. Its CONTENTS are the cache.
-    local e sz2
     for e in "$root"/*; do
         [ -e "$e" ] || [ -L "$e" ] || continue
         [ -L "$e" ] && { KEPT=$((KEPT + 1)); log_line "KEPT   $e reason=symlink (never followed in a delete path)"; continue; }
@@ -641,21 +728,26 @@ discover() {
     return 0
 }
 
-# glob_matches_any <list> — 0 when at least one pattern matches at least one existing directory.
-# Used to tell "this box has no runners" (a measured empty population, exit 0) from "the operator
-# asserted a layout that is not there" (a refusal), exactly as the runner-work owner does.
-glob_matches_any() {
+# glob_matched_dirs <list> — the directories a glob list matches, one per line (empty when none).
+# ⛔ "MATCHED A DIRECTORY" IS NOT "MATCHED AN INSTALL", AND CONFLATING THEM WAS THE FAIL-OPEN (#4169
+# review, BLOCKING). This helper used to be a yes/no directory test, so an operator-set seam that
+# matched a tree holding no `bin/Runner.Listener` passed the refusal gate, fell through to the
+# "measured empty population" line, and exited 0 with `census=ok installs=0` — an inert class whose
+# record read `verdict_runner_cache=ok` over the sink it exists to free. Returning the MATCHES lets the
+# refusal name them, so the operator sees a broken install / a seam one component short instead of
+# having to re-derive why a matching glob produced no install.
+glob_matched_dirs() {
     local g p _had_f=0
     case $- in *f*) _had_f=1 ;; esac
     set -f
     for g in $1; do
         # shellcheck disable=SC2086
         for p in $(compgen -G "$g" 2>/dev/null); do
-            [ -d "$p" ] && { [ "$_had_f" = 1 ] || set +f; return 0; }
+            [ -d "$p" ] && printf '%s\n' "$p"
         done
     done
     [ "$_had_f" = 1 ] || set +f
-    return 1
+    return 0
 }
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -667,9 +759,21 @@ census_read || { CENSUS="unreadable"; log_line "reap-runner-cache: ⛔ CENSUS UN
 
 discover
 if [ -z "$INSTALL_DIRS" ]; then
-    if [ "$RC_EXPLICIT" = 1 ] && ! glob_matches_any "$RC_GLOBS"; then
-        printf '%s: FAIL-CLOSED — REAP_RC_GLOBS ('%s') matched NO directory, and it was set EXPLICITLY; a class that scans nothing is NOT a pass\n' "$SCRIPT_NAME" "$RC_GLOBS" >&2
-        log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=no-roots installs=0 candidates=0 reaped=0 skipped_live=0 kept=0 unmeasurable=0 failed=0 freed_mb=0 cache_mb=0 capped=0 remaining=0"
+    if [ "$RC_EXPLICIT" = 1 ]; then
+        # ⛔ "MATCHED NO INSTALL" IS THE REFUSAL, NOT "MATCHED NO DIRECTORY" (#4169 review, BLOCKING).
+        # The operator asserted a layout and the class found no install in it. Whether the globs matched
+        # nothing at all or matched directories carrying no install marker, the class would scan
+        # NOTHING — and a class that scans nothing is not a pass. Both refuse (exit 3) and both publish
+        # `census=no-roots`, which `disk-reaper.sh` maps to `misconfigured` + `?`, never to a measured 0.
+        _mdirs="$(glob_matched_dirs "$RC_GLOBS" | tr '\n' ' ')"
+        if [ -n "${_mdirs// /}" ]; then
+            _n="$(printf '%s' "$_mdirs" | wc -w | tr -d ' ')"
+            printf '%s: FAIL-CLOSED — REAP_RC_GLOBS (%s) matched %s director%s [%s], but NONE carries the install marker bin/Runner.Listener; a class that scans NO INSTALL is not a pass. A directory is an install by its MARKER, never by the glob — fix the seam (or the install), do not widen it\n' \
+                "$SCRIPT_NAME" "$RC_GLOBS" "$_n" "$( [ "$_n" = 1 ] && printf 'y' || printf 'ies')" "$_mdirs" >&2
+        else
+            printf '%s: FAIL-CLOSED — REAP_RC_GLOBS (%s) matched NO directory, and it was set EXPLICITLY; a class that scans nothing is NOT a pass\n' "$SCRIPT_NAME" "$RC_GLOBS" >&2
+        fi
+        log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=no-roots installs=0 candidates=0 reaped=0 skipped_live=0 kept=0 unmeasurable=0 refused=0 failed=0 freed_mb=0 cache_mb=0 capped=0 remaining=0"
         exit 3
     fi
     log_line "reap-runner-cache: no runner install matched $RC_GLOBS — a MEASURED empty population (this box runs no CI runner in those layouts)"
@@ -708,6 +812,15 @@ fi
 for p in $SHARED_DIRS; do
     sweep_shared "$p"
 done
+# ⛔ A SHARED ROOT THAT MATCHED NOTHING IS PRINTED, NOT ASSUMED AWAY (#4169 review, P1). The class's
+# durable half moves every pooled install's writes into ONE root the pool derives
+# (`$RUNNER_ROOT/_cache`), so a box whose pool root lands outside this seam's globs has its bytes one
+# directory up from every candidate: the class reads `candidates=0 verdict=ok` and the sink grows
+# unread. The default now derives from the same `RUNNER_ROOT`, and this line makes the remaining case —
+# an operator override on ONE of the two tools — findable in the pass record instead of silent.
+if [ -n "$SHARED_GLOBS" ] && [ -z "$SHARED_DIRS" ]; then
+    log_line "reap-runner-cache: shared_root=absent (shared_globs='$SHARED_GLOBS' matched no directory — a pool started with a different RUNNER_ROOT/RUNNER_CACHE_ROOT exports its XDG_CACHE_HOME elsewhere, and NOTHING in this pass covers it: name that path in REAP_RC_SHARED_GLOBS / DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS)"
+fi
 
 # ── the report ─────────────────────────────────────────────────────────────────────────────────
 # ⛔ EVERY READING IS PRINTED (agent-infra#2344). "the class did nothing" and "the class could not see
@@ -715,22 +828,29 @@ done
 [ -n "$READINGS" ] && log_line "$READINGS"
 [ -n "$CAND_NAMES" ] && log_line "$CAND_NAMES"
 
+# ⛔ A REFUSED SCOPE IS ITS OWN CENSUS STATE, AND IT IS DECIDED HERE — AFTER every sweep, so no later
+# root's liveness question is answered from a census state that is about a SCOPE problem. `refused` is
+# not `unmeasurable` (an abstention is a gate that could not ANSWER; a refusal is an input that was
+# WRONG) and it is emphatically not `ok`: the documented refusal had no implementation at all, which
+# left the class inert while its record read `verdict_runner_cache=ok` (#4169 review, BLOCKING).
+if [ "$CENSUS" = ok ] && [ "$REFUSED" -gt 0 ]; then CENSUS="refused"; fi
 rc=0
 [ "$FAILED" -gt 0 ] && rc=4
-if [ "$CENSUS" != ok ] || [ "$UNMEASURABLE" -gt 0 ]; then
+if [ "$CENSUS" != ok ] || [ "$UNMEASURABLE" -gt 0 ] || [ "$REFUSED" -gt 0 ]; then
     # ⛔ AN UNMEASURABLE CANDIDATE IS NOT A SUCCESS. It was KEPT because the gate could not answer, and
     # a pass that cannot answer is fail-closed (rc 3) — the same rule every other owner applies. A
-    # `census=unreadable` with nothing matched at all is still 3.
+    # `census=unreadable` with nothing matched at all is still 3, and a `census=refused` pass removed
+    # nothing by construction (the refusal precedes every delete in `sweep_shared`).
     [ "$rc" = 0 ] && rc=3
 fi
 if [ "$rc" = 0 ] && is_dry && [ "$CANDIDATES" -gt 0 ]; then rc=5; fi
 
-log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
+log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} refused=${REFUSED} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
 # ⛔ THE LOG LINE CARRIES THE POPULATION IT SCANNED (`install_globs=` / `shared_globs=`). The stdout
 # header already prints them, but the LOG is the durable artifact an operator reads after the fact, and
 # it is the only way a test can prove WHICH population a pass was pinned to — which is the whole point
 # of `disk-reaper.test.sh` pinning this class to its fixtures (agent-infra#4169): an unpinned suite ran
 # the destructive pass against the box's real `/opt/gh-runner*` installs while claiming to be hermetic.
-[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
+[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE refused=$REFUSED freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
 command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
 exit "$rc"

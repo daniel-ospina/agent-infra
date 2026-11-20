@@ -277,7 +277,11 @@ TMP_MAX_AGE_FLOOR_MIN=360                            # 6 h — GitHub-hosted job
 # OVERRIDE: `RUNNER_CACHE_ROOT` — e.g. to put the cache on a dedicated volume; the reaper's
 # `DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` must name the same path (they are two tools' views of one
 # directory, so a box that moves it says so in both places).
-CACHE_ROOT="${RUNNER_CACHE_ROOT:-$RUNNER_ROOT/_cache}"
+# ⛔ `-` NOT `:-` (#4169 review, P3). With `:-` an operator who EMPTIED `RUNNER_CACHE_ROOT` got the
+# default substituted before `ensure_cache_root` could look at it, so the "set but empty" arm below was
+# unreachable dead code that read as a guard — and it picked the WIDER value for the operator who
+# emptied the seam, which is the delete direction this file's sibling seams refuse three times over.
+CACHE_ROOT="${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}"
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
 POOL_LABEL_X64="self-hosted-x64"

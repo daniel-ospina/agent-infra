@@ -824,8 +824,15 @@ marker, and a wide default costs a `stat` and no delete surface.
 |---|---|
 | `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) |
 | `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
-| `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) |
+| `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) — ⛔ **except the newest one per install**: a listener holds its CURRENT log open, so unlinking it reclaims no bytes while crediting the `du` figure to the ledger and costing the next failure its diagnostics (`reason=newest-log`) |
 | the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, and only when NO install on the box has a job running |
+
+⛔ **THE SHARED ROOT IS GLOB-DECIDED, SO IT IS SCOPE-CHECKED BEFORE ANY DELETE.** It must not **be** an
+install and must not **contain** one (`REFUSED … reason=shared-root-contains-an-install`): the
+one-token error this seam invites is naming the installs' parent (`$RUNNER_ROOT` for
+`$RUNNER_ROOT/_cache`), and the liveness gate cannot save it — a runner between jobs is idle **by
+design**. A refused root removes nothing, publishes `census=refused` and exits 3. `refused=<n>` is
+printed on the class line, so the refusal is a count, not an inference.
 
 ⛔ The install tree itself is never a candidate: not `bin/`, `config/`, `externals/`, not
 `_work/<checkout>` (that is `class=runner-work`'s sink, with its own mtime floor), and not `_tool`,
@@ -838,9 +845,12 @@ the witness named — never partially reaped. The verdict comes from the process
 that can answer it:
 
 * `bin/Runner.Worker` in the install's process list → **a job is running** (`reason=worker-running`);
-* `bin/Runner.Listener` present **and** content under `_work` written within
-  `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is running or has just started
-  (`reason=listener+busy-work`) — the conservative direction, and it is bounded by that knob;
+* content under `_work` written within `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is running or
+  has just started (`reason=busy-work`) — the conservative direction, bounded by that knob, and
+  ⛔ **asked FIRST and independently of argv**: it used to sit behind a literal
+  `bin/Runner.Listener`/`run.sh` argv match, so an install whose listener argv is `./run.sh`, a
+  canonicalised path, or a renamed `run.sh` took the `no-listener` arm and lost its cache while a job
+  was running;
 * a listener with no worker and nothing fresh under `_work` → the install is BETWEEN jobs: the cache
   is idle and the next job re-downloads what it needs.
 
@@ -853,7 +863,9 @@ box whose `du` is slow.
 **The record.** `freed_mb_runner_cache=`, `would_free_mb_runner_cache=`, `candidates_runner_cache=`,
 `reaped_runner_cache=`, **`skipped_live_runner_cache=`** (how many installs were NOT touched because a
 job was running — the count that answers *"why is my 40 GB cache still here"*),
-`unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took),
+`unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took — ⛔ the class's
+**total**, so it INCLUDES the shared per-box root; it used to sum only the installs' `.cache` dirs and
+read `0` on exactly the layout the durable half creates, beside a non-zero `freed_mb`),
 `capped_runner_cache=` (the per-pass cap stopped it; the next tick continues),
 `verdict_runner_cache=` and `note_runner_cache=`. The class line prints, per install,
 `INSTALL <dir> cache_mb=<n> live=<yes|no|unknown> reason=<witness>` and, per filesystem,
@@ -863,8 +875,15 @@ job was running — the count that answers *"why is my 40 GB cache still here"*)
 **The durable fix, not only the guard.** `scripts/ci_runner_pool.sh` exports **one** cache path per box
 — `XDG_CACHE_HOME=$RUNNER_CACHE_ROOT` (default `$RUNNER_ROOT/_cache`, created at start and announced on
 the `cache-root=` line) — for every listener it starts, so N slots no longer hold N copies of the same
-content. Override it with `RUNNER_CACHE_ROOT`, and name the same path in
-`DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` (two tools, one directory). A listener that survived a reboot
+content. Override it with `RUNNER_CACHE_ROOT` — and ⛔ name the same path in
+`DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` (two tools, one directory). The reaper's default list now
+**derives** its third entry from `${RUNNER_ROOT:-/tmp/actions-runner}/_cache`, the same variable and
+default the pool derives from, so the two cannot disagree on the `RUNNER_ROOT=/opt` box this repo
+documents as live; and a pass whose shared globs match **nothing** prints
+`shared_root=absent (…)`, so an operator override on only one of the two tools is visible in the
+record instead of silently unfree-ing the sink. ⛔ `RUNNER_CACHE_ROOT` is read with `${X-}`, not
+`${X:-}`: a SET-but-EMPTY value is refused (`why=cache-root-empty`), never silently replaced by the
+default. A listener that survived a reboot
 keeps the environment it was exec'd with — the documented residual, identical to the private `TMPDIR`
 one (#7815).
 
@@ -1507,7 +1526,12 @@ prints `SUMMARY class=runner-work … candidates=<n> … census=ok` in BOTH mode
 a real count; `census=no-roots` (an EXPLICIT glob list that matched nothing) is `misconfigured` + `?`
 rather than a `0`; `census=refused` (a matched root REFUSED because its basename is not `_work`) is
 `misconfigured` + `?` with its own `runner-work-root-refused` token, so the record names the seam rather
-than a glob that matched; and **`census=abstained`** (nothing under a matched root could be measured, so the
+than a glob that matched. `runner-cache` (the sixth, #4168) follows the same rule with its own tokens:
+`census=no-roots` — an EXPLICIT glob list that matched no **install** (no directory at all, OR
+directories of which none carries `bin/Runner.Listener`; the second shape used to exit 0 and read
+`verdict=ok` over a class that scanned nothing) — and `census=refused` (a matched SHARED root that is —
+or contains — an install) are each `misconfigured` + `?`, with `runner-cache-no-root` /
+`runner-cache-root-refused` naming which seam is wrong; and **`census=abstained`** (nothing under a matched root could be measured, so the
 population was never measured) is `?` plus `verdict_runner_work=abstained` at rc 0, while
 **`census=partial`** (SOME of the population could not be measured) keeps the measured count as a LOWER
 BOUND and answers `verdict_runner_work=partial` — in both cases a zero nothing measured is not a zero,
@@ -1664,7 +1688,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**9 case runs + 11 mutants + 1 scope case — 21 outcomes**), covering every arm #4168 names. The table
+(**15 case runs + 17 mutants + 1 scope case — 33 outcomes**), covering every arm #4168 names. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
@@ -1680,6 +1704,12 @@ because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 | H | a re-probe that **cannot answer** keeps the candidate and fails closed (`rc=3`) | same refresh mutant (the unreadable arm) |
 | I | a candidate **bigger than the whole per-pass cap** is still admitted, once, instead of being refused on every tick forever | the oversized-admission guard → `if false; then` |
 | J | the `REAP_RC_LOG` seam is **honoured** — the log lands at the pinned path and not the default one | `REAP_RC_LOG:-` → `REAP_RC_LOG_IGNORED:-` |
+| K | an **EXPLICIT** glob list that matched directories but **NO install** (no `bin/Runner.Listener`) is a REFUSAL (`census=no-roots`, rc 3) naming what it matched — it used to fall through to "measured empty population" and exit 0 with `installs=0`/`verdict=ok` while the class scanned nothing | the `if [ "$RC_EXPLICIT" = 1 ]; then` refusal gate → `if false; then` |
+| L | a **shared root that IS an install** is REFUSED before any delete (`reason=shared-root-is-an-install`, `census=refused`, rc 3, `refused=1`) — the marker and the scratch survive | the `if is_install "$root"; then` guard → `if false; then` |
+| L2 | a **shared root that CONTAINS an install** (the parent — the exact one-token error) is REFUSED (`reason=shared-root-contains-an-install`), and the install underneath is intact | the `if [ -n "$is_inst" ]; then` guard → `if false; then` |
+| M | `cache_mb=` counts the **shared root** the durable half creates, not only the per-install `.cache` dirs (it read `0` while the bytes were here) | the shared-root accumulate → removed |
+| N | the listener's **CURRENT** `_diag` log is KEPT (`reason=newest-log`: held open, so unlinking it frees nothing) while an OLDER aged log in the same install IS reaped | the newest-log keep → `if false; then` |
+| O | the `_work` freshness witness is **argv-independent**: a fresh `_work` keeps the cache with a listener argv the literal match does not recognise (`reason=skipped-live:busy-work`) | the witness assignment → `newest=0` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

@@ -194,9 +194,15 @@
 #                              (same rule as DISK_REAPER_RUNNER_GLOBS)
 #   DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS     space-separated globs naming the ONE per-box cache root
 #                              that pool-started runners get as `XDG_CACHE_HOME` (default:
-#                              /tmp/actions-runner/_cache, $HOME/actions-runner/_cache). A SET-BUT-EMPTY
+#                              /tmp/actions-runner/_cache, $HOME/actions-runner/_cache, and
+#                              ${RUNNER_ROOT:-/tmp/actions-runner}/_cache — the third is DERIVED from
+#                              the same variable `ci_runner_pool.sh` derives its root from, so the two
+#                              tools cannot disagree on a `RUNNER_ROOT=/opt` box, the layout this repo
+#                              documents as live). A SET-BUT-EMPTY
 #                              value is a refusal in the owner; matching NOTHING is ordinary (a box that
-#                              does not use the pool layout has no shared root), so it is not. This is
+#                              does not use the pool layout has no shared root), so it is not — the owner
+#                              PRINTS `shared_root=absent` instead, so a pool root that landed outside
+#                              this seam is visible in the pass record. This is
 #                              the arm that stops N installs holding N copies of the same content
 #   DISK_REAPER_RUNNER_CACHE_MIN_MB           size bound on a `.cache`: below this it is KEPT (default
 #                              256 MB — reaping a few MB of a content-addressed cache buys nothing and
@@ -310,7 +316,7 @@ RUNNER_MIN_AGE="${DISK_REAPER_RUNNER_MIN_AGE:-7200}"
 RUNNER_CACHE_GLOBS="${DISK_REAPER_RUNNER_CACHE_GLOBS-/opt/gh-runner* $HOME/actions-runner* $HOME/actions-runner/* /tmp/actions-runner* /tmp/actions-runner/*}"
 RUNNER_CACHE_GLOBS_EXPLICIT=0
 if [ -n "${DISK_REAPER_RUNNER_CACHE_GLOBS+set}" ]; then RUNNER_CACHE_GLOBS_EXPLICIT=1; fi
-RUNNER_CACHE_SHARED_GLOBS="${DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS-/tmp/actions-runner/_cache $HOME/actions-runner/_cache}"
+RUNNER_CACHE_SHARED_GLOBS="${DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS-/tmp/actions-runner/_cache $HOME/actions-runner/_cache ${RUNNER_ROOT:-/tmp/actions-runner}/_cache}"
 # 7 days, not the runner-work class's 2 hours: `_work/_temp` holds a LIVE job's `$RUNNER_TEMP`
 # (`reap-runner-work.sh` retains it for exactly that reason), and this class only touches it when the
 # install is provably IDLE — but the floor is still the operator's dial, and a week is far above the
@@ -3051,6 +3057,24 @@ reap_runner_cache() {
     # ⛔ AN EXPLICIT GLOB LIST THAT MATCHED NOTHING IS `misconfigured`, NEVER A MEASURED ZERO — the same
     # rule (and the same shape) as `venv-no-repo` and `runner-work-no-root`: a class that scanned
     # NOTHING is not a pass, and the remedy is different from "the box has no runners".
+    # ⛔ AND "MATCHED NOTHING" MEANS "MATCHED NO INSTALL", NOT "MATCHED NO DIRECTORY" (#4169 review,
+    # BLOCKING). The owner now refuses BOTH shapes with `census=no-roots` — no directory at all, and
+    # directories of which none carries `bin/Runner.Listener` — because the second one used to fall
+    # through to the measured-empty line and exit 0 while the record read `verdict=ok`.
+    # ⛔ A REFUSED ROOT IS NOT A MISSING ROOT, AND IT IS NOT `ok` EITHER (#4169 review, BLOCKING). The
+    # owner refuses a matched SHARED root that is — or contains — a runner INSTALL (the seam is one
+    # component short: `$RUNNER_ROOT` for `$RUNNER_ROOT/_cache`), removes nothing and exits 3. Without
+    # this arm the record said `verdict_runner_cache=ok installs=0 candidates=0` — an inert class
+    # reporting health over a cache root nobody covered — because the owner's documented refusal published
+    # no state the entry point could read. `refused` is that state: same rc, same `misconfigured` class as
+    # the sibling `runner-work-root-refused`, DIFFERENT note, because the remedy is a one-token glob fix
+    # and never "widen it".
+    if [ "$_rc_census" = "refused" ]; then
+        log_line "disk-reaper: ⛔ class=runner-cache FAIL-CLOSED — a matched SHARED cache root was REFUSED because it IS (or CONTAINS) a runner INSTALL; sweeping it is the 'one component short' error (e.g. '$RUNNER_ROOT' for '$RUNNER_ROOT/_cache'), so nothing was removed"
+        NOTE_RC="a matched root under DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS was REFUSED because it is — or contains — a runner INSTALL (bin/Runner.Listener): the seam is one component short (e.g. '/opt' for '/opt/_cache'), nothing was swept; fix the glob, do not widen it"; RC_RC=3
+        MISCONFIG="${MISCONFIG}${MISCONFIG:+, }runner-cache-root-refused"
+        WANT_RC=0; VERDICT_RC="misconfigured"; DF_RC_OK=1; return 3
+    fi
     if [ "$_rc_census" = "no-roots" ]; then
         log_line "disk-reaper: ⛔ class=runner-cache FAIL-CLOSED — no directory matched DISK_REAPER_RUNNER_CACHE_GLOBS ('$RUNNER_CACHE_GLOBS'), and it was set EXPLICITLY; a class that scans nothing is NOT a pass"
         NOTE_RC="no runner install matched DISK_REAPER_RUNNER_CACHE_GLOBS"; RC_RC=3
