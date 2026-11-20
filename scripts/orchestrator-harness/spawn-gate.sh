@@ -633,8 +633,10 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # checkout — not the only route to one, and not every checkout this tree ever creates. MANY scripts
 # still call `git worktree add` directly and are NOT
 # gated here — `stall-fix.sh` (a throwaway mend checkout), `ai-drainer.sh` (its own per-lane working
-# checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no admission at all),
-# `refresh-candidates.sh`,
+# checkout, `wt-drainer-<name>`, created with a bare `git worktree add` — it now asks THIS file's
+# `disk_free_mb`/`disk_lane_costs`/`disk_lane_need` immediately before each creation and stops at the
+# floor (agent-infra#2159), so it is no longer "no admission at all" — but it is a reader of the
+# predicate, not a caller of `disk_admit`), `refresh-candidates.sh`,
 # `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts), the
 # merge rail's own base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (on the live
 # scout path), among others.
