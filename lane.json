@@ -1,0 +1,34 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-bgskew-1795195255-p65498-58ff52ea",
+  "_sha": "d6f236b7f9d617a4f401609dd071a2445c7d125b",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.GC6C2ETNd1/bg-o/bg/bgskew.log"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/tmp.GC6C2ETNd1/wt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "duration_s": 58,
+  "ended_at": 1795195313,
+  "exit_code": 0,
+  "heartbeat_at": 1795195313,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-bgskew-1795195255-p65498-58ff52ea",
+  "lease_until": 1795195933,
+  "pid": 65498,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1795195255,
+  "state": "DONE",
+  "tag": "bgskew",
+  "worktree": "/tmp/tmp.GC6C2ETNd1/wt"
+}
