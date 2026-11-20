@@ -420,3 +420,31 @@ verification is therefore stated as **the specific arms**, not the count.
 **PROOF after round 2**: `ai-drainer.test.sh` → **252 passed / 0 failed**, exit 0
 (`(k4f)`, `(k4g)`, `(k4e)`, `(k-real)`, `(k2)`, `(k3)`, `(k6)` all green).
 `spawn-gate.test.sh` → **516 passed / 0 failed** (unchanged file, re-run for the pair).
+
+---
+
+## CODE-REVIEW round 3 — ISSUES: 5, all verified by execution, all applied
+
+Round 3 found that **round 2's own repair introduced two more dead/divergent constructs** — the same
+class, one level down. The pattern is worth naming: each round deletes an unreachable guard and, in
+the same edit, writes a new one.
+
+| # | finding | disposition |
+|---|---|---|
+| P2 | round 2's rewrite left a **dedicated `''` arm that can never fire**: `DISK_MIN_FREE_MB` is defaulted at `:238` (`"${DISK_MIN_FREE_MB:-${MIN_FREE_MB:-500}}"`), so it is never empty at the case — MEASURED, an explicitly empty seam logs no `is empty` WARN at all | **applied** — folded back into the single `''|*[!0-9]*)` arm, which is reachable; no arm-message ships without a path to it |
+| P2 | **`DISK_MIN_FREE_MB` diverged from `spawn-gate.sh` on the zero SHAPE**, not just the width: the gate's `is_num` rejects every `0*`, so `DISK_MIN_FREE_MB=007` is **500 MB** to the refuser and was **7 MB** to the planner — the drainer planned lanes the gate then refuses at rc 77. Exactly the "two answers to *is this volume full*" class #3395 removed, and both the `:375` parity comment and the ENV block at `:162` asserted a parity the code did not have | **applied** — a `0[0-9]*)` arm refuses the shape on the drainer side too (`0[0-9]*` is `is_num`'s `0*` minus bare `0`, which the `>=1` bound already sends to 500 on both sides); parity comment corrected to state bounds **and** width **and** zero-shape; arm **(k4h)** pins both halves |
+| P2 | `disk_term`'s `elif [ "$disk_need_read" -le 0 ]` was **unreachable and byte-identical** to text `_disk_off` already carried — every path that makes `disk_need` 0 sets `_disk_off` first, so the first arm always wins (MEASURED with an instrumented copy: the marker never printed) | **applied** — the `elif` is deleted; `_disk_off` is the only producer of that message |
+| P2 | round 2 replaced a false claim with **another false claim**: "19 or more digits is what wraps" — the wrap point is the **value** 2^63, which is itself 19 digits, so a 19-digit value below it does not wrap. That is the band `(k4d)` exercises | **applied** — the message now states the boundary as the value (`bash's integers end at 2^63 = 9223372036854775808, which is itself 19 digits — a 19-digit value below it does not wrap, a 20-digit one always does`) and says plainly that the cap is deliberately tighter than the wrap point |
+| P2 | arm **(k4g)** did not prove its own claim: all three of its clauses are satisfied VERBATIM by a run where **no module was found at all**, so it could not tell "sourced and answered `abc`" from "never looked for" — precisely the finding round 2 applied to `(k4e)` | **applied** — a second clause pins the probe's distinguishing reason (`<path> is present and was sourced but did not answer the disk question`), so the arm now fails if sourcing is dropped |
+
+### The lesson this round makes explicit
+
+Four of the fifteen findings across three rounds are **unreachable or self-contradictory constructs
+introduced by the previous round's fix**, and two more are **claims about the code written in the same
+edit that changed the code**. A comment asserting a guard is a claim like any other, and it is the one
+no test reads. The rule the plan now carries: **an arm's title must be asserted, not described** —
+`(k4e)`, `(k4g)` and `(k4h)` each name a property, and each now greps for the text that is only
+produced when that property holds.
+
+**PROOF after round 3**: `ai-drainer.test.sh` → **255 passed / 0 failed**, exit 0.
+`spawn-gate.test.sh` → **516 passed / 0 failed**.
