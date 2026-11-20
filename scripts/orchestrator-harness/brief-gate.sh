@@ -1086,6 +1086,31 @@ brief_gate_grade_role() { # brief_gate_grade_role <role>
   esac
 }
 
+# brief_gate_selfid — WHICH COPY OF THIS VALIDATOR IS EXECUTING, as `brief-gate.sh @ <digest12>`.
+# ⛔ THIS EXISTS BECAUSE TWO COPIES AT TWO REVISIONS ARE INDISTINGUISHABLE FROM THE OUTSIDE (#4152's
+# residual class). `nonblocking-dispatch.sh` resolves `brief-gate.sh` from FOUR homes (`$O`, `$HARNESS`,
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness`, `~/.pi/agent/scripts`) — the `$O`-skew that file
+# already documents — while an author runs whatever `./brief-gate.sh` their own checkout holds. So one
+# brief can be measured by two validators, and until now neither said which: the author's green cheap
+# check and the dispatcher's refusal were byte-indistinguishable in provenance, which is exactly the
+# stale-validation-path signature a duplicated-validation defect presents ("identical but surprising").
+# ⛔ A CONTENT DIGEST, NOT A GIT SHA. The copy that actually refuses a dispatch is `$O/brief-gate.sh`,
+# a SEEDED FILE that is in no repository — a git sha would be unresolvable there, i.e. absent from
+# exactly the case this is for. Two copies of one commit have identical bytes (one revision, correctly);
+# two copies at different revisions do not, and that is the question being asked.
+# ⛔ IT NEVER FAILS THE REFUSAL. With no digest tool the line reads `unresolved`, and that is deliberate:
+# an identification aid that turns a readable refusal into a crash is worse than one that says nothing —
+# the author is sent to re-author a brief that was already fine. Order is sha256sum → shasum → openssl,
+# the portable sets on Linux and on macOS (where the fleet also runs).
+brief_gate_selfid() {
+  local f="${BASH_SOURCE[0]:-$0}" h=""
+  if command -v sha256sum >/dev/null 2>&1; then h="$(sha256sum "$f" 2>/dev/null | cut -c1-12)"
+  elif command -v shasum >/dev/null 2>&1; then h="$(shasum -a 256 "$f" 2>/dev/null | cut -c1-12)"
+  elif command -v openssl >/dev/null 2>&1; then h="$(openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}' | cut -c1-12)"
+  fi
+  printf '%s @ %s' "$(basename "$f")" "${h:-unresolved}"
+}
+
 # brief_gate_missing_all <file|-> [role] [round] [repo] — every missing token for a dispatch: the SHAPE
 # tokens plus the PREVIOUS WORK cross-check. `--missing` is the verb an author iterates with, so it must
 # see the same body `--check` sees.
@@ -1213,6 +1238,12 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
   {
     printf '[brief-gate] REFUSED — this dispatch does not carry its full contract (research + non-vacuity + round). NOTHING WAS STARTED: no model call, no session, no claim.\n'
     printf '[brief-gate]   brief: %s   role: %s   round: %s\n' "$f" "$role" "${rnd:-0}"
+    # ⛔ THE VALIDATOR NAMES ITSELF (#4152 residual). A refusal is only actionable if the author can
+    # tell WHICH copy refused: this box resolves the gate from four homes, so the cheap check they ran
+    # and the one that judged the dispatch can be two different revisions. With the digest here, two
+    # copies that disagree are two distinguishable lines instead of one repeated surprise — and the
+    # dispatcher's own naming line (its resolved PATH) plus this digest identifies the pair.
+    printf '[brief-gate]   validator: %s\n' "$(brief_gate_selfid)"
     printf '[brief-gate] missing:\n%s' "$lines"
     printf '[brief-gate] add exactly this to the brief, fill the <…> slots, and re-dispatch\n'
     printf '[brief-gate] (the canonical block, byte-identical to `brief-gate.sh --section %s %s`):\n' "$role" "${rnd:-0}"
@@ -1381,9 +1412,16 @@ brief_gate_line() { # brief_gate_line [role]
 #     `COMPARABLES:` line are role- and round-scoped, so grading them as `lane` would be a different
 #     question — and a 0 there is not evidence about the dispatch that will run.
 #   • `repo`: the PREVIOUS WORK cross-check measures `refs/wip/*` in THIS repository (an explicit path is
-#     taken strictly) and otherwise in whatever the caller's CWD resolves to. A dispatch from a
-#     different checkout must name the target repo here, or the measurement is about the wrong tree.
+#     taken strictly) and otherwise in whatever the caller's CWD resolves to (or `$CLAIM_REPO`/`$REPO`,
+#     when the caller's environment sets one — that outranks the CWD). A dispatch from a different
+#     checkout must name the target repo here, or the measurement is about the wrong tree.
 #     `nonblocking-dispatch.sh` passes its own worktree for exactly this reason.
+#     ⛔ AND THE ARGUMENT IS ONLY HALF OF IT (#4152): the cheap check is evidence about the dispatch
+#     only when BOTH CALLERS ARE THE SAME FILE. `nonblocking-dispatch.sh` resolves the validator from
+#     four homes while an author runs their checkout's copy, so a green `--check` can be a green about a
+#     different validator. The refusal block prints the executing copy's content digest
+#     (`validator: brief-gate.sh @ <digest12>`) for precisely that comparison — if the refusals from the
+#     two places name different digests, the brief was not the problem, the two copies were.
 #   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
 #                                                   `record-review.sh` calls this on a review comment)
 #   bash brief-gate.sh --wip-refs <issue> [repo]  → `<ref>\t<sha12>` per refs/wip ref belonging to the
@@ -1404,6 +1442,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)
       printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker] [round] [repo]\n' "$0" >&2
+      printf '       (the [repo] argument is required for a green run to be evidence about a DISPATCH: the\n' >&2
+      printf '       dispatcher measures its own worktree, so a check run from another tree measures another\n' >&2
+      printf '       repository — and both callers must be the SAME brief-gate.sh file, which the refusal\n' >&2
+      printf '       block names as `validator: brief-gate.sh @ <digest12>`)\n' >&2
       printf '       %s --missing <brief-file|-> [role] [round] [repo] | --mutation-missing <file|->\n' "$0" >&2
       printf '       %s --wip-refs <issue> [repo]\n' "$0" >&2
       printf '       %s --section [role] [round] | --mutation-section | --line [role]\n' "$0" >&2
