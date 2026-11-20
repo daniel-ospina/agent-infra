@@ -763,20 +763,23 @@ fi
 # unit whose every tick exits 127 while `list-timers` reads green. Before this line NEITHER was on a
 # cell, which is why a capability that had shipped, been tested and carried a header was scheduled on
 # zero boxes — the installer could not even find the thing it was meant to install.
-# agent-infra#4176 adds atomic-land.sh. It is the ONE instrument that lands a base-moved head
-# without a fresh review: step [1/4] integrates the base (a MERGE, so the three-dot diff the reviewer
-# signed is unchanged), [3/4] carries the record forward, [4/4] hands it to the rail. Nothing in the
-# harness called it, and the conflict arm's alternative — a fixer that ends in a bare `git push` —
-# moves the head with NOTHING re-binding the record, which is the measured "13 records existed and none
-# matched" re-cutting loop. The controller now dispatches it for a CONFLICTING PR that carries an
-# accepted record, resolved from the SAME tree as the workers (`$(dirname "$O_WORK")/atomic-land.sh`) —
-# so it must exist in BOTH trees the deployed fleet runs workers from, and this array is the farm half.
+# agent-infra#4176 adds atomic-land.sh — DELIVERED AHEAD OF ITS CALLER, and that is stated here rather
+# than implied. #4176's acceptance names "`atomic-land.sh` present in the farm (or every caller uses the
+# repo-relative path)" as its first bullet, and #4178 measured that the second half of that "or" cannot
+# be met on a DEPLOYED box: `deploy-harness.sh` seeds `$O` FLAT with `scripts/orchestrator-harness/.`
+# only, so `$O/atomic-land.sh` never exists there and the only reachable copy is this one. ⛔ NO
+# CONTROLLER CALLS IT YET: #4178's router attempt was FALSIFIED in review — a CONFLICTING PR is a
+# *definite* rail blocker (`scripts/landing/landability.py` says so in terms: "`gh pr update-branch`
+# refuses and the merge cannot happen", and `atomic-land.sh` stops there), while the population the rail
+# CAN carry (a base-moved but conflict-free head) never reaches the conflict arm and is already carried
+# by `merge-one.sh` via `record-review.sh --check-carry`. So this entry is the half of #4176's first
+# bullet that is true and safe to land: it costs nothing, it makes the instrument resolvable from a
+# deployed tree the day a caller exists, and it does not pretend to a wiring that does not exist.
 # ⛔ NOT A LONE FARMED FILE: every dependency it resolves beside itself is ALREADY farmed
 # (admin-merge.sh, record-review.sh, registry-sync.sh, lib/diff-normalize.py, lib/bounded.sh), which is
 # why one entry completes the unit rather than shipping a rail that would fail at its own step [4/4].
-# `scripts/landing/` (bulk.py, landability.py, rail-bg.sh) is deliberately NOT farmed here: nothing in
-# the controller calls them, they are operator/beat tools that run from a checkout (#4176's acceptance
-# asks for `atomic-land.sh` by name).
+# `scripts/landing/` (bulk.py, landability.py, rail-bg.sh) is deliberately NOT farmed: nothing in the
+# controller calls them, they are operator/beat tools that run from a checkout.
 fleet_srcs=(atomic-land.sh fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh disk-reaper-deployed-check.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py lane-route.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0

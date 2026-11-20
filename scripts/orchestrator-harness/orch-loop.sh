@@ -5484,60 +5484,6 @@ claim_selection_verdict() {
 # entries: "no proven fact -> release". The over-release direction is bounded by the arms: a released
 # PR simply re-enters the un-owned queue, where the rail and the cross-box CAS still refuse a second
 # worker — while staying "owned" is unbounded and is what stopped the box doing either job.
-# ── THE RAIL ARM'S GATE: is there an ACCEPTED review record for this PR? (agent-infra#4176) ────────
-# A CONFLICTING PR whose local record carries a CLEAN-class verdict is the ONE population
-# `scripts/atomic-land.sh` can land WITHOUT a fresh review: its step [1/4] integrates the base (a
-# MERGE, so the three-dot diff the reviewer signed is unchanged) and its step [3/4] carries the record
-# forward onto the new head. A fixer cannot do that — `fix-one.sh` ends in a bare `git push`, and
-# NOTHING re-binds the record afterwards, which is the measured "13 records existed and none matched"
-# loop (#4176) that then re-cuts the same PR every beat.
-#
-# The read-order and the verdict set MIRROR `atomic-land.sh` (read_record/ACCEPTED_VERDICTS) on
-# purpose: this predicate must never answer "accepted" for a record the rail would itself refuse —
-# the rail is the authority, this only decides whether to hand it the PR. A record that cannot be
-# read, or that belongs to another repo, is NOT evidence: return 1 and the fixer runs exactly as
-# before. Every unreadable-or-unaccepted case therefore costs the pre-#4176 behaviour, never a dispatch
-# to a rail that cannot use it.
-# [railgate:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers; an UNSOURCED
-# gate is a silent `command not found` = 127 in every driven arm, which reads as "no record" and
-# would grade the fixer path as the RAIL path's equal — the false-GREEN direction)
-rail_land_path() { # -> the rail's path in whichever tree THIS box has it in, else rc 1 (absent)
-  # ⛔ FOUR LAYOUTS, ONE ANSWER, AND THE FARM IS THE ONE THAT MATTERS ON A DEPLOYED BOX (#4176).
-  # `deploy-harness.sh` copies `scripts/orchestrator-harness/.` into `$O` FLAT, so the deployed runtime
-  # has `$O/fix-one.sh` but NOT the rail — `atomic-land.sh` lives one level ABOVE the harness scripts in
-  # a checkout, and only in `~/.pi/agent/scripts/` on a box that farms it. A single candidate therefore
-  # read "absent" on exactly the boxes the issue is about, which would make this arm an inert enforcer:
-  # it would look wired and never fire. The resolution list mirrors how this file's own workers resolve
-  # their modules (`$O_WORK`, then $AGENT_INFRA_PATH, then the farm).
-  local _b
-  for _b in "${O_WORK:-$O}" "$(dirname "${O_WORK:-$O}")" "${AGENT_INFRA_PATH:-}/scripts" "$HOME/.pi/agent/scripts"; do
-    [ -n "$_b" ] || continue
-    [ -f "$_b/atomic-land.sh" ] && { printf '%s\n' "$_b/atomic-land.sh"; return 0; }
-  done
-  return 1
-}
-
-rail_record_accepted() { # <pr> -> 0 iff a record with an accepted verdict exists for THIS repo
-  local _q _l _f=""
-  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
-  _q="$HOME/.pi/agent/reviews/${OR%/*}-${OR#*/}-${1}.json"
-  _l="$HOME/.pi/agent/reviews/${1}.json"
-  if [ -f "$_q" ]; then _f="$_q"; elif [ -f "$_l" ]; then _f="$_l"; fi
-  [ -n "$_f" ] || return 1
-  python3 - "$_f" "$OR" <<'PY' 2>/dev/null
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-if d.get("repo") and d.get("repo") != sys.argv[2]:
-    sys.exit(1)
-# Mirror of atomic-land.sh's ACCEPTED_VERDICTS (extensions/review-enforcer/index.ts).
-sys.exit(0 if d.get("verdict") in ("clean", "clean-micro", "clean-low") else 1)
-PY
-}
-# [railgate:end]
-
 pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (reaps a stale lock)
   local pr="${1:-}" sha="${2:-}" br="${3:-}" _v _lk
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
@@ -7504,50 +7450,6 @@ while true; do
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ── #4176: THE CONFLICT ARM ASKS THE RAIL FIRST, ONCE PER PR ──────────────────────
-            # The owner's directive (2026-11-20, quoted in issue #4176): the harness must land batch-style and
-            # stop re-cutting the same PR forever. The loop that produced the re-cutting is measured
-            # in the issue: a fixer integrates `origin/main` and PUSHES; a push moves the head and
-            # nothing re-binds the review record, so `ai-review-gate` goes red, the beat sees
-            # "ready but blocked", and it dispatches again — 13 records existed, none matched.
-            #
-            # `atomic-land.sh` is the instrument that closes that loop and it has existed since
-            # #767; nothing in this loop ever called it. Its step [1/4] integrates the base with a
-            # MERGE (the three-dot diff the reviewer signed is unchanged by it), its step [3/4]
-            # carries the record forward onto the new head, and only a REAL content change makes it
-            # stop and name a fresh review — which is exactly the case a fixer exists for.
-            #
-            # ⛔ THIS CANNOT BYPASS THE REVIEW GATE, and that is the whole safety argument: the rail
-            # never authors a record. It carries an existing signed verdict only when the artifact is
-            # proven unchanged, and it refuses (exit 3, named) otherwise. So the arm is gated on a
-            # record we can SEE and that the rail would accept (rail_record_accepted, mirroring its
-            # own read_record/ACCEPTED_VERDICTS) — no record, or a not-clean verdict, and this arm is
-            # not taken at all: the fixer runs exactly as it did before #4176.
-            #
-            # ⛔ ONCE PER PR (`state/rail-tried-<PR>`, PR-lifetime like `conflictcount`): the rail
-            # cannot resolve a genuine content conflict — `gh pr update-branch` fails — so after one
-            # refused attempt the remaining budget belongs to the fixer, which CAN author the
-            # resolution (and owes the fresh review that follows it). Bounding the rail here is what
-            # keeps this from becoming a way to spin a doomed PR: one cheap attempt, then the
-            # existing path, unchanged.
-            RAIL_LAND="$(rail_land_path || true)"
-            if [ ! -f "$O/state/rail-tried-$PR" ] && [ -n "$RAIL_LAND" ] && rail_record_accepted "$PR"; then
-              : > "$O/state/rail-tried-$PR"
-              # ⛔ THE WORKER NAME IS `fix-$PR`: it is the census name (wt_count fix-), the ownership
-              # name `pr_owner_live`/`sess` already answer for, and the name whose terminal the
-              # operator reads. A second name would double-count one PR against the fix-lane ceiling
-              # and let two workers own it.
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$RAIL_LAND' $PR --repo '$OR'"; then
-                echo "#$PR CONFLICTING -> rail (atomic-land) attempt 1 — the record carries iff the reviewed diff is unchanged" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict: the rail takes it first (atomic-land carry-forward, no re-review)"
-              else
-                # Not an act: nothing is running. The next cycle finds the marker spent and dispatches
-                # the fixer, which is the pre-#4176 path.
-                echo "#$PR CONFLICTING, rail spawn FAILED — a fixer takes the next cycle" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict rail spawn FAILED"
-              fi
-              continue
-            fi
             # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2927).
             # A CONFLICTED fixer is REPAIR: the PR and its head already exist. ⛔ Not "and its CI pass
             # has already been paid for" — a repair push DOES start a fresh run; the basis is #2927's
