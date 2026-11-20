@@ -262,11 +262,14 @@ TMP_MAX_AGE_FLOOR_MIN=360                            # 6 h — GitHub-hosted job
 # MEASURED (2026-11-19): every runner install kept its OWN unbounded `.cache` under the install root
 # (/opt/gh-runner-x64/.cache **40.7 GB**, one install on cell-2 at **50.1 GB**, ≈445 GB fleet-wide). The
 # installs are per-slot, so the multiplier is the SLOT COUNT: N slots holding N copies of the same
-# package content. `XDG_CACHE_HOME` is the one variable every cache consumer under a job honours
-# (uv `UV_CACHE_DIR` derives from it, npm/pip/Go follow it), and the listener hands ITS environment to
-# every job step — so pointing it at ONE directory per box removes the multiplication. That is the
-# durable half of #4168; the reaper class `runner-cache` (scripts/reap-runner-cache.sh) is the guard
-# that bounds the directory itself.
+# package content. `XDG_CACHE_HOME` is the variable the measured consumers under a job honour — uv
+# derives `UV_CACHE_DIR` from it, and pip and Go follow it; npm does NOT (its documented default stays
+# `~/.npm` under POSIX, and `$XDG_CACHE_HOME/npm` is still only a proposal, npm/rfcs#389), so an npm
+# cache stays outside this root. That does not weaken the mechanism: uv is the measured 50 GB consumer
+# and every slot shares ONE `$HOME`, so the npm cache is not multiplied per slot either. The listener
+# hands ITS environment to every job step — so pointing `XDG_CACHE_HOME` at ONE directory per box
+# removes the multiplication. That is the durable half of #4168; the reaper class `runner-cache`
+# (scripts/reap-runner-cache.sh) is the guard that bounds the directory itself.
 # ⛔ ABSOLUTE AND OUTSIDE THE INSTALL DIRS. An install-local default is the defect: it recreates one
 # cache per slot. The default sits beside the instances (`$RUNNER_ROOT/_cache`), which is one directory
 # for the whole box whatever the slot count, and it is EXCLUDED from `slots`/`status` by the same

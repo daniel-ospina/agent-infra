@@ -188,7 +188,6 @@ STATE_DIR="${REAP_RC_STATE_DIR:-${DISK_REAPER_STATE_DIR:-${HOME:-}/.pi/agent/sta
 LOG_FILE="${REAP_RC_LOG:-$STATE_DIR/runner-cache-reap.log}"
 PS_TIMEOUT="${REAP_RC_PS_TIMEOUT:-60}"
 DU_TIMEOUT="${REAP_RC_DU_TIMEOUT:-120}"
-FIND_TIMEOUT="${REAP_RC_FIND_TIMEOUT:-120}"
 
 usage() {
     sed -n '2,200p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '1,120p'

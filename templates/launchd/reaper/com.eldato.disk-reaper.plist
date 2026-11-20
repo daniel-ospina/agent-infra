@@ -93,6 +93,14 @@
         <string>{{REAPER_DIR}}/reap-abandoned-worktrees.sh</string>
         <key>DUP_INSTALL_REAPER</key>
         <string>{{REAPER_DIR}}/reap-duplicate-installs.sh</string>
+        <!-- ⛔ AND THIS ONE, FOR THE SAME REASON AGAIN (#4169 review). `runner-cache` is in the DEFAULT
+             class list, so this hourly job runs it too; the pin was added only to the FAST
+             cache unit, leaving this artifact (and the systemd hourly unit) one delegate short. On a
+             box whose HOME holds an older farmed copy, this class silently ran THAT delete policy
+             while the installed copy went unconsulted. Both artifacts pin the same set; T67 asserts
+             it, so the next class cannot land pinned in only one of them. -->
+        <key>RUNNER_CACHE_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-runner-cache.sh</string>
         <!-- ⛔ THE WRAPPER CANNOT SEE ITS OWN PATH HERE. The launcher pipes this script to
              `/bin/bash -s` (that is why BOUNDED_LIB is pinned above), and under `bash -s`
              `BASH_SOURCE` is UNSET — so `disk-reaper-run.sh` cannot resolve `disk-reaper.sh`

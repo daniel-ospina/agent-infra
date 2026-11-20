@@ -44,6 +44,11 @@
 #      path and NOT at the default one, which is what the entry point relies on when the state dir has
 #      fallen back to tmpfs.
 #      Mutant: `REAP_RC_LOG:-` -> `REAP_RC_LOG_IGNORED:-` (the seam stops being read).
+#   E  THE INSTALL MARKER IS THE SCOPE, not the size bound: a directory the glob matches but which
+#      carries no `bin/Runner.Listener` is untouched while the real install in the same run is reaped.
+#      Its neighbour's cache is ABOVE the size bound on purpose — otherwise `below-min-cache` would
+#      protect it and the case would pass for a reason unrelated to the marker (#4169 review, NOTE-3).
+#      Mutant: `is_install() { … }` -> `is_install() { true; }`.
 #
 # Hermetic: every fixture is under $T, HOME is redirected, the state dir and the install globs are
 # explicit `$T/...` paths, and the process census is a FIXTURE TABLE — NOTHING here can read or delete
@@ -441,7 +446,7 @@ case_j() { # <owner-script>
 
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
-MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
+MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -449,6 +454,10 @@ apply_mutation "$OWNER" "$MUT_B" 's/^        elif \[ -n "\$sz" \] && \[ "\$sz" -
     || { printf '  ❌ mutation B could not be applied (the size bound moved)\n'; mut_ok=0; }
 apply_mutation "$OWNER" "$MUT_D" 's/^    if \[ "\$CENSUS" != "ok" \]; then LIVE_REASON="census-unreadable"; return 2; fi$/    :/' \
     || { printf '  ❌ mutation D could not be applied (the census gate moved)\n'; mut_ok=0; }
+# ⛔ THE MARKER TEST IS THE ONLY THING PROTECTING A GLOB-MATCHED NEIGHBOUR, so it gets its own mutant:
+# case E's neighbour carries a cache ABOVE the size bound precisely so the bound cannot answer for it.
+apply_mutation "$OWNER" "$MUT_E" 's/^is_install() { .*$/is_install() { true; }/' \
+    || { printf '  ❌ mutation E could not be applied (the install marker test moved)\n'; mut_ok=0; }
 apply_mutation "$REAPER" "$MUT_C" 's/\[ "\$mb" -lt "\$RUNNER_CACHE_TRIGGER_FREE_MB" \] && low=1/[ "$mb" -gt "$RUNNER_CACHE_TRIGGER_FREE_MB" ] \&\& low=1/' \
     || { printf '  ❌ mutation C could not be applied (the trigger comparison moved)\n'; mut_ok=0; }
 apply_mutation "$OWNER" "$MUT_C2" 's/^    \[ "\$(( FREED_MB + pending ))" -gt "\$MAX_MB" \]$/    false/' \
@@ -482,6 +491,9 @@ expect_fail "B mutant: the size bound deleted"                         case_b "$
 expect_fail "C mutant: the trigger comparison inverted"                case_c "$MUT_C" "$OWNER"
 expect_fail "C2 mutant: the per-pass cap never reached"                case_c "$REAPER" "$MUT_C2"
 expect_fail "D mutant: the census gate deleted"                        case_d "$MUT_D"
+# E's mutant is applied HERE but asserted at the scope case itself (below), because `case_scope` is
+# defined after this block — an `expect_fail` naming an undefined function is "command not found",
+# which reads as a caught mutant while proving nothing.
 expect_fail "F mutant: the re-probe stops RE-READING the census"         case_f "$MUT_F"
 expect_fail "G mutant: the re-probe stops RE-READING (shared root arm)"  case_g "$MUT_F"
 expect_fail "H mutant: the re-probe stops RE-READING (unreadable arm)"  case_h "$MUT_F"
@@ -492,17 +504,26 @@ printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an
 # unrelated neighbour, and must leave the neighbour alone. It is the shape the family has already been
 # bitten by (`REAPED …/gh-runner-x//bin`, a seam one component short).
+# ⛔ AND IT MUST BE THE MARKER THAT PROTECTS THE NEIGHBOUR, NOT THE SIZE BOUND (#4169 review, NOTE-3).
+# The neighbour used to hold a 0 MB cache while `REAP_RC_MIN_CACHE_MB=1`, so `is_install() { true; }`
+# still KEPT it as `below-min-cache` and every row stayed green: the case passed for a reason unrelated
+# to what it claims to pin, and the mutant that deletes the marker test survived it. The neighbour now
+# carries a cache ABOVE the bound, so only `is_install` can keep it — proven by `MUT_E` below.
 case_scope() {
-    local base outer out rc
+    local base outer out rc owner="${1:-$OWNER}"
     base="$(mktemp -d "$T/e.XXXXXX")"
-    outer="$base/not-a-runner"; mkdir -p "$outer/.cache/keep"; printf 'x\n' >"$outer/.cache/keep/f"
+    outer="$base/not-a-runner"; mkdir -p "$outer/.cache/keep"
+    # 2 MB of REAL bytes: above `REAP_RC_MIN_CACHE_MB=1` below, so the SIZE bound cannot keep this
+    # neighbour — only the install marker can.
+    dd if=/dev/zero of="$outer/.cache/keep/blob" bs=1M count=2 >/dev/null 2>&1
     mk_install "$base/gh-runner-ok"; mk_cache "$base/gh-runner-ok" 2; idle_work "$base/gh-runner-ok"
     mk_ps "$base/ps" "$base/gh-runner-ok" idle
     # The glob matches the NEIGHBOUR too; only a marker-carrying install may be reaped.
     out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
            REAP_RC_GLOBS="$base/*" REAP_RC_EXPLICIT=1 REAP_RC_SHARED_GLOBS="$base/no-shared" \
            REAP_RC_MIN_CACHE_MB=1 REAP_RC_STATE_DIR="$base/state" \
-           bash "$OWNER" --apply 2>&1)"; rc=$?
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
     case_check "$([ -d "$outer/.cache/keep" ] && echo 0 || echo 1)" \
                "a directory matched by the glob but WITHOUT the install marker is untouched"
@@ -511,6 +532,7 @@ case_scope() {
     return $((CASE_FAIL > 0))
 }
 expect_pass "E only a directory carrying bin/Runner.Listener is ever touched" case_scope
+expect_fail "E mutant: the install marker test deleted"                 case_scope "$MUT_E"
 
 printf '\n──────────────────────────────\n'
 printf 'passed: %s   failed: %s\n' "$PASS" "$FAIL"

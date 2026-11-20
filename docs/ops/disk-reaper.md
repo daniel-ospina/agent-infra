@@ -1664,7 +1664,9 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**4 case runs + 5 mutants + 1 scope case**), covering the four arms #4168 names:
+(**9 case runs + 11 mutants + 1 scope case — 21 outcomes**), covering every arm #4168 names. The table
+below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
+because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
@@ -1672,7 +1674,12 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | B | **no churn**: a cache below the size bound and scratch younger than the age bound are KEPT and named, while an aged entry in the same install IS reaped | `elif [ -n "$sz" ] && [ "$sz" -lt "$MIN_CACHE_MB" ]; then` → `elif false; then` |
 | C | the **size trigger, both directions**, through `disk-reaper.sh`: above the threshold no class runs (record `verdict_runner_cache=not-run`, with the reading); below it the class runs, and a pass STOPS at the per-pass cap leaving the rest (`reason=pass-cap`, `capped_runner_cache=1`) | `[ "$mb" -lt "$RUNNER_CACHE_TRIGGER_FREE_MB" ]` → `-gt` (trigger inverted); separately the cap test → `false` |
 | D | an **unreadable process census** removes nothing and exits 3 (`census=unreadable`) | the census gate deleted |
-| E | a directory the glob matches but which carries **no install marker** is untouched, while the real install in the same run is reaped | — (scope case; the marker test is what the case pins) |
+| E | a directory the glob matches but which carries **no install marker** is untouched, while the real install in the same run is reaped — the neighbour's cache is **above** the size bound, so only the marker can protect it | `is_install() { … }` → `is_install() { true; }` |
+| F | a job that **starts mid-pass** keeps its cache: the census is RE-READ before each removal, not consulted from the pass-start snapshot | `census_refresh() { census_read; }` → `census_refresh() { :; }` |
+| G | the **shared per-box cache root** asks the same freshly-read population question before emptying an entry | same refresh mutant (the shared arm) |
+| H | a re-probe that **cannot answer** keeps the candidate and fails closed (`rc=3`) | same refresh mutant (the unreadable arm) |
+| I | a candidate **bigger than the whole per-pass cap** is still admitted, once, instead of being refused on every tick forever | the oversized-admission guard → `if false; then` |
+| J | the `REAP_RC_LOG` seam is **honoured** — the log lands at the pinned path and not the default one | `REAP_RC_LOG:-` → `REAP_RC_LOG_IGNORED:-` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

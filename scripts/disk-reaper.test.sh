@@ -73,6 +73,14 @@
 #       own line instead of stamping every probe failure "not a git checkout", names the silent-git
 #       shape (`<git gave no message>`), and names the BOUND firing as itself (rc=124 on a dead or
 #       hung mount) rather than as a git that said nothing (#2159).
+#   T67 EVERY delegate the pass resolves is PINNED in BOTH scheduled artifacts (hourly unit, launchd
+#       plist) and pinned to the right basename — and the fast cache unit pins the one delegate its own
+#       class needs. Derived from the `find_delegate` lines and set-EQUAL in both directions, because
+#       `#4169` added a class to the DEFAULT `--only` list and pinned it in one artifact only, so the
+#       hourly pass ran it through `find_delegate`'s `$HOME` farm fallback while the deployed checker
+#       certified the installed copy — a deletion tool certified against a file it never executes.
+#       Controls: a copy with the pin deleted (each artifact) and a copy with the pin pointing at a
+#       DIFFERENT owner must both redden, so the row cannot pass by reading nothing.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -3580,6 +3588,84 @@ assert_contains "$OUT" "runs the FULL pass every 10 minutes" \
 # and the positive control: the same install over the REAL templates succeeds and really is armed
 assert_contains "$(cat "$T/t8/units/eldato-disk-reaper-cache.service" 2>/dev/null)" "--size-trigger" \
     "T66 control: the unmutated install DOES carry --size-trigger (the assertion above is not vacuous)"
+
+# ── T67: EVERY delegate the pass resolves is PINNED in BOTH scheduled artifacts ─────────────────
+# ⛔ THE FAILURE THIS PINS IS A FALSE PASS, NOT A MISSING FEATURE. `find_delegate` tries
+# `$HOME/.pi/agent/scripts/<basename>` FIRST and `$SELF_DIR` second, so a delegate that a unit does
+# not pin resolves through the FARM, not the installed copy. `#4169` added `runner-cache` to the
+# DEFAULT `--only` list (so BOTH the hourly systemd unit and the hourly plist run it) and pinned
+# `RUNNER_CACHE_REAPER` in the FAST cache unit only — leaving the two artifacts that run the class
+# one delegate short, which is precisely the state the plist's own comment records for #3057
+# ("Both artifacts must pin the same set"). On a box whose HOME holds an older farmed copy the class
+# then runs THAT delete policy while `disk-reaper-deployed-check.sh` certifies the installed copy —
+# a deletion tool certified against a file it does not execute. The row is DERIVED (from the
+# `find_delegate` lines) and SET-EQUAL in both directions, so a new class cannot land pinned in only
+# one artifact and a pin for a delegate that no longer exists cannot linger.
+T67_DELEGATES="$(grep -E '^[A-Z][A-Z0-9_]*_PATH="\$\(find_delegate ' "$REAPER" \
+    | sed -E 's/.*find_delegate "\$\{([A-Z0-9_]+):-\}" ([A-Za-z0-9._-]+)\).*/\1 \2/')"
+assert_eq "$(grep -c . <<<"$T67_DELEGATES")" "$(grep -cE '^[A-Z][A-Z0-9_]*_PATH="\$\(find_delegate ' "$REAPER")" \
+    "T67 the delegate list is DERIVED from the pass, not mirrored (a parse that drops one is a failure)"
+# systemd: `Environment=<NAME>=` on its own line, value on the same line.
+t67_sd_pins()   { grep -oE '^Environment=[A-Z0-9_]+_REAPER=' "$1" | sed 's/^Environment=//; s/=$//'; }
+t67_sd_value()  { sed -nE "s/^Environment=$2=(.*)\$/\\1/p" "$1"; }
+# launchd: `<key>NAME</key>` then `<string>value</string>` on the next line.
+t67_pl_pins()   { grep -oE '<key>[A-Z0-9_]+_REAPER</key>' "$1" | sed 's/<key>//; s/<\/key>//'; }
+# launchd: `<key>NAME</key>` then `<string>value</string>` on the next line. The awk arm reads the LINE
+# AFTER the key, strips the surrounding whitespace AND the `<string>`/`</string>` tags, and returns the
+# path — comparing the raw line would make every pin look "wrong-target".
+t67_pl_value()  { awk -v k="$2" '$0 ~ "<key>" k "</key>" { getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); gsub(/<\/?string>/, ""); print; exit }' "$1"; }
+# t67_gaps <systemd|launchd> <file> — a delegate that is UNPINNED, or pinned to a DIFFERENT basename.
+t67_gaps() {
+    local kind="$1" f="$2" name base val gaps=""
+    while read -r name base; do
+        [ -n "$name" ] || continue
+        if [ "$kind" = systemd ]; then val="$(t67_sd_value "$f" "$name")"; else val="$(t67_pl_value "$f" "$name")"; fi
+        [ -n "$val" ] || { gaps="$gaps $name(unpinned)"; continue; }
+        case "$val" in *"/$base") ;; *) gaps="$gaps $name(wrong-target:$val)" ;; esac
+    done <<<"$T67_DELEGATES"
+    printf '%s' "$gaps"
+}
+# t67_extras <names…> — pins for a name that is NOT a delegate (DISK_REAPER is the entry point itself).
+t67_extras() {
+    local n extras=""
+    for n in "$@"; do
+        [ "$n" = DISK_REAPER ] && continue
+        grep -qxF -- "$n" <<<"$(awk '{print $1}' <<<"$T67_DELEGATES")" || extras="$extras $n"
+    done
+    printf '%s' "$extras"
+}
+T67_SD="$REPO_ROOT/templates/systemd/eldato-disk-reaper.service"
+T67_PL="$REPO_ROOT/templates/launchd/reaper/com.eldato.disk-reaper.plist"
+T67_FAST="$REPO_ROOT/templates/systemd/eldato-disk-reaper-cache.service"
+[ -f "$T67_SD" ] && [ -f "$T67_PL" ] && [ -f "$T67_FAST" ] \
+    || bad "T67 fixture: a scheduled artifact is missing (the row would otherwise pass by reading nothing)"
+assert_eq "$(t67_gaps systemd "$T67_SD")" "" \
+    "T67 the HOURLY systemd unit pins EVERY delegate the pass resolves (and to the right basename)"
+assert_eq "$(t67_gaps launchd "$T67_PL")" "" \
+    "T67 the launchd plist pins EVERY delegate the pass resolves (and to the right basename)"
+assert_eq "$(t67_extras $(t67_sd_pins "$T67_SD"))" "" \
+    "T67 ... and the systemd unit pins nothing that is not a delegate"
+assert_eq "$(t67_extras $(t67_pl_pins "$T67_PL"))" "" \
+    "T67 ... and neither does the plist (the two artifacts agree on the SET, not just on the names)"
+assert_eq "$(t67_sd_value "$T67_FAST" RUNNER_CACHE_REAPER)" "{{REAPER_DIR}}/reap-runner-cache.sh" \
+    "T67 the FAST cache unit pins the one delegate its own class needs"
+# ── non-vacuity: both parsers must REDDEN when the pin is actually removed ──────────────────────
+# A row that reads the file but cannot fail under a deleted pin is the "inert enforcer" shape. The
+# control mutates a COPY of each artifact, so the templates under test are never touched.
+T67_MUT="$T/scratch/t67"; mkdir -p "$T67_MUT"
+grep -v '^Environment=RUNNER_CACHE_REAPER=' "$T67_SD" >"$T67_MUT/hourly.service"
+assert_contains "$(t67_gaps systemd "$T67_MUT/hourly.service")" "RUNNER_CACHE_REAPER(unpinned)" \
+    "T67 control: dropping the systemd pin makes the row RED (the assertion above is not vacuous)"
+awk '/<key>RUNNER_CACHE_REAPER<\/key>/{skip=1; next} skip==1 && /<string>/{skip=0; next} {print}' \
+    "$T67_PL" >"$T67_MUT/reaper.plist"
+assert_absent "$(cat "$T67_MUT/reaper.plist")" "RUNNER_CACHE_REAPER" \
+    "T67 control: the plist mutant really dropped BOTH lines of the pair"
+assert_contains "$(t67_gaps launchd "$T67_MUT/reaper.plist")" "RUNNER_CACHE_REAPER(unpinned)" \
+    "T67 control: and dropping it makes the plist arm RED too"
+# and a pin that names the WRONG file is caught (the `/_cache` shape: a plausible, one-token error)
+sed 's#reap-runner-cache.sh#reap-runner-work.sh#' "$T67_SD" >"$T67_MUT/wrong.service"
+assert_contains "$(t67_gaps systemd "$T67_MUT/wrong.service")" "RUNNER_CACHE_REAPER(wrong-target:" \
+    "T67 control: a pin pointing at a DIFFERENT owner is caught, not merely an absent one"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
