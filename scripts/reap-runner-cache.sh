@@ -63,7 +63,12 @@
 # "idle" is the one shape that turns this class into a job-killer.
 # ⛔ AND THE PROBE IS RE-ASKED IMMEDIATELY BEFORE EVERY REMOVAL (`toctou`), because classification can
 # be minutes old on a box whose `du` is slow: a job that started in that window must not lose its
-# cache. A re-probe that cannot answer KEEPS the candidate.
+# cache. A re-probe that cannot answer KEEPS the candidate. "Re-asked" means a FRESH process table —
+# one `ps` per removal — not a second look at the frozen one: a census read once at pass start cannot
+# observe a job that started after it, so a re-probe that reuses it is not a probe at all (the shape
+# #4169's review found: the `toctou` arm existed, was documented, and could not fire). The SHARED
+# root re-asks the POPULATION question ("does ANY install have a job in flight NOW?"), because that
+# root is what every install's listener reads.
 #
 # ── CADENCE (agent-infra#4168 point 3) ───────────────────────────────────────────────────────────
 # This file is the POLICY OWNER; it holds no clock. `disk-reaper.sh` runs it on TWO cadences and its
@@ -75,6 +80,13 @@
 # 2.3 GB free. The per-pass cap (`--max-mb`, and `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB`, default
 # 20480 MB) exists so the frequent pass cannot itself become the load problem: it stops after the cap
 # and reports `capped=1 remaining=<n>` so the next tick continues where it stopped.
+# ⛔ A CANDIDATE THAT ALONE EXCEEDS THE WHOLE CAP IS STILL TAKEN, while the pass has not yet reached
+# its cap. Without that, the cap is an INERT ENFORCER on exactly the population this class exists to
+# free: the measured installs are 50.1 / 40.7 / 42.7 / 38.1 / 36.3 / 27.1 / 23.5 / 21.6 GB against a
+# 20 GB default, so every one of them is `FREED_MB(0) + pending > MAX_MB` on EVERY tick, forever —
+# while the log line promises the next tick continues and the record says `capped=1 remaining=<n>`.
+# Admitting one such candidate drops the box by that much and leaves the rest for the next tick, so
+# the cap still bounds the pass's work per tick and the backlog still converges.
 #
 # ── EXIT CODES ───────────────────────────────────────────────────────────────────────────────────
 #   0  the sweep ran; nothing is wrong (this INCLUDES a sweep that found nothing to do)
@@ -103,7 +115,13 @@
 #   REAP_RC_MAX_MB         per-pass cap, 0 = uncapped           (default 0; the entry point passes one)
 #   REAP_RC_PS_BIN         the process census binary            (default /bin/ps)
 #   REAP_RC_DU_BIN         (default du)  REAP_RC_STAT_BIN (default stat)
-#   REAP_RC_STATE_DIR      where the bounded log lives          (default $DISK_REAPER_STATE_DIR)
+#   REAP_RC_STATE_DIR      the state dir (also the log's default location)
+#                          (default $DISK_REAPER_STATE_DIR)
+#   REAP_RC_LOG            the pass log's path                 (default <state>/runner-cache-reap.log)
+#                          ⛔ HONOURED, like REAP_RW_LOG/REAP_AW_LOG: the entry point exports it on the
+#                          state-dir-fallback path, and an exported seam the owner ignores reads as a
+#                          seam that does not exist (#4169 review) — the log then lands in $HOME on
+#                          exactly the full-disk pass the fallback exists for.
 #   REAP_RC_DRY_RUN        0 supplies the default mode only (an explicit flag always wins)
 #
 # ⛔ THIS FILE IS THE CLASS'S ONLY DELETE RULE. `disk-reaper.sh` runs it and accounts for it; it
@@ -167,6 +185,7 @@ DU_BIN="${REAP_RC_DU_BIN:-du}"
 STAT_BIN="${REAP_RC_STAT_BIN:-stat}"
 DRY_RUN="${REAP_RC_DRY_RUN:-1}"
 STATE_DIR="${REAP_RC_STATE_DIR:-${DISK_REAPER_STATE_DIR:-${HOME:-}/.pi/agent/state}}"
+LOG_FILE="${REAP_RC_LOG:-$STATE_DIR/runner-cache-reap.log}"
 PS_TIMEOUT="${REAP_RC_PS_TIMEOUT:-60}"
 DU_TIMEOUT="${REAP_RC_DU_TIMEOUT:-120}"
 FIND_TIMEOUT="${REAP_RC_FIND_TIMEOUT:-120}"
@@ -274,16 +293,42 @@ mtime_of() { # <path> — epoch mtime, portable across GNU and BSD stat; empty w
     case "$m" in ''|*[!0-9]*) return 1 ;; *) printf '%s' "$m" ;; esac
 }
 
-# ── the process census: ONE read, used for every install ─────────────────────────────────────────
+# ── the process census: ONE read for the pass, and a FRESH one before every removal ─────────────
 # A per-install `ps` would be N walks of the same table on a 12-runner box; and a census that cannot
 # answer is not "idle" (see the header), so it is captured once and its failure is sticky.
+# ⛔ `census_read` ASSIGNS NOTHING UNLESS IT SUCCEEDS. A failed read that blanked `CENSUS_TEXT` would
+# leave `proc_has` searching "" — answering "no Runner.Worker found" — which is the DELETE direction,
+# the same fail-open the numeric seams above refuse. The caller decides what a failure MEANS:
+# pass-start sets `CENSUS=unreadable` (the sticky, fail-closed verdict), a re-probe KEEPS the candidate.
 CENSUS_TEXT=""
 census_read() {
     # ⛔ `-axo` (not `-eo`): the runner's argv is what identifies the install, and a BSD `ps` without
     # `-x` omits every process not owned by this session — the listeners on a system unit included.
-    CENSUS_TEXT="$(tb_timeout "$PS_TIMEOUT" "$PS_BIN" -axo pid=,command= 2>/dev/null)"; local rc=$?
-    if [ "$rc" != 0 ] || [ -z "$CENSUS_TEXT" ]; then CENSUS="unreadable"; return 1; fi
+    local _t
+    _t="$(tb_timeout "$PS_TIMEOUT" "$PS_BIN" -axo pid=,command= 2>/dev/null)" || return 1
+    [ -n "$_t" ] || return 1
+    CENSUS_TEXT="$_t"
     return 0
+}
+
+# census_refresh — the TOCTOU probe: RE-READ the table, immediately before a removal.
+# ⛔ This is what makes the header's promise true. Classification runs, then `du` on a 50 GB cache can
+# take minutes; a census read ONCE cannot see a job that started in that window, so a "re-probe" that
+# consults the frozen text (or only the `_work` mtime witness) proves nothing about the process table.
+# One `ps` per removal is the cost, and it is deliberately paid: a `ps` is milliseconds against a `du`
+# that already takes seconds, and the alternative is deleting a live job's cache.
+census_refresh() { census_read; }
+
+# any_live_now — the SHARED root's re-probe question, against the CURRENT (just refreshed) census:
+# is ANY install running a job right now? The shared root is every install's `XDG_CACHE_HOME`, so a
+# single live install anywhere on the box makes it unsafe.
+any_live_now() {
+    local d rc
+    for d in $INSTALL_DIRS; do
+        install_live "$d"; rc=$?
+        if [ "$rc" = 0 ]; then return 0; fi
+    done
+    return 1
 }
 
 # proc_has <token> — 0 when some process's command line mentions <token>.
@@ -341,13 +386,24 @@ install_live() {
 cap_reached() {
     local pending="${1:-0}"
     [ "$MAX_MB" -gt 0 ] || return 1
+    # ⛔ A CANDIDATE BIGGER THAN THE WHOLE CAP IS NOT REFUSED FOREVER (see the header). The measured
+    # population is 21–50 GB against a 20 GB default, so testing `FREED_MB + pending > MAX_MB` from a
+    # `FREED_MB` that starts at 0 refuses the headline case on EVERY tick and the box never frees it.
+    # Admit exactly one such candidate per pass, while the pass has not reached its cap yet (so a
+    # small candidate earlier in the pass cannot lock the big one out), and let the cap bound
+    # everything after it: FREED_MB then exceeds MAX_MB and every later candidate is deferred.
+    if [ "$pending" -gt "$MAX_MB" ] && [ "$FREED_MB" -lt "$MAX_MB" ]; then
+        return 1
+    fi
     [ "$(( FREED_MB + pending ))" -gt "$MAX_MB" ]
 }
 
-# reap_one <path> <size-mb|?-> <kind> <install> — the ONE destructive call, gated three ways.
+# reap_one <path> <size-mb|?-> <kind> <install|-> — the ONE destructive call, gated three ways.
 #   1. the cap (a pass may not become the load problem it exists to fix)
-#   2. a RE-PROBE of the install's liveness, immediately before removal
+#   2. a RE-PROBE against a FRESH process census, immediately before removal
 #   3. `rm -rf` is not evidence: the path must be GONE afterwards or the removal FAILED
+# `<install>` names the install whose liveness the re-probe re-asks; `-` is the SHARED cache root,
+# whose question is the population's (any install live), because that root is not one install's.
 reap_one() {
     local path="$1" size="$2" kind="$3" install="$4" _live
     if cap_reached "${size%%[!0-9]*}"; then
@@ -362,17 +418,33 @@ reap_one() {
         case "$size" in ''|*[!0-9]*) ;; *) FREED_MB=$((FREED_MB + size)) ;; esac
         return 0
     fi
-    # ⛔ RE-PROBE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL. The classification above can be minutes old
-    # on a box whose `du` is slow, and a job that started in that window must not lose its cache.
-    if [ -n "$install" ]; then
+    # ⛔ RE-PROBE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL, AGAINST A FRESH CENSUS. The classification
+    # above can be minutes old on a box whose `du` is slow, and a job that started in that window must
+    # not lose its cache. ⛔ THE REFRESH COMES FIRST AND ITS FAILURE IS FATAL TO THE REMOVAL: without
+    # it `install_live` would answer from the pass-start text and the `toctou` arm could never fire
+    # (#4169 review) — a documented gate that cannot act is worse than no gate.
+    if ! census_refresh; then
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $path reason=toctou-census-unreadable (the re-probe could not RE-READ the process table; NOT removed)"
+        return 0
+    fi
+    if [ "$install" = "-" ]; then
+        # The SHARED root: the question is the POPULATION's, not one install's.
+        if any_live_now; then
+            SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
+            log_line "SKIPPED-LIVE $path reason=toctou:${LIVE_REASON:-an-install-has-a-job-running} (an install started a job during the pass; re-probed immediately before removal, NOT removed)"
+            return 0
+        fi
+    elif [ -n "$install" ]; then
         install_live "$install"; _live=$?
         case "$_live" in
             0) SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
                log_line "SKIPPED-LIVE $path reason=toctou:${LIVE_REASON} (a job started during the pass; re-probed immediately before removal, NOT removed)"
                return 0 ;;
-            2) UNMEASURABLE=$((UNMEASURABLE + 1))
-               log_line "KEPT   $path reason=toctou-census-unreadable (the re-probe could not answer; NOT removed)"
-               return 0 ;;
+            # ⛔ NO `2` ARM HERE ON PURPOSE. `install_live` answers 2 only for an unreadable census, and
+            # that case was just refused by the refresh above (and, at pass start, by `sweep_install`
+            # before it ever reaches this call) — so a `2` arm here is unreachable dead code that reads
+            # as a gate. The live arm and the refresh-failure arm are the two that can happen.
         esac
     fi
     if [ ! -e "$path" ] && [ ! -L "$path" ]; then
@@ -501,9 +573,12 @@ ANY_LIVE=0
 sweep_shared() {
     local root="$1" sz
     [ -d "$root" ] || return 0
-    # ⛔ NO SECOND CENSUS HERE. `ANY_LIVE` was established by `sweep_install`, the one place every
-    # install's liveness is read; re-probing the population here would be a second answer to the same
-    # question, and the two can disagree while a job starts between them.
+    # ⛔ `ANY_LIVE` IS THE CLASSIFICATION, NOT THE GATE. It was established by `sweep_install`, the one
+    # place every install's liveness is read, and it is what reports the skip (and what makes cleanup
+    # of a huge root cheap when a job is already known to be running). The GATE is the per-entry
+    # re-probe in `reap_one` (`-` = the population question), against a FRESH census: the entries are
+    # removed minutes after this classification on a box whose `du` is slow, and a job that started in
+    # that window must not lose the cache it is reading.
     if [ "$CENSUS" != ok ]; then
         UNMEASURABLE=$((UNMEASURABLE + 1))
         log_line "KEPT   $root reason=census-unreadable (the SHARED root is used by every install; liveness is UNKNOWN)"
@@ -534,7 +609,7 @@ sweep_shared() {
         [ -e "$e" ] || [ -L "$e" ] || continue
         [ -L "$e" ] && { KEPT=$((KEPT + 1)); log_line "KEPT   $e reason=symlink (never followed in a delete path)"; continue; }
         sz2="$(du_mb "$e")" || sz2=""
-        reap_one "$e" "${sz2:-?}" shared-cache ""
+        reap_one "$e" "${sz2:-?}" shared-cache "-"
     done
     return 0
 }
@@ -584,13 +659,12 @@ glob_matches_any() {
     return 1
 }
 
-mkdir -p "$STATE_DIR" 2>/dev/null || true
-LOG_FILE="$STATE_DIR/runner-cache-reap.log"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
 : >"$LOG_FILE" 2>/dev/null || LOG_FILE=""
 
 log_line "reap-runner-cache: mode=$( is_dry && printf dry-run || printf apply ) install_globs='$RC_GLOBS' shared_globs='$SHARED_GLOBS' min_cache_mb=${MIN_CACHE_MB} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
 
-census_read || log_line "reap-runner-cache: ⛔ CENSUS UNREADABLE — '$PS_BIN -axo pid=,command=' did not answer, so no install's liveness can be proved. NOTHING will be removed and this pass is FAIL-CLOSED (a cache deleted under a live job fails the job)."
+census_read || { CENSUS="unreadable"; log_line "reap-runner-cache: ⛔ CENSUS UNREADABLE — '$PS_BIN -axo pid=,command=' did not answer, so no install's liveness can be proved. NOTHING will be removed and this pass is FAIL-CLOSED (a cache deleted under a live job fails the job)."; }
 
 discover
 if [ -z "$INSTALL_DIRS" ]; then
@@ -607,7 +681,15 @@ for d in $INSTALL_DIRS; do
 done
 
 # The shared roots last: they need every install's liveness, which the loop above just established.
+# ⛔ THE MATCHED PATHS ARE COLLECTED UNDER `set -f` AND SWEPT AFTER IT IS RESTORED. `set -f` exists to
+# split the GLOB LIST into patterns; leaving it on while the sweep runs disabled GLOBBING INSIDE
+# `sweep_shared`, so its `for e in "$root"/*` iterated the literal string `$root/*`, matched nothing,
+# and the shared per-box cache root — the durable half of this class — was NEVER emptied. `candidates=`
+# stayed 0 and the class read as a measured "nothing to do" (#4169 review: no row covered this root;
+# the row it does cover is why it was found). `discover`/`INSTALL_DIRS` is the same shape: collect
+# under the flag, consume after it.
 SEEN_SHARED=" "
+SHARED_DIRS=""
 if [ -n "$SHARED_GLOBS" ]; then
     _had_f=0
     case $- in *f*) _had_f=1 ;; esac
@@ -618,11 +700,15 @@ if [ -n "$SHARED_GLOBS" ]; then
             [ -d "$p" ] || continue
             case "$SEEN_SHARED" in *" $p "*) continue ;; esac
             SEEN_SHARED="$SEEN_SHARED$p "
-            sweep_shared "$p"
+            SHARED_DIRS="${SHARED_DIRS}${SHARED_DIRS:+
+}$p"
         done
     done
     [ "$_had_f" = 1 ] || set +f
 fi
+for p in $SHARED_DIRS; do
+    sweep_shared "$p"
+done
 
 # ── the report ─────────────────────────────────────────────────────────────────────────────────
 # ⛔ EVERY READING IS PRINTED (agent-infra#2344). "the class did nothing" and "the class could not see
@@ -641,6 +727,11 @@ fi
 if [ "$rc" = 0 ] && is_dry && [ "$CANDIDATES" -gt 0 ]; then rc=5; fi
 
 log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
-[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE freed_mb=$FREED_MB"
+# ⛔ THE LOG LINE CARRIES THE POPULATION IT SCANNED (`install_globs=` / `shared_globs=`). The stdout
+# header already prints them, but the LOG is the durable artifact an operator reads after the fact, and
+# it is the only way a test can prove WHICH population a pass was pinned to — which is the whole point
+# of `disk-reaper.test.sh` pinning this class to its fixtures (agent-infra#4169): an unpinned suite ran
+# the destructive pass against the box's real `/opt/gh-runner*` installs while claiming to be hermetic.
+[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
 command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
 exit "$rc"

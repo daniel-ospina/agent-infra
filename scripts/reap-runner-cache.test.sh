@@ -27,6 +27,23 @@
 #   D  AN UNREADABLE PROCESS CENSUS REMOVES NOTHING and exits 3: an install's liveness cannot be proved,
 #      so neither its cache nor its scratch may go.
 #      Mutant: `if [ "$CENSUS" != "ok" ]; then LIVE_REASON="census-unreadable"; return 2; fi` -> deleted.
+#   F  THE PROBE IS RE-ASKED, PER INSTALL: a job that STARTS during the pass is caught by the re-probe and
+#      the cache is kept (`reason=toctou:worker-running`). The census fixture ANSWERS DIFFERENTLY on the
+#      second call, which is the only way to tell a re-probe from a frozen table.
+#      Mutant: `census_refresh() { census_read; }` -> `{ :; }` (the refresh stops re-reading).
+#   G  THE SAME PROPERTY FOR THE SHARED PER-BOX CACHE ROOT, which no row covered at all: the entry is
+#      kept when an install starts a job mid-pass. Same mutant (the shared arm asks the population
+#      question through the same refresh).
+#   H  A RE-PROBE THAT CANNOT ANSWER KEEPS THE CANDIDATE and the pass fails closed (rc 3) — the arm that
+#      replaces the unreachable `_live = 2` branch. Same mutant.
+#   I  A CANDIDATE BIGGER THAN THE WHOLE PER-PASS CAP IS STILL TAKEN (once), and the cap still bounds the
+#      pass afterwards; the measured population is 21–50 GB against a 20 GB default, so refusing it is
+#      an inert enforcer that never frees the box.
+#      Mutant: the oversized-admission guard -> `if false; then`.
+#   J  THE `REAP_RC_LOG` SEAM IS HONOURED, not exported-and-ignored: the pass log lands at the pinned
+#      path and NOT at the default one, which is what the entry point relies on when the state dir has
+#      fallen back to tmpfs.
+#      Mutant: `REAP_RC_LOG:-` -> `REAP_RC_LOG_IGNORED:-` (the seam stops being read).
 #
 # Hermetic: every fixture is under $T, HOME is redirected, the state dir and the install globs are
 # explicit `$T/...` paths, and the process census is a FIXTURE TABLE — NOTHING here can read or delete
@@ -127,6 +144,24 @@ cat >"$PS_STUB" <<'STUB'
 cat "$RC_TEST_PS_TABLE"
 STUB
 chmod +x "$PS_STUB"
+
+# ps_seq_stub — a census whose ANSWER CHANGES BETWEEN CALLS. ⛔ This is the only fixture that can observe
+# a RE-PROBE: a stub that always answers the same thing cannot tell "the table was re-read" from "the
+# frozen copy was consulted", which is exactly the defect #4169's review found in the documented
+# `toctou` arm. `$RC_TEST_PS_SEQ` lists one table path per line (call N reads line N, the last repeats),
+# and `RC_TEST_PS_FAIL_AFTER=<n>` makes every call after the n-th answer NOTHING (the unreadable arm).
+PS_SEQ_STUB="$T/ps-stub-seq"
+cat >"$PS_SEQ_STUB" <<'STUB'
+#!/bin/sh
+n=$(cat "$RC_TEST_PS_SEQ_N" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s' "$n" >"$RC_TEST_PS_SEQ_N"
+if [ "${RC_TEST_PS_FAIL_AFTER:-0}" -gt 0 ] && [ "$n" -gt "${RC_TEST_PS_FAIL_AFTER:-0}" ]; then exit 1; fi
+total=$(grep -c . "$RC_TEST_PS_SEQ")
+[ "$n" -gt "$total" ] && n="$total"
+cat "$(sed -n "${n}p" "$RC_TEST_PS_SEQ")"
+STUB
+chmod +x "$PS_SEQ_STUB"
 
 # run_owner <owner> <fixture-base> <ps-table> [extra args…] — prints the owner's output.
 run_owner() {
@@ -273,8 +308,140 @@ case_d() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── F: the probe is RE-ASKED per install — a job that STARTS mid-pass keeps its cache ────────
+case_f() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/f.XXXXXX")"
+    inst="$base/gh-runner-f"
+    mk_install "$inst"; mk_cache "$inst" 2; idle_work "$inst"
+    # Call 1 (pass start) sees an IDLE install; every call after sees a Runner.Worker — i.e. a job
+    # started while the pass was classifying. ⛔ The difference between the two tables is the ONLY thing
+    # that can keep the cache, so a frozen census MUST reap it and this case must redden.
+    mk_ps "$base/ps-idle" "$inst" idle
+    mk_ps "$base/ps-live" "$inst" live
+    printf '%s\n%s\n' "$base/ps-idle" "$base/ps-live" >"$base/seq"
+    rm -f "$base/n"
+    out="$(RC_TEST_PS_SEQ="$base/seq" RC_TEST_PS_SEQ_N="$base/n" REAP_RC_PS_BIN="$PS_SEQ_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --min-cache-mb 1 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -d "$inst/.cache" ] && echo 0 || echo 1)" \
+               "the cache of an install whose job STARTED mid-pass is NOT removed"
+    case_check "$(grep -qF 'reason=toctou:worker-running' <<<"$out" && echo 0 || echo 1)" \
+               "and the skip NAMES the re-probe and its witness (reason=toctou:worker-running)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── G: the SHARED per-box cache root gets the same re-probe (the population's question) ──────
+case_g() { # <owner-script>
+    local owner="$1" base inst shared out rc
+    base="$(mktemp -d "$T/g.XXXXXX")"
+    inst="$base/gh-runner-g"; shared="$base/shared/_cache"
+    mk_install "$inst"; mk_cache "$inst" 0        # below the size bound: this install is not a candidate
+    idle_work "$inst"
+    mkdir -p "$shared/uv"; dd if=/dev/zero of="$shared/uv/blob" bs=1M count=2 >/dev/null 2>&1
+    mk_ps "$base/ps-idle" "$inst" idle
+    mk_ps "$base/ps-live" "$inst" live
+    printf '%s\n%s\n' "$base/ps-idle" "$base/ps-live" >"$base/seq"
+    rm -f "$base/n"
+    out="$(RC_TEST_PS_SEQ="$base/seq" RC_TEST_PS_SEQ_N="$base/n" REAP_RC_PS_BIN="$PS_SEQ_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$shared" REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -d "$shared/uv" ] && echo 0 || echo 1)" \
+               "a SHARED-root entry is NOT emptied when an install starts a job mid-pass"
+    case_check "$(grep -qF 'reason=toctou:worker-running' <<<"$out" && echo 0 || echo 1)" \
+               "and the skip NAMES the re-probe (no row covered the shared root before this case)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── H: a re-probe that CANNOT ANSWER keeps the candidate and fails closed ───────────────────
+case_h() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/h.XXXXXX")"
+    inst="$base/gh-runner-h"
+    mk_install "$inst"; mk_cache "$inst" 2; idle_work "$inst"
+    mk_ps "$base/ps-idle" "$inst" idle
+    printf '%s\n' "$base/ps-idle" >"$base/seq"
+    rm -f "$base/n"
+    # Call 1 answers; every later call answers NOTHING — the probe that can no longer prove anything.
+    out="$(RC_TEST_PS_FAIL_AFTER=1 RC_TEST_PS_SEQ="$base/seq" RC_TEST_PS_SEQ_N="$base/n" \
+           REAP_RC_PS_BIN="$PS_SEQ_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --min-cache-mb 1 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "a re-probe that cannot answer FAILS CLOSED (rc=$rc, want 3)"
+    case_check "$([ -d "$inst/.cache" ] && echo 0 || echo 1)" "and the candidate is KEPT, not removed on a stale reading"
+    case_check "$(grep -qF 'reason=toctou-census-unreadable' <<<"$out" && echo 0 || echo 1)" \
+               "the arm is REACHABLE and named (reason=toctou-census-unreadable) — it was dead code before"
+    return $((CASE_FAIL > 0))
+}
+
+# ── I: a candidate BIGGER than the whole cap is still taken (the inert-enforcer shape) ──────────
+# ⛔ THE TWO INSTALLS ARE NOT ORDERED ON PURPOSE: `compgen -G` returns matches in filesystem order, not
+# lexical order, so an assertion that names WHICH one went first is a flake. The property is
+# order-independent in both directions — the oversized cache must be GONE either way, and pre-fix it
+# survives either way (refused as `0 + 5 > 3` when it is first; refused after the small one eats the
+# cap when it is second). That is what makes this row redden on the pre-fix code deterministically.
+case_i() { # <owner-script>
+    local owner="$1" base big small out rc
+    base="$(mktemp -d "$T/i.XXXXXX")"
+    big="$base/gh-runner-big"; small="$base/gh-runner-small"
+    mk_install "$big"; mk_install "$small"
+    mk_cache "$big" 5; mk_cache "$small" 2
+    idle_work "$big"; idle_work "$small"
+    mk_ps "$base/ps" "$big" idle
+    printf '  4244 %s/bin/Runner.Listener run\n' "$small" >>"$base/ps"
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 3 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$(grep -qF "REAPED $big/.cache" <<<"$out" && echo 0 || echo 1)" \
+               "a 5MB cache against a 3MB cap IS reclaimed — NEVER refused on every tick (the measured 21-50GB population against the 20GB default)"
+    case_check "$([ ! -e "$big/.cache" ] && echo 0 || echo 1)" "and it is really gone, not merely reported"
+    case_check "$([ "$(grep -c '^REAPED ' <<<"$out")" -le 2 ] && echo 0 || echo 1)" \
+               "the cap still bounds the pass (at most the two candidates, never a third tick's work)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── J: the REAP_RC_LOG seam is HONOURED (the entry point exports it on its fallback path) ──────
+# ⛔ An exported seam the owner ignores reads as a seam that does not exist, and on the state-dir
+# fallback path — a box with a FULL DISK, i.e. exactly when this class matters — the log then lands in
+# `$HOME` instead of the fallback state dir. The sibling owners honour `REAP_RW_LOG`/`REAP_AW_LOG`; the
+# three must not disagree about the same fact.
+case_j() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/j.XXXXXX")"
+    inst="$base/gh-runner-j"
+    mk_install "$inst"; mk_cache "$inst" 0; idle_work "$inst"
+    mk_ps "$base/ps" "$inst" idle
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" \
+           REAP_RC_STATE_DIR="$base/state" REAP_RC_LOG="$base/pinned/own.log" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -f "$base/pinned/own.log" ] && echo 0 || echo 1)" \
+               "REAP_RC_LOG is HONOURED: the pass log landed at the pinned path"
+    case_check "$(grep -qF 'SUMMARY' "$base/pinned/own.log" 2>/dev/null && echo 0 || echo 1)" \
+               "and it carries the SUMMARY (the durable artifact, not an empty file)"
+    case_check "$([ ! -e "$base/state/runner-cache-reap.log" ] && echo 0 || echo 1)" \
+               "while the default path was NOT used (the seam is not merely ignored)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
+MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -286,12 +453,27 @@ apply_mutation "$REAPER" "$MUT_C" 's/\[ "\$mb" -lt "\$RUNNER_CACHE_TRIGGER_FREE_
     || { printf '  ❌ mutation C could not be applied (the trigger comparison moved)\n'; mut_ok=0; }
 apply_mutation "$OWNER" "$MUT_C2" 's/^    \[ "\$(( FREED_MB + pending ))" -gt "\$MAX_MB" \]$/    false/' \
     || { printf '  ❌ mutation C2 could not be applied (the cap test moved)\n'; mut_ok=0; }
+# ⛔ THE TOCTOU MUTANT NEUTERS THE RE-READ, NOT THE WHOLE ARM: with the refresh stubbed to `:` the probe
+# still runs and still consults a census — a FROZEN one — which is precisely the defect the finding
+# described. If the case only reddened when the arm was deleted outright, it would not be testing that
+# the probe is fresh.
+apply_mutation "$OWNER" "$MUT_F" 's/^census_refresh() { census_read; }$/census_refresh() { :; }/' \
+    || { printf '  ❌ mutation F could not be applied (the census re-read moved)\n'; mut_ok=0; }
+apply_mutation "$OWNER" "$MUT_J" 's/REAP_RC_LOG:-/REAP_RC_LOG_IGNORED:-/' \
+    || { printf '  ❌ mutation J could not be applied (the log seam moved)\n'; mut_ok=0; }
+apply_mutation "$OWNER" "$MUT_I" 's/^    if \[ "\$pending" -gt "\$MAX_MB" \] && \[ "\$FREED_MB" -lt "\$MAX_MB" \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation I could not be applied (the oversized-candidate guard moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
 expect_pass "B a small cache and young scratch are KEPT; aged scratch is reaped" case_b "$OWNER"
 expect_pass "C the size trigger fires only below the threshold, and a pass is capped" case_c "$REAPER" "$OWNER"
 expect_pass "D an unreadable census removes nothing and fails closed" case_d "$OWNER"
+expect_pass "F a job that starts mid-pass keeps its cache (the probe IS re-read)" case_f "$OWNER"
+expect_pass "G the SHARED cache root re-probes the population too" case_g "$OWNER"
+expect_pass "H a re-probe that cannot answer keeps the candidate and fails closed" case_h "$OWNER"
+expect_pass "I a candidate bigger than the whole cap is still taken, once" case_i "$OWNER"
+expect_pass "J the REAP_RC_LOG seam is honoured" case_j "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -300,6 +482,11 @@ expect_fail "B mutant: the size bound deleted"                         case_b "$
 expect_fail "C mutant: the trigger comparison inverted"                case_c "$MUT_C" "$OWNER"
 expect_fail "C2 mutant: the per-pass cap never reached"                case_c "$REAPER" "$MUT_C2"
 expect_fail "D mutant: the census gate deleted"                        case_d "$MUT_D"
+expect_fail "F mutant: the re-probe stops RE-READING the census"         case_f "$MUT_F"
+expect_fail "G mutant: the re-probe stops RE-READING (shared root arm)"  case_g "$MUT_F"
+expect_fail "H mutant: the re-probe stops RE-READING (unreadable arm)"  case_h "$MUT_F"
+expect_fail "I mutant: the oversized-candidate guard deleted"            case_i "$MUT_I"
+expect_fail "J mutant: the log seam is ignored"                         case_j "$MUT_J"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an
