@@ -667,8 +667,8 @@ reset_run
 cp "$DRAINER" "$ROOT/drainer-copy-k4e.sh"
 RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_NO_SPAWN_GATE_MOD=1
 run_drainer_fg k4e "$ROOT/drainer-copy-k4e.sh"
-check "(k4e) with no module beside it, a COPY still dispatches and names both searched paths" \
-  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -q "no spawn-gate.sh disk predicate found (looked at" "$LAST_AI/logs/ai-drainer.log"' \
+check "(k4e) with no module beside it, a COPY still dispatches and names BOTH searched paths" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -qF "looked at $ROOT/o-k4e/spawn-gate.sh and $ROOT/spawn-gate.sh" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep 'NOTE:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
@@ -695,6 +695,42 @@ run_drainer_fg k4d
 check "(k4d) a 19-digit seam is REFUSED by name (it would wrap and disable the term silently)" \
   '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "is 19 digits; this seam is capped at 9" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4f) THE FLOOR SEAM'S WIDTH IS TESTED ON THE RAW STRING, BEFORE `10#` ────────────────────────
+# ⛔ MEASURED (review round 2): `DISK_MIN_FREE_MB=18446744073909551616` is 20 digits and `10#` WRAPS it
+# to `200000000`, which PASSES both the `>= 1` and `<= 249999999` bounds. So a range check applied after
+# the conversion cannot see the wrap: the floor became 200,000,000 MB, the ceiling floored to 0, and the
+# tick logged `disk=0 free=4000MB need=1000MB disk_floor=200000000MB` at rc 0 with **no WARN at all** —
+# an inert drainer presented as a measured box fact. The width rule must run on the string, like
+# `spawn-gate.sh:203`'s `is_limit`.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=18446744073909551616
+RUN_DISK_FREE_MB=4000 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k4f
+check "(k4f) a 20-digit floor is caught on the RAW string and falls back to 500 — not wrapped in-band" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "WARN: DISK_MIN_FREE_MB=.*is 20 digits" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk_floor=500MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "disk_floor=200000000MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'WARN: DISK_MIN_FREE_MB' "$LAST_AI/logs/ai-drainer.log" | head -1) $(grep 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k4f) …and the term still BINDS (3 lanes fit in 4000-500 over 1000) — the wrap would have made it 0" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "disk=[3-9]" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4g) A MODULE THAT ANSWERS A NON-NUMBER IS *NOT* THE FAIL-CLOSED ARM — IT IS UNKNOWN ───────
+# Round 2 proved the removed arms could never fire: `_disk_probe` digit-validates its own reading, so a
+# module answering `abc` hands back nothing and is indistinguishable from UNKNOWN. The behaviour is
+# therefore DEGRADE (rc 0, named NOTE, `disk=off`), and this arm pins it so the two shapes cannot
+# silently swap back into a claim the code does not implement.
+mkdir -p "$ROOT/o-k4g"
+printf '%s\n' \
+  'disk_free_mb() { printf "abc"; }' \
+  'disk_lane_costs() { printf "1"; }' \
+  'disk_lane_need() { printf "1000"; }' \
+  > "$ROOT/o-k4g/spawn-gate.sh"
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500 RUN_SPAWN_GATE_MOD="$ROOT/o-k4g/spawn-gate.sh"
+run_drainer_fg k4g
+check "(k4g) a module answering a non-number DEGRADES (rc 0, named NOTE, disk=off) — not a silent FAIL arm" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "NOTE: the disk term is DISABLED" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=off" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'NOTE: the disk term' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── (k5) AN EXPLICIT `need = 0` DISABLES THE TERM, SAYS SO, AND DOES NOT CRASH ─────────────────
