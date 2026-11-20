@@ -103,6 +103,15 @@ assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1
 # reads as a broken guard rather than a missing fixture.
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 [ -d "$REPO_ROOT/templates/systemd" ] || { echo "FATAL: $REPO_ROOT/templates/systemd missing — the suite renders units from it"; exit 1; }
+# ⛔ `TEMPLATES_DIR` IS PINNED TO THE TREE UNDER TEST, FOR EVERY INSTALLER CASE (#4169). Unpinned,
+# `install-disk-reaper-timer.sh` prefers `${AGENT_INFRA_PATH}/templates/systemd` — the MAIN checkout,
+# which is a DIFFERENT tree — so a worktree run graded the main checkout's templates. On this box that
+# turned every installer case into "REFUSING: eldato-disk-reaper-cache templates are missing under
+# /home/cmux/agent-infra/templates/systemd", i.e. a red that looks exactly like this PR's code being
+# wrong while the worktree that has the templates was never asked. The cases that need a synthetic or
+# gutted template dir (t31/t55/…) already pin their own value, and a prefix assignment wins over an
+# export, so this is the default and not an override.
+export TEMPLATES_DIR="$REPO_ROOT/templates/systemd"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
@@ -122,6 +131,27 @@ export REAP_AW_ROOTS REAP_DI_ROOTS
 mkdir -p "$T/scratch/rw/gh-runner-fixture/_work"
 DISK_REAPER_RUNNER_GLOBS="$T/scratch/rw/gh-runner*/_work"
 export DISK_REAPER_RUNNER_GLOBS
+# ⛔ AND THE `runner-cache` CLASS, WHICH WAS THE ONE OWNER LEFT UNPINNED — A CORRECTNESS BUG, NOT
+# TIDINESS (#4169 review, P1). Everything above redirected HOME and pinned the other destructive
+# owners, but this class kept its DEFAULTS: `/opt/gh-runner*` and `/tmp/actions-runner*`, i.e. the
+# cells' REAL installs (`ci_runner_pool.sh:235` defaults `RUNNER_ROOT=/tmp/actions-runner`). Several
+# cases here run the DEFAULT class list with `--apply`, so T2 reaped the real >=256 MB `.cache`
+# directories, aged out real `_work/_temp`/`_diag` entries and emptied the real shared root
+# `/tmp/actions-runner/_cache` on whichever box ran the suite — refuting this file's own guarantee
+# (drtest.sh:82/178, "Nothing here can read or write the real box's state"). That is the same class of
+# defect the runner-work pin above records, one owner later.
+# ⛔ IT MUST BE THE ENTRY POINT'S SEAM (`DISK_REAPER_RUNNER_CACHE_*`), NOT THE OWNER'S
+# (`REAP_RC_GLOBS`): `disk-reaper.sh:2986` passes `REAP_RC_GLOBS="$RUNNER_CACHE_GLOBS"` explicitly, so
+# a pin on the owner variable is silently OVERRIDDEN and the suite still runs against the box.
+# ⛔ AND IT POINTS AT A DIRECTORY THAT EXISTS: an explicit glob list matching NOTHING is a REFUSAL
+# (exit 3) by the class's own policy, which would turn every case here red for a fixture reason.
+# `MIN_MB=1` keeps the fixture caches (a few MB) inside the class's size bound; a case that needs the
+# 256 MB default pins it for itself.
+mkdir -p "$T/scratch/rc/gh-runner-fixture" "$T/scratch/rc/shared"
+DISK_REAPER_RUNNER_CACHE_GLOBS="$T/scratch/rc/gh-runner-*"
+DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS="$T/scratch/rc/shared"
+DISK_REAPER_RUNNER_CACHE_MIN_MB="${DISK_REAPER_RUNNER_CACHE_MIN_MB:-1}"
+export DISK_REAPER_RUNNER_CACHE_GLOBS DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB
 SLEEPERS=""
 cleanup() {
     local p
@@ -193,6 +223,18 @@ ENVNAME=""
 # `REAP_WT_GIT_TIMEOUT` per call. `pi-reap-worktrees.test.sh:459` already pins this; the `${…:-local}`
 # form keeps every case that deliberately exercises `auto` able to override it (T3 does: it proves the
 # remote-oid path against a LOCAL BARE origin, which is offline already).
+# ⛔ THE `runner-cache` CLASS IS PINNED TOO, AND THAT PIN IS A CORRECTNESS FIX, NOT TIDINESS (#4169
+# review, P1). This suite redirected HOME but NOT the class's own globs, so the class inherited its
+# defaults — `/opt/gh-runner*` and `/tmp/actions-runner*`, the cells' REAL installs
+# (`ci_runner_pool.sh:235` defaults `RUNNER_ROOT=/tmp/actions-runner`) — and an unpinned `--apply` case
+# (T2) reaped the real >=256 MB `.cache` directories, aged out real `_work/_temp`/`_diag` entries and
+# emptied the real shared root `/tmp/actions-runner/_cache` on the box running the tests. That refutes
+# this file's own guarantee at drtest.sh:82/178 ("Nothing here can read or write the real box's state").
+# ⛔ IT IS THE ENTRY POINT'S SEAM (`DISK_REAPER_RUNNER_CACHE_*`), NOT THE OWNER'S (`REAP_RC_GLOBS`):
+# `disk-reaper.sh:2986` passes `REAP_RC_GLOBS="$RUNNER_CACHE_GLOBS"` explicitly, so pinning the owner
+# variable here would have been silently OVERRIDDEN and the suite would still have run against the box.
+# The pinned glob points at a directory this suite CREATES (below), so the class's "an explicit glob
+# list that matched nothing is a refusal, not a measured zero" rule cannot turn every case into exit 3.
 # ⚠️ THIS BLOCK SITS ABOVE THE ASSIGNMENT CHAIN ON PURPOSE — see the RULE 7 note: a comment line put
 # INSIDE a `\`-continued list ends the command word, and the pass then silently runs against the REAL
 # $HOME. It cost 79 unrelated red assertions the first time this file learned it (and it happened
@@ -432,8 +474,16 @@ exit 0
 SC
 chmod +x "$T/t8/bin/systemctl"
 inst() { # inst <args...>
+    # ⛔ `TEMPLATES_DIR` IS PINNED TO THE TREE UNDER TEST, LIKE EVERY OTHER INSTALLER CASE HERE
+    # (t19/t55/… pin the same value). Unpinned, `install-disk-reaper-timer.sh` prefers
+    # `${AGENT_INFRA_PATH}/templates/systemd` — the MAIN checkout — so a worktree run graded a
+    # DIFFERENT tree's templates: on this box the main checkout predates the fast-cache unit pair, so
+    # T8 went red with "cache templates are missing under /home/cmux/agent-infra/templates/systemd"
+    # against a worktree that has them. A suite that reads another checkout's fixtures is not testing
+    # this one, and the red is indistinguishable from the code being wrong.
     HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
     DISK_REAPER_STATE_DIR="$T/t8/home/.pi/agent/state" \
+    TEMPLATES_DIR="$HERE/../templates/systemd" \
     SYSTEMD_UNIT_DIR="$T/t8/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t8/calls.log" \
     bash "$INST" "$@"
 }
@@ -3453,6 +3503,57 @@ assert_contains "$OUT" "the git probe did not finish within 5s" \
     "T63 a probe killed by the BOUND is named as a timeout, not as a git that said nothing"
 assert_absent "$OUT" "<git gave no message>" \
     "T63 ... and is never reported as the empty-stderr shape it is not"
+
+# ── T64: the `runner-cache` class is PINNED to this fixture, not to the box (#4169 review P1) ────
+# WHAT WAS WRONG: the class inherited `/opt/gh-runner*` and `/tmp/actions-runner*` in every `--apply`
+# case of this file, so it could and did reap the real box. WHAT THESE ROWS PIN is both halves — that
+# the population it scans is the FIXTURE (so a future edit cannot quietly restore the defaults), and
+# that the pin does not make the class INERT (a pinned-to-nowhere class reads a measured zero forever
+# and looks healthy, which is the failure mode `--only` refusals exist to prevent). The reading is in
+# the OWNER's log, which is the only durable record of WHICH population a pass walked.
+ENVNAME=t64
+PIN_INST="$T/scratch/rc/gh-runner-pin"
+mkdir -p "$PIN_INST/bin" "$PIN_INST/_work/_temp" "$PIN_INST/_diag" "$PIN_INST/.cache/uv"
+: >"$PIN_INST/bin/Runner.Listener"
+dd if=/dev/zero of="$PIN_INST/.cache/uv/blob" bs=1M count=3 >/dev/null 2>&1
+RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
+OUT="$(run_reaper --dry-run 2>&1)"
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "install_globs=$T/scratch/rc/gh-runner-*" \
+    "T64 the class scans THIS fixture's installs (the log names the population it walked)"
+assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/opt/gh-runner" \
+    "T64 and never inherits the box's real /opt install glob"
+assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/tmp/actions-runner" \
+    "T64 nor the pool's real /tmp root"
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "installs=1" \
+    "T64 the pinned population is the fixture install — installs=1, not a measured zero"
+# The armed half: the class still DOES its work, on the fixture. Without this row a pin to a path that
+# matches nothing would pass every assertion above and the class would be inert by construction.
+OUT="$(run_reaper --apply --only runner-cache 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T64 an apply pass over the pinned class exits 0"
+assert_dir "$PIN_INST" "T64 the fixture INSTALL is never a candidate (only its cache is)"
+assert_nodir "$PIN_INST/.cache" "T64 the FIXTURE's cache is what the armed pass reclaimed"
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "reaped=1" \
+    "T64 and the log records the removal, so the pin is not a silent no-op"
+
+# ── T65: an UNSIZED candidate's path is published intact (#4169 review, P3) ──────────────────────
+# The owner emits `REAP ?MB <path> kind=…` when `du` cannot size a candidate, and the parse here used
+# a digits-REQUIRED pattern, so the size token stayed glued to the front of the path: the row was
+# counted correctly (a `?` is still a candidate) but the operator's ONLY locator read `REAP ?MB /opt/…`.
+# A broken `du` is the natural fixture — it is the real cause of a `?` row, so nothing is stubbed that
+# the production path would not itself hit.
+ENVNAME=t65
+UNS_INST="$T/scratch/rc/gh-runner-unsized"
+mkdir -p "$UNS_INST/bin" "$UNS_INST/_work/_temp" "$UNS_INST/_diag" "$UNS_INST/.cache/uv"
+: >"$UNS_INST/bin/Runner.Listener"
+printf 'x\n' >"$UNS_INST/.cache/uv/blob"
+OUT="$(REAP_RC_DU_BIN="$T/no-such-du-binary" run_reaper --dry-run --only runner-cache 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T65 a dry run holding an unsized candidate still reports work present (rc=5)"
+assert_contains "$OUT" "? bytes unmeasured" \
+    "T65 an unsized candidate is COUNTED, never dropped for having no byte figure"
+assert_contains "$OUT" "class=runner-cache (? bytes unmeasured — the owner could not size it) $UNS_INST/.cache" \
+    "T65 and its path is published INTACT — the ?MB token is stripped off the locator"
+assert_absent "$OUT" ") REAP ?MB" \
+    "T65 no published locator leaks the owner's unsized size token (the pre-fix row read \"… ) REAP ?MB /path\")"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

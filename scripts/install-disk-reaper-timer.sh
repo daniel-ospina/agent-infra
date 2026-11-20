@@ -1200,9 +1200,17 @@ install_cache_trigger_units() {
     # the install BEFORE the clock starts, never after. This asks the one question that matters for THIS
     # unit — does its ExecStart carry `--size-trigger` — because without that flag the 10-minute timer
     # would run the FULL pass 144 times a day, which is the opposite of what it is for.
-    got="$($SC cat "$CACHE_UNIT_NAME.service" 2>/dev/null)" || got=""
+    # ⛔ AND IT GOES THROUGH `unit_text_effective`, NOT A BARE `$SC cat` (#4169). A direct `cat` asked a
+    # manager that cannot answer under `target=override` — where the installed FILE *is* the artifact,
+    # because the unit dir is an override dir the manager never loaded — so every override install
+    # REFUSED here, including the suite's own fixture: 26 installer assertions red, and no way to see
+    # from them that the unit was perfectly fine. That is the "two readers of one fact" defect this
+    # file already removed twice (#1872/#4034): the hourly unit's read-back has always used this same
+    # shared reader, which prefers the manager where the manager is authoritative and falls back to the
+    # file where it is not. One reader, both units.
+    got="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$CACHE_UNIT_NAME.service" 2>/dev/null)" || got=""
     if [ -z "$got" ]; then
-        err "REFUSING to report the fast cache pass as installed: \`$SC cat $CACHE_UNIT_NAME.service\` answered nothing"
+        err "REFUSING to report the fast cache pass as installed: the installed $CACHE_UNIT_NAME.service could not be READ BACK from the $TARGET artifact (target dir $UNIT_DIR)"
         return 1
     fi
     if ! grep -q -- '--size-trigger' <<<"$got"; then
@@ -1513,7 +1521,8 @@ do_status() {
         fi
         return 0
     fi
-    if ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
+    if ! _hourly="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$UNIT_NAME.service" 2>/dev/null)" \
+       || [ -z "$_hourly" ]; then
         log_line "installed=no"
         return 1
     fi
@@ -1531,7 +1540,8 @@ do_status() {
     # whose package cache has no clock at all. Reported, never fatal: the hourly pass still covers every
     # class (this one at a cadence that cannot hold a reserve), so a missing fast pass is a WARNING with
     # a named remedy rather than a red that would hide the hourly unit's own verdict.
-    if $SC cat "$CACHE_UNIT_NAME.service" >/dev/null 2>&1; then
+    if _cache_unit="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$CACHE_UNIT_NAME.service" 2>/dev/null)" \
+       && [ -n "$_cache_unit" ]; then
         _cache_timer_active="$($SC is-active "$CACHE_UNIT_NAME.timer" 2>/dev/null || echo no)"
         log_line "cache_pass_installed=yes"
         log_line "cache_pass_timer_active=${_cache_timer_active:-unknown}"
@@ -1616,15 +1626,24 @@ do_uninstall() {
         return 0
     fi
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+    # ⛔ THE FAST-CACHE PAIR IS PART OF THIS INSTALL AND GOES WITH IT (#4169). `--install` writes TWO
+    # unit pairs — the hourly pass and the 10-minute size-triggered cache pass — and this verb removed
+    # only the first, then printed "uninstalled" and exited 0 while `eldato-disk-reaper-cache.timer`
+    # stayed ENABLED. Measured (T51): four files installed, two left behind, rc 0 — an armed ten-minute
+    # timer still firing the reaper after the operator uninstalled it, which is the exact shape the
+    # read-back below exists to catch. The per-target arms and the verification now cover both pairs.
+    $SC disable --now "$CACHE_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    local _h_svc="$UNIT_DIR/$UNIT_NAME.service" _h_tim="$UNIT_DIR/$UNIT_NAME.timer"
+    local _c_svc="$UNIT_DIR/$CACHE_UNIT_NAME.service" _c_tim="$UNIT_DIR/$CACHE_UNIT_NAME.timer"
     # Same rule as the install: the file op follows the TARGET. For a user unit the files are the
     # user's own, so a `rm -f` through `${SUDO-sudo -n}` fails silently and the box reports itself
     # uninstalled while the (armed) unit files remain for the next daemon-reload to resurrect.
     case "$TARGET" in
-        user) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        user) rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=user)"; return 1; } ;;
-        override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        override) rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=override)"; return 1; } ;;
-        *)    ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        *)    ${SUDO-sudo -n} rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=system)"; return 1; } ;;
     esac
     $SC daemon-reload >/dev/null 2>&1 || true
@@ -1637,7 +1656,7 @@ do_uninstall() {
     # unit is REPORTED, not failed — a cell can legitimately carry a system-scope install while an
     # operator uninstalls a user-scope one, and failing that would be a false block on the only way to
     # remove it (measured: a real /etc/systemd/system install made every user-target uninstall rc=1).
-    if [ -e "$UNIT_DIR/$UNIT_NAME.service" ] || [ -e "$UNIT_DIR/$UNIT_NAME.timer" ]; then
+    if [ -e "$_h_svc" ] || [ -e "$_h_tim" ] || [ -e "$_c_svc" ] || [ -e "$_c_tim" ]; then
         err "NOT reporting this as uninstalled — the unit files are STILL PRESENT in $UNIT_DIR (target=$TARGET)"
         err "(an enabled timer here still fires the armed pass; remove them as the right user, then re-run)"
         return 1
@@ -1653,8 +1672,12 @@ do_uninstall() {
              $(printf '%s' "${DISK_REAPER_EXTRA_SCOPES:-}" | tr ':' ' '); do
         [ -n "$d" ] || continue
         [ "$d" = "$UNIT_DIR" ] && continue
-        if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
-            err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
+        _also=""
+        for _u in "$UNIT_NAME" "$CACHE_UNIT_NAME"; do
+            if [ -e "$d/$_u.service" ] || [ -e "$d/$_u.timer" ]; then _also="${_also}${_also:+, }$_u"; fi
+        done
+        if [ -n "$_also" ]; then
+            err "note: $_also is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
             err "      an enabled timer THERE still fires the armed pass; uninstall it from that scope"
         fi
     done

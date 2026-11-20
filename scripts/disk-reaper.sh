@@ -1172,7 +1172,11 @@ if [ -n "$STATE_DIR_PRIMARY_NOTE" ]; then
     export REAP_RW_STATE_DIR="${REAP_RW_STATE_DIR:-$STATE_DIR}"
     export REAP_RW_LOG="${REAP_RW_LOG:-$STATE_DIR/reap-runner-work.log}"
     export REAP_RC_STATE_DIR="${REAP_RC_STATE_DIR:-$STATE_DIR}"
-    export REAP_RC_LOG="${REAP_RC_LOG:-$STATE_DIR/reap-runner-cache.log}"
+    # ⛔ THE FILENAME IS THE OWNER'S OWN DEFAULT (`reap-runner-cache.sh`: `$STATE_DIR/runner-cache-reap.log`).
+    # It used to read `reap-runner-cache.log` here, and the owner neither honoured this seam nor used that
+    # name — so the fallback path silently wrote a DIFFERENT log from the normal path, on the one pass
+    # (a full disk) where the log is the only record anyone reads afterwards (#4169 review, P3).
+    export REAP_RC_LOG="${REAP_RC_LOG:-$STATE_DIR/runner-cache-reap.log}"
     # Scratch too: the bounded probes and the venv owner's `mktemp` would otherwise still target the
     # exhausted filesystem. `tb_bound_tmp` is lazy and idempotent, so the retry below only creates the
     # scratch that the earlier attempt could not.
@@ -2863,8 +2867,12 @@ reap_runner_work() {
 # MEASURED (2026-11-19, five cells): every runner install keeps its own unbounded `.cache` under the
 # install root — `/opt/gh-runner-x64/.cache` **40.7 GB**, `/opt/gh-runner-cell4/.cache` 38.1 GB,
 # `/opt/gh-runner-x64-4/.cache` **50.1 GB** on cell-2, five installs at 13–27 GB on cell-1. A one-pass
-# `rm -rf /opt/gh-runner-*/.cache` reclaimed **≈445 GB across those five boxes** (cell-4 went 2.3 GB →
-# 116 GB free) and no work was lost. ⛔ IT IS A PIPELINE DEFECT, NOT TIDINESS: the runner ceiling is
+# RECURSIVE DELETE of the installs' `.cache` reclaimed **≈445 GB across those five boxes** (cell-4 went
+# 2.3 GB → 116 GB free) and no work was lost. ⛔ THE COMMAND IS NOT SPELLED HERE ON PURPOSE: T6 of
+# `disk-reaper.test.sh` pins that THIS entry point owns no delete rule (its only recursive delete is
+# its own lock), so writing the operator's one-liner into this comment reddens a static pin that is
+# correct — the fix is to keep the prose, not to relax the pin. Spelled in full in `docs/ops/disk-reaper.md`.
+# ⛔ IT IS A PIPELINE DEFECT, NOT TIDINESS: the runner ceiling is
 # DISK-BOUND (`per_runner_disk_mb ≈ 8409`, `DISK_RESERVE_MB = 20480` in `runner_autoscale.py`), so at
 # 2–8 GB free `by_disk` pins the ceiling to **1** and the box cannot add capacity (#4004 is the same
 # symptom from the other side). None of the five classes above matched this sink, so the hourly pass
@@ -3070,7 +3078,13 @@ reap_runner_cache() {
             case "$line" in
                 "REAP "*)
                     size="$(printf '%s' "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+MB$/) {print $i; exit}}')"
-                    path="$(printf '%s' "$line" | sed -E 's/^ *REAP +[0-9]+\??MB +//; s/ +kind=.*$//')"
+                    # ⛔ `[^ ]*MB`, NOT `[0-9]+\??MB`. The owner emits `REAP ?MB <path> kind=…` when `du`
+                    # could not size a candidate, and a digits-required pattern left the size token IN the
+                    # path — the row was counted (the size branch below handles `?`) but the operator's only
+                    # locator read `REAP ?MB /opt/…`, in the very branch whose comment says a `?` row "is
+                    # still a CANDIDATE" (#4169 review, P3). The token never contains a space, and the
+                    # pattern is anchored, so this cannot swallow any of the path.
+                    path="$(printf '%s' "$line" | sed -E 's/^ *REAP +[^ ]*MB +//; s/ +kind=.*$//')"
                     size="${size%MB}"
                     all_c=$((all_c + 1))
                     case "$size" in
