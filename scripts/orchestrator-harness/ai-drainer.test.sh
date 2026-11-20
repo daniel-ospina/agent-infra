@@ -28,6 +28,16 @@ set -uo pipefail
 # green on a roomy runner, red on a full one. All four are required, and they must be EXPORTED (a
 # bare assignment is a shell variable, not the environment; TREE defaults to 350 MB when unstated).
 # A case that wants a different floor sets it on that command's own `env` prefix.
+#
+# ⛔ THE SAME IS TRUE OF THE DRAINER'S DISK TERM (agent-infra#2159), AND IT NEEDS NO FIFTH TERM: the
+# three lane terms are 0 here, so the predicate returns `need = max(0,0) + 0 = 0`, and an explicit 0
+# DISABLES the term (`disk=off` on the line). Every arm therefore plans from cores and memory, exactly
+# as before the term existed — which is what the `(e4)`/`(e5)`/`(e6)` rows assert. An arm about the
+# term itself states its own numbers (`RUN_DISK_FREE_MB`/`RUN_DISK_LANE_NEED_MB`/`RUN_DISK_MIN_FREE_MB`),
+# or hands the terms back to the module with `RUN_DISK_TERMS_UNSET=1` so its CLASSIFICATION is what is
+# under test. ⛔ AND THE FOUR NON-VACUITY ARMS RUN MUTANT COPIES FROM `$ROOT`, where no `spawn-gate.sh`
+# sits beside the script — so the drainer must DEGRADE (a named NOTE, cores+memory) rather than fail
+# closed on an unavailable predicate, or those arms dispatch nothing and prove nothing.
 export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,6 +121,15 @@ chmod +x "$DISPATCH"
 #   RUN_PRESSURE    the Darwin `kern.memorystatus_vm_pressure_level` to assume (1|2|4|unreadable)
 #   RUN_MAX_PRESSURE  MAX_MEM_PRESSURE_LEVEL (the Darwin refuse-at threshold)
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
+#   RUN_DISK_FREE_MB   DISK_FREE_MB — the free-disk PROBE seam (agent-infra#2159). Stated ⇒ used for the
+#                   plan AND for the in-loop re-ask, so an arm that injects it is hermetic.
+#   RUN_DISK_LANE_NEED_MB  DISK_LANE_NEED_MB — the per-lane requirement. `0` DISABLES the disk term.
+#   RUN_DISK_MIN_FREE_MB   DISK_MIN_FREE_MB — the floor the ceiling subtracts (suite default 1).
+#   RUN_SPAWN_GATE_MOD  the module carrying the disk predicate   default: this directory's
+#                   spawn-gate.sh — the REAL one, so the suite exercises the shipped predicate rather
+#                   than a stub of it. Point it at a counter stub to model a disk that MOVES mid-tick.
+#   RUN_NO_SPAWN_GATE_MOD  1 ⇒ NO module at all (the mutant-copy shape). A distinct flag because
+#                   `${VAR:-default}` cannot express "explicitly empty" — see `_drainer_env`.
 #   RUN_LO_MOD      live-ownership.sh (the cwd witness, #2800)     default: resolved by the drainer
 #   RUN_LO_CWD_PROBE  the probe COMMAND lo_cwd_rows uses (ls / lsof)  default: resolved by the module
 #                   (a counting stub pins "one probe per removal", #2800 review round 2)
@@ -119,6 +138,23 @@ chmod +x "$DISPATCH"
 #                   only be OBSERVED from a CWD that holds lane-shaped filenames)
 _drainer_env() { # <tag> → echoes the env assignments, one per line (callers use `env`)
   local o="$ROOT/o-$1" ai="$ROOT/ai-$1"
+  # ⛔ THE DISK TERMS ARE EMITTED EXPLICITLY, AND THEY CAN ALSO BE HANDED BACK TO THE MODULE.
+  # The suite exports `DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0` at the top so its
+  # verdict never depends on the host, and `0` is a STATED value the predicate honours — so the default
+  # here reproduces that neutralisation rather than inheriting whatever the operator's shell carries.
+  # `RUN_DISK_TERMS_UNSET=1` emits them EMPTY instead, which `is_limit` rejects, so the module derives
+  # its own class defaults: that is the ONLY way an arm can exercise the classification (and the only
+  # way "2,064 MB, not the 8,144 repo-blind worst case" can be falsified).
+  local _dt="${RUN_DISK_TREE_MB:-${DISK_LANE_TREE_MB:-0}}"
+  local _ds="${RUN_DISK_SELF_MB:-${DISK_LANE_SELF_MB:-0}}"
+  local _dr="${RUN_DISK_RESERVE_MB:-${DISK_LANE_RESERVE_MB:-0}}"
+  if [ "${RUN_DISK_TERMS_UNSET:-0}" = 1 ]; then _dt=""; _ds=""; _dr=""; fi
+  # `RUN_SPAWN_GATE_MOD` cannot express "explicitly empty" through `${…:-default}` (an empty value is
+  # treated as unset, so the default wins) — and "empty" is a STATE this suite must be able to test:
+  # it is the shape of every mutant copy run out of `$ROOT`, which has no module beside it.
+  local _sg="$HERE/spawn-gate.sh"
+  [ -n "${RUN_SPAWN_GATE_MOD:-}" ] && _sg="$RUN_SPAWN_GATE_MOD"
+  [ "${RUN_NO_SPAWN_GATE_MOD:-0}" = 1 ] && _sg=""
   # The channel: the fixture seed by default, `RUN_FLEET_REPO` to name one, and `RUN_NO_FLEET_REPO=1` for
   # "nothing configured" — a state the drainer must REFUSE by name rather than resolve to a lane checkout.
   local _fleet_v="${RUN_FLEET_REPO:-$SEED}"
@@ -135,6 +171,10 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "PROC_ROOT=${RUN_PROC_ROOT:-/proc}" "WTL=${RUN_WTL:-}" \
     "LO_MOD=${RUN_LO_MOD:-}" \
     "LO_CWD_PROBE=${RUN_LO_CWD_PROBE:-}" \
+    "DISK_FREE_MB=${RUN_DISK_FREE_MB:-}" "DISK_LANE_NEED_MB=${RUN_DISK_LANE_NEED_MB:-}" \
+    "DISK_MIN_FREE_MB=${RUN_DISK_MIN_FREE_MB:-${DISK_MIN_FREE_MB:-1}}" \
+    "DISK_LANE_TREE_MB=${_dt}" "DISK_LANE_SELF_MB=${_ds}" "DISK_LANE_RESERVE_MB=${_dr}" \
+    "SPAWN_GATE_MOD=${_sg}" \
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
     "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
@@ -186,6 +226,8 @@ reset_run() {
   RUN_PROC_ROOT=; RUN_WTL=
   RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   RUN_LO_MOD=; RUN_LO_CWD_PROBE=
+  RUN_DISK_FREE_MB=; RUN_DISK_LANE_NEED_MB=; RUN_DISK_MIN_FREE_MB=; RUN_SPAWN_GATE_MOD=
+  RUN_DISK_TREE_MB=; RUN_DISK_SELF_MB=; RUN_DISK_RESERVE_MB=; RUN_DISK_TERMS_UNSET=0; RUN_NO_SPAWN_GATE_MOD=0
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -516,6 +558,276 @@ RUN_NCPU=4 RUN_LOAD=3100 RUN_TARGET=2                     # 31.00 < 32.00 → al
 run_drainer_fg e7b
 check "(e7) one notch under it (31.00 of 32.00) the tick DOES dispatch" \
   '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 2 ]' "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+
+reset_run
+# ── THE DISK TERM (agent-infra#2159) ─────────────────────────────────────────────────────────
+# ⛔ THE REGRESSION THIS SECTION EXISTS FOR, VERBATIM FROM THE LIVE LOG (pi-cell-4, 2026-11-19
+# 23:28:03Z): `START: target=22 … dispatching 7` on a box with 1.7 GB free, then
+# `[disk-gate] REFUSED … DISK-NOHEADROOM … free=1.7GB, need=2.0GB`, then
+# `FAIL: dispatcher refused … dispatched 0 of 7` and the UNIT WENT RED — for a box fact, on a target
+# it could never reach. Arm (k2) is that exact reading.
+
+# ── (k-real) THE PER-LANE NEED IS THE SHIPPED PREDICATE, AND IT IS 2,064 MB ON A HARNESS SEED ──
+# Not 8,144 — that is `disk_worktree_need`, the repo-blind PRE-START worst case, and using it here
+# would plan 1 lane where ~5 fit. This arm pins the number so a future "harmonise the two seams"
+# change reddens it instead of silently quartering the box's lane count.
+RUN_NCPU=16 RUN_MEM=16000 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500 RUN_DISK_FREE_MB=12000
+RUN_DISK_TERMS_UNSET=1
+run_drainer_fg kreal
+check "(k-real) a harness seed needs 2,064 MB — the live arm's pair, not the 8,144 pre-start worst case" \
+  'grep -q "need=2064MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k-real) …and 12,000 MB free above a 500 MB floor is 5 lanes of that size" \
+  'grep -q "disk=5 " "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 5 ]' \
+  "$(grep -E 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k0) THE TARGET LINE'S FIELD ORDER IS INTACT — the 4-field `read` would fold the disk fields ──
+# `read -r a b c d <<<"1 2 3 4 5"` puts "4 5" in `d`. `mem_pool` is what carries that risk, and
+# NOTHING asserted it before, so a fifth field could have landed as `pool=1488 5 12000 3000MB`.
+check "(k0) mem_pool is still ONE number (a trailing field would have been folded into it)" \
+  'grep -Eq "pool=[0-9]+MB@75%/512MB[)]" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=5 free=12000MB need=2064MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k1) THE DISK CEILING BINDS, AND IT IS THE MINIMUM OF THREE ───────────────────────────────
+# 16 cores → cpu 40; 16,000 MB → mem 22; (12,000−500)/3,000 → disk 3. Disk wins: target=3.
+RUN_NCPU=16 RUN_MEM=16000 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=12000 RUN_DISK_LANE_NEED_MB=3000
+run_drainer_fg k1
+check "(k1) the disk binds below cpu and memory → target 3, and all three terms are printed" \
+  'grep -q "target=3 (cpu=40 mem=22" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=3 free=12000MB need=3000MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k1) …and exactly 3 lanes are dispatched, no more" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 3 ]' \
+  "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+
+reset_run
+# ── (k2) ⛔ THE INCIDENT: 1.7 GB FREE, 2,064 MB PER LANE → NOTHING DISPATCHED, EXIT 0 ──────
+# Before this change the same reading produced `target=22 … dispatching 7`, one spawn-gate refusal,
+# and a RED unit. A full volume is a fact about the box, so the tick must end GREEN and NAME it.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=1721 RUN_DISK_LANE_NEED_MB=2064
+run_drainer_fg k2
+check "(k2) 1,721 MB free at 2,064 MB per lane → target 0, nothing dispatched" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "disk=0 free=1721MB need=2064MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1) dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+check "(k2) …and the tick is a NAMED skip, EXIT 0 — not a failed unit" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "SKIP: nothing to add" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC"
+
+reset_run
+# ── (k3) THE FLOOR IS SUBTRACTED — 1,499 free is 0 lanes, 1,500 free is 1 ────────────────────
+# need=1000, floor=500. Dropping the subtraction gives floor(1499/1000)=1 — one lane on a box that
+# has NOT kept its reserve. This is why the boundary is 1499 and not 2564 (both readings agree there).
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=1499 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k3a
+check "(k3) 1,499 MB free with a 500 MB floor → 0 lanes (the reserve is not spent on a lane)" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "disk=0 free=1499MB need=1000MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+RUN_DISK_FREE_MB=1500
+run_drainer_fg k3b
+check "(k3) one more megabyte (1,500) → exactly 1 lane" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 1 ] && grep -q "disk=1 free=1500MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1) dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+
+reset_run
+# ── (k4) AN UNREADABLE READING FAILS CLOSED, BY NAME — the required direction here ─────────────
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=unreadable RUN_DISK_LANE_NEED_MB=2064
+run_drainer_fg k4
+check "(k4) an unreadable free-disk seam FAILS the tick naming the seam, dispatching nothing" \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "DISK_FREE_MB=.unreadable. is not a whole number of MB — a STATED seam" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4b) ⛔ AN UNAVAILABLE MODULE DEGRADES — IT DOES NOT TAKE THE BOX TO ZERO ─────────────────────
+# This arm was written the other way round (expecting a fail-closed tick) and the SUITE corrected it:
+# four of its own non-vacuity arms run a MUTANT COPY of the drainer from a temp dir, where no
+# `spawn-gate.sh` sits beside it — a fail-closed probe made those runs dispatch ZERO lanes and exit 1
+# before reaching the code under test. That is the field shape too (a runtime dir seeded without the
+# module), and an INERT drainer is worse than a disk term that is absent: the box would dispatch
+# nothing, for ever, quietly. So an unavailable predicate keeps the pre-#2159 behaviour and says so.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_SPAWN_GATE_MOD="$ROOT/no-such-spawn-gate.sh"
+run_drainer_fg k4b
+check "(k4b) an unavailable module still DISPATCHES (cores+memory) — the box is not left inert" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -q "disk=off" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k4b) …and the degradation is NAMED with its remedy, not silent" \
+  'grep -q "the disk term is DISABLED for this tick" "$LAST_AI/logs/ai-drainer.log" && grep -q "SPAWN_GATE_MOD=.* is not a readable file" "$LAST_AI/logs/ai-drainer.log" && grep -q "SPAWN_GATE_MOD states it outright" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep 'NOTE:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k4b) …and it does NOT read as the deliberate need=0 (the two reasons are distinguishable)" \
+  '! grep -q "DISK_LANE_NEED_MB=0 — an explicit" "$LAST_AI/logs/ai-drainer.log"'
+
+reset_run
+# ── (k4e) NO MODULE ANYWHERE: the reason names the TWO paths it searched (the field shape the suite's
+# own non-vacuity arms depend on). Those arms run a copy of the drainer out of `$ROOT`, where `$SELF_DIR`
+# is `$ROOT` — so this arm runs a COPY too, which is the only way to reach that branch from here.
+cp "$DRAINER" "$ROOT/drainer-copy-k4e.sh"
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_NO_SPAWN_GATE_MOD=1
+run_drainer_fg k4e "$ROOT/drainer-copy-k4e.sh"
+check "(k4e) with no module beside it, a COPY still dispatches and names BOTH searched paths" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -qF "looked at $ROOT/o-k4e/spawn-gate.sh and $ROOT/spawn-gate.sh" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep 'NOTE:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4c) A STATED SEAM IS VALIDATED BEFORE THE DEGRADE DECISION (order, measured) ────────────
+# With `DISK_FREE_MB=unreadable` AND an unreachable module, the first build took the degrade branch
+# and silently DISCARDED the garbage seam — the tick dispatched on cores+memory instead of refusing a
+# value an operator typed wrong. A stated-but-unreadable seam is a fault in the READING, so it fails
+# closed even when the improvement is also absent.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_FREE_MB=unreadable
+RUN_SPAWN_GATE_MOD="$ROOT/no-such-spawn-gate.sh"
+run_drainer_fg k4c
+check "(k4c) a garbage seam FAILS even when the module is also unreachable (the seam is not discarded)" \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "is not a whole number of MB — a STATED seam that cannot be read" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4d) AN OUT-OF-RANGE SEAM IS REFUSED, NOT WRAPPED INTO A NEGATIVE ──────────────────────────
+# MEASURED: `9223372036854775808` converts to a NEGATIVE, then `disk_free − DISK_MIN_FREE_MB` wraps
+# back to a large POSITIVE, so `[ "$headroom" -ge 0 ]` cannot catch it and the disk term silently never
+# binds (the line even printed `free=-9223372036854775808MB`). The cap is the module's own `is_limit`
+# rule (<=9 digits), not an invention of this file.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_FREE_MB=9223372036854775808
+run_drainer_fg k4d
+check "(k4d) a 19-digit seam is REFUSED by name (it would wrap and disable the term silently)" \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "is 19 digits; this seam is capped at 9" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4f) THE FLOOR SEAM'S WIDTH IS TESTED ON THE RAW STRING, BEFORE `10#` ────────────────────────
+# ⛔ MEASURED (review round 2): `DISK_MIN_FREE_MB=18446744073909551616` is 20 digits and `10#` WRAPS it
+# to `200000000`, which PASSES both the `>= 1` and `<= 249999999` bounds. So a range check applied after
+# the conversion cannot see the wrap: the floor became 200,000,000 MB, the ceiling floored to 0, and the
+# tick logged `disk=0 free=4000MB need=1000MB disk_floor=200000000MB` at rc 0 with **no WARN at all** —
+# an inert drainer presented as a measured box fact. The width rule must run on the string, like
+# `spawn-gate.sh:203`'s `is_limit`.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=18446744073909551616
+RUN_DISK_FREE_MB=4000 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k4f
+check "(k4f) a 20-digit floor is caught on the RAW string and falls back to 500 — not wrapped in-band" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "WARN: DISK_MIN_FREE_MB=.*is 20 digits" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk_floor=500MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "disk_floor=200000000MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'WARN: DISK_MIN_FREE_MB' "$LAST_AI/logs/ai-drainer.log" | head -1) $(grep 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k4f) …and the term still BINDS (3 lanes fit in 4000-500 over 1000) — the wrap would have made it 0" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "disk=[3-9]" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4g) A MODULE THAT ANSWERS A NON-NUMBER IS *NOT* THE FAIL-CLOSED ARM — IT IS UNKNOWN ───────
+# Round 2 proved the removed arms could never fire: `_disk_probe` digit-validates its own reading, so a
+# module answering `abc` hands back nothing and is indistinguishable from UNKNOWN. The behaviour is
+# therefore DEGRADE (rc 0, named NOTE, `disk=off`), and this arm pins it so the two shapes cannot
+# silently swap back into a claim the code does not implement.
+mkdir -p "$ROOT/o-k4g"
+printf '%s\n' \
+  'disk_free_mb() { printf "abc"; }' \
+  'disk_lane_costs() { printf "1"; }' \
+  'disk_lane_need() { printf "1000"; }' \
+  > "$ROOT/o-k4g/spawn-gate.sh"
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500 RUN_SPAWN_GATE_MOD="$ROOT/o-k4g/spawn-gate.sh"
+run_drainer_fg k4g
+check "(k4g) a module answering a non-number DEGRADES (rc 0, named NOTE, disk=off) — not a silent FAIL arm" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "NOTE: the disk term is DISABLED" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=off" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'NOTE: the disk term' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+# ⛔ AND IT MUST PROVE THE MODULE WAS *CONSULTED* (round 3). The three clauses above are satisfied
+# VERBATIM by a run in which NO module was found at all, so on their own they cannot tell "sourced and
+# answered abc" from "never looked for" — the exact defect round 2 raised against (k4e) and fixed
+# there. The probe's own reason is the distinguishing text, and it names the file.
+check "(k4g) …and it PROVES the stub was sourced (not merely absent) — the reason names the file and says it did not answer" \
+  'grep -qF "$ROOT/o-k4g/spawn-gate.sh is present and was sourced but did not answer the disk question" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'NOTE: the disk term' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4h) THE FLOOR AGREES WITH `spawn-gate.sh` ON THE ZERO SHAPE, NOT ONLY ON THE WIDTH ─────────
+# ⛔ MEASURED (review round 3): `spawn-gate.sh`'s `is_num` rejects every `0*` form, so the gate resolves
+# `DISK_MIN_FREE_MB=007` to **500 MB** — while the drainer's hand-copied rule accepted it as **7 MB**.
+# The planner would floor on 7 MB and plan lanes the gate then refuses at rc 77: two answers to "is this
+# volume full" for one volume, which is the class #3395 removed. Both halves are pinned below.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=007
+RUN_DISK_FREE_MB=4000 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k4h
+check "(k4h) a leading-zero floor resolves to 500 — the answer spawn-gate.sh gives, not 7" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "WARN: DISK_MIN_FREE_MB=.*has a leading zero" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk_floor=500MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "disk_floor=7MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'WARN: DISK_MIN_FREE_MB' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+# ⛔ AND THE GATE'S ANSWER IS RESOLVED BY EXECUTION, NOT BY GREPPING ITS SOURCE (review round 4).
+# The round-3 version asserted one link of a three-link chain (`is_num` rejects `0*`) and would stay
+# green if `spawn-gate.sh:203` stopped routing the floor through `is_limit` — a live risk, because that
+# same file already chose a `case` validator over `is_num` for disk readability, on purpose. Sourcing
+# the module in a subshell makes the arm fail on a SEMANTIC divergence instead of on a reformat.
+GATE_FLOOR_007=$(DISK_MIN_FREE_MB=007 bash -c '. "$1" >/dev/null 2>&1; printf %s "$DISK_MIN_FREE_MB"' _ "$HERE/spawn-gate.sh" 2>/dev/null)
+check "(k4h) …and the GATE resolves that same 007 to 500 — the SAME floor, resolved by the gate itself" \
+  '[ "$GATE_FLOOR_007" = "500" ]' \
+  "gate resolved 007 -> '$GATE_FLOOR_007' (want 500)"
+
+reset_run
+# ── (k5) AN EXPLICIT `need = 0` DISABLES THE TERM, SAYS SO, AND DOES NOT CRASH ─────────────────
+# `$(( x / 0 ))` KILLS the shell — so a divisor taken before this branch would abort the tick mid-lock
+# with no FAIL: and no STOP: line at all. The assertion is that the tick SURVIVES and dispatches.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=10 RUN_DISK_LANE_NEED_MB=0
+run_drainer_fg k5
+check "(k5) need=0 does not crash the tick (a bare division would have) and lanes are dispatched" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ]' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+check "(k5) …and the disabled term is STATED on the line, not silently absent" \
+  'grep -q "disk=off (DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k5b) A `need` the MODULE derived as 0 is a DIFFERENT FACT from a seam that said 0 ────────
+# The two reasons must not be conflated: one is an operator's deliberate choice, the other is a
+# module summing zero cost terms. The first build named `DISK_LANE_NEED_MB=0` in BOTH cases — the same
+# wrong-diagnosis class `k4` caught for the module path.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET=
+run_drainer_fg k5b
+check "(k5b) a module-derived need=0 says so, and does NOT claim an operator set DISK_LANE_NEED_MB=0" \
+  'grep -q "disk=off (the predicate answered need=0 MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "DISK_LANE_NEED_MB=0 — an explicit" "$LAST_AI/logs/ai-drainer.log" && [ "$LAST_RC" -eq 0 ]' \
+  "rc=$LAST_RC $(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k6) ⛔ THE TARGET IS STALE BY LANE 2, SO THE LOOP ASKS AGAIN ──────────────────────────────
+# A counter stub models the only thing that makes the re-ask necessary: a disk that FALLS as this tick
+# creates its own worktrees. Reads in order 10000, 6000, 4000, 0 → the tick plans 5, fits 2, stops.
+# With the in-loop check removed, a tick planned at 10,000 MB would dispatch all 5 onto a dead volume.
+printf '%s\n' \
+  'disk_free_mb() { local f="$DISK_COUNTER_FILE" n; n="$(cat "$f" 2>/dev/null || printf 0)"; n=$((n + 1)); printf "%s" "$n" >"$f"; case "$n" in 1) printf 10000 ;; 2) printf 6000 ;; 3) printf 4000 ;; *) printf 0 ;; esac; }' \
+  'disk_lane_costs() { printf "0 0 1000\n"; }' \
+  'disk_lane_need() { local t="${1:-0}" s="${2:-0}" r="${3:-0}" w; if [ "$t" -gt "$s" ]; then w="$t"; else w="$s"; fi; printf "%s\n" "$(( w + r ))"; }' \
+  >"$ROOT/disk-counter-gate.sh"
+# exported, not just assigned: `run_drainer_fg` runs the drainer as a CHILD through `env`, so a bare
+# shell variable would never reach the stub's `$DISK_COUNTER_FILE` and the counter would restart every
+# read — a stub bug that reads exactly like the defect the arm is looking for.
+export DISK_COUNTER_FILE="$ROOT/disk-counter-k6"
+RUN_NCPU=2 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500 \
+  RUN_SPAWN_GATE_MOD="$ROOT/disk-counter-gate.sh"
+run_drainer_fg k6
+unset DISK_COUNTER_FILE
+check "(k6) the tick plans 5 from the first reading, then STOPS at the disk floor after 2" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 2 ] && grep -q "STOP: disk floor — dispatched 2 of 5 lane(s)" "$LAST_AI/logs/ai-drainer.log"' \
+  "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep -E 'STOP:|START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k6) …and that stop is a NAMED box fact, EXIT 0, not a failed unit" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "NOT a tick failure" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC"
+
+reset_run
+# ── (k8) A PIN OVERRIDES THE DERIVED CEILING — BUT NEVER THE HARD GUARD (both halves) ──────────
+# Half 1: pin 6 against a disk ceiling of 3 → the PIN wins (the same structure the swap/load guards
+# already have: those are hard guards, cpu/mem/disk are derived ceilings).
+RUN_NCPU=16 RUN_MEM=16000 RUN_TARGET=6 RUN_DISK_MIN_FREE_MB=500
+RUN_DISK_FREE_MB=4000 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k8a
+check "(k8) a PINNED target is not clamped by the disk ceiling (it is a derived ceiling)" \
+  'grep -q "target=6 (PINNED by TARGET_LANES)" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=3 " "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 6 ]' \
+  "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1) dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+# Half 2: the same pin on a box under the floor → the in-loop hard guard still refuses to create a
+# single worktree. A pin is an operator's call about the TARGET, never about the volume.
+RUN_DISK_FREE_MB=600
+run_drainer_fg k8b
+check "(k8) …but the in-loop HARD GUARD cannot be pinned past — 0 worktrees created" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "STOP: disk floor — dispatched 0 of 6 lane(s)" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep -E 'STOP:|START:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── ARM (f): THE CENSUS COUNTS THE LAUNCHER'S WORKERS TOO (durable terminals have no pidfile) ──

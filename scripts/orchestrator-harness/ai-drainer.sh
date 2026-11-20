@@ -38,10 +38,11 @@
 # a tick must not block the next tick's top-up, and it must still be counted.)
 #
 # ── THE CAPACITY TARGET: a formula, its constants, and why each one ────────────────────────────
-#     target = min( cpu_ceiling , mem_ceiling )               (0 when a hard guard refuses)
+#     target = min( cpu_ceiling , mem_ceiling , disk_ceiling )  (0 when a hard guard refuses)
 #
-#     cpu_ceiling = MAX_LANES = floor(ncpu × 5/2)             ← the fleet's recorded owner ruling
-#     mem_ceiling = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+#     cpu_ceiling  = MAX_LANES = floor(ncpu × 5/2)            ← the fleet's recorded owner ruling
+#     mem_ceiling  = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+#     disk_ceiling = floor( (free_disk − DISK_MIN_FREE_MB) ÷ DISK_LANE_NEED_MB )
 #
 #   * `cpu_ceiling` — **2.5 × cores** is the owner's ruling of 2026-10-17 ("the lane ceiling is 2.5x
 #     the number of CPUs"), the same derivation `orch-loop.sh`/`install.sh` ship as `MAX_LANES`. It is
@@ -58,6 +59,28 @@
 #     77–85 MB RSS on this box and the fleet measures ~250–400 MB per working pass
 #     (`docs/ops/pi-idle-repl-reaper-policy.md`), so 512 MB is the round figure ABOVE the measured
 #     peak — one host, its sub-agent host, and its tool children.
+#   * `disk_ceiling` — **LANES ARE DISK-BOUND TOO, AND THAT TERM WAS MISSING** (agent-infra#2159).
+#     MEASURED on pi-cell-4, 2026-11-19 23:28:03Z, from this file's own log: `START: target=22 …
+#     dispatching 7` on a box with **1.7 GB free** whose per-lane requirement is 2,064 MB. The first
+#     lane was refused by the spawn gate (`DISK-NOHEADROOM REFUSED-DISK(free=1.7GB, need=2.0GB)`), the
+#     tick reported `FAIL: dispatcher refused … dispatched 0 of 7`, and the unit went RED — for a box
+#     fact, with a target the box could never reach and nothing on the line saying so. The reaper
+#     cannot fix that: it reclaims what it can, and this tick re-plans from a number that never
+#     included the disk.
+#
+#     The per-lane need is **NOT a new literal here**. It is `spawn-gate.sh`'s own
+#     `disk_lane_costs` + `disk_lane_need` (`max(tree, self) + reserve`) classified against the
+#     checkout the lanes work, i.e. the same predicate the gate that REFUSES a lane uses — one
+#     number, two adapters (#3395's two-seams-two-numbers defect). On this box that pair answers
+#     **2,064 MB** for a harness seed, which is byte-identical to the `need=2.0GB` in the refusal it
+#     now prevents. ⚠️ The figure is repo-class dependent (a `python_target` seed answers 8,144 MB),
+#     which is why the START line always PRINTS `need=`.
+#
+#     The free reading is `df` column 4, i.e. **`f_bavail`** — `statvfs(3)`: "Number of free blocks
+#     for unprivileged users" — never `Size − Used`. The two differ by the filesystem's root reserve
+#     and MEASURED on this box that difference is ~10 GB (`252G total − 230G used = 22G` computed vs
+#     `12G` actually available): a `Size − Used` derivation would over-report the box's capacity by
+#     ~5 lanes, which is the false-PASS direction.
 #   * The LOAD arm does not size the target; it refuses to ADD work. At `load1 ≥ 8 × ncpu`
 #     (`LPC_CEILING=8`) the box is past the fleet's own "do not place here" line
 #     (`CAP_LPC_CEILING=800`, `docs/ops/fleet-capacity.md` §5), so the tick dispatches nothing and says
@@ -106,8 +129,15 @@
 #     lanes, never overlapping ones) arriving as a long SILENT-IN-EFFECT stall: it surfaces only as a
 #     repeating SKIP line, so watch for it on a box that stops topping up with lanes still alive. The
 #     single knobs are `SLICE_TOTAL`/`SLICE_WIDTH` (more windows) or the lane term itself.
-#   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
-#     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
+#   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory,
+#     by the cpu ceiling AND by the disk, and each lane is one dispatcher call (not a fork fan-out).
+#     ⛔ AND THE DISK IS ASKED AGAIN IMMEDIATELY BEFORE EACH `git worktree add`: the target is computed
+#     once at tick start and free space SHRINKS as the tick creates its own worktrees, so by lane 2
+#     the planned number is stale in exactly the direction that fails. The second ask is a HARD GUARD
+#     (a `TARGET_LANES` pin cannot bypass it — see the pin note at the call site). ⚠️ UNLESS
+#     `DISK_FREE_MB` IS STATED: an injected reading IS the reading, so the re-ask compares that same
+#     value and the guard is FROZEN rather than live (`DISK_FREE_MB` is a test/operator seam — the
+#     `k6` arm models a moving disk with a stub MODULE for exactly that reason).
 #
 # ── ENV (every path/label overridable; defaults are the shipped layout) ────────────────────────
 #   O                 controller runtime dir — holds `bg/` (dispatcher + per-lane pidfiles)
@@ -128,6 +158,19 @@
 #   LANE_MEM_MB       resident budget per lane (MB)                  default: 512  (see above)
 #   MEM_BUDGET_PCT    share of the available pool the target may use  default: 75
 #   MIN_MEM_FREE_MB   memory floor a lane may not eat into (MB)       default: 512
+#   DISK_MIN_FREE_MB  disk floor a lane may not eat into (MB)         default: 500
+#                     ⛔ THE SAME DECLARATION `spawn-gate.sh` USES ("${DISK_MIN_FREE_MB:-${MIN_FREE_MB:-500}}",
+#                     clamped to [1, 249999999]) — a second floor would be a second answer to "is this
+#                     volume full", which is the class #3395 removed.
+#   DISK_LANE_NEED_MB the MB one lane needs on `$SEED_REPO`'s volume   default: DERIVED
+#                     from spawn-gate.sh's `disk_lane_costs`/`disk_lane_need`; an explicit `0` DISABLES
+#                     the disk term and says so (the suite's neutralisation, and spawn-gate's own
+#                     "an explicit 0 is honoured" rule).
+#   DISK_FREE_MB      free disk (MB) — the PROBE, injectable        default: DERIVED (df column 4)
+#                     ⚠️ a stated value is used for BOTH asks, so the in-loop guard is frozen at it
+#                     rather than measuring the shrinking volume — see the NO RUN-AWAY note above.
+#   SPAWN_GATE_MOD    the module carrying the disk predicate        default: $O/spawn-gate.sh, else
+#                     this script's own directory
 #   MIN_SWAP_MB       free-SWAP floor — **LINUX ONLY**, and only where swap EXISTS (MB) default: 700
 #                     (a Darwin box has no such floor: its swap file is grown on demand, so `free` is
 #                     not headroom — see the DARWIN block at the capacity guard)
@@ -189,6 +232,13 @@ TARGET_LANES="${TARGET_LANES:-}"    # pin the whole target
 LANE_MEM_MB="${LANE_MEM_MB:-512}"
 MEM_BUDGET_PCT="${MEM_BUDGET_PCT:-75}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
+# ⛔ THE FLOOR IS spawn-gate.sh's DECLARATION, NOT A LITERAL OF OURS. `MIN_FREE_MB` is the cell
+# supervisor's name for the same knob and `spawn-gate.sh` arbitrates between the two; a drainer that
+# read only its own name would let a cell tuned through `MIN_FREE_MB` dispatch against the 500 default.
+DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-${MIN_FREE_MB:-500}}"
+DISK_LANE_NEED_MB="${DISK_LANE_NEED_MB:-}"      # empty ⇒ DERIVED from the module
+DISK_FREE_MB="${DISK_FREE_MB:-}"                # empty ⇒ DERIVED from the module
+SPAWN_GATE_MOD="${SPAWN_GATE_MOD:-}"            # empty ⇒ $O, then this script's directory
 MIN_SWAP_MB="${MIN_SWAP_MB:-700}"
 MAX_MEM_PRESSURE_LEVEL="${MAX_MEM_PRESSURE_LEVEL:-2}"
 LPC_CEILING="${LPC_CEILING:-8}"
@@ -323,6 +373,35 @@ case "$MAX_MEM_PRESSURE_LEVEL" in
   *) log_line "WARN: MAX_MEM_PRESSURE_LEVEL='${MAX_MEM_PRESSURE_LEVEL}' is not a threshold this arm can refuse at (2 = warning, 3, 4 = critical; 1 = normal would refuse EVERY box) — using 2. To stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; MAX_MEM_PRESSURE_LEVEL=2 ;;
 esac
 MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
+# ⛔ THE SAME BOUNDS AND THE SAME WIDTH AND ZERO-SHAPE RULES AS `spawn-gate.sh`, ALL TESTED ON THE RAW
+# STRING. This number is now a DIVISOR (see `_capacity_target`): a `DISK_MIN_FREE_MB=0` would let the
+# last available megabyte be planned into a lane, and a value beyond the clamp is a typo that must not
+# widen a floor. ⛔ WIDTH BEFORE `10#`, MEASURED (review round 2): `$((10#18446744073909551616))`
+# WRAPS to `200000000`, which passes every bound below — so a range check applied AFTER the conversion
+# cannot see the wrap, and the tick would run with a 200,000,000 MB floor (`disk=0`, inert) while the
+# only line it prints is a SKIP that reads like a full volume. `spawn-gate.sh:203` tests the raw
+# string (`is_limit`, <= 9 digits) and so does this. ⛔ AND `is_num` REJECTS LEADING ZEROS (round 3): a
+# hand-copied rule that accepted `007` as 7 MB would diverge from the gate's 500 MB, so the `0[0-9]*`
+# arm below refuses the same shape — parity here has to include every shape, not just the width.
+case "$DISK_MIN_FREE_MB" in
+  ''|*[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
+  # ⛔ LEADING ZEROS ARE REFUSED BECAUSE `spawn-gate.sh` REFUSES THEM (round 3, MEASURED). Its `is_num`
+  # rejects every `0*` shape, so `DISK_MIN_FREE_MB=007` is **500** MB to the gate that will refuse the
+  # lane. Accepting it as 7 MB here would make the PLANNER and the REFUSER disagree about the floor on
+  # the same volume — the "second answer to 'is this volume full'" this file exists to avoid (#3395),
+  # and it plans lanes the gate then refuses at rc 77. `0[0-9]*` is `is_num`'s `0*` minus the bare `0`,
+  # which the `>= 1` bound below already sends to 500 on both sides.
+  0[0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' has a leading zero — spawn-gate.sh's is_num refuses that shape and resolves 500, so this does too — using 500"; DISK_MIN_FREE_MB=500 ;;
+  *)
+    if [ "${#DISK_MIN_FREE_MB}" -gt 9 ]; then
+      log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is ${#DISK_MIN_FREE_MB} digits; the cap is 9, the same one spawn-gate.sh's is_limit applies (<=999999999 MB, ~976 TB) — using 500"
+      DISK_MIN_FREE_MB=500
+    else
+      DISK_MIN_FREE_MB="$((10#$DISK_MIN_FREE_MB))"
+    fi ;;
+esac
+[ "$DISK_MIN_FREE_MB" -ge 1 ] || { log_line "WARN: DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} would let a lane eat the last megabyte (0 = no floor) — using 500; to stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; DISK_MIN_FREE_MB=500; }
+[ "$DISK_MIN_FREE_MB" -le 249999999 ] || { log_line "WARN: DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} is beyond any sane floor — using 500"; DISK_MIN_FREE_MB=500; }
 LANE_MEM_MB="$(_num LANE_MEM_MB "$LANE_MEM_MB" 512)"
 [ "$LANE_MEM_MB" -ge 1 ] || { log_line "WARN: LANE_MEM_MB=0 — using 1"; LANE_MEM_MB=1; }
 MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
@@ -607,6 +686,157 @@ elif [ "$PLATFORM" = "unknown" ]; then
 else
   [ -z "${MEM_PRESSURE_LEVEL:-}" ] || log_line "WARN: MEM_PRESSURE_LEVEL is set but this is a Linux box — the Darwin pressure arm does not apply here (the SwapFree floor does)"
 fi
+
+# ── THE DISK PROBE (agent-infra#2159) — ONE PREDICATE, ITS OWN FILE ──────────────────────────
+# ⛔ THIS FILE DOES NOT RE-DERIVE THE DISK NUMBERS. `spawn-gate.sh` owns them (`disk_free_mb`,
+# `disk_lane_costs`, `disk_lane_need`) and is the gate that actually REFUSES a lane, so a drainer with
+# its own arithmetic would plan against a figure the refuser disagrees with — #3395's defect with a
+# constant instead of an ordering. The module is SOURCED IN A SUBSHELL, which is this tree's own way
+# to use it without letting it poison the caller ("A subshell cannot poison this shell"), and is how
+# `spawn-gate.test.sh` already drives it.
+#
+# ⛔ AN EMPTY ANSWER IS `UNKNOWN`, NEVER ZERO, and the two are distinguishable: the probe prints two
+# integers or nothing at all, and the `need = 0` branch is reached only by a PARSED `0`. That matters
+# because `0` DISABLES the term (a stated choice) while UNKNOWN must not become one by accident.
+_disk_why() { # the NAMED reason the module cannot answer — never "unreachable" while it sits there,
+  # and never "looked in two places" when an operator STATED a third
+  local mod="${SPAWN_GATE_MOD:-}"
+  if [ -n "$mod" ] && [ ! -f "$mod" ]; then
+    printf '%s' "SPAWN_GATE_MOD=${mod} is not a readable file"
+  elif [ -z "$mod" ]; then
+    printf '%s' "no spawn-gate.sh disk predicate found (looked at ${O}/spawn-gate.sh and ${SELF_DIR}/spawn-gate.sh; set SPAWN_GATE_MOD)"
+  else
+    printf '%s' "${mod} is present and was sourced but did not answer the disk question — a STALE copy (it predates disk_free_mb/disk_lane_costs/disk_lane_need), or it died while being sourced"
+  fi
+}
+_disk_probe() { # <free-path> <cost-path> -> "<free_mb> <need_mb>" on stdout; NOTHING = UNKNOWN
+  # ⛔ TWO PATHS, TWO QUESTIONS: free space is measured on the volume the worktrees LAND on (`$AI`),
+  # while the per-lane cost is CLASSIFIED against the checkout the lanes WORK (`$SEED_REPO`) —
+  # `disk_lane_costs` charges a python target differently from a harness one, so classifying the state
+  # directory instead of the seed would answer a question nobody asked.
+  local mod="${SPAWN_GATE_MOD:-}"
+  [ -n "$mod" ] && [ -f "$mod" ] || return 0
+  ( . "$mod" >/dev/null 2>&1 || exit 1
+    command -v disk_free_mb   >/dev/null 2>&1 || exit 1
+    command -v disk_lane_costs >/dev/null 2>&1 || exit 1
+    command -v disk_lane_need  >/dev/null 2>&1 || exit 1
+    dfree="$(disk_free_mb "${1:-.}")" || exit 1
+    case "$dfree" in ''|*[!0-9]*) exit 1 ;; esac
+    dcosts="$(disk_lane_costs "${2:-${1:-.}}")" || exit 1
+    # shellcheck disable=SC2086  # intentional split of three integers; the case guard below re-joins
+    set -- $dcosts
+    [ "$#" -eq 3 ] || exit 1
+    case "$1$2$3" in ''|*[!0-9]*) exit 1 ;; esac
+    dneed="$(disk_lane_need "$1" "$2" "$3")" || exit 1
+    case "$dneed" in ''|*[!0-9]*) exit 1 ;; esac
+    printf '%s %s' "$dfree" "$dneed" ) 2>/dev/null
+}
+_disk_free_now() { # <path> -> free MB on stdout; NOTHING = UNKNOWN (ONE implementation, two adapters)
+  local pair
+  # ⛔ AN INJECTED READING IS *THE* READING. `DISK_FREE_MB` is the probe seam, so when it is stated the
+  # re-ask uses it too — otherwise a tick planned from the seam would re-measure the LIVE box mid-loop,
+  # i.e. the plan and its enforcement would come from two different boxes, which is the very
+  # divergence this term exists to remove (and it would make every arm that injects the seam
+  # non-hermetic).
+  if [ -n "${DISK_FREE_MB:-}" ]; then
+    case "$DISK_FREE_MB" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$((10#$DISK_FREE_MB))"
+    return 0
+  fi
+  pair="$(_disk_probe "${1:-.}" "${SEED_REPO:-${1:-.}}")"
+  case "$pair" in *' '*) printf '%s' "${pair%% *}" ;; esac
+}
+
+if [ -z "$SPAWN_GATE_MOD" ]; then
+  for _sg_cand in "$O/spawn-gate.sh" "$SELF_DIR/spawn-gate.sh"; do
+    [ -f "$_sg_cand" ] && { SPAWN_GATE_MOD="$_sg_cand"; break; }
+  done
+fi
+disk_free="${DISK_FREE_MB:-}"
+disk_need="${DISK_LANE_NEED_MB:-}"
+_disk_off=""
+# ⛔ A STATED SEAM IS VALIDATED BEFORE ANY DEGRADE DECISION, AND TO THE MODULE'S OWN RANGE RULE.
+# ORDER MATTERS AND IT WAS MEASURED WRONG (review round 1, P2): with `DISK_FREE_MB=unreadable` AND the
+# module unreachable, the degrade branch was taken first and the garbage seam was silently DISCARDED —
+# the tick dispatched on cores+memory instead of refusing a seam an operator typed wrong.
+# ⛔ THE RANGE RULE IS `spawn-gate.sh`'s (`is_limit` = digits AND <= 9 characters, :115) because these
+# numbers are now DIVISORS and a value wider than bash's integer range WRAPS: measured
+# `DISK_FREE_MB=9223372036854775808` -> negative, then `disk_free - DISK_MIN_FREE_MB` wraps back to a
+# large positive, so `[ "$headroom" -ge 0 ]` cannot catch it and the term silently never binds (the
+# line even printed a negative `free=`). 9 digits is ~976 TB in MB, i.e. far past any real volume.
+# The PROBE needs no such guard: `df`'s column 4 is a 64-bit block count divided by 1024, so its
+# worst case is ~1.8e16 — well inside bash's range, so it cannot wrap.
+_disk_seam_check() { # <name> <value>; returns 1 when the seam is not stated at all
+  local v="${2:-}"
+  [ -n "$v" ] || return 1
+  case "$v" in
+    ''|*[!0-9]*) log_line "FAIL: ${1}='${v}' is not a whole number of MB — a STATED seam that cannot be read is a fault in the reading, not an absent predicate, so the disk ceiling is not evaluated and nothing was dispatched"; exit 1 ;;
+  esac
+  if [ "${#v}" -gt 9 ]; then
+    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9, the same width limit spawn-gate.sh's is_limit applies (<=999999999 MB, ~976 TB). ⛔ THE CAP IS NOT A WRAP TEST, AND THE WRAP IS NOT A DIGIT COUNT: bash's integers end at 2^63 = 9223372036854775808, which is itself 19 digits — so a 19-digit value BELOW it does not wrap, while a 20-digit one always does. The cap is deliberately tighter than the wrap point so that a stated value is a magnitude this bound is defined for; raise it only with a stated reason."
+    exit 1
+  fi
+  return 0
+}
+_seam_need=0
+_disk_seam_check DISK_FREE_MB "${DISK_FREE_MB:-}" || :
+_disk_seam_check DISK_LANE_NEED_MB "${DISK_LANE_NEED_MB:-}" && _seam_need=1 || :
+if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
+  _disk_pair="$(_disk_probe "$AI" "$SEED_REPO")"
+  case "$_disk_pair" in
+    *' '*)
+      [ -n "$disk_free" ] || disk_free="${_disk_pair%% *}"
+      [ -n "$disk_need" ] || disk_need="${_disk_pair#* }" ;;
+  esac
+fi
+# ⛔ TWO FAILURES, TWO DIFFERENT ANSWERS, AND THE SPLIT IS THE POINT (MEASURED, not theorised).
+#
+#   (a) THE PREDICATE IS UNAVAILABLE — the module is absent, stale, or died while sourced. That is a
+#       DEPLOYMENT gap in a NEW bound, so the tick DEGRADES TO THE PRE-#2159 BEHAVIOUR and SAYS SO:
+#       cores and memory only. ⛔ IT MUST NOT FAIL CLOSED HERE, and the measurement that settled it is in
+#       `ai-drainer.test.sh`: four of its non-vacuity arms run a MUTANT COPY of this script from a temp
+#       directory, where `$SELF_DIR` is that temp dir and no `spawn-gate.sh` is beside it. A fail-closed
+#       probe made those runs dispatch ZERO lanes and exit 1 before they reached the code they were
+#       testing — which is precisely the defect a fail-closed arm here would cause in the field: a box
+#       whose runtime dir was seeded WITHOUT the module becomes a drainer that dispatches nothing at
+#       all, silently but for a log line. That is the inert-unit class (#3194), and it is a worse
+#       outcome than the disk term being absent. A new bound must not be able to take a box to ZERO
+#       because a file is missing; it degrades, loudly, and the NOTE names the fix.
+#   (b) A **STATED** SEAM THAT IS NOT WHOLE MEGABYTES (or is wider than 9 digits) — that is a FAULT in
+#       a reading the OPERATOR asserted, not an absent improvement, so it FAILS CLOSED by name, in
+#       `_disk_seam_check`, BEFORE any degrade decision. `DISK_FREE_MB=unreadable` ends the tick even
+#       when the module is also unreachable, and that is asserted.
+#       ⛔ AND A MODULE THAT *ANSWERS* A NON-NUMBER IS **NOT** THIS CASE: `_disk_probe` digit-validates
+#       its own reading and hands back nothing, so such an answer is indistinguishable from UNKNOWN and
+#       takes arm (a). An earlier revision carried a second fail-closed arm for it here; that arm was
+#       UNREACHABLE (every stated non-digit exits at `_disk_seam_check` first) and is gone — a guard
+#       that can never fire reads exactly like one that does, which is worse than no guard. The arm
+#       `k4g` pins the real behaviour so the two shapes cannot swap back.
+if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
+  _disk_off="the disk predicate could not answer: $(_disk_why)"
+  disk_free=0; disk_need=0
+  log_line "NOTE: the disk term is DISABLED for this tick — ${_disk_off}. This tick plans from cores and memory only, which is the PRE-#2159 behaviour: a full volume can still be refused by the spawn gate and reported as a failed tick. Make the predicate reachable (the module is looked up as \$O/spawn-gate.sh then <this script's dir>/spawn-gate.sh; SPAWN_GATE_MOD states it outright)."
+else
+  # ⛔ BOTH VALUES ARE ALL-DIGIT BY CONSTRUCTION HERE, SO THIS IS NORMALISATION, NOT A CHECK. A stated
+  # seam was validated by `_disk_seam_check` above (digits, and ≤ 9 of them); a probe value is
+  # digit-validated inside `_disk_probe`. `10#` is here for the leading-zero case (`007` is not octal).
+  disk_free="$((10#$disk_free))"
+  disk_need="$((10#$disk_need))"
+  # `0` is a STATED choice (the suite's neutralisation, and spawn-gate's own "an explicit 0 is
+  # honoured" rule): the term does not apply, and the line says so instead of naming a seam that was
+  # never set. ⛔ TWO WAYS TO GET 0 AND THEY ARE NOT THE SAME FACT — `DISK_LANE_NEED_MB=0` is an
+  # operator's deliberate choice, while a module that computes 0 has summed zero cost terms (an
+  # unset/garbled lane-cost environment). Naming the seam in the second case would be the same
+  # wrong-diagnosis class `k4` caught above.
+  if [ "$disk_need" -le 0 ]; then
+    if [ "$_seam_need" = 1 ]; then
+      _disk_off="DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB"
+    else
+      _disk_off="the predicate answered need=0 MB (${SPAWN_GATE_MOD}) — every lane-cost term it read is zero, so the disk term cannot bind; set DISK_LANE_NEED_MB to state the requirement outright"
+    fi
+  fi
+fi
+disk_floor_note="disk_floor=${DISK_MIN_FREE_MB}MB"
 
 # ── SETTLE: THE OUTCOME OF LANES AN EARLIER TICK DISPATCHED ────────────────────────────────────
 # ⛔ THE LANE'S OWN EXIT STATUS IS STILL THE VERDICT — it is just read by the NEXT tick instead of by
@@ -1611,16 +1841,29 @@ _held_offsets() { # prints " 0 10 30 " — offsets held by lanes that are still 
 }
 
 # ── THE TARGET ────────────────────────────────────────────────────────────────────────────────
-_capacity_target() { # prints "<target> <cpu_ceiling> <mem_ceiling> <mem_pool_mb>"
-  local pool usable mem_ceiling target
+_capacity_target() { # prints "<target> <cpu_ceiling> <mem_ceiling> <mem_pool_mb> <disk_ceiling> <disk_free_mb> <disk_need_mb>"
+  local pool usable mem_ceiling disk_ceiling target headroom
   pool=$((mem_avail - MIN_MEM_FREE_MB))
   [ "$pool" -ge 0 ] || pool=0
   usable=$((pool * MEM_BUDGET_PCT / 100))
   mem_ceiling=$((usable / LANE_MEM_MB))
   [ "$mem_ceiling" -ge 0 ] || mem_ceiling=0
+  # ⛔ THE DIVISION IS GUARDED BY A BRANCH THAT RUNS FIRST, NOT BY A FALLBACK VALUE. `$(( x / 0 ))`
+  # does not return 0 — it KILLS the shell (`division by 0`), which under `set -u` would abort the
+  # tick mid-lock with no FAIL: and no STOP: line at all. `need = 0` therefore means "this term does
+  # not apply" and is answered without touching the divisor; the ceiling is set to `MAX_LANES` so the
+  # `min` below cannot bind on it, and the log renders `disk=off` rather than a number nobody measured.
+  if [ "$disk_need" -le 0 ]; then
+    disk_ceiling="$MAX_LANES"
+  else
+    headroom=$((disk_free - DISK_MIN_FREE_MB))
+    [ "$headroom" -ge 0 ] || headroom=0
+    disk_ceiling=$((headroom / disk_need))
+  fi
   target="$MAX_LANES"
   [ "$mem_ceiling" -lt "$target" ] && target="$mem_ceiling"
-  printf '%s %s %s %s' "$target" "$MAX_LANES" "$mem_ceiling" "$pool"
+  [ "$disk_ceiling" -lt "$target" ] && target="$disk_ceiling"
+  printf '%s %s %s %s %s %s %s' "$target" "$MAX_LANES" "$mem_ceiling" "$pool" "$disk_ceiling" "$disk_free" "$disk_need"
 }
 
 # ── GUARD 3: ROTATE THE SLICE — PER LANE, never per tick ───────────────────────────────────────
@@ -1811,8 +2054,25 @@ if [ "$lo100" -ge "$load_ceiling_100" ]; then
   log_line "SKIP: load $(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') >= ${LPC_CEILING}x${NCPU} ($(awk -v l="$load_ceiling_100" 'BEGIN{printf "%.2f", l/100}')) — do not ADD work to a saturated box; $alive_src; $swap_note"
   finish 0
 fi
-read -r target cpu_ceil mem_ceil mem_pool <<<"$(_capacity_target)"
+read -r target cpu_ceil mem_ceil mem_pool disk_ceil disk_free_read disk_need_read <<<"$(_capacity_target)"
+# ⛔ THE DISK TERM IS APPENDED AT THE END OF THE LINE, NOT INSIDE THE PARENTHETICAL, and that is not
+# cosmetic: the arms assert CONTIGUOUS substrings of these lines (`target=10 (cpu=10 mem=`,
+# `mem=0 from mem_avail=600MB`, `(PINNED by TARGET_LANES) alive=0 `), so a field inserted mid-string
+# reddens a regression arm that has nothing to do with the disk. Appending keeps every one of them
+# meaning what it meant, and `disk=` still sits on the same line as the numbers it bounds.
+# ⛔ THE TWO ECHO FIELDS ARE THE TERM'S OWN INPUTS, READ BACK — the log renders THESE, not the
+# globals, so the line a reader audits is provably the pair the target was computed from.
+if [ -n "$_disk_off" ]; then
+  disk_term="disk=off (${_disk_off})"
+else
+  disk_term="disk=${disk_ceil} free=${disk_free_read}MB need=${disk_need_read}MB $disk_floor_note"
+fi
 if [ -n "$TARGET_PIN" ]; then
+  # ⛔ A PIN OVERRIDES THE DERIVED CEILINGS AND NOT THE HARD GUARDS — the same structure this file
+  # already has: the swap floor and the load arm are checked BEFORE the target and a pin cannot
+  # bypass them, while `cpu`/`mem` are DERIVED ceilings and it does. The disk ceiling is derived too,
+  # so the pin wins here — but the in-loop ask below is a hard guard, so a pinned box still cannot
+  # create worktrees past the disk floor. Both halves are asserted in `ai-drainer.test.sh` (k8).
   target="$TARGET_PIN"
   target_why="target=$target (PINNED by TARGET_LANES)"
 else
@@ -1865,7 +2125,7 @@ if [ "$n" -eq 0 ]; then
   # ⛔ ZERO IS A NORMAL ANSWER, and it is logged with the same arithmetic as a dispatch so nobody has
   # to guess why the box is quiet: at target, the ring is fully held by live lanes, or the target
   # itself is 0 because memory/cores say so.
-  log_line "SKIP: nothing to add — $target_why alive=$lanes ($alive_src) free_windows=${#FREE[@]}/$slices $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}')"
+  log_line "SKIP: nothing to add — $target_why alive=$lanes ($alive_src) free_windows=${#FREE[@]}/$slices $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') $disk_term"
   finish 0
 fi
 # ⛔ THE SEED IS PROVEN BEFORE THE FIRST LANE, NOT DISCOVERED PER LANE (agent-infra#2787). MEASURED
@@ -1884,7 +2144,7 @@ if ! git -C "$SEED_REPO" rev-parse --verify -q "$SEED_REF" >/dev/null 2>&1; then
   log_line "FAIL: SEED_REPO=$SEED_REPO has no ref '$SEED_REF' to branch a lane from — no lane was dispatched, no worktree was created and no record was written; fetch the seed (git -C $SEED_REPO fetch origin) or set SEED_REF"
   finish 1
 fi
-log_line "START: $target_why alive=$lanes ($alive_src) dispatching $n $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') slices=$slices free_windows=${#FREE[@]} dispatcher=$DISPATCH"
+log_line "START: $target_why alive=$lanes ($alive_src) dispatching $n $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') slices=$slices free_windows=${#FREE[@]} dispatcher=$DISPATCH $disk_term"
 
 # ──8<── topup-loop ───────────────────────────────────────────────────────────────────────────
 # ⛔ THIS LOOP IS THE WHOLE CHANGE. Before it, `bash "$DISPATCH"` ran ONCE per tick and the tick
@@ -1905,6 +2165,27 @@ while [ "$i" -lt "$n" ]; do
   # an operator reads.
   cp "$brief_lane" "$BRIEF" 2>/dev/null || true
   wt="$AI/wt-drainer-$NAME"
+  # ⛔ ASK THE DISK AGAIN, IMMEDIATELY BEFORE CREATING ANYTHING. The target was computed ONCE at tick
+  # start, and free space SHRINKS as this very loop creates its own worktrees — so by lane 2 the
+  # planned number is stale in exactly the direction that fails. The spawn gate's own doctrine is to
+  # ask BEFORE `git worktree add` (#3395), and this is the same question at the same moment, so the
+  # loop asks it instead of dying at the `worktree add` below.
+  # ⛔ AND IT IS A HARD GUARD: `TARGET_LANES` cannot bypass it (see the pin note above).
+  if [ -z "$_disk_off" ]; then
+    _lf="$(_disk_free_now "$AI")"
+    case "$_lf" in
+      ''|*[!0-9]*)
+        log_line "FAIL: free disk could not be re-read before lane $((i + 1)) of $n ($(_disk_why)) — this lane is not started; the $(i) lane(s) already dispatched keep their records"; exit 1 ;;
+    esac
+    if [ "$_lf" -lt "$((DISK_MIN_FREE_MB + disk_need))" ]; then
+      # ⛔ A FULL VOLUME IS A FACT ABOUT THE BOX, NOT A FAILURE OF THIS TICK — the disposition
+      # `dispatch-merge.sh` already takes ("stops the batch, because a full volume is a fact about the
+      # box rather than about one issue"). The lanes already dispatched are RECORDED, counted by the
+      # next tick and settled by it; nothing is rolled back.
+      log_line "STOP: disk floor — dispatched $i of $n lane(s); free=${_lf}MB need=${disk_need}MB $disk_floor_note. This is NOT a tick failure and NOT a load refusal: waiting or reaping is what clears it (a full volume is a fact about the box). The $i dispatched lane(s) keep their records and are counted by the next tick."
+      finish 0
+    fi
+  fi
   if ! git -C "$SEED_REPO" worktree add -f "$wt" "$SEED_REF" >/dev/null 2>&1; then
     log_line "FAIL: cannot create a worktree at $wt from $SEED_REPO ($SEED_REF) — dispatched ${i} of ${n} before this, their records stand"
     exit 1
@@ -1951,5 +2232,5 @@ while [ "$i" -lt "$n" ]; do
 done
 # ──8<── /topup-loop ──────────────────────────────────────────────────────────────────────────
 
-log_line "DONE: dispatched $n lane(s) to fill target=$target (alive was $lanes, now $((lanes + n))); the tick does not wait for them — the next tick counts them and tops up"
+log_line "DONE: dispatched $n lane(s) to fill target=$target (alive was $lanes, now $((lanes + n))); the tick does not wait for them — the next tick counts them and tops up $disk_term"
 finish 0
