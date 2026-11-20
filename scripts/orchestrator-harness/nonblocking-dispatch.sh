@@ -192,7 +192,18 @@ fi
 # every macOS box while green on ubuntu-latest).
 # The canonical section still reaches the reader verbatim. On success the gate prints nothing, so the
 # capture is invisible on the normal path.
-if ! brief_out="$(bash "$bg_lib" --check "$PROMPT" worker 2>&1)"; then
+# ⛔ THE REPO IS THE WORKTREE, AND IT IS PASSED EXPLICITLY (#4152). The PREVIOUS WORK cross-check
+# measures `refs/wip/*` in a repository — and with no repository argument it uses whatever THE CALLER'S
+# CWD resolves to (`brief_gate_repo`). That made the verdict a property of who ran the check: an author
+# running `--check` from their own checkout and this dispatcher running from `$O` could measure two
+# different origins for ONE brief, i.e. the same bytes judged twice with two answers — #4152's class,
+# one axis over from the role. `$WT` is the tree the worker will actually `cd` into, so the measurement
+# is about the repository the work belongs to. The round is passed as `0` only because the repo is the
+# FOURTH positional; the authored-brief path has no review round.
+# On a box whose `$WT` cannot be measured the gate says so and admits with a warning (`UNVERIFIED`) — the
+# same fail-open direction it already takes when no repository is resolvable, and a warning instead of
+# the previous silence.
+if ! brief_out="$(bash "$bg_lib" --check "$PROMPT" worker 0 "$WT" 2>&1)"; then
   echo "nonblocking-dispatch.sh: REFUSED — brief-gate=$bg_lib judged the brief at $PROMPT and refused it (agent-infra#2258). NOTHING WAS STARTED: no worker, no session, no model call. The [brief-gate] block BELOW names every missing element and prints the canonical section." >&2
   printf '%s\n' "$brief_out" >&2
   exit 80

@@ -35,6 +35,23 @@
 #        CLAIM: WIP: BRANCH: WORKTREE: PRIOR:   — each with a non-empty value, and WIP's value
 #        BEGINNING `issue-<N>` (`pr-<N>` for a fixer's PR key). See the fourth contract below.
 #
+# ⛔ ONE PASS, NOT ONE LAYER PER ATTEMPT (#4152). A brief with NO `PREVIOUS WORK` section is missing the
+# block AND the key shape of the `WIP:` line that block must contain, and it is refused for BOTH in the
+# same response (`PREVIOUS-WORK-SECTION` + `PREVIOUS-WORK-WIP`). Why that is not redundant: the four
+# other labels are free-form and are enumerated by the block's own bullet, so the block's absence tells
+# the author everything about them — but the KEY SHAPE is a rule the enumeration does not state, so an
+# author who is told only "add the block" writes the natural honest `WIP: none — no branch on origin`
+# and is refused a SECOND time for a rule nobody mentioned. MEASURED 2026-11-18: three dispatch
+# attempts to start one lane, the third only after the refusal had been re-read twice.
+#
+# ⛔ AND `worker` IS AN ALIAS OF `lane`, FOLDED ONCE BEFORE ANY RULE SEES IT (#4152). The AUTHORED-brief
+# path grades `worker` (`nonblocking-dispatch.sh`, `pr-doctor.py`) while an author's cheap pre-flight is
+# `--check <file>`, whose role defaults to `lane` — and #4152 was measured on exactly that pair giving
+# two different answers about one brief. Every rule in this file already treats the two identically;
+# folding them (`brief_gate_grade_role`) means they CANNOT drift apart, instead of leaving two names
+# for one contract and hoping. `--section worker` still renders (it is the role pr-doctor splices) and
+# is byte-identical to `--section lane`, so the gate still cannot refuse its own advice.
+#
 # Two labelled fields are not decoration: they are the two halves of the pass that the two measured
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
 # about it" — rung 3 (`web_fetch`) is always available, so the field is never unsatisfiable.
@@ -814,6 +831,16 @@ END {
     if (!pwwt)  print "PREVIOUS-WORK-WORKTREE"
     if (!pwpri) print "PREVIOUS-WORK-PRIOR"
   }
+  # ⛔ ONE PASS (#4152): the block and the KEY SHAPE of the `WIP:` line it must contain are discovered in
+  # the SAME edit, so they are reported in the SAME refusal — the author who is told to add the block is
+  # told, in the same breath, that its `WIP:` value must START with the key. Both are genuinely missing
+  # (`!pwsec` means there is no `WIP:` line in a section for the cross-check to read, which is why that
+  # reader abstains), so this is a true report of two requirements, not a duplicate of the block bullet.
+  # It is DELIBERATELY a separate statement placed AFTER the else-block, not an arm folded into the
+  # section token: the suite section-token mutant (H45–H47) anchors on that exact line and on the
+  # `else` that follows it, so folding these together would leave that mutation testing a different
+  # program than the one it names.
+  if (!pwsec) print "PREVIOUS-WORK-WIP"
 }
 '
 
@@ -1042,6 +1069,48 @@ END {
 }
 '
 
+# brief_gate_grade_role <role> — THE role a rule is evaluated with (#4152). `worker` is an alias of
+# `lane`, and it is folded HERE so that no rule in this file — and none added later — can tell them
+# apart. The two names exist because the callers do: `nonblocking-dispatch.sh` and `pr-doctor.py` grade
+# `worker` (it is the role their generated brief is rendered for), while an author's cheap pre-flight is
+# `--check <file>`, whose role defaults to `lane`. #4152 is the measurement of that pair disagreeing:
+# the cheap check returned 0 on a brief the dispatcher then refused. Folding is the fix that cannot
+# regress — a rule that branched on `worker` would now be unreachable rather than merely untested.
+# ⛔ `fixer` AND `reviewer` ARE NOT ALIASED, because their differences are REAL (`pr-<N>` keys are a
+# fixer's, the non-vacuity block is a reviewer's, and the round is a reviewer input) — those are roles
+# the caller must name, and `--check` cannot invent them. See `--check`'s usage line.
+brief_gate_grade_role() { # brief_gate_grade_role <role>
+  case "${1:-lane}" in
+    worker) printf 'lane' ;;
+    *)      printf '%s' "${1:-lane}" ;;
+  esac
+}
+
+# brief_gate_selfid — WHICH COPY OF THIS VALIDATOR IS EXECUTING, as `brief-gate.sh @ <digest12>`.
+# ⛔ THIS EXISTS BECAUSE TWO COPIES AT TWO REVISIONS ARE INDISTINGUISHABLE FROM THE OUTSIDE (#4152's
+# residual class). `nonblocking-dispatch.sh` resolves `brief-gate.sh` from FOUR homes (`$O`, `$HARNESS`,
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness`, `~/.pi/agent/scripts`) — the `$O`-skew that file
+# already documents — while an author runs whatever `./brief-gate.sh` their own checkout holds. So one
+# brief can be measured by two validators, and until now neither said which: the author's green cheap
+# check and the dispatcher's refusal were byte-indistinguishable in provenance, which is exactly the
+# stale-validation-path signature a duplicated-validation defect presents ("identical but surprising").
+# ⛔ A CONTENT DIGEST, NOT A GIT SHA. The copy that actually refuses a dispatch is `$O/brief-gate.sh`,
+# a SEEDED FILE that is in no repository — a git sha would be unresolvable there, i.e. absent from
+# exactly the case this is for. Two copies of one commit have identical bytes (one revision, correctly);
+# two copies at different revisions do not, and that is the question being asked.
+# ⛔ IT NEVER FAILS THE REFUSAL. With no digest tool the line reads `unresolved`, and that is deliberate:
+# an identification aid that turns a readable refusal into a crash is worse than one that says nothing —
+# the author is sent to re-author a brief that was already fine. Order is sha256sum → shasum → openssl,
+# the portable sets on Linux and on macOS (where the fleet also runs).
+brief_gate_selfid() {
+  local f="${BASH_SOURCE[0]:-$0}" h=""
+  if command -v sha256sum >/dev/null 2>&1; then h="$(sha256sum "$f" 2>/dev/null | cut -c1-12)"
+  elif command -v shasum >/dev/null 2>&1; then h="$(shasum -a 256 "$f" 2>/dev/null | cut -c1-12)"
+  elif command -v openssl >/dev/null 2>&1; then h="$(openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}' | cut -c1-12)"
+  fi
+  printf '%s @ %s' "$(basename "$f")" "${h:-unresolved}"
+}
+
 # brief_gate_missing_all <file|-> [role] [round] [repo] — every missing token for a dispatch: the SHAPE
 # tokens plus the PREVIOUS WORK cross-check. `--missing` is the verb an author iterates with, so it must
 # see the same body `--check` sees.
@@ -1050,7 +1119,7 @@ END {
 # EOF, so `--missing -` reported "complete, rc=0" for a brief that `--check -` refuses — the diagnostic
 # verb disagreeing with the gate is how an author is told their brief is fine when it is not.
 brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [repo]
-  local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf=""
+  local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf="" grade=""
   rnd="$(brief_gate_round_norm "${3:-0}")"
   if [ "$f" = "-" ]; then
     tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
@@ -1065,8 +1134,12 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
   # ⛔ BOTH ARGUMENTS: #3441's review ROUND (on the base) and #3484's ROLE (the WIP key rule is
   # role-scoped). Resolving this by keeping one side drops the other feature silently — which is what a
   # rebase resolution did to this file on the shared branch before this replay.
-  brief_gate_missing "$f" "$role" "$rnd"
-  brief_gate_previous_work "$f" "$repo" "$role"
+  # ⛔ AND THE ALIAS IS APPLIED HERE TOO (#4152): the diagnostic verb an author iterates with must grade
+  # with the same role the gate does, or `--missing` and `--check` disagree about one brief — the exact
+  # class this change exists to close, one verb over.
+  grade="$(brief_gate_grade_role "$role")"
+  brief_gate_missing "$f" "$grade" "$rnd"
+  brief_gate_previous_work "$f" "$repo" "$grade"
   [ -n "$tmpf" ] && rm -f "$tmpf"
   return 0
 }
@@ -1074,7 +1147,7 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
 # brief_gate_verify <brief-file|-> [role] [round] [repo] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
 brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
-  local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw=""
+  local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw="" grade=""
   case "$role" in
     lane|fixer|reviewer|worker) : ;;
     *)
@@ -1096,8 +1169,13 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
     cat > "$tmpf"
     f="$tmpf"
   fi
-  miss="$(brief_gate_missing "$f" "$role" "$rnd")"
-  pw="$(brief_gate_previous_work "$f" "$repo" "$role")"
+  # ⛔ THE RULES ARE EVALUATED ON THE ALIAS FORM (#4152) — `brief_gate_grade_role` above. `role` stays as
+  # the caller NAMED it for everything this function PRINTS (`brief: … role: worker`, and the canonical
+  # block from `--section worker`), because the message must describe the dispatch the caller is making.
+  # Only the verdict is computed on `grade`, where `worker` and `lane` are one contract.
+  grade="$(brief_gate_grade_role "$role")"
+  miss="$(brief_gate_missing "$f" "$grade" "$rnd")"
+  pw="$(brief_gate_previous_work "$f" "$repo" "$grade")"
   [ -n "$pw" ] && miss="${miss:+$miss$'\n'}${pw}"
   if [ -z "$miss" ]; then
     [ -n "$tmpf" ] && rm -f "$tmpf"
@@ -1160,6 +1238,12 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
   {
     printf '[brief-gate] REFUSED — this dispatch does not carry its full contract (research + non-vacuity + round). NOTHING WAS STARTED: no model call, no session, no claim.\n'
     printf '[brief-gate]   brief: %s   role: %s   round: %s\n' "$f" "$role" "${rnd:-0}"
+    # ⛔ THE VALIDATOR NAMES ITSELF (#4152 residual). A refusal is only actionable if the author can
+    # tell WHICH copy refused: this box resolves the gate from four homes, so the cheap check they ran
+    # and the one that judged the dispatch can be two different revisions. With the digest here, two
+    # copies that disagree are two distinguishable lines instead of one repeated surprise — and the
+    # dispatcher's own naming line (its resolved PATH) plus this digest identifies the pair.
+    printf '[brief-gate]   validator: %s\n' "$(brief_gate_selfid)"
     printf '[brief-gate] missing:\n%s' "$lines"
     printf '[brief-gate] add exactly this to the brief, fill the <…> slots, and re-dispatch\n'
     printf '[brief-gate] (the canonical block, byte-identical to `brief-gate.sh --section %s %s`):\n' "$role" "${rnd:-0}"
@@ -1318,6 +1402,26 @@ brief_gate_line() { # brief_gate_line [role]
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
 #   bash brief-gate.sh --check <file|-> [role] [round] [repo]  → 0 pass · 80 refused (message on stderr) · 78 cannot verify
 #   bash brief-gate.sh --missing <file|-> [role] [round] [repo] → the missing tokens, one per line
+#
+# ⛔ THE CHEAP CHECK AND THE DISPATCH PATH ARE ONE VERDICT (#4152) — with two things the caller must
+# supply, because they are inputs the gate cannot invent:
+#   • `role`/`round`: the defaults are `lane`/`0`, which is what every AUTHORED-brief dispatch uses
+#     (`nonblocking-dispatch.sh` grades `worker`, and `worker` is folded onto `lane` — see
+#     `brief_gate_grade_role`). A brief destined for `fix-one.sh` or `merge-one.sh` must be checked as
+#     `fixer` / `reviewer <round>`: `pr-<N>` WIP keys, the non-vacuity block and (from round 4) the
+#     `COMPARABLES:` line are role- and round-scoped, so grading them as `lane` would be a different
+#     question — and a 0 there is not evidence about the dispatch that will run.
+#   • `repo`: the PREVIOUS WORK cross-check measures `refs/wip/*` in THIS repository (an explicit path is
+#     taken strictly) and otherwise in whatever the caller's CWD resolves to (or `$CLAIM_REPO`/`$REPO`,
+#     when the caller's environment sets one — that outranks the CWD). A dispatch from a different
+#     checkout must name the target repo here, or the measurement is about the wrong tree.
+#     `nonblocking-dispatch.sh` passes its own worktree for exactly this reason.
+#     ⛔ AND THE ARGUMENT IS ONLY HALF OF IT (#4152): the cheap check is evidence about the dispatch
+#     only when BOTH CALLERS ARE THE SAME FILE. `nonblocking-dispatch.sh` resolves the validator from
+#     four homes while an author runs their checkout's copy, so a green `--check` can be a green about a
+#     different validator. The refusal block prints the executing copy's content digest
+#     (`validator: brief-gate.sh @ <digest12>`) for precisely that comparison — if the refusals from the
+#     two places name different digests, the brief was not the problem, the two copies were.
 #   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
 #                                                   `record-review.sh` calls this on a review comment)
 #   bash brief-gate.sh --wip-refs <issue> [repo]  → `<ref>\t<sha12>` per refs/wip ref belonging to the
@@ -1338,6 +1442,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)
       printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker] [round] [repo]\n' "$0" >&2
+      printf '       (the [repo] argument is required for a green run to be evidence about a DISPATCH: the\n' >&2
+      printf '       dispatcher measures its own worktree, so a check run from another tree measures another\n' >&2
+      printf '       repository — and both callers must be the SAME brief-gate.sh file, which the refusal\n' >&2
+      printf '       block names as `validator: brief-gate.sh @ <digest12>`)\n' >&2
       printf '       %s --missing <brief-file|-> [role] [round] [repo] | --mutation-missing <file|->\n' "$0" >&2
       printf '       %s --wip-refs <issue> [repo]\n' "$0" >&2
       printf '       %s --section [role] [round] | --mutation-section | --line [role]\n' "$0" >&2
