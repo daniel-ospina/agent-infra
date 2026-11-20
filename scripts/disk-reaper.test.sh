@@ -3555,6 +3555,32 @@ assert_contains "$OUT" "class=runner-cache (? bytes unmeasured — the owner cou
 assert_absent "$OUT" ") REAP ?MB" \
     "T65 no published locator leaks the owner's unsized size token (the pre-fix row read \"… ) REAP ?MB /path\")"
 
+# ── T66: the fast-cache instance REFUSES to report itself installed without --size-trigger ──────
+# The earlier review recorded NO ROW for this arm: a cache unit rendered WITHOUT the flag installs
+# green, and the 10-minute timer then runs the FULL pass 144 times a day — the opposite of what it
+# exists for. The TEMPLATE is mutated, not the code, so the arm that reads the installed artifact back
+# is what has to fire (a code-side mutant would test the sed, not the gate).
+ENVNAME=t66
+REPO="$(mk_repo t66repo)"
+T66_TPL="$T/t66/templates"; mkdir -p "$T66_TPL"
+cp "$REPO_ROOT/templates/systemd/"*.service "$REPO_ROOT/templates/systemd/"*.timer "$T66_TPL/"
+sed -i.bak 's/ --size-trigger//' "$T66_TPL/eldato-disk-reaper-cache.service"
+rm -f "$T66_TPL/eldato-disk-reaper-cache.service.bak"
+mkdir -p "$T/t66/units" "$T/t66/bin" "$T/t66/home"
+cp "$T/t8/bin/systemctl" "$T/t66/bin/systemctl"
+OUT="$(HOME="$T/t66/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+      DISK_REAPER_STATE_DIR="$T/t66/home/.pi/agent/state" TEMPLATES_DIR="$T66_TPL" \
+      SYSTEMD_UNIT_DIR="$T/t66/units" SYSTEMCTL="$T/t66/bin/systemctl" \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T66 an install whose cache unit lost --size-trigger is REFUSED (rc=$RC, want 1)"
+assert_contains "$OUT" "no ExecStart= in the installed eldato-disk-reaper-cache.service carries --size-trigger" \
+    "T66 and names the missing flag IN THE ARGV (a comment mentioning it does not count)"
+assert_contains "$OUT" "runs the FULL pass every 10 minutes" \
+    "T66 ... and states the consequence, so the refusal is actionable"
+# and the positive control: the same install over the REAL templates succeeds and really is armed
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper-cache.service" 2>/dev/null)" "--size-trigger" \
+    "T66 control: the unmutated install DOES carry --size-trigger (the assertion above is not vacuous)"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

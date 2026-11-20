@@ -1213,9 +1213,19 @@ install_cache_trigger_units() {
         err "REFUSING to report the fast cache pass as installed: the installed $CACHE_UNIT_NAME.service could not be READ BACK from the $TARGET artifact (target dir $UNIT_DIR)"
         return 1
     fi
-    if ! grep -q -- '--size-trigger' <<<"$got"; then
-        err "REFUSING: the installed $CACHE_UNIT_NAME.service does not carry --size-trigger — a 10-minute timer without it runs the FULL pass every 10 minutes"
-        err "  installed ExecStart: $(printf '%s\n' "$got" | sed -n 's/^ExecStart=//p' | head -1)"
+    # ⛔ AND IT IS CHECKED IN THE ARGV, NOT ANYWHERE IN THE TEXT (#4169 round 2). This used to grep the
+    # WHOLE unit, so a COMMENT mentioning the flag satisfied it: MEASURED — a template whose ExecStart lost
+    # `--size-trigger` while its explanatory comment kept the word INSTALLED GREEN, and the 10-minute timer
+    # then ran the FULL pass 144 times a day, which is the false-PASS shape this read-back exists to remove.
+    # The file already owns the right reader: `effective_execstarts` is what systemd will actually run
+    # (after a bare `ExecStart=` reset and any drop-in), so the flag is read where it has to be.
+    local _cache_armed=0 _exec
+    while IFS= read -r _exec; do
+        case "$_exec" in *--size-trigger*) _cache_armed=1 ;; esac
+    done <<<"$(effective_execstarts "$got")"
+    if [ "$_cache_armed" != 1 ]; then
+        err "REFUSING: no ExecStart= in the installed $CACHE_UNIT_NAME.service carries --size-trigger — a 10-minute timer without it runs the FULL pass every 10 minutes"
+        err "  installed ExecStart: $(effective_execstarts "$got" | head -1)"
         return 1
     fi
     $SC enable --now "$CACHE_UNIT_NAME.timer" || { err "could not enable/start $CACHE_UNIT_NAME.timer — the 10-minute cache pass will NOT run unattended"; return 1; }
