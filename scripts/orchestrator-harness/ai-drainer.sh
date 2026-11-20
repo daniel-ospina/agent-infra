@@ -735,7 +735,6 @@ if [ -z "$SPAWN_GATE_MOD" ]; then
 fi
 disk_free="${DISK_FREE_MB:-}"
 disk_need="${DISK_LANE_NEED_MB:-}"
-_disk_asked=0
 _disk_off=""
 # ⛔ A STATED SEAM IS VALIDATED BEFORE ANY DEGRADE DECISION, AND TO THE MODULE'S OWN RANGE RULE.
 # ORDER MATTERS AND IT WAS MEASURED WRONG (review round 1, P2): with `DISK_FREE_MB=unreadable` AND the
@@ -755,7 +754,8 @@ _disk_seam_check() { # <name> <value>; returns 1 when the seam is not stated at 
     ''|*[!0-9]*) log_line "FAIL: ${1}='${v}' is not a whole number of MB — a STATED seam that cannot be read is a fault in the reading, not an absent predicate, so the disk ceiling is not evaluated and nothing was dispatched"; exit 1 ;;
   esac
   if [ "${#v}" -gt 9 ]; then
-    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 (<=999999999 MB, ~976 TB) because a wider value WRAPS bash's integer range and would silently disable the disk term rather than bind it — refusing instead of planning from a wrapped number"; exit 1
+    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 for parity with spawn-gate.sh's is_limit (<=999999999 MB, ~976 TB). ⛔ THE CAP IS NOT A WRAP DETECTOR — 19 or more digits is what wraps bash's 2^63 integer range; the cap is deliberately tighter so a stated value is a magnitude this bound is defined for. Raise it only with a stated reason."
+    exit 1
   fi
   return 0
 }
@@ -763,7 +763,6 @@ _seam_need=0
 _disk_seam_check DISK_FREE_MB "${DISK_FREE_MB:-}" || :
 _disk_seam_check DISK_LANE_NEED_MB "${DISK_LANE_NEED_MB:-}" && _seam_need=1 || :
 if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
-  _disk_asked=1
   _disk_pair="$(_disk_probe "$AI" "$SEED_REPO")"
   case "$_disk_pair" in
     *' '*)
