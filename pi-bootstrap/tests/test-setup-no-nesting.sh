@@ -1948,10 +1948,35 @@ _STALE_FK_EXEMPT="$LANE_PRODUCERS_EXEMPT"
 LANE_PRODUCERS_EXEMPT="$_STALE_FK_EXEMPT orch-loop.sh:#9999"
 STALE_FOREIGN_KIND_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-stale-foreign-kind" "$POP_STALE_FOREIGN_KIND")"
 LANE_PRODUCERS_EXEMPT="$_STALE_FK_EXEMPT"
+# ⛔ THE PRECONDITION IS ASSERTED, because the property below is CONDITIONAL on it. The discrimination
+# only exists while the same-named `script:` producer actually REACHES `applied`: the day a farm array
+# delivers `orch-loop.sh`, `delivered_flat` returns BEFORE the EXEMPT arm (`delivered=$((delivered+1));
+# continue`), so `applied` never records `script:orch-loop.sh` — and then a KIND-BLIND matcher reads
+# `foreign:orch-loop.sh` stale exactly like the kind-qualified one, i.e. the probe stays GREEN while the
+# property it exists for is gone. Live today (`grep -c orch-loop pi-bootstrap/setup.sh` → 0), silently
+# vacuous the day that changes (review of #4067, P3). The DECLARED-GAP line echoes the names the EXEMPT
+# arm applied THIS run, so it is direct evidence of `applied`, not a proxy for it.
+case "$STALE_FOREIGN_KIND_MSG" in
+  *"DECLARED-GAP"*"orch-loop.sh(#9999)"*)
+    echo "ok: the FOREIGN kind probe's same-named OTHER-KIND producer reached \`applied\` (script:orch-loop.sh disclosed for the probe) — its discriminating power is live, not vacuous" ;;
+  *) fail "the FOREIGN kind probe is VACUOUS on this tree: 'script:orch-loop.sh' did not reach \`applied\` (no DECLARED-GAP line naming it), so a KIND-BLIND matcher would read foreign:orch-loop.sh stale exactly like the correct one and this probe could no longer witness the property — pick a basename no farm array delivers, or retire the probe if the whole class is gone (#1899)" ;;
+esac
 case "$STALE_FOREIGN_KIND_MSG" in
   *"STALE disclosure"*"foreign:orch-loop.sh"*)
     echo "ok: a FOREIGN disclosure is matched by KIND — a same-named producer in another kind does not keep it alive" ;;
-  *) fail "a FOREIGN disclosure survived on the strength of a same-named producer in another kind — the FOREIGN staleness matcher is KIND-BLIND (#1899); probe said: $(printf '%s' "$STALE_FOREIGN_KIND_MSG" | grep 'STALE\|SUMMARY' | head -c 300)" ;;
+  *)
+    # ⛔ THIS ROW CANNOT, ON ITS OWN, TELL THE TWO CAUSES APART — a KIND-BLIND matcher and a MISSING
+    # FOREIGN leg are BOTH silent for a foreign entry. Naming one of them as the cause is what the
+    # liveness row above was corrected for (review of #4067, P3: a deletion of the FOREIGN loop made
+    # this row report KIND-BLIND, a cause it never observed). The leg-live probe IS the discriminator:
+    # it strips the entry from the population OUTRIGHT, so a LIVE leg reports it stale under ANY matcher,
+    # while a missing leg reports nothing. Attribute from its message, never from this row's own silence.
+    case "$STALE_FOREIGN_MSG" in
+      *"STALE disclosure"*"foreign:orch-loop.sh"*)
+        fail "a FOREIGN disclosure survived on the strength of a same-named producer in another kind — the FOREIGN staleness matcher is KIND-BLIND (#1899); probe said: $(printf '%s' "$STALE_FOREIGN_KIND_MSG" | grep 'STALE\|SUMMARY' | head -c 300)" ;;
+      *)
+        fail "the FOREIGN stale loop reported NOTHING for foreign:orch-loop.sh — the FOREIGN leg is MISSING (the leg-live row above names that same cause), so this row cannot witness the KIND property at all; it is NOT evidence of a kind-blind matcher (#1899); probe said: $(printf '%s' "$STALE_FOREIGN_KIND_MSG" | grep 'STALE\|SUMMARY' | head -c 300)" ;;
+    esac ;;
 esac
 # ...and staleness is KIND-QUALIFIED: `lane-triage.py` as a `script:` producer does NOT keep its
 # `state:` residual alive. This is the shape of a #1553 landing that farms the file — without the kind
