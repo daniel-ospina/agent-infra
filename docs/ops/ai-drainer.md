@@ -65,8 +65,10 @@ nothing, and it exits 0):
    because a new bound must not be able to take a box to ZERO because a file is missing (the
    inert-unit class, #3194) — a drainer that dispatches nothing is worse than one without a disk
    term. A **stated** `DISK_FREE_MB`/`DISK_LANE_NEED_MB` that is not whole megabytes, or is wider than
-   9 digits (which would WRAP), **fails closed by name**: that is a fault in the reading, not an
-   absent improvement.
+   9 digits (the cap `spawn-gate.sh`'s own `is_limit` applies — ≤999,999,999 MB ≈ 976 TB), **fails
+   closed by name**: that is a fault in the reading the operator asserted, not an absent improvement.
+   A module that *answers* a non-number is not that case — it is indistinguishable from "could not
+   answer" and takes the degrade path above.
    The disk is also re-asked immediately before **each** `git worktree add`, because the target is
    computed once and the tick's own worktrees consume the free space it was planned from — a stop
    there is logged as `STOP: disk floor …` and exits **0**, since a full volume is a fact about the
@@ -108,7 +110,7 @@ nothing, and it exits 0):
    cannot be identified is
    one of those cases: the two swap arms are different gates, so choosing one on a guess is refused by
    name (`DRAINER_OS` overrides `uname -s`; it is the suite's seam). The **cores**
-   probe is the one exception, and it does not fail closed: it is the CPU *ceiling* only, so an
+   probe is the other exception, and it does not fail closed: it is the CPU *ceiling* only, so an
    unreadable one warns and assumes 4 cores, which under-reports the ceiling (the conservative
    direction) instead of stopping the job.
 2. **top-up, not one-shot.** Each tick counts the lanes already alive and dispatches `target − alive`
