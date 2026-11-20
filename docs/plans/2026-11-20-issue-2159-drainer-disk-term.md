@@ -346,10 +346,13 @@ the disk term being absent: the whole cell loses its capacity instead of one bou
 | shape | answer | why |
 |---|---|---|
 | the predicate is **unavailable** (module absent / stale / died while sourced) | **DEGRADE**: a named `NOTE:`, `disk=off (...)` on the line, and the tick plans from cores+memory — the pre-#2159 behaviour | a NEW bound must not be able to take a box to **zero** because a file is missing. The improvement is absent, not contradicted; the NOTE names the remedy (`SPAWN_GATE_MOD`). Same precedent as `fleet_line`'s `why=capacity.sh-unreachable` |
-| the predicate **answered with a non-number** (a `df`/seam value that is not whole MB) | **FAIL closed, by name** | that is a FAULT in a resource this tick is about to spend, not an absent improvement — the same posture as the memory and swap probes (D5's original argument, now correctly scoped) |
+| a **STATED seam** (`DISK_FREE_MB` / `DISK_LANE_NEED_MB`) that is not whole MB, is wider than 9 digits, or has a leading zero | **FAIL closed, by name** | that is a FAULT in a reading the OPERATOR asserted — not an absent improvement, and not a value the bound is defined for. Same posture as the memory and swap probes (D5's original argument, now correctly scoped). Enforced in `_disk_seam_check`, **before** any degrade decision, so a garbage seam is not silently discarded by an unrelated missing module |
+| the module **answered with a non-number** (e.g. `disk_free_mb` printing `abc`) | **DEGRADE** — indistinguishable from UNKNOWN | ⛔ THIS ROW USED TO SAY "FAIL closed" AND THAT WAS WRONG (superseded; corrected in review round 2, and the plan's own round-2 table records why). `_disk_probe` digit-validates its own reading and hands back NOTHING for a non-number, so by the time the caller looks there is no "answered garbage" state to fail on — only "no answer". A fail-closed arm there was **unreachable** and was deleted; the behaviour is pinned by arm `k4g` (rc 0, named NOTE, `disk=off`, and the reason names the module as present-and-silent) |
 
-Both are asserted, in opposite directions: (k4) `DISK_FREE_MB=unreadable` **must** end the tick;
-(k4b) an unavailable module **must not** (it must still dispatch, and say why).
+Both directions are asserted: (k4) a stated `DISK_FREE_MB=unreadable` **must** end the tick; (k4b) an
+unavailable module **must not** (it must still dispatch, and say why); (k4g) a module that ANSWERS a
+non-number **must not** either — it degrades, because it is indistinguishable from silence; (k4f) and
+(k4h) pin the floor's own resolution against `spawn-gate.sh`'s, by width and by zero shape.
 
 ### The other failure, and it was MY arm
 
@@ -448,3 +451,27 @@ produced when that property holds.
 
 **PROOF after round 3**: `ai-drainer.test.sh` → **255 passed / 0 failed**, exit 0.
 `spawn-gate.test.sh` → **516 passed / 0 failed**.
+
+---
+
+## CODE-REVIEW round 4 — ISSUES: 2, both applied (converging: 5 → 5 → 5 → 2)
+
+Both remaining findings were **record/proof defects, not behaviour defects** — the code was right and
+the artifacts describing it were not. That is the shape a review loop converges in, and it is worth
+noting which direction it closed: round 4 attacked the DELTA (as instructed) and found nothing wrong
+with the delta's behaviour.
+
+| # | finding | disposition |
+|---|---|---|
+| P2 | **the plan's OWN decision record still stated the polarity the code had deliberately abandoned.** The D19 table's second row said a predicate that **answers a non-number** FAILS CLOSED — contradicting this same document's round-2 row, the ops doc, the code, and arm `k4g`, all of which say it DEGRADES. The D19 table is the artifact a later lane reads as the design record | **applied** — D19 now has THREE rows matching the code: unavailable → DEGRADE; a **STATED seam** that is not whole MB / >9 digits / leading-zero → FAIL closed in `_disk_seam_check` before any degrade decision; a **module answering a non-number** → DEGRADE, marked as superseded with the reason it is indistinguishable from UNKNOWN. The assertion summary names all four arms |
+| P2 | arm **(k4h)** claimed to prove parity with the gate but asserted ONE link of a three-link chain (`is_num` rejects `0*`), so it would stay green if `spawn-gate.sh:203` stopped routing the floor through `is_limit` — a LIVE risk, because that same file already chose a `case` validator over `is_num` for disk readability, on purpose | **applied** — the link-by-link greps are replaced by an **execution** check: the module is sourced in a subshell with `DISK_MIN_FREE_MB=007` and the resolved floor is compared to 500, exactly as `_disk_probe` consumes it. The arm now fails on a SEMANTIC divergence instead of on a reformat |
+
+### What this round says about the loop
+
+Four rounds, 17 findings. Rounds 1–3 found behaviour defects (mostly constructs the PREVIOUS round
+introduced). Round 4 found none in the behaviour and two in the record. **The distinction matters for
+the attestation**: what is being asserted is not "the code is perfect" but "the code and everything
+written about it agree, and each claim is pinned by an arm that fails when it stops being true".
+
+**PROOF after round 4**: `ai-drainer.test.sh` → **255 passed / 0 failed**, exit 0, including the new
+execution-based gate check `(k4h) …and the GATE resolves that same 007 to 500`.

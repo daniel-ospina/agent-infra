@@ -751,9 +751,15 @@ run_drainer_fg k4h
 check "(k4h) a leading-zero floor resolves to 500 — the answer spawn-gate.sh gives, not 7" \
   '[ "$LAST_RC" -eq 0 ] && grep -q "WARN: DISK_MIN_FREE_MB=.*has a leading zero" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk_floor=500MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "disk_floor=7MB" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep -E 'WARN: DISK_MIN_FREE_MB' "$LAST_AI/logs/ai-drainer.log" | head -1)"
-check "(k4h) …and the GATE's own is_num still rejects the 0* shape, so the parity this arm pins is real" \
-  'grep -qF "0) return 0 ;; 0*) return 1" "$HERE/spawn-gate.sh"' \
-  "$(grep -n 'is_num()' "$HERE/spawn-gate.sh")"
+# ⛔ AND THE GATE'S ANSWER IS RESOLVED BY EXECUTION, NOT BY GREPPING ITS SOURCE (review round 4).
+# The round-3 version asserted one link of a three-link chain (`is_num` rejects `0*`) and would stay
+# green if `spawn-gate.sh:203` stopped routing the floor through `is_limit` — a live risk, because that
+# same file already chose a `case` validator over `is_num` for disk readability, on purpose. Sourcing
+# the module in a subshell makes the arm fail on a SEMANTIC divergence instead of on a reformat.
+GATE_FLOOR_007=$(DISK_MIN_FREE_MB=007 bash -c '. "$1" >/dev/null 2>&1; printf %s "$DISK_MIN_FREE_MB"' _ "$HERE/spawn-gate.sh" 2>/dev/null)
+check "(k4h) …and the GATE resolves that same 007 to 500 — the SAME floor, resolved by the gate itself" \
+  '[ "$GATE_FLOOR_007" = "500" ]' \
+  "gate resolved 007 -> '$GATE_FLOOR_007' (want 500)"
 
 reset_run
 # ── (k5) AN EXPLICIT `need = 0` DISABLES THE TERM, SAYS SO, AND DOES NOT CRASH ─────────────────
