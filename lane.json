@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-fix-4152-1795192572-p1640175-0fcc7e20",
+  "_sha": "22604d7c7b9d22adbe83891aaa6cc0fd8f31a1ad",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/fix-4152.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/4152-briefgate-agree"
+    },
+    {
+      "kind": "sha",
+      "value": "0e771d1cfb46f270ac37d9a2eb034cecde19a89b"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-4152"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4142,
+  "ended_at": 1795196714,
+  "exit_code": 0,
+  "heartbeat_at": 1795196714,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-fix-4152-1795192572-p1640175-0fcc7e20",
+  "lease_until": 1795204514,
+  "pid": 1640175,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795192572,
+  "state": "DONE",
+  "tag": "fix-4152",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4152"
+}
