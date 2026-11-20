@@ -373,13 +373,24 @@ case "$MAX_MEM_PRESSURE_LEVEL" in
   *) log_line "WARN: MAX_MEM_PRESSURE_LEVEL='${MAX_MEM_PRESSURE_LEVEL}' is not a threshold this arm can refuse at (2 = warning, 3, 4 = critical; 1 = normal would refuse EVERY box) — using 2. To stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; MAX_MEM_PRESSURE_LEVEL=2 ;;
 esac
 MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
-# ⛔ VALIDATED THE WAY `spawn-gate.sh` VALIDATES IT — same bounds, same fallback, and the reason is
-# that this number is now a DIVISOR (see `_capacity_target`): a `DISK_MIN_FREE_MB=0` would let the
+# ⛔ THE SAME BOUNDS AND THE SAME WIDTH RULE AS `spawn-gate.sh`, AND BOTH ARE TESTED ON THE RAW
+# STRING. This number is now a DIVISOR (see `_capacity_target`): a `DISK_MIN_FREE_MB=0` would let the
 # last available megabyte be planned into a lane, and a value beyond the clamp is a typo that must not
-# widen a floor. Neither direction is silent.
+# widen a floor. ⛔ WIDTH BEFORE `10#`, MEASURED (review round 2): `$((10#18446744073909551616))`
+# WRAPS to `200000000`, which passes every bound below — so a range check applied AFTER the conversion
+# cannot see the wrap, and the tick would run with a 200,000,000 MB floor (`disk=0`, inert) while the
+# only line it prints is a SKIP that reads like a full volume. `spawn-gate.sh:203` tests the raw
+# string (`is_limit`, <= 9 digits) and so does this.
 case "$DISK_MIN_FREE_MB" in
-  ''|*[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
-  *) DISK_MIN_FREE_MB="$((10#$DISK_MIN_FREE_MB))" ;;
+  '') log_line "WARN: DISK_MIN_FREE_MB is empty — using 500"; DISK_MIN_FREE_MB=500 ;;
+  *[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
+  *)
+    if [ "${#DISK_MIN_FREE_MB}" -gt 9 ]; then
+      log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is ${#DISK_MIN_FREE_MB} digits; the cap is 9, the same one spawn-gate.sh's is_limit applies (<=999999999 MB, ~976 TB) — using 500"
+      DISK_MIN_FREE_MB=500
+    else
+      DISK_MIN_FREE_MB="$((10#$DISK_MIN_FREE_MB))"
+    fi ;;
 esac
 [ "$DISK_MIN_FREE_MB" -ge 1 ] || { log_line "WARN: DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} would let a lane eat the last megabyte (0 = no floor) — using 500; to stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; DISK_MIN_FREE_MB=500; }
 [ "$DISK_MIN_FREE_MB" -le 249999999 ] || { log_line "WARN: DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} is beyond any sane floor — using 500"; DISK_MIN_FREE_MB=500; }
@@ -735,7 +746,6 @@ if [ -z "$SPAWN_GATE_MOD" ]; then
 fi
 disk_free="${DISK_FREE_MB:-}"
 disk_need="${DISK_LANE_NEED_MB:-}"
-_disk_asked=0
 _disk_off=""
 # ⛔ A STATED SEAM IS VALIDATED BEFORE ANY DEGRADE DECISION, AND TO THE MODULE'S OWN RANGE RULE.
 # ORDER MATTERS AND IT WAS MEASURED WRONG (review round 1, P2): with `DISK_FREE_MB=unreadable` AND the
@@ -755,7 +765,8 @@ _disk_seam_check() { # <name> <value>; returns 1 when the seam is not stated at 
     ''|*[!0-9]*) log_line "FAIL: ${1}='${v}' is not a whole number of MB — a STATED seam that cannot be read is a fault in the reading, not an absent predicate, so the disk ceiling is not evaluated and nothing was dispatched"; exit 1 ;;
   esac
   if [ "${#v}" -gt 9 ]; then
-    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 (<=999999999 MB, ~976 TB) because a wider value WRAPS bash's integer range and would silently disable the disk term rather than bind it — refusing instead of planning from a wrapped number"; exit 1
+    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 for parity with spawn-gate.sh's is_limit (<=999999999 MB, ~976 TB). ⛔ THE CAP IS NOT A WRAP DETECTOR — 19 or more digits is what wraps bash's 2^63 integer range; the cap is deliberately tighter so a stated value is a magnitude this bound is defined for. Raise it only with a stated reason."
+    exit 1
   fi
   return 0
 }
@@ -763,7 +774,6 @@ _seam_need=0
 _disk_seam_check DISK_FREE_MB "${DISK_FREE_MB:-}" || :
 _disk_seam_check DISK_LANE_NEED_MB "${DISK_LANE_NEED_MB:-}" && _seam_need=1 || :
 if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
-  _disk_asked=1
   _disk_pair="$(_disk_probe "$AI" "$SEED_REPO")"
   case "$_disk_pair" in
     *' '*)
@@ -784,33 +794,26 @@ fi
 #       all, silently but for a log line. That is the inert-unit class (#3194), and it is a worse
 #       outcome than the disk term being absent. A new bound must not be able to take a box to ZERO
 #       because a file is missing; it degrades, loudly, and the NOTE names the fix.
-#   (b) THE PREDICATE ANSWERED WITH A READING THAT IS NOT A NUMBER — a `df`/seam value that is not
-#       whole megabytes. That is a FAULT in a resource this tick is about to spend, not an absent
-#       improvement, and it FAILS CLOSED by name (the same posture as the memory and swap probes).
-#       `DISK_FREE_MB=unreadable` is asserted to end the tick; a missing module is asserted NOT to.
+#   (b) A **STATED** SEAM THAT IS NOT WHOLE MEGABYTES (or is wider than 9 digits) — that is a FAULT in
+#       a reading the OPERATOR asserted, not an absent improvement, so it FAILS CLOSED by name, in
+#       `_disk_seam_check`, BEFORE any degrade decision. `DISK_FREE_MB=unreadable` ends the tick even
+#       when the module is also unreachable, and that is asserted.
+#       ⛔ AND A MODULE THAT *ANSWERS* A NON-NUMBER IS **NOT** THIS CASE: `_disk_probe` digit-validates
+#       its own reading and hands back nothing, so such an answer is indistinguishable from UNKNOWN and
+#       takes arm (a). An earlier revision carried a second fail-closed arm for it here; that arm was
+#       UNREACHABLE (every stated non-digit exits at `_disk_seam_check` first) and is gone — a guard
+#       that can never fire reads exactly like one that does, which is worse than no guard. The arm
+#       `k4g` pins the real behaviour so the two shapes cannot swap back.
 if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
   _disk_off="the disk predicate could not answer: $(_disk_why)"
   disk_free=0; disk_need=0
   log_line "NOTE: the disk term is DISABLED for this tick — ${_disk_off}. This tick plans from cores and memory only, which is the PRE-#2159 behaviour: a full volume can still be refused by the spawn gate and reported as a failed tick. Make the predicate reachable (the module is looked up as \$O/spawn-gate.sh then <this script's dir>/spawn-gate.sh; SPAWN_GATE_MOD states it outright)."
 else
-  # ⛔ THE REASON IS DERIVED, NOT GUESSED — and "the probe could not answer" is only TRUE when the
-  # probe was actually asked. MEASURED in the arm `k4`: a garbage `DISK_FREE_MB` with a stated
-  # `DISK_LANE_NEED_MB` never consults the module at all, so a fixed message blamed a stale
-  # `spawn-gate.sh` that was in fact current — a diagnosis that sends an operator to re-farm a healthy
-  # file. Both shapes are named, and each names the thing that actually failed.
-  if [ "$_disk_asked" = 1 ]; then
-    _disk_src="and the probe could not answer ($(_disk_why))"
-  else
-    _disk_src="and both values were stated as seams, so the probe was not consulted (only the stated value is wrong — see DISK_FREE_MB/DISK_LANE_NEED_MB)"
-  fi
-  case "$disk_free" in
-    ''|*[!0-9]*) log_line "FAIL: free disk is UNKNOWN — DISK_FREE_MB='${DISK_FREE_MB:-<unset>}' is not a whole number of MB $_disk_src — the disk ceiling cannot be evaluated, so nothing was dispatched"; exit 1 ;;
-    *) disk_free="$((10#$disk_free))" ;;
-  esac
-  case "$disk_need" in
-    ''|*[!0-9]*) log_line "FAIL: the per-lane disk requirement is UNKNOWN — DISK_LANE_NEED_MB='${DISK_LANE_NEED_MB:-<unset>}' is not a whole number of MB $_disk_src — the disk ceiling cannot be evaluated, so nothing was dispatched"; exit 1 ;;
-    *) disk_need="$((10#$disk_need))" ;;
-  esac
+  # ⛔ BOTH VALUES ARE ALL-DIGIT BY CONSTRUCTION HERE, SO THIS IS NORMALISATION, NOT A CHECK. A stated
+  # seam was validated by `_disk_seam_check` above (digits, and ≤ 9 of them); a probe value is
+  # digit-validated inside `_disk_probe`. `10#` is here for the leading-zero case (`007` is not octal).
+  disk_free="$((10#$disk_free))"
+  disk_need="$((10#$disk_need))"
   # `0` is a STATED choice (the suite's neutralisation, and spawn-gate's own "an explicit 0 is
   # honoured" rule): the term does not apply, and the line says so instead of naming a seam that was
   # never set. ⛔ TWO WAYS TO GET 0 AND THEY ARE NOT THE SAME FACT — `DISK_LANE_NEED_MB=0` is an

@@ -384,3 +384,39 @@ false-PASS the term exists to prevent.
 **PROOF after round 1**: `ai-drainer.test.sh` → **249 passed / 0 failed**, exit 0, sha256 identical
 before and after the run.
 
+
+---
+
+## CODE-REVIEW round 2 — ISSUES: 5, all verified by execution, all applied
+
+Round 2 was told to attack the round-1 fixes themselves, and **two of its five findings were defects
+round 1 introduced**. Both are recorded here because they are the class this plan keeps meeting: a
+statement that reads like a guard while nothing behind it can fire.
+
+| # | finding | disposition |
+|---|---|---|
+| P2 | **`DISK_MIN_FREE_MB` was left out of the range guard round 1 added** — and the guard it *did* get is applied AFTER `10#`, so a value that WRAPS lands back **in band**. MEASURED: `DISK_MIN_FREE_MB=18446744073909551616` → `10#` yields `200000000`, which passes both the `>=1` and `<=249999999` bounds → floor 200,000,000 MB → `disk=0` → the tier goes inert and prints a SKIP that reads like a full volume, at rc 0 with **no WARN**. The comment claiming parity with `spawn-gate.sh` was false: `spawn-gate.sh:203` tests the raw STRING (`is_limit`) | **applied** — the width rule runs on the RAW value, before the conversion; the comment now states the bound AND the order; arm **(k4f)** reproduces the wrap and asserts `disk_floor=500MB` and that the term still BINDS |
+| P2 | **round 1 made half of its own documented split unreachable.** The two non-digit FAIL arms, `_disk_asked` and `_disk_src`, could never fire: a stated non-digit exits at `_disk_seam_check` first (that is round 1's own fix), and `_disk_probe` digit-validates its own reading, so the `else` branch can only ever hold digits-or-empty. A module that answers `abc` therefore DEGRADES (rc 0) while the comment asserted it "FAILS CLOSED by name". Three dead constructs plus a false comment | **applied** — `_disk_asked`, `_disk_src` and both unreachable arms deleted; the comment now states the split the code implements (a **stated** seam fails closed, a **module** answering a non-number is indistinguishable from UNKNOWN and degrades); arm **(k4g)** pins the module case so the two shapes cannot silently swap back |
+| P2 | the 9-digit cap's **stated reason was false** for 10–18 digits, in both the FAIL message and the ops doc: `$((1000000000))` does not wrap; only 19+ digits wrap 2^63 | **applied** — both texts now give the true reason (parity with `is_limit`, ≤999,999,999 MB ≈ 976 TB) and say plainly that the cap is not a wrap detector |
+| P2 | the ops doc round 1 edited became **self-contradictory**: disk was "the second exception" at one line and cores "the one exception" six lines later | **applied** — cores is now "the other exception" |
+| P2 | arm **(k4e)** did not prove its own title: it pinned only the `(looked at` prefix, so an implementation printing **one** path would stay green while the claim "names BOTH searched paths" became false | **applied** — the arm pins both full paths (`$ROOT/o-k4e/spawn-gate.sh and $ROOT/spawn-gate.sh`), which also proves `$SELF_DIR` resolved to the copy's directory — the property the four mutant-copy arms depend on |
+
+### The build error this cycle surfaced, and why it matters
+
+Both rounds' fixes were applied with a single multi-hunk edit whose **third hunk failed to match**.
+The editor applies a call atomically, so hunks 1, 2 and 4 did not land either — but a *second* call
+then removed `_disk_asked`'s assignment while leaving its read site. The result was `set -u` killing
+every tick at `ai-drainer.sh:800`:
+
+```
+ai-drainer.sh: line 800: _disk_asked: unbound variable
+```
+
+**146 arms failed and 107 still "passed"** — many of them vacuously, because the arms that assert *"the
+tick refuses"* were satisfied by the crash rather than by the behaviour. That is the failure mode a
+pass/fail tally hides: a suite can go red for the wrong reason and green for no reason. The fix
+verification is therefore stated as **the specific arms**, not the count.
+
+**PROOF after round 2**: `ai-drainer.test.sh` → **252 passed / 0 failed**, exit 0
+(`(k4f)`, `(k4g)`, `(k4e)`, `(k-real)`, `(k2)`, `(k3)`, `(k6)` all green).
+`spawn-gate.test.sh` → **516 passed / 0 failed** (unchanged file, re-run for the pair).
