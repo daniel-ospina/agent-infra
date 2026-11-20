@@ -1069,13 +1069,6 @@ END {
 }
 '
 
-# brief_gate_missing_all <file|-> [role] [round] [repo] — every missing token for a dispatch: the SHAPE
-# tokens plus the PREVIOUS WORK cross-check. `--missing` is the verb an author iterates with, so it must
-# see the same body `--check` sees.
-# ⛔ STDIN IS MATERIALISED ONCE HERE TOO (fresh-context review of #3484, P2). `brief_gate_missing` and
-# `brief_gate_previous_work` are two readers; with `-` the first drains the pipe and the second sits at
-# EOF, so `--missing -` reported "complete, rc=0" for a brief that `--check -` refuses — the diagnostic
-# verb disagreeing with the gate is how an author is told their brief is fine when it is not.
 # brief_gate_grade_role <role> — THE role a rule is evaluated with (#4152). `worker` is an alias of
 # `lane`, and it is folded HERE so that no rule in this file — and none added later — can tell them
 # apart. The two names exist because the callers do: `nonblocking-dispatch.sh` and `pr-doctor.py` grade
@@ -1093,6 +1086,13 @@ brief_gate_grade_role() { # brief_gate_grade_role <role>
   esac
 }
 
+# brief_gate_missing_all <file|-> [role] [round] [repo] — every missing token for a dispatch: the SHAPE
+# tokens plus the PREVIOUS WORK cross-check. `--missing` is the verb an author iterates with, so it must
+# see the same body `--check` sees.
+# ⛔ STDIN IS MATERIALISED ONCE HERE TOO (fresh-context review of #3484, P2). `brief_gate_missing` and
+# `brief_gate_previous_work` are two readers; with `-` the first drains the pipe and the second sits at
+# EOF, so `--missing -` reported "complete, rc=0" for a brief that `--check -` refuses — the diagnostic
+# verb disagreeing with the gate is how an author is told their brief is fine when it is not.
 brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [repo]
   local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf="" grade=""
   rnd="$(brief_gate_round_norm "${3:-0}")"
