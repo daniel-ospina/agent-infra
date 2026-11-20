@@ -2175,7 +2175,15 @@ while [ "$i" -lt "$n" ]; do
     _lf="$(_disk_free_now "$AI")"
     case "$_lf" in
       ''|*[!0-9]*)
-        log_line "FAIL: free disk could not be re-read before lane $((i + 1)) of $n ($(_disk_why)) — this lane is not started; the $(i) lane(s) already dispatched keep their records"; exit 1 ;;
+        # ⛔ AN UNREADABLE RE-READ IS A BOX FACT, NOT A TICK FAILURE — the SAME disposition as the
+        # full-volume branch immediately below, and for the same reason (#2159's whole thesis: a fact
+        # about the box must not be reported as a failure of the unit). Round 5 caught this branch
+        # `exit 1`-ing while its neighbour exited 0, which made the unit RED for a reading it could not
+        # take — the exact defect the disk term was added to stop. Dispatch still STOPS: we will not
+        # start a lane against headroom this tick could not verify. Nothing is rolled back; the lanes
+        # already dispatched keep their records. Arm (k6b) pins it.
+        log_line "STOP: disk unreadable — dispatched $i of $n lane(s); free disk could NOT be re-read before lane $((i + 1)) ($(_disk_why)). This is NOT a tick failure: headroom could not be verified, so no further lane was started against it. The $i dispatched lane(s) keep their records and are counted by the next tick."
+        finish 0 ;;
     esac
     if [ "$_lf" -lt "$((DISK_MIN_FREE_MB + disk_need))" ]; then
       # ⛔ A FULL VOLUME IS A FACT ABOUT THE BOX, NOT A FAILURE OF THIS TICK — the disposition

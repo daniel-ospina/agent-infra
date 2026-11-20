@@ -812,6 +812,31 @@ check "(k6) …and that stop is a NAMED box fact, EXIT 0, not a failed unit" \
   "rc=$LAST_RC"
 
 reset_run
+# ── (k6b) AN UNREADABLE RE-READ STOPS THE BATCH **WITHOUT** REDDENING THE UNIT ────────────────────
+# ⛔ ROUND 5 FOUND THIS BRANCH `exit 1`-ING while its neighbour (the full-volume stop) exited 0, and
+# NOTHING asserted either behaviour: (k6)'s stub always answers a NUMBER, so the garbage-after-first-read
+# shape was never exercised. That asymmetry made the unit RED for a reading the tick could not take —
+# exactly the defect #2159 exists to remove (a box fact reported as a unit failure). The posture is now
+# one rule at both in-loop outcomes: STOP dispatching, name it, exit 0, already-dispatched records stand.
+# First read answers 10000 so the tick is allowed to plan; every later read answers garbage.
+printf '%s\n' \
+  'disk_free_mb() { local f="$DISK_COUNTER_FILE" n; n="$(cat "$f" 2>/dev/null || printf 0)"; n=$((n + 1)); printf "%s" "$n" >"$f"; case "$n" in 1) printf 10000 ;; *) printf garbled ;; esac; }' \
+  'disk_lane_costs() { printf "0 0 1000\n"; }' \
+  'disk_lane_need() { local t="${1:-0}" s="${2:-0}" r="${3:-0}" w; if [ "$t" -gt "$s" ]; then w="$t"; else w="$s"; fi; printf "%s\n" "$(( w + r ))"; }' \
+  >"$ROOT/disk-garble-gate.sh"
+export DISK_COUNTER_FILE="$ROOT/disk-counter-k6b"
+RUN_NCPU=2 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500 \
+  RUN_SPAWN_GATE_MOD="$ROOT/disk-garble-gate.sh"
+run_drainer_fg k6b
+unset DISK_COUNTER_FILE
+check "(k6b) an unreadable re-read STOPS the batch — no lane started against unverified headroom" \
+  'grep -q "STOP: disk unreadable" "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ]' \
+  "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep -E 'STOP:|FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k6b) …and that stop is EXIT 0 and says it is not a tick failure — a box fact, not a red unit" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "NOT a tick failure" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "FAIL:" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC"
+
+reset_run
 # ── (k8) A PIN OVERRIDES THE DERIVED CEILING — BUT NEVER THE HARD GUARD (both halves) ──────────
 # Half 1: pin 6 against a disk ceiling of 3 → the PIN wins (the same structure the swap/load guards
 # already have: those are hard guards, cpu/mem/disk are derived ceilings).

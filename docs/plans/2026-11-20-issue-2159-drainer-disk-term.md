@@ -123,11 +123,13 @@ clamped to `[1, 249999999]`). A second floor would be a second answer to "is thi
 ### D5 — polarity
 
 * **readable reading** → compare. `free < floor` ⇒ `disk_ceiling = 0`.
-* **unreadable reading** ⇒ **FAIL the tick, naming the probe** — the file's own posture for memory
-  (`FAIL: available memory could not be read … the memory ceiling cannot be evaluated`, exit 1) and
-  for swap. A guard that could not be evaluated must not look like an idle box, and a drainer that
-  planned lanes blind would be the fail-OPEN the live arm is allowed to take *because* it costs one
-  lane, not a whole tick's plan.
+* **unreadable reading** ⇒ ⛔ **SUPERSEDED BY D19 — read that row instead.** This section originally
+  prescribed FAIL-the-tick, by analogy with the memory and swap probes. D19 reversed it after the arm
+  ran: an unavailable disk predicate **DEGRADES** (named `NOTE:`, `disk=off`, plan from cores+memory),
+  because a fail-closed probe here turns a box whose runtime dir lacks the module into a drainer that
+  dispatches NOTHING (inert-unit class #3194). A **STATED** seam is still fail-closed — see D19.
+  The memory/swap precedent does not transfer: those probes CAN always answer, while this one depends on
+  a SEPARATE FILE being present.
 * **`need_mb = 0`** (the documented neutralisation idiom, and `spawn-gate`'s own "an explicit 0 is
   honoured") ⇒ **no disk term**, and a `NOTE:` line says the term is disabled. An exclusion a reader
   cannot see is the same defect one layer down.
@@ -141,7 +143,12 @@ seam's own doctrine is to ask **before** `git worktree add`, so the loop asks ag
     STOP: disk floor reached after N of M lane(s) — free=<mb> need=<mb> floor=<mb> …
 
 and `finish 0`, because a full volume is a fact about the box, not a failure of the tick (the
-disposition `dispatch-merge.sh` already takes). The lanes already dispatched keep their records:
+disposition `dispatch-merge.sh` already takes). ⛔ **THERE ARE TWO STOP REASONS AND THEY TAKE THE SAME
+DISPOSITION** (round 5 found the second one `exit 1`-ing while this one exited 0, with no arm on
+either): `STOP: disk floor` when the re-read is a number below the floor, and `STOP: disk unreadable`
+when the re-read cannot be taken at all. Both stop dispatch, both say `NOT a tick failure`, both exit
+**0** — a box fact must not redden the unit, which is #2159's entire thesis. Arm `(k6b)` pins the
+second. The lanes already dispatched keep their records:
 their `DISPATCHED:` lines stand and are counted by the next tick.
 
 ### D7 — the reading is auditable
@@ -158,7 +165,7 @@ assertions keep their meaning.
 | R2 | the per-lane need is the existing predicate (no second literal); the module-miss is NAMED |
 | R3 | free space is column 4 (`f_bavail`) on the volume the worktrees land on |
 | R4 | floor is the existing `DISK_MIN_FREE_MB` declaration |
-| R5 | unreadable probe FAILS the tick naming the probe (not 0 lanes, not silence) |
+| R5 | unreadable probe ⇒ ⛔ **SUPERSEDED BY D19**: DEGRADES with a named `NOTE:`, `disk=off`, plan from cores+memory (a stated seam is still fail-closed) |
 | R6 | `need = 0` disables the term AND says so |
 | R7 | in-loop re-check before each `git worktree add`, stopping cleanly with a named line |
 | R8 | `DISK_FREE_MB` / `DISK_LANE_NEED_MB` / `SPAWN_GATE_MOD` injected seams for hermetic arms |
@@ -180,7 +187,7 @@ dispatcher's own gate still reports `FAIL`/exit 1 — filed as a residual, not f
 | (k4) | unreadable reading → FAIL naming the probe, nothing dispatched |
 | (k5) | `DISK_LANE_NEED_MB=0` → term disabled, NOTE emitted, cpu/mem decide |
 | (k6) | in-loop: the disk falls after the target is computed → `STOP: disk …` after the lanes that fit, exit 0 |
-| (k7) | the existing (e4)/(e5)/(e6) assertions unchanged (regression) |
+| (k7) | ⛔ THERE IS NO `k7` ARM: that label was planned and dropped, and the regression it was meant to carry is held by the existing `(e4)/(e5)/(e6)` arms (unchanged, still green). Named here so a later reader does not hunt for it |
 
 ## Mutation proof planned
 
@@ -261,7 +268,9 @@ TARGET_LANES) alive=0 .* dispatching 3 `). The literal shape, therefore:
     target=<t> (cpu=<c> mem=<m> from mem_avail=<a>MB pool=<p>MB@<pct>%/<lane>MB disk=<d> free=<f> need=<n>)
 
 and the PINNED line gains `; disk=<d> free=<f> need=<n>` after its own text. (e4) at `:484` is the arm
-that catches a mid-string insertion, and k7 keeps it.
+that catches a mid-string insertion, and it is kept UNCHANGED — ⛔ there is no separate `k7` arm (one was
+planned, then dropped); `(e4)/(e5)/(e6)` ARE that regression, and they are the reason the disk fields are
+appended at the END of the line instead of inside the parenthetical.
 
 ### D14 — fail-closed is argued on its own grounds, not inherited
 
@@ -298,8 +307,8 @@ named**, not filed as fixed.
 | file | what changes |
 |---|---|
 | `scripts/orchestrator-harness/ai-drainer.sh` | header formula `:45`; "NO RUN-AWAY" `:155-160`; `_capacity_target` `:1614-1624`; call site `:1814-1819`; probe block; dispatch loop `:1905-1915` |
-| `scripts/orchestrator-harness/ai-drainer.test.sh` | `RUN_DISK_FREE_MB`/`RUN_DISK_LANE_NEED_MB`/`RUN_SPAWN_GATE_MOD` in `_drainer_env`; arms k0-k8 |
-| `docs/ops/ai-drainer.md:78-84` | the fail-closed probe list gains **disk** |
+| `scripts/orchestrator-harness/ai-drainer.test.sh` | `RUN_DISK_FREE_MB`/`RUN_DISK_LANE_NEED_MB`/`RUN_SPAWN_GATE_MOD` in `_drainer_env`; arms `k-real`, `k0`–`k6` (+`k6b`), `k8` — ⛔ NOT "k0-k8": there is no `k7` |
+| `docs/ops/ai-drainer.md:78-84` | ⛔ **SUPERSEDED BY D19** — the fail-closed probe list does NOT gain `disk`; disk is named as the second EXCEPTION to it (module-miss degrades). Listing it here was the reversal round 1 caught as a P1 |
 | `scripts/orchestrator-harness/spawn-gate.sh:634-637` | its census says `ai-drainer.sh` creates `wt-drainer-<name>` "with a bare `git worktree add` and **no admission at all**" — false after D6, so the sentence is corrected in this change |
 
 ### Test-arm plumbing (D18)
@@ -341,12 +350,12 @@ any copy run from elsewhere — would have become a drainer that dispatches **no
 quietly but for a log line. That is the **inert-unit class (#3194)**, and it is a WORSE outcome than
 the disk term being absent: the whole cell loses its capacity instead of one bound degrading.
 
-### D19 — the polarity is SPLIT, and this supersedes D10/R14 (as written, not as intended)
+### D19 — the polarity is SPLIT, and this supersedes D5/R5/D10/R14 and the two-forward statements at §"readable/unreadable reading" (see the markers there)
 
 | shape | answer | why |
 |---|---|---|
 | the predicate is **unavailable** (module absent / stale / died while sourced) | **DEGRADE**: a named `NOTE:`, `disk=off (...)` on the line, and the tick plans from cores+memory — the pre-#2159 behaviour | a NEW bound must not be able to take a box to **zero** because a file is missing. The improvement is absent, not contradicted; the NOTE names the remedy (`SPAWN_GATE_MOD`). Same precedent as `fleet_line`'s `why=capacity.sh-unreachable` |
-| a **STATED seam** (`DISK_FREE_MB` / `DISK_LANE_NEED_MB`) that is not whole MB, is wider than 9 digits, or has a leading zero | **FAIL closed, by name** | that is a FAULT in a reading the OPERATOR asserted — not an absent improvement, and not a value the bound is defined for. Same posture as the memory and swap probes (D5's original argument, now correctly scoped). Enforced in `_disk_seam_check`, **before** any degrade decision, so a garbage seam is not silently discarded by an unrelated missing module |
+| a **STATED seam** (`DISK_FREE_MB` / `DISK_LANE_NEED_MB`) that is not whole MB, or is wider than 9 digits | **FAIL closed, by name** | that is a FAULT in a reading the OPERATOR asserted — not an absent improvement, and not a value the bound is defined for. Same posture as the memory and swap probes (D5's original argument, now correctly scoped). Enforced in `_disk_seam_check`, **before** any degrade decision, so a garbage seam is not silently discarded by an unrelated missing module. ⛔ **A LEADING ZERO IS NOT IN THIS ROW** (round 5 caught the over-claim): `_disk_seam_check` has exactly two FAIL arms, non-digit and >9 digits, and a leading zero is **NORMALISED** — `DISK_FREE_MB=007` is 7 MB (`$((10#007))`), which honestly yields `disk=0` and a named skip. The `0[0-9]*` refusal exists only for `DISK_MIN_FREE_MB`, where the number must match `spawn-gate.sh`'s `is_num` answer or the planner and the refuser disagree about the same floor |
 | the module **answered with a non-number** (e.g. `disk_free_mb` printing `abc`) | **DEGRADE** — indistinguishable from UNKNOWN | ⛔ THIS ROW USED TO SAY "FAIL closed" AND THAT WAS WRONG (superseded; corrected in review round 2, and the plan's own round-2 table records why). `_disk_probe` digit-validates its own reading and hands back NOTHING for a non-number, so by the time the caller looks there is no "answered garbage" state to fail on — only "no answer". A fail-closed arm there was **unreachable** and was deleted; the behaviour is pinned by arm `k4g` (rc 0, named NOTE, `disk=off`, and the reason names the module as present-and-silent) |
 
 Both directions are asserted: (k4) a stated `DISK_FREE_MB=unreadable` **must** end the tick; (k4b) an
@@ -475,3 +484,33 @@ written about it agree, and each claim is pinned by an arm that fails when it st
 
 **PROOF after round 4**: `ai-drainer.test.sh` → **255 passed / 0 failed**, exit 0, including the new
 execution-based gate check `(k4h) …and the GATE resolves that same 007 to 500`.
+
+---
+
+## CODE-REVIEW round 5 — ISSUES: 4, all applied (one BEHAVIOUR change, three record corrections)
+
+Round 5's most important finding was behavioural, and it was the same defect class this issue exists
+to remove — a box fact reported as a unit failure — surviving in the one branch nobody had looked at.
+
+| # | finding | disposition |
+|---|---|---|
+| P2 | **the in-loop re-read's unreadable branch `exit 1`-ed while its neighbour (the full-volume stop) exited 0**, it was documented nowhere, and nothing asserted either. That made the unit RED for a reading the tick could not take — exactly what #2159 is about. `(k6)`'s stub always answers a NUMBER, so the garbage-after-first-read shape was untested | **applied** — the branch is now `STOP: disk unreadable …` + `finish 0`, **one rule at both in-loop outcomes** (stop dispatch, name it, exit 0, already-dispatched records stand). Arm **(k6b)** added: a counter stub that answers `10000` once and `garbled` thereafter, asserting the named stop, `dispatched=0`, rc 0, and the absence of any `FAIL:` line |
+| P2 | **D19's own row over-claimed**: it listed "or has a leading zero" among the stated-seam FAIL cases, but `_disk_seam_check` has exactly two FAIL arms (non-digit, >9 digits) and a leading zero on a **free/need seam** is normalised by `10#` (`007` → 7 MB). The `0[0-9]*` refusal belongs only to `DISK_MIN_FREE_MB` | **applied** — the row now says exactly that, and states why the two are different: a 7 MB free reading honestly yields `disk=0`, while a floored 7 MB would disagree with the gate that refuses the lane |
+| P2 | **three surviving statements of the polarity rounds 1–2 reversed**, none marked superseded (`:126` unreadable ⇒ FAIL the tick; `R5` in the requirements table; the file-inventory row saying the fail-closed list "gains **disk**"), so the plan still carried the polarity its own D19 calls WRONG | **applied** — all three now carry an explicit `⛔ SUPERSEDED BY D19` marker and name the shipped behaviour; D19's supersedes line names D5/R5/D10/R14 |
+| P2 | the plan claimed arms **`k0`–`k8`**, but there is no `k7` — a later reader would hunt for a missing arm | **applied** — the inventory names the delivered set (`k-real`, `k0`–`k6`+`k6b`, `k8`) and says the `k7` regression is carried by the existing `(e4)/(e5)/(e6)` arms |
+
+**Also verified by this round (not findings):** sourcing `spawn-gate.sh` in `(k4h)` is safe —
+`spawn-gate.sh:5744-5746` is a `BASH_SOURCE`/`$0` main-guard, and `$0` is `_` in that sub-shell, so the
+CLI path cannot run; module scope is assignments plus `sysctl`/`nproc`/`getconf` reads and a
+`gh-auth.sh` source whose module scope is two empty assignments. And the arm cannot pass vacuously: a
+missing module leaves `DISK_FREE_MB` at `007` and a `set -u` abort leaves it empty — both compare
+unequal to `500`, so the arm goes red.
+
+**PROOF after round 5**: `ai-drainer.test.sh` → **257 passed / 0 failed**, exit 0 — including
+`(k6b) an unreadable re-read STOPS the batch …` and `…and that stop is EXIT 0 …`.
+
+⚠️ **DISK, while it is the subject of the issue:** the box went 8.3 GB → **1.9 GB free (100%)** during
+this round, ~1 GB of it during one 6-minute suite run. The suite's own temp is ~100 KB, so the
+consumer is elsewhere on this shared cell (runner work dirs, `~/.tortoise`, session transcripts).
+Recorded, not chased: it is a fleet-capacity fact, and it is precisely the pressure this PR makes the
+drainer stop planning against.

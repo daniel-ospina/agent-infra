@@ -73,9 +73,11 @@ nothing, and it exits 0):
    A module that *answers* a non-number is not that case — it is indistinguishable from "could not
    answer" and takes the degrade path above.
    The disk is also re-asked immediately before **each** `git worktree add`, because the target is
-   computed once and the tick's own worktrees consume the free space it was planned from — a stop
-   there is logged as `STOP: disk floor …` and exits **0**, since a full volume is a fact about the
-   box, not a failed tick. ⚠️ **UNLESS `DISK_FREE_MB` IS STATED**: an injected reading IS the reading,
+   computed once and the tick's own worktrees consume the free space it was planned from. There are
+   **two** stop reasons there and they take the **same** disposition — `STOP: disk floor …` when the
+   re-read is a number below the floor, and `STOP: disk unreadable …` when the re-read cannot be taken
+   at all. Both **exit 0**, because a box fact (a full volume, an unreadable one) is not a failed tick;
+   both name what happened and leave the already-dispatched lanes' records standing. ⚠️ **UNLESS `DISK_FREE_MB` IS STATED**: an injected reading IS the reading,
    so it is used for the re-ask too (that is what keeps a test hermetic), and the in-loop guard is
    then frozen at that value rather than measuring the shrinking volume. Say it plainly: setting
    `DISK_FREE_MB` trades the live guard for a fixed one.
