@@ -134,7 +134,10 @@
 #     ⛔ AND THE DISK IS ASKED AGAIN IMMEDIATELY BEFORE EACH `git worktree add`: the target is computed
 #     once at tick start and free space SHRINKS as the tick creates its own worktrees, so by lane 2
 #     the planned number is stale in exactly the direction that fails. The second ask is a HARD GUARD
-#     (a `TARGET_LANES` pin cannot bypass it — see the pin note at the call site).
+#     (a `TARGET_LANES` pin cannot bypass it — see the pin note at the call site). ⚠️ UNLESS
+#     `DISK_FREE_MB` IS STATED: an injected reading IS the reading, so the re-ask compares that same
+#     value and the guard is FROZEN rather than live (`DISK_FREE_MB` is a test/operator seam — the
+#     `k6` arm models a moving disk with a stub MODULE for exactly that reason).
 #
 # ── ENV (every path/label overridable; defaults are the shipped layout) ────────────────────────
 #   O                 controller runtime dir — holds `bg/` (dispatcher + per-lane pidfiles)
@@ -164,6 +167,8 @@
 #                     the disk term and says so (the suite's neutralisation, and spawn-gate's own
 #                     "an explicit 0 is honoured" rule).
 #   DISK_FREE_MB      free disk (MB) — the PROBE, injectable        default: DERIVED (df column 4)
+#                     ⚠️ a stated value is used for BOTH asks, so the in-loop guard is frozen at it
+#                     rather than measuring the shrinking volume — see the NO RUN-AWAY note above.
 #   SPAWN_GATE_MOD    the module carrying the disk predicate        default: $O/spawn-gate.sh, else
 #                     this script's own directory
 #   MIN_SWAP_MB       free-SWAP floor — **LINUX ONLY**, and only where swap EXISTS (MB) default: 700
@@ -674,9 +679,12 @@ fi
 # ⛔ AN EMPTY ANSWER IS `UNKNOWN`, NEVER ZERO, and the two are distinguishable: the probe prints two
 # integers or nothing at all, and the `need = 0` branch is reached only by a PARSED `0`. That matters
 # because `0` DISABLES the term (a stated choice) while UNKNOWN must not become one by accident.
-_disk_why() { # the NAMED reason the module cannot answer — never "unreachable" while it sits there
+_disk_why() { # the NAMED reason the module cannot answer — never "unreachable" while it sits there,
+  # and never "looked in two places" when an operator STATED a third
   local mod="${SPAWN_GATE_MOD:-}"
-  if [ -z "$mod" ] || [ ! -f "$mod" ]; then
+  if [ -n "$mod" ] && [ ! -f "$mod" ]; then
+    printf '%s' "SPAWN_GATE_MOD=${mod} is not a readable file"
+  elif [ -z "$mod" ]; then
     printf '%s' "no spawn-gate.sh disk predicate found (looked at ${O}/spawn-gate.sh and ${SELF_DIR}/spawn-gate.sh; set SPAWN_GATE_MOD)"
   else
     printf '%s' "${mod} is present and was sourced but did not answer the disk question — a STALE copy (it predates disk_free_mb/disk_lane_costs/disk_lane_need), or it died while being sourced"
@@ -729,6 +737,31 @@ disk_free="${DISK_FREE_MB:-}"
 disk_need="${DISK_LANE_NEED_MB:-}"
 _disk_asked=0
 _disk_off=""
+# ⛔ A STATED SEAM IS VALIDATED BEFORE ANY DEGRADE DECISION, AND TO THE MODULE'S OWN RANGE RULE.
+# ORDER MATTERS AND IT WAS MEASURED WRONG (review round 1, P2): with `DISK_FREE_MB=unreadable` AND the
+# module unreachable, the degrade branch was taken first and the garbage seam was silently DISCARDED —
+# the tick dispatched on cores+memory instead of refusing a seam an operator typed wrong.
+# ⛔ THE RANGE RULE IS `spawn-gate.sh`'s (`is_limit` = digits AND <= 9 characters, :115) because these
+# numbers are now DIVISORS and a value wider than bash's integer range WRAPS: measured
+# `DISK_FREE_MB=9223372036854775808` -> negative, then `disk_free - DISK_MIN_FREE_MB` wraps back to a
+# large positive, so `[ "$headroom" -ge 0 ]` cannot catch it and the term silently never binds (the
+# line even printed a negative `free=`). 9 digits is ~976 TB in MB, i.e. far past any real volume.
+# The PROBE needs no such guard: `df`'s column 4 is a 64-bit block count divided by 1024, so its
+# worst case is ~1.8e16 — well inside bash's range, so it cannot wrap.
+_disk_seam_check() { # <name> <value>; returns 1 when the seam is not stated at all
+  local v="${2:-}"
+  [ -n "$v" ] || return 1
+  case "$v" in
+    ''|*[!0-9]*) log_line "FAIL: ${1}='${v}' is not a whole number of MB — a STATED seam that cannot be read is a fault in the reading, not an absent predicate, so the disk ceiling is not evaluated and nothing was dispatched"; exit 1 ;;
+  esac
+  if [ "${#v}" -gt 9 ]; then
+    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 (<=999999999 MB, ~976 TB) because a wider value WRAPS bash's integer range and would silently disable the disk term rather than bind it — refusing instead of planning from a wrapped number"; exit 1
+  fi
+  return 0
+}
+_seam_need=0
+_disk_seam_check DISK_FREE_MB "${DISK_FREE_MB:-}" || :
+_disk_seam_check DISK_LANE_NEED_MB "${DISK_LANE_NEED_MB:-}" && _seam_need=1 || :
 if [ -z "$disk_free" ] || [ -z "$disk_need" ]; then
   _disk_asked=1
   _disk_pair="$(_disk_probe "$AI" "$SEED_REPO")"
@@ -779,9 +812,18 @@ else
     *) disk_need="$((10#$disk_need))" ;;
   esac
   # `0` is a STATED choice (the suite's neutralisation, and spawn-gate's own "an explicit 0 is
-  # honoured" rule): the term does not apply, and the line says so instead of printing a number that
-  # was never measured.
-  [ "$disk_need" -gt 0 ] || _disk_off="DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB"
+  # honoured" rule): the term does not apply, and the line says so instead of naming a seam that was
+  # never set. ⛔ TWO WAYS TO GET 0 AND THEY ARE NOT THE SAME FACT — `DISK_LANE_NEED_MB=0` is an
+  # operator's deliberate choice, while a module that computes 0 has summed zero cost terms (an
+  # unset/garbled lane-cost environment). Naming the seam in the second case would be the same
+  # wrong-diagnosis class `k4` caught above.
+  if [ "$disk_need" -le 0 ]; then
+    if [ "$_seam_need" = 1 ]; then
+      _disk_off="DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB"
+    else
+      _disk_off="the predicate answered need=0 MB (${SPAWN_GATE_MOD}) — every lane-cost term it read is zero, so the disk term cannot bind; set DISK_LANE_NEED_MB to state the requirement outright"
+    fi
+  fi
 fi
 disk_floor_note="disk_floor=${DISK_MIN_FREE_MB}MB"
 

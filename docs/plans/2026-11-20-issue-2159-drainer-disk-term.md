@@ -364,3 +364,23 @@ pool figures: `pool=[0-9]+MB@75%/512MB[)]`. Corrected.
 all (both values were seams). The reason is now derived: `and both values were stated as seams, so
 the probe was not consulted`. A diagnosis that sends an operator to re-farm a healthy file is the
 same defect as a gate that refuses without stating what it measured.
+
+---
+
+## CODE-REVIEW round 1 — ISSUES: 5, all verified by execution, all applied (5c1e8989e → this commit)
+
+| # | finding | disposition |
+|---|---|---|
+| P1 | the shipped ops doc states the **opposite polarity** of the module-miss case (`docs/ops/ai-drainer.md` said "fails closed by name" and added `disk` to the fail-closed probe list) — the code DEGRADES, and an arm pins that | **applied** — §1 now states the split; `disk` is removed from the fail-closed list and named as the second exception with its reason |
+| P2 | an invalid `DISK_FREE_MB` did **not** fail closed when the module also could not answer: the degrade branch ran first and silently DISCARDED the garbage seam | **applied** — a stated seam is validated **before** the degrade decision; arm **(k4c)** |
+| P2 | no integer-**range** guard: `DISK_FREE_MB=9223372036854775808` converts negative, the floor subtraction wraps back to a large positive, `[ -ge 0 ]` cannot catch it, and the term silently never binds (the line printed a negative `free=`) | **applied** — the module's own `is_limit` rule (≤9 digits) for both seams, with the probe exempt because `df` column 4 divided by 1024 cannot reach bash's wrap; arm **(k4d)** |
+| P2 | a stated `DISK_FREE_MB` **freezes** the in-loop guard at a constant, while both docs said the disk is re-asked before *each* worktree | **applied as a stated qualification**, not a code change: the seam is what keeps the suite hermetic (the alternative makes every injected arm depend on the host's free space — the hazard this suite's own header forbids), so the header, the ENV block and the ops doc now say the guard is frozen when the seam is stated |
+| P2 | two new diagnostics named something that did not happen (`_disk_why` claiming "looked at two paths" when `SPAWN_GATE_MOD` was stated; `need=0` blaming `DISK_LANE_NEED_MB` when the module derived it) | **applied** — `_disk_why` distinguishes stated-but-not-a-file from nowhere-to-look; `need=0` distinguishes a stated seam from a derived zero; arms **(k4e)** and **(k5b)** |
+
+Two of the five (the validation ORDER and the RANGE guard) were defects the reviewer reproduced by
+EXECUTION, not by reading — the wrap in particular is invisible in review and produces exactly the
+false-PASS the term exists to prevent.
+
+**PROOF after round 1**: `ai-drainer.test.sh` → **249 passed / 0 failed**, exit 0, sha256 identical
+before and after the run.
+

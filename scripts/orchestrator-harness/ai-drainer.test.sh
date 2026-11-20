@@ -128,6 +128,8 @@ chmod +x "$DISPATCH"
 #   RUN_SPAWN_GATE_MOD  the module carrying the disk predicate   default: this directory's
 #                   spawn-gate.sh — the REAL one, so the suite exercises the shipped predicate rather
 #                   than a stub of it. Point it at a counter stub to model a disk that MOVES mid-tick.
+#   RUN_NO_SPAWN_GATE_MOD  1 ⇒ NO module at all (the mutant-copy shape). A distinct flag because
+#                   `${VAR:-default}` cannot express "explicitly empty" — see `_drainer_env`.
 #   RUN_LO_MOD      live-ownership.sh (the cwd witness, #2800)     default: resolved by the drainer
 #   RUN_LO_CWD_PROBE  the probe COMMAND lo_cwd_rows uses (ls / lsof)  default: resolved by the module
 #                   (a counting stub pins "one probe per removal", #2800 review round 2)
@@ -147,6 +149,12 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
   local _ds="${RUN_DISK_SELF_MB:-${DISK_LANE_SELF_MB:-0}}"
   local _dr="${RUN_DISK_RESERVE_MB:-${DISK_LANE_RESERVE_MB:-0}}"
   if [ "${RUN_DISK_TERMS_UNSET:-0}" = 1 ]; then _dt=""; _ds=""; _dr=""; fi
+  # `RUN_SPAWN_GATE_MOD` cannot express "explicitly empty" through `${…:-default}` (an empty value is
+  # treated as unset, so the default wins) — and "empty" is a STATE this suite must be able to test:
+  # it is the shape of every mutant copy run out of `$ROOT`, which has no module beside it.
+  local _sg="$HERE/spawn-gate.sh"
+  [ -n "${RUN_SPAWN_GATE_MOD:-}" ] && _sg="$RUN_SPAWN_GATE_MOD"
+  [ "${RUN_NO_SPAWN_GATE_MOD:-0}" = 1 ] && _sg=""
   # The channel: the fixture seed by default, `RUN_FLEET_REPO` to name one, and `RUN_NO_FLEET_REPO=1` for
   # "nothing configured" — a state the drainer must REFUSE by name rather than resolve to a lane checkout.
   local _fleet_v="${RUN_FLEET_REPO:-$SEED}"
@@ -166,7 +174,7 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "DISK_FREE_MB=${RUN_DISK_FREE_MB:-}" "DISK_LANE_NEED_MB=${RUN_DISK_LANE_NEED_MB:-}" \
     "DISK_MIN_FREE_MB=${RUN_DISK_MIN_FREE_MB:-${DISK_MIN_FREE_MB:-1}}" \
     "DISK_LANE_TREE_MB=${_dt}" "DISK_LANE_SELF_MB=${_ds}" "DISK_LANE_RESERVE_MB=${_dr}" \
-    "SPAWN_GATE_MOD=${RUN_SPAWN_GATE_MOD:-$HERE/spawn-gate.sh}" \
+    "SPAWN_GATE_MOD=${_sg}" \
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
     "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
@@ -219,7 +227,7 @@ reset_run() {
   RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   RUN_LO_MOD=; RUN_LO_CWD_PROBE=
   RUN_DISK_FREE_MB=; RUN_DISK_LANE_NEED_MB=; RUN_DISK_MIN_FREE_MB=; RUN_SPAWN_GATE_MOD=
-  RUN_DISK_TREE_MB=; RUN_DISK_SELF_MB=; RUN_DISK_RESERVE_MB=; RUN_DISK_TERMS_UNSET=0
+  RUN_DISK_TREE_MB=; RUN_DISK_SELF_MB=; RUN_DISK_RESERVE_MB=; RUN_DISK_TERMS_UNSET=0; RUN_NO_SPAWN_GATE_MOD=0
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -630,7 +638,7 @@ RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=500
 RUN_DISK_FREE_MB=unreadable RUN_DISK_LANE_NEED_MB=2064
 run_drainer_fg k4
 check "(k4) an unreadable free-disk seam FAILS the tick naming the seam, dispatching nothing" \
-  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "free disk is UNKNOWN — DISK_FREE_MB=.unreadable." "$LAST_AI/logs/ai-drainer.log"' \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "DISK_FREE_MB=.unreadable. is not a whole number of MB — a STATED seam" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
@@ -647,10 +655,46 @@ check "(k4b) an unavailable module still DISPATCHES (cores+memory) — the box i
   '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -q "disk=off" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 check "(k4b) …and the degradation is NAMED with its remedy, not silent" \
-  'grep -q "the disk term is DISABLED for this tick" "$LAST_AI/logs/ai-drainer.log" && grep -q "no spawn-gate.sh disk predicate found" "$LAST_AI/logs/ai-drainer.log" && grep -q "SPAWN_GATE_MOD" "$LAST_AI/logs/ai-drainer.log"' \
+  'grep -q "the disk term is DISABLED for this tick" "$LAST_AI/logs/ai-drainer.log" && grep -q "SPAWN_GATE_MOD=.* is not a readable file" "$LAST_AI/logs/ai-drainer.log" && grep -q "SPAWN_GATE_MOD states it outright" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep 'NOTE:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 check "(k4b) …and it does NOT read as the deliberate need=0 (the two reasons are distinguishable)" \
   '! grep -q "DISK_LANE_NEED_MB=0 — an explicit" "$LAST_AI/logs/ai-drainer.log"'
+
+reset_run
+# ── (k4e) NO MODULE ANYWHERE: the reason names the TWO paths it searched (the field shape the suite's
+# own non-vacuity arms depend on). Those arms run a copy of the drainer out of `$ROOT`, where `$SELF_DIR`
+# is `$ROOT` — so this arm runs a COPY too, which is the only way to reach that branch from here.
+cp "$DRAINER" "$ROOT/drainer-copy-k4e.sh"
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_NO_SPAWN_GATE_MOD=1
+run_drainer_fg k4e "$ROOT/drainer-copy-k4e.sh"
+check "(k4e) with no module beside it, a COPY still dispatches and names both searched paths" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -q "no spawn-gate.sh disk predicate found (looked at" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") $(grep 'NOTE:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4c) A STATED SEAM IS VALIDATED BEFORE THE DEGRADE DECISION (order, measured) ────────────
+# With `DISK_FREE_MB=unreadable` AND an unreachable module, the first build took the degrade branch
+# and silently DISCARDED the garbage seam — the tick dispatched on cores+memory instead of refusing a
+# value an operator typed wrong. A stated-but-unreadable seam is a fault in the READING, so it fails
+# closed even when the improvement is also absent.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_FREE_MB=unreadable
+RUN_SPAWN_GATE_MOD="$ROOT/no-such-spawn-gate.sh"
+run_drainer_fg k4c
+check "(k4c) a garbage seam FAILS even when the module is also unreachable (the seam is not discarded)" \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "is not a whole number of MB — a STATED seam that cannot be read" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4d) AN OUT-OF-RANGE SEAM IS REFUSED, NOT WRAPPED INTO A NEGATIVE ──────────────────────────
+# MEASURED: `9223372036854775808` converts to a NEGATIVE, then `disk_free − DISK_MIN_FREE_MB` wraps
+# back to a large POSITIVE, so `[ "$headroom" -ge 0 ]` cannot catch it and the disk term silently never
+# binds (the line even printed `free=-9223372036854775808MB`). The cap is the module's own `is_limit`
+# rule (<=9 digits), not an invention of this file.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_FREE_MB=9223372036854775808
+run_drainer_fg k4d
+check "(k4d) a 19-digit seam is REFUSED by name (it would wrap and disable the term silently)" \
+  '[ "$LAST_RC" -eq 1 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "is 19 digits; this seam is capped at 9" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep 'FAIL:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── (k5) AN EXPLICIT `need = 0` DISABLES THE TERM, SAYS SO, AND DOES NOT CRASH ─────────────────
@@ -665,6 +709,17 @@ check "(k5) need=0 does not crash the tick (a bare division would have) and lane
 check "(k5) …and the disabled term is STATED on the line, not silently absent" \
   'grep -q "disk=off (DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB)" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k5b) A `need` the MODULE derived as 0 is a DIFFERENT FACT from a seam that said 0 ────────
+# The two reasons must not be conflated: one is an operator's deliberate choice, the other is a
+# module summing zero cost terms. The first build named `DISK_LANE_NEED_MB=0` in BOTH cases — the same
+# wrong-diagnosis class `k4` caught for the module path.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET=
+run_drainer_fg k5b
+check "(k5b) a module-derived need=0 says so, and does NOT claim an operator set DISK_LANE_NEED_MB=0" \
+  'grep -q "disk=off (the predicate answered need=0 MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "DISK_LANE_NEED_MB=0 — an explicit" "$LAST_AI/logs/ai-drainer.log" && [ "$LAST_RC" -eq 0 ]' \
+  "rc=$LAST_RC $(grep -E 'START:|SKIP:' "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── (k6) ⛔ THE TARGET IS STALE BY LANE 2, SO THE LOOP ASKS AGAIN ──────────────────────────────

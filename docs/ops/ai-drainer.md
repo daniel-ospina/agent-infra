@@ -59,11 +59,21 @@ nothing, and it exits 0):
    refuses it are the SAME number (#3395's two-seams defect). It is repo-class dependent — 2,064 MB
    for a harness seed, 8,144 MB for a python one — and the `START:` line always prints `need=`.
    `DISK_MIN_FREE_MB` is that module's floor, not a second one. An explicit `DISK_LANE_NEED_MB=0`
-   disables the term and says so; a state directory with no usable module **fails closed by name**.
+   disables the term and says so. ⛔ **TWO POLARITIES, AND THEY DIFFER ON PURPOSE** — a state
+   directory with no usable module **DEGRADES**: one named `NOTE:`, `disk=off` on the line, and the
+   tick plans from cores and memory, which is the pre-#2159 behaviour. It does **not** fail closed,
+   because a new bound must not be able to take a box to ZERO because a file is missing (the
+   inert-unit class, #3194) — a drainer that dispatches nothing is worse than one without a disk
+   term. A **stated** `DISK_FREE_MB`/`DISK_LANE_NEED_MB` that is not whole megabytes, or is wider than
+   9 digits (which would WRAP), **fails closed by name**: that is a fault in the reading, not an
+   absent improvement.
    The disk is also re-asked immediately before **each** `git worktree add`, because the target is
    computed once and the tick's own worktrees consume the free space it was planned from — a stop
    there is logged as `STOP: disk floor …` and exits **0**, since a full volume is a fact about the
-   box, not a failed tick.
+   box, not a failed tick. ⚠️ **UNLESS `DISK_FREE_MB` IS STATED**: an injected reading IS the reading,
+   so it is used for the re-ask too (that is what keeps a test hermetic), and the in-loop guard is
+   then frozen at that value rather than measuring the shrinking volume. Say it plainly: setting
+   `DISK_FREE_MB` trades the live guard for a fixed one.
 
    `MIN_MEM_FREE_MB` (512) is the **same** floor the controller's own spawn gate uses, so the two
    cannot disagree; `MEM_BUDGET_PCT` (75) stops the target at the boundary instead of consuming the
@@ -91,8 +101,11 @@ nothing, and it exits 0):
      reopen. (Same root as agent-infra#2016, which corrected the identical reading in `orch-loop.sh`'s
      `[cap]` gate.)
 
-   An unreadable **load / memory / swap / disk / Darwin-pressure** probe **fails closed** — a guard that
-   could not be evaluated must not look like an idle box. A box whose platform cannot be identified is
+   An unreadable **load / memory / swap / Darwin-pressure** probe **fails closed** — a guard that
+   could not be evaluated must not look like an idle box. (**Disk** is the second exception, and for
+   the opposite reason: its module can be absent on a box whose runtime dir was seeded without it, and
+   an inert drainer there is worse than a missing bound — see §1's degrade rule.) A box whose platform
+   cannot be identified is
    one of those cases: the two swap arms are different gates, so choosing one on a guess is refused by
    name (`DRAINER_OS` overrides `uname -s`; it is the suite's seam). The **cores**
    probe is the one exception, and it does not fail closed: it is the CPU *ceiling* only, so an
