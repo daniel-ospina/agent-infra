@@ -381,8 +381,13 @@ MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
 # cannot see the wrap, and the tick would run with a 200,000,000 MB floor (`disk=0`, inert) while the
 # only line it prints is a SKIP that reads like a full volume. `spawn-gate.sh:203` tests the raw
 # string (`is_limit`, <= 9 digits) and so does this.
+# ⛔ AND THE EMPTY VALUE NEEDS NO ARM OF ITS OWN — there is one fewer shape here than there looks.
+# Line 238 declares the floor as `${DISK_MIN_FREE_MB:-${MIN_FREE_MB:-500}}`, the SAME declaration
+# `spawn-gate.sh` uses (:202), so `:-` has already substituted the default BEFORE this `case` runs and
+# the value cannot be empty by the time it is tested. MEASURED (review round 3): `DISK_MIN_FREE_MB=""`
+# reaches this point as `500`. An `''` arm here would be a guard that can never fire — which reads
+# exactly like one that does, the class this diff deleted two of elsewhere and must not re-add.
 case "$DISK_MIN_FREE_MB" in
-  '') log_line "WARN: DISK_MIN_FREE_MB is empty — using 500"; DISK_MIN_FREE_MB=500 ;;
   *[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
   *)
     if [ "${#DISK_MIN_FREE_MB}" -gt 9 ]; then
