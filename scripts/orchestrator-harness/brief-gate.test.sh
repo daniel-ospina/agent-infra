@@ -19,6 +19,10 @@
 #   §E  the census: the files that touch the gate are an EQUALITY, so a dispatch path added tomorrow
 #       without one reddens this suite instead of drifting in unvalidated (the shape
 #       spawn-gate.test.sh already uses for `pi -p` invokers).
+#   §J  the AGREEMENT (#4152): the cheap check (`--check <file>`) and the DISPATCH PATH
+#       (`nonblocking-dispatch.sh`) are driven on the SAME brief and compared BY BYTES, so the two
+#       callers cannot give one brief two verdicts — and a refusal reports every missing requirement in
+#       ONE pass, not one layer per attempt.
 #
 # Run: bash scripts/orchestrator-harness/brief-gate.test.sh
 set -u
@@ -1236,7 +1240,10 @@ MUT_PW="$TMP/mutant-pw.sh"
 # ⛔ THE ANCHOR TRACKS THE CALL SITE (review cycle 2): the reader now takes the ROLE too, and an anchor
 # that stops matching makes the "mutant" byte-identical to the real file — the arm that proves the check
 # is load-bearing then passes for the wrong reason. The diff assertion below is what catches that.
-sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$role")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
+# ⛔ IT WAS RE-POINTED FOR #4152, AND THAT IS THE MECHANISM WORKING: the call site now passes the FOLDED
+# role (`$grade`) instead of `$role`, so the old anchor stopped matching and (H38) reddened ON the change
+# instead of silently grading a mutant that no longer existed. Any future edit here moves this with it.
+sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$grade")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
 diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H38) the cross-check mutation REALLY changed the file (its anchor still matches)"
 bash -n "$MUT_PW"; ck $? "(H39) …and the mutant still parses"
@@ -1301,6 +1308,279 @@ diff -q "$GATE" "$MUT_PW2" >/dev/null 2>&1; rc=$?
 bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H46) MUTATION: (ii) now FAILS — with the token line deleted, no-PW is no longer named as PREVIOUS-WORK-SECTION"
 bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-CLAIM'; ck $? "(H47) …and the FIVE LABEL tokens still refuse the same brief, so (x-b) removed a token and not the contract"
+
+echo
+echo "§J (#4152) the CHEAP CHECK and the DISPATCH PATH are ONE VERDICT — same code, same list, ONE pass"
+# ── WHY THIS SECTION EXISTS. `--check` is the cheap pre-flight an author runs before dispatching, and
+# `nonblocking-dispatch.sh` is the path that then judges the same bytes. MEASURED 2026-11-18: the cheap
+# check returned 0 on a brief the dispatcher refused; with that fixed, the dispatcher refused AGAIN for
+# a rule the first refusal had never mentioned — three attempts to start one lane. So every arm below is
+# BEHAVIOURAL and COMPARATIVE: the tokens and the two callers' own output, compared against each other
+# rather than against a hand-typed expectation that could drift with the contract.
+#
+# ⛔ THE FIXTURE IS §H's `no-pw.txt` ON PURPOSE — CANONICAL minus the `## PREVIOUS WORK` section, i.e.
+# complete in every other respect, so the only thing it can be refused for is the two PREVIOUS WORK
+# requirements: the block, and the KEY SHAPE of the `WIP:` line the block must contain.
+NB="$HERE/nonblocking-dispatch.sh"
+[ -x "$NB" ] || [ -f "$NB" ]; ck $? "§J fixture: the dispatch path under test is the SHIPPED nonblocking-dispatch.sh"
+grep -q '^## RESEARCH FIRST' "$TMP/no-pw.txt"; ck $? "§J fixture: the no-PW brief still carries its research contract (so the arms below are about PREVIOUS WORK)"
+agree_tokens() { # agree_tokens <gate> <brief> [role] [round] [repo] — a SET comparison: token ORDER
+  local g="$1" f="$2"; shift 2                        # must never be able to make two verdicts look
+  bash "$g" --missing "$f" "$@" 2>/dev/null | sort | tr '\n' ' '   # different, or to hide a divergence.
+}
+miss_nopw="$(bash "$GATE" --missing "$TMP/no-pw.txt" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-SECTION' <<<"$miss_nopw"; ck $? "(J1) ONE PASS: a brief with NO PREVIOUS WORK block names the BLOCK — the requirement the first attempt is refused for"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss_nopw"; ck $? "(J2) …AND the KEY SHAPE of the WIP line in the SAME response — the author cannot discover a rule that the block's own refusal does not state, which is the SECOND refusal #4152 measured"
+bash "$GATE" --check "$TMP/no-pw.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J3) …and the DOCUMENTED cheap form — \`--check <file>\`, role omitted — REFUSES it (rc=$rc)"
+J_OUT="$(bash "$GATE" --check "$TMP/no-pw.txt" 2>&1)"
+grep -q 'containing CLAIM:, WIP:, BRANCH:, WORKTREE: and PRIOR:' <<<"$J_OUT"; ck $? "(J4) …and the refusal LIST teaches the block"
+grep -q 'START the value with the key' <<<"$J_OUT"; ck $? "(J5) …AND the key shape, in that SAME list — both fixes are visible in one pass, not one layer per attempt"
+# ── THE AGREEMENT, axis 1: the ROLE. `worker` is the dispatcher's role; `lane` is what an author's
+# `--check <file>` gets by default. One contract, so one verdict — see `brief_gate_grade_role`.
+agree_lane="$(agree_tokens "$GATE" "$TMP/no-pw.txt" lane)"
+agree_worker="$(agree_tokens "$GATE" "$TMP/no-pw.txt" worker)"
+[ "$agree_lane" = "$agree_worker" ]; ck $? "(J6) the AUTHOR's default role (lane) and the DISPATCHER's role (worker) are ONE contract — identical token list [${agree_lane}]"
+bash "$GATE" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J7) …and both roles refuse (lane rc=$rc), so the equality above is not an equality of two ADMITTANCES"
+bash "$GATE" --check "$TMP/no-pw.txt" worker >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J8) …(worker rc=$rc)"
+# ── THE AGREEMENT, axis 2: THE DISPATCH PATH ITSELF, driven. The acceptance criterion is "the same
+# message and the same list", so the two callers' output is compared BY BYTES.
+mkdir -p "$TMP/agree-o" "$TMP/agree-wt"
+# ⛔ THE WORKTREE IS A REAL GIT REPO WITH AN ORIGIN, even though NEITHER fixture below carries a KEYED
+# `issue-<N>` claim for the cross-check to look up (so no `ls-remote` is reached and the arms cost no
+# network). It is faithful to what the dispatcher requires of `$WT` — `run_agent`'s LAND-BACKLOG gate
+# derives the slug from `$WT`'s origin and refuses a bare `mkdir` — so if the refusal ever moved later
+# in the file, this arm would still be measuring the BRIEF and not a missing remote.
+git -C "$TMP/agree-wt" init -q 2>/dev/null || true
+git -C "$TMP/agree-wt" remote add origin https://github.com/owner/repo.git 2>/dev/null || true
+# ⛔ THE GATE'S BODY, NOT THE WHOLE STDERR: the dispatcher prints one naming line of its OWN before the
+# gate's output (its resolver's path, #2708). Everything from the gate's first line on is the
+# validator's, and that is what must match. (awk reads all input, so no early exit and no SIGPIPE.)
+agree_body() { awk '/^\[brief-gate\] REFUSED/{f=1} f'; }
+AGREE_NOPW="$TMP/agree-no-pw.txt"; cp "$TMP/no-pw.txt" "$AGREE_NOPW"   # one brief, one arm
+J_OUT2="$( env -u O_WORK O="$TMP/agree-o" bash "$NB" agreeno "$TMP/agree-wt" "$AGREE_NOPW" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J9) the DISPATCH PATH refuses the SAME brief with 80 (rc=$rc)"
+printf '%s\n' "$J_OUT2" | agree_body > "$TMP/agree-d.txt"
+bash "$GATE" --check "$AGREE_NOPW" worker 0 "$TMP/agree-wt" > "$TMP/agree-c.txt" 2>&1
+diff -q "$TMP/agree-d.txt" "$TMP/agree-c.txt" >/dev/null; ck $? "(J10) …with BYTE-IDENTICAL output to \`--check <brief> worker 0 <repo>\` — the exit code MEANS the same thing in both places, so a green cheap run is evidence about the dispatch"
+grep -q 'START the value with the key' <<<"$J_OUT2"; ck $? "(J11) …and the DISPATCHER's own list teaches the WIP key shape too (J2 is not a token only the diagnostic verb prints)"
+bash "$GATE" --missing "$AGREE_NOPW" worker 0 "$TMP/agree-wt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; ck $? "(J12) …because the RANKED token list behind that body carries it (the repo argument changes nothing about this refusal, and the arm proves it rather than assuming it)"
+# ── THE ALIAS DID NOT ERASE A REAL ROLE DIFFERENCE. A `pr-<N>` WIP key belongs to a FIXER, and `fixer`
+# is a role the CALLER must name — if the fold had collapsed every role, this pair would agree and a
+# fixer's brief would silently be judged as a lane's (the mirror of #4152's defect).
+AGREE_PR="$TMP/agree-prkey.txt"
+sed 's|^WIP:.*|WIP:       pr-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-19T00:00Z)|' "$CANON" > "$AGREE_PR"
+grep -q 'pr-4242 -> none' "$AGREE_PR"; ck $? "§J fixture: the role-sensitive brief really carries a fixer PR key"
+bash "$GATE" --check "$AGREE_PR" fixer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(J13) …which a FIXER's brief may use (admitted, rc=$rc) — the genuine role difference survives the fold"
+bash "$GATE" --check "$AGREE_PR" worker >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J14) …and which the DISPATCHER's role refuses (rc=$rc), so a fixer brief graded as the dispatcher's role cannot pass"
+J_OUT3="$( env -u O_WORK O="$TMP/agree-o" bash "$NB" agreepr "$TMP/agree-wt" "$AGREE_PR" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J15) the dispatcher refuses the role-sensitive brief too (rc=$rc)"
+printf '%s\n' "$J_OUT3" | agree_body > "$TMP/agree-d2.txt"
+bash "$GATE" --check "$AGREE_PR" worker 0 "$TMP/agree-wt" > "$TMP/agree-c2.txt" 2>&1
+diff -q "$TMP/agree-d2.txt" "$TMP/agree-c2.txt" >/dev/null; ck $? "(J16) …byte-identically to the cheap check at the SAME role/round/repo"
+# ── NON-VACUITY. Each new assertion is MUTATED below, and each mutation is proven to (a) really change
+# the program and (b) make its own arm FAIL. A shared helper (`agree_tokens`) is used for the mutant, so
+# the mutant is graded by exactly the code (J6) is graded by.
+MUT_ONEPASS="$TMP/mutant-onepass.sh"
+sed 's|^  if (!pwsec) print "PREVIOUS-WORK-WIP"$|  # MUTANT: one pass removed|' "$GATE" > "$MUT_ONEPASS"
+diff -q "$GATE" "$MUT_ONEPASS" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J17) the ONE-PASS mutation really changed the file (its anchor still matches)"
+grep -qx '  if (!pwsec) print "PREVIOUS-WORK-SECTION"' "$MUT_ONEPASS"; ck $? "(J18) …and it removed the WIP token ONLY — the block token is still there, so (J2) is about the second requirement and not about the refusal"
+bash -n "$MUT_ONEPASS"; ck $? "(J19) …and the mutant still parses"
+bash "$MUT_ONEPASS" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J20) MUTATION: (J2) now FAILS — with the one-pass line gone the key shape is SILENT again, which is exactly the second refusal #4152 measured"
+bash "$MUT_ONEPASS" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(J21) …while the BLOCK token survives that mutant, so (J1) was not green because of the same line"
+bash "$MUT_ONEPASS" --check "$TMP/no-pw.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J22) …and the brief is still REFUSED, so the arm removed a REPORTED requirement and not the refusal itself (rc=$rc)"
+# ⛔ THE ROLE-DIVERGENCE MUTANT IS A WRAPPER, AND THE SHAPE IS THE HONEST ONE. The agreement is enforced
+# by FOLDING the two names, so reverting that fold alone changes nothing TODAY — no rule in the file
+# branches on `worker`, and that unreachability is the property under test. What must be shown is that
+# (J6) can FAIL if the two names ever became two contracts; so the mutant IS two contracts: the real
+# gate, plus a `worker`-only requirement bolted in front of it.
+MUT_ROLE="$TMP/mutant-worker-role.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# MUTANT: worker is NOT an alias of lane — it carries a contract of its own.\n'
+  printf 'if [ "${1:-}" = "--missing" ] && [ "${3:-}" = "worker" ]; then\n'
+  printf '  bash %q --missing "${2:--}" lane "${4:-0}" "${5:-}"; printf "WORKER-ONLY\\n"; exit 0\n' "$GATE"
+  printf 'fi\n'
+  printf 'exec bash %q "$@"\n' "$GATE"
+} > "$MUT_ROLE"
+diff -q "$GATE" "$MUT_ROLE" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J23) the ROLE-DIVERGENCE mutant is a different program from the gate"
+grep -q 'WORKER-ONLY' "$MUT_ROLE"; ck $? "(J24) …and it really adds a worker-only requirement (an inert wrapper would prove nothing)"
+mut_lane="$(agree_tokens "$MUT_ROLE" "$TMP/no-pw.txt" lane)"
+mut_worker="$(agree_tokens "$MUT_ROLE" "$TMP/no-pw.txt" worker)"
+[ "$mut_lane" != "$mut_worker" ]; ck $? "(J25) MUTATION: (J6) now FAILS — with two contracts for one role the author's check and the dispatcher's check disagree again: lane=[${mut_lane}] worker=[${mut_worker}]"
+[ "$mut_lane" = "$agree_lane" ]; ck $? "(J26) …and the mutation touched ONLY the worker side (the lane verdict is unchanged), so (J6) was not green because a rule had been deleted"
+# ⛔ AND THE DISPATCHER'S OWN ROLE IS MUTATED, because "the same message" is a claim about THIS CALLER and
+# not about the gate. The mutant is the SHIPPED dispatcher with one word changed; it gets its own `$O`
+# (that resolver takes `$O/spawn-gate.sh` first) with a copy of the validator beside it. The substitute
+# role is `reviewer`, NOT `fixer`: a fixer would ADMIT the role-sensitive brief and fall through to a
+# real spawn, and this arm is about the refusal text, not about launching an agent.
+MUT_NB_DIR="$TMP/agree-mut-nb"; mkdir -p "$MUT_NB_DIR"
+cp "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$MUT_NB_DIR/"
+sed 's|--check "$PROMPT" worker 0 "$WT"|--check "$PROMPT" reviewer 0 "$WT"|' "$NB" > "$MUT_NB_DIR/nonblocking-dispatch.sh"
+grep -q -- '--check "$PROMPT" reviewer 0 "$WT"' "$MUT_NB_DIR/nonblocking-dispatch.sh"; ck $? "(J27) the DISPATCHER mutation really changed the role it grades with"
+bash -n "$MUT_NB_DIR/nonblocking-dispatch.sh"; ck $? "(J28) …and it still parses"
+J_OUT4="$( env -u O_WORK O="$MUT_NB_DIR" bash "$MUT_NB_DIR/nonblocking-dispatch.sh" agreemut "$TMP/agree-wt" "$AGREE_PR" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J29) …and it still refuses that brief (rc=$rc), so the arm below compares two REFUSALS and not a refusal with an admission"
+printf '%s\n' "$J_OUT4" | agree_body > "$TMP/agree-d3.txt"
+diff -q "$TMP/agree-d3.txt" "$TMP/agree-c2.txt" >/dev/null; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J30) MUTATION: (J16) now FAILS — a dispatcher grading a different role no longer produces the cheap check's message, which is the whole claim of (J10)/(J16)"
+
+
+# ── THE AGREEMENT, axis 3: WHICH REPOSITORY the PREVIOUS WORK cross-check measures. This is the arm
+# for the ONE edit in this diff that can change a VERDICT (`nonblocking-dispatch.sh:206` passing `$WT`
+# as the fourth positional), and a fresh-context review measured it UNREACHABLE: `brief_gate_previous_
+# work` consults the repository argument only AFTER it has parsed an `issue-<N>` key out of a `WIP:`
+# value (`[ -n "${issues// /}" ] || return 0` precedes `repo="$(brief_gate_repo "$repo")"`), and BOTH
+# §J fixtures above are deliberately KEYLESS. So `$WT` was read by no arm and reverting `0 "$WT"` left
+# this whole section green — rule 3 of the non-vacuity contract (`#3442`), and the misleading kind of
+# green: it reads as coverage of the repo axis that does not exist.
+#
+# THE FIXTURE, and why it takes TWO repositories: the axis under test is WHICH repository is measured,
+# so one tree cannot distinguish the arms. Two LOCAL BARE repos serve as the origins, so `git ls-remote`
+# answers OFFLINE and this stays hermetic (no network, no `gh`). `origin-wip` holds
+# `refs/wip/issue-4242-briefgate` — the hyphen-delimited segment `4242` is #3382's declared naming rule —
+# and `origin-plain` holds none. `agree-keyed-wt` has the first as its origin and `agree-keyed-cwd` the
+# second. The brief is CANONICAL plus a KEYED absence claim, so the cross-check is the ONLY thing that
+# can refuse it: every other requirement is satisfied.
+AGREE_KEYED="$TMP/agree-keyed.txt"
+sed 's|^WIP:.*|WIP:       issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-20T00:00Z)|' "$CANON" > "$AGREE_KEYED"
+grep -q '^WIP:.*issue-4242 -> none' "$AGREE_KEYED"; ck $? "§J fixture: the repo-axis brief really carries a KEYED absence claim, so the cross-check has an issue to look up"
+git init -q --bare "$TMP/agree-origin-wip" >/dev/null 2>&1
+git init -q --bare "$TMP/agree-origin-plain" >/dev/null 2>&1
+# a ref needs an object; `hash-object -w` writes one straight into the bare repo (no worktree needed)
+AGREE_WIPSHA="$(printf 'rescued\n' | git -C "$TMP/agree-origin-wip" hash-object -w --stdin 2>/dev/null)"
+git -C "$TMP/agree-origin-wip" update-ref refs/wip/issue-4242-briefgate "$AGREE_WIPSHA" 2>/dev/null
+mkdir -p "$TMP/agree-keyed-wt" "$TMP/agree-keyed-cwd"
+git -C "$TMP/agree-keyed-wt" init -q >/dev/null 2>&1
+git -C "$TMP/agree-keyed-wt" remote add origin "$TMP/agree-origin-wip" 2>/dev/null
+git -C "$TMP/agree-keyed-cwd" init -q >/dev/null 2>&1
+git -C "$TMP/agree-keyed-cwd" remote add origin "$TMP/agree-origin-plain" 2>/dev/null
+bash "$GATE" --wip-refs 4242 "$TMP/agree-keyed-wt" 2>/dev/null | grep -q 'refs/wip/issue-4242-briefgate'; ck $? "§J fixture: the KEYED worktree's origin really holds a rescued WIP ref for 4242, answered OFFLINE by a local bare repo"
+bash "$GATE" --wip-refs 4242 "$TMP/agree-keyed-cwd" 2>/dev/null | grep -q 'refs/wip/issue-4242-briefgate'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§J fixture: …and the OTHER repository really holds none, so the two arms below differ in exactly one fact"
+# ⛔ `REPO` AND `CLAIM_REPO` ARE CLEARED ON THE CWD-RESOLVING ARMS. `brief_gate_repo` prefers them to the
+# cwd — its documented order, and lanes really do run with `REPO` exported (this host does, as
+# `/home/cmux/agent-infra`), so leaving them set would make the arm grade an AMBIENT repository instead
+# of the fixture, i.e. grade the host. Declared here for the same reason `$O_WORK` is cleared above.
+( cd "$TMP/agree-keyed-cwd" && env -u REPO -u CLAIM_REPO bash "$GATE" --check "$AGREE_KEYED" worker >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 0 ]; ck $? "(J31) the cheap check with NO repo argument, run from the checkout that holds NO rescued WIP, ADMITS the keyed brief (rc=$rc) — the measurement is a property of the caller's tree"
+AGREE_REPO_OUT="$(env -u REPO -u CLAIM_REPO bash "$GATE" --check "$AGREE_KEYED" worker 0 "$TMP/agree-keyed-wt" 2>&1)"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J32) …and the SAME brief, the SAME bytes, refused (rc=$rc) once the repository is NAMED — so the fourth positional is what changes the verdict, not the brief"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED\|CONTRADICTS `refs/wip/\*`' <<<"$AGREE_REPO_OUT"; ck $? "(J33) …and it refuses for the RIGHT reason, naming the rescued ref it found"
+# ── NOW THE DISPATCH PATH, WHICH IS WHERE THE FOURTH POSITIONAL LIVES. Driven from the repository that
+# holds NO rescued WIP: a dispatcher that measured ITS OWN cwd would admit here, and one that measures
+# the worktree it will `cd` into must refuse. That is `nonblocking-dispatch.sh:206` under test.
+AGREE_D_OUT="$( cd "$TMP/agree-keyed-cwd" && env -u REPO -u CLAIM_REPO -u O_WORK O="$TMP/agree-o" \
+  bash "$NB" agreerepo "$TMP/agree-keyed-wt" "$AGREE_KEYED" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J34) the DISPATCHER, driven from that same no-WIP checkout, still REFUSES (rc=$rc) — it measures the WORKTREE it will use, not the caller's tree"
+grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_D_OUT"; ck $? "(J35) …and its refusal names the rescued ref, so the arm above is a refusal about the repository and not an unrelated 80"
+# ── THE MUTATION. This is the row that did not exist: revert the fourth positional and (J34) must FAIL.
+# The mutant is the SHIPPED dispatcher with one argument removed, in a faithful sibling directory
+# (every `*.sh` and `lib/` symlinked, so `$SELF`-relative resolution — `gate-policy.sh`,
+# `reviewer-preflight.sh`, `lib/bounded.sh` — is the real one and the ONLY difference is the edit).
+# ⛔ THE `lib` SYMLINK SOURCE IS `$HERE/..`, NOT `$HERE`: `brief_gate_bounded` resolves
+# `$(dirname $BASH_SOURCE)/../lib/bounded.sh`, i.e. `scripts/lib/` — there is no
+# `scripts/orchestrator-harness/lib`. Symlinking `$HERE/lib` made a DANGLING link, so the bounding
+# layer fell through to `$AGENT_INFRA_PATH`/`$HOME`; on a lane box with `$AGENT_INFRA_PATH` exported
+# that accidentally resolved and the arms were green, and on CI (where it is unset) `--wip-refs`
+# returned 2 UNMEASURED, the mutant's gate ADMITTED, and (J41) went RED — measured, which is why the
+# fixture below now ASSERTS the bounding layer resolves instead of trusting a symlink to be one.
+AGREE_MUT_ROOT="$TMP/agree-mut-root"
+AGREE_MUT_DIR="$AGREE_MUT_ROOT/scripts/orchestrator-harness"
+mkdir -p "$AGREE_MUT_DIR"
+for _f in "$HERE"/*.sh; do ln -s "$_f" "$AGREE_MUT_DIR/$(basename "$_f")" 2>/dev/null; done
+[ -d "$HERE/../lib" ] && ln -s "$HERE/../lib" "$AGREE_MUT_ROOT/scripts/lib" 2>/dev/null
+[ -f "$AGREE_MUT_ROOT/scripts/lib/bounded.sh" ]; ck $? "§J fixture: the mutant's \`scripts/lib/bounded.sh\` RESOLVES — a dangling link here silently unbounds \`--wip-refs\` and makes (J41) red for the wrong reason"
+rm -f "$AGREE_MUT_DIR/nonblocking-dispatch.sh"
+sed 's|--check "$PROMPT" worker 0 "$WT"|--check "$PROMPT" worker|' "$NB" > "$AGREE_MUT_DIR/nonblocking-dispatch.sh"
+AGREE_MUT_NB="$AGREE_MUT_DIR/nonblocking-dispatch.sh"
+diff -q "$NB" "$AGREE_MUT_NB" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J36) the REPO-AXIS mutation really changed the dispatcher (its anchor still matches at this head)"
+grep -q -- '--check "$PROMPT" worker 0 "$WT"' "$AGREE_MUT_NB"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J37) …and it removed the FOURTH POSITIONAL only — the third is still \`worker\`, so the arm reruns the changed line and nothing else"
+bash -n "$AGREE_MUT_NB"; ck $? "(J38) …and the mutant still parses"
+# A stub `pi`/`gh` and a pinned footer, so an ADMITTED brief cannot reach a real model call or the network:
+# the mutant is expected to get PAST the gate (that is the defect), and the arm must still be hermetic.
+mkdir -p "$TMP/agree-bin"
+printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$TMP/agree-bin/pi"; chmod +x "$TMP/agree-bin/pi"
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/agree-bin/gh"; chmod +x "$TMP/agree-bin/gh"
+agree_mutant() { # agree_mutant <cwd> <name> — drive the SHIPPED dispatcher minus the fourth positional
+  ( cd "$1" && env -u REPO -u CLAIM_REPO -u O_WORK O="$TMP/agree-mut-o" PI_LOG="$TMP/agree-pi.log" \
+      PATH="$TMP/agree-bin:$PATH" HOME="$TMP/agree-mut-home" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+      NB_START_SETTLE=2 bash "$AGREE_MUT_NB" "$2" "$TMP/agree-keyed-wt" "$AGREE_KEYED" 5 2>&1 )
+}
+mkdir -p "$TMP/agree-mut-o" "$TMP/agree-mut-home"; : > "$TMP/agree-pi.log"
+# ⛔ AND WAIT FOR THE WORKER THE MUTANT LAUNCHED (bounded). An ADMITTED brief really spawns, so the
+# disowned worker is still alive when this suite moves on: it races the `trap … rm -rf "$TMP"` at EXIT
+# (measured — `rm: cannot remove '<tmp>': Directory not empty`), and worse, its terminal rescue path can
+# push a `refs/wip/*` ref into the fixture's own bare origin, which would make a LATER run of these
+# arms see a ref this run did not create. Waiting is the deterministic reading, not a sleep: the wait
+# ends the moment the worker publishes its exit status.
+agree_settle() { # agree_settle <name> — bounded wait for a mutant-launched worker's exit status
+  local i=0 d="$TMP/agree-mut-o/bg"
+  while [ "$i" -lt 20 ] && [ ! -f "$d/$1.rc" ]; do sleep 1; i=$((i+1)); done
+}
+AGREE_M_OUT="$(agree_mutant "$TMP/agree-keyed-cwd" agreemutcwd)"; rc=$?
+agree_settle agreemutcwd
+[ "$rc" -ne 80 ]; ck $? "(J39) MUTATION: (J34) now FAILS — with the fourth positional gone the dispatcher admits the brief (rc=$rc, not 80) and no longer names the CONTRADICTION, because it measured the CALLER's tree instead of the worktree"
+grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_M_OUT"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J40) …and the mutant's output does NOT name the rescued ref, so (J35) was carrying this arm alone"
+# ⛔ AND THE SAME MUTANT REFUSES WHEN ITS CWD *IS* THE WORKTREE — the second half of the proof. It shows
+# the mutant still MEASURES a repository and that the redden above is the AXIS moving, not a gate that
+# stopped working (which would make (J39) green for the wrong reason and prove nothing about `$WT`).
+AGREE_M2_OUT="$(agree_mutant "$TMP/agree-keyed-wt" agreemutwt)"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J41) …while the SAME mutant, run with its cwd at the worktree that HOLDS the ref, still refuses (rc=$rc) — so (J39)'s red is the repository AXIS, and the gate itself is intact"
+grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_M2_OUT"; ck $? "(J42) …naming the same rescued ref, which is the fact the mutant lost when it stopped receiving the worktree"
+
+
+echo
+echo "§K the VALIDATOR NAMES ITSELF — two copies at two revisions are distinguishable (#4152 residual)"
+# ⛔ WHY THIS SECTION EXISTS. `nonblocking-dispatch.sh` resolves `brief-gate.sh` from FOUR homes, while an
+# author runs whatever `./brief-gate.sh` their own checkout holds — so one brief can be judged by two
+# different validators. Until this section's subject landed, nothing in either output said WHICH copy
+# judged: a green cheap check and a refusing dispatcher were indistinguishable in provenance, the
+# documented "identical but surprising" signature of a stale/duplicated validation path. The refusal
+# block now names the executing copy's CONTENT DIGEST (not a git sha: the copy that refuses in
+# production is `$O/brief-gate.sh`, a seeded file in no repository) — so two skewed copies print two
+# different lines, and the author is sent to the copies instead of re-authoring a correct brief.
+gate_selfid() { # gate_selfid <file> — the same portable order the gate itself uses
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -c1-12
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -c1-12
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}' | cut -c1-12
+  fi
+}
+K_SELF="$(gate_selfid "$GATE")"
+K_OUT="$(bash "$GATE" --check "$TMP/no-pw.txt" 2>&1)"
+grep -q "validator: brief-gate.sh @ ${K_SELF:-unresolved}" <<<"$K_OUT"; ck $? "(K1) the REFUSAL names the copy that produced it — \`validator: brief-gate.sh @ ${K_SELF:-unresolved}\` — computed from the file's own bytes"
+[ -n "$K_SELF" ]; ck $? "(K2) …and that digest is confirmed INDEPENDENTLY here (a constant or a copy of the message would not survive this row)"
+# the property the whole line exists for: two copies whose BYTES differ must print DIFFERENT identifiers
+K_COPY="$TMP/agree-gate-copy.sh"
+cp "$GATE" "$K_COPY"; printf '\n# one differing byte is one different revision\n' >> "$K_COPY"
+K_COPYID="$(env -u REPO -u CLAIM_REPO bash "$K_COPY" --check "$TMP/no-pw.txt" 2>&1)"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(K3) …a COPY of the validator, one comment line different, still refuses (rc=$rc) — so the rows below compare two real refusals"
+grep -q "validator: brief-gate.sh @ ${K_SELF:-unresolved}" <<<"$K_COPYID"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(K4) …and names a DIFFERENT identifier — two copies at two revisions are told apart by the refusal itself, which is the entire point (#4152: 'which copy refused me?' was a 6 h 32 m hunt)"
+# MUTATION: pin the identifier to a constant and (K4) must FAIL — that is what makes (K4) reachable
+K_MUT="$TMP/agree-gate-constid.sh"
+sed 's|^  printf .%s @ %s. "$(basename "$f")" "${h:-unresolved}"$|  printf "%s @ %s" "$(basename "$f")" 000000000000|' "$GATE" > "$K_MUT"
+diff -q "$GATE" "$K_MUT" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(K5) the CONSTANT-IDENTIFIER mutation really changed the validator (its anchor still matches at this head)"
+K_MUTID="$(env -u REPO -u CLAIM_REPO bash "$K_MUT" --check "$TMP/no-pw.txt" 2>&1)"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(K6) …and it still REFUSES (rc=$rc) — an identification aid must never be load-bearing on the verdict, so this row proves the mutation moved the identifier and not the refusal"
+grep -q '@ 000000000000$' <<<"$K_MUTID"; ck $? "(K7) …because it now prints the constant, i.e. (K4) fails under it"
+K_USAGE="$(bash "$GATE" --no-such-verb 2>&1)"; rc=$?
+[ "$rc" -eq 78 ]; ck $? "(K8) an unknown verb is still the cannot-verify exit 78 (rc=$rc), so the usage rows below are the ones a caller actually sees"
+grep -q 'must be the SAME brief-gate.sh file' <<<"$K_USAGE"; ck $? "(K9) …and the usage text states the precondition that makes a green cheap run evidence about a dispatch: both callers must be the SAME FILE (the repo argument alone makes the measurement tree-independent, not copy-independent)"
+
+
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
