@@ -494,9 +494,9 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="nonblocking-dispatch.sh:#4067 orch-loop.sh:#241
 # and it entered for the same reason: the one site the derivation sees is a MEASURED example, not a farmed
 # path. `scripts/pr-doctor.py:2520` quotes a real verdict line (`VERDICT=UNDELIVERED next=repair-chain
 # chain=/home/cmux/orchestrator/nonblocking-dispatch.sh`), and that absolute path is the DISPATCHER'S
-# DEPLOYED location — `$O`, seeded from the harness pin by the cross-box deploy
-# (`scripts/deploy-crossbox.sh:153` `cp -p "$H"/*.sh "$O"/`, with `$H` the clone's harness dir at `:42`;
-# `scripts/orchestrator-harness/deploy-harness.sh:504` is the same copy, temp+rename).
+# DEPLOYED location — `$O`, seeded from the CLONE's harness dir by the cross-box deploy
+# (`scripts/deploy-crossbox.sh:153` `cp -p "$H"/*.sh "$O"/`, `$H` set at `:43`), and from the PIN by
+# `scripts/orchestrator-harness/deploy-harness.sh:504` (temp+rename) — two callers, one destination.
 # `scripts/orchestrator-harness/install.sh:1725` is NOT the installer: it is the DRIFT list that asserts each
 # of these files IS present in `$O` (`:1740-1741` `[ -f "$O/$f" ] || DRIFTED` then `diff -q "$SHIPPED/$f"`),
 # which is the evidence that the dispatcher is part of the deployed set. NO farm array in
@@ -1045,8 +1045,9 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
   # list, so its entry is `script:cmux_dispatch.py` at the FARM DESTINATION — and that is what the earlier
   # sentence was written about; it was never true of this form as a whole. The form is KEPT for the same
   # reason F8 is: the class can reappear in any farmed consumer, and a scanner that had to be re-widened to
-  # see it would report `0 undelivered-and-undisclosed` meanwhile — #1899's own failure shape. The probe
-  # below (`foreign:orch-loop.sh`) keeps it non-inert.
+  # see it would report `0 undelivered-and-undisclosed` meanwhile — #1899's own failure shape. The DECLARED-
+  # FORM fixture (`foreign:f6-home.sh foreign:f6-tools.py`) is what keeps it non-inert; `foreign:orch-loop.sh`
+  # is a LIVE population entry (#2413), not a probe.
   # BOTH agent dirs are excluded — F3 owns `agent/scripts/<n>` and `agent/state/<p>`, so the state producer
   # (`lane-confirm.py`, orchestrator-heartbeat.sh:336) does not also surface here as a duplicate `foreign:`.
   { grep -ohE '/(Users|home)/[A-Za-z0-9_./-]+/[A-Za-z0-9_-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
@@ -1912,6 +1913,18 @@ if [ "$(producer_probe check_producer_farm_declared "dispo-probe-stale-exempt" "
 else
   fail "a STALE exemption did NOT trip the disposition check — a disclosure whose producer is gone read as clean"
 fi
+# ...and EACH disclosure list's stale leg must be LIVE, not just the exempt one. The loop above walks three
+# lists; the probe above removes an `EXEMPT` producer, so it observes ONE leg and a one-line deletion of the
+# FOREIGN leg left the suite green (found by a fresh review of #4067, whose new entry is covered by exactly
+# that leg). Every disclosure list is therefore exercised with a producer declared ONLY in it, removed from
+# the population — `applied` cannot carry it, so a live leg reports it STALE and a missing one stays silent.
+POP_STALE_FOREIGN="$(printf '%s\n' $LANE_PRODUCERS_CANONICAL | grep -vx 'foreign:orch-loop.sh' | tr '\n' ' ')"
+STALE_FOREIGN_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-stale-foreign" "$POP_STALE_FOREIGN")"
+case "$STALE_FOREIGN_MSG" in
+  *"STALE disclosure"*"foreign:orch-loop.sh"*)
+    echo "ok: a foreign disclosure whose producer left the population is STALE (the FOREIGN stale leg is live)" ;;
+  *) fail "a foreign disclosure survived its producer leaving the population — the FOREIGN leg of the stale loop is missing, or kind-blind (#1899): $(printf '%s' "$STALE_FOREIGN_MSG" | grep 'STALE\|SUMMARY' | head -c 200)" ;;
+esac
 # ...and staleness is KIND-QUALIFIED: `lane-triage.py` as a `script:` producer does NOT keep its
 # `state:` residual alive. This is the shape of a #1553 landing that farms the file — without the kind
 # in the match, the residual would survive on the strength of a same-named producer in another dir.
