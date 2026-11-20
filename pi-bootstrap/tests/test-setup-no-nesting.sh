@@ -494,17 +494,29 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="nonblocking-dispatch.sh:#4067 orch-loop.sh:#241
 # and it entered for the same reason: the one site the derivation sees is a MEASURED example, not a farmed
 # path. `scripts/pr-doctor.py:2520` quotes a real verdict line (`VERDICT=UNDELIVERED next=repair-chain
 # chain=/home/cmux/orchestrator/nonblocking-dispatch.sh`), and that absolute path is the DISPATCHER'S
-# DEPLOYED location — rendered by the harness deploy (`scripts/orchestrator-harness/install.sh:1725`
-# installs `nonblocking-dispatch.sh` into the pin dir, and `scripts/deploy-crossbox.sh:42-43` pushes the
-# clone plus `$H` to `$O` on the target box). NO farm array in `pi-bootstrap/setup.sh` delivers it (measured
-# 2026-11-20: `rg -n 'nonblocking-dispatch' pi-bootstrap/setup.sh` → no entry), so this farm can never carry
-# it and a farm registration would duplicate the delivery the clone already makes — the hazard
-# `setup.sh:398` names for `graph_srcs`. ⛔ THE RESIDUE HAZARD: this entry records a FACT, it does not fix
-# the DIVERGENCE that #4067 is titled for (each cell runs whatever its own checkout carries, which is how
-# pi-cell-3 held a `T="${4:-3000}"` literal). If a farm array ever delivers the file, or the `pr-doctor.py`
-# site moves out of the clone, the stale-disclosure check below FAILS on this entry — delete it in THAT
-# change, and delete it in the same change that lands a delivery mechanism, so the record cannot outlive
-# its reason (#1899).
+# DEPLOYED location — `$O`, seeded from the harness pin by the cross-box deploy
+# (`scripts/deploy-crossbox.sh:153` `cp -p "$H"/*.sh "$O"/`, with `$H` the clone's harness dir at `:42`;
+# `scripts/orchestrator-harness/deploy-harness.sh:504` is the same copy, temp+rename).
+# `scripts/orchestrator-harness/install.sh:1725` is NOT the installer: it is the DRIFT list that asserts each
+# of these files IS present in `$O` (`:1740-1741` `[ -f "$O/$f" ] || DRIFTED` then `diff -q "$SHIPPED/$f"`),
+# which is the evidence that the dispatcher is part of the deployed set. NO farm array in
+# `pi-bootstrap/setup.sh` delivers it (measured 2026-11-20: `rg -n 'nonblocking-dispatch' pi-bootstrap/setup.sh`
+# → no entry, rc 1).
+# ⛔ AND A FARM COULD NOT SUBSTITUTE FOR THE CLONE EVEN IF ONE DID: every flat farm entry is written to
+# `$DEST/scripts/<base>` (`pi-bootstrap/setup.sh:1185` `dest="$DEST/scripts/$base"`), a DIFFERENT path from
+# the `$O` the derived edge names — so a registration would leave THIS `foreign:` entry intact (the derived
+# set would still contain it, and the gate would still be red) while putting a SECOND, independently-drifting
+# copy of the dispatcher on the box, which is #4067's titled defect rather than a fix for it. (`setup.sh:666`
+# states the neighbouring `graph_srcs` hazard — "a pair declared in BOTH is copied twice" — but the DESTINATION
+# mismatch above is what decides this one; do not cite the duplication hazard as the reason.)
+# ⛔ THE RESIDUE HAZARD: this entry records a FACT, it does not fix the DIVERGENCE that #4067 is titled for
+# (each cell runs whatever its own checkout carries, which is how pi-cell-3 held a `T="${4:-3000}"` literal).
+# The stale-disclosure check below DOES catch the site MOVING OUT of the clone: the derivation then stops
+# yielding `foreign:nonblocking-dispatch.sh`, and the entry reads declared-but-NOT-APPLIED. It does NOT catch
+# a farm array starting to deliver the file — the `foreign)` arm of the applied-record case consults only
+# this list and never a delivery lookup, so the entry would stay APPLIED and the run green. That asymmetry is
+# why the deletion is owed by the CHANGE, not by the check: delete this entry in the same change that lands a
+# delivery mechanism for the path `pr-doctor.py` names, so the record cannot outlive its reason (#1899).
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
