@@ -35,6 +35,23 @@
 #        CLAIM: WIP: BRANCH: WORKTREE: PRIOR:   — each with a non-empty value, and WIP's value
 #        BEGINNING `issue-<N>` (`pr-<N>` for a fixer's PR key). See the fourth contract below.
 #
+# ⛔ ONE PASS, NOT ONE LAYER PER ATTEMPT (#4152). A brief with NO `PREVIOUS WORK` section is missing the
+# block AND the key shape of the `WIP:` line that block must contain, and it is refused for BOTH in the
+# same response (`PREVIOUS-WORK-SECTION` + `PREVIOUS-WORK-WIP`). Why that is not redundant: the four
+# other labels are free-form and are enumerated by the block's own bullet, so the block's absence tells
+# the author everything about them — but the KEY SHAPE is a rule the enumeration does not state, so an
+# author who is told only "add the block" writes the natural honest `WIP: none — no branch on origin`
+# and is refused a SECOND time for a rule nobody mentioned. MEASURED 2026-11-18: three dispatch
+# attempts to start one lane, the third only after the refusal had been re-read twice.
+#
+# ⛔ AND `worker` IS AN ALIAS OF `lane`, FOLDED ONCE BEFORE ANY RULE SEES IT (#4152). The AUTHORED-brief
+# path grades `worker` (`nonblocking-dispatch.sh`, `pr-doctor.py`) while an author's cheap pre-flight is
+# `--check <file>`, whose role defaults to `lane` — and #4152 was measured on exactly that pair giving
+# two different answers about one brief. Every rule in this file already treats the two identically;
+# folding them (`brief_gate_grade_role`) means they CANNOT drift apart, instead of leaving two names
+# for one contract and hoping. `--section worker` still renders (it is the role pr-doctor splices) and
+# is byte-identical to `--section lane`, so the gate still cannot refuse its own advice.
+#
 # Two labelled fields are not decoration: they are the two halves of the pass that the two measured
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
 # about it" — rung 3 (`web_fetch`) is always available, so the field is never unsatisfiable.
@@ -814,6 +831,16 @@ END {
     if (!pwwt)  print "PREVIOUS-WORK-WORKTREE"
     if (!pwpri) print "PREVIOUS-WORK-PRIOR"
   }
+  # ⛔ ONE PASS (#4152): the block and the KEY SHAPE of the `WIP:` line it must contain are discovered in
+  # the SAME edit, so they are reported in the SAME refusal — the author who is told to add the block is
+  # told, in the same breath, that its `WIP:` value must START with the key. Both are genuinely missing
+  # (`!pwsec` means there is no `WIP:` line in a section for the cross-check to read, which is why that
+  # reader abstains), so this is a true report of two requirements, not a duplicate of the block bullet.
+  # It is DELIBERATELY a separate statement placed AFTER the else-block, not an arm folded into the
+  # section token: the suite section-token mutant (H45–H47) anchors on that exact line and on the
+  # `else` that follows it, so folding these together would leave that mutation testing a different
+  # program than the one it names.
+  if (!pwsec) print "PREVIOUS-WORK-WIP"
 }
 '
 
@@ -1049,8 +1076,25 @@ END {
 # `brief_gate_previous_work` are two readers; with `-` the first drains the pipe and the second sits at
 # EOF, so `--missing -` reported "complete, rc=0" for a brief that `--check -` refuses — the diagnostic
 # verb disagreeing with the gate is how an author is told their brief is fine when it is not.
+# brief_gate_grade_role <role> — THE role a rule is evaluated with (#4152). `worker` is an alias of
+# `lane`, and it is folded HERE so that no rule in this file — and none added later — can tell them
+# apart. The two names exist because the callers do: `nonblocking-dispatch.sh` and `pr-doctor.py` grade
+# `worker` (it is the role their generated brief is rendered for), while an author's cheap pre-flight is
+# `--check <file>`, whose role defaults to `lane`. #4152 is the measurement of that pair disagreeing:
+# the cheap check returned 0 on a brief the dispatcher then refused. Folding is the fix that cannot
+# regress — a rule that branched on `worker` would now be unreachable rather than merely untested.
+# ⛔ `fixer` AND `reviewer` ARE NOT ALIASED, because their differences are REAL (`pr-<N>` keys are a
+# fixer's, the non-vacuity block is a reviewer's, and the round is a reviewer input) — those are roles
+# the caller must name, and `--check` cannot invent them. See `--check`'s usage line.
+brief_gate_grade_role() { # brief_gate_grade_role <role>
+  case "${1:-lane}" in
+    worker) printf 'lane' ;;
+    *)      printf '%s' "${1:-lane}" ;;
+  esac
+}
+
 brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [repo]
-  local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf=""
+  local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf="" grade=""
   rnd="$(brief_gate_round_norm "${3:-0}")"
   if [ "$f" = "-" ]; then
     tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
@@ -1065,8 +1109,12 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
   # ⛔ BOTH ARGUMENTS: #3441's review ROUND (on the base) and #3484's ROLE (the WIP key rule is
   # role-scoped). Resolving this by keeping one side drops the other feature silently — which is what a
   # rebase resolution did to this file on the shared branch before this replay.
-  brief_gate_missing "$f" "$role" "$rnd"
-  brief_gate_previous_work "$f" "$repo" "$role"
+  # ⛔ AND THE ALIAS IS APPLIED HERE TOO (#4152): the diagnostic verb an author iterates with must grade
+  # with the same role the gate does, or `--missing` and `--check` disagree about one brief — the exact
+  # class this change exists to close, one verb over.
+  grade="$(brief_gate_grade_role "$role")"
+  brief_gate_missing "$f" "$grade" "$rnd"
+  brief_gate_previous_work "$f" "$repo" "$grade"
   [ -n "$tmpf" ] && rm -f "$tmpf"
   return 0
 }
@@ -1074,7 +1122,7 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
 # brief_gate_verify <brief-file|-> [role] [round] [repo] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
 brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
-  local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw=""
+  local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw="" grade=""
   case "$role" in
     lane|fixer|reviewer|worker) : ;;
     *)
@@ -1096,8 +1144,13 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
     cat > "$tmpf"
     f="$tmpf"
   fi
-  miss="$(brief_gate_missing "$f" "$role" "$rnd")"
-  pw="$(brief_gate_previous_work "$f" "$repo" "$role")"
+  # ⛔ THE RULES ARE EVALUATED ON THE ALIAS FORM (#4152) — `brief_gate_grade_role` above. `role` stays as
+  # the caller NAMED it for everything this function PRINTS (`brief: … role: worker`, and the canonical
+  # block from `--section worker`), because the message must describe the dispatch the caller is making.
+  # Only the verdict is computed on `grade`, where `worker` and `lane` are one contract.
+  grade="$(brief_gate_grade_role "$role")"
+  miss="$(brief_gate_missing "$f" "$grade" "$rnd")"
+  pw="$(brief_gate_previous_work "$f" "$repo" "$grade")"
   [ -n "$pw" ] && miss="${miss:+$miss$'\n'}${pw}"
   if [ -z "$miss" ]; then
     [ -n "$tmpf" ] && rm -f "$tmpf"
@@ -1318,6 +1371,19 @@ brief_gate_line() { # brief_gate_line [role]
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
 #   bash brief-gate.sh --check <file|-> [role] [round] [repo]  → 0 pass · 80 refused (message on stderr) · 78 cannot verify
 #   bash brief-gate.sh --missing <file|-> [role] [round] [repo] → the missing tokens, one per line
+#
+# ⛔ THE CHEAP CHECK AND THE DISPATCH PATH ARE ONE VERDICT (#4152) — with two things the caller must
+# supply, because they are inputs the gate cannot invent:
+#   • `role`/`round`: the defaults are `lane`/`0`, which is what every AUTHORED-brief dispatch uses
+#     (`nonblocking-dispatch.sh` grades `worker`, and `worker` is folded onto `lane` — see
+#     `brief_gate_grade_role`). A brief destined for `fix-one.sh` or `merge-one.sh` must be checked as
+#     `fixer` / `reviewer <round>`: `pr-<N>` WIP keys, the non-vacuity block and (from round 4) the
+#     `COMPARABLES:` line are role- and round-scoped, so grading them as `lane` would be a different
+#     question — and a 0 there is not evidence about the dispatch that will run.
+#   • `repo`: the PREVIOUS WORK cross-check measures `refs/wip/*` in THIS repository (an explicit path is
+#     taken strictly) and otherwise in whatever the caller's CWD resolves to. A dispatch from a
+#     different checkout must name the target repo here, or the measurement is about the wrong tree.
+#     `nonblocking-dispatch.sh` passes its own worktree for exactly this reason.
 #   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
 #                                                   `record-review.sh` calls this on a review comment)
 #   bash brief-gate.sh --wip-refs <issue> [repo]  → `<ref>\t<sha12>` per refs/wip ref belonging to the

@@ -19,6 +19,10 @@
 #   §E  the census: the files that touch the gate are an EQUALITY, so a dispatch path added tomorrow
 #       without one reddens this suite instead of drifting in unvalidated (the shape
 #       spawn-gate.test.sh already uses for `pi -p` invokers).
+#   §J  the AGREEMENT (#4152): the cheap check (`--check <file>`) and the DISPATCH PATH
+#       (`nonblocking-dispatch.sh`) are driven on the SAME brief and compared BY BYTES, so the two
+#       callers cannot give one brief two verdicts — and a refusal reports every missing requirement in
+#       ONE pass, not one layer per attempt.
 #
 # Run: bash scripts/orchestrator-harness/brief-gate.test.sh
 set -u
@@ -1236,7 +1240,10 @@ MUT_PW="$TMP/mutant-pw.sh"
 # ⛔ THE ANCHOR TRACKS THE CALL SITE (review cycle 2): the reader now takes the ROLE too, and an anchor
 # that stops matching makes the "mutant" byte-identical to the real file — the arm that proves the check
 # is load-bearing then passes for the wrong reason. The diff assertion below is what catches that.
-sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$role")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
+# ⛔ IT WAS RE-POINTED FOR #4152, AND THAT IS THE MECHANISM WORKING: the call site now passes the FOLDED
+# role (`$grade`) instead of `$role`, so the old anchor stopped matching and (H38) reddened ON the change
+# instead of silently grading a mutant that no longer existed. Any future edit here moves this with it.
+sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$grade")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
 diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H38) the cross-check mutation REALLY changed the file (its anchor still matches)"
 bash -n "$MUT_PW"; ck $? "(H39) …and the mutant still parses"
@@ -1301,6 +1308,126 @@ diff -q "$GATE" "$MUT_PW2" >/dev/null 2>&1; rc=$?
 bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H46) MUTATION: (ii) now FAILS — with the token line deleted, no-PW is no longer named as PREVIOUS-WORK-SECTION"
 bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-CLAIM'; ck $? "(H47) …and the FIVE LABEL tokens still refuse the same brief, so (x-b) removed a token and not the contract"
+
+echo
+echo "§J (#4152) the CHEAP CHECK and the DISPATCH PATH are ONE VERDICT — same code, same list, ONE pass"
+# ── WHY THIS SECTION EXISTS. `--check` is the cheap pre-flight an author runs before dispatching, and
+# `nonblocking-dispatch.sh` is the path that then judges the same bytes. MEASURED 2026-11-18: the cheap
+# check returned 0 on a brief the dispatcher refused; with that fixed, the dispatcher refused AGAIN for
+# a rule the first refusal had never mentioned — three attempts to start one lane. So every arm below is
+# BEHAVIOURAL and COMPARATIVE: the tokens and the two callers' own output, compared against each other
+# rather than against a hand-typed expectation that could drift with the contract.
+#
+# ⛔ THE FIXTURE IS §H's `no-pw.txt` ON PURPOSE — CANONICAL minus the `## PREVIOUS WORK` section, i.e.
+# complete in every other respect, so the only thing it can be refused for is the two PREVIOUS WORK
+# requirements: the block, and the KEY SHAPE of the `WIP:` line the block must contain.
+NB="$HERE/nonblocking-dispatch.sh"
+[ -x "$NB" ] || [ -f "$NB" ]; ck $? "§J fixture: the dispatch path under test is the SHIPPED nonblocking-dispatch.sh"
+grep -q '^## RESEARCH FIRST' "$TMP/no-pw.txt"; ck $? "§J fixture: the no-PW brief still carries its research contract (so the arms below are about PREVIOUS WORK)"
+agree_tokens() { # agree_tokens <gate> <brief> [role] [round] [repo] — a SET comparison: token ORDER
+  local g="$1" f="$2"; shift 2                        # must never be able to make two verdicts look
+  bash "$g" --missing "$f" "$@" 2>/dev/null | sort | tr '\n' ' '   # different, or to hide a divergence.
+}
+miss_nopw="$(bash "$GATE" --missing "$TMP/no-pw.txt" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-SECTION' <<<"$miss_nopw"; ck $? "(J1) ONE PASS: a brief with NO PREVIOUS WORK block names the BLOCK — the requirement the first attempt is refused for"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss_nopw"; ck $? "(J2) …AND the KEY SHAPE of the WIP line in the SAME response — the author cannot discover a rule that the block's own refusal does not state, which is the SECOND refusal #4152 measured"
+bash "$GATE" --check "$TMP/no-pw.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J3) …and the DOCUMENTED cheap form — \`--check <file>\`, role omitted — REFUSES it (rc=$rc)"
+J_OUT="$(bash "$GATE" --check "$TMP/no-pw.txt" 2>&1)"
+grep -q 'containing CLAIM:, WIP:, BRANCH:, WORKTREE: and PRIOR:' <<<"$J_OUT"; ck $? "(J4) …and the refusal LIST teaches the block"
+grep -q 'START the value with the key' <<<"$J_OUT"; ck $? "(J5) …AND the key shape, in that SAME list — both fixes are visible in one pass, not one layer per attempt"
+# ── THE AGREEMENT, axis 1: the ROLE. `worker` is the dispatcher's role; `lane` is what an author's
+# `--check <file>` gets by default. One contract, so one verdict — see `brief_gate_grade_role`.
+agree_lane="$(agree_tokens "$GATE" "$TMP/no-pw.txt" lane)"
+agree_worker="$(agree_tokens "$GATE" "$TMP/no-pw.txt" worker)"
+[ "$agree_lane" = "$agree_worker" ]; ck $? "(J6) the AUTHOR's default role (lane) and the DISPATCHER's role (worker) are ONE contract — identical token list [${agree_lane}]"
+bash "$GATE" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J7) …and both roles refuse (lane rc=$rc), so the equality above is not an equality of two ADMITTANCES"
+bash "$GATE" --check "$TMP/no-pw.txt" worker >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J8) …(worker rc=$rc)"
+# ── THE AGREEMENT, axis 2: THE DISPATCH PATH ITSELF, driven. The acceptance criterion is "the same
+# message and the same list", so the two callers' output is compared BY BYTES.
+mkdir -p "$TMP/agree-o" "$TMP/agree-wt"
+git -C "$TMP/agree-wt" init -q 2>/dev/null || true
+git -C "$TMP/agree-wt" remote add origin https://github.com/owner/repo.git 2>/dev/null || true
+# ⛔ THE GATE'S BODY, NOT THE WHOLE STDERR: the dispatcher prints one naming line of its OWN before the
+# gate's output (its resolver's path, #2708). Everything from the gate's first line on is the
+# validator's, and that is what must match. (awk reads all input, so no early exit and no SIGPIPE.)
+agree_body() { awk '/^\[brief-gate\] REFUSED/{f=1} f'; }
+AGREE_NOPW="$TMP/agree-no-pw.txt"; cp "$TMP/no-pw.txt" "$AGREE_NOPW"   # one brief, one arm
+J_OUT2="$( env -u O_WORK O="$TMP/agree-o" bash "$NB" agreeno "$TMP/agree-wt" "$AGREE_NOPW" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J9) the DISPATCH PATH refuses the SAME brief with 80 (rc=$rc)"
+printf '%s\n' "$J_OUT2" | agree_body > "$TMP/agree-d.txt"
+bash "$GATE" --check "$AGREE_NOPW" worker 0 "$TMP/agree-wt" > "$TMP/agree-c.txt" 2>&1
+diff -q "$TMP/agree-d.txt" "$TMP/agree-c.txt" >/dev/null; ck $? "(J10) …with BYTE-IDENTICAL output to \`--check <brief> worker 0 <repo>\` — the exit code MEANS the same thing in both places, so a green cheap run is evidence about the dispatch"
+grep -q 'START the value with the key' <<<"$J_OUT2"; ck $? "(J11) …and the DISPATCHER's own list teaches the WIP key shape too (J2 is not a token only the diagnostic verb prints)"
+bash "$GATE" --missing "$AGREE_NOPW" worker 0 "$TMP/agree-wt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; ck $? "(J12) …because the RANKED token list behind that body carries it (the repo argument changes nothing about this refusal, and the arm proves it rather than assuming it)"
+# ── THE ALIAS DID NOT ERASE A REAL ROLE DIFFERENCE. A `pr-<N>` WIP key belongs to a FIXER, and `fixer`
+# is a role the CALLER must name — if the fold had collapsed every role, this pair would agree and a
+# fixer's brief would silently be judged as a lane's (the mirror of #4152's defect).
+AGREE_PR="$TMP/agree-prkey.txt"
+sed 's|^WIP:.*|WIP:       pr-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-19T00:00Z)|' "$CANON" > "$AGREE_PR"
+grep -q 'pr-4242 -> none' "$AGREE_PR"; ck $? "§J fixture: the role-sensitive brief really carries a fixer PR key"
+bash "$GATE" --check "$AGREE_PR" fixer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(J13) …which a FIXER's brief may use (admitted, rc=$rc) — the genuine role difference survives the fold"
+bash "$GATE" --check "$AGREE_PR" worker >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J14) …and which the DISPATCHER's role refuses (rc=$rc), so a fixer brief graded as the dispatcher's role cannot pass"
+J_OUT3="$( env -u O_WORK O="$TMP/agree-o" bash "$NB" agreepr "$TMP/agree-wt" "$AGREE_PR" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J15) the dispatcher refuses the role-sensitive brief too (rc=$rc)"
+printf '%s\n' "$J_OUT3" | agree_body > "$TMP/agree-d2.txt"
+bash "$GATE" --check "$AGREE_PR" worker 0 "$TMP/agree-wt" > "$TMP/agree-c2.txt" 2>&1
+diff -q "$TMP/agree-d2.txt" "$TMP/agree-c2.txt" >/dev/null; ck $? "(J16) …byte-identically to the cheap check at the SAME role/round/repo"
+# ── NON-VACUITY. Each new assertion is MUTATED below, and each mutation is proven to (a) really change
+# the program and (b) make its own arm FAIL. A shared helper (`agree_tokens`) is used for the mutant, so
+# the mutant is graded by exactly the code (J6) is graded by.
+MUT_ONEPASS="$TMP/mutant-onepass.sh"
+sed 's|^  if (!pwsec) print "PREVIOUS-WORK-WIP"$|  # MUTANT: one pass removed|' "$GATE" > "$MUT_ONEPASS"
+diff -q "$GATE" "$MUT_ONEPASS" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J17) the ONE-PASS mutation really changed the file (its anchor still matches)"
+grep -qx '  if (!pwsec) print "PREVIOUS-WORK-SECTION"' "$MUT_ONEPASS"; ck $? "(J18) …and it removed the WIP token ONLY — the block token is still there, so (J2) is about the second requirement and not about the refusal"
+bash -n "$MUT_ONEPASS"; ck $? "(J19) …and the mutant still parses"
+bash "$MUT_ONEPASS" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J20) MUTATION: (J2) now FAILS — with the one-pass line gone the key shape is SILENT again, which is exactly the second refusal #4152 measured"
+bash "$MUT_ONEPASS" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(J21) …while the BLOCK token survives that mutant, so (J1) was not green because of the same line"
+bash "$MUT_ONEPASS" --check "$TMP/no-pw.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J22) …and the brief is still REFUSED, so the arm removed a REPORTED requirement and not the refusal itself (rc=$rc)"
+# ⛔ THE ROLE-DIVERGENCE MUTANT IS A WRAPPER, AND THE SHAPE IS THE HONEST ONE. The agreement is enforced
+# by FOLDING the two names, so reverting that fold alone changes nothing TODAY — no rule in the file
+# branches on `worker`, and that unreachability is the property under test. What must be shown is that
+# (J6) can FAIL if the two names ever became two contracts; so the mutant IS two contracts: the real
+# gate, plus a `worker`-only requirement bolted in front of it.
+MUT_ROLE="$TMP/mutant-worker-role.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# MUTANT: worker is NOT an alias of lane — it carries a contract of its own.\n'
+  printf 'if [ "${1:-}" = "--missing" ] && [ "${3:-}" = "worker" ]; then\n'
+  printf '  bash %q --missing "${2:--}" lane "${4:-0}" "${5:-}"; printf "WORKER-ONLY\\n"; exit 0\n' "$GATE"
+  printf 'fi\n'
+  printf 'exec bash %q "$@"\n' "$GATE"
+} > "$MUT_ROLE"
+diff -q "$GATE" "$MUT_ROLE" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J23) the ROLE-DIVERGENCE mutant is a different program from the gate"
+grep -q 'WORKER-ONLY' "$MUT_ROLE"; ck $? "(J24) …and it really adds a worker-only requirement (an inert wrapper would prove nothing)"
+mut_lane="$(agree_tokens "$MUT_ROLE" "$TMP/no-pw.txt" lane)"
+mut_worker="$(agree_tokens "$MUT_ROLE" "$TMP/no-pw.txt" worker)"
+[ "$mut_lane" != "$mut_worker" ]; ck $? "(J25) MUTATION: (J6) now FAILS — with two contracts for one role the author's check and the dispatcher's check disagree again: lane=[${mut_lane}] worker=[${mut_worker}]"
+[ "$mut_lane" = "$agree_lane" ]; ck $? "(J26) …and the mutation touched ONLY the worker side (the lane verdict is unchanged), so (J6) was not green because a rule had been deleted"
+# ⛔ AND THE DISPATCHER'S OWN ROLE IS MUTATED, because "the same message" is a claim about THIS CALLER and
+# not about the gate. The mutant is the SHIPPED dispatcher with one word changed; it gets its own `$O`
+# (that resolver takes `$O/spawn-gate.sh` first) with a copy of the validator beside it. The substitute
+# role is `reviewer`, NOT `fixer`: a fixer would ADMIT the role-sensitive brief and fall through to a
+# real spawn, and this arm is about the refusal text, not about launching an agent.
+MUT_NB_DIR="$TMP/agree-mut-nb"; mkdir -p "$MUT_NB_DIR"
+cp "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$MUT_NB_DIR/"
+sed 's|--check "$PROMPT" worker 0 "$WT"|--check "$PROMPT" reviewer 0 "$WT"|' "$NB" > "$MUT_NB_DIR/nonblocking-dispatch.sh"
+grep -q -- '--check "$PROMPT" reviewer 0 "$WT"' "$MUT_NB_DIR/nonblocking-dispatch.sh"; ck $? "(J27) the DISPATCHER mutation really changed the role it grades with"
+bash -n "$MUT_NB_DIR/nonblocking-dispatch.sh"; ck $? "(J28) …and it still parses"
+J_OUT4="$( env -u O_WORK O="$MUT_NB_DIR" bash "$MUT_NB_DIR/nonblocking-dispatch.sh" agreemut "$TMP/agree-wt" "$AGREE_PR" 5 2>&1 )"; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(J29) …and it still refuses that brief (rc=$rc), so the arm below compares two REFUSALS and not a refusal with an admission"
+printf '%s\n' "$J_OUT4" | agree_body > "$TMP/agree-d3.txt"
+diff -q "$TMP/agree-d3.txt" "$TMP/agree-c2.txt" >/dev/null; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(J30) MUTATION: (J16) now FAILS — a dispatcher grading a different role no longer produces the cheap check's message, which is the whole claim of (J10)/(J16)"
+
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
