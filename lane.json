@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1795155604,
+  "host": "cmux",
+  "issue": 78,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-78-1795155604-p246902-38e9f4f6",
+  "lease_until": 1795156209,
+  "pid": 246902,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795155604,
+  "state": "RUNNING",
+  "tag": "78",
+  "worktree": "/tmp/tmp.CYQ2Ck2nPZ/lbwt2"
+}
