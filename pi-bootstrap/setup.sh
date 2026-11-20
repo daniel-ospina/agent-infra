@@ -775,9 +775,15 @@ fi
 # by `merge-one.sh` via `record-review.sh --check-carry`. So this entry is the half of #4176's first
 # bullet that is true and safe to land: it costs nothing, it makes the instrument resolvable from a
 # deployed tree the day a caller exists, and it does not pretend to a wiring that does not exist.
-# ⛔ NOT A LONE FARMED FILE: every dependency it resolves beside itself is ALREADY farmed
-# (admin-merge.sh, record-review.sh, registry-sync.sh, lib/diff-normalize.py, lib/bounded.sh), which is
-# why one entry completes the unit rather than shipping a rail that would fail at its own step [4/4].
+# ⛔ NOT A LONE FARMED FILE, AND THE LIST IS THE FOUR FILES THE RAIL ACTUALLY TOUCHES — it carries no
+# `source`/`.` at all (fresh-context review, P2: an earlier version of this comment also listed
+# `lib/bounded.sh`, which nothing in this rail reads — `bounded.sh`'s consumers are lib/box.sh and the
+# disk-reaper/conflict-rebase family). The closure is `admin-merge.sh` ($SELF_DIR), `record-review.sh`
+# ($SELF_DIR), `registry-sync.sh` ($SELF_DIR) and `lib/diff-normalize.py` (resolved as
+# `$(dirname "$RECORD_SH")/lib/diff-normalize.py`); all four are ALREADY farmed, which is why ONE entry
+# completes the unit. ⛔ AND A MISSING SIBLING DOES NOT ALL FAIL AT ONE STEP: `admin-merge.sh` and
+# `record-review.sh` are refused at STARTUP, before step [1/4] (`atomic-land.sh:356-357`), while an
+# absent `registry-sync.sh` only WARNS and returns 0 (the registry union degrades to local-only, #2374).
 # `scripts/landing/` (bulk.py, landability.py, rail-bg.sh) is deliberately NOT farmed: nothing in the
 # controller calls them, they are operator/beat tools that run from a checkout.
 fleet_srcs=(atomic-land.sh fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh disk-reaper-deployed-check.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py lane-route.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
