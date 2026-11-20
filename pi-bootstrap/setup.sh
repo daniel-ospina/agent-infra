@@ -775,13 +775,12 @@ fi
 # by `merge-one.sh` via `record-review.sh --check-carry`. So this entry is the half of #4176's first
 # bullet that is true and safe to land: it costs nothing, it makes the instrument resolvable from a
 # deployed tree the day a caller exists, and it does not pretend to a wiring that does not exist.
-# ⛔ NOT A LONE FARMED FILE, AND THE LIST IS THE FOUR FILES THE RAIL ACTUALLY TOUCHES — it carries no
-# `source`/`.` at all (fresh-context review, P2: an earlier version of this comment also listed
-# `lib/bounded.sh`, which nothing in this rail reads — `bounded.sh`'s consumers are lib/box.sh and the
-# disk-reaper/conflict-rebase family). The closure is `admin-merge.sh` ($SELF_DIR), `record-review.sh`
-# ($SELF_DIR), `registry-sync.sh` ($SELF_DIR) and `lib/diff-normalize.py` (resolved as
-# `$(dirname "$RECORD_SH")/lib/diff-normalize.py`); all four are ALREADY farmed, which is why ONE entry
-# completes the unit. ⛔ AND A MISSING SIBLING DOES NOT ALL FAIL AT ONE STEP: `admin-merge.sh` and
+# ⛔ NOT A LONE FARMED FILE. `atomic-land.sh` carries no `source`/`.` at all, so its closure is EXACTLY
+# the four files it touches — `admin-merge.sh` ($SELF_DIR), `record-review.sh` ($SELF_DIR),
+# `registry-sync.sh` ($SELF_DIR) and `lib/diff-normalize.py` (resolved as
+# `$(dirname "$RECORD_SH")/lib/diff-normalize.py`) — and all four are ALREADY farmed, which is why ONE
+# entry completes the unit. ⛔ NO `bounded.sh` ENUMERATION HERE, deliberately: two review rounds showed
+# the list keeps being wrong in both directions, and the load-bearing fact does not need it. ⛔ AND A MISSING SIBLING DOES NOT ALL FAIL AT ONE STEP: `admin-merge.sh` and
 # `record-review.sh` are refused at STARTUP, before step [1/4] (`atomic-land.sh:356-357`), while an
 # absent `registry-sync.sh` only WARNS and returns 0 (the registry union degrades to local-only, #2374).
 # `scripts/landing/` (bulk.py, landability.py, rail-bg.sh) is deliberately NOT farmed: nothing in the
