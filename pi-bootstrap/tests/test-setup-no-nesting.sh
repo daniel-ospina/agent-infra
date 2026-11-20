@@ -470,7 +470,7 @@ LANE_PRODUCERS_STATE_RESIDUAL="lane-confirm.py:#1797 lane-triage.py:#1553 lane-v
 # has, because this repo does not contain the file and no array can carry it). A missing producer is now
 # REFUSED with the full list of paths tried, in place of running an interpreter against a literal that
 # only one box happened to have.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="orch-loop.sh:#2413"
+LANE_PRODUCERS_FOREIGN_RESIDUAL="nonblocking-dispatch.sh:#4067 orch-loop.sh:#2413"
 # `orch-loop.sh` joined this class on 2026-11-06 with agent-infra#2413 (PR #3413). It is NOT a delivered
 # producer and NOT a farm gap this PR can close: the entry comes from `watchdog-loop.sh`'s own MEASURED
 # example of where the controller lives on a Mac — `bash /home/cmux/harness/<sha>/scripts/
@@ -490,6 +490,21 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="orch-loop.sh:#2413"
 # outside the scanned population.
 # DISCLOSED with an owner, which the gate's own remedy names, instead of left as an undelivered
 # producer that only shows up on a fresh box.
+# `nonblocking-dispatch.sh` joined on 2026-11-20 with agent-infra#4067 — the SAME class as `orch-loop.sh`,
+# and it entered for the same reason: the one site the derivation sees is a MEASURED example, not a farmed
+# path. `scripts/pr-doctor.py:2520` quotes a real verdict line (`VERDICT=UNDELIVERED next=repair-chain
+# chain=/home/cmux/orchestrator/nonblocking-dispatch.sh`), and that absolute path is the DISPATCHER'S
+# DEPLOYED location — rendered by the harness deploy (`scripts/orchestrator-harness/install.sh:1725`
+# installs `nonblocking-dispatch.sh` into the pin dir, and `scripts/deploy-crossbox.sh:42-43` pushes the
+# clone plus `$H` to `$O` on the target box). NO farm array in `pi-bootstrap/setup.sh` delivers it (measured
+# 2026-11-20: `rg -n 'nonblocking-dispatch' pi-bootstrap/setup.sh` → no entry), so this farm can never carry
+# it and a farm registration would duplicate the delivery the clone already makes — the hazard
+# `setup.sh:398` names for `graph_srcs`. ⛔ THE RESIDUE HAZARD: this entry records a FACT, it does not fix
+# the DIVERGENCE that #4067 is titled for (each cell runs whatever its own checkout carries, which is how
+# pi-cell-3 held a `T="${4:-3000}"` literal). If a farm array ever delivers the file, or the `pr-doctor.py`
+# site moves out of the clone, the stale-disclosure check below FAILS on this entry — delete it in THAT
+# change, and delete it in the same change that lands a delivery mechanism, so the record cannot outlive
+# its reason (#1899).
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
@@ -680,7 +695,7 @@ script:watch-truncation.sh script:wip-sweep.sh
 lib:beat-pair.sh lib:bounded.sh lib:cell-home.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py
 lib:diff-normalize.py lib:live-paths.sh lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-foreign:orch-loop.sh
+foreign:nonblocking-dispatch.sh foreign:orch-loop.sh
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh other:orchestrator-harness/repo-slug.sh
 "
@@ -1009,11 +1024,17 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
   # `scripts/safe-send.sh:146`, which ran `…/tortoise/tools/cmux_dispatch.py` — a producer in a DIFFERENT
   # checkout, in no farm array, undisclosed, while the gate printed `DECLARED-FOREIGN: … 1` as if that were the
   # whole class (#1957). A cross-checkout `tools/`, `bin/` or `lib/` is the same failure as `scripts/`.
-  # ⛔ NO LIVE SITE USES THIS FORM TODAY (#1957 removed the last one — safe-send.sh now resolves the
-  # producer from a candidate list, so the entry it contributes is `script:cmux_dispatch.py` at the FARM
-  # DESTINATION). It is KEPT for the same reason F8 is: the class can reappear in any farmed consumer, and
-  # a scanner that had to be re-widened to see it would report `0 undelivered-and-undisclosed` meanwhile —
-  # #1899's own failure shape. Its probe below (`foreign:orch-loop.sh`) keeps it non-inert.
+  # ⛔ TWO LIVE SITES USE THIS FORM (corrected 2026-11-20 — the sentence that stood here said there were
+  # NONE, and it had already been false for two weeks): `scripts/pr-doctor.py:2520` documents the
+  # dispatcher's DEPLOYED path (`chain=/home/cmux/orchestrator/nonblocking-dispatch.sh`, which is how
+  # `foreign:nonblocking-dispatch.sh` entered the population, #4067) and `orchestrator-harness/
+  # watchdog-loop.sh`'s MEASURED harness-pin example is `foreign:orch-loop.sh` (#2413). #1957 really did
+  # remove the LAST FARMABLE-DESTINATION site — `safe-send.sh` now resolves the producer from a candidate
+  # list, so its entry is `script:cmux_dispatch.py` at the FARM DESTINATION — and that is what the earlier
+  # sentence was written about; it was never true of this form as a whole. The form is KEPT for the same
+  # reason F8 is: the class can reappear in any farmed consumer, and a scanner that had to be re-widened to
+  # see it would report `0 undelivered-and-undisclosed` meanwhile — #1899's own failure shape. The probe
+  # below (`foreign:orch-loop.sh`) keeps it non-inert.
   # BOTH agent dirs are excluded — F3 owns `agent/scripts/<n>` and `agent/state/<p>`, so the state producer
   # (`lane-confirm.py`, orchestrator-heartbeat.sh:336) does not also surface here as a duplicate `foreign:`.
   { grep -ohE '/(Users|home)/[A-Za-z0-9_./-]+/[A-Za-z0-9_-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
