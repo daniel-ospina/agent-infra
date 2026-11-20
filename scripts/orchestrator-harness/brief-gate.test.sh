@@ -1512,14 +1512,14 @@ agree_mutant() { # agree_mutant <cwd> <name> — drive the SHIPPED dispatcher mi
 mkdir -p "$TMP/agree-mut-o" "$TMP/agree-mut-home"; : > "$TMP/agree-pi.log"
 AGREE_M_OUT="$(agree_mutant "$TMP/agree-keyed-cwd" agreemutcwd)"; rc=$?
 [ "$rc" -ne 80 ]; ck $? "(J39) MUTATION: (J34) now FAILS — with the fourth positional gone the dispatcher admits the brief (rc=$rc, not 80) and no longer names the CONTRADICTION, because it measured the CALLER's tree instead of the worktree"
-printf '%s\n' "$AGREE_M_OUT" | grep -q 'CONTRADICTS `refs/wip/\*`'; rc=$?
+grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_M_OUT"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(J40) …and the mutant's output does NOT name the rescued ref, so (J35) was carrying this arm alone"
 # ⛔ AND THE SAME MUTANT REFUSES WHEN ITS CWD *IS* THE WORKTREE — the second half of the proof. It shows
 # the mutant still MEASURES a repository and that the redden above is the AXIS moving, not a gate that
 # stopped working (which would make (J39) green for the wrong reason and prove nothing about `$WT`).
 AGREE_M2_OUT="$(agree_mutant "$TMP/agree-keyed-wt" agreemutwt)"; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(J41) …while the SAME mutant, run with its cwd at the worktree that HOLDS the ref, still refuses (rc=$rc) — so (J39)'s red is the repository AXIS, and the gate itself is intact"
-printf '%s\n' "$AGREE_M2_OUT" | grep -q 'CONTRADICTS `refs/wip/\*`'; ck $? "(J42) …naming the same rescued ref, which is the fact the mutant lost when it stopped receiving the worktree"
+grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_M2_OUT"; ck $? "(J42) …naming the same rescued ref, which is the fact the mutant lost when it stopped receiving the worktree"
 
 
 echo
