@@ -318,3 +318,49 @@ R13 a pin overrides the derived disk ceiling but never the in-loop hard guard (b
 R14 module miss / empty output FAILS the tick by name; `need=0` is a branch before the division and is
     distinguishable in the log from a miss
 R15 the four stale artifacts of D17 are updated in this change
+
+---
+
+## BUILD–PROVE round: THE SUITE FALSIFIED D5/D10, AND IT WAS RIGHT
+
+`ai-drainer.test.sh` → **239 passed, 5 failed** on the first build. One failure was my arm's
+assertion (below); the other FOUR were the design, and they were the most valuable output of the
+turn.
+
+### What failed, and why it was not a test artifact
+
+Four **non-vacuity** arms (holder-gate ×2, held-windows, lock) went red with
+`dispatched=0`, `tree survived`, `rc=1`. They run a MUTANT COPY of the drainer out of `$ROOT`.
+`SELF_DIR` for that copy is `$ROOT`, so the module lookup (`$O/spawn-gate.sh`, then
+`<script dir>/spawn-gate.sh`) finds nothing — and D10's fail-closed probe then ended the tick with
+exit 1 BEFORE settle and before any dispatch. Those arms were proving nothing because they never
+reached the code they test.
+
+⛔ **THE FIELD SHAPE IS THE SAME.** Any box whose runtime dir was seeded without `spawn-gate.sh` — or
+any copy run from elsewhere — would have become a drainer that dispatches **nothing**, for ever,
+quietly but for a log line. That is the **inert-unit class (#3194)**, and it is a WORSE outcome than
+the disk term being absent: the whole cell loses its capacity instead of one bound degrading.
+
+### D19 — the polarity is SPLIT, and this supersedes D10/R14 (as written, not as intended)
+
+| shape | answer | why |
+|---|---|---|
+| the predicate is **unavailable** (module absent / stale / died while sourced) | **DEGRADE**: a named `NOTE:`, `disk=off (...)` on the line, and the tick plans from cores+memory — the pre-#2159 behaviour | a NEW bound must not be able to take a box to **zero** because a file is missing. The improvement is absent, not contradicted; the NOTE names the remedy (`SPAWN_GATE_MOD`). Same precedent as `fleet_line`'s `why=capacity.sh-unreachable` |
+| the predicate **answered with a non-number** (a `df`/seam value that is not whole MB) | **FAIL closed, by name** | that is a FAULT in a resource this tick is about to spend, not an absent improvement — the same posture as the memory and swap probes (D5's original argument, now correctly scoped) |
+
+Both are asserted, in opposite directions: (k4) `DISK_FREE_MB=unreadable` **must** end the tick;
+(k4b) an unavailable module **must not** (it must still dispatch, and say why).
+
+### The other failure, and it was MY arm
+
+(k0) asserted `pool=<n>MB@75%/512MB disk=` — contiguous. It is not: the disk fields go at the END of
+the line, so on a NON-pinned tick there is `) alive=0 … dispatcher=… ` in between. The arm's real
+intent (a folded `mem_pool`) is asserted precisely by requiring the closing paren right after the
+pool figures: `pool=[0-9]+MB@75%/512MB[)]`. Corrected.
+
+### Also corrected: a message that named the wrong cause
+
+(k4) showed `_disk_why` blaming a STALE `spawn-gate.sh` when the module had never been consulted at
+all (both values were seams). The reason is now derived: `and both values were stated as seams, so
+the probe was not consulted`. A diagnosis that sends an operator to re-farm a healthy file is the
+same defect as a gate that refuses without stating what it measured.
