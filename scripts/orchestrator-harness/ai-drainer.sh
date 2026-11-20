@@ -373,17 +373,25 @@ case "$MAX_MEM_PRESSURE_LEVEL" in
   *) log_line "WARN: MAX_MEM_PRESSURE_LEVEL='${MAX_MEM_PRESSURE_LEVEL}' is not a threshold this arm can refuse at (2 = warning, 3, 4 = critical; 1 = normal would refuse EVERY box) — using 2. To stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; MAX_MEM_PRESSURE_LEVEL=2 ;;
 esac
 MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
-# ⛔ THE SAME BOUNDS AND THE SAME WIDTH RULE AS `spawn-gate.sh`, AND BOTH ARE TESTED ON THE RAW
+# ⛔ THE SAME BOUNDS AND THE SAME WIDTH AND ZERO-SHAPE RULES AS `spawn-gate.sh`, ALL TESTED ON THE RAW
 # STRING. This number is now a DIVISOR (see `_capacity_target`): a `DISK_MIN_FREE_MB=0` would let the
 # last available megabyte be planned into a lane, and a value beyond the clamp is a typo that must not
 # widen a floor. ⛔ WIDTH BEFORE `10#`, MEASURED (review round 2): `$((10#18446744073909551616))`
 # WRAPS to `200000000`, which passes every bound below — so a range check applied AFTER the conversion
 # cannot see the wrap, and the tick would run with a 200,000,000 MB floor (`disk=0`, inert) while the
 # only line it prints is a SKIP that reads like a full volume. `spawn-gate.sh:203` tests the raw
-# string (`is_limit`, <= 9 digits) and so does this.
+# string (`is_limit`, <= 9 digits) and so does this. ⛔ AND `is_num` REJECTS LEADING ZEROS (round 3): a
+# hand-copied rule that accepted `007` as 7 MB would diverge from the gate's 500 MB, so the `0[0-9]*`
+# arm below refuses the same shape — parity here has to include every shape, not just the width.
 case "$DISK_MIN_FREE_MB" in
-  '') log_line "WARN: DISK_MIN_FREE_MB is empty — using 500"; DISK_MIN_FREE_MB=500 ;;
-  *[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
+  ''|*[!0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is not a whole number — using 500"; DISK_MIN_FREE_MB=500 ;;
+  # ⛔ LEADING ZEROS ARE REFUSED BECAUSE `spawn-gate.sh` REFUSES THEM (round 3, MEASURED). Its `is_num`
+  # rejects every `0*` shape, so `DISK_MIN_FREE_MB=007` is **500** MB to the gate that will refuse the
+  # lane. Accepting it as 7 MB here would make the PLANNER and the REFUSER disagree about the floor on
+  # the same volume — the "second answer to 'is this volume full'" this file exists to avoid (#3395),
+  # and it plans lanes the gate then refuses at rc 77. `0[0-9]*` is `is_num`'s `0*` minus the bare `0`,
+  # which the `>= 1` bound below already sends to 500 on both sides.
+  0[0-9]*) log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' has a leading zero — spawn-gate.sh's is_num refuses that shape and resolves 500, so this does too — using 500"; DISK_MIN_FREE_MB=500 ;;
   *)
     if [ "${#DISK_MIN_FREE_MB}" -gt 9 ]; then
       log_line "WARN: DISK_MIN_FREE_MB='${DISK_MIN_FREE_MB}' is ${#DISK_MIN_FREE_MB} digits; the cap is 9, the same one spawn-gate.sh's is_limit applies (<=999999999 MB, ~976 TB) — using 500"
@@ -765,7 +773,7 @@ _disk_seam_check() { # <name> <value>; returns 1 when the seam is not stated at 
     ''|*[!0-9]*) log_line "FAIL: ${1}='${v}' is not a whole number of MB — a STATED seam that cannot be read is a fault in the reading, not an absent predicate, so the disk ceiling is not evaluated and nothing was dispatched"; exit 1 ;;
   esac
   if [ "${#v}" -gt 9 ]; then
-    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9 for parity with spawn-gate.sh's is_limit (<=999999999 MB, ~976 TB). ⛔ THE CAP IS NOT A WRAP DETECTOR — 19 or more digits is what wraps bash's 2^63 integer range; the cap is deliberately tighter so a stated value is a magnitude this bound is defined for. Raise it only with a stated reason."
+    log_line "FAIL: ${1}='${v}' is ${#v} digits; this seam is capped at 9, the same width limit spawn-gate.sh's is_limit applies (<=999999999 MB, ~976 TB). ⛔ THE CAP IS NOT A WRAP TEST, AND THE WRAP IS NOT A DIGIT COUNT: bash's integers end at 2^63 = 9223372036854775808, which is itself 19 digits — so a 19-digit value BELOW it does not wrap, while a 20-digit one always does. The cap is deliberately tighter than the wrap point so that a stated value is a magnitude this bound is defined for; raise it only with a stated reason."
     exit 1
   fi
   return 0
@@ -2056,8 +2064,6 @@ read -r target cpu_ceil mem_ceil mem_pool disk_ceil disk_free_read disk_need_rea
 # globals, so the line a reader audits is provably the pair the target was computed from.
 if [ -n "$_disk_off" ]; then
   disk_term="disk=off (${_disk_off})"
-elif [ "$disk_need_read" -le 0 ]; then
-  disk_term="disk=off (DISK_LANE_NEED_MB=0 — an explicit per-lane requirement of 0 MB)"
 else
   disk_term="disk=${disk_ceil} free=${disk_free_read}MB need=${disk_need_read}MB $disk_floor_note"
 fi
