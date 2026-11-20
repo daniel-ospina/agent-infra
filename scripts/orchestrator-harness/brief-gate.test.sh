@@ -1348,6 +1348,11 @@ bash "$GATE" --check "$TMP/no-pw.txt" worker >/dev/null 2>&1; rc=$?
 # ── THE AGREEMENT, axis 2: THE DISPATCH PATH ITSELF, driven. The acceptance criterion is "the same
 # message and the same list", so the two callers' output is compared BY BYTES.
 mkdir -p "$TMP/agree-o" "$TMP/agree-wt"
+# ⛔ THE WORKTREE IS A REAL GIT REPO WITH AN ORIGIN, even though NEITHER fixture below carries a KEYED
+# `issue-<N>` claim for the cross-check to look up (so no `ls-remote` is reached and the arms cost no
+# network). It is faithful to what the dispatcher requires of `$WT` — `run_agent`'s LAND-BACKLOG gate
+# derives the slug from `$WT`'s origin and refuses a bare `mkdir` — so if the refusal ever moved later
+# in the file, this arm would still be measuring the BRIEF and not a missing remote.
 git -C "$TMP/agree-wt" init -q 2>/dev/null || true
 git -C "$TMP/agree-wt" remote add origin https://github.com/owner/repo.git 2>/dev/null || true
 # ⛔ THE GATE'S BODY, NOT THE WHOLE STDERR: the dispatcher prints one naming line of its OWN before the
