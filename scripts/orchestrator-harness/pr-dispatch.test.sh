@@ -458,6 +458,13 @@ clear_records() { # remove both shapes for the drive's PR — a case must never 
 # graded the cap arm while reporting on the rail arm). `rail-tried-<PR>` is reset with it: both are the
 # once-per-PR markers of the same router.
 reset_conflict_fixture() { rm -f "$TMP/O/state/conflictcount-4242" "$TMP/O/state/rail-tried-4242"; }
+# ── the rail's LOCATION is part of what #4176 buys, so the fixture can put it in each layout ────────
+# `rail_land_path` resolves four trees because `deploy-harness.sh` seeds `$O` FLAT (workers only) while
+# `atomic-land.sh` sits one level ABOVE the harness scripts in a checkout and in `~/.pi/agent/scripts/`
+# on a farmed box. The one that matters for #4176 is the FARM: it is what a deployed box actually has.
+seed_rail_checkout() { : > "$TMP/atomic-land.sh"; }                      # candidate 2 (one level above O)
+seed_rail_farm()     { mkdir -p "$TMP/home/.pi/agent/scripts"; : > "$TMP/home/.pi/agent/scripts/atomic-land.sh"; }
+clear_rails()        { rm -f "$TMP/atomic-land.sh" "$TMP/O/atomic-land.sh" "$TMP/home/.pi/agent/scripts/atomic-land.sh"; }
 # drive_conflict <lanes-in-use:0> [<spawn-ok:1>] — the CONFLICTING arm runs inside a one-iteration
 # `for`, because the shipped block ends in `continue` (which is a syntax error at file scope, and a
 # `break` after it makes "took the conflict path" vs "fell through" observable: the fall-through
@@ -480,6 +487,11 @@ drive_conflict() {
     # depends on the box. `$TMP/home` is the suite's fixture HOME; a case that wants a record seeds it
     # there (`seed_record`) and clears it afterwards (`clear_records`).
     HOME="$TMP/home"; export HOME; mkdir -p "$HOME/.pi/agent/reviews"
+    # ⛔ AND A DETERMINISTIC `AGENT_INFRA_PATH` (#4176). `rail_land_path` has a candidate under
+    # `$AGENT_INFRA_PATH/scripts`, so on a box where that is exported the suite would find the REAL
+    # rail and every "no rail installed" case below would grade the wrong tree. Pointed at a path that
+    # does not exist, the only candidates are the fixture's.
+    AGENT_INFRA_PATH="$TMP/noinfra"; export AGENT_INFRA_PATH
     # shellcheck disable=SC1090
     . "$HERE/worker-terminal.sh"
     cmux() {
@@ -578,6 +590,11 @@ drive_route() {
     SPAWN_OK="${5:-1}"; WT_DIR="$O/state"; WT_TABLE_TTL=0
     # ⛔ ISOLATED HOME — see the same lines in `drive_conflict` (agent-infra#4176).
     HOME="$TMP/home"; export HOME; mkdir -p "$HOME/.pi/agent/reviews"
+    # ⛔ AND A DETERMINISTIC `AGENT_INFRA_PATH` (#4176). `rail_land_path` has a candidate under
+    # `$AGENT_INFRA_PATH/scripts`, so on a box where that is exported the suite would find the REAL
+    # rail and every "no rail installed" case below would grade the wrong tree. Pointed at a path that
+    # does not exist, the only candidates are the fixture's.
+    AGENT_INFRA_PATH="$TMP/noinfra"; export AGENT_INFRA_PATH
     # The CONFLICT budget is `state/conflictcount-<PR>` (its OWN file — see the P2 note in the shipped
     # arm), seeded here so "N rounds already spent" is a fixture fact rather than something the drive
     # has to reach by spawning N times.
@@ -877,7 +894,7 @@ echo "=== T5c: a CONFLICTING PR carrying an ACCEPTED record goes to the RAIL fir
 # always had, and a rail attempt is spent ONCE per PR so a genuine content conflict still gets its fixer.
 # The rail is resolved as `$(dirname "$O_WORK")/atomic-land.sh`; with `O_WORK` unset in this rig that is
 # `$TMP/atomic-land.sh`, which is why the fixture creates (and removes) that file.
-: > "$TMP/atomic-land.sh"
+clear_rails; seed_rail_checkout
 reset_conflict_fixture; clear_records; seed_record clean
 drive_conflict 0
 grep -q 'atomic-land.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
@@ -920,8 +937,17 @@ drive_conflict 0
 grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
   && ok "…and after a failed rail spawn the NEXT cycle is the fixer, not another rail attempt" \
   || bad "…a failed rail spawn left the arm retrying the rail forever"
+# ⛔ THE FARM IS THE LAYOUT THIS ISSUE IS ABOUT (#4176): `deploy-harness.sh` seeds `$O` FLAT with the
+# workers only, so on a deployed box `atomic-land.sh` exists in `~/.pi/agent/scripts/` and NOWHERE else.
+# A resolver with a single candidate read that as "absent" — an arm that looks wired and never fires.
+clear_rails; seed_rail_farm
+reset_conflict_fixture; clear_records; seed_record clean
+drive_conflict 0
+grep -q 'atomic-land.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…the rail is found in the FARM when the deployed layout has it nowhere else (flat \$O)" \
+  || bad "…a farm-only rail was not found — the arm would be inert on every deployed box: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
 # …and a box with no rail installed is the pre-#4176 tree, exactly: the fixer, unchanged.
-rm -f "$TMP/atomic-land.sh"; reset_conflict_fixture; clear_records; seed_record clean
+clear_rails; reset_conflict_fixture; clear_records; seed_record clean
 drive_conflict 0
 grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
   && ok "…with NO rail installed the fixer is dispatched (a missing instrument is not a dead PR)" \

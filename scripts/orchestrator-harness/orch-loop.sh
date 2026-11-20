@@ -5501,6 +5501,22 @@ claim_selection_verdict() {
 # [railgate:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers; an UNSOURCED
 # gate is a silent `command not found` = 127 in every driven arm, which reads as "no record" and
 # would grade the fixer path as the RAIL path's equal — the false-GREEN direction)
+rail_land_path() { # -> the rail's path in whichever tree THIS box has it in, else rc 1 (absent)
+  # ⛔ FOUR LAYOUTS, ONE ANSWER, AND THE FARM IS THE ONE THAT MATTERS ON A DEPLOYED BOX (#4176).
+  # `deploy-harness.sh` copies `scripts/orchestrator-harness/.` into `$O` FLAT, so the deployed runtime
+  # has `$O/fix-one.sh` but NOT the rail — `atomic-land.sh` lives one level ABOVE the harness scripts in
+  # a checkout, and only in `~/.pi/agent/scripts/` on a box that farms it. A single candidate therefore
+  # read "absent" on exactly the boxes the issue is about, which would make this arm an inert enforcer:
+  # it would look wired and never fire. The resolution list mirrors how this file's own workers resolve
+  # their modules (`$O_WORK`, then $AGENT_INFRA_PATH, then the farm).
+  local _b
+  for _b in "${O_WORK:-$O}" "$(dirname "${O_WORK:-$O}")" "${AGENT_INFRA_PATH:-}/scripts" "$HOME/.pi/agent/scripts"; do
+    [ -n "$_b" ] || continue
+    [ -f "$_b/atomic-land.sh" ] && { printf '%s\n' "$_b/atomic-land.sh"; return 0; }
+  done
+  return 1
+}
+
 rail_record_accepted() { # <pr> -> 0 iff a record with an accepted verdict exists for THIS repo
   local _q _l _f=""
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -7514,8 +7530,8 @@ while true; do
             # resolution (and owes the fresh review that follows it). Bounding the rail here is what
             # keeps this from becoming a way to spin a doomed PR: one cheap attempt, then the
             # existing path, unchanged.
-            RAIL_LAND="$(dirname "${O_WORK:-$O}")/atomic-land.sh"
-            if [ ! -f "$O/state/rail-tried-$PR" ] && [ -f "$RAIL_LAND" ] && rail_record_accepted "$PR"; then
+            RAIL_LAND="$(rail_land_path || true)"
+            if [ ! -f "$O/state/rail-tried-$PR" ] && [ -n "$RAIL_LAND" ] && rail_record_accepted "$PR"; then
               : > "$O/state/rail-tried-$PR"
               # ⛔ THE WORKER NAME IS `fix-$PR`: it is the census name (wt_count fix-), the ownership
               # name `pr_owner_live`/`sess` already answer for, and the name whose terminal the
