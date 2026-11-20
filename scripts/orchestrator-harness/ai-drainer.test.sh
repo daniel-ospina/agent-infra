@@ -731,6 +731,29 @@ run_drainer_fg k4g
 check "(k4g) a module answering a non-number DEGRADES (rc 0, named NOTE, disk=off) — not a silent FAIL arm" \
   '[ "$LAST_RC" -eq 0 ] && grep -q "NOTE: the disk term is DISABLED" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk=off" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep -E 'NOTE: the disk term' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+# ⛔ AND IT MUST PROVE THE MODULE WAS *CONSULTED* (round 3). The three clauses above are satisfied
+# VERBATIM by a run in which NO module was found at all, so on their own they cannot tell "sourced and
+# answered abc" from "never looked for" — the exact defect round 2 raised against (k4e) and fixed
+# there. The probe's own reason is the distinguishing text, and it names the file.
+check "(k4g) …and it PROVES the stub was sourced (not merely absent) — the reason names the file and says it did not answer" \
+  'grep -qF "$ROOT/o-k4g/spawn-gate.sh is present and was sourced but did not answer the disk question" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'NOTE: the disk term' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (k4h) THE FLOOR AGREES WITH `spawn-gate.sh` ON THE ZERO SHAPE, NOT ONLY ON THE WIDTH ─────────
+# ⛔ MEASURED (review round 3): `spawn-gate.sh`'s `is_num` rejects every `0*` form, so the gate resolves
+# `DISK_MIN_FREE_MB=007` to **500 MB** — while the drainer's hand-copied rule accepted it as **7 MB**.
+# The planner would floor on 7 MB and plan lanes the gate then refuses at rc 77: two answers to "is this
+# volume full" for one volume, which is the class #3395 removed. Both halves are pinned below.
+RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_DISK_MIN_FREE_MB=007
+RUN_DISK_FREE_MB=4000 RUN_DISK_LANE_NEED_MB=1000
+run_drainer_fg k4h
+check "(k4h) a leading-zero floor resolves to 500 — the answer spawn-gate.sh gives, not 7" \
+  '[ "$LAST_RC" -eq 0 ] && grep -q "WARN: DISK_MIN_FREE_MB=.*has a leading zero" "$LAST_AI/logs/ai-drainer.log" && grep -q "disk_floor=500MB" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "disk_floor=7MB" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC $(grep -E 'WARN: DISK_MIN_FREE_MB' "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(k4h) …and the GATE's own is_num still rejects the 0* shape, so the parity this arm pins is real" \
+  'grep -qF "0) return 0 ;; 0*) return 1" "$HERE/spawn-gate.sh"' \
+  "$(grep -n 'is_num()' "$HERE/spawn-gate.sh")"
 
 reset_run
 # ── (k5) AN EXPLICIT `need = 0` DISABLES THE TERM, SAYS SO, AND DOES NOT CRASH ─────────────────
