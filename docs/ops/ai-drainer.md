@@ -45,9 +45,25 @@ nothing, and it exits 0):
 
 1. **the target is a measurement, not a number.** Per tick:
 
-       target = min( cpu_ceiling , mem_ceiling )
-       cpu_ceiling = MAX_LANES = floor(ncpu × 5/2)          ← the fleet's 2026-10-17 lane ruling
-       mem_ceiling = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+       target = min( cpu_ceiling , mem_ceiling , disk_ceiling )
+       cpu_ceiling  = MAX_LANES = floor(ncpu × 5/2)         ← the fleet's 2026-10-17 lane ruling
+       mem_ceiling  = floor( (MemAvailable − MIN_MEM_FREE_MB) × MEM_BUDGET_PCT/100 ÷ LANE_MEM_MB )
+       disk_ceiling = floor( (free_disk − DISK_MIN_FREE_MB) ÷ DISK_LANE_NEED_MB )
+
+   The **disk** term was missing until agent-infra#2159, and its absence is what a 100 %-full box
+   looked like from inside this tick: `START: target=22 … dispatching 7` computed from memory and cores
+   alone, then the spawn gate refused the first lane (`DISK-NOHEADROOM … free=1.7GB, need=2.0GB`) and
+   the unit went RED — for a box fact, against a target the box could never reach. The per-lane
+   requirement is not a new constant: it is `spawn-gate.sh`'s own `disk_lane_costs` /
+   `disk_lane_need` classified against `SEED_REPO`, so the number that plans a lane and the number that
+   refuses it are the SAME number (#3395's two-seams defect). It is repo-class dependent — 2,064 MB
+   for a harness seed, 8,144 MB for a python one — and the `START:` line always prints `need=`.
+   `DISK_MIN_FREE_MB` is that module's floor, not a second one. An explicit `DISK_LANE_NEED_MB=0`
+   disables the term and says so; a state directory with no usable module **fails closed by name**.
+   The disk is also re-asked immediately before **each** `git worktree add`, because the target is
+   computed once and the tick's own worktrees consume the free space it was planned from — a stop
+   there is logged as `STOP: disk floor …` and exits **0**, since a full volume is a fact about the
+   box, not a failed tick.
 
    `MIN_MEM_FREE_MB` (512) is the **same** floor the controller's own spawn gate uses, so the two
    cannot disagree; `MEM_BUDGET_PCT` (75) stops the target at the boundary instead of consuming the
@@ -75,7 +91,7 @@ nothing, and it exits 0):
      reopen. (Same root as agent-infra#2016, which corrected the identical reading in `orch-loop.sh`'s
      `[cap]` gate.)
 
-   An unreadable **load / memory / swap / Darwin-pressure** probe **fails closed** — a guard that
+   An unreadable **load / memory / swap / disk / Darwin-pressure** probe **fails closed** — a guard that
    could not be evaluated must not look like an idle box. A box whose platform cannot be identified is
    one of those cases: the two swap arms are different gates, so choosing one on a guess is refused by
    name (`DRAINER_OS` overrides `uname -s`; it is the suite's seam). The **cores**
