@@ -58,8 +58,11 @@ nothing, and it exits 0):
    `disk_lane_need` classified against `SEED_REPO`, so the number that plans a lane and the number that
    refuses it are the SAME number (#3395's two-seams defect). It is repo-class dependent — 2,064 MB
    for a harness seed, 8,144 MB for a python one — and the `START:` line always prints `need=`.
-   `DISK_MIN_FREE_MB` is that module's floor, not a second one. An explicit `DISK_LANE_NEED_MB=0`
-   disables the term and says so. ⛔ **TWO POLARITIES, AND THEY DIFFER ON PURPOSE** — a state
+   `DISK_MIN_FREE_MB` is that module's floor, not a second one, and it is resolved by the **same rules**:
+   whole MB, at most 9 digits (the `is_limit` width cap — ≤999,999,999 MB ≈ 976 TB), and **no leading
+   zero** (the module's `is_num` rejects every `0*` shape, so `007` is 500 MB to the gate; resolving it
+   as 7 MB here would floor the plan on a number the gate disagrees with). An explicit
+   `DISK_LANE_NEED_MB=0` disables the term and says so. ⛔ **TWO POLARITIES, AND THEY DIFFER ON PURPOSE** — a state
    directory with no usable module **DEGRADES**: one named `NOTE:`, `disk=off` on the line, and the
    tick plans from cores and memory, which is the pre-#2159 behaviour. It does **not** fail closed,
    because a new bound must not be able to take a box to ZERO because a file is missing (the
