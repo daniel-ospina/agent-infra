@@ -1486,11 +1486,19 @@ grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_D_OUT"; ck $? "(J35) …and its r
 # The mutant is the SHIPPED dispatcher with one argument removed, in a faithful sibling directory
 # (every `*.sh` and `lib/` symlinked, so `$SELF`-relative resolution — `gate-policy.sh`,
 # `reviewer-preflight.sh`, `lib/bounded.sh` — is the real one and the ONLY difference is the edit).
+# ⛔ THE `lib` SYMLINK SOURCE IS `$HERE/..`, NOT `$HERE`: `brief_gate_bounded` resolves
+# `$(dirname $BASH_SOURCE)/../lib/bounded.sh`, i.e. `scripts/lib/` — there is no
+# `scripts/orchestrator-harness/lib`. Symlinking `$HERE/lib` made a DANGLING link, so the bounding
+# layer fell through to `$AGENT_INFRA_PATH`/`$HOME`; on a lane box with `$AGENT_INFRA_PATH` exported
+# that accidentally resolved and the arms were green, and on CI (where it is unset) `--wip-refs`
+# returned 2 UNMEASURED, the mutant's gate ADMITTED, and (J41) went RED — measured, which is why the
+# fixture below now ASSERTS the bounding layer resolves instead of trusting a symlink to be one.
 AGREE_MUT_ROOT="$TMP/agree-mut-root"
 AGREE_MUT_DIR="$AGREE_MUT_ROOT/scripts/orchestrator-harness"
 mkdir -p "$AGREE_MUT_DIR"
 for _f in "$HERE"/*.sh; do ln -s "$_f" "$AGREE_MUT_DIR/$(basename "$_f")" 2>/dev/null; done
-[ -d "$HERE/lib" ] && ln -s "$HERE/lib" "$AGREE_MUT_ROOT/scripts/lib" 2>/dev/null
+[ -d "$HERE/../lib" ] && ln -s "$HERE/../lib" "$AGREE_MUT_ROOT/scripts/lib" 2>/dev/null
+[ -f "$AGREE_MUT_ROOT/scripts/lib/bounded.sh" ]; ck $? "§J fixture: the mutant's \`scripts/lib/bounded.sh\` RESOLVES — a dangling link here silently unbounds \`--wip-refs\` and makes (J41) red for the wrong reason"
 rm -f "$AGREE_MUT_DIR/nonblocking-dispatch.sh"
 sed 's|--check "$PROMPT" worker 0 "$WT"|--check "$PROMPT" worker|' "$NB" > "$AGREE_MUT_DIR/nonblocking-dispatch.sh"
 AGREE_MUT_NB="$AGREE_MUT_DIR/nonblocking-dispatch.sh"
@@ -1510,7 +1518,18 @@ agree_mutant() { # agree_mutant <cwd> <name> — drive the SHIPPED dispatcher mi
       NB_START_SETTLE=2 bash "$AGREE_MUT_NB" "$2" "$TMP/agree-keyed-wt" "$AGREE_KEYED" 5 2>&1 )
 }
 mkdir -p "$TMP/agree-mut-o" "$TMP/agree-mut-home"; : > "$TMP/agree-pi.log"
+# ⛔ AND WAIT FOR THE WORKER THE MUTANT LAUNCHED (bounded). An ADMITTED brief really spawns, so the
+# disowned worker is still alive when this suite moves on: it races the `trap … rm -rf "$TMP"` at EXIT
+# (measured — `rm: cannot remove '<tmp>': Directory not empty`), and worse, its terminal rescue path can
+# push a `refs/wip/*` ref into the fixture's own bare origin, which would make a LATER run of these
+# arms see a ref this run did not create. Waiting is the deterministic reading, not a sleep: the wait
+# ends the moment the worker publishes its exit status.
+agree_settle() { # agree_settle <name> — bounded wait for a mutant-launched worker's exit status
+  local i=0 d="$TMP/agree-mut-o/bg"
+  while [ "$i" -lt 20 ] && [ ! -f "$d/$1.rc" ]; do sleep 1; i=$((i+1)); done
+}
 AGREE_M_OUT="$(agree_mutant "$TMP/agree-keyed-cwd" agreemutcwd)"; rc=$?
+agree_settle agreemutcwd
 [ "$rc" -ne 80 ]; ck $? "(J39) MUTATION: (J34) now FAILS — with the fourth positional gone the dispatcher admits the brief (rc=$rc, not 80) and no longer names the CONTRADICTION, because it measured the CALLER's tree instead of the worktree"
 grep -q 'CONTRADICTS `refs/wip/\*`' <<<"$AGREE_M_OUT"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(J40) …and the mutant's output does NOT name the rescued ref, so (J35) was carrying this arm alone"
