@@ -233,6 +233,18 @@ sed -n '/^spend_clear() {/,/^}/p' "$ORCH" >> "$TMP/spend.sh"
   && ok "the spend record's producer and its clearer are extracted from the shipped loop" \
   || bad "the spend record (spend_book/spend_clear) could not be extracted — every booking in this suite is a silent 127"
 
+# ── extraction 1g: the RAIL GATE (`rail_record_accepted`, agent-infra#4176) ──────────────────────
+# ⛔ THE CONFLICT ARM NOW BRANCHES ON WHETHER AN ACCEPTED REVIEW RECORD EXISTS, and this suite drives
+# the arm in a subshell with no `-e` and its output discarded — so an UNSOURCED gate is a silent 127,
+# i.e. "no record", i.e. the FIXER path on every row. That is the false-GREEN direction again: the
+# rail arm would look absent-by-design and no row here could observe it firing at all. Extracted from
+# the shipped file (never re-invented) so the verdict set and the read-order under test are the ones
+# the controller runs, and sourced by BOTH drivers because both run the conflict block.
+sed -n '/# \[railgate:begin\]/,/# \[railgate:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/railgate.sh"
+[ -s "$TMP/railgate.sh" ] && grep -q '^rail_record_accepted() {' "$TMP/railgate.sh" \
+  && ok "the rail gate (rail_record_accepted) is extracted from the shipped loop" \
+  || bad "the rail gate could not be extracted — every CONFLICTING drive would read 'no record' and grade the fixer path"
+
 # ── extraction 1d: the PARKED guard (agent-infra#4120) ───────────────────────────────────────────
 # ⛔ A PARK IS A TERMINATOR THAT RUNS BEFORE EVERY ARM, so a conflicting head that inherits one is
 # unreachable no matter what the conflict router does — and the parks most often held on a conflicting
@@ -423,6 +435,29 @@ PY
 # and every numeric comparison below died on an "integer expression expected" that bash reports as a
 # FAILING test — a fixture bug that would have read as a code defect.
 spawns() { awk 'END{print NR+0}' "$TMP/spy" 2>/dev/null; }
+# ── the review-record fixture (#4176) ────────────────────────────────────────────────────────────────
+# `rail_record_accepted` decides the RAIL arm from `$HOME/.pi/agent/reviews`, so the CONFLICT drives
+# need a record they can write and take away. Both files the shipped reader can see are covered: the
+# repo-qualified name first (what `record-review.sh` writes today) and the legacy `<PR>.json`, whose own
+# `repo` field is what admits or rejects it. The verdict is the parameter because "accepted" is the
+# gate: `clean`/`clean-micro`/`clean-low` are ACCEPTED_VERDICTS, anything else (including `not-clean`)
+# must NOT route to the rail.
+seed_record() { # seed_record <verdict> [<pr>] → the repo-qualified record in the fixture HOME
+  local v="${1:-clean}" pr="${2:-4242}"
+  mkdir -p "$TMP/home/.pi/agent/reviews"
+  printf '{"pr":%s,"head_sha":"abc1234","diff_sha256":"deadbeef","verdict":"%s","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-20T00:00:00Z"}\n' \
+    "$pr" "$v" > "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-$pr.json"
+}
+clear_records() { # remove both shapes for the drive's PR — a case must never inherit another's record
+  rm -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-4242.json" \
+        "$TMP/home/.pi/agent/reviews/4242.json"
+}
+# ⛔ THE CONFLICT BUDGET IS PR-LIFETIME AND NOT CLEARED BETWEEN DRIVES (`state/conflictcount-<PR>`), so a
+# T5c case that is meant to REACH the spawn branch must reset it — three earlier cases spend it, and the
+# fourth then arrives AT CAP and parks before the arm is ever reached (measured: an earlier cut of T5c
+# graded the cap arm while reporting on the rail arm). `rail-tried-<PR>` is reset with it: both are the
+# once-per-PR markers of the same router.
+reset_conflict_fixture() { rm -f "$TMP/O/state/conflictcount-4242" "$TMP/O/state/rail-tried-4242"; }
 # drive_conflict <lanes-in-use:0> [<spawn-ok:1>] — the CONFLICTING arm runs inside a one-iteration
 # `for`, because the shipped block ends in `continue` (which is a syntax error at file scope, and a
 # `break` after it makes "took the conflict path" vs "fell through" observable: the fall-through
@@ -438,6 +473,13 @@ drive_conflict() {
     MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
     MSTAT=CONFLICTING; SPAWN_OK="${2:-1}"
     WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # ⛔ ISOLATED HOME, THE SAME ONE `drive()` USES (agent-infra#4176). The CONFLICT arm now asks
+    # `rail_record_accepted` whether a review record exists, and that reads $HOME/.pi/agent/reviews —
+    # so a drive inheriting the operator's real HOME would take the RAIL arm on a box whose PR 4242
+    # happened to carry a clean record, and the fixer path everywhere else. That is a grade that
+    # depends on the box. `$TMP/home` is the suite's fixture HOME; a case that wants a record seeds it
+    # there (`seed_record`) and clears it afterwards (`clear_records`).
+    HOME="$TMP/home"; export HOME; mkdir -p "$HOME/.pi/agent/reviews"
     # shellcheck disable=SC1090
     . "$HERE/worker-terminal.sh"
     cmux() {
@@ -488,6 +530,7 @@ PY
     . "$TMP/spawntok.sh"
     . "$TMP/isnum.sh"        # the blocks' `is_num "$NFC" || NFC=0` guards (see drive() for why)
     . "$TMP/spend.sh"        # the CONFLICT arm books its spend record at spawn — sourced (see extraction 1f)
+    . "$TMP/railgate.sh"     # …and its RAIL gate, which branches the same arm (see extraction 1g)
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     for _once in 1; do
@@ -533,6 +576,8 @@ drive_route() {
     V="$1"; MSTAT="${2:-}"; MERGE_AUTHORITY=rail; AUTHORITY_UNKNOWN=0
     MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
     SPAWN_OK="${5:-1}"; WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # ⛔ ISOLATED HOME — see the same lines in `drive_conflict` (agent-infra#4176).
+    HOME="$TMP/home"; export HOME; mkdir -p "$HOME/.pi/agent/reviews"
     # The CONFLICT budget is `state/conflictcount-<PR>` (its OWN file — see the P2 note in the shipped
     # arm), seeded here so "N rounds already spent" is a fixture fact rather than something the drive
     # has to reach by spawning N times.
@@ -579,6 +624,7 @@ PY
     . "$TMP/isnum.sh"
     . "$TMP/parkctrl.sh"        # the SHIPPED park: the bound is only a bound if the file lands
     . "$TMP/spend.sh"           # …and the CONFLICT arm's own booking (extraction 1f)
+    . "$TMP/railgate.sh"        # …and its RAIL gate, which the conflict router branches on (1g)
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     # ⛔ THE PARKED GUARD RUNS FIRST, EXACTLY AS IT DOES IN THE SWEEP (agent-infra#4120). With
@@ -818,6 +864,69 @@ drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
   && ok "CONFLICTING: a FAILED conflict-fixer spawn is a wait + a printed line (never a phantom act)" \
   || bad "CONFLICTING: a failed spawn recorded acts=$(acts) — the record claims work that did not happen"
+
+
+echo
+echo "=== T5c: a CONFLICTING PR carrying an ACCEPTED record goes to the RAIL first (#4176) ==="
+# ⛔ WHAT THIS GRADES. #4176's defect is not that the rail is broken — `atomic-land.sh` has carried a
+# record across a base move since #767. It is that NOTHING IN THE CONTROLLER CALLED IT, so a base-moved
+# CONFLICTING PR went to a fixer whose only ending is a raw `git push`: the head moves, nothing re-binds
+# the record, and the beat re-cuts the same PR forever (measured: 13 records, none matched).
+# So the arm must dispatch `atomic-land.sh` for EXACTLY the population the rail can land — a record with
+# an accepted verdict — and nothing else. A PR with no record, or a not-clean one, keeps the fixer it has
+# always had, and a rail attempt is spent ONCE per PR so a genuine content conflict still gets its fixer.
+# The rail is resolved as `$(dirname "$O_WORK")/atomic-land.sh`; with `O_WORK` unset in this rig that is
+# `$TMP/atomic-land.sh`, which is why the fixture creates (and removes) that file.
+: > "$TMP/atomic-land.sh"
+reset_conflict_fixture; clear_records; seed_record clean
+drive_conflict 0
+grep -q 'atomic-land.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "a CONFLICTING PR with a CLEAN record: the dispatch IS the rail (atomic-land carry-forward)" \
+  || bad "…the rail was never dispatched: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+[ "$(acts)" = "1" ] && ! grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…it is ONE act and does NOT also spawn the fixer (no double dispatch on one PR)" \
+  || bad "…the rail arm also spawned a fixer, or recorded acts=$(acts)"
+[ -f "$TMP/O/state/rail-tried-4242" ] \
+  && ok "…and the once-per-PR marker is written, so a later cycle cannot spend the rail twice" \
+  || bad "…the rail-tried marker was not written — every cycle would re-dispatch the rail"
+# ⛔ THE SECOND CYCLE IS THE CONTENT-CONFLICT CASE. The rail has refused (it cannot author a
+# resolution — `gh pr update-branch` fails on a real conflict), so the remaining budget is the fixer's:
+# that is the pre-#4176 path, unchanged, and it is what proves the rail arm is a PREFERENCE and not a
+# replacement.
+drive_conflict 0
+grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ! grep -q 'atomic-land.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…the SECOND attempt is the fixer: a genuine content conflict falls back to fix-one.sh" \
+  || bad "…the second attempt did not fall back to the fixer: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+# The other half of the gate: a record the rail would REFUSE is not a reason to hand it the PR.
+reset_conflict_fixture; clear_records; seed_record not-clean
+drive_conflict 0
+grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…a NOT-CLEAN record does not route to the rail (fix-one.sh, exactly as before)" \
+  || bad "…a not-clean record was handed to the rail: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+reset_conflict_fixture; clear_records
+drive_conflict 0
+grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…and NO record leaves the fixer path untouched (the rail is never guessed at)" \
+  || bad "…a record-less PR went to the rail: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+# A FAILED rail spawn is NOT an act — nothing is running, and saying otherwise would be the phantom-act
+# class the fixer arm above already refuses.
+reset_conflict_fixture; clear_records; seed_record clean
+drive_conflict 0 0
+[ "$(acts)" = "0" ] && grep -qi 'rail spawn FAILED' "$TMP/d.log" \
+  && ok "…a FAILED rail spawn is a wait + a printed line (never a phantom act)" \
+  || bad "…a failed rail spawn recorded acts=$(acts) — the record claims work that did not happen"
+drive_conflict 0
+grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…and after a failed rail spawn the NEXT cycle is the fixer, not another rail attempt" \
+  || bad "…a failed rail spawn left the arm retrying the rail forever"
+# …and a box with no rail installed is the pre-#4176 tree, exactly: the fixer, unchanged.
+rm -f "$TMP/atomic-land.sh"; reset_conflict_fixture; clear_records; seed_record clean
+drive_conflict 0
+grep -q 'fix-one.sh' "$TMP/O/state/run-fix-4242.sh" 2>/dev/null \
+  && ok "…with NO rail installed the fixer is dispatched (a missing instrument is not a dead PR)" \
+  || bad "…a missing rail changed the dispatch: $(head -c 200 "$TMP/O/state/run-fix-4242.sh" 2>/dev/null | tr '\n' ';')"
+reset_conflict_fixture; clear_records
 drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
