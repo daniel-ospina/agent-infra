@@ -17,6 +17,14 @@
 # frequent pass cannot itself become the load problem; it reports `capped=1 remaining=<n>` and the next
 # tick continues where it stopped.
 #
+# ⛔ THE SAME NUMBER IS THE CLASS'S OWN PRESSURE GATE, ON BOTH ARMS. `disk-reaper.sh` forwards it as
+# `REAP_RC_INSTALL_TRIGGER_FREE_MB` and `REAP_RC_SHARED_TRIGGER_FREE_MB`, so a per-install `.cache` and
+# the shared per-box root are each reaped only when the filesystem HOLDING them is below it. That is not
+# redundancy: the reading above decides whether the PASS runs, and its `df` targets are the glob
+# PREFIXES — which include `/tmp` and `$HOME` — so a box whose `/tmp` is a small tmpfs would otherwise
+# run this pass every 10 minutes AND flush every idle install's warm cache while the runners' own volume
+# held hundreds of GB free (#4169 review, P2). One dial, so the unit and the class cannot disagree.
+#
 # The class never touches an install with a JOB IN FLIGHT: `scripts/reap-runner-cache.sh` proves
 # liveness from the process table (`Runner.Worker` present, or a listener with content written under
 # `_work` inside its freshness window) and SKIPS that install whole (`skipped_live=`). A cache deleted
