@@ -73,6 +73,14 @@
 #       own line instead of stamping every probe failure "not a git checkout", names the silent-git
 #       shape (`<git gave no message>`), and names the BOUND firing as itself (rc=124 on a dead or
 #       hung mount) rather than as a git that said nothing (#2159).
+#   T67 EVERY delegate the pass resolves is PINNED in BOTH scheduled artifacts (hourly unit, launchd
+#       plist) and pinned to the right basename — and the fast cache unit pins the one delegate its own
+#       class needs. Derived from the `find_delegate` lines and set-EQUAL in both directions, because
+#       `#4169` added a class to the DEFAULT `--only` list and pinned it in one artifact only, so the
+#       hourly pass ran it through `find_delegate`'s `$HOME` farm fallback while the deployed checker
+#       certified the installed copy — a deletion tool certified against a file it never executes.
+#       Controls: a copy with the pin deleted (each artifact) and a copy with the pin pointing at a
+#       DIFFERENT owner must both redden, so the row cannot pass by reading nothing.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -103,6 +111,15 @@ assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1
 # reads as a broken guard rather than a missing fixture.
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 [ -d "$REPO_ROOT/templates/systemd" ] || { echo "FATAL: $REPO_ROOT/templates/systemd missing — the suite renders units from it"; exit 1; }
+# ⛔ `TEMPLATES_DIR` IS PINNED TO THE TREE UNDER TEST, FOR EVERY INSTALLER CASE (#4169). Unpinned,
+# `install-disk-reaper-timer.sh` prefers `${AGENT_INFRA_PATH}/templates/systemd` — the MAIN checkout,
+# which is a DIFFERENT tree — so a worktree run graded the main checkout's templates. On this box that
+# turned every installer case into "REFUSING: eldato-disk-reaper-cache templates are missing under
+# /home/cmux/agent-infra/templates/systemd", i.e. a red that looks exactly like this PR's code being
+# wrong while the worktree that has the templates was never asked. The cases that need a synthetic or
+# gutted template dir (t31/t55/…) already pin their own value, and a prefix assignment wins over an
+# export, so this is the default and not an override.
+export TEMPLATES_DIR="$REPO_ROOT/templates/systemd"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
@@ -122,6 +139,57 @@ export REAP_AW_ROOTS REAP_DI_ROOTS
 mkdir -p "$T/scratch/rw/gh-runner-fixture/_work"
 DISK_REAPER_RUNNER_GLOBS="$T/scratch/rw/gh-runner*/_work"
 export DISK_REAPER_RUNNER_GLOBS
+# ⛔ AND THE `runner-cache` CLASS, WHICH WAS THE ONE OWNER LEFT UNPINNED — A CORRECTNESS BUG, NOT
+# TIDINESS (#4169 review, P1). Everything above redirected HOME and pinned the other destructive
+# owners, but this class kept its DEFAULTS: `/opt/gh-runner*` and `/tmp/actions-runner*`, i.e. the
+# cells' REAL installs (`ci_runner_pool.sh:235` defaults `RUNNER_ROOT=/tmp/actions-runner`). Several
+# cases here run the DEFAULT class list with `--apply`, so T2 reaped the real >=256 MB `.cache`
+# directories, aged out real `_work/_temp`/`_diag` entries and emptied the real shared root
+# `/tmp/actions-runner/_cache` on whichever box ran the suite — refuting this file's own guarantee
+# (drtest.sh:82/178, "Nothing here can read or write the real box's state"). That is the same class of
+# defect the runner-work pin above records, one owner later.
+# ⛔ IT MUST BE THE ENTRY POINT'S SEAM (`DISK_REAPER_RUNNER_CACHE_*`), NOT THE OWNER'S
+# (`REAP_RC_GLOBS`): `disk-reaper.sh:2986` passes `REAP_RC_GLOBS="$RUNNER_CACHE_GLOBS"` explicitly, so
+# a pin on the owner variable is silently OVERRIDDEN and the suite still runs against the box.
+# ⛔ AND IT POINTS AT A DIRECTORY THAT EXISTS: an explicit glob list matching NOTHING is a REFUSAL
+# (exit 3) by the class's own policy, which would turn every case here red for a fixture reason.
+# `MIN_MB=1` keeps the fixture caches (a few MB) inside the class's size bound; a case that needs the
+# 256 MB default pins it for itself.
+# ⛔ THE FIXTURE MUST BE AN **INSTALL**, NOT MERELY A DIRECTORY (#4169 review, BLOCKING). The class
+# refuses an EXPLICIT glob list that matched no INSTALL (`census=no-roots`, rc 3), so a fixture that was
+# only a directory turned every full-pass case here red for a fixture reason — and it was hiding the
+# very defect the refusal exists for: a matched directory with no `bin/Runner.Listener` used to read
+# `census=ok installs=0` and pass. So the base fixture carries the marker.
+age_rc_install() { # <install-dir> — make a fixture install read IDLE
+    # The class treats `_work` content written inside `REAP_RC_JOB_WINDOW_S` (900 s) as a job in
+    # flight and skips the install WHOLE — and a `mkdir` a millisecond ago is exactly that. Only the
+    # direct children of `_work`/`_diag` are aged: they are what the freshness witness and the age
+    # gates read.
+    local d="$1" when
+    when=$(( $(date +%s) - 2 * 86400 ))
+    mkdir -p "$d/_work/_temp" "$d/_diag"
+    touch -d "@$when" "$d/_work/_temp" "$d/_diag" 2>/dev/null \
+        || touch -t "$(date -r "$when" +%Y%m%d%H%M 2>/dev/null || printf 202001010000)" \
+                   "$d/_work/_temp" "$d/_diag" 2>/dev/null || true
+}
+mkdir -p "$T/scratch/rc/gh-runner-fixture/bin" "$T/scratch/rc/shared"
+: >"$T/scratch/rc/gh-runner-fixture/bin/Runner.Listener"
+age_rc_install "$T/scratch/rc/gh-runner-fixture"
+DISK_REAPER_RUNNER_CACHE_GLOBS="$T/scratch/rc/gh-runner-*"
+DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS="$T/scratch/rc/shared"
+DISK_REAPER_RUNNER_CACHE_MIN_MB="${DISK_REAPER_RUNNER_CACHE_MIN_MB:-1}"
+export DISK_REAPER_RUNNER_CACHE_GLOBS DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB
+# ⛔ AND THE OWNER'S FREE-SPACE GATES, PINNED OFF AT THE **ENTRY POINT'S** SEAM — NOT THE OWNER'S. The
+# gates read the BOX (`df -Pk` against the shared root's and the install's filesystems), so on a host
+# with 70 GB free the 40960 default would KEEP every fixture cache, a host-dependent outcome in a suite
+# whose whole contract is "nothing here depends on the box". ⛔ THIS PIN USED TO BE ON THE OWNER SEAM
+# (`REAP_RC_SHARED_TRIGGER_FREE_MB=0`) AND WAS SILENTLY OVERRIDDEN the moment the entry point started
+# forwarding both gates from `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` — the exact trap this file
+# already documents for `REAP_RC_GLOBS` (#4169 review, P2). Pinning the entry point's dial is what
+# reaches the class, and `reap-runner-cache.test.sh` cases R and T are where each gate is exercised in
+# both directions against a `df` STUB.
+DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0
+export DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB
 SLEEPERS=""
 cleanup() {
     local p
@@ -193,6 +261,18 @@ ENVNAME=""
 # `REAP_WT_GIT_TIMEOUT` per call. `pi-reap-worktrees.test.sh:459` already pins this; the `${…:-local}`
 # form keeps every case that deliberately exercises `auto` able to override it (T3 does: it proves the
 # remote-oid path against a LOCAL BARE origin, which is offline already).
+# ⛔ THE `runner-cache` CLASS IS PINNED TOO, AND THAT PIN IS A CORRECTNESS FIX, NOT TIDINESS (#4169
+# review, P1). This suite redirected HOME but NOT the class's own globs, so the class inherited its
+# defaults — `/opt/gh-runner*` and `/tmp/actions-runner*`, the cells' REAL installs
+# (`ci_runner_pool.sh:235` defaults `RUNNER_ROOT=/tmp/actions-runner`) — and an unpinned `--apply` case
+# (T2) reaped the real >=256 MB `.cache` directories, aged out real `_work/_temp`/`_diag` entries and
+# emptied the real shared root `/tmp/actions-runner/_cache` on the box running the tests. That refutes
+# this file's own guarantee at drtest.sh:82/178 ("Nothing here can read or write the real box's state").
+# ⛔ IT IS THE ENTRY POINT'S SEAM (`DISK_REAPER_RUNNER_CACHE_*`), NOT THE OWNER'S (`REAP_RC_GLOBS`):
+# `disk-reaper.sh:2986` passes `REAP_RC_GLOBS="$RUNNER_CACHE_GLOBS"` explicitly, so pinning the owner
+# variable here would have been silently OVERRIDDEN and the suite would still have run against the box.
+# The pinned glob points at a directory this suite CREATES (below), so the class's "an explicit glob
+# list that matched nothing is a refusal, not a measured zero" rule cannot turn every case into exit 3.
 # ⚠️ THIS BLOCK SITS ABOVE THE ASSIGNMENT CHAIN ON PURPOSE — see the RULE 7 note: a comment line put
 # INSIDE a `\`-continued list ends the command word, and the pass then silently runs against the REAL
 # $HOME. It cost 79 unrelated red assertions the first time this file learned it (and it happened
@@ -432,8 +512,16 @@ exit 0
 SC
 chmod +x "$T/t8/bin/systemctl"
 inst() { # inst <args...>
+    # ⛔ `TEMPLATES_DIR` IS PINNED TO THE TREE UNDER TEST, LIKE EVERY OTHER INSTALLER CASE HERE
+    # (t19/t55/… pin the same value). Unpinned, `install-disk-reaper-timer.sh` prefers
+    # `${AGENT_INFRA_PATH}/templates/systemd` — the MAIN checkout — so a worktree run graded a
+    # DIFFERENT tree's templates: on this box the main checkout predates the fast-cache unit pair, so
+    # T8 went red with "cache templates are missing under /home/cmux/agent-infra/templates/systemd"
+    # against a worktree that has them. A suite that reads another checkout's fixtures is not testing
+    # this one, and the red is indistinguishable from the code being wrong.
     HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
     DISK_REAPER_STATE_DIR="$T/t8/home/.pi/agent/state" \
+    TEMPLATES_DIR="$HERE/../templates/systemd" \
     SYSTEMD_UNIT_DIR="$T/t8/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t8/calls.log" \
     bash "$INST" "$@"
 }
@@ -3453,6 +3541,296 @@ assert_contains "$OUT" "the git probe did not finish within 5s" \
     "T63 a probe killed by the BOUND is named as a timeout, not as a git that said nothing"
 assert_absent "$OUT" "<git gave no message>" \
     "T63 ... and is never reported as the empty-stderr shape it is not"
+
+# ── T64: the `runner-cache` class is PINNED to this fixture, not to the box (#4169 review P1) ────
+# WHAT WAS WRONG: the class inherited `/opt/gh-runner*` and `/tmp/actions-runner*` in every `--apply`
+# case of this file, so it could and did reap the real box. WHAT THESE ROWS PIN is both halves — that
+# the population it scans is the FIXTURE (so a future edit cannot quietly restore the defaults), and
+# that the pin does not make the class INERT (a pinned-to-nowhere class reads a measured zero forever
+# and looks healthy, which is the failure mode `--only` refusals exist to prevent). The reading is in
+# the OWNER's log, which is the only durable record of WHICH population a pass walked.
+ENVNAME=t64
+PIN_INST="$T/scratch/rc/gh-runner-pin"
+mkdir -p "$PIN_INST/bin" "$PIN_INST/_work/_temp" "$PIN_INST/_diag" "$PIN_INST/.cache/uv"
+: >"$PIN_INST/bin/Runner.Listener"
+age_rc_install "$PIN_INST"   # IDLE: a fresh `_work` is a job in flight, and this fixture asserts a reap
+dd if=/dev/zero of="$PIN_INST/.cache/uv/blob" bs=1M count=3 >/dev/null 2>&1
+RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
+OUT="$(run_reaper --dry-run 2>&1)"
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "install_globs=$T/scratch/rc/gh-runner-*" \
+    "T64 the class scans THIS fixture's installs (the log names the population it walked)"
+assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/opt/gh-runner" \
+    "T64 and never inherits the box's real /opt install glob"
+assert_absent "$(cat "$RC_LOG" 2>/dev/null)" "/tmp/actions-runner" \
+    "T64 nor the pool's real /tmp root"
+# TWO installs at this point: the base runner-cache fixture and this case's pin. The row is about the
+# pin being REACHED (a pinned-to-nowhere class reads a measured zero forever), so it asserts the
+# population that exists rather than a number that only happens to be 1.
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "installs=2" \
+    "T64 the pinned population is the fixture installs — installs=2, not a measured zero"
+# The armed half: the class still DOES its work, on the fixture. Without this row a pin to a path that
+# matches nothing would pass every assertion above and the class would be inert by construction.
+OUT="$(run_reaper --apply --only runner-cache 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T64 an apply pass over the pinned class exits 0"
+assert_dir "$PIN_INST" "T64 the fixture INSTALL is never a candidate (only its cache is)"
+assert_nodir "$PIN_INST/.cache" "T64 the FIXTURE's cache is what the armed pass reclaimed"
+assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "reaped=1" \
+    "T64 and the log records the removal, so the pin is not a silent no-op"
+# ⛔ AND THE SIXTH CLASS IS IN THE PASS TOTAL (#4169 review, P3). `freed_mb_total` summed FIVE classes —
+# `runner-cache` was missing from it — so a pass whose only reclamation was its runner caches published
+# `freed_mb_runner_cache=<GB>` beside a `freed_mb_total=` that did not contain it, and the
+# `alert=under-reclaim` derived from that sum fired on a pass that had in fact freed the space. The 3 MB
+# above was really reaped, so the total must be at least the class's own figure and must not be zero.
+T64_ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+T64_RC_FREED="$(sed -n 's/^freed_mb_runner_cache=//p' <<<"$T64_ST" | head -1)"
+T64_TOTAL="$(sed -n 's/^freed_mb_total=//p' <<<"$T64_ST" | head -1)"
+case "$T64_RC_FREED" in ''|*[!0-9]*) T64_RC_FREED=0 ;; esac
+case "$T64_TOTAL" in ''|*[!0-9]*) T64_TOTAL=-1 ;; esac
+assert_eq "$([ "$T64_TOTAL" -ge "$T64_RC_FREED" ] && [ "$T64_TOTAL" -ge 0 ] && echo yes || echo no)" "yes" \
+    "T64 and freed_mb_total CONTAINS the runner-cache class (total=${T64_TOTAL}MB rc=${T64_RC_FREED}MB)"
+assert_eq "$([ "$T64_RC_FREED" -gt 0 ] && echo nonzero || echo zero)" "nonzero" \
+    "T64 … with a non-zero class figure, so the row above cannot pass on two zeros"
+
+# ── T65: an UNSIZED candidate's path is published intact (#4169 review, P3) ──────────────────────
+# The owner emits `REAP ?MB <path> kind=…` when `du` cannot size a candidate, and the parse here used
+# a digits-REQUIRED pattern, so the size token stayed glued to the front of the path: the row was
+# counted correctly (a `?` is still a candidate) but the operator's ONLY locator read `REAP ?MB /opt/…`.
+# A broken `du` is the natural fixture — it is the real cause of a `?` row, so nothing is stubbed that
+# the production path would not itself hit.
+ENVNAME=t65
+UNS_INST="$T/scratch/rc/gh-runner-unsized"
+mkdir -p "$UNS_INST/bin" "$UNS_INST/_work/_temp" "$UNS_INST/_diag" "$UNS_INST/.cache/uv"
+: >"$UNS_INST/bin/Runner.Listener"
+age_rc_install "$UNS_INST"   # IDLE, or the candidate is skipped-live before it can be `?`-sized
+printf 'x\n' >"$UNS_INST/.cache/uv/blob"
+OUT="$(REAP_RC_DU_BIN="$T/no-such-du-binary" run_reaper --dry-run --only runner-cache 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T65 a dry run holding an unsized candidate still reports work present (rc=5)"
+assert_contains "$OUT" "? bytes unmeasured" \
+    "T65 an unsized candidate is COUNTED, never dropped for having no byte figure"
+assert_contains "$OUT" "class=runner-cache (? bytes unmeasured — the owner could not size it) $UNS_INST/.cache" \
+    "T65 and its path is published INTACT — the ?MB token is stripped off the locator"
+assert_absent "$OUT" ") REAP ?MB" \
+    "T65 no published locator leaks the owner's unsized size token (the pre-fix row read \"… ) REAP ?MB /path\")"
+
+# ── T66: the fast-cache instance REFUSES to report itself installed without --size-trigger ──────
+# The earlier review recorded NO ROW for this arm: a cache unit rendered WITHOUT the flag installs
+# green, and the 10-minute timer then runs the FULL pass 144 times a day — the opposite of what it
+# exists for. The TEMPLATE is mutated, not the code, so the arm that reads the installed artifact back
+# is what has to fire (a code-side mutant would test the sed, not the gate).
+ENVNAME=t66
+REPO="$(mk_repo t66repo)"
+T66_TPL="$T/t66/templates"; mkdir -p "$T66_TPL"
+cp "$REPO_ROOT/templates/systemd/"*.service "$REPO_ROOT/templates/systemd/"*.timer "$T66_TPL/"
+sed -i.bak 's/ --size-trigger//' "$T66_TPL/eldato-disk-reaper-cache.service"
+rm -f "$T66_TPL/eldato-disk-reaper-cache.service.bak"
+mkdir -p "$T/t66/units" "$T/t66/bin" "$T/t66/home"
+cp "$T/t8/bin/systemctl" "$T/t66/bin/systemctl"
+OUT="$(HOME="$T/t66/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+      DISK_REAPER_STATE_DIR="$T/t66/home/.pi/agent/state" TEMPLATES_DIR="$T66_TPL" \
+      SYSTEMD_UNIT_DIR="$T/t66/units" SYSTEMCTL="$T/t66/bin/systemctl" \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T66 an install whose cache unit lost --size-trigger is REFUSED (rc=$RC, want 1)"
+assert_contains "$OUT" "no ExecStart= in the installed eldato-disk-reaper-cache.service carries --size-trigger" \
+    "T66 and names the missing flag IN THE ARGV (a comment mentioning it does not count)"
+assert_contains "$OUT" "runs the FULL pass every 10 minutes" \
+    "T66 ... and states the consequence, so the refusal is actionable"
+# and the positive control: the same install over the REAL templates succeeds and really is armed
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper-cache.service" 2>/dev/null)" "--size-trigger" \
+    "T66 control: the unmutated install DOES carry --size-trigger (the assertion above is not vacuous)"
+
+# ── T67: EVERY delegate the pass resolves is PINNED in BOTH scheduled artifacts ─────────────────
+# ⛔ THE FAILURE THIS PINS IS A FALSE PASS, NOT A MISSING FEATURE. `find_delegate` tries
+# `$HOME/.pi/agent/scripts/<basename>` FIRST and `$SELF_DIR` second, so a delegate that a unit does
+# not pin resolves through the FARM, not the installed copy. `#4169` added `runner-cache` to the
+# DEFAULT `--only` list (so BOTH the hourly systemd unit and the hourly plist run it) and pinned
+# `RUNNER_CACHE_REAPER` in the FAST cache unit only — leaving the two artifacts that run the class
+# one delegate short, which is precisely the state the plist's own comment records for #3057
+# ("Both artifacts must pin the same set"). On a box whose HOME holds an older farmed copy the class
+# then runs THAT delete policy while `disk-reaper-deployed-check.sh` certifies the installed copy —
+# a deletion tool certified against a file it does not execute. The row is DERIVED (from the
+# `find_delegate` lines) and SET-EQUAL in both directions, so a new class cannot land pinned in only
+# one artifact and a pin for a delegate that no longer exists cannot linger.
+T67_DELEGATES="$(grep -E '^[A-Z][A-Z0-9_]*_PATH="\$\(find_delegate ' "$REAPER" \
+    | sed -E 's/.*find_delegate "\$\{([A-Z0-9_]+):-\}" ([A-Za-z0-9._-]+)\).*/\1 \2/')"
+assert_eq "$(grep -c . <<<"$T67_DELEGATES")" "$(grep -cE '^[A-Z][A-Z0-9_]*_PATH="\$\(find_delegate ' "$REAPER")" \
+    "T67 the delegate list is DERIVED from the pass, not mirrored (a parse that drops one is a failure)"
+# systemd: `Environment=<NAME>=` on its own line, value on the same line.
+t67_sd_pins()   { grep -oE '^Environment=[A-Z0-9_]+_REAPER=' "$1" | sed 's/^Environment=//; s/=$//'; }
+t67_sd_value()  { sed -nE "s/^Environment=$2=(.*)\$/\\1/p" "$1"; }
+# launchd: `<key>NAME</key>` then `<string>value</string>` on the next line.
+t67_pl_pins()   { grep -oE '<key>[A-Z0-9_]+_REAPER</key>' "$1" | sed 's/<key>//; s/<\/key>//'; }
+# launchd: `<key>NAME</key>` then `<string>value</string>` on the next line. The awk arm reads the LINE
+# AFTER the key, strips the surrounding whitespace AND the `<string>`/`</string>` tags, and returns the
+# path — comparing the raw line would make every pin look "wrong-target".
+t67_pl_value()  { awk -v k="$2" '$0 ~ "<key>" k "</key>" { getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); gsub(/<\/?string>/, ""); print; exit }' "$1"; }
+# t67_gaps <systemd|launchd> <file> — a delegate that is UNPINNED, or pinned to a DIFFERENT basename.
+t67_gaps() {
+    local kind="$1" f="$2" name base val gaps=""
+    while read -r name base; do
+        [ -n "$name" ] || continue
+        if [ "$kind" = systemd ]; then val="$(t67_sd_value "$f" "$name")"; else val="$(t67_pl_value "$f" "$name")"; fi
+        [ -n "$val" ] || { gaps="$gaps $name(unpinned)"; continue; }
+        case "$val" in *"/$base") ;; *) gaps="$gaps $name(wrong-target:$val)" ;; esac
+    done <<<"$T67_DELEGATES"
+    printf '%s' "$gaps"
+}
+# t67_extras <names…> — pins for a name that is NOT a delegate (DISK_REAPER is the entry point itself).
+t67_extras() {
+    local n extras=""
+    for n in "$@"; do
+        [ "$n" = DISK_REAPER ] && continue
+        grep -qxF -- "$n" <<<"$(awk '{print $1}' <<<"$T67_DELEGATES")" || extras="$extras $n"
+    done
+    printf '%s' "$extras"
+}
+T67_SD="$REPO_ROOT/templates/systemd/eldato-disk-reaper.service"
+T67_PL="$REPO_ROOT/templates/launchd/reaper/com.eldato.disk-reaper.plist"
+T67_FAST="$REPO_ROOT/templates/systemd/eldato-disk-reaper-cache.service"
+[ -f "$T67_SD" ] && [ -f "$T67_PL" ] && [ -f "$T67_FAST" ] \
+    || bad "T67 fixture: a scheduled artifact is missing (the row would otherwise pass by reading nothing)"
+assert_eq "$(t67_gaps systemd "$T67_SD")" "" \
+    "T67 the HOURLY systemd unit pins EVERY delegate the pass resolves (and to the right basename)"
+assert_eq "$(t67_gaps launchd "$T67_PL")" "" \
+    "T67 the launchd plist pins EVERY delegate the pass resolves (and to the right basename)"
+assert_eq "$(t67_extras $(t67_sd_pins "$T67_SD"))" "" \
+    "T67 ... and the systemd unit pins nothing that is not a delegate"
+assert_eq "$(t67_extras $(t67_pl_pins "$T67_PL"))" "" \
+    "T67 ... and neither does the plist (the two artifacts agree on the SET, not just on the names)"
+assert_eq "$(t67_sd_value "$T67_FAST" RUNNER_CACHE_REAPER)" "{{REAPER_DIR}}/reap-runner-cache.sh" \
+    "T67 the FAST cache unit pins the one delegate its own class needs"
+# ⛔ AND THE INSTALLER'S MISSING-DELEGATE LIST MUST COVER EVERY DELEGATE THE UNITS PIN (#4169 review,
+# P3). The units pin them; the installer's job is to NAME a missing one at install time — and it listed
+# six of the seven, so a box installed without `reap-runner-cache.sh` got a unit naming a class that
+# fails closed (exit 3) EVERY pass with no warning at all: the inert-enforcer shape the rest of that
+# list exists to prevent. Direction is one-way on purpose — the list also names shared libraries that
+# are not delegates, so "delegates ⊆ list" is the invariant, not set equality.
+T67_INSTALLER="$REPO_ROOT/scripts/install-disk-reaper-timer.sh"
+T67_DELEGATE_BASES="$(awk '{print $2}' <<<"$T67_DELEGATES")"
+t67_unnamed() {
+    local n names gaps=""
+    names="$(sed -n '/^    for d in pi-cache-reap.sh/,/; do$/p' "$T67_INSTALLER")"
+    for n in $T67_DELEGATE_BASES; do
+        [ -n "$n" ] || continue
+        case " $names " in *" $n "*) ;; *) gaps="$gaps $n" ;; esac
+    done
+    printf '%s' "$gaps"
+}
+assert_file "$T67_INSTALLER" "T67 fixture: the installer exists (the row below would otherwise pass by reading nothing)"
+assert_eq "$(t67_unnamed)" "" \
+    "T67 the installer NAMES a missing copy of EVERY delegate the units pin (it did not name reap-runner-cache.sh)"
+# non-vacuity: the parse must REDDEN when a name is dropped from the LIST — on a COPY, never the file.
+# (The file also MENTIONS the name in a comment; what the row reads is the `for d in …` list, so the
+# control removes the list entry and asserts that it is really gone before grading the parser.)
+mkdir -p "$T/scratch/t67-inst"; T67_MUT_INST="$T/scratch/t67-inst/installer.sh"
+grep -v '^ *reap-runner-cache\.sh *\\$' "$T67_INSTALLER" >"$T67_MUT_INST"
+assert_eq "$(grep -c '^ *reap-runner-cache\.sh *\\$' "$T67_MUT_INST")" "0" \
+    "T67 control: the mutant copy really dropped the list entry (a mutation that did nothing proves nothing)"
+assert_contains "$(T67_INSTALLER="$T67_MUT_INST" t67_unnamed)" "reap-runner-cache.sh" \
+    "T67 control: dropping it from the installer list makes that row RED (not a vacuous read)"
+# ── non-vacuity: both parsers must REDDEN when the pin is actually removed ──────────────────────
+# A row that reads the file but cannot fail under a deleted pin is the "inert enforcer" shape. The
+# control mutates a COPY of each artifact, so the templates under test are never touched.
+T67_MUT="$T/scratch/t67"; mkdir -p "$T67_MUT"
+grep -v '^Environment=RUNNER_CACHE_REAPER=' "$T67_SD" >"$T67_MUT/hourly.service"
+assert_contains "$(t67_gaps systemd "$T67_MUT/hourly.service")" "RUNNER_CACHE_REAPER(unpinned)" \
+    "T67 control: dropping the systemd pin makes the row RED (the assertion above is not vacuous)"
+awk '/<key>RUNNER_CACHE_REAPER<\/key>/{skip=1; next} skip==1 && /<string>/{skip=0; next} {print}' \
+    "$T67_PL" >"$T67_MUT/reaper.plist"
+assert_absent "$(cat "$T67_MUT/reaper.plist")" "RUNNER_CACHE_REAPER" \
+    "T67 control: the plist mutant really dropped BOTH lines of the pair"
+assert_contains "$(t67_gaps launchd "$T67_MUT/reaper.plist")" "RUNNER_CACHE_REAPER(unpinned)" \
+    "T67 control: and dropping it makes the plist arm RED too"
+# and a pin that names the WRONG file is caught (the `/_cache` shape: a plausible, one-token error)
+sed 's#reap-runner-cache.sh#reap-runner-work.sh#' "$T67_SD" >"$T67_MUT/wrong.service"
+assert_contains "$(t67_gaps systemd "$T67_MUT/wrong.service")" "RUNNER_CACHE_REAPER(wrong-target:" \
+    "T67 control: a pin pointing at a DIFFERENT owner is caught, not merely an absent one"
+
+# ── T68: ONE DIAL, BOTH CLASS GATES — the entry point FORWARDS the trigger (#4169 review, P2) ────
+# WHAT WAS WRONG: `REAP_RC_SHARED_TRIGGER_FREE_MB` was documented as "the size-triggered pass's own
+# trigger", and the owner gates its shared root on it — but `disk-reaper.sh`'s `run_class env` list
+# forwarded EIGHT seams and not that one, so an operator who LOWERED
+# `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` still had the shared root emptied below the class's own
+# 40960 default while their unit said the box was fine. The SAME class of silence is what the review's
+# second half named: the install arm had no free-space condition at all, so a trigger fired by a tmpfs
+# `/tmp` flushed every idle install's warm cache on a box with hundreds of GB free.
+# ⛔ THE ROW IS ABOUT THE FORWARDING, so it asserts the numbers the CLASS logged its own gates at (the
+# owner prints both at pass start) AND the two keep reasons, with a `df` STUB so the reading cannot come
+# from this host's disk.
+# ⛔ AND THE DIAL MUST BE A NON-DEFAULT NUMBER (#4169 review, P2). It used to be `40960` — the owner's
+# OWN default for both gates — so deleting the two forwardings left the owner at 40960, the `df` stub at
+# 200 GB free, and every row here GREEN: the row documented as "a pass that forwarded only one of the two
+# would redden here" could not go red for the regression it names (agent-infra#3442 rule 3). The dial is
+# now 2500 and the stub reports 10000 MB free — ABOVE 2500 (so a correct pass KEEPS both) and BELOW the
+# class's own 40960 default (so a pass that failed to forward REAPS both). The row therefore proves WHICH
+# number is in force, not merely that some gate kept a cache.
+ENVNAME=t68
+T68_DIAL=2500
+FWD_INST="$T/scratch/rc/gh-runner-forwarded"
+mkdir -p "$FWD_INST/bin" "$FWD_INST/_work/_temp" "$FWD_INST/_diag" "$FWD_INST/.cache/uv"
+: >"$FWD_INST/bin/Runner.Listener"
+age_rc_install "$FWD_INST"
+dd if=/dev/zero of="$FWD_INST/.cache/uv/blob" bs=1M count=3 >/dev/null 2>&1
+printf 'warm\n' >"$T/scratch/rc/shared/entry"
+T68_DF="$T/scratch/t68-df"
+printf '%s\n' '#!/bin/sh' \
+    'printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"' \
+    'printf "fixture 999999999 0 10240000 0%% /\n"' >"$T68_DF"
+chmod +x "$T68_DF"
+# run_t68 <reaper-path> — ONE pass over the T68 fixture at the T68 dial, through the (possibly mutated)
+# entry point. `REAP_RC_DF_BIN`/`DISK_REAPER_*` ride as prefix assignments: bash exports those to the
+# child `bash "$REAPER"`, while `REAPER` itself is read by `run_reaper` in THIS shell, so it is assigned
+# around the call rather than prefixed (a prefix assignment is NOT visible to the function body).
+run_t68() {
+    local _save="$REAPER" _rc
+    REAPER="$1"
+    REAP_RC_DF_BIN="$T68_DF" DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB="${2:-$T68_DIAL}" \
+        run_reaper --apply --only runner-cache
+    _rc=$?
+    REAPER="$_save"
+    return "$_rc"
+}
+RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
+OUT="$(run_t68 "$REAPER")"; RC=$?
+assert_eq "$RC" "0" "T68 a pass with the operator's trigger rendered exits 0"
+assert_contains "$OUT" "install_trigger_free_mb=${T68_DIAL} shared_trigger_free_mb=${T68_DIAL}" \
+    "T68 the ONE dial reaches BOTH class gates (install + shared), so they cannot silently diverge"
+assert_contains "$OUT" "reason=install-free-above-trigger free_mb=10000 trigger_mb=${T68_DIAL}" \
+    "T68 a warm install cache on a filesystem with 10 GB free is KEPT by the FORWARDED number (not by the 40960 default)"
+assert_dir "$FWD_INST/.cache" "T68 … and the bytes are really still there"
+assert_contains "$OUT" "reason=shared-free-above-trigger free_mb=10000 trigger_mb=${T68_DIAL}" \
+    "T68 while the shared root is kept by the SAME forwarded number (it is not the only gated arm any more)"
+# ⛔ THE CONTROL IS THE PRE-FIX STATE: the same fixture, a copy of the entry point with BOTH forwardings
+# deleted. It must print the owner's own 40960 defaults and REAP the caches the pass above kept — so this
+# row reddens for exactly the edit that removes the thing it pins.
+T68_MUT_DIR="$T/t68-mut"
+mkdir -p "$T68_MUT_DIR"
+ln -sfn "$REPO_ROOT/scripts/lib" "$T68_MUT_DIR/lib"
+ln -sfn "$REPO_ROOT/scripts/reap-runner-cache.sh" "$T68_MUT_DIR/reap-runner-cache.sh"
+assert_eq "$(grep -c -e 'REAP_RC_INSTALL_TRIGGER_FREE_MB=' -e 'REAP_RC_SHARED_TRIGGER_FREE_MB=' "$REAPER")" "2" \
+    "T68 the entry point really carries BOTH forwardings (the control below is anchored on them)"
+sed -e '/REAP_RC_INSTALL_TRIGGER_FREE_MB=/d' -e '/REAP_RC_SHARED_TRIGGER_FREE_MB=/d' "$REAPER" >"$T68_MUT_DIR/disk-reaper.sh"
+T68_MUT="$T68_MUT_DIR/disk-reaper.sh"
+assert_eq "$(grep -c -e 'REAP_RC_INSTALL_TRIGGER_FREE_MB=' -e 'REAP_RC_SHARED_TRIGGER_FREE_MB=' "$T68_MUT")" "0" \
+    "T68 the control copy really has both forwardings REMOVED (an unapplied mutation is not a control)"
+OUT_MUT="$(bash -n "$T68_MUT" 2>&1 && run_t68 "$T68_MUT")"
+assert_contains "$OUT_MUT" "install_trigger_free_mb=40960 shared_trigger_free_mb=40960" \
+    "T68 MUTANT without the forwardings both gates fall back to the owner's 40960 and the row above reddens"
+assert_absent "$OUT_MUT" "trigger_mb=${T68_DIAL}" \
+    "T68 MUTANT … and the dial number is nowhere in the mutant's readings"
+assert_nodir "$FWD_INST/.cache" \
+    "T68 MUTANT the warm cache the forwarded pass kept is REAPED — the pre-fix state, measured, is the harm"
+# ⛔ AND `0` IS NAMED, NOT SILENT (#4169 review, P3). One dial, three consumers: 0 can never fire the
+# fast clock and it also disables BOTH class pressure gates, so an operator who sets it to stop the
+# 10-minute pass silently makes the HOURLY pass an ungated warm-cache flusher. Legal, but never quiet:
+# the pass journal carries a warning and the record carries a note.
+OUT_ZERO="$(run_t68 "$REAPER" 0)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.log" 2>/dev/null)" "pressure gates DISARMED" \
+    "T68 a dial of 0 says so in the pass journal (a one-dial policy reversal is never silent)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" \
+    "class pressure gates disarmed by DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0" \
+    "T68 … and the RECORD carries it (note_runner_cache=), so a supervisor printing the record sees it"
+assert_contains "${OUT_ZERO}" "install_trigger_free_mb=0 shared_trigger_free_mb=0" \
+    "T68 … while the class itself reports the two gates it was handed, at 0"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

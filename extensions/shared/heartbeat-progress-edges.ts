@@ -1182,6 +1182,41 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
   },
+  // ── #4168: the runner CACHE reclaim class's age/window bounds, as MATCHED PAIRS ──────────────────
+  // The entry point's pass-through seam and the owner's own default are two declarations of one
+  // policy (the shape `VENV_MIN_AGE` / `REAP_VENV_MIN_AGE_SECONDS` and `RUNNER_MIN_AGE` /
+  // `RUNNER_WORK_MIN_AGE` already use), so both layers are registered. ⛔ THE REVERSE SCAN FOUND THESE
+  // THREE THE MOMENT THE CLASSES LANDED, which is the whole point of that direction: `disk-reaper.sh`
+  // forwards them through `run_class env`, and a bound only the scheduler knows about is invisible to
+  // the audit that exists to notice exactly that. The OWNER's own defaults are NOT declarable
+  // symbols — `reap-runner-cache.sh` reads `${REAP_RC_SCRATCH_DAYS:-7}` into `SCRATCH_DAYS`, so the
+  // scan sees no declaration of the `REAP_RC_*` name there and the `value` fragment registered here
+  // is the pass-through's own RHS. The shipped defaults (7 d, 7 d, 900 s) are asserted by
+  // `scripts/reap-runner-cache.test.sh`, which drives every one of them through the seam.
+  {
+    name: "REAP_RC_SCRATCH_DAYS",
+    owners: ["scripts/disk-reaper.sh"],
+    value: '"$RUNNER_CACHE_SCRATCH_DAYS"',
+    axis: "reap",
+    guardedBy: NONE,
+    note: "#4168 — the entry point's pass-through of the runner-cache class's `_work/_temp` age bound (`DISK_REAPER_RUNNER_CACHE_SCRATCH_DAYS`, default 7 d) to its owner `reap-runner-cache.sh`. Registered rather than exempted because it IS a stall/liveness-family bound in the `REAP` + `_DAYS` shape: it decides whether a runner's leftover scratch may be removed.",
+  },
+  {
+    name: "REAP_RC_LOG_DAYS",
+    owners: ["scripts/disk-reaper.sh"],
+    value: '"$RUNNER_CACHE_LOG_DAYS"',
+    axis: "reap",
+    guardedBy: NONE,
+    note: "#4168 — the same pass-through for the `_diag/*.log` age bound (`DISK_REAPER_RUNNER_CACHE_LOG_DAYS`, default 7 d). The owner keeps the NEWEST log per install regardless of age (the listener holds it open), so this bound only ever reaches aged, closed logs.",
+  },
+  {
+    name: "REAP_RC_JOB_WINDOW_S",
+    owners: ["scripts/disk-reaper.sh"],
+    value: '"$RUNNER_CACHE_JOB_WINDOW"',
+    axis: "reap",
+    guardedBy: NONE,
+    note: "#4168 — the same pass-through for the class's \"a job is running\" freshness window (`DISK_REAPER_RUNNER_CACHE_JOB_WINDOW_S`, default 900 s). ⛔ IT IS A LIVENESS WITNESS, NOT A DELETE BOUND: content written under `_work` inside the window makes the install LIVE and skips its cache whole, so every error direction here keeps data. The witness takes the newest mtime a job WROTE and never the mtime of `_work/_temp` itself, because this class deletes into that directory and `rm` bumps its parent's mtime (#4169 review, P1).",
+  },
   // ── ai#3057: the runner-work reclaim class's floor, as a MATCHED PAIR ────────────────────────────
   // The entry point's pass-through and the owner's own floor are two declarations of one policy (as
   // `VENV_MIN_AGE` / `REAP_VENV_MIN_AGE_SECONDS` above are), so both are registered: a floor only ONE

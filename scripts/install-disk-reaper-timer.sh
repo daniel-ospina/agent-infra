@@ -113,6 +113,20 @@ MODE_FLAG="--apply"
 # is what let a "succeeding" hourly reaper sit on cells at 94-96% used (see the unit template).
 MODE_SUCCESS_EXIT="0 6"
 
+# ── the SECOND unit: the size-triggered runner-cache pass (#4168) ──────────────────────────────
+# ⛔ WHY A SECOND UNIT RATHER THAN A SECOND LINE IN THE FIRST. The hourly pass and this one have
+# DIFFERENT cadences and different MODES of action: the hourly pass is a full sweep on an age-gated
+# policy set, this one is a self-gating, capped cache pass on a 10-minute clock. `templates/systemd/
+# eldato-disk-reaper-cache.{service,timer}` carries the argument in full. They share the pass's LOCK
+# (`disk-reaper.sh` derives it from `DISK_REAPER_TMPFS_ROOT`, not from the state dir), so the two can
+# never delete at the same moment — the second one defers (rc 6).
+CACHE_UNIT_NAME="eldato-disk-reaper-cache"
+# The two numbers this unit exists for, rendered into its Environment= so the thresholds a box runs
+# with are readable in the artifact rather than hidden in a script default (the same rule MODE_FLAG
+# follows). ⛔ VALIDATED: they are baked into a persistent unit, so a typo must fail the install.
+CACHE_TRIGGER_FREE_MB="${DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB:-40960}"
+CACHE_PASS_CAP_MB="${DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB:-20480}"
+
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
@@ -332,7 +346,12 @@ refuse_transient_target() {
     # this list is how the abandoned-worktree class dies on every pass with nothing saying so.
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
              reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
+             reap-runner-cache.sh \
              lib/live-paths.sh lib/cell-home.sh; do
+        # ⛔ `reap-runner-cache.sh` IS A DELEGATE THE UNITS PIN (#4169 review, P3). It was missing here,
+        # so a box whose install lacked it got a unit that named a class which fails closed (exit 3) every
+        # pass and NO install-time warning at all — the exact silent-inert shape the rest of this list
+        # exists to prevent. The list is "every delegate the two artifacts pin", not "the five older ones".
         # #2542 adds the two new owners AND the census library they share. The library is in this list
         # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
         # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse
@@ -440,6 +459,8 @@ render() { # render <template> <dest>
         -e "s|{{REAPER_DIR}}|$(xml_sed_repl "${REAPER%/*}")|g" \
         -e "s|{{MODE_FLAG}}|$MODE_FLAG|g" \
         -e "s|{{MODE_SUCCESS_EXIT}}|$MODE_SUCCESS_EXIT|g" \
+        -e "s|{{CACHE_TRIGGER_FREE_MB}}|$CACHE_TRIGGER_FREE_MB|g" \
+        -e "s|{{CACHE_PASS_CAP_MB}}|$CACHE_PASS_CAP_MB|g" \
         -e "s|{{BOUNDED_LIB}}|$(xml_sed_repl "${REAPER%/*}/lib/bounded.sh")|g" \
         -e "s|{{LABEL}}|$LABEL|g" \
         -e "s|{{PY_BIN}}|$(xml_sed_repl "${PY_BIN:-}")|g" \
@@ -1131,6 +1152,92 @@ report_gh_resolvable() {
     fi
 }
 
+# install_cache_trigger_units — put the FREQUENT, self-gating cache pass on the clock (#4168).
+# ⛔ IT IS A SEPARATE FUNCTION, NOT A WIDER LOOP OVER THE FIRST UNIT, because the first unit's read-back
+# (`verify_installed_unit`) certifies ONE artifact against ONE policy (its HOME, its delegate pins, its
+# mode flag). Teaching that verifier a second unit is how "the reaper is installed" would start meaning
+# two different things; here each unit is rendered, written, read back and enabled on its own terms.
+# ⛔ A FAILURE HERE FAILS THE INSTALL. The bring-up gates CELL READY on this script's exit code, and the
+# alternative — a warning that the fast pass could not be installed — is the inert-enforcer shape the
+# whole feature exists to remove: the box would read "reaped hourly" while the sink this unit owns grew
+# at a write rate no hourly pass can hold.
+install_cache_trigger_units() {
+    local src_svc="$TEMPLATES_DIR/$CACHE_UNIT_NAME.service" src_tim="$TEMPLATES_DIR/$CACHE_UNIT_NAME.timer"
+    local tmpd changed=0 installed=0 got
+    [ -f "$src_svc" ] && [ -f "$src_tim" ] || {
+        err "REFUSING: $CACHE_UNIT_NAME templates are missing under $TEMPLATES_DIR — without them the box gets the hourly pass only, and a package cache grows at a write rate an hourly pass cannot hold (agent-infra#4168)"
+        return 1; }
+    case "$CACHE_TRIGGER_FREE_MB" in ''|*[!0-9]*)
+        err "REFUSING: DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB='$CACHE_TRIGGER_FREE_MB' is not a whole number of MB — it is rendered into a persistent unit and decides when the fast pass acts"
+        return 1 ;; esac
+    case "$CACHE_PASS_CAP_MB" in ''|*[!0-9]*)
+        err "REFUSING: DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB='$CACHE_PASS_CAP_MB' is not a whole number of MB — it is the per-pass cap that keeps a 10-minute pass from becoming the load"
+        return 1 ;; esac
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-cache-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
+    render "$src_svc" "$tmpd/$CACHE_UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }
+    render "$src_tim" "$tmpd/$CACHE_UNIT_NAME.timer" || { rm -rf "$tmpd"; return 1; }
+    if [ "$TARGET" = "user" ]; then
+        sed -i.bak '/^User=/d' "$tmpd/$CACHE_UNIT_NAME.service" && rm -f "$tmpd/$CACHE_UNIT_NAME.service.bak"
+    fi
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_line "dry-run: would install $CACHE_UNIT_NAME.{service,timer} to $UNIT_DIR (target=$TARGET) and enable $CACHE_UNIT_NAME.timer"
+        log_line "--- $CACHE_UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$CACHE_UNIT_NAME.service"
+        log_line "--- $CACHE_UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$CACHE_UNIT_NAME.timer"
+        rm -rf "$tmpd"; return 0
+    fi
+    cmp -s "$tmpd/$CACHE_UNIT_NAME.service" "$UNIT_DIR/$CACHE_UNIT_NAME.service" || changed=1
+    cmp -s "$tmpd/$CACHE_UNIT_NAME.timer" "$UNIT_DIR/$CACHE_UNIT_NAME.timer" || changed=1
+    mkdir -p "$UNIT_DIR" 2>/dev/null || true
+    case "$TARGET" in
+        override|user) cp -f "$tmpd/$CACHE_UNIT_NAME.service" "$tmpd/$CACHE_UNIT_NAME.timer" "$UNIT_DIR/" 2>/dev/null && installed=1 ;;
+        *) ${SUDO-sudo -n} install -m 0644 "$tmpd/$CACHE_UNIT_NAME.service" "$UNIT_DIR/$CACHE_UNIT_NAME.service" \
+               && ${SUDO-sudo -n} install -m 0644 "$tmpd/$CACHE_UNIT_NAME.timer" "$UNIT_DIR/$CACHE_UNIT_NAME.timer" \
+               && installed=1 ;;
+    esac
+    rm -rf "$tmpd"
+    if [ "$installed" != 1 ]; then
+        err "could not write $CACHE_UNIT_NAME.{service,timer} into $UNIT_DIR (target=$TARGET) — the fast cache pass is NOT installed"
+        return 1
+    fi
+    $SC daemon-reload >/dev/null 2>&1 || { err "daemon-reload failed after installing $CACHE_UNIT_NAME"; return 1; }
+    # ⛔ READ THE ARTIFACT BACK BEFORE ARMING IT — the same rule, and the same measured reason, as the
+    # hourly unit: a unit that systemd would refuse (a leftover placeholder, a bad ExecStart) must fail
+    # the install BEFORE the clock starts, never after. This asks the one question that matters for THIS
+    # unit — does its ExecStart carry `--size-trigger` — because without that flag the 10-minute timer
+    # would run the FULL pass 144 times a day, which is the opposite of what it is for.
+    # ⛔ AND IT GOES THROUGH `unit_text_effective`, NOT A BARE `$SC cat` (#4169). A direct `cat` asked a
+    # manager that cannot answer under `target=override` — where the installed FILE *is* the artifact,
+    # because the unit dir is an override dir the manager never loaded — so every override install
+    # REFUSED here, including the suite's own fixture: 26 installer assertions red, and no way to see
+    # from them that the unit was perfectly fine. That is the "two readers of one fact" defect this
+    # file already removed twice (#1872/#4034): the hourly unit's read-back has always used this same
+    # shared reader, which prefers the manager where the manager is authoritative and falls back to the
+    # file where it is not. One reader, both units.
+    got="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$CACHE_UNIT_NAME.service" 2>/dev/null)" || got=""
+    if [ -z "$got" ]; then
+        err "REFUSING to report the fast cache pass as installed: the installed $CACHE_UNIT_NAME.service could not be READ BACK from the $TARGET artifact (target dir $UNIT_DIR)"
+        return 1
+    fi
+    # ⛔ AND IT IS CHECKED IN THE ARGV, NOT ANYWHERE IN THE TEXT (#4169 round 2). This used to grep the
+    # WHOLE unit, so a COMMENT mentioning the flag satisfied it: MEASURED — a template whose ExecStart lost
+    # `--size-trigger` while its explanatory comment kept the word INSTALLED GREEN, and the 10-minute timer
+    # then ran the FULL pass 144 times a day, which is the false-PASS shape this read-back exists to remove.
+    # The file already owns the right reader: `effective_execstarts` is what systemd will actually run
+    # (after a bare `ExecStart=` reset and any drop-in), so the flag is read where it has to be.
+    local _cache_armed=0 _exec
+    while IFS= read -r _exec; do
+        case "$_exec" in *--size-trigger*) _cache_armed=1 ;; esac
+    done <<<"$(effective_execstarts "$got")"
+    if [ "$_cache_armed" != 1 ]; then
+        err "REFUSING: no ExecStart= in the installed $CACHE_UNIT_NAME.service carries --size-trigger — a 10-minute timer without it runs the FULL pass every 10 minutes"
+        err "  installed ExecStart: $(effective_execstarts "$got" | head -1)"
+        return 1
+    fi
+    $SC enable --now "$CACHE_UNIT_NAME.timer" || { err "could not enable/start $CACHE_UNIT_NAME.timer — the 10-minute cache pass will NOT run unattended"; return 1; }
+    log_line "  cache pass: $CACHE_UNIT_NAME.timer enabled (every 10 min, fires only below ${CACHE_TRIGGER_FREE_MB}MB free, capped at ${CACHE_PASS_CAP_MB}MB per pass)"
+    return 0
+}
+
 do_install_launchd() {
     local src_plist="$LAUNCHD_TEMPLATES_DIR/$LABEL.plist"
     local tmpd changed=0 loaded=0
@@ -1209,6 +1316,11 @@ except ET.ParseError as e:
     log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     log_line "  reaper: $REAPER"
     log_line "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
+    # ⛔ NOT A SILENT GAP (#4168). The size-triggered pass ships as a systemd unit pair, and this arm is
+    # launchd. Naming it is the difference between "not applicable here" and "nobody installed it": the
+    # measured sink lives on the Linux cells, and a Mac that carries runner installs can run the same
+    # pass by hand or from its own scheduler.
+    log_line "  cache pass: NOT INSTALLED on this platform — the size-triggered runner-cache pass ships as $CACHE_UNIT_NAME.{service,timer} for systemd. Run it here with: bash $REAPER --apply --size-trigger"
     log_line "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
     log_line "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     log_line "  state:  $STATE_DIR/disk-reaper.status"
@@ -1266,6 +1378,11 @@ do_install_systemd() {
         log_line "--- $UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.service"
         log_line "--- $UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.timer"
         rm -rf "$tmpd"
+        # ⛔ THE SECOND UNIT IS PREVIEWED TOO (#4168). A dry run that showed only the hourly artifact
+        # would describe a box that does not exist after `--install` — the fast cache pass is installed
+        # by this same verb, and a preview that omits it makes the thresholds it renders unreadable
+        # before they are baked into a persistent unit. Its own DRY_RUN branch renders and prints.
+        install_cache_trigger_units || return 1
         return 0
     fi
 
@@ -1322,6 +1439,11 @@ do_install_systemd() {
         fi
         log_line "  linger: enabled (the user timer survives logout)"
     fi
+
+    # ⛔ THE FAST PASS IS INSTALLED HERE, AFTER THE HOURLY ONE IS VERIFIED AND ARMED. Order matters:
+    # if the hourly unit is refused, the box has no reaper at all and this script must fail before it
+    # spends an install on a pass that covers one class.
+    install_cache_trigger_units || return 1
 
     log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     log_line "  reaper: $REAPER"
@@ -1414,7 +1536,8 @@ do_status() {
         fi
         return 0
     fi
-    if ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
+    if ! _hourly="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$UNIT_NAME.service" 2>/dev/null)" \
+       || [ -z "$_hourly" ]; then
         log_line "installed=no"
         return 1
     fi
@@ -1426,6 +1549,25 @@ do_status() {
     log_line "next_run=${next:-unknown}"
     LAST_RUN="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null || echo unknown)"
     log_line "last_run=$LAST_RUN"
+    # ⛔ THE FAST PASS HAS ITS OWN STATE AND MUST BE READABLE (#4168). A unit that installed but was
+    # never enabled is exactly the inert enforcer this verb exists to expose, and it is a SEPARATE
+    # artifact from the hourly one — reporting only the hourly timer would say "scheduled" about a box
+    # whose package cache has no clock at all. Reported, never fatal: the hourly pass still covers every
+    # class (this one at a cadence that cannot hold a reserve), so a missing fast pass is a WARNING with
+    # a named remedy rather than a red that would hide the hourly unit's own verdict.
+    if _cache_unit="$(unit_text_effective "$SC" "$TARGET" "$UNIT_DIR" "$CACHE_UNIT_NAME.service" 2>/dev/null)" \
+       && [ -n "$_cache_unit" ]; then
+        _cache_timer_active="$($SC is-active "$CACHE_UNIT_NAME.timer" 2>/dev/null || echo no)"
+        log_line "cache_pass_installed=yes"
+        log_line "cache_pass_timer_active=${_cache_timer_active:-unknown}"
+        case "${_cache_timer_active:-}" in
+            active|activating) ;;
+            *) err "the size-triggered cache pass timer is '${_cache_timer_active:-unknown}', not active — the runner package cache is only covered by the hourly pass, which cannot hold a reserve against its write rate (agent-infra#4168). Re-run: bash $0 --install" ;;
+        esac
+    else
+        log_line "cache_pass_installed=no"
+        err "the size-triggered cache pass ($CACHE_UNIT_NAME) is NOT installed — the runner package cache is only covered by the hourly pass (agent-infra#4168). Re-run: bash $0 --install"
+    fi
     REC=""; REC_RC=0
     if [ -n "$REAPER" ] && [ -f "$REAPER" ]; then
         log_line "--- pass record ---"
@@ -1499,15 +1641,24 @@ do_uninstall() {
         return 0
     fi
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+    # ⛔ THE FAST-CACHE PAIR IS PART OF THIS INSTALL AND GOES WITH IT (#4169). `--install` writes TWO
+    # unit pairs — the hourly pass and the 10-minute size-triggered cache pass — and this verb removed
+    # only the first, then printed "uninstalled" and exited 0 while `eldato-disk-reaper-cache.timer`
+    # stayed ENABLED. Measured (T51): four files installed, two left behind, rc 0 — an armed ten-minute
+    # timer still firing the reaper after the operator uninstalled it, which is the exact shape the
+    # read-back below exists to catch. The per-target arms and the verification now cover both pairs.
+    $SC disable --now "$CACHE_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    local _h_svc="$UNIT_DIR/$UNIT_NAME.service" _h_tim="$UNIT_DIR/$UNIT_NAME.timer"
+    local _c_svc="$UNIT_DIR/$CACHE_UNIT_NAME.service" _c_tim="$UNIT_DIR/$CACHE_UNIT_NAME.timer"
     # Same rule as the install: the file op follows the TARGET. For a user unit the files are the
     # user's own, so a `rm -f` through `${SUDO-sudo -n}` fails silently and the box reports itself
     # uninstalled while the (armed) unit files remain for the next daemon-reload to resurrect.
     case "$TARGET" in
-        user) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        user) rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=user)"; return 1; } ;;
-        override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        override) rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=override)"; return 1; } ;;
-        *)    ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+        *)    ${SUDO-sudo -n} rm -f "$_h_svc" "$_h_tim" "$_c_svc" "$_c_tim" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=system)"; return 1; } ;;
     esac
     $SC daemon-reload >/dev/null 2>&1 || true
@@ -1520,7 +1671,7 @@ do_uninstall() {
     # unit is REPORTED, not failed — a cell can legitimately carry a system-scope install while an
     # operator uninstalls a user-scope one, and failing that would be a false block on the only way to
     # remove it (measured: a real /etc/systemd/system install made every user-target uninstall rc=1).
-    if [ -e "$UNIT_DIR/$UNIT_NAME.service" ] || [ -e "$UNIT_DIR/$UNIT_NAME.timer" ]; then
+    if [ -e "$_h_svc" ] || [ -e "$_h_tim" ] || [ -e "$_c_svc" ] || [ -e "$_c_tim" ]; then
         err "NOT reporting this as uninstalled — the unit files are STILL PRESENT in $UNIT_DIR (target=$TARGET)"
         err "(an enabled timer here still fires the armed pass; remove them as the right user, then re-run)"
         return 1
@@ -1536,8 +1687,12 @@ do_uninstall() {
              $(printf '%s' "${DISK_REAPER_EXTRA_SCOPES:-}" | tr ':' ' '); do
         [ -n "$d" ] || continue
         [ "$d" = "$UNIT_DIR" ] && continue
-        if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
-            err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
+        _also=""
+        for _u in "$UNIT_NAME" "$CACHE_UNIT_NAME"; do
+            if [ -e "$d/$_u.service" ] || [ -e "$d/$_u.timer" ]; then _also="${_also}${_also:+, }$_u"; fi
+        done
+        if [ -n "$_also" ]; then
+            err "note: $_also is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
             err "      an enabled timer THERE still fires the armed pass; uninstall it from that scope"
         fi
     done

@@ -258,6 +258,30 @@ CLOCK_PROBE_TIMEOUT_S="${RUNNER_CLOCK_PROBE_TIMEOUT_S:-10}"
 # only values that are below any plausible one.
 TMP_MAX_AGE_MIN="${RUNNER_TMP_MAX_AGE_MIN:-1440}"   # 24 h: far above this fleet's jobs, so the START sweep cannot meet live scratch here
 TMP_MAX_AGE_FLOOR_MIN=360                            # 6 h — GitHub-hosted job ceiling; see above
+# ── ONE per-box CACHE ROOT for every instance of this pool (#4168) ─────────────────────────────
+# MEASURED (2026-11-19): every runner install kept its OWN unbounded `.cache` under the install root
+# (/opt/gh-runner-x64/.cache **40.7 GB**, one install on cell-2 at **50.1 GB**, ≈445 GB fleet-wide). The
+# installs are per-slot, so the multiplier is the SLOT COUNT: N slots holding N copies of the same
+# package content. `XDG_CACHE_HOME` is the variable the measured consumers under a job honour — uv
+# derives `UV_CACHE_DIR` from it, and pip and Go follow it; npm does NOT (its documented default stays
+# `~/.npm` under POSIX, and `$XDG_CACHE_HOME/npm` is still only a proposal, npm/rfcs#389), so an npm
+# cache stays outside this root. That does not weaken the mechanism: uv is the measured 50 GB consumer
+# and every slot shares ONE `$HOME`, so the npm cache is not multiplied per slot either. The listener
+# hands ITS environment to every job step — so pointing `XDG_CACHE_HOME` at ONE directory per box
+# removes the multiplication. That is the durable half of #4168; the reaper class `runner-cache`
+# (scripts/reap-runner-cache.sh) is the guard that bounds the directory itself.
+# ⛔ ABSOLUTE AND OUTSIDE THE INSTALL DIRS. An install-local default is the defect: it recreates one
+# cache per slot. The default sits beside the instances (`$RUNNER_ROOT/_cache`), which is one directory
+# for the whole box whatever the slot count, and it is EXCLUDED from `slots`/`status` by the same
+# rule that excludes `_template` (no `.runner`).
+# OVERRIDE: `RUNNER_CACHE_ROOT` — e.g. to put the cache on a dedicated volume; the reaper's
+# `DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` must name the same path (they are two tools' views of one
+# directory, so a box that moves it says so in both places).
+# ⛔ `-` NOT `:-` (#4169 review, P3). With `:-` an operator who EMPTIED `RUNNER_CACHE_ROOT` got the
+# default substituted before `ensure_cache_root` could look at it, so the "set but empty" arm below was
+# unreachable dead code that read as a guard — and it picked the WIDER value for the operator who
+# emptied the seam, which is the delete direction this file's sibling seams refuse three times over.
+CACHE_ROOT="${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}"
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
 POOL_LABEL_X64="self-hosted-x64"
@@ -1075,6 +1099,42 @@ instance_tmpdir() {
 # below instead of by the runner's per-job cleanup.
 instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 
+# ── the shared cache root (#4168) ──────────────────────────────────────────────────────────────
+# ⛔ PRINTED AND CREATED AT START, exactly as the private temp root is, and for the same reason: an env
+# an operator cannot see is one they cannot audit, and a listener handed a `XDG_CACHE_HOME` that does
+# not exist has its jobs fall back to whatever the image gives them — i.e. back into the per-install
+# directory this change exists to stop multiplying.
+cache_root() { printf '%s' "$CACHE_ROOT"; }
+
+ensure_cache_root() { # 0 ok · 2 cannot-act (nothing started)
+  local c="$CACHE_ROOT" p
+  case "$c" in
+    '') err "cannot-act why=cache-root-empty (RUNNER_CACHE_ROOT is set but empty; an empty XDG_CACHE_HOME is a path the listener would resolve against each job's cwd)"; return 2 ;;
+    /*) : ;;
+    *) err "cannot-act why=cache-root-not-absolute path=$c (RUNNER_CACHE_ROOT must be an absolute path — a relative one is resolved against each JOB's working directory, so no directory created here would be the one a job uses)"; return 2 ;;
+  esac
+  # The same write-AND-search test the temp root's sibling makes: `mktemp`-style consumers need both,
+  # and a mode-200 directory passes `-w` alone.
+  if [ -d "$c" ]; then
+    [ -w "$c" ] && [ -x "$c" ] && return 0
+    err "cannot-act why=cache-root-unwritable path=$c — nothing started: this user needs WRITE and SEARCH (w=$([ -w "$c" ] && echo y || echo n) x=$([ -x "$c" ] && echo y || echo n)) on the shared cache root, and every job's package manager would otherwise fail on a read-only cache"
+    return 2
+  fi
+  if [ "$DRY" = 1 ]; then
+    p="$c"; while [ ! -e "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do p="$(dirname "$p")"; done
+    if [ -d "$p" ] && [ -w "$p" ] && [ -x "$p" ]; then
+      log_line "dry-run: would create cache-root=$c (XDG_CACHE_HOME for every instance of this pool)"
+      return 0
+    fi
+    err "cannot-act why=cache-root-uncreatable path=$c — nothing started: the shared cache root cannot be created, so every instance would fall back to a per-install cache (the multiplication this root removes)"
+    return 2
+  fi
+  mkdir -p -m 700 "$c" 2>/dev/null || true
+  [ -d "$c" ] || { err "cannot-act why=cache-root-uncreatable path=$c — nothing started: the shared cache root could not be created, so every instance would fall back to a per-install cache"; return 2; }
+  log_line "created cache-root=$c (XDG_CACHE_HOME for every instance of this pool; override with RUNNER_CACHE_ROOT)"
+  return 0
+}
+
 # dir_mode <path> — the permission bits as `stat` spells them (`700`, `755`, …), or EMPTY when the host
 # offers neither form (review P2-2 reads this). `stat -c` is GNU and `stat -f` is BSD/macOS; this file already carries that exact
 # pair for mtime (`.runner` age) and for inode identity, so this is the same portable reading rather than
@@ -1383,13 +1443,19 @@ start_listener() {
   # A `.env` that names a TMPDIR still WINS: `run.sh` sources it AFTER this and overwrites the value,
   # which is the documented precedence (an explicit operator setting beats a default) — and the export
   # here uses that same value in that case, so all three variables agree either way.
+  # ⛔ THE SHARED CACHE ROOT IS SATISFIED BEFORE THE EXEC TOO (#4168): a listener handed an
+  # `XDG_CACHE_HOME` that does not exist starts fine and then writes each job's packages somewhere
+  # else, so the directory has to exist before the process that will use it.
+  ensure_cache_root || return 2
   t="$(instance_tmpdir "$d")" || return 2
   [ -n "$t" ] || t="$(instance_tmp_root "$d")"
   # PRINT THE PATHS, as the memory floor prints its reading: an env an operator cannot see is one they
   # cannot audit, and this is the line that proves two instances of one box are isolated.
   log_line "env name=$(basename "$d") TMPDIR=$t TMP=$t TEMP=$t (RUNNER_TEMP is the runner's own)"
+  log_line "cache-root=$(cache_root) XDG_CACHE_HOME for name=$(basename "$d") — ONE directory per box, so N slots do not hold N copies of the same packages (agent-infra#4168)"
   (
     cd "$d" || exit 2
+    XDG_CACHE_HOME="$(cache_root)"; export XDG_CACHE_HOME
     TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"
   ) >>"$log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do

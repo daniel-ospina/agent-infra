@@ -323,6 +323,16 @@ if [ -n "${FIXTURE_TMPDIR_LOG:-}" ]; then
   if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR:-}" ]; then printf 'present %s\n' "$TMPDIR"
   else printf 'absent %s\n' "${TMPDIR:-<unset>}"; fi >>"$FIXTURE_TMPDIR_LOG"
 fi
+# ⛔ THE SAME WITNESS FOR THE SHARED CACHE ROOT (#4168). `XDG_CACHE_HOME` is the variable the measured
+#   consumers under a job honour (uv derives `UV_CACHE_DIR` from it; pip and Go follow it), so WHICH
+#   value the listener actually handed to the job is the only assertion that pins the durable half of
+#   #4168. Asserting `cache-root=…` on the manager's stdout would prove the manager PRINTED a path, not
+#   that the listener's children inherited it — and `ensure_cache_root` can be deleted entirely while
+#   that line still prints.
+if [ -n "${FIXTURE_CACHE_LOG:-}" ]; then
+  if [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "${XDG_CACHE_HOME:-}" ]; then printf 'present %s\n' "$XDG_CACHE_HOME"
+  else printf 'absent %s\n' "${XDG_CACHE_HOME:-<unset>}"; fi >>"$FIXTURE_CACHE_LOG"
+fi
 exec "$DIR/bin/Runner.Listener" run
 STUB
 cat >"$TEMPLATE/bin/Runner.Listener" <<'STUB'
@@ -3172,6 +3182,123 @@ case "$out" in
   *"add --name pi-runner-noregr"*) bad "the refusal still advises 'add --name', which refuses the same path with rc 4" ;;
   *) ok "the refusal does not send the operator to a verb that refuses the same path" ;;
 esac
+
+# ── THE SHARED CACHE ROOT (#4168) — the DURABLE HALF, ASSERTED ─────────────────────────────────
+# ⛔ FIVE NEW GUARDS ON THE DELETE-DIRECTION SEAM SHIPPED WITH NO ASSERTION AT ALL (#4169 review, P2):
+# the `-` (not `:-`) in the default, the four `ensure_cache_root` refusal arms, and the
+# `XDG_CACHE_HOME` export. The only row that looked like coverage — `reap-runner-cache.test.sh` case P
+# — re-evaluated the ASSIGNMENT LINE with a no-op `sed`, so it stayed green with `ensure_cache_root`
+# deleted, with the export deleted, and with `-` reverted to `:-`. agent-infra#3442 rule 1 wants a
+# mutant per new guard, so every assertion below has one that must redden it.
+echo "── cache root: ONE per-box XDG_CACHE_HOME, and every way it can be refused ──"
+CACHELOG="$T/cache.log"; : >"$CACHELOG"
+fresh_pool cacher; reset_logs
+register pi-runner-cacher
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CACHE_LOG="$CACHELOG" run restart --name pi-runner-cacher)"
+assert_eq "$?" "0" "a start with the default cache root succeeds"
+assert_contains "$out" "cache-root=$RUNNER_ROOT/_cache" \
+  "the manager PRINTS the one root it hands the listener (ONE per box, not one per slot)"
+assert_dir "$RUNNER_ROOT/_cache" "and the directory really exists — created BEFORE the exec, not hoped for"
+assert_eq "$(mode_of "$RUNNER_ROOT/_cache")" "700" "mode 0700, the same rule as the private temp root"
+# ⛔ THE ASSERTION THAT PINS THE DURABLE HALF: the LISTENER recorded what it inherited, from INSIDE
+# `run.sh`, at the instant a job would be handed that environment. A `cache-root=` line on the
+# manager's stdout proves a PRINT, not an inherited environment — delete `ensure_cache_root` and the
+# print still happens.
+assert_eq "$(tail -1 "$CACHELOG" 2>/dev/null)" "present $RUNNER_ROOT/_cache" \
+  "the listener's own environment carries XDG_CACHE_HOME=<the one per-box root>"
+
+# (1) SET-BUT-EMPTY IS A REFUSAL: that is the `-` and not `:-` in the default (#4169 review, P3).
+# ⛔ WITH `:-` this arm is UNREACHABLE DEAD CODE that reads as a guard, and it picks the WIDER value for
+# the operator who emptied the seam — the delete direction this file refuses three times over.
+fresh_pool cacheempty; reset_logs
+register pi-runner-cache2
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT= run restart --name pi-runner-cache2)"
+assert_eq "$?" "2" "an EMPTIED RUNNER_CACHE_ROOT is cannot-act (rc 2), never the default"
+assert_contains "$out" "cannot-act why=cache-root-empty" "naming the state it refused"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cache2") ))" "0" "and NOTHING was started"
+assert_absent "$RUNNER_ROOT/_cache" "and the default root was not silently created for it"
+
+# (2) A RELATIVE value resolves against each JOB's cwd, so no directory created here is the one a job
+# uses — refused for the same reason a relative TMPDIR is.
+fresh_pool cacherl; reset_logs
+register pi-runner-cache3
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT=relative/cache run restart --name pi-runner-cache3)"
+assert_eq "$?" "2" "a RELATIVE cache root is cannot-act (rc 2)"
+assert_contains "$out" "cannot-act why=cache-root-not-absolute path=relative/cache" "naming the shape AND the value"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cache3") ))" "0" "and nothing was started"
+
+# (3) AN UNCREATABLE root starts nothing: a FILE where a parent directory must be (portable ENOTDIR).
+fresh_pool cachebad; reset_logs
+register pi-runner-cache4
+: >"$RUNNER_ROOT/blocker"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT="$RUNNER_ROOT/blocker/_cache" run restart --name pi-runner-cache4)"
+assert_eq "$?" "2" "an UNCREATABLE cache root is cannot-act (rc 2), never a start that falls back per-install"
+assert_contains "$out" "cannot-act why=cache-root-uncreatable path=$RUNNER_ROOT/blocker/_cache" \
+  "naming the path it could not create"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cache4") ))" "0" "and nothing was started"
+
+# (4) AN EXISTING BUT UNWRITABLE root starts nothing (a root shell passes `-w` anyway, so it is skipped).
+fresh_pool cachelock; reset_logs
+register pi-runner-cache5
+mkdir -p "$RUNNER_ROOT/locked"
+chmod 500 "$RUNNER_ROOT/locked"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unwritable cache root (a root shell writes it anyway)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT="$RUNNER_ROOT/locked" run restart --name pi-runner-cache5)"
+  assert_eq "$?" "2" "an UNWRITABLE cache root is cannot-act (rc 2)"
+  assert_contains "$out" "cannot-act why=cache-root-unwritable path=$RUNNER_ROOT/locked" "naming the path and why"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cache5") ))" "0" "and nothing was started"
+fi
+chmod 700 "$RUNNER_ROOT/locked" 2>/dev/null || true
+
+# ── MUTANTS: each of the three guards above must be load-bearing on its own ─────────────────────
+MUT_CR="$T/mutant-cache-root-ci_runner_pool.sh"
+MUT_CX="$T/mutant-cache-export-ci_runner_pool.sh"
+MUT_CC="$T/mutant-cache-call-ci_runner_pool.sh"
+python3 - "$POOL" "$MUT_CR" "$MUT_CX" "$MUT_CC" <<'PY'
+import sys
+src, dst_cr, dst_cx, dst_cc = sys.argv[1:5]
+text = open(src).read()
+# (a) `-` reverted to `:-`: the set-but-empty arm becomes unreachable and the default is substituted.
+needle = 'CACHE_ROOT="${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}"'
+assert text.count(needle) == 1, "the cache-root default moved: update the mutation target"
+open(dst_cr, "w").write(text.replace(needle, 'CACHE_ROOT="${RUNNER_CACHE_ROOT:-$RUNNER_ROOT/_cache}"'))
+# (b) the export removed: the manager still prints a cache-root, the listener inherits nothing.
+needle2 = '    XDG_CACHE_HOME="$(cache_root)"; export XDG_CACHE_HOME\n'
+assert text.count(needle2) == 1, "the XDG_CACHE_HOME export moved: update the mutation target"
+open(dst_cx, "w").write(text.replace(needle2, ""))
+# (c) the guard CALL removed: every refusal arm becomes decoration and a listener starts anyway.
+needle3 = "  ensure_cache_root || return 2\n"
+assert text.count(needle3) == 1, "the ensure_cache_root call moved: update the mutation target"
+open(dst_cc, "w").write(text.replace(needle3, ""))
+PY
+assert_file "$MUT_CR" "the cache-root-default mutation copy was produced"
+assert_file "$MUT_CX" "the export mutation copy was produced"
+assert_file "$MUT_CC" "the guard-call mutation copy was produced"
+fresh_pool cachemut; reset_logs
+register pi-runner-cachemut
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT= bash "$MUT_CR" restart --name pi-runner-cachemut 2>&1)"
+case "$out" in
+  *"cannot-act why=cache-root-empty"*) bad "MUTANT SURVIVED: with ':-' the emptied seam is silently defaulted — the assertion pins nothing" ;;
+  *) ok "MUTANT: restoring ':-' makes the emptied-seam refusal unreachable (the assertion discriminates)" ;;
+esac
+fresh_pool cachexmut; reset_logs
+register pi-runner-cachexmut
+: >"$CACHELOG"
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CACHE_LOG="$CACHELOG" bash "$MUT_CX" restart --name pi-runner-cachexmut >/dev/null 2>&1
+case "$(tail -1 "$CACHELOG" 2>/dev/null)" in
+  *absent*) ok "MUTANT: without the export the listener inherits no XDG_CACHE_HOME (the assertion discriminates)" ;;
+  *) bad "MUTANT SURVIVED: the listener still inherited a cache home with the export deleted" ;;
+esac
+fresh_pool cachemut2; reset_logs
+register pi-runner-cachemut2
+: >"$RUNNER_ROOT/blocker"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CACHE_ROOT="$RUNNER_ROOT/blocker/_cache" bash "$MUT_CC" restart --name pi-runner-cachemut2 2>&1)"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cachemut2") ))" "1" \
+  "MUTANT: without the guard CALL an uncreatable cache root starts a listener anyway (the assertion discriminates)"
+
+kill_fixture_listeners
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then

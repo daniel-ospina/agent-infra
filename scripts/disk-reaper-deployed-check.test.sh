@@ -73,9 +73,28 @@ command_not_found_handle() {
 
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
-FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh
-lib/cell-home.sh lib/live-paths.sh"
+# ⛔ THE PINNED SET IS DERIVED FROM THE CHECKER, NEVER MIRRORED (#4169). This was a hand-kept COPY of
+# the checker's `FILES`, and the copy is the defect: adding a delete-policy owner to the checker left
+# the FIXTURE one file short, so the checker reported the newly-pinned file MISSING from every fixture
+# and ELEVEN control cases reddened for a reason that had nothing to do with the arm each one covers.
+# Measured on #4169: `reap-runner-cache.sh` was added to `FILES` (the change's whole point) and D1 x4,
+# D2b, D4, D5, D10, D11, D13 x2 went red — 63/63 green on main, 52/11 here, with nothing wrong in any
+# arm. A derived set cannot drift, and the case that must actually prove coverage of a new owner
+# (D15 below) is what reddens when the checker drops one — a mirrored list proved nothing either way.
+FILES="$(awk '
+    !f && $0 ~ /^FILES="/ { f = 1; $0 = substr($0, index($0, "=\"") + 2) }
+    f {
+        if ($0 ~ /"$/) { printf "%s", substr($0, 1, length($0) - 1); exit }
+        printf "%s ", $0
+    }
+' "$CHECK")"
+# ⛔ FAIL CLOSED ON AN EMPTY DERIVATION (the #3405 lesson: a fixture that silently holds nothing is a
+# silently-skipped suite, not a green one). A parse break here would otherwise leave every case
+# comparing against an empty deployed dir with no clue why.
+if [ -z "${FILES// /}" ]; then
+    echo "  ❌ harness bug: could not derive FILES from $CHECK — the pinned-set parse broke"
+    echo "PASS=0 FAIL=1"; exit 1
+fi
 
 # ⛔ ONE EXIT TRAP CLEANS EVERYTHING THIS SUITE CREATES (review of #3422, P3). It leaked two ways: the
 # undefined-command record (a trap was removed here without a replacement) and every per-fixture temp
@@ -187,6 +206,52 @@ OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
 eq "$RC" "1" "D13 the delete-policy owner MISSING from the deployed set is drift (exit 1), never ok"
 has "$OUT" "reap-runner-work.sh — MISSING" "D13 …and it is NAMED, so the unhashable file cannot be the quiet one"
 mv "$T/deployed/.gone" "$T/deployed/reap-runner-work.sh"
+
+# ── D15: reap-runner-cache.sh is IN the pinned set too (#4168) ─────────────────────────
+# ⛔ THIS IS THE CASE THAT MUST RED WHEN THE CHECKER DROPS THE OWNER — and, since `FILES` is DERIVED
+# above, it is also the only case that can: a mirrored fixture would have gone red for the WRONG
+# reason (a short fixture), which proves nothing about the checker. `reap-runner-cache.sh` holds the
+# delete policy for the runners' per-install PACKAGE CACHE (≈445 GB measured across five boxes), and
+# it is pinned in the fast unit's `Environment=RUNNER_CACHE_REAPER=`. A cell carrying an earlier
+# farmed copy — or no copy — would run a different delete policy (or none) while this checker
+# certified `deployed ok` over a set that never mentioned it. So the name must be IN the record, and
+# removing it from the deployed dir must be DRIFT, named.
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" --source "$T/src" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
+eq "$RC" "0" "D15 control: a complete stamp over the set including reap-runner-cache.sh verifies"
+has "$(cat "$REC")" "  reap-runner-cache.sh" "D15 the record CARRIES reap-runner-cache.sh — it is inside the check, not beside it"
+mv "$T/deployed/reap-runner-cache.sh" "$T/deployed/.gone"
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "1" "D15 the package-cache delete-policy owner MISSING from the deployed set is drift (exit 1)"
+has "$OUT" "reap-runner-cache.sh — MISSING" "D15 …and it is NAMED, never the quiet one"
+mv "$T/deployed/.gone" "$T/deployed/reap-runner-cache.sh"
+# ⛔ NON-VACUITY: the case above can only pass because the checker PINS the file. Drop the name from
+# the checker's own `FILES` and the four assertions above must red — otherwise they assert the
+# fixture, not the checker. The whole suite has to re-run against the mutant, so this is a nested
+# invocation of this file against a rewritten copy of the checker.
+MUT_T="$(mktemp -d "${TMPDIR:-/tmp}/drdc-mut.XXXXXX")"
+_ENV_DIRS="$_ENV_DIRS $MUT_T"
+mkdir -p "$MUT_T/scripts"
+awk 'BEGIN{d=0} /^FILES="/{d=1} d{ line=$0; gsub(/reap-runner-cache\.sh/,"",line); print line; if ($0 ~ /"$/) d=0; next } {print}' \
+    "$CHECK" >"$MUT_T/scripts/disk-reaper-deployed-check.sh"
+chmod +x "$MUT_T/scripts/disk-reaper-deployed-check.sh"
+# ⛔ THE GREP MUST BE SCOPED TO THE `FILES` BLOCK. Grepping the whole mutant file proves nothing: the
+# checker's own COMMENT block legitimately names `reap-runner-cache.sh`, so a whole-file grep answered
+# `found` whether the rewrite applied or not — an assertion that cannot go red, which is the vacuity
+# this very block exists to exclude (measured: it passed while the rewrite was a no-op).
+if sed -n '/^FILES="/,/"$/p' "$MUT_T/scripts/disk-reaper-deployed-check.sh" | grep -q 'reap-runner-cache\.sh'; then
+    bad "D15 mutant: the rewrite DID NOT APPLY — the checker's FILES still pins reap-runner-cache.sh"
+else
+    ok "D15 mutant: the rewrite APPLIED (the checker's FILES no longer pins reap-runner-cache.sh)"
+fi
+OUT="$(bash "$MUT_T/scripts/disk-reaper-deployed-check.sh" --stamp --dir "$T/deployed" --record "$T/mut.record" 2>&1)"; RC=$?
+if [ "$RC" = "0" ] && ! grep -qF '  reap-runner-cache.sh' "$T/mut.record"; then
+    ok "D15 mutant: the un-pinned checker's record OMITS reap-runner-cache.sh (so D15's assertions are about the checker)"
+else
+    bad "D15 mutant: the un-pinned checker still records reap-runner-cache.sh (got rc=$RC) — D15 is vacuous"
+fi
+rm -rf "$MUT_T"
 
 # ── D7/D8: an unproven deployment is exit 3, never 0 ────────────────────────────
 mk_env

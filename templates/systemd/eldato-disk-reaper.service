@@ -53,6 +53,14 @@ Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
 # same reason as the owners above — and this class is the one with no pre-existing policy owner,
 # so a pin that resolved to an older farmed copy would run a DIFFERENT delete rule.
 Environment=RUNNER_WORK_REAPER={{REAPER_DIR}}/reap-runner-work.sh
+# The runner package-cache owner (#4168). `runner-cache` is in the DEFAULT `--only` list, so THIS unit
+# runs it every hour as well as the fast cache unit below — and a delegate that is pinned in one
+# artifact and not the other is the exact defect this block exists to prevent: it resolved through
+# `find_delegate`'s `$HOME/.pi/agent/scripts` fallback, so a box with an older farmed copy ran THAT
+# delete policy while the installed one (the one `disk-reaper-deployed-check.sh` certifies) was never
+# consulted. Every delegate `disk-reaper.sh` resolves is pinned in BOTH scheduled artifacts; T67
+# asserts that set equality so a new class cannot land pinned in only one of them.
+Environment=RUNNER_CACHE_REAPER={{REAPER_DIR}}/reap-runner-cache.sh
 # Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
 Nice=10
 IOSchedulingClass=idle
