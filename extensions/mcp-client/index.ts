@@ -608,20 +608,21 @@ export function expandExprTracked(str: string): ExpandedExpr {
   return { value: out, unresolved };
 }
 
-/** Names of `${VAR}`s in `str` that are unset (or "") and declare no `${VAR:-default}`. */
-export function findUnresolvedVars(str: string): string[] {
-  return expandExprTracked(str).unresolved;
-}
-
 /**
  * `${VAR}` expressions that appear in an argv entry, in order — the ONLY thing about `args` that is
  * rendered into a diagnostic.
  *
- * #4189 review (finding 5): `findUnresolvedVars` is the wrong predicate for this field. It asks "is
- * `process.env[NAME]` unset?", but `args` are NEVER env-expanded (agent-infra#696), so the placeholder
- * reaches the child WHETHER OR NOT the variable is set. The headline capability — "name the
- * placeholder" — fired only in the rarer configuration and stayed silent in the normal one.
- * The predicate that matches the field is "does the entry contain a `${...}` at all".
+ * #4189 review (finding 5): "is the variable in this placeholder unset?" is the wrong predicate for
+ * this field. It asks "is `process.env[NAME]` unset?", but `args` are NEVER env-expanded
+ * (agent-infra#696), so the placeholder reaches the child WHETHER OR NOT the variable is set. The
+ * headline capability — "name the placeholder" — fired only in the rarer configuration and stayed
+ * silent in the normal one. The predicate that matches the field is "does the entry contain a
+ * `${...}` at all".
+ *
+ * #4189 review (P3): the unset-variable predicate was exported as `findUnresolvedVars` and this diff
+ * gave it NO production caller — the checker read that as a dead export kept alive by a test naming
+ * the superseded behaviour, and deleted it. `expandExprTracked(...).unresolved` is the live export
+ * behind the `command`/`cwd` fields; nothing else should reintroduce the wrong predicate.
  *
  * #4189 review (finding 1): this deliberately returns only the `${…}` spans, never the surrounding
  * literal — `args` is where this repo documents credentials being inlined (that is why #696 exists),
@@ -638,12 +639,27 @@ export function findArgPlaceholders(arg: string): string[] {
  * Does this argv entry look like a PATH that the child would resolve against its cwd?
  *
  * Deliberately narrow: a flag (`-e`, `--version`) is not a path, and an inline program supplied to
- * `-e` is not one either. This gate only decides whether a relative argv is DANGEROUS when no cwd
- * could be resolved (see finding 4), so a false negative leaves today's behaviour and a false
- * positive refuses a working entry — narrow is the right side to err on.
+ * `-e` is not one either, and neither is a PACKAGE SPECIFIER — see below. This gate only decides
+ * whether a relative argv is DANGEROUS when no cwd could be resolved (see finding 4), so a false
+ * negative leaves today's behaviour and a false positive refuses a working entry — narrow is the
+ * right side to err on.
+ *
+ * ⛔ A PACKAGE SPECIFIER IS NOT A PATH (#4189 review, P3). "contains a `/`" classified
+ * `@brave/brave-search-mcp-server`, `@houtini/gemini-mcp` and `@playwright/mcp@latest` as relative
+ * paths — shapes this repo's OWN `templates/.mcp.base.json` ships. With that reading, an entry written
+ * `{"command":"npx","args":["-y","@scope/pkg"],"cwd":"${SOME_UNSET}"}` would be hard-refused at
+ * stage `config` even though `npx` resolves the package itself and never needed the cwd: a FALSE BLOCK
+ * on an entry that used to run. A scoped specifier resolves inside `node_modules`, never against the
+ * child's cwd, so the one leading `@scope/` segment is excluded here.
+ *
+ * Residual, deliberate: an UNSCOPED specifier with a subpath (`pkg/bin.js`) is still read as a path.
+ * It is indistinguishable from a genuine relative path (`fixtures/server.mjs`) without knowing which
+ * argv the launcher consumes, and guessing there is how a working entry gets refused.
  */
 export function isPathLikeArg(arg: string): boolean {
   if (arg.startsWith("-")) return false;
+  // `@scope/name` or `@scope/name@version` — a package specifier, resolved by the launcher, not the cwd.
+  if (/^@[^/\\\s]+\/[^/\\\s]+$/.test(arg)) return false;
   if (arg.includes("/") || arg.includes("\\")) return true;
   return /\.(?:py|js|mjs|cjs|ts|mts|sh|bash|rb|pl|jar|exe|cmd|bat)$/i.test(arg);
 }
@@ -1527,9 +1543,10 @@ export function renderConnectFailure(
   // out of the transcript. (Rewritten from a review finding — do not "improve" this back to argv.)
   const args = diag.args ?? [];
   // The `${VAR}` spans come from `unresolvedVars`, which the connect path populates with
-  // `findArgPlaceholders` — the predicate for this FIELD ("does the entry contain a `${…}`"), not
-  // `findUnresolvedVars` ("is its variable unset"). Single-sourced deliberately: a renderer that
-  // re-derived the spans itself would leave the caller's population unobservable, i.e. dead weight.
+  // `findArgPlaceholders` — the predicate for this FIELD ("does the entry contain a `${…}`"), not the
+  // unset-variable test `expandExprTracked(...).unresolved` uses for `command`/`cwd`. Single-sourced
+  // deliberately: a renderer that re-derived the spans itself would leave the caller's population
+  // unobservable, i.e. dead weight.
   const argPlaceholderFields = new Map<string, string[]>();
   for (const v of diag.unresolvedVars) {
     if (!v.field.startsWith("args[")) continue;
@@ -2064,7 +2081,12 @@ export class McpServerManager {
       // the PARENT's cwd, and `spawnSync(…, {cwd: ""})` reports `spawnSync python3 ENOENT` — an unset
       // variable reported as a missing interpreter. Passing nothing is the only honest reading.
       const resolvedCommand = expandExprTracked(config.command);
-      const resolvedCwd = config.cwd ? expandExprTracked(config.cwd) : undefined;
+      // ⛔ `!== undefined`, NOT truthiness (#4189 review, P2). `"cwd": ""` is falsy, so a truthiness
+      // test collapsed it to `undefined` BEFORE `cwdUnusable` was computed — the guard's own comment
+      // claimed the `"cwd": ""` spelling was caught, while the predicate could not see it. `""` must
+      // reach the expander so it comes back as `{value: "", unresolved: []}` (resolved by its own
+      // report, unusable in fact) and the refusal below fires.
+      const resolvedCwd = config.cwd !== undefined ? expandExprTracked(config.cwd) : undefined;
       stdioDiag = newConnectDiagnostics({
         command: resolvedCommand.value,
         args: config.args ?? [],

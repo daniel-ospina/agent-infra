@@ -106,6 +106,33 @@ writeFileSync(
         cwd: "${AGENT_INFRA_PATH_4189_EMPTY:-}",
         lazy: true,
       },
+      // #4189 review (P2) — the SAME fail-open, third spelling: a LITERAL empty `cwd`. `config.cwd` is
+      // falsy here, so the guard's `config.cwd ? … : undefined` collapsed it to `undefined` BEFORE
+      // `cwdUnusable` was computed: no refusal, no cwd, silent inheritance — while the doc and the
+      // code comment both claimed this spelling was caught.
+      "relative-args-literal-empty-cwd": {
+        command: process.execPath,
+        args: ["fixtures/server-4189.mjs"],
+        cwd: "",
+        lazy: true,
+      },
+      // #4189 review (P3) — the `!resolvedCommand.value.trim()` → stage `config` refusal had NO
+      // assertion: no fixture declared a `command` that expands to nothing, so a mutant deleting the
+      // guard reddened no row. This is that fixture.
+      "empty-resolved-command": {
+        command: "${AGENT_INFRA_PATH_4189_UNSET}",
+        args: [],
+        lazy: true,
+      },
+      // #4189 review (P3) — NEGATIVE CONTROL for the path-like gate: `@scope/pkg` is a PACKAGE
+      // SPECIFIER the launcher resolves inside node_modules, so it must NOT be read as a relative path.
+      // Before the fix this entry was refused at `config` although nothing in it depended on the cwd.
+      "relative-args-package-specifier": {
+        command: process.execPath,
+        args: ["@scope/pkg-4189"],
+        cwd: "${AGENT_INFRA_PATH_4189_UNSET}",
+        lazy: true,
+      },
       // NEGATIVE CONTROL for the same guard: an entry that declares NO cwd at all keeps inheriting (it
       // asked for nothing), so it must NOT be refused at `config` — the fix must not start refusing a
       // `cwd`-less `{"command":"node","args":["server.js"]}`.
@@ -152,7 +179,7 @@ await test("lazy server is NOT connected at startup", async () => {
   await manager.connectAll(CONFIG_PATH);
   equal((manager as any).connections.length, 0, "no eager connections for a lazy-only config");
   const cat = manager.catalog();
-  equal(cat.length, 8, "every declared server is in the catalog");
+  equal(cat.length, 11, "every declared server is in the catalog");
   equal(cat[0]!.name, "echo-server");
   equal(cat[0]!.tier, "lazy");
   equal(cat[0]!.status, "sleeping");
@@ -288,6 +315,60 @@ await test("NEGATIVE CONTROL: a relative argv with NO declared cwd is not refuse
   ok(err.stage !== "config", `an entry that declares no cwd asked for inheritance:\n${err.message}`);
 });
 
+// #4189 review (P2): the literal `"cwd": ""` spelling. It is FALSY, so the guard's own
+// `config.cwd ? … : undefined` collapsed it before `cwdUnusable` was computed and the refusal never
+// fired — the exact fail-open the guard was added for, in a shape the doc claimed was closed.
+await test("a relative argv with a LITERAL empty cwd is refused at stage 'config'", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("relative-args-literal-empty-cwd");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.name, "McpConnectError", `typed error, got ${err.name}`);
+  equal(err.stage, "config", `stage, got ${err.stage}:\n${err.message}`);
+  ok(err.message.includes("args[0]"), `names the relative entry:\n${err.message}`);
+  ok(err.message.includes("INHERITS"), `says what would have happened instead:\n${err.message}`);
+  ok(
+    err.message.includes("explicitly empty cwd"),
+    `names the literal-empty spelling rather than a variable that may be fine:\n${err.message}`
+  );
+});
+
+// #4189 review (P3): the empty-resolved-`command` refusal is a NEW guard; without this fixture a
+// mutant deleting it reddened no row.
+await test("a 'command' that expands to nothing is refused at stage 'config'", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("empty-resolved-command");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.name, "McpConnectError", `typed error, got ${err.name}`);
+  equal(err.stage, "config", `stage, got ${err.stage}:\n${err.message}`);
+  ok(
+    err.message.includes("'command' resolved to an empty string"),
+    `names the empty command:\n${err.message}`
+  );
+});
+
+// #4189 review (P3): `@scope/pkg` is a package specifier, not a path — the false block this arm pins.
+await test("NEGATIVE CONTROL: a scoped package specifier is NOT refused at 'config'", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("relative-args-package-specifier");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected (node cannot resolve the package)");
+  ok(
+    err.stage !== "config",
+    `a package specifier never needed the cwd, so it must not be refused at config:\n${err.message}`
+  );
+});
+
 await test("an args placeholder whose variable IS set is still NAMED (args never expand)", async () => {
   let err: any;
   try {
@@ -322,6 +403,9 @@ await test("the failing servers registered no tools and left no connection behin
         "args-placeholder-set-var",
         "relative-args-unresolved-cwd",
         "relative-args-empty-default-cwd",
+        "relative-args-literal-empty-cwd",
+        "relative-args-package-specifier",
+        "empty-resolved-command",
         "relative-args-no-cwd",
       ].includes(c.serverName)
     ),

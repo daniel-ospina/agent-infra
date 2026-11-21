@@ -20,7 +20,6 @@ import {
   IDLE_SWEEP_INTERVAL_MS,
   // #4189 — the connect-failure diagnostic
   expandExprTracked,
-  findUnresolvedVars,
   findArgPlaceholders,
   isPathLikeArg,
   describeCwd,
@@ -241,18 +240,11 @@ await test("a set var is not unresolved", () => {
   delete process.env.PRESENT_4189;
 });
 
-await test("findUnresolvedVars names the placeholder inside an args entry verbatim", () => {
-  deepEqual(findUnresolvedVars("${UNSET_4189}/server.py"), ["UNSET_4189"]);
-  deepEqual(findUnresolvedVars("-m"), []);
-});
-
-// #4189 review (finding 5): `args` are NEVER env-expanded, so the literal reaches the child whether
-// or not the variable is set. The predicate that matches the FIELD is "does the entry contain a
-// ${...}", not "is its variable unset" — the old predicate stayed silent in the normal config.
 await test("findArgPlaceholders fires for a SET variable too — args are never expanded", () => {
   process.env.SET_4189 = "/nonexistent-agent-infra-4189";
-  // The pre-fix predicate (`findUnresolvedVars`) returns [] here, because the var IS set.
-  deepEqual(findUnresolvedVars("${SET_4189}/mcp-servers/x/server.py"), []);
+  // The superseded predicate — `expandExprTracked(...).unresolved` — returns [] here, because the var
+  // IS set. That is the negative control for finding 5: the unset-variable test cannot see this field.
+  deepEqual(expandExprTracked("${SET_4189}/mcp-servers/x/server.py").unresolved, []);
   deepEqual(findArgPlaceholders("${SET_4189}/mcp-servers/x/server.py"), ["${SET_4189}"]);
   delete process.env.SET_4189;
   deepEqual(findArgPlaceholders("-m"), []);
@@ -265,6 +257,21 @@ await test("isPathLikeArg separates a relative path from a flag or an inline pro
   equal(isPathLikeArg("-e"), false);
   equal(isPathLikeArg("--version"), false);
   equal(isPathLikeArg("console.error('boom')"), false);
+});
+
+// #4189 review (P3): every one of these is a scoped PACKAGE SPECIFIER the launcher resolves inside
+// node_modules — never a cwd-relative path. The first three are shipped in `templates/.mcp.base.json`
+// today, so classifying them as paths made `{"command":"npx","args":["-y","@scope/pkg"],
+// "cwd":"${UNSET}"}` a hard `config` refusal on an entry that had always run.
+await test("isPathLikeArg does NOT classify a scoped package specifier as a path", () => {
+  equal(isPathLikeArg("@brave/brave-search-mcp-server"), false);
+  equal(isPathLikeArg("@houtini/gemini-mcp"), false);
+  equal(isPathLikeArg("@playwright/mcp@latest"), false);
+  equal(isPathLikeArg("@modelcontextprotocol/sdk"), false);
+  // Negative controls: the exclusion must not swallow real relative paths or an unscoped subpath.
+  equal(isPathLikeArg("fixtures/server-4189.mjs"), true);
+  equal(isPathLikeArg("mcp-servers/orchestrator/server.py"), true);
+  equal(isPathLikeArg("pkg/bin.js"), true);
 });
 
 section("connect diagnostics — stage classification (#4189)");
