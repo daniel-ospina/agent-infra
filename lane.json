@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-14193-1795288643-p203438-290575e5",
+  "_sha": "0b9ec5e3546ebec9b4b70742fbae268fddecc3fe",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-14193.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14184-stale-retired-test-doors"
+    },
+    {
+      "kind": "sha",
+      "value": "e4fbfbb2eded63d2799adeb1c717e33f2e202c11"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-14193"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 8437,
+  "ended_at": 1795297080,
+  "exit_code": 0,
+  "heartbeat_at": 1795297080,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-14193-1795288643-p203438-290575e5",
+  "lease_until": 1795333680,
+  "pid": 203438,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795288643,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-14193",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-14193"
+}
