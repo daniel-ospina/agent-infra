@@ -201,6 +201,23 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 # refunded `fixcount` but could NOT refund the per-head budget, and after two such cycles the PR
 # parked as "2 red-fixer attempt(s) at this head did not clear it" having never run a fixer.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
+# A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
+# git and gh call below would act on one while reporting about the other — the measured wrong-repo
+# lane. Refuse by name, before materialising anything. ⛔ AFTER the `start` truncation above, so this
+# per-dispatch line survives in the log it is written to (A-verify finding, #2694).
+# ⛔ AND BEFORE THE NUMBER CHECK BELOW (#4190 review P3). Both are pre-work refusals, and identity is
+# the more fundamental fact: a lane that was BOTH mis-targeted AND handed a non-PR number used to be
+# told only "the number is an issue" with a refunded attempt, so the operator had to discover the repo
+# defect in a second round — and the two gh reads below are repo-scoped themselves (`--repo $OR`), so
+# answering them about a target this box is not is answering about the wrong repo.
+REPO_ASSERT_LINE="$(repo_target_assert "fixer #$PR target" "$REPO_ABS" "$OR" "")"; REPO_ASSERT_RC=$?
+printf '%s\n' "$REPO_ASSERT_LINE" >> "$L.log"
+if [ "$REPO_ASSERT_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: the checkout $REPO_ABS and the target repo $OR disagree (exit $REPO_ASSERT_RC) — no fixer started, no branch touched" >> "$L.log"
+  refund_gate_attempt
+  exit "$REPO_ASSERT_RC"
+fi
 # ── IS THE NUMBER EVEN A PR? (agent-infra#4182 arm 3 — MEASURED 2026-11-21) ──────────────────
 # [fixgate-prresolve:begin]
 # A fixer is dispatched by PR NUMBER, and nothing here asked whether that number IS a pull request:
@@ -292,18 +309,6 @@ else
   FIX_BRIEF_HEAD="UNKNOWN — $PR_RESOLVE_UNKNOWN"
 fi
 # [fixgate-prresolve:end]
-# ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
-# A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
-# git and gh call below would act on one while reporting about the other — the measured wrong-repo
-# lane. Refuse by name, before materialising anything. ⛔ AFTER the `start` truncation above, so this
-# per-dispatch line survives in the log it is written to (A-verify finding, #2694).
-REPO_ASSERT_LINE="$(repo_target_assert "fixer #$PR target" "$REPO_ABS" "$OR" "")"; REPO_ASSERT_RC=$?
-printf '%s\n' "$REPO_ASSERT_LINE" >> "$L.log"
-if [ "$REPO_ASSERT_RC" -ne 0 ]; then
-  echo "[fix $PR] REFUSED: the checkout $REPO_ABS and the target repo $OR disagree (exit $REPO_ASSERT_RC) — no fixer started, no branch touched" >> "$L.log"
-  refund_gate_attempt
-  exit "$REPO_ASSERT_RC"
-fi
 
 [ -z "$WT" ] && {
   # Foreign (other-machine) branch: materialise a local worktree so the fixer has somewhere to work.
