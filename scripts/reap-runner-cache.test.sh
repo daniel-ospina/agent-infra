@@ -880,13 +880,59 @@ STUB
     return $((CASE_FAIL > 0))
 }
 
+# ── U: the shared root's PER-ENTRY re-probe is not vacuous with an EMPTY population (#4169 review, P3) ──
+# ⛔ THE DEFECT THIS PINS: `any_live_now` walks `$INSTALL_DIRS`, so with ZERO installs discovered it
+# iterated nothing and answered "not live" WITHOUT READING ANYTHING — discarding the fresh census
+# `census_refresh` had just paid for. The Q gate closes that shape only at the PASS-START position;
+# `reap_one`'s shared-arm re-probe runs minutes later, and a runner process that appeared in that
+# window was invisible. The fixture is exactly that sequence: the pass-start census carries NO runner
+# process (so Q's gate correctly treats the pre-loop state as proven idle), and the SECOND census —
+# read immediately before the removal — carries an unattributable `Runner.Worker`. The entry must be
+# KEPT, and named `toctou:unattributed-runner-process`.
+# Mutant: the empty-population census witness in `any_live_now` -> unreachable (MUT_U).
+case_u() { # <owner-script>
+    local owner="$1" base shared out rc df_stub
+    base="$(mktemp -d "$T/u.XXXXXX")"
+    shared="$base/shared/_cache"
+    mkdir -p "$shared/uv"; dd if=/dev/zero of="$shared/uv/blob" bs=1M count=2 >/dev/null 2>&1
+    # TWO census answers: (1) no runner process at all — a real proof of idleness for the Q gate;
+    # (2) a Runner.Worker for an install this pass's globs do NOT match, appearing mid-pass.
+    printf '  1 /usr/bin/init\n' >"$base/ps1"
+    printf '  4243 %s/elsewhere/gh-runner-z/bin/Runner.Worker spawnclient 1 2\n' "$base" >"$base/ps2"
+    printf '%s\n%s\n' "$base/ps1" "$base/ps2" >"$base/ps-seq"
+    df_stub="$base/df-stub"
+    cat >"$df_stub" <<'STUB'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture %s 0 %s 0%% /\n' 999999 "$(( ${RC_TEST_DF_FREE_MB:-1000} * 1024 ))"
+STUB
+    chmod +x "$df_stub"
+    # Zero installs WITHOUT the explicit-seam refusal (`REAP_RC_EXPLICIT=0` = "these globs are the
+    # defaults, a measured-empty box is not a refusal"), and the root BELOW the pressure gate so the
+    # only thing that can keep it is the liveness re-probe.
+    out="$(RC_TEST_DF_FREE_MB=1000 REAP_RC_DF_BIN="$df_stub" \
+           RC_TEST_PS_SEQ="$base/ps-seq" RC_TEST_PS_SEQ_N="$base/ps-n" REAP_RC_PS_BIN="$PS_SEQ_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=0 \
+           REAP_RC_SHARED_GLOBS="$shared" REAP_RC_SHARED_TRIGGER_FREE_MB=40960 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'U rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ -d "$shared/uv" ] && echo 0 || echo 1)" \
+               "a job that appears MID-PASS keeps the shared root even with ZERO installs discovered"
+    case_check "$(grep -qF 'reason=toctou:unattributed-runner-process' <<<"$out" && echo 0 || echo 1)" \
+               "and the keep NAMES the fresh census witness (reason=toctou:unattributed-runner-process)"
+    case_check "$(grep -qF 'installs=0' <<<"$out" && echo 0 || echo 1)" \
+               "and the pass really had an EMPTY population — the re-probe, not the Q gate, is what kept it"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
 MUT_K="$T/mut-k.sh"; MUT_L="$T/mut-l.sh"; MUT_L2="$T/mut-l2.sh"; MUT_M="$T/mut-m.sh"
 MUT_N="$T/mut-n.sh"; MUT_O="$T/mut-o.sh"
 MUT_P="$T/mut-p.sh"; MUT_Q="$T/mut-q.sh"; MUT_R="$T/mut-r.sh"
-MUT_S="$T/mut-s.sh"; MUT_T="$T/mut-t.sh"; MUT_B2="$T/mut-b2.sh"
+MUT_S="$T/mut-s.sh"; MUT_T="$T/mut-t.sh"; MUT_B2="$T/mut-b2.sh"; MUT_U="$T/mut-u.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -957,6 +1003,11 @@ apply_mutation "$OWNER" "$MUT_T" 's/^        elif \[ "\$INSTALL_TRIGGER_FREE_MB"
 # `false` here reaps it and reddens the case.
 apply_mutation "$OWNER" "$MUT_B2" 's/^        if \[ "\$fm" -gt "\$cutoff_s" \]; then$/        if false; then/' \
     || { printf '  ❌ mutation B2 could not be applied (the _work/_temp age gate moved)\n'; mut_ok=0; }
+# ⛔ U — the empty-population witness in `any_live_now`. The mutant makes the non-empty branch
+# unconditional, so with ZERO installs the loop runs zero times and the function answers "not live"
+# WITHOUT consulting the census it was just handed — the pre-fix defect, exactly.
+apply_mutation "$OWNER" "$MUT_U" 's/^    if \[ -n "\$INSTALL_DIRS" \]; then$/    if true; then/' \
+    || { printf '  ❌ mutation U could not be applied (the empty-population witness in any_live_now moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -979,6 +1030,7 @@ expect_pass "Q zero installs + an unattributable runner process keeps the shared
 expect_pass "R the shared root is pressure-gated: kept when warm, reaped when low, kept when unanswerable" case_r "$OWNER"
 expect_pass "S aged scratch and logs are ALL reclaimed in one pass (the class cannot poison its own witness)" case_s "$OWNER"
 expect_pass "T the install cache is pressure-gated on its own filesystem: warm kept, low reaped, unanswerable kept" case_t "$OWNER"
+expect_pass "U with ZERO installs the per-entry re-probe still asks the FRESH census (no vacuous liveness)" case_u "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -1007,6 +1059,7 @@ expect_fail "R mutant: the shared free-space gate removed"               case_r 
 expect_fail "S mutant: the witness reads the sink's own mtime again"      case_s "$MUT_S"
 expect_fail "T mutant: the install free-space gate removed"               case_t "$MUT_T"
 expect_fail "B2 mutant: the _work/_temp age gate removed"                 case_b "$MUT_B2"
+expect_fail "U mutant: the empty-population witness in any_live_now is unreachable" case_u "$MUT_U"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

@@ -406,12 +406,27 @@ census_refresh() { census_read; }
 # any_live_now — the SHARED root's re-probe question, against the CURRENT (just refreshed) census:
 # is ANY install running a job right now? The shared root is every install's `XDG_CACHE_HOME`, so a
 # single live install anywhere on the box makes it unsafe.
+# ⛔ AND AN EMPTY POPULATION IS NOT AN ANSWER (#4169 review, P3). `for d in $INSTALL_DIRS` with no
+# disclosed install iterates ZERO times and the function then answers "not live" — having read
+# NOTHING — while the caller has just paid for a fresh `census_refresh`. The pass-start Q gate refuses
+# that shape at the PRE-loop position (an unattributed runner process keeps the root), but the
+# per-entry re-probe in `reap_one` reaches this function minutes later, so the same question has to be
+# asked of the SAME fresh census here: with no population, a runner process the pass cannot attribute
+# to any discovered install means liveness is UNKNOWN and the entry is KEPT. A zero-install pass over
+# a box with no runner process at all still answers IDLE — that is a census result, not an absence.
 any_live_now() {
     local d rc
-    for d in $INSTALL_DIRS; do
-        install_live "$d"; rc=$?
-        if [ "$rc" = 0 ]; then return 0; fi
-    done
+    if [ -n "$INSTALL_DIRS" ]; then
+        for d in $INSTALL_DIRS; do
+            install_live "$d"; rc=$?
+            if [ "$rc" = 0 ]; then return 0; fi
+        done
+        return 1
+    fi
+    if proc_has "Runner.Listener" || proc_has "Runner.Worker"; then
+        LIVE_REASON="unattributed-runner-process"
+        return 0
+    fi
     return 1
 }
 

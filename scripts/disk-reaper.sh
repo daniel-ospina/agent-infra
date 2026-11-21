@@ -349,6 +349,11 @@ RUNNER_CACHE_TRIGGER_FREE_MB="${DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB:-40960}
 # ⛔ ONE DIAL, THREE CONSUMERS. `RUNNER_CACHE_TRIGGER_FREE_MB` decides whether the frequent pass RUNS;
 # the same number is the class's own pressure gate on the shared root AND on each install's `.cache`,
 # so the operator's unit file and the class can never disagree about what "40 GB" means.
+# ⛔ AND `0` IS THREE DECISIONS, NOT ONE: it can never fire the fast pass (free < 0 is impossible) AND
+# it disables BOTH class pressure gates, so an operator who sets 0 to stop the 10-minute clock silently
+# turns the HOURLY pass into an ungated warm-cache flusher. It stays legal (the suites pin it to keep
+# fixtures host-independent), and `reap_runner_cache` NAMES it in the journal and the record every pass
+# it is in force — see the comment there. Disabling the timer unit is how to stop only the clock.
 RUNNER_CACHE_INSTALL_TRIGGER_FREE_MB="$RUNNER_CACHE_TRIGGER_FREE_MB"
 RUNNER_CACHE_SHARED_TRIGGER_FREE_MB="$RUNNER_CACHE_TRIGGER_FREE_MB"
 RUNNER_CACHE_PASS_CAP_MB="${DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB:-20480}"
@@ -3004,6 +3009,22 @@ reap_runner_cache() {
         NOTE_RC="reap-runner-cache.sh not found"; RC_RC=3
         MISCONFIG="${MISCONFIG}${MISCONFIG:+, }runner-cache-delegate-missing"
         WANT_RC=0; VERDICT_RC="misconfigured"; DF_RC_OK=1; return 3
+    fi
+    # ⛔ `0` ON THIS DIAL IS TWO DECISIONS, AND ONE OF THEM IS UNSAFE IF NOBODY SAYS SO (#4169 review,
+    # P3). The dial is `--size-trigger`'s threshold AND the class's own pressure gate on both arms
+    # (ONE DIAL, THREE CONSUMERS above), and `size_trigger_gate` fires only on `free < threshold` — so 0
+    # means "never fire" for the fast clock while it FORWARDS 0 to both class gates, which the owner
+    # documents as "the gate is disabled". An operator who sets 0 to stop the 10-minute pass therefore
+    # also turns the HOURLY pass into an ungated cache flusher: every idle install's warm `.cache` and the
+    # shared root are reaped every hour on a box with hundreds of GB free, which is the exact tax #4168
+    # removed. It is a legitimate configuration (the suite pins it to keep fixtures host-independent), so
+    # it is not refused — but it is NAMED here, in the pass journal, every time it is in force, because a
+    # policy that reverses on one dial must never reverse silently. To stop ONLY the fast pass, disable
+    # the timer unit (`systemctl disable --now eldato-disk-reaper-cache.timer`) or `--uninstall`.
+    if [ "$RUNNER_CACHE_TRIGGER_FREE_MB" = 0 ]; then
+        log_line "disk-reaper: ⚠ class=runner-cache pressure gates DISARMED — DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0 forwards install_trigger_free_mb=0 shared_trigger_free_mb=0 to the class (both free-space gates OFF) and can never fire this fast pass (free < 0 is impossible). The HOURLY pass will reap warm caches ungated. This is the documented way to disable the GATE; to disable only the 10-minute CLOCK, disable the cache timer unit instead"
+        log "class=runner-cache pressure gates DISARMED — DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0 forwards 0 to install_trigger_free_mb and shared_trigger_free_mb, so BOTH free-space gates are off AND this fast pass can never fire; the hourly pass reaps warm caches ungated (disable the cache timer unit to stop only the clock)"
+        NOTE_RC="${NOTE_RC:+$NOTE_RC; }class pressure gates disarmed by DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0"
     fi
     # df BEFORE, per distinct filesystem (the installs and the shared root can be on different mounts).
     while IFS= read -r tgt; do

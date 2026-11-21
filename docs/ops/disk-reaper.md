@@ -822,10 +822,10 @@ marker, and a wide default costs a `stat` and no delete surface.
 
 | path | rule |
 |---|---|
-| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) **and** the filesystem holding THAT install has less than `REAP_RC_INSTALL_TRIGGER_FREE_MB` free (default 40960 MB; `0` disables the gate). It is a WARM cache, not a leak, and the install arm is pressure-gated for exactly the reason the shared root is — see ⛔ below |
+| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) **and** the filesystem holding THAT install has less than `REAP_RC_INSTALL_TRIGGER_FREE_MB` free (default 40960 MB; `0` on the CLASS seam disables the gate). It is a WARM cache, not a leak, and the install arm is pressure-gated for exactly the reason the shared root is — see ⛔ below |
 | `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
 | `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) — ⛔ **except the newest one per install**: a listener holds its CURRENT log open, so unlinking it reclaims no bytes while crediting the `du` figure to the ledger and costing the next failure its diagnostics (`reason=newest-log`) |
-| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` disables the gate). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
+| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` on the CLASS seam disables the gate). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
 
 ⛔ **THE SHARED ROOT IS GLOB-DECIDED, SO IT IS SCOPE-CHECKED BEFORE ANY DELETE.** It must not **be** an
 install and must not **contain** one (`REFUSED … reason=shared-root-contains-an-install`): the
@@ -853,7 +853,16 @@ THIS cache's own filesystem needs the bytes (`KEPT … reason=install-free-above
 trigger_mb=<n>`), and an unanswerable `df` KEEPS it (`reason=install-free-unmeasurable`). Both gates —
 install and shared — are forwarded from ONE operator dial,
 `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`, so the unit file and the class cannot silently disagree
-about what "40 GB" means.
+about what "40 GB" means. ⛔ **ONE DIAL, THREE CONSUMERS — INCLUDING `0`, WHICH IS WHY IT IS NAMED.**
+`0` on that dial is BOTH "the fast clock can never fire" (`free < 0` is impossible) AND "both class
+pressure gates are disabled", because 0 is forwarded to both of them — so an operator who sets `0` to
+stop the 10-minute pass also turns the **hourly** pass into an ungated cache flusher: every idle
+install's warm `.cache` and the shared root get reaped every hour on a box with hundreds of GB free.
+A pass with the dial at `0` therefore writes a `⚠ class=runner-cache pressure gates DISARMED` line to
+the pass journal and a `note_runner_cache=` entry into the record — the reversal is legitimate (it is
+the documented way to disable a gate) but it is never SILENT. **To stop only the 10-minute clock,
+disable the cache timer unit** (`systemctl disable --now eldato-disk-reaper-cache.timer`) or run
+`--uninstall`; do not reach for `0`.
 
 ⛔ **AND IT IS PRESSURE-GATED, NOT AGE-GATED.** `REAP_RC_SHARED_TRIGGER_FREE_MB` (default 40960, the
 size-triggered pass's own threshold) keeps the root warm while the box has space
@@ -933,7 +942,9 @@ others. A second unit, `templates/systemd/eldato-disk-reaper-cache.{service,time
 minutes** with `--size-trigger`: it measures free space, does **nothing** while the box is above
 `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` (default 40960 MB = 40 GB), and below it runs this class
 **alone**, capped at `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB` (default 20480 MB) so a pass that can fire
-144 times a day cannot itself become the load problem. The two reasons:
+144 times a day cannot itself become the load problem. ⛔ Setting that dial to `0` disables BOTH
+pressure gates as well as the clock — see the ONE DIAL, THREE CONSUMERS paragraph above, and disable
+the timer unit instead if the clock is what you want gone. The two reasons:
 
 * **Hourly is slower than the write rate.** A busy cell writes tens of GB of cache per hour; the
   measured failure is a pass that was *correct* and could not hold a reserve (187 MB reclaimed while a
@@ -1736,7 +1747,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**18 case runs + 20 mutants + 1 scope case — 39 outcomes**), covering every arm #4168 names. The table
+(**21 case runs + 24 mutants + 1 scope case — 46 outcomes**), covering every arm #4168 names. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
@@ -1761,6 +1772,9 @@ because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 | P | the pool's cache root is reached from the **LAYOUT**: an install at `$RUNNER_ROOT/gh-runner-x64` makes `$RUNNER_ROOT/_cache` a candidate with **no** shared-glob match and a **wrong** `RUNNER_ROOT` in the environment (`shared_root=derived (…)`), and the pool's OWN `CACHE_ROOT=` expression is read and asserted to resolve to that same directory | the derived candidate (`add_shared_dir "$_p/_cache" derived`) → `:` |
 | Q | with **zero installs discovered**, a runner process no install accounts for keeps the SHARED root (`reason=unattributed-runner-process`, rc 3) — the liveness gate is not vacuous | the population witness (`if proc_has "Runner.Listener" …`) → `if false; then` |
 | R | the shared root is **pressure-gated**: kept with 200 GB free (`reason=shared-free-above-trigger`), reaped below the trigger, and KEPT with rc 3 when `df` cannot answer (`reason=free-unmeasurable`) — against a `df` stub, both directions | `if [ "$SHARED_TRIGGER_FREE_MB" -gt 0 ]; then` → `if false; then` |
+| S | the class never **poisons the witness it proves idleness with**: TWO aged `_work/_temp` entries and TWO aged `_diag` logs in one install are ALL reclaimed in ONE pass, because the freshness witness skips the sink's own mtime (`rm` inside `_temp` used to make the class skip its own remaining candidates, and the poisoned mtime outlived the pass) | the `_work/_temp` skip in the witness removed (`if [ "$f" = "$d/_temp" ]` → `if false`) |
+| T | the per-install `.cache` is **pressure-gated on ITS OWN filesystem**: kept with 200 GB free (`reason=install-free-above-trigger`), reaped below the trigger, and KEPT with rc 3 when `df` cannot answer (`reason=install-free-unmeasurable`) — a trigger fired by a small `/tmp` must not flush a warm cache on the runners' big volume | the install-arm gate removed (`elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && …` → `elif false; then`) |
+| U | with **ZERO installs discovered** the shared root's PER-ENTRY re-probe still asks the **freshly re-read census**: a `Runner.Worker` that appears mid-pass (and that no discovered install accounts for) keeps the entry (`reason=toctou:unattributed-runner-process`). The Q gate closes that shape at the pass-start position only — `any_live_now` answered "not live" having read nothing once the population was empty | the empty-population witness in `any_live_now` made unreachable (`if [ -n "$INSTALL_DIRS" ]` → `if true`) |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

@@ -3755,8 +3755,16 @@ assert_contains "$(t67_gaps systemd "$T67_MUT/wrong.service")" "RUNNER_CACHE_REA
 # `/tmp` flushed every idle install's warm cache on a box with hundreds of GB free.
 # ⛔ THE ROW IS ABOUT THE FORWARDING, so it asserts the numbers the CLASS logged its own gates at (the
 # owner prints both at pass start) AND the two keep reasons, with a `df` STUB so the reading cannot come
-# from this host's disk. A pass that forwarded only one of the two would redden here.
+# from this host's disk.
+# ⛔ AND THE DIAL MUST BE A NON-DEFAULT NUMBER (#4169 review, P2). It used to be `40960` — the owner's
+# OWN default for both gates — so deleting the two forwardings left the owner at 40960, the `df` stub at
+# 200 GB free, and every row here GREEN: the row documented as "a pass that forwarded only one of the two
+# would redden here" could not go red for the regression it names (agent-infra#3442 rule 3). The dial is
+# now 2500 and the stub reports 10000 MB free — ABOVE 2500 (so a correct pass KEEPS both) and BELOW the
+# class's own 40960 default (so a pass that failed to forward REAPS both). The row therefore proves WHICH
+# number is in force, not merely that some gate kept a cache.
 ENVNAME=t68
+T68_DIAL=2500
 FWD_INST="$T/scratch/rc/gh-runner-forwarded"
 mkdir -p "$FWD_INST/bin" "$FWD_INST/_work/_temp" "$FWD_INST/_diag" "$FWD_INST/.cache/uv"
 : >"$FWD_INST/bin/Runner.Listener"
@@ -3766,19 +3774,63 @@ printf 'warm\n' >"$T/scratch/rc/shared/entry"
 T68_DF="$T/scratch/t68-df"
 printf '%s\n' '#!/bin/sh' \
     'printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"' \
-    'printf "fixture 999999999 0 204800000 0%% /\n"' >"$T68_DF"
+    'printf "fixture 999999999 0 10240000 0%% /\n"' >"$T68_DF"
 chmod +x "$T68_DF"
+# run_t68 <reaper-path> — ONE pass over the T68 fixture at the T68 dial, through the (possibly mutated)
+# entry point. `REAP_RC_DF_BIN`/`DISK_REAPER_*` ride as prefix assignments: bash exports those to the
+# child `bash "$REAPER"`, while `REAPER` itself is read by `run_reaper` in THIS shell, so it is assigned
+# around the call rather than prefixed (a prefix assignment is NOT visible to the function body).
+run_t68() {
+    local _save="$REAPER" _rc
+    REAPER="$1"
+    REAP_RC_DF_BIN="$T68_DF" DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB="${2:-$T68_DIAL}" \
+        run_reaper --apply --only runner-cache
+    _rc=$?
+    REAPER="$_save"
+    return "$_rc"
+}
 RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
-OUT="$(REAP_RC_DF_BIN="$T68_DF" DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=40960 \
-       run_reaper --apply --only runner-cache 2>&1)"; RC=$?
+OUT="$(run_t68 "$REAPER")"; RC=$?
 assert_eq "$RC" "0" "T68 a pass with the operator's trigger rendered exits 0"
-assert_contains "$OUT" "install_trigger_free_mb=40960 shared_trigger_free_mb=40960" \
+assert_contains "$OUT" "install_trigger_free_mb=${T68_DIAL} shared_trigger_free_mb=${T68_DIAL}" \
     "T68 the ONE dial reaches BOTH class gates (install + shared), so they cannot silently diverge"
-assert_contains "$OUT" "reason=install-free-above-trigger" \
-    "T68 a warm install cache on a filesystem with 200 GB free is KEPT, not flushed by a trigger fired elsewhere"
+assert_contains "$OUT" "reason=install-free-above-trigger free_mb=10000 trigger_mb=${T68_DIAL}" \
+    "T68 a warm install cache on a filesystem with 10 GB free is KEPT by the FORWARDED number (not by the 40960 default)"
 assert_dir "$FWD_INST/.cache" "T68 … and the bytes are really still there"
-assert_contains "$OUT" "reason=shared-free-above-trigger" \
+assert_contains "$OUT" "reason=shared-free-above-trigger free_mb=10000 trigger_mb=${T68_DIAL}" \
     "T68 while the shared root is kept by the SAME forwarded number (it is not the only gated arm any more)"
+# ⛔ THE CONTROL IS THE PRE-FIX STATE: the same fixture, a copy of the entry point with BOTH forwardings
+# deleted. It must print the owner's own 40960 defaults and REAP the caches the pass above kept — so this
+# row reddens for exactly the edit that removes the thing it pins.
+T68_MUT_DIR="$T/t68-mut"
+mkdir -p "$T68_MUT_DIR"
+ln -sfn "$REPO_ROOT/scripts/lib" "$T68_MUT_DIR/lib"
+ln -sfn "$REPO_ROOT/scripts/reap-runner-cache.sh" "$T68_MUT_DIR/reap-runner-cache.sh"
+assert_eq "$(grep -c -e 'REAP_RC_INSTALL_TRIGGER_FREE_MB=' -e 'REAP_RC_SHARED_TRIGGER_FREE_MB=' "$REAPER")" "2" \
+    "T68 the entry point really carries BOTH forwardings (the control below is anchored on them)"
+sed -e '/REAP_RC_INSTALL_TRIGGER_FREE_MB=/d' -e '/REAP_RC_SHARED_TRIGGER_FREE_MB=/d' "$REAPER" >"$T68_MUT_DIR/disk-reaper.sh"
+T68_MUT="$T68_MUT_DIR/disk-reaper.sh"
+assert_eq "$(grep -c -e 'REAP_RC_INSTALL_TRIGGER_FREE_MB=' -e 'REAP_RC_SHARED_TRIGGER_FREE_MB=' "$T68_MUT")" "0" \
+    "T68 the control copy really has both forwardings REMOVED (an unapplied mutation is not a control)"
+OUT_MUT="$(bash -n "$T68_MUT" 2>&1 && run_t68 "$T68_MUT")"
+assert_contains "$OUT_MUT" "install_trigger_free_mb=40960 shared_trigger_free_mb=40960" \
+    "T68 MUTANT without the forwardings both gates fall back to the owner's 40960 and the row above reddens"
+assert_absent "$OUT_MUT" "trigger_mb=${T68_DIAL}" \
+    "T68 MUTANT … and the dial number is nowhere in the mutant's readings"
+assert_nodir "$FWD_INST/.cache" \
+    "T68 MUTANT the warm cache the forwarded pass kept is REAPED — the pre-fix state, measured, is the harm"
+# ⛔ AND `0` IS NAMED, NOT SILENT (#4169 review, P3). One dial, three consumers: 0 can never fire the
+# fast clock and it also disables BOTH class pressure gates, so an operator who sets it to stop the
+# 10-minute pass silently makes the HOURLY pass an ungated warm-cache flusher. Legal, but never quiet:
+# the pass journal carries a warning and the record carries a note.
+OUT_ZERO="$(run_t68 "$REAPER" 0)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.log" 2>/dev/null)" "pressure gates DISARMED" \
+    "T68 a dial of 0 says so in the pass journal (a one-dial policy reversal is never silent)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" \
+    "class pressure gates disarmed by DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0" \
+    "T68 … and the RECORD carries it (note_runner_cache=), so a supervisor printing the record sees it"
+assert_contains "${OUT_ZERO}" "install_trigger_free_mb=0 shared_trigger_free_mb=0" \
+    "T68 … while the class itself reports the two gates it was handed, at 0"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
