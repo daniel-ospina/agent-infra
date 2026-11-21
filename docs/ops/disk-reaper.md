@@ -30,7 +30,7 @@ only code that deletes:
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 | `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
 the shipped 3600 s was half of it — see the class note below), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
-| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
+| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), pressure-gated on its OWN filesystem (`REAP_RC_INSTALL_TRIGGER_FREE_MB`, default 40 GB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated by the same dial (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
 
 ## Why one entry point
 
@@ -822,7 +822,7 @@ marker, and a wide default costs a `stat` and no delete surface.
 
 | path | rule |
 |---|---|
-| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) |
+| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) **and** the filesystem holding THAT install has less than `REAP_RC_INSTALL_TRIGGER_FREE_MB` free (default 40960 MB; `0` disables the gate). It is a WARM cache, not a leak, and the install arm is pressure-gated for exactly the reason the shared root is — see ⛔ below |
 | `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
 | `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) — ⛔ **except the newest one per install**: a listener holds its CURRENT log open, so unlinking it reclaims no bytes while crediting the `du` figure to the ledger and costing the next failure its diagnostics (`reason=newest-log`) |
 | the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` disables the gate). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
@@ -843,6 +843,18 @@ lives OUTSIDE the globs and may be reading that root right now, so liveness is U
 is touched, and the pass fails closed (`KEPT … reason=unattributed-runner-process`, rc 3). A census
 carrying no runner process at all is a real proof that nothing can be using it.
 
+⛔ **THE INSTALL ARM IS PRESSURE-GATED ON ITS OWN FILESYSTEM, AND THAT IS NOT REDUNDANT WITH THE SIZE
+TRIGGER.** `--size-trigger` fires when ANY filesystem the glob PREFIXES resolve to is low, and those
+prefixes include `/tmp` and `$HOME`; a box whose `/tmp` is a small tmpfs therefore fired the frequent
+pass every 10 minutes while the RUNNERS' volume held hundreds of GB free — and the pass then flushed
+every idle install's warm cache, because the install arm had **no** free-space condition at all. The
+trigger's job is to decide whether the PASS runs; `REAP_RC_INSTALL_TRIGGER_FREE_MB` decides whether
+THIS cache's own filesystem needs the bytes (`KEPT … reason=install-free-above-trigger free_mb=<n>
+trigger_mb=<n>`), and an unanswerable `df` KEEPS it (`reason=install-free-unmeasurable`). Both gates —
+install and shared — are forwarded from ONE operator dial,
+`DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`, so the unit file and the class cannot silently disagree
+about what "40 GB" means.
+
 ⛔ **AND IT IS PRESSURE-GATED, NOT AGE-GATED.** `REAP_RC_SHARED_TRIGGER_FREE_MB` (default 40960, the
 size-triggered pass's own threshold) keeps the root warm while the box has space
 (`KEPT … reason=shared-free-above-trigger free_mb=<n> trigger_mb=<n>`), and a `df` that cannot answer
@@ -860,12 +872,18 @@ the witness named — never partially reaped. The verdict comes from the process
 that can answer it:
 
 * `bin/Runner.Worker` in the install's process list → **a job is running** (`reason=worker-running`);
-* content under `_work` written within `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is running or
-  has just started (`reason=busy-work`) — the conservative direction, bounded by that knob, and
-  ⛔ **asked FIRST and independently of argv**: it used to sit behind a literal
+* content under `_work` **written by a job** within `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is
+  running or has just started (`reason=busy-work`) — the conservative direction, bounded by that knob,
+  and ⛔ **asked FIRST and independently of argv**: it used to sit behind a literal
   `bin/Runner.Listener`/`run.sh` argv match, so an install whose listener argv is `./run.sh`, a
   canonicalised path, or a renamed `run.sh` took the `no-listener` arm and lost its cache while a job
-  was running;
+  was running. ⛔ **IT ASKS WHAT A JOB WROTE, NEVER THE MTIME OF THE SINK ITSELF.** `_work/_temp` is a
+  direct child of `_work` and this class deletes INTO it, so `rm` of one scratch entry set `_temp`'s own
+  mtime to now — the class then read its own delete as "a job is running": the remaining aged entries
+  and the whole `_diag` arm were skipped in that pass, and the poisoned mtime outlived the pass, so the
+  next 10-minute tick reported a job that never ran and skipped that install's `.cache` whole. The
+  witness now takes the newest mtime under `_work`'s other children plus one bounded level INTO `_temp`
+  (a live job's own writes), so it cannot be perturbed by the pass itself;
 * a listener with no worker and nothing fresh under `_work` → the install is BETWEEN jobs: the cache
   is idle and the next job re-downloads what it needs.
 
