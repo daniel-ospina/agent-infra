@@ -3925,7 +3925,7 @@ _armut_cls="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$_armut/fix-one.sh" \
   | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u | tr '\n' ' ')"
 case " $_armut_cls " in *" AGENT_NEW_ARM_REFUSED "*) rc=0 ;; *) rc=1 ;; esac
 ck "(arm derivation) a gate classified on a line carrying a \` #\` REACHES the derived set — with an inline comment strip it appears nowhere and both completeness checks pass over it ($_armut_cls)" $rc
-_arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
+_arm_nonclassifier="REPO_TARGET_REFUSED AGENT_NOT_A_PR_REFUSED"   # exited at fix-one.sh:228 (repo identity) and at fix-one.sh:264 (the DISPATCH defect: the number is an ISSUE, not a PR — #4182 arm 3), never compared
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
