@@ -211,28 +211,49 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 # brief still asserted a reviewer had found real issues. A lane that obeys that brief fixes nothing,
 # reports success, and pushes to a branch no PR tracks (#4182 arm 1) — and it materialises a worktree
 # and a claim for it before anyone can tell.
-# ⛔ THE POLARITY IS THE POINT: only gh POSITIVELY naming the number as not-a-PR refuses. An
-# unreadable read (exhausted gh budget, auth, timeout) is NOT proof the PR is missing, and refusing
-# on it would over-block every ordinary dispatch made while the box's gh budget was spent — that is
-# #4182's arm 2, whose correct handling is a brief that says its head is UNKNOWN, not a refusal. So
-# the transient case is recorded loudly and the run continues.
+# ⛔ THE POLARITY IS THE POINT: this refuses only on a POSITIVE IDENTIFICATION — gh can still read
+# the ISSUE of that number while it cannot produce a PR for it. Two reads, no wording match:
+#
+#   * WHY NOT THE MESSAGE TEXT (#4190 review N1, and this block's first version — both VERIFIED
+#     against the shipped shim). Keying on gh's sentence (`Could not resolve to a PullRequest`) is
+#     DEFEATED on exactly the boxes where the measured dispatch happened: fix-one.sh prepends
+#     `$O/gh-rest` to PATH (line 56), `number` is in that shim's `PR_FIELDS`, and its `pr view --json`
+#     arm serves the read through REST — where a 404 arrives as `gh-rest: API error: Not Found`, not
+#     the GraphQL sentence. Upstream gh cannot help either: it documents ONE generic code for "fails
+#     for any reason" (`gh help exit-codes`: 0 ok, 1 any failure, 2 cancelled, 4 auth), so the exit
+#     status does not discriminate. N1 also recorded that cli/cli#14038 emits the same GraphQL
+#     sentence when the ACCOUNT LACKS ACCESS — a false refusal on a real PR, which this design removes
+#     because an access-denied PR still has an issue projection only if a PR/issue of that number
+#     exists, and the ISSUE read is what the arm below requires.
+#   * WHY NOT `refs/pull/<N>/head` (the second attempt, replaced here). It is a NETWORK round trip in
+#     a dispatch path and a GitHub-only convention — MEASURED: it turned 41 fixture runs of
+#     spawn-gate.test.sh into rc=86, which is what a guard that over-blocks looks like from inside.
+#   * WHY THE ISSUE READ IS THE RIGHT POSITIVE. The measured defect class IS "the number is an ISSUE":
+#     #3301 is an open issue in this repo, so `gh issue view 3301` succeeds while `gh pr view 3301`
+#     cannot. A fixture with a stubbed, failing gh fails BOTH reads and therefore never refuses —
+#     correct, because nothing in it proves the number is an issue.
+#   * STATED RESIDUAL: a pure typo (a number that is neither a PR nor an issue) is NOT refused here,
+#     because refusing it would require treating an unreadable read as an absence. It still gets the
+#     UNKNOWN brief below and the review-read fix in the same PR.
 PR_RESOLVE_UNKNOWN=""
 if [ -z "${HEAD:-}" ]; then
   pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
-  case "$pr_probe" in
-    *"Could not resolve to a PullRequest"*)
-      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR (gh: $(printf '%s' "$pr_probe" | head -1)) — this is a DISPATCH defect (the number is an ISSUE, or belongs to another repo), not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a PR number." >> "$L.log"
-      echo "[fix $PR] REFUSED: no pull request #$PR in $OR — dispatch defect, no fixer started, attempt refunded" >&2
+  if [ "$pr_probe_rc" -ne 0 ]; then
+    issue_probe="$(gh issue view "$PR" --repo "$OR" --json number 2>&1)"; issue_probe_rc=$?
+    # A here-string, not `printf … | grep -q`: under pipefail a quiet grep that matches early closes
+    # the pipe and the writer takes SIGPIPE, so the pipeline reports 141 and this reads as "not an
+    # issue" exactly when the payload matched (`check-no-sigpipe-grep.sh`, #841/#864).
+    if [ "$issue_probe_rc" -eq 0 ] && grep -q '[0-9]' <<<"$issue_probe"; then
+      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR, but it DOES have an ISSUE with that number (gh issue view succeeded; gh pr view failed rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)). This is a DISPATCH defect — an ISSUE number routed to the PR fixer — not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a real PR number." >> "$L.log"
+      echo "[fix $PR] REFUSED: #$PR is an ISSUE in $OR, not a pull request — dispatch defect, no fixer started, attempt refunded" >&2
       refund_gate_attempt
-      exit 78 ;;
-    *)
-      if [ "$pr_probe_rc" -ne 0 ]; then
-        PR_RESOLVE_UNKNOWN="the PR-existence probe could not answer (gh rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) — NOT read as a missing PR, because an unreadable read is not an absence"
-      else
-        PR_RESOLVE_UNKNOWN="the PR exists but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
-      fi
-      echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, but anything below that depends on the head reports UNKNOWN instead of asserting" >> "$L.log" ;;
-  esac
+      exit "${AGENT_NOT_A_PR_REFUSED:-86}"
+    fi
+    PR_RESOLVE_UNKNOWN="gh produced no resource for this number (rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) and the issue probe did not identify it either (rc=$issue_probe_rc) — NOT read as a missing PR, because an unreadable read is not an absence"
+  else
+    PR_RESOLVE_UNKNOWN="the PR exists (gh answered) but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
+  fi
+  echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, and the brief's head-dependent sentences render UNKNOWN instead of a blank" >> "$L.log"
 fi
 # ⛔ THE BRIEF'S HEAD-DEPENDENT SENTENCES RENDER THE HEAD — AND RENDER UNKNOWN WHEN IT IS UNKNOWN
 # (#4190 review F1, P2). The staleness guards further down interpolated `$HEAD` VERBATIM, so with
