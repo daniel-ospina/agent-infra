@@ -90,11 +90,27 @@ for pair in "prresolve.sh:PR_RESOLVE_UNKNOWN" "reviewread.sh:FIX_REVIEW_LEAD" "r
   ck "0) $f is extractable and still carries '$needle' ($(wc -l < "$T/$f" | tr -d ' ') lines)" "$_rc"
 done
 bash -n "$FIXER"; ck "0) fix-one.sh still parses" $?
+# ⛔ THE DESIGN, PINNED AS CODE SHAPE (comments may quote the wording it explains, so prose is
+# stripped first). Both were review findings: a message matcher is defeated by the gh-rest shim, and a
+# `git ls-remote` probe is a network round trip in the dispatch path that over-blocked 41 fixture runs.
+_code_lines="$(grep -v '^[[:space:]]*#' "$T/prresolve.sh" || true)"
+case "$_code_lines" in
+  *'Could not resolve to a PullRequest'*) bad "0) the guard matches gh's WORDING — the gh-rest shim serves this read over REST, so it never fires there" ;;
+  *) ok "0) the guard decides on reads, not on gh's wording" ;;
+esac
+case "$_code_lines" in
+  *'ls-remote'*) bad "0) the guard makes a refs/pull round trip — a network call in the dispatch path" ;;
+  *) ok "0) no network probe: the guard decides from gh reads only" ;;
+esac
+case "$_code_lines" in
+  *'gh issue view'*) ok "0) the refusal rests on the POSITIVE identification (the number is an issue)" ;;
+  *) bad "0) the block no longer reads the issue projection — the positive half of the predicate is gone" ;;
+esac
 
 # ── the driver for the PR-existence block ──────────────────────────────────────────────────────
-# run_pr <head> <gh_rc> <gh_out>   → $T/run/{rc,unknown,refunded,ghcalls,log}
+# run_pr <head> <pr_rc> <pr_out> <issue_rc> <issue_out>   → $T/run/{rc,unknown,refunded,ghcalls,log}
 run_pr() {
-  local head="${1-}" gh_rc="${2:-0}" gh_out="${3-}" d="$T/run"
+  local head="${1-}" pr_rc="${2:-0}" pr_out="${3-}" issue_rc="${4:-0}" issue_out="${5-}" d="$T/run"
   rm -rf "$d"; mkdir -p "$d/o/state" "$d/o/logs"
   printf '1\n' > "$d/o/state/fixcount-3301"
   (
@@ -102,7 +118,17 @@ run_pr() {
     O="$d/o"; L="$d/o/logs/fix-3301"; PR=3301; OR=daniel-ospina/agent-infra; HEAD="$head"; CTRL=1
     : > "$L"
     GH_CALLS="$d/ghcalls"; : > "$GH_CALLS"
-    gh() { printf '%s\n' "$*" >> "$GH_CALLS"; [ -n "$gh_out" ] && printf '%s\n' "$gh_out"; return "$gh_rc"; }
+    # ⛔ THE TWO SUBCOMMANDS ANSWER INDEPENDENTLY. That asymmetry IS the guard's evidence (a number
+    # that is an ISSUE and not a PR), so the stub models `pr view` and `issue view` separately — a
+    # single "gh fails" switch would make every arm indistinguishable from the pre-fix behaviour.
+    gh() {
+      printf '%s\n' "$*" >> "$GH_CALLS"
+      case "$*" in
+        'pr view'*)    [ -n "$pr_out" ] && printf '%s\n' "$pr_out"; return "$pr_rc" ;;
+        'issue view'*) [ -n "$issue_out" ] && printf '%s\n' "$issue_out"; return "$issue_rc" ;;
+        *) return 1 ;;
+      esac
+    }
     # spawn-gate.sh's predicate, which the refund block uses; the stub keeps this suite hermetic.
     is_num() { case "${1-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
     . "$T/refund.sh" >/dev/null 2>&1
@@ -114,30 +140,45 @@ run_pr() {
   printf '%s\n' "$(cat "$d/o/state/fixcount-3301" 2>/dev/null)" > "$d/refunded"
 }
 
-# 1. the number is not a PR — the measured case
-run_pr "" 1 "GraphQL: Could not resolve to a PullRequest with the number of 3301. (repository.pullRequest)"
-ck "1) a not-a-PR number is REFUSED with exit 78 (got rc=$(cat "$T/run/rc"))" \
-   "$([ "$(cat "$T/run/rc")" = 78 ] && echo 0 || echo 1)"
-grep -qF 'REFUSED' "$T/run/o/logs/fix-3301.log" && grep -qF 'no pull request numbered 3301' "$T/run/o/logs/fix-3301.log"
-ck "1) the refusal names the number AND the class (a DISPATCH defect, not a repair)" $?
+# 1. the number IS an issue — the measured case (gh issue view answers, gh pr view cannot)
+run_pr "" 1 "GraphQL: Could not resolve to a PullRequest with the number of 3301. (repository.pullRequest)" 0 '{"number":3301}'
+ck "1) a number that is an ISSUE is REFUSED with the DISPATCH code 86 (rc=$(cat "$T/run/rc"))" \
+   "$([ "$(cat "$T/run/rc")" = 86 ] && echo 0 || echo 1)"
+grep -qF 'REFUSED' "$T/run/o/logs/fix-3301.log" && grep -qF 'it DOES have an ISSUE with that number' "$T/run/o/logs/fix-3301.log"
+ck "1) the refusal names the number AND the positive evidence (an issue exists, a PR does not)" $?
 grep -qF 'DISPATCH defect' "$T/run/o/logs/fix-3301.log"
 ck "1) the log says why it is not a repair (so the next reader does not re-derive it)" $?
 grep -qx '0' "$T/run/refunded"; _rc=$?
 ck "1) the booked attempt is REFUNDED (fixcount 1 -> $(cat "$T/run/refunded"))" "$_rc"
 
-# 2. gh cannot answer — must NOT refuse (the over-block arm: an unreadable read is not an absence)
-run_pr "" 1 "gh: HTTP 403: API rate limit exceeded for user ID 1 (https://api.github.com/graphql)"
-ck "2) an UNREADABLE probe does NOT refuse the dispatch (rc=$(cat "$T/run/rc"), want not-78)" \
-   "$([ "$(cat "$T/run/rc")" != 78 ] && echo 0 || echo 1)"
-grep -qF 'could not answer' "$T/run/unknown"
-ck "2) and it is RECORDED as unanswerable, never as a missing PR" $?
+# 2. gh cannot answer and the issue probe cannot identify it either — must NOT refuse (the over-block
+# arm: an unreadable read is not an absence, and #4182 arm 2's dispatch must still run)
+run_pr "" 1 "gh: HTTP 403: API rate limit exceeded for user ID 1 (https://api.github.com/graphql)" 1 "gh: HTTP 403: API rate limit exceeded"
+ck "2) an UNREADABLE pair does NOT refuse the dispatch (rc=$(cat "$T/run/rc"), want not-86)" \
+   "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
+grep -qF 'did not identify it either' "$T/run/unknown"
+ck "2) and it is RECORDED as unreadable, never as a missing PR" $?
 grep -qx '1' "$T/run/refunded"; _rc=$?
 ck "2) nothing is refunded for a run that proceeds (fixcount still $(cat "$T/run/refunded"))" "$_rc"
 
+# 2b. ⛔ THE ARM THE FIRST DESIGN FAILED (#4190 review N1, VERIFIED). A `gh-rest` box serves
+# `pr view --json` over REST, where a 404 arrives as `gh-rest: API error: Not Found` — NOT the GraphQL
+# sentence. Keying on the wording would mean the refusal NEVER FIRES on the fleet's own config, so the
+# decision must not depend on which transport answered.
+run_pr "" 1 "gh-rest: API error: Not Found" 0 '{"number":3301}'
+ck "2b) the REST/shim wording also REFUSES (rc=$(cat "$T/run/rc"))" \
+   "$([ "$(cat "$T/run/rc")" = 86 ] && echo 0 || echo 1)"
+
+# 2c. declared threat class (iv): a gh failure whose TEXT contains the refusal phrase, with NO issue
+# identified, must NOT refuse — message text cannot decide this either way.
+run_pr "" 1 "GraphQL: Could not resolve to a PullRequest with the number of 3301. (repository.pullRequest)" 1 "gh-rest: API error: Not Found"
+ck "2c) message TEXT cannot decide it — the phrase alone does NOT refuse (rc=$(cat "$T/run/rc"))" \
+   "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
+
 # 3. the PR exists, but its head read came back empty — #4182 arm 2, still no refusal
-run_pr "" 0 '{"number":3301}'
+run_pr "" 0 '{"number":3301}' 1 "unused"
 ck "3) an empty head on a REAL PR does not refuse (rc=$(cat "$T/run/rc"))" \
-   "$([ "$(cat "$T/run/rc")" != 78 ] && echo 0 || echo 1)"
+   "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
 grep -qF 'staleness guard cannot name this head' "$T/run/unknown"
 ck "3) the recorded reason names the BLANKED staleness guard instead of claiming a head" $?
 # ⛔ THE PROCEEDING PATH MUST NOT REFUND, IN EITHER SUB-CASE (#1720/#2223). An empty head is the
@@ -150,7 +191,7 @@ grep -qF 'UNKNOWN' "$T/run/briefhead" && ! grep -qx 'UNKNOWN$' "$T/run/briefhead
 ck "3) and the head the BRIEF will show is UNKNOWN plus that reason, never a blank ($(head -c 60 "$T/run/briefhead")…)" "$_rc"
 
 # 4. a head was read — the probe must not cost a second gh call per dispatch
-run_pr "0123456789abcdef0123456789abcdef01234567" 0 ""
+run_pr "0123456789abcdef0123456789abcdef01234567" 0 "" 0 ""
 [ -s "$T/run/ghcalls" ] && ck "4) no probe when the head is already known (gh calls: $(wc -l < "$T/run/ghcalls"))" 1 \
                         || ok "4) no probe when the head is already known (gh calls: 0)"
 ck "4) and nothing is recorded as UNKNOWN on the ordinary path" "$([ -z "$(cat "$T/run/unknown")" ] && echo 0 || echo 1)"
@@ -257,7 +298,13 @@ run_brief() {
     FIX_REVIEW_LEAD="REVIEW-LEAD-MARKER"
     : > "$L"
     printf '1\n' > "$O/state/fixcount-3301"
-    gh() { [ -n "$gh_out" ] && printf '%s\n' "$gh_out"; return "$gh_rc"; }
+    gh() {
+      case "$*" in
+        'pr view'*)    [ -n "$gh_out" ] && printf '%s\n' "$gh_out"; return "$gh_rc" ;;
+        'issue view'*) return 1 ;;
+        *) return 1 ;;
+      esac
+    }
     is_num() { case "${1-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
     . "$T/refund.sh" >/dev/null 2>&1
     . "$T/prresolve.sh" >/dev/null 2>&1
