@@ -966,11 +966,36 @@ for c in $FIX_REQ_FAIL $FIX_ADV_FAIL; do _fix_check_section "$c"; done
 # found real issues". The read is observed now: success keeps the comments verbatim, and a failure
 # writes a SELF-DESCRIBING header so the file can never be mistaken for a review — while the brief's
 # lead stops asserting a review it did not read.
+#
+# ⛔ A READ THAT SUCCEEDED AND DELIVERED NOTHING IS NOT A REVIEW EITHER (#4190 review F2, P1).
+# Redirected, `gh pr view --comments` prints ONLY comments and reviews (GitHub CLI manual;
+# cli/cli#14714), so a PR with none yields **exit 0 and zero bytes** — and the lead was computed from
+# `$FIX_REVIEW_READ_RC` ALONE, so the fixer was handed a 0-BYTE findings file under a sentence
+# asserting a reviewer found real issues. That is #3608's class surviving on the success path, and
+# nothing gates it: this script has no "findings must exist" precondition, and the CI-red dispatch
+# path is raised by a failing check rather than by a review comment. So the content is observed too.
+# The three states are therefore distinct, and each renders a lead that is TRUE of the artifact:
+#   read FAILED              → NOT-A-REVIEW header + "the review could not be read"
+#   read OK, NO content      → NOT-A-REVIEW header + "the PR carries no review comment"
+#   read OK, content present → verbatim (the artifact IS the PR's comments), and the lead claims
+#                              findings ONLY when a findings heading is actually present in it.
+# ⛔ The third state's lead says "no findings heading was DETECTED", never "the PR has no review":
+# the heading test is a text match, and asserting absence from a text match would rebuild the very
+# defect this block removes, one level down.
 FIX_REVIEW_READ_RC=0
 FIX_REVIEW_LEAD="A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full"
+FIX_REVIEW_FINDINGS_RE='^#{1,6}[[:space:]].*P[0-3]|\[P[0-3]\]'
 gh pr view "$PR" --repo "$OR" --comments > "$L-comments.raw" 2>&1 || FIX_REVIEW_READ_RC=$?
 if [ "$FIX_REVIEW_READ_RC" -eq 0 ]; then
   cat "$L-comments.raw" > "$L-comments.txt"
+  if ! grep -q '[^[:space:]]' "$L-comments.txt"; then
+    echo "⛔ THIS FILE IS NOT A REVIEW — the comment read SUCCEEDED (gh rc=0) but delivered NO content. When its output is redirected, gh pr view --comments prints ONLY comments and reviews, so this PR carries none. There are no findings in this file because there is nothing in this file: do not invent work from an absent review." > "$L-comments.txt"
+    FIX_REVIEW_LEAD="⛔ THE PR CARRIES NO REVIEW COMMENT: the comment read succeeded but delivered an EMPTY findings file ($L-comments.txt says so on its first line), so this dispatch was not raised by reviewer findings — most likely by a failing check. Fix what the CI evidence names; if there is nothing to fix, say so plainly in your final message instead of manufacturing a change."
+    echo "[fix $PR] WARN: the comment read succeeded but delivered NO content — $L-comments.txt is marked NOT-A-REVIEW and the brief no longer asserts a review that does not exist (#3608/#4190)" >> "$L.log"
+  elif ! grep -qE "$FIX_REVIEW_FINDINGS_RE" "$L-comments.txt"; then
+    FIX_REVIEW_LEAD="the comment read SUCCEEDED and $L-comments.txt holds this PR's comments verbatim, but no findings heading ('### N. Px' or '[P1]') was DETECTED in it — read it and decide. If there is nothing to fix, say so plainly in your final message instead of manufacturing a change."
+    echo "[fix $PR] WARN: the comment read succeeded but no findings heading ('### N. Px' / '[P1]') was detected in $L-comments.txt — the brief no longer asserts findings it did not see (#4190 review F2)" >> "$L.log"
+  fi
 else
   {
     echo "⛔ THIS FILE IS NOT A REVIEW — the comment read FAILED (gh rc=$FIX_REVIEW_READ_RC), so this PR's comments were never read. Everything below is the raw failure text, kept so the failure is VISIBLE instead of absent."
