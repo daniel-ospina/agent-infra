@@ -30,7 +30,7 @@ only code that deletes:
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 | `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
 the shipped 3600 s was half of it — see the class note below), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
-| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB) and age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d) |
+| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
 
 ## Why one entry point
 
@@ -825,7 +825,7 @@ marker, and a wide default costs a `stat` and no delete surface.
 | `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) |
 | `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
 | `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) — ⛔ **except the newest one per install**: a listener holds its CURRENT log open, so unlinking it reclaims no bytes while crediting the `du` figure to the ledger and costing the next failure its diagnostics (`reason=newest-log`) |
-| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, and only when NO install on the box has a job running |
+| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` disables the gate). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
 
 ⛔ **THE SHARED ROOT IS GLOB-DECIDED, SO IT IS SCOPE-CHECKED BEFORE ANY DELETE.** It must not **be** an
 install and must not **contain** one (`REFUSED … reason=shared-root-contains-an-install`): the
@@ -833,6 +833,21 @@ one-token error this seam invites is naming the installs' parent (`$RUNNER_ROOT`
 `$RUNNER_ROOT/_cache`), and the liveness gate cannot save it — a runner between jobs is idle **by
 design**. A refused root removes nothing, publishes `census=refused` and exits 3. `refused=<n>` is
 printed on the class line, so the refusal is a count, not an inference.
+
+⛔ **AND ITS LIVENESS GATE IS NEVER VACUOUS.** The shared root's "is any install live?" question is asked
+of the DISCOVERED installs — so on a box where the globs matched **no** install it used to be answered
+"not live" having read nothing, and the root every install on that box shares was emptied on the
+authority of a question nobody asked. With an empty population the witness is the **process census**
+instead: a `Runner.Listener`/`Runner.Worker` that no discovered install accounts for means an install
+lives OUTSIDE the globs and may be reading that root right now, so liveness is UNKNOWN, nothing under it
+is touched, and the pass fails closed (`KEPT … reason=unattributed-runner-process`, rc 3). A census
+carrying no runner process at all is a real proof that nothing can be using it.
+
+⛔ **AND IT IS PRESSURE-GATED, NOT AGE-GATED.** `REAP_RC_SHARED_TRIGGER_FREE_MB` (default 40960, the
+size-triggered pass's own threshold) keeps the root warm while the box has space
+(`KEPT … reason=shared-free-above-trigger free_mb=<n> trigger_mb=<n>`), and a `df` that cannot answer
+KEEPS it too (`reason=free-unmeasurable`, rc 3) — an unanswerable gate is not a delete permission. The
+liveness skip is asked FIRST, so a root a job is actually using is always reported as `skipped-live`.
 
 ⛔ The install tree itself is never a candidate: not `bin/`, `config/`, `externals/`, not
 `_work/<checkout>` (that is `class=runner-work`'s sink, with its own mtime floor), and not `_tool`,
@@ -876,12 +891,20 @@ read `0` on exactly the layout the durable half creates, beside a non-zero `free
 — `XDG_CACHE_HOME=$RUNNER_CACHE_ROOT` (default `$RUNNER_ROOT/_cache`, created at start and announced on
 the `cache-root=` line) — for every listener it starts, so N slots no longer hold N copies of the same
 content. Override it with `RUNNER_CACHE_ROOT` — and ⛔ name the same path in
-`DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` (two tools, one directory). The reaper's default list now
-**derives** its third entry from `${RUNNER_ROOT:-/tmp/actions-runner}/_cache`, the same variable and
-default the pool derives from, so the two cannot disagree on the `RUNNER_ROOT=/opt` box this repo
-documents as live; and a pass whose shared globs match **nothing** prints
-`shared_root=absent (…)`, so an operator override on only one of the two tools is visible in the
-record instead of silently unfree-ing the sink. ⛔ `RUNNER_CACHE_ROOT` is read with `${X-}`, not
+`DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS` (two tools, one directory). ⛔ **THE COUPLING IS THE LAYOUT, NOT
+AN ENVIRONMENT VARIABLE.** The reaper asks every **discovered install's parent** for `_cache`, and the
+pool's own layout makes that the pool's cache root (`CACHE_ROOT=${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}`
+with the installs at `$RUNNER_ROOT/gh-runner-*`) — so on the `RUNNER_ROOT=/opt` box this repo documents
+as live the class reaches `/opt/_cache` **whatever** the invoking shell or a scheduled unit does or does
+not export. The list's third entry still derives from `${RUNNER_ROOT:-/tmp/actions-runner}/_cache` as a
+compat net, but ⛔ deriving from that variable alone was **not** one source: neither scheduled artifact
+renders `RUNNER_ROOT`, so on a cell the reaper saw `/tmp/actions-runner/_cache`, matched nothing, and
+reported `ok` while the pool filled a directory no glob covered. `case P` of the suite pins the
+derivation AND reads the pool's own `CACHE_ROOT=` expression to assert the two resolve to the SAME
+directory — the cross-tool check this paragraph used to promise in prose only. `shared_root=derived (…)`
+names the candidate in the pass record, and a pass whose globs match **nothing** prints
+`shared_root=absent (…)`, so an operator override on only one of the two tools is visible instead of
+silently unfree-ing the sink. ⛔ `RUNNER_CACHE_ROOT` is read with `${X-}`, not
 `${X:-}`: a SET-but-EMPTY value is refused (`why=cache-root-empty`), never silently replaced by the
 default. A listener that survived a reboot
 keeps the environment it was exec'd with — the documented residual, identical to the private `TMPDIR`
@@ -900,6 +923,13 @@ minutes** with `--size-trigger`: it measures free space, does **nothing** while 
 * **The other five classes must NOT be fired harder.** Their gates are about AGE and emptiness, and
   sweeping them more often under pressure is exactly the "reclaim harder" instinct that deletes live
   work. So the fast clock runs ONE class, and it is self-gating.
+
+⛔ **AND THE HOURLY PASS NO LONGER EMPTIES THE SHARED ROOT ON A HEALTHY BOX.** The class's shared arm is
+pressure-gated (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default the same 40 GB), so under the hourly clock a
+warm machine-wide cache survives while the box has space, and the 10-minute size-triggered pass is what
+reclaims it below the trigger. Without that gate a healthy box with hundreds of GB free had every job
+re-download the same packages once an hour, for no space at all — the class was doing work its own
+trigger says is unnecessary (#4169 review, P3).
 
 The trigger pass writes its **own** record (`$STATE_DIR/disk-reaper-cache.status`) so it can never
 overwrite the hourly pass's; `--print-status` still answers for the full pass. Both passes take the
@@ -1688,7 +1718,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**15 case runs + 17 mutants + 1 scope case — 33 outcomes**), covering every arm #4168 names. The table
+(**18 case runs + 20 mutants + 1 scope case — 39 outcomes**), covering every arm #4168 names. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
@@ -1710,6 +1740,9 @@ because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 | M | `cache_mb=` counts the **shared root** the durable half creates, not only the per-install `.cache` dirs (it read `0` while the bytes were here) | the shared-root accumulate → removed |
 | N | the listener's **CURRENT** `_diag` log is KEPT (`reason=newest-log`: held open, so unlinking it frees nothing) while an OLDER aged log in the same install IS reaped | the newest-log keep → `if false; then` |
 | O | the `_work` freshness witness is **argv-independent**: a fresh `_work` keeps the cache with a listener argv the literal match does not recognise (`reason=skipped-live:busy-work`) | the witness assignment → `newest=0` |
+| P | the pool's cache root is reached from the **LAYOUT**: an install at `$RUNNER_ROOT/gh-runner-x64` makes `$RUNNER_ROOT/_cache` a candidate with **no** shared-glob match and a **wrong** `RUNNER_ROOT` in the environment (`shared_root=derived (…)`), and the pool's OWN `CACHE_ROOT=` expression is read and asserted to resolve to that same directory | the derived candidate (`add_shared_dir "$_p/_cache" derived`) → `:` |
+| Q | with **zero installs discovered**, a runner process no install accounts for keeps the SHARED root (`reason=unattributed-runner-process`, rc 3) — the liveness gate is not vacuous | the population witness (`if proc_has "Runner.Listener" …`) → `if false; then` |
+| R | the shared root is **pressure-gated**: kept with 200 GB free (`reason=shared-free-above-trigger`), reaped below the trigger, and KEPT with rc 3 when `df` cannot answer (`reason=free-unmeasurable`) — against a `df` stub, both directions | `if [ "$SHARED_TRIGGER_FREE_MB" -gt 0 ]; then` → `if false; then` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

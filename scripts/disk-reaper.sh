@@ -317,6 +317,15 @@ RUNNER_CACHE_GLOBS="${DISK_REAPER_RUNNER_CACHE_GLOBS-/opt/gh-runner* $HOME/actio
 RUNNER_CACHE_GLOBS_EXPLICIT=0
 if [ -n "${DISK_REAPER_RUNNER_CACHE_GLOBS+set}" ]; then RUNNER_CACHE_GLOBS_EXPLICIT=1; fi
 RUNNER_CACHE_SHARED_GLOBS="${DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS-/tmp/actions-runner/_cache $HOME/actions-runner/_cache ${RUNNER_ROOT:-/tmp/actions-runner}/_cache}"
+# ⛔ THE GLOBS ABOVE ARE NOT THE ONLY SOURCE OF THE SHARED ROOT (#4169 review, BLOCKING). The owner also
+# asks every DISCOVERED install's parent for `_cache`, because that is the pool's own default
+# (`ci_runner_pool.sh`: `CACHE_ROOT=${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}`, installs at
+# `$RUNNER_ROOT/gh-runner-*`) read off the layout instead of off this process' environment — which
+# renders no `RUNNER_ROOT` in either artifact, so the `${RUNNER_ROOT:-…}` entry above is only correct
+# when the invoicing shell happens to export it. On `RUNNER_ROOT=/opt` (the cells' measured layout) the
+# owner reaches `/opt/_cache` through the derivation whether or not this list matches anything.
+# `rc_df_targets` deliberately stays on the globs: the derived root sits beside the installs, so the
+# per-filesystem `df` pair taken for the install globs already covers the bytes it frees.
 # 7 days, not the runner-work class's 2 hours: `_work/_temp` holds a LIVE job's `$RUNNER_TEMP`
 # (`reap-runner-work.sh` retains it for exactly that reason), and this class only touches it when the
 # install is provably IDLE — but the floor is still the operator's dial, and a week is far above the
@@ -3549,7 +3558,13 @@ record_body() {
     # in ONE class while reading healthy — so a four-class sum would have reported
     # `alert=under-reclaim` on the pass that just fixed the box. `FREED_RW` is the same unit (MB, a df
     # delta), and `TOTAL` above is the same sum, so the two surfaces cannot disagree.
-    _freed_total=$(( ${FREED_UV:-0} + ${FREED_VENV:-0} + ${FREED_WT:-0} + ${FREED_DUP:-0} + ${FREED_RW:-0} ))
+    _freed_total=$(( ${FREED_UV:-0} + ${FREED_VENV:-0} + ${FREED_WT:-0} + ${FREED_DUP:-0} + ${FREED_RW:-0} + ${FREED_RC:-0} ))
+    # ⛔ THE SIXTH CLASS IS IN THE SUM (#4169 review, P3). `runner-cache` was missing here, so
+    # `freed_mb_total=` — and the `alert=under-reclaim` derived from the same total — silently excluded
+    # everything the newest class freed: a box whose ONLY reclamation was its runner caches read
+    # `freed_mb_total=<small>` beside `freed_mb_runner_cache=<GB>`, and the under-reclaim alarm fired on a
+    # pass that had in fact freed the space. The class's own field was already correct, which is exactly
+    # how a missing term survives review: every number a reader checked was right.
     _free_mb=""
     # ⛔ `${REAP_AW_ROOTS%%:*:-/tmp}` IS NOT A DEFAULT — it is the pattern `*:-/tmp`, so with
     # REAP_AW_ROOTS unset the expansion aborted and `free_mb` was `unmeasured` on exactly the path the

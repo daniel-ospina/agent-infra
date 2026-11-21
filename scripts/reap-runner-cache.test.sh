@@ -49,6 +49,20 @@
 #      Its neighbour's cache is ABOVE the size bound on purpose — otherwise `below-min-cache` would
 #      protect it and the case would pass for a reason unrelated to the marker (#4169 review, NOTE-3).
 #      Mutant: `is_install() { … }` -> `is_install() { true; }`.
+#   P  THE SHARED ROOT'S DEFAULT HAS ONE SOURCE, AND IT IS THE LAYOUT — not `${RUNNER_ROOT:-…}` in the
+#      reaper's OWN environment. The pool writes to `${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}` and puts
+#      every install at `$RUNNER_ROOT/gh-runner-*`, so a discovered install's parent `_cache` IS the
+#      pool's cache root on any box, whatever a scheduled unit renders into its `Environment=` (neither
+#      renders `RUNNER_ROOT`, which is what falsified the previous "one source" claim on `/opt`).
+#      Mutant: the derived candidate -> removed.
+#   Q  THE SHARED ROOT'S LIVENESS GATE IS NOT VACUOUS. With NO install discovered, `any_live_now` walks
+#      an empty list and answers "not live" without reading anything — so the census must be asked
+#      instead, and an unattributable runner process means liveness is UNKNOWN and nothing is removed.
+#      Mutant: the population witness -> removed.
+#   R  THE SHARED ROOT IS PRESSURE-GATED, NOT AGE-GATED: kept above the free-space trigger, reaped below
+#      it, and KEPT when the probe cannot answer (a warm cache is not a leak, and an hourly pass must not
+#      empty it on a healthy box).
+#      Mutant: the free-space gate -> removed.
 #
 # Hermetic: every fixture is under $T, HOME is redirected, the state dir and the install globs are
 # explicit `$T/...` paths, and the process census is a FIXTURE TABLE — NOTHING here can read or delete
@@ -87,7 +101,13 @@ trap cleanup EXIT
 unset DISK_REAPER_ONLY DISK_REAPER_REPOS DISK_REAPER_RUNNER_CACHE_GLOBS \
       DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB \
       DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB \
-      REAP_RC_GLOBS REAP_RC_SHARED_GLOBS REAP_RC_MIN_CACHE_MB REAP_RC_PS_BIN 2>/dev/null || true
+      REAP_RC_GLOBS REAP_RC_SHARED_GLOBS REAP_RC_MIN_CACHE_MB REAP_RC_PS_BIN \
+      REAP_RC_DF_BIN 2>/dev/null || true
+# ⛔ THE FREE-SPACE GATE IS PINNED OFF FOR THE WHOLE SUITE, because it reads the BOX: this host has
+# 70+ GB free, so the 40960 default would keep every shared root and make the shared-arm cases
+# vacuous. `case_r` is the ONE place the gate is exercised, with a `df` STUB, so both directions and the
+# unmeasurable arm are deterministic instead of host-dependent.
+export REAP_RC_SHARED_TRIGGER_FREE_MB=0
 export HOME="$T/home"; mkdir -p "$HOME"
 
 # apply_mutation <src> <dest> <sed-expression> — write the mutant; FAIL LOUDLY when nothing changed.
@@ -614,10 +634,136 @@ case_o() { # <owner-script>
     [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
     case_check "$([ -d "$inst/.cache" ] && echo 0 || echo 1)" \
-               "a FRESH `_work` keeps the cache even when the listener argv does not match the literal (argv-independent witness)"
+               'a FRESH `_work` keeps the cache even when the listener argv does not match the literal (argv-independent witness)'
     case_check "$(grep -qF 'reason=skipped-live:busy-work' <<<"$out" && echo 0 || echo 1)" \
                "and the skip names THAT witness (reason=skipped-live:busy-work)"
     case_check "$(grep -qF 'live=yes' <<<"$out" && echo 0 || echo 1)" "the installation reading says live=yes"
+    return $((CASE_FAIL > 0))
+}
+
+# ── P: the SHARED root's default comes from the LAYOUT, not from this process' env ────────────
+# ⛔ THE FALSIFIED CLAIM (#4169 review, BLOCKING). The default derived `${RUNNER_ROOT:-…}/_cache`
+# from the reaper's OWN environment, and NEITHER scheduled artifact renders `RUNNER_ROOT` — so on the
+# documented `RUNNER_ROOT=/opt` layout (the cells' real shape: installs at `/opt/gh-runner-*`, cache at
+# `/opt/_cache`) the reaper derived `/tmp/actions-runner/_cache`, matched nothing, and reported `ok` while
+# the pool filled a directory no glob covered. The fixture below is that layout, with `RUNNER_ROOT`
+# UNSET — the derivation must not need it.
+# Mutant: the derived candidate -> removed.
+case_p() { # <owner-script>
+    local owner="$1" base root inst shared out rc pool_root
+    base="$(mktemp -d "$T/p.XXXXXX")"
+    root="$base/opt"
+    inst="$root/gh-runner-x64"; shared="$root/_cache"
+    mk_install "$inst"; mk_cache "$inst" 0; idle_work "$inst"
+    mkdir -p "$shared/uv"; dd if=/dev/zero of="$shared/uv/blob" bs=1M count=3 >/dev/null 2>&1
+    mk_ps "$base/ps" "$inst" idle
+    # ⛔ NO `REAP_RC_SHARED_GLOBS` OVERRIDE and NO `RUNNER_ROOT`: only the derivation can find `$shared`.
+    out="$(cd "$base" && RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$root/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           env -u RUNNER_ROOT -u RUNNER_CACHE_ROOT -u REAP_RC_SHARED_GLOBS \
+           REAP_RC_MIN_CACHE_MB=1 REAP_RC_SHARED_TRIGGER_FREE_MB=0 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ ! -e "$shared/uv" ] && echo 0 || echo 1)" \
+               "the pool's cache root beside the installs IS swept with no RUNNER_ROOT and no shared-glob override"
+    case_check "$(grep -qF "shared_root=derived (" <<<"$out" && grep -qF "$shared" <<<"$out" && echo 0 || echo 1)" \
+               "and the pass NAMES the derived candidate it reached (shared_root=derived …)"
+    # ⛔ THE CROSS-TOOL PIN the earlier round admitted it did not have: the pool's OWN expression, read
+    # from the pool, resolves to the directory this case just swept. A change to either tool's layout
+    # reddens here instead of silently re-opening the sink.
+    pool_root="$(cd "$HERE" && env -u RUNNER_CACHE_ROOT RUNNER_ROOT="$root" bash -c \
+        "$(sed -n 's/^CACHE_ROOT=/CACHE_ROOT=/p' "$HERE/ci_runner_pool.sh" | head -1); printf '%s' \"\$CACHE_ROOT\"" 2>/dev/null)"
+    case_check "$([ "$pool_root" = "$shared" ] && echo 0 || echo 1)" \
+               "and the POOL's own CACHE_ROOT expression resolves to that same directory (tools=$pool_root layout=$shared)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── Q: the shared root's liveness gate is NOT VACUOUS when no install was discovered ───────────
+# ⛔ `any_live_now` walks `$INSTALL_DIRS`; with an EMPTY population it returns "not live" having read
+# nothing, and the shared root was emptied on the authority of a question nobody asked. If the process
+# census carries a listener/worker that no discovered install accounts for, an install lives OUTSIDE the
+# globs and may be reading that root right now: liveness is UNKNOWN, nothing is removed, rc 3.
+# Mutant: the population witness -> removed.
+case_q() { # <owner-script>
+    local owner="$1" base shared out rc
+    base="$(mktemp -d "$T/q.XXXXXX")"
+    shared="$base/shared/_cache"
+    mkdir -p "$shared/uv"; dd if=/dev/zero of="$shared/uv/blob" bs=1M count=2 >/dev/null 2>&1
+    # A runner process for an install that this pass's glob does NOT match (it lives elsewhere).
+    printf '  4242 %s/elsewhere/gh-runner-z/bin/Runner.Listener run\n' "$base" >"$base/ps"
+    printf '  4243 %s/elsewhere/gh-runner-z/bin/Runner.Worker spawnclient 1 2\n' "$base" >>"$base/ps"
+    # Zero installs WITHOUT the explicit-seam refusal (`REAP_RC_EXPLICIT=0` is the documented way to say
+    # "these globs are the defaults, a measured-empty box is not a refusal").
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=0 \
+           REAP_RC_SHARED_GLOBS="$shared" REAP_RC_SHARED_TRIGGER_FREE_MB=0 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ -d "$shared/uv" ] && echo 0 || echo 1)" \
+               "with ZERO installs discovered and a runner process nobody accounts for, the SHARED root is UNTOUCHED"
+    case_check "$(grep -qF "KEPT   $shared reason=unattributed-runner-process" <<<"$out" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME (reason=unattributed-runner-process), not silently"
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "the pass FAILS CLOSED (rc=$rc, want 3) — an empty population is not proof of idleness"
+    return $((CASE_FAIL > 0))
+}
+
+# ── R: the SHARED root is PRESSURE-gated, not reaped on every tick ─────────────────────────────
+# ⛔ #4169 review, P3: it had no size bound of its own and the HOURLY pass ran no free-space gate, so a
+# box with hundreds of GB free had its warm machine-wide cache emptied every hour and every job
+# re-downloaded the same packages. Both directions plus the unmeasurable arm, with a `df` STUB so the
+# reading is a fixture and not this host's disk.
+# Mutant: the free-space gate -> removed.
+case_r() { # <owner-script>
+    local owner="$1" base shared out rc df_stub
+    base="$(mktemp -d "$T/r.XXXXXX")"
+    shared="$base/shared/_cache"
+    mk_ps "$base/ps" "$shared" idle
+    df_stub="$base/df-stub"
+    cat >"$df_stub" <<'STUB'
+#!/bin/sh
+case "${RC_TEST_DF_MODE:-ok}" in
+    fail) exit 1 ;;
+esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture %s 0 %s 0%% /\n' 999999 "$(( ${RC_TEST_DF_FREE_MB:-0} * 1024 ))"
+STUB
+    chmod +x "$df_stub"
+    mk_install "$base/gh-runner-r"; mk_cache "$base/gh-runner-r" 0; idle_work "$base/gh-runner-r"
+    run_df() { # <free-mb> <mode> — one fresh fixture + one pass, prints the owner output
+        rm -rf "$shared"; mkdir -p "$shared/uv"
+        dd if=/dev/zero of="$shared/uv/blob" bs=1M count=2 >/dev/null 2>&1
+        RC_TEST_DF_FREE_MB="$1" RC_TEST_DF_MODE="$2" REAP_RC_DF_BIN="$df_stub" \
+        RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+        REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+        REAP_RC_SHARED_GLOBS="$shared" REAP_RC_SHARED_TRIGGER_FREE_MB=40960 \
+        REAP_RC_MIN_CACHE_MB=1 REAP_RC_STATE_DIR="$base/state" \
+        bash "$owner" --apply 2>&1
+    }
+    # (1) ABOVE the trigger: a healthy box keeps its warm cache.
+    out="$(run_df 200000 ok)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'R1 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "above the trigger the pass exits 0 (rc=$rc)"
+    case_check "$([ -d "$shared/uv" ] && echo 0 || echo 1)" \
+               "a WARM shared cache on a box with 200 GB free is KEPT (the hourly pass is not a cache evictor)"
+    case_check "$(grep -qF 'reason=shared-free-above-trigger' <<<"$out" && echo 0 || echo 1)" \
+               "and the keep NAMES the reading and the threshold (reason=shared-free-above-trigger)"
+    # (2) BELOW the trigger: the frequent pass's case, reaped.
+    out="$(run_df 1000 ok)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'R2 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ ! -e "$shared/uv" ] && echo 0 || echo 1)" \
+               "BELOW the trigger the shared root IS reaped (the pressure gate is not an inert enforcer)"
+    # (3) THE PROBE CANNOT ANSWER: keep it and fail closed — never "unknown" read as "safe to delete".
+    out="$(run_df 1000 fail)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'R3 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ -d "$shared/uv" ] && echo 0 || echo 1)" \
+               'a df that cannot answer KEEPS the root (an unanswerable gate is not a delete permission)'
+    case_check "$(grep -qF 'reason=free-unmeasurable' <<<"$out" && echo 0 || echo 1)" \
+               "and it is named (reason=free-unmeasurable)"
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "and the pass fails closed (rc=$rc, want 3)"
     return $((CASE_FAIL > 0))
 }
 
@@ -626,6 +772,7 @@ MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
 MUT_K="$T/mut-k.sh"; MUT_L="$T/mut-l.sh"; MUT_L2="$T/mut-l2.sh"; MUT_M="$T/mut-m.sh"
 MUT_N="$T/mut-n.sh"; MUT_O="$T/mut-o.sh"
+MUT_P="$T/mut-p.sh"; MUT_Q="$T/mut-q.sh"; MUT_R="$T/mut-r.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -673,6 +820,16 @@ apply_mutation "$OWNER" "$MUT_N" 's/^        if \[ -n "\$newest_log" \] && \[ "\
 # argv could make a job visible).
 apply_mutation "$OWNER" "$MUT_O" 's/^    newest="\$(newest_mtime_under "\$d\/_work")"$/    newest=0/' \
     || { printf '  ❌ mutation O could not be applied (the argv-independent _work witness moved)\n'; mut_ok=0; }
+# ⛔ P — the DERIVED shared root (the layout is the one source; the env-derived default was falsified by
+# the units' own environments).
+apply_mutation "$OWNER" "$MUT_P" 's/^    add_shared_dir "\$_p\/_cache" derived$/    :/' \
+    || { printf '  ❌ mutation P could not be applied (the derived shared candidate moved)\n'; mut_ok=0; }
+# ⛔ Q — the population witness: without it an EMPTY install population answers "not live" vacuously.
+apply_mutation "$OWNER" "$MUT_Q" 's/^        if proc_has "Runner.Listener" || proc_has "Runner.Worker"; then$/        if false; then/' \
+    || { printf '  ❌ mutation Q could not be applied (the population witness moved)\n'; mut_ok=0; }
+# ⛔ R — the free-space gate on the shared root (a warm cache is not a leak).
+apply_mutation "$OWNER" "$MUT_R" 's/^    if \[ "\$SHARED_TRIGGER_FREE_MB" -gt 0 \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation R could not be applied (the shared free-space gate moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -690,6 +847,9 @@ expect_pass "L2 a shared root that CONTAINS an install is REFUSED (the parent, o
 expect_pass "M cache_mb counts the SHARED root, not only the per-install .cache dirs" case_m "$OWNER"
 expect_pass "N the listener's CURRENT _diag log is kept; older aged logs are reaped" case_n "$OWNER"
 expect_pass "O a fresh _work keeps the cache without a literal listener argv match" case_o "$OWNER"
+expect_pass "P the pool's cache root is reached from the LAYOUT, with no RUNNER_ROOT and no override" case_p "$OWNER"
+expect_pass "Q zero installs + an unattributable runner process keeps the shared root (rc 3)" case_q "$OWNER"
+expect_pass "R the shared root is pressure-gated: kept when warm, reaped when low, kept when unanswerable" case_r "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -712,6 +872,9 @@ expect_fail "L2 mutant: a shared root CONTAINING an install is swept"   case_l2 
 expect_fail "M mutant: the shared-root reading is not counted"          case_m "$MUT_M"
 expect_fail "N mutant: the newest (open) _diag log is reaped too"       case_n "$MUT_N"
 expect_fail "O mutant: the argv-independent _work witness deleted"      case_o "$MUT_O"
+expect_fail "P mutant: the derived shared candidate removed"             case_p "$MUT_P"
+expect_fail "Q mutant: the population witness removed (vacuous liveness)" case_q "$MUT_Q"
+expect_fail "R mutant: the shared free-space gate removed"              case_r "$MUT_R"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

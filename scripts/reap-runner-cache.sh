@@ -124,9 +124,20 @@
 #                          the seam to turn the class off, which is the delete direction.
 #   REAP_RC_SHARED_GLOBS   space-separated globs naming the ONE per-box cache root
 #                          (default: /tmp/actions-runner/_cache $HOME/actions-runner/_cache
-#                          ${RUNNER_ROOT:-/tmp/actions-runner}/_cache — the third is DERIVED from the
-#                          same variable `ci_runner_pool.sh` derives its `XDG_CACHE_HOME` from, so the
-#                          two tools cannot disagree about the default on a `RUNNER_ROOT=/opt` box)
+#                          ${RUNNER_ROOT:-/tmp/actions-runner}/_cache). ⛔ THE GLOBS ARE NOT THE ONLY
+#                          SOURCE AND THEY ARE NOT THE AUTHORITATIVE ONE: every discovered install's
+#                          PARENT is also asked for `_cache` (see `add_shared_dir`), because that is the
+#                          pool's own default (`CACHE_ROOT=${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}`, with
+#                          the installs at `$RUNNER_ROOT/gh-runner-*`) read off the layout instead of off
+#                          this process' environment — a scheduled unit that renders no `RUNNER_ROOT`
+#                          cannot falsify it (#4169 review, BLOCKING).
+#   REAP_RC_SHARED_TRIGGER_FREE_MB
+#                          the free-space gate on the SHARED root: it is emptied only when the filesystem
+#                          holding it has LESS than this many MiB free (default 40960 = the size-triggered
+#                          pass's own trigger; 0 disables the gate). A shared cache is a WARM cache, not a
+#                          leak: sweeping it on an hourly pass over a box with 200 GB free makes every
+#                          job re-download the same packages (#4169 review, P3).
+#   REAP_RC_DF_BIN         the free-space probe             (default df, called as `df -Pk <path>`)
 #   REAP_RC_EXPLICIT       1 = REAP_RC_GLOBS was SET by the caller, so matching NO INSTALL is a REFUSAL
 #                          (an asserted layout that is not there, or a seam one component short) and not
 #                          a measured-empty box. `disk-reaper.sh` sets it from the operator seam.
@@ -197,13 +208,16 @@ SHARED_GLOBS="${REAP_RC_SHARED_GLOBS-}"
 SHARED_GLOBS_SET=0
 [ -n "${REAP_RC_SHARED_GLOBS+set}" ] && SHARED_GLOBS_SET=1
 if [ "$SHARED_GLOBS_SET" = 0 ]; then
-    # ⛔ ONE SOURCE FOR THE DEFAULT, BECAUSE TWO TOOLS SHARE ONE DIRECTORY (#4169 review, P1).
-    # `ci_runner_pool.sh` exports `XDG_CACHE_HOME=${RUNNER_CACHE_ROOT:-$RUNNER_ROOT/_cache}` (its own
+    # ⛔ THE LIST BELOW IS A LEGACY-COMPATIBILITY NET, NOT THE COUPLING (#4169 review, BLOCKING).
+    # `ci_runner_pool.sh` exports `XDG_CACHE_HOME=${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}` (its own
     # `RUNNER_ROOT` default is `/tmp/actions-runner`), and on the layout this repo documents as LIVE —
     # `RUNNER_ROOT=/opt`, where all four installs on `pi-cell-4` sit (`ci_runner_pool.sh` records the
     # measurement) — a hardcoded `/tmp/... $HOME/...` list matches NOTHING while the pool writes tens of
-    # GB into `/opt/_cache`. The class then reads `candidates=0 verdict=ok` over exactly the unbounded
-    # sink #4168 exists to free. The derived entry is the coupling: same variable, same default.
+    # GB into `/opt/_cache`. The derived `${RUNNER_ROOT:-…}/_cache` entry below agreed only when THIS
+    # process' environment carried the same `RUNNER_ROOT`, and neither scheduled artifact renders it, so
+    # it was the review's falsified "one source". THE REAL COUPLING IS THE LAYOUT: every discovered
+    # install's parent is asked for `_cache` (see the derivation at the shared-dir collection), which
+    # cannot disagree with the pool whatever an environment says.
     SHARED_GLOBS="/tmp/actions-runner/_cache $HOME/actions-runner/_cache ${RUNNER_ROOT:-/tmp/actions-runner}/_cache"
 fi
 MIN_CACHE_MB="${REAP_RC_MIN_CACHE_MB:-256}"
@@ -213,6 +227,13 @@ JOB_WINDOW_S="${REAP_RC_JOB_WINDOW_S:-900}"
 MAX_MB="${REAP_RC_MAX_MB:-0}"
 PS_BIN="${REAP_RC_PS_BIN:-/bin/ps}"
 DU_BIN="${REAP_RC_DU_BIN:-du}"
+DF_BIN="${REAP_RC_DF_BIN:-df}"
+SHARED_TRIGGER_FREE_MB="${REAP_RC_SHARED_TRIGGER_FREE_MB:-40960}"
+case "$SHARED_TRIGGER_FREE_MB" in
+    ''|*[!0-9]*) printf '%s: FAIL-CLOSED — REAP_RC_SHARED_TRIGGER_FREE_MB=%s is not a whole number of MiB; a garbage gate value must not silently disable (or widen) a delete gate\n' \
+        "$SCRIPT_NAME" "$SHARED_TRIGGER_FREE_MB" >&2
+        exit 2 ;;
+esac
 STAT_BIN="${REAP_RC_STAT_BIN:-stat}"
 DRY_RUN="${REAP_RC_DRY_RUN:-1}"
 STATE_DIR="${REAP_RC_STATE_DIR:-${DISK_REAPER_STATE_DIR:-${HOME:-}/.pi/agent/state}}"
@@ -314,6 +335,18 @@ du_mb() { # <path> — blocks occupied in MiB, or empty when the probe could not
     local kb
     kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
     kb="${kb%%[[:space:]]*}"
+    case "$kb" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$(( kb / 1024 ))"
+}
+
+# free_mb_for_path <path> — MiB free on the filesystem holding <path>, or empty when it cannot answer.
+# `df -Pk` is the POSIX spelling on Linux and on BSD/macOS alike ("-P" = one record per line), the same
+# reason `du -sk` is used above; its 4th column is 1KiB blocks, so the reading is divided, not rounded.
+free_mb_for_path() {
+    local out kb
+    out="$(tb_timeout "$DU_TIMEOUT" "$DF_BIN" -Pk "$1" 2>/dev/null)" || return 1
+    kb="$(printf '%s\n' "$out" | awk 'NR==2 && $4 ~ /^[0-9]+$/ { printf "%d", $4 }') "
+    kb="${kb%% *}"
     case "$kb" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$(( kb / 1024 ))"
 }
@@ -630,7 +663,7 @@ sweep_install() { # <install-dir>
 # answer it needs (`ANY_LIVE`) is already known.
 ANY_LIVE=0
 sweep_shared() {
-    local root="$1" sz e sz2 is_inst
+    local root="$1" sz e sz2 is_inst free_mb
     [ -d "$root" ] || return 0
     # ⛔ `ANY_LIVE` IS THE CLASSIFICATION, NOT THE GATE. It was established by `sweep_install`, the one
     # place every install's liveness is read, and it is what reports the skip (and what makes cleanup
@@ -678,12 +711,52 @@ sweep_shared() {
     # number contradicting itself in a PR whose heading is "the numbers are printed, not implied".
     sz="$(du_mb "$root")" || sz=""
     case "$sz" in ''|*[!0-9]*) ;; *) CACHE_TOTAL_MB=$((CACHE_TOTAL_MB + sz)) ;; esac   # shared-root reading joins the class total
+    # ⛔ THE LIVENESS GATE MUST NOT BE VACUOUS (#4169 review, BLOCKING). `any_live_now` walks
+    # `$INSTALL_DIRS`, so with NO install discovered it answers "not live" WITHOUT READING ANYTHING —
+    # and this arm then emptied the root every install on the box shares, on the word of a question it
+    # never asked. When the population is empty the witness is the CENSUS instead: a runner process the
+    # pass cannot attribute to any discovered install means an install lives OUTSIDE the globs and may be
+    # reading this root right now, so liveness is UNKNOWN and nothing is removed. A census carrying no
+    # runner process at all is a real proof (not an absence of evidence) that nothing can be using it.
+    if [ "$INSTALLS" -eq 0 ]; then
+        if proc_has "Runner.Listener" || proc_has "Runner.Worker"; then
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "KEPT   $root reason=unattributed-runner-process (no install matched this pass's globs, but the process census carries a Runner.Listener/Runner.Worker that no discovered install accounts for — an install OUTSIDE those globs may be using this SHARED root, so its liveness is UNKNOWN and nothing under it was touched)"
+            return 0
+        fi
+    fi
+    # ⛔ PRESSURE-GATED, NOT AGE-GATED (#4169 review, P3). This root has no size bound of its own, so an
+    # unconditional sweep on the HOURLY pass empties a warm machine-wide cache on a box with hundreds of
+    # GB free — every job then re-downloads the same packages, and the class becomes a tax on a healthy
+    # machine. It is reaped only below `REAP_RC_SHARED_TRIGGER_FREE_MB` (the same 40 GB the size-triggered
+    # pass uses), so the frequent pass owns it under pressure and the hourly pass leaves it warm. ⛔ THE
+    # GATE SITS AFTER THE LIVENESS SKIP, so a root a job is actually using is always reported as
+    # `skipped-live` — the safety verdict outranks the policy one.
+
     if [ "$ANY_LIVE" = 1 ]; then
         SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
         log_line "SKIPPED-LIVE $root reason=skipped-live:an-install-has-a-job-running cache_mb=${sz:-?} (the SHARED cache is used by every install on this box)"
         READINGS="${READINGS}${READINGS:+
 }INSTALL ${root} cache_mb=${sz:-?} live=yes reason=shared-with-a-live-install"
         return 0
+    fi
+    if [ "$SHARED_TRIGGER_FREE_MB" -gt 0 ]; then
+        free_mb="$(free_mb_for_path "$root")"
+        case "${free_mb:-}" in
+            ''|*[!0-9]*)
+                UNMEASURABLE=$((UNMEASURABLE + 1))
+                log_line "KEPT   $root reason=free-unmeasurable ('$DF_BIN -Pk' could not answer for this root, so the free-space gate cannot say whether the box is under pressure; NOTHING under it was removed)"
+                READINGS="${READINGS}${READINGS:+
+}INSTALL ${root} cache_mb=${sz:-?} live=no reason=shared-free-unmeasurable"
+                return 0 ;;
+        esac
+        if [ "$free_mb" -ge "$SHARED_TRIGGER_FREE_MB" ]; then
+            KEPT=$((KEPT + 1))
+            log_line "KEPT   $root reason=shared-free-above-trigger free_mb=${free_mb} trigger_mb=${SHARED_TRIGGER_FREE_MB} (a WARM shared cache on a box with space: the gate keeps it, and the size-triggered pass reaps it once free space falls below the trigger)"
+            READINGS="${READINGS}${READINGS:+
+}INSTALL ${root} cache_mb=${sz:-?} live=no reason=shared-kept-warm-above-trigger"
+            return 0
+        fi
     fi
     READINGS="${READINGS}${READINGS:+
 }INSTALL ${root} cache_mb=${sz:-?} live=no reason=shared-root-no-job-running"
@@ -793,6 +866,20 @@ done
 # under the flag, consume after it.
 SEEN_SHARED=" "
 SHARED_DIRS=""
+SHARED_DERIVED=""
+# add_shared_dir <path> [derived] — one place that decides "is this a candidate at all", so the two
+# sources below cannot disagree about existence or about the de-duplication.
+add_shared_dir() {
+    local p="${1%/}" _derived="${2:-}"
+    [ -n "$p" ] || p="/"
+    case "$SEEN_SHARED" in *" $p "*) return 0 ;; esac
+    [ -d "$p" ] || return 0
+    SEEN_SHARED="$SEEN_SHARED$p "
+    SHARED_DIRS="${SHARED_DIRS}${SHARED_DIRS:+
+}$p"
+    [ "$_derived" = derived ] && SHARED_DERIVED="${SHARED_DERIVED}${SHARED_DERIVED:+ }$p"
+    return 0
+}
 if [ -n "$SHARED_GLOBS" ]; then
     _had_f=0
     case $- in *f*) _had_f=1 ;; esac
@@ -800,15 +887,26 @@ if [ -n "$SHARED_GLOBS" ]; then
     for g in $SHARED_GLOBS; do
         # shellcheck disable=SC2086
         for p in $(compgen -G "$g" 2>/dev/null); do
-            [ -d "$p" ] || continue
-            case "$SEEN_SHARED" in *" $p "*) continue ;; esac
-            SEEN_SHARED="$SEEN_SHARED$p "
-            SHARED_DIRS="${SHARED_DIRS}${SHARED_DIRS:+
-}$p"
+            add_shared_dir "$p"
         done
     done
     [ "$_had_f" = 1 ] || set +f
 fi
+# ⛔ THE DEFAULT HAS ONE SOURCE AND IT IS THE LAYOUT, NOT AN ENVIRONMENT VARIABLE (#4169 review,
+# BLOCKING). The pool writes to `${RUNNER_CACHE_ROOT-$RUNNER_ROOT/_cache}` and puts every install at
+# `$RUNNER_ROOT/gh-runner-*`, so a discovered install's PARENT IS `$RUNNER_ROOT` and its `_cache` is the
+# pool's default — on any box, whatever a scheduled unit happens to render into its `Environment=`.
+# ⛔ DERIVING FROM `${RUNNER_ROOT:-…}` IN THIS PROCESS' ENV WAS NOT ONE SOURCE: the two units render only
+# `TRIGGER_FREE_MB`/`PASS_CAP_MB`, so on `RUNNER_ROOT=/opt` (the layout `docs/ops/fleet-capacity.md`
+# tells operators to use) this process saw no `RUNNER_ROOT`, derived `/tmp/actions-runner/_cache`, and
+# the pool's real `/opt/_cache` sat one component away from every glob with nothing reaping it — the
+# unbounded sink #4168 exists to remove, reported healthy. The derivation below cannot disagree with the
+# pool, because it is read off the installs the pool itself created.
+for d in $INSTALL_DIRS; do
+    _p="${d%/*}"; [ -n "$_p" ] || _p="/"
+    add_shared_dir "$_p/_cache" derived
+done
+[ -n "$SHARED_DERIVED" ] && log_line "reap-runner-cache: shared_root=derived ($SHARED_DERIVED) — a discovered install's parent is \$RUNNER_ROOT and the pool's cache root is \$RUNNER_ROOT/_cache, so this candidate cannot disagree with the pool about the default"
 for p in $SHARED_DIRS; do
     sweep_shared "$p"
 done
@@ -819,7 +917,7 @@ done
 # unread. The default now derives from the same `RUNNER_ROOT`, and this line makes the remaining case —
 # an operator override on ONE of the two tools — findable in the pass record instead of silent.
 if [ -n "$SHARED_GLOBS" ] && [ -z "$SHARED_DIRS" ]; then
-    log_line "reap-runner-cache: shared_root=absent (shared_globs='$SHARED_GLOBS' matched no directory — a pool started with a different RUNNER_ROOT/RUNNER_CACHE_ROOT exports its XDG_CACHE_HOME elsewhere, and NOTHING in this pass covers it: name that path in REAP_RC_SHARED_GLOBS / DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS)"
+    log_line "reap-runner-cache: shared_root=absent (shared_globs='$SHARED_GLOBS' matched no directory, and no discovered install's parent holds a _cache — a pool started with a different RUNNER_CACHE_ROOT exports its XDG_CACHE_HOME elsewhere, and NOTHING in this pass covers it: name that path in REAP_RC_SHARED_GLOBS / DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS)"
 fi
 
 # ── the report ─────────────────────────────────────────────────────────────────────────────────

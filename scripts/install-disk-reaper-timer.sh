@@ -346,7 +346,12 @@ refuse_transient_target() {
     # this list is how the abandoned-worktree class dies on every pass with nothing saying so.
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
              reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
+             reap-runner-cache.sh \
              lib/live-paths.sh lib/cell-home.sh; do
+        # ⛔ `reap-runner-cache.sh` IS A DELEGATE THE UNITS PIN (#4169 review, P3). It was missing here,
+        # so a box whose install lacked it got a unit that named a class which fails closed (exit 3) every
+        # pass and NO install-time warning at all — the exact silent-inert shape the rest of this list
+        # exists to prevent. The list is "every delegate the two artifacts pin", not "the five older ones".
         # #2542 adds the two new owners AND the census library they share. The library is in this list
         # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
         # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse

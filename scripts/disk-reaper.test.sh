@@ -179,6 +179,13 @@ DISK_REAPER_RUNNER_CACHE_GLOBS="$T/scratch/rc/gh-runner-*"
 DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS="$T/scratch/rc/shared"
 DISK_REAPER_RUNNER_CACHE_MIN_MB="${DISK_REAPER_RUNNER_CACHE_MIN_MB:-1}"
 export DISK_REAPER_RUNNER_CACHE_GLOBS DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB
+# ⛔ AND THE OWNER'S FREE-SPACE GATE, PINNED OFF, FOR THE SAME REASON (#4169 review, P3). The gate reads
+# the BOX (`df -Pk` against the shared root's filesystem), so on a host with 70 GB free the 40960 default
+# would KEEP the fixture's shared root in every case that runs the class — a host-dependent outcome in a
+# suite whose whole contract is "nothing here depends on the box". `reap-runner-cache.test.sh` case R is
+# where the gate itself is exercised, both directions, against a `df` STUB.
+REAP_RC_SHARED_TRIGGER_FREE_MB=0
+export REAP_RC_SHARED_TRIGGER_FREE_MB
 SLEEPERS=""
 cleanup() {
     local p
@@ -3565,6 +3572,20 @@ assert_dir "$PIN_INST" "T64 the fixture INSTALL is never a candidate (only its c
 assert_nodir "$PIN_INST/.cache" "T64 the FIXTURE's cache is what the armed pass reclaimed"
 assert_contains "$(cat "$RC_LOG" 2>/dev/null)" "reaped=1" \
     "T64 and the log records the removal, so the pin is not a silent no-op"
+# ⛔ AND THE SIXTH CLASS IS IN THE PASS TOTAL (#4169 review, P3). `freed_mb_total` summed FIVE classes —
+# `runner-cache` was missing from it — so a pass whose only reclamation was its runner caches published
+# `freed_mb_runner_cache=<GB>` beside a `freed_mb_total=` that did not contain it, and the
+# `alert=under-reclaim` derived from that sum fired on a pass that had in fact freed the space. The 3 MB
+# above was really reaped, so the total must be at least the class's own figure and must not be zero.
+T64_ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+T64_RC_FREED="$(sed -n 's/^freed_mb_runner_cache=//p' <<<"$T64_ST" | head -1)"
+T64_TOTAL="$(sed -n 's/^freed_mb_total=//p' <<<"$T64_ST" | head -1)"
+case "$T64_RC_FREED" in ''|*[!0-9]*) T64_RC_FREED=0 ;; esac
+case "$T64_TOTAL" in ''|*[!0-9]*) T64_TOTAL=-1 ;; esac
+assert_eq "$([ "$T64_TOTAL" -ge "$T64_RC_FREED" ] && [ "$T64_TOTAL" -ge 0 ] && echo yes || echo no)" "yes" \
+    "T64 and freed_mb_total CONTAINS the runner-cache class (total=${T64_TOTAL}MB rc=${T64_RC_FREED}MB)"
+assert_eq "$([ "$T64_RC_FREED" -gt 0 ] && echo nonzero || echo zero)" "nonzero" \
+    "T64 … with a non-zero class figure, so the row above cannot pass on two zeros"
 
 # ── T65: an UNSIZED candidate's path is published intact (#4169 review, P3) ──────────────────────
 # The owner emits `REAP ?MB <path> kind=…` when `du` cannot size a candidate, and the parse here used
@@ -3673,6 +3694,35 @@ assert_eq "$(t67_extras $(t67_pl_pins "$T67_PL"))" "" \
     "T67 ... and neither does the plist (the two artifacts agree on the SET, not just on the names)"
 assert_eq "$(t67_sd_value "$T67_FAST" RUNNER_CACHE_REAPER)" "{{REAPER_DIR}}/reap-runner-cache.sh" \
     "T67 the FAST cache unit pins the one delegate its own class needs"
+# ⛔ AND THE INSTALLER'S MISSING-DELEGATE LIST MUST COVER EVERY DELEGATE THE UNITS PIN (#4169 review,
+# P3). The units pin them; the installer's job is to NAME a missing one at install time — and it listed
+# six of the seven, so a box installed without `reap-runner-cache.sh` got a unit naming a class that
+# fails closed (exit 3) EVERY pass with no warning at all: the inert-enforcer shape the rest of that
+# list exists to prevent. Direction is one-way on purpose — the list also names shared libraries that
+# are not delegates, so "delegates ⊆ list" is the invariant, not set equality.
+T67_INSTALLER="$REPO_ROOT/scripts/install-disk-reaper-timer.sh"
+T67_DELEGATE_BASES="$(awk '{print $2}' <<<"$T67_DELEGATES")"
+t67_unnamed() {
+    local n names gaps=""
+    names="$(sed -n '/^    for d in pi-cache-reap.sh/,/; do$/p' "$T67_INSTALLER")"
+    for n in $T67_DELEGATE_BASES; do
+        [ -n "$n" ] || continue
+        case " $names " in *" $n "*) ;; *) gaps="$gaps $n" ;; esac
+    done
+    printf '%s' "$gaps"
+}
+assert_file "$T67_INSTALLER" "T67 fixture: the installer exists (the row below would otherwise pass by reading nothing)"
+assert_eq "$(t67_unnamed)" "" \
+    "T67 the installer NAMES a missing copy of EVERY delegate the units pin (it did not name reap-runner-cache.sh)"
+# non-vacuity: the parse must REDDEN when a name is dropped from the LIST — on a COPY, never the file.
+# (The file also MENTIONS the name in a comment; what the row reads is the `for d in …` list, so the
+# control removes the list entry and asserts that it is really gone before grading the parser.)
+mkdir -p "$T/scratch/t67-inst"; T67_MUT_INST="$T/scratch/t67-inst/installer.sh"
+grep -v '^ *reap-runner-cache\.sh *\\$' "$T67_INSTALLER" >"$T67_MUT_INST"
+assert_eq "$(grep -c '^ *reap-runner-cache\.sh *\\$' "$T67_MUT_INST")" "0" \
+    "T67 control: the mutant copy really dropped the list entry (a mutation that did nothing proves nothing)"
+assert_contains "$(T67_INSTALLER="$T67_MUT_INST" t67_unnamed)" "reap-runner-cache.sh" \
+    "T67 control: dropping it from the installer list makes that row RED (not a vacuous read)"
 # ── non-vacuity: both parsers must REDDEN when the pin is actually removed ──────────────────────
 # A row that reads the file but cannot fail under a deleted pin is the "inert enforcer" shape. The
 # control mutates a COPY of each artifact, so the templates under test are never touched.
