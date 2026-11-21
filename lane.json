@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-14013-docspage-1795212418-p551892-53c8590d",
+  "_sha": "1c94227f3bd11661868d3b2bf1e68e394c4d808f",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/14013-docspage.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14013-docs-round3"
+    },
+    {
+      "kind": "sha",
+      "value": "7cb7e59e142a5623e1909f04587f5fc1e8acd68d"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/14013-docspage"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 8786,
+  "ended_at": 1795221204,
+  "exit_code": 1,
+  "heartbeat_at": 1795221204,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14013-docspage-1795212418-p551892-53c8590d",
+  "lease_until": 1795257804,
+  "pid": 551892,
+  "reason": "exit:1",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795212418,
+  "state": "FAILED",
+  "tag": "14013-docspage",
+  "worktree": "/home/cmux/tortoise/.worktrees/14013-docspage"
+}
