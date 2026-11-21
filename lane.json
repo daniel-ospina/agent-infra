@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795274350,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14014-m4-1795274350-p2428556-6d6565dc",
+  "lease_until": 1795310950,
+  "pid": 2428556,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795274350,
+  "state": "RUNNING",
+  "tag": "14014-m4",
+  "worktree": "/home/cmux/tortoise/.worktrees/14014-m4"
+}
