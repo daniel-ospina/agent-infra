@@ -96,6 +96,24 @@ writeFileSync(
         cwd: "${AGENT_INFRA_PATH_4189_UNSET}",
         lazy: true,
       },
+      // #4189 review 2 (finding 1) — the SAME fail-open, one spelling over: the cwd declares a default
+      // and that default is EMPTY, so `expandExprTracked` reports it as RESOLVED (`unresolved: []`) while
+      // the value it produced is "". The unresolved-only refusal let this through, `cwd: "" || undefined`
+      // handed the transport `undefined`, and the relative argv resolved against pi's cwd.
+      "relative-args-empty-default-cwd": {
+        command: process.execPath,
+        args: ["fixtures/server-4189.mjs"],
+        cwd: "${AGENT_INFRA_PATH_4189_EMPTY:-}",
+        lazy: true,
+      },
+      // NEGATIVE CONTROL for the same guard: an entry that declares NO cwd at all keeps inheriting (it
+      // asked for nothing), so it must NOT be refused at `config` — the fix must not start refusing a
+      // `cwd`-less `{"command":"node","args":["server.js"]}`.
+      "relative-args-no-cwd": {
+        command: process.execPath,
+        args: ["fixtures/server-4189.mjs"],
+        lazy: true,
+      },
       // #4189 review (finding 5) — the placeholder whose variable IS set. `args` are never expanded, so
       // the literal reaches the child either way and must still be NAMED. The pre-fix predicate
       // (`findUnresolvedVars`) reports nothing here, which is why the headline capability was silent in
@@ -134,7 +152,7 @@ await test("lazy server is NOT connected at startup", async () => {
   await manager.connectAll(CONFIG_PATH);
   equal((manager as any).connections.length, 0, "no eager connections for a lazy-only config");
   const cat = manager.catalog();
-  equal(cat.length, 6, "every declared server is in the catalog");
+  equal(cat.length, 8, "every declared server is in the catalog");
   equal(cat[0]!.name, "echo-server");
   equal(cat[0]!.tier, "lazy");
   equal(cat[0]!.status, "sleeping");
@@ -239,6 +257,37 @@ await test("a relative argv with an UNRESOLVED cwd is refused at stage 'config' 
   ok(err.message.includes("INHERITS"), `says what would have happened instead:\n${err.message}`);
 });
 
+await test("a relative argv with a DECLARED-BUT-EMPTY cwd is refused at stage 'config' too", async () => {
+  // #4189 review 2, finding 1: `cwd: "${VAR:-}"` is reported as RESOLVED, so the unresolved-only
+  // predicate never fired and the child silently inherited pi's cwd.
+  let err: any;
+  try {
+    await manager.loadServer("relative-args-empty-default-cwd");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.name, "McpConnectError", `typed error, got ${err.name}`);
+  equal(err.stage, "config", `stage, got ${err.stage}:\n${err.message}`);
+  ok(err.message.includes("args[0]"), `names the relative entry:\n${err.message}`);
+  ok(err.message.includes("INHERITS"), `says what would have happened instead:\n${err.message}`);
+  ok(
+    err.message.includes("no path") || err.message.includes("nothing in the declaration resolved"),
+    `names the empty-default shape rather than a variable that may be fine:\n${err.message}`
+  );
+});
+
+await test("NEGATIVE CONTROL: a relative argv with NO declared cwd is not refused at 'config'", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("relative-args-no-cwd");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected (the fixture's server file does not exist)");
+  ok(err.stage !== "config", `an entry that declares no cwd asked for inheritance:\n${err.message}`);
+});
+
 await test("an args placeholder whose variable IS set is still NAMED (args never expand)", async () => {
   let err: any;
   try {
@@ -266,9 +315,15 @@ await test("the failing servers registered no tools and left no connection behin
   );
   equal(
     (manager as any).connections.some((c: any) =>
-      ["crash-server", "missing-command", "args-placeholder", "relative-args-unresolved-cwd"].includes(
-        c.serverName
-      )
+      [
+        "crash-server",
+        "missing-command",
+        "args-placeholder",
+        "args-placeholder-set-var",
+        "relative-args-unresolved-cwd",
+        "relative-args-empty-default-cwd",
+        "relative-args-no-cwd",
+      ].includes(c.serverName)
     ),
     false,
     "a failed connect must not leave a half-open connection"

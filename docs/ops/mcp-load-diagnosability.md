@@ -157,12 +157,16 @@ LOADED: + 0 tools        # 0 tools is the probe: no ExtensionAPI is bound, so re
    unresolved instead — truthfully: "the entry declares none", "declares one that expanded to
    nothing, so the child INHERITS the caller's cwd", and a resolved directory are three different
    facts and are rendered as three different facts.
-5. **Refuses a relative argv whose `cwd` could not be resolved** (`stage: config`, before any spawn).
-   `cwd: undefined` is an INHERITANCE, not a refusal, so with `cwd`'s variable unset a relative `args[0]`
-   would resolve against whatever directory pi happens to run in — inside an agent-infra checkout that
-   silently loads *that* checkout's server (in a lane, possibly uncommitted code). The same
-   misconfiguration that used to be a deterministic `ENOENT` would have become "it works, with someone
-   else's code".
+5. **Refuses a relative argv whose `cwd` produced no usable directory** (`stage: config`, before any
+   spawn). The condition is *"did the entry's `cwd` yield a directory"*, not *"was a `${VAR}` in it
+   unresolved"*: `"cwd": "${VAR:-}"` (a declared default with no path) and `"cwd": ""` are reported by
+   the expander as *resolved*, yet hand the transport nothing, so the narrower predicate let exactly
+   those spellings through. `cwd: undefined` is an INHERITANCE, not a refusal, so with `cwd` unusable a
+   relative `args[0]` would resolve against whatever directory pi happens to run in — inside an
+   agent-infra checkout that silently loads *that* checkout's server (in a lane, possibly uncommitted
+   code). The same misconfiguration that used to be a deterministic `ENOENT` would have become "it
+   works, with someone else's code". An entry that declares **no** `cwd` keeps inheriting — it asked for
+   nothing.
 6. **Never prints the argv.** `args` is the one field this repo documents as the place credentials get
    inlined in plaintext — that is the whole of #696 — and the rendered failure is returned as `mcp_load`
    tool output, i.e. into the model's context, the transcript, and routinely into PR/issue bodies. The
@@ -170,7 +174,8 @@ LOADED: + 0 tools        # 0 tools is the probe: no ExtensionAPI is bound, so re
    names an argument's value.
 
 `spawn`-stage failures carrying a deterministic errno (`ENOENT`/`EACCES`/`ENOTDIR`) are **not retried** by
-the eager-connect retry: the cause is the config, and a retry only doubles the noise.
+the eager-connect retry: the cause is the config, and a retry only doubles the noise. A `config`-stage
+refusal is never retried either — no process was started, so no retry can change the verdict.
 
 `templates/.mcp.base.json` and `.mcp.json`: the `orchestrator` entry's `args[0]` becomes relative to its
 (expanded) `cwd`, so the shipped entry spawns on any box where `AGENT_INFRA_PATH` is set. When the

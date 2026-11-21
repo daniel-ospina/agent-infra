@@ -355,6 +355,22 @@ await test("a declared cwd that expanded to nothing is reported as such, not as 
   equal(describeCwd(diag).includes("INHERITS"), true);
 });
 
+await test("an empty declared default in `cwd` names the right repair (no unresolved variable)", () => {
+  // #4189 review 2, finding 1: `"cwd": "${VAR:-}"` comes back resolved-but-empty, so there is no
+  // unresolved variable to blame — naming one would send the operator to fix a variable that is fine.
+  const diag = newConnectDiagnostics({
+    command: "python3",
+    cwd: undefined,
+    cwdDeclared: "${AGENT_INFRA_PATH_EMPTY_4189:-}",
+    spawned: true,
+  });
+  const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
+  ok(!msg.includes("the entry declares none"), msg);
+  ok(msg.includes("INHERITS"), msg);
+  ok(msg.includes("nothing in the declaration resolved to a directory"), msg);
+  ok(!msg.includes("resolved to nothing)"), `must not blame a variable that may be unset-but-defaulted:\n${msg}`);
+});
+
 await test("an entry that declares no cwd still says so", () => {
   const diag = newConnectDiagnostics({ command: "npx", cwd: undefined, cwdDeclared: undefined });
   equal(describeCwd(diag), "(not set — the entry declares none)");
@@ -443,7 +459,7 @@ await test("the stderr capture is bounded to its tail", () => {
 });
 
 await test("a deterministic spawn failure is NOT retried; a handshake one still is", () => {
-  const mk = (stage: "spawn" | "handshake", code?: string) =>
+  const mk = (stage: "config" | "spawn" | "handshake", code?: string) =>
     new McpConnectError(
       "s",
       stage,
@@ -454,6 +470,9 @@ await test("a deterministic spawn failure is NOT retried; a handshake one still 
   equal(isRetryableEagerConnectError(mk("spawn", "EACCES")), false);
   equal(isRetryableEagerConnectError(mk("spawn", "EAGAIN")), true, "a transient fork failure is still retried");
   equal(isRetryableEagerConnectError(mk("handshake")), true);
+  // #4189 review (note 1): a `config` refusal starts no process, so no retry can change its verdict —
+  // retrying it only logs the same refusal twice at startup.
+  equal(isRetryableEagerConnectError(mk("config")), false, "a config refusal is never retried");
 });
 
 // ── constants ────────────────────────────────────────────────────────────

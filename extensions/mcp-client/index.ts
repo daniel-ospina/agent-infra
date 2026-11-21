@@ -337,6 +337,10 @@ export function isRetryableEagerConnectError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Missing transport config — deterministic.
   if (/has neither 'command' nor 'url'/.test(msg)) return false;
+  // #4189 review (note 1): the `config` refusals are MORE deterministic than a spawn errno — nothing
+  // was started, and no environment change between two attempts can alter the verdict — so a retry only
+  // re-logs the same refusal (and, for an eager server, doubles the noise at startup).
+  if (err instanceof McpConnectError && err.stage === "config") return false;
   // #4189: a DETERMINISTIC spawn failure — the errno cross-spawn reports for a missing binary,
   // directory or permission — is a config fault. Retrying re-runs the same argv and only doubles the
   // noise; transient fork failures (EAGAIN/ENOMEM/EMFILE) stay retryable below.
@@ -1623,7 +1627,13 @@ export function describeCwd(diag: McpConnectDiagnostics): string {
   if (diag.cwd !== undefined) return diag.cwd;
   if (diag.cwdDeclared === undefined) return "(not set — the entry declares none)";
   const unresolvedInCwd = diag.unresolvedVars.filter((v) => v.field === "cwd").map((v) => v.name);
-  const which = unresolvedInCwd.length > 0 ? ` (${unresolvedInCwd.map((n) => "${" + n + "}").join(", ")} resolved to nothing)` : "";
+  // #4189 review 2: "declared but empty" has two spellings — an unresolved `${VAR}`, and a declared
+  // default (or literal `""`) that carried no path. Naming the wrong one would send an operator to fix
+  // a variable that is already set.
+  const which =
+    unresolvedInCwd.length > 0
+      ? ` (${unresolvedInCwd.map((n) => "${" + n + "}").join(", ")} resolved to nothing)`
+      : " (nothing in the declaration resolved to a directory)";
   return (
     `(declared ${JSON.stringify(diag.cwdDeclared)} but it expanded to ""${which} — so NO cwd is passed` +
     ` and the child INHERITS the caller's cwd, ${process.cwd()})`
@@ -2109,17 +2119,35 @@ export class McpServerManager {
       // `.worktrees/<lane>`) that SILENTLY LOADS THAT CHECKOUT'S SERVER — in a lane, possibly
       // uncommitted code. The same misconfiguration that used to be a deterministic ENOENT would become
       // "it works, with someone else's code".
-      if (resolvedCwd && resolvedCwd.unresolved.length > 0) {
+      //
+      // ⛔ THE PREDICATE IS "did the entry's cwd produce a DIRECTORY", NOT "was a `${VAR}` in it
+      // unresolved" (#4189 review 2, finding 1). The narrower predicate let one spelling of the same
+      // fail-open through: `expandExprTracked` honours a DECLARED default even when that default is
+      // empty, so `"cwd": "${VAR:-}"` (or `"cwd": ""`) comes back `{value: "", unresolved: []}` —
+      // resolved by its own report, unusable in fact. `cwd: resolvedCwd?.value || undefined` then hands
+      // the transport `undefined`, the SDK inherits pi's cwd, and a relative `args[0]` resolves against
+      // a directory this entry never chose. The declared default loses the path but keeps the
+      // permission, which is exactly what the refusal exists to prevent.
+      const cwdUnusable =
+        resolvedCwd !== undefined &&
+        (resolvedCwd.unresolved.length > 0 || resolvedCwd.value === "");
+      if (cwdUnusable) {
         const relative = (config.args ?? [])
           .map((arg, i) => ({ arg, i }))
           .filter(({ arg }) => isPathLikeArg(arg) && !isAbsolute(arg));
         if (relative.length > 0) {
+          // Name the shape actually seen: an unresolved `${VAR}`, or a declared default that carried
+          // no path. Same refusal, different repair.
+          const why =
+            resolvedCwd!.unresolved.length > 0
+              ? `${resolvedCwd!.unresolved.map((n) => "${" + n + "}").join(", ")} expanded to "" — `
+              : `it expanded to "" (a declared default with no path, or an explicitly empty cwd) — `;
           throw new McpConnectError(
             name,
             "config",
             new Error(
               `'cwd' is declared as ${JSON.stringify(config.cwd)} but ` +
-                `${resolvedCwd.unresolved.map((n) => "${" + n + "}").join(", ")} expanded to "" — ` +
+                why +
                 `and ${relative.map(({ i }) => `args[${i}]`).join(", ")} ${relative.length === 1 ? "is" : "are"} RELATIVE. ` +
                 `No cwd would be passed, so the child would inherit pi's cwd (${process.cwd()}) and resolve ` +
                 `the argv against a directory this entry never chose. Export the variable, or declare a ` +
