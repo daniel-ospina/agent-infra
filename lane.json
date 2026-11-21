@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795274187,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14012-pin-1795274187-p2570351-435fdb3b",
+  "lease_until": 1795310787,
+  "pid": 2570351,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795274187,
+  "state": "RUNNING",
+  "tag": "14012-pin",
+  "worktree": "/home/cmux/tortoise/.worktrees/14012-pin"
+}
