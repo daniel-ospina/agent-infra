@@ -621,6 +621,10 @@ async function main() {
     catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
     ok(rc !== 0, `an untracked collision must fail sync, got rc=${rc}: ${out}`);
     ok(/farm=NOT-RUN reason=untracked-collision\b/.test(out), `expected the collision token, got: ${out}`);
+    // ⛔ ASSERT *OUR* LISTING, not the filename: git's own stderr already contains `incoming.txt` on
+    // every refusal, so `includes("incoming.txt")` alone is satisfied by the pre-fix code and would
+    // make this arm vacuous.
+    ok(out.includes("An incoming commit adds these paths"), `the collision must be CLASSIFIED as one, got: ${out}`);
     ok(out.includes("incoming.txt"), `the blocking UNTRACKED path must be named, got: ${out}`);
     ok(!existsSync(marker), "nothing was pulled, so the farm must NOT have run");
   });
@@ -637,7 +641,9 @@ async function main() {
     try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
     catch (e: any) { out = e.stdout?.toString() ?? ""; }
     ok(/farm=NOT-RUN reason=dirty-checkout\b/.test(out), `tracked dirt stays the primary reason, got: ${out}`);
-    ok(out.includes("incoming.txt"), `the untracked blocker belongs in the report as context, got: ${out}`);
+    // Same reason as above: only OUR listing proves the second blocker was reported as context.
+    ok(out.includes("An incoming commit adds these paths"), `the untracked blocker must be reported as context, got: ${out}`);
+    ok(out.includes("incoming.txt"), `the untracked blocker must be named, got: ${out}`);
   });
 
   // ── #1661: stuck-index + staleness signals ──────────────────────────────
