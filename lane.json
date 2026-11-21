@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-14015-m5-1795274352-p2441175-ef3d20a2",
+  "_sha": "854fc5383568242f0b6ae106718855d87e27b62c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/14015-m5.log"
+    },
+    {
+      "kind": "branch",
+      "value": "chore/14015-m5-miss-rate"
+    },
+    {
+      "kind": "sha",
+      "value": "ae381c44d129e54c6609ca83bfc45b4604f9442c"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/14015-m5"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 10323,
+  "ended_at": 1795284675,
+  "exit_code": 0,
+  "heartbeat_at": 1795284675,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14015-m5-1795274352-p2441175-ef3d20a2",
+  "lease_until": 1795321275,
+  "pid": 2441175,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795274352,
+  "state": "DONE",
+  "tag": "14015-m5",
+  "worktree": "/home/cmux/tortoise/.worktrees/14015-m5"
+}
