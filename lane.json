@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795274071,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-13094-graphevent-1795274071-p2507582-5d5fa54f",
+  "lease_until": 1795310671,
+  "pid": 2507582,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795274071,
+  "state": "RUNNING",
+  "tag": "13094-graphevent",
+  "worktree": "/home/cmux/tortoise/.worktrees/13094-graphevent"
+}
