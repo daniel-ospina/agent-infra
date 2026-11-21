@@ -38,6 +38,7 @@
 #      brief stops asserting findings (#4190 review F2, P1). Redirected, `gh pr view --comments`
 #      prints ONLY comments and reviews, so a PR with none yields exit 0 AND ZERO BYTES — which the
 #      pre-fix lead presented as "a fresh-context reviewer found real issues" over an empty file.
+#      (The premise is MEASURED at arm 5b below, not assumed.)
 #   5c content WITHOUT a findings heading gets a lead that says none was DETECTED — never a claim of
 #      findings, and never the stronger, false claim that the PR carries no review (#4190 review F2).
 #   6  the review read FAILS → the artifact's FIRST line says it is not a review, the failure text is
@@ -144,7 +145,24 @@ run_pr() {
       printf '%s\n' "$*" >> "$GH_CALLS"
       case "$*" in
         'pr view'*)    [ -n "$pr_out" ] && printf '%s\n' "$pr_out"; return "$pr_rc" ;;
-        'issue view'*) [ -n "$issue_out" ] && printf '%s\n' "$issue_out"; return "$issue_rc" ;;
+        # ⛔ THE PROJECTION IS FIELD-SELECTED, SO THIS STUB SELECTS TOO (#4190 — MEASURED on the live
+        # shim). `gh issue view 3301 --json url` answers `{"url":"…/issues/3301"}`; the SAME read
+        # with `--json number` answers `{"number":3301}` — no url at all. A stub that emitted its
+        # payload for ANY field list certified a guard that had stopped asking for `url`: MEASURED
+        # that changing the block's `--json url` to `--json number` left this suite 59/59 GREEN,
+        # while the deployed predicate can then never match `/issues/<N>` — a one-token fail-open of
+        # exactly the guard this PR ships. So the stub models the SELECTION, and arms 1/2b red if the
+        # request stops naming `url` (the errors in arms 2/2c/3 keep their own text).
+        'issue view'*)
+          if [ "$issue_rc" -eq 0 ]; then
+            case "$*" in
+              *--json*url*) [ -n "$issue_out" ] && printf '%s\n' "$issue_out" ;;
+              *)            printf '%s\n' '{"number":3301}' ;;
+            esac
+          else
+            [ -n "$issue_out" ] && printf '%s\n' "$issue_out"
+          fi
+          return "$issue_rc" ;;
         *) return 1 ;;
       esac
     }

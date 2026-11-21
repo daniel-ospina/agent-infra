@@ -272,6 +272,13 @@ fi
 #     pre-booked the head-keyed `redfix-<PR>` counter for this dispatch never sees it refunded by this
 #     call, while `fixcount` is refunded exactly as the log line says. Nothing here can name that
 #     head; the sentence in the log is therefore about `fixcount`, not about both.
+#   * ⛔ THE PREDICATE WAS MEASURED AGAINST THE LIVE SHIM, IN BOTH DIRECTIONS (2026-11-21), because a
+#     read verified only against a stub certifies the stub. Through the `gh` the fixer actually runs
+#     (`$O/gh-rest` first on PATH): issue 3301 → `{ "url": "…/issues/3301" }` → the pattern MATCHES
+#     (refuse); PR-numbered 4190 → `{"url":"…/pull/4190"}` (the shim DELEGATES a PR-numbered `issue
+#     view`, so real gh's compact JSON arrives) → the pattern does NOT match (proceed). Both shapes
+#     are covered by the arm-0 pin and arms 1/1b; the stub in `fix-one-prresolve.test.sh` models the
+#     field SELECTION too, so a request that stops naming `url` cannot pass green.
 PR_RESOLVE_UNKNOWN=""
 if [ -z "${HEAD:-}" ]; then
   pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
