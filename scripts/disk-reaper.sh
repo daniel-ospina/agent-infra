@@ -212,6 +212,14 @@
 #   DISK_REAPER_RUNNER_CACHE_JOB_WINDOW_S     "a job is running" freshness window (default 900)
 #   DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB  the size trigger: a `--size-trigger` pass runs when
 #                              free space on the cache filesystem is BELOW this (default 40960 = 40 GB)
+#                              ⛔ IT ALSO DRIVES THE CLASS'S OWN TWO PRESSURE GATES (the shared root and
+#                              each install's `.cache`), forwarded as
+#                              `REAP_RC_SHARED_TRIGGER_FREE_MB` / `REAP_RC_INSTALL_TRIGGER_FREE_MB`, so
+#                              one dial means one policy. Without the forwarding an operator who LOWERED
+#                              the trigger still had the class empty the shared root at < 40 960 MB free
+#                              (#4169 review, P2), and without the INSTALL gate the pass flushed every
+#                              idle install's warm cache on a box the trigger fired for a tmpfs `/tmp` it
+#                              does not own (#4169 review, P2).
 #   DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB      per-pass reclaim cap (default 20480 = 20 GB; 0 = uncapped)
 #   DISK_REAPER_CLASS_TIMEOUT  watchdog per class, secs  (default 1800)
 #   DISK_REAPER_DU_TIMEOUT     watchdog per dry-run `du`, secs (default 120)
@@ -338,6 +346,11 @@ RUNNER_CACHE_LOG_DAYS="${DISK_REAPER_RUNNER_CACHE_LOG_DAYS:-7}"
 RUNNER_CACHE_JOB_WINDOW="${DISK_REAPER_RUNNER_CACHE_JOB_WINDOW_S:-900}"
 # ── the size trigger and the per-pass cap (§SCHEDULING above) ──────────────────────────────────
 RUNNER_CACHE_TRIGGER_FREE_MB="${DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB:-40960}"
+# ⛔ ONE DIAL, THREE CONSUMERS. `RUNNER_CACHE_TRIGGER_FREE_MB` decides whether the frequent pass RUNS;
+# the same number is the class's own pressure gate on the shared root AND on each install's `.cache`,
+# so the operator's unit file and the class can never disagree about what "40 GB" means.
+RUNNER_CACHE_INSTALL_TRIGGER_FREE_MB="$RUNNER_CACHE_TRIGGER_FREE_MB"
+RUNNER_CACHE_SHARED_TRIGGER_FREE_MB="$RUNNER_CACHE_TRIGGER_FREE_MB"
 RUNNER_CACHE_PASS_CAP_MB="${DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB:-20480}"
 SIZE_TRIGGER=0   # 1 = a `--size-trigger` pass (`--only runner-cache` + the free-space gate)
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
@@ -3008,6 +3021,8 @@ reap_runner_cache() {
               REAP_RC_SCRATCH_DAYS="$RUNNER_CACHE_SCRATCH_DAYS" \
               REAP_RC_LOG_DAYS="$RUNNER_CACHE_LOG_DAYS" \
               REAP_RC_JOB_WINDOW_S="$RUNNER_CACHE_JOB_WINDOW" \
+              REAP_RC_INSTALL_TRIGGER_FREE_MB="$RUNNER_CACHE_INSTALL_TRIGGER_FREE_MB" \
+              REAP_RC_SHARED_TRIGGER_FREE_MB="$RUNNER_CACHE_SHARED_TRIGGER_FREE_MB" \
               REAP_RC_STATE_DIR="$STATE_DIR" \
               bash "$RUNNER_CACHE_REAPER_PATH" "$(mode_flag)" --max-mb "$RUNNER_CACHE_PASS_CAP_MB"
     out="$CLASS_OUT"; rc="$CLASS_RC"

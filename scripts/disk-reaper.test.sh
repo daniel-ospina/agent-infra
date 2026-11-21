@@ -179,13 +179,17 @@ DISK_REAPER_RUNNER_CACHE_GLOBS="$T/scratch/rc/gh-runner-*"
 DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS="$T/scratch/rc/shared"
 DISK_REAPER_RUNNER_CACHE_MIN_MB="${DISK_REAPER_RUNNER_CACHE_MIN_MB:-1}"
 export DISK_REAPER_RUNNER_CACHE_GLOBS DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB
-# ⛔ AND THE OWNER'S FREE-SPACE GATE, PINNED OFF, FOR THE SAME REASON (#4169 review, P3). The gate reads
-# the BOX (`df -Pk` against the shared root's filesystem), so on a host with 70 GB free the 40960 default
-# would KEEP the fixture's shared root in every case that runs the class — a host-dependent outcome in a
-# suite whose whole contract is "nothing here depends on the box". `reap-runner-cache.test.sh` case R is
-# where the gate itself is exercised, both directions, against a `df` STUB.
-REAP_RC_SHARED_TRIGGER_FREE_MB=0
-export REAP_RC_SHARED_TRIGGER_FREE_MB
+# ⛔ AND THE OWNER'S FREE-SPACE GATES, PINNED OFF AT THE **ENTRY POINT'S** SEAM — NOT THE OWNER'S. The
+# gates read the BOX (`df -Pk` against the shared root's and the install's filesystems), so on a host
+# with 70 GB free the 40960 default would KEEP every fixture cache, a host-dependent outcome in a suite
+# whose whole contract is "nothing here depends on the box". ⛔ THIS PIN USED TO BE ON THE OWNER SEAM
+# (`REAP_RC_SHARED_TRIGGER_FREE_MB=0`) AND WAS SILENTLY OVERRIDDEN the moment the entry point started
+# forwarding both gates from `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` — the exact trap this file
+# already documents for `REAP_RC_GLOBS` (#4169 review, P2). Pinning the entry point's dial is what
+# reaches the class, and `reap-runner-cache.test.sh` cases R and T are where each gate is exercised in
+# both directions against a `df` STUB.
+DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=0
+export DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB
 SLEEPERS=""
 cleanup() {
     local p
@@ -3740,6 +3744,41 @@ assert_contains "$(t67_gaps launchd "$T67_MUT/reaper.plist")" "RUNNER_CACHE_REAP
 sed 's#reap-runner-cache.sh#reap-runner-work.sh#' "$T67_SD" >"$T67_MUT/wrong.service"
 assert_contains "$(t67_gaps systemd "$T67_MUT/wrong.service")" "RUNNER_CACHE_REAPER(wrong-target:" \
     "T67 control: a pin pointing at a DIFFERENT owner is caught, not merely an absent one"
+
+# ── T68: ONE DIAL, BOTH CLASS GATES — the entry point FORWARDS the trigger (#4169 review, P2) ────
+# WHAT WAS WRONG: `REAP_RC_SHARED_TRIGGER_FREE_MB` was documented as "the size-triggered pass's own
+# trigger", and the owner gates its shared root on it — but `disk-reaper.sh`'s `run_class env` list
+# forwarded EIGHT seams and not that one, so an operator who LOWERED
+# `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB` still had the shared root emptied below the class's own
+# 40960 default while their unit said the box was fine. The SAME class of silence is what the review's
+# second half named: the install arm had no free-space condition at all, so a trigger fired by a tmpfs
+# `/tmp` flushed every idle install's warm cache on a box with hundreds of GB free.
+# ⛔ THE ROW IS ABOUT THE FORWARDING, so it asserts the numbers the CLASS logged its own gates at (the
+# owner prints both at pass start) AND the two keep reasons, with a `df` STUB so the reading cannot come
+# from this host's disk. A pass that forwarded only one of the two would redden here.
+ENVNAME=t68
+FWD_INST="$T/scratch/rc/gh-runner-forwarded"
+mkdir -p "$FWD_INST/bin" "$FWD_INST/_work/_temp" "$FWD_INST/_diag" "$FWD_INST/.cache/uv"
+: >"$FWD_INST/bin/Runner.Listener"
+age_rc_install "$FWD_INST"
+dd if=/dev/zero of="$FWD_INST/.cache/uv/blob" bs=1M count=3 >/dev/null 2>&1
+printf 'warm\n' >"$T/scratch/rc/shared/entry"
+T68_DF="$T/scratch/t68-df"
+printf '%s\n' '#!/bin/sh' \
+    'printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"' \
+    'printf "fixture 999999999 0 204800000 0%% /\n"' >"$T68_DF"
+chmod +x "$T68_DF"
+RC_LOG="$T/$ENVNAME/state/runner-cache-reap.log"
+OUT="$(REAP_RC_DF_BIN="$T68_DF" DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB=40960 \
+       run_reaper --apply --only runner-cache 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T68 a pass with the operator's trigger rendered exits 0"
+assert_contains "$OUT" "install_trigger_free_mb=40960 shared_trigger_free_mb=40960" \
+    "T68 the ONE dial reaches BOTH class gates (install + shared), so they cannot silently diverge"
+assert_contains "$OUT" "reason=install-free-above-trigger" \
+    "T68 a warm install cache on a filesystem with 200 GB free is KEPT, not flushed by a trigger fired elsewhere"
+assert_dir "$FWD_INST/.cache" "T68 … and the bytes are really still there"
+assert_contains "$OUT" "reason=shared-free-above-trigger" \
+    "T68 while the shared root is kept by the SAME forwarded number (it is not the only gated arm any more)"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

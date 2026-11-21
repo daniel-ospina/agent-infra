@@ -137,6 +137,18 @@
 #                          pass's own trigger; 0 disables the gate). A shared cache is a WARM cache, not a
 #                          leak: sweeping it on an hourly pass over a box with 200 GB free makes every
 #                          job re-download the same packages (#4169 review, P3).
+#   REAP_RC_INSTALL_TRIGGER_FREE_MB
+#                          the SAME gate for a per-install `.cache`, measured on the filesystem that
+#                          holds THAT install (default 40960; 0 disables). ⛔ IT EXISTS BECAUSE THE
+#                          ENTRY POINT'S TRIGGER CANNOT SEE THIS CLASS'S SINKS: the `--size-trigger`
+#                          pass fires when ANY filesystem its glob prefixes resolve to is low, and those
+#                          prefixes include `/tmp` and `$HOME` — so a box whose `/tmp` is a small tmpfs
+#                          fired the pass every 10 minutes while the RUNNERS' filesystem held hundreds
+#                          of GB free, and the pass would have flushed every idle install's warm cache
+#                          with no free-space condition at all (#4169 review, P2). The trigger's job is
+#                          to decide whether the PASS runs; this gate decides whether THIS cache's own
+#                          filesystem needs the space. Both are forwarded from the same operator dial
+#                          (`DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`) by `disk-reaper.sh`.
 #   REAP_RC_DF_BIN         the free-space probe             (default df, called as `df -Pk <path>`)
 #   REAP_RC_EXPLICIT       1 = REAP_RC_GLOBS was SET by the caller, so matching NO INSTALL is a REFUSAL
 #                          (an asserted layout that is not there, or a seam one component short) and not
@@ -232,6 +244,12 @@ SHARED_TRIGGER_FREE_MB="${REAP_RC_SHARED_TRIGGER_FREE_MB:-40960}"
 case "$SHARED_TRIGGER_FREE_MB" in
     ''|*[!0-9]*) printf '%s: FAIL-CLOSED — REAP_RC_SHARED_TRIGGER_FREE_MB=%s is not a whole number of MiB; a garbage gate value must not silently disable (or widen) a delete gate\n' \
         "$SCRIPT_NAME" "$SHARED_TRIGGER_FREE_MB" >&2
+        exit 2 ;;
+esac
+INSTALL_TRIGGER_FREE_MB="${REAP_RC_INSTALL_TRIGGER_FREE_MB:-40960}"
+case "$INSTALL_TRIGGER_FREE_MB" in
+    ''|*[!0-9]*) printf '%s: FAIL-CLOSED — REAP_RC_INSTALL_TRIGGER_FREE_MB=%s is not a whole number of MiB; a garbage gate value must not silently disable (or widen) a delete gate\n' \
+        "$SCRIPT_NAME" "$INSTALL_TRIGGER_FREE_MB" >&2
         exit 2 ;;
 esac
 STAT_BIN="${REAP_RC_STAT_BIN:-stat}"
@@ -351,8 +369,7 @@ free_mb_for_path() {
     printf '%s' "$(( kb / 1024 ))"
 }
 
-mtime_of() { # <path> — epoch mtime, portable across GNU and BSD stat; empty when unstatable
-    local m
+mtime_of() { # <path> — epoch mtime, portable across GNU and BSD stat; empty when unstatable    local m
     m="$(tb_timeout 60 "$STAT_BIN" -f '%m' "$1" 2>/dev/null)"
     case "$m" in ''|*[!0-9]*) ;; *) printf '%s' "$m"; return 0 ;; esac
     m="$(tb_timeout 60 "$STAT_BIN" -c '%Y' "$1" 2>/dev/null)"
@@ -404,20 +421,56 @@ any_live_now() {
 # takes SIGPIPE when `grep -q` exits early makes the PIPELINE non-zero — and the direction that matters
 # here is the FALSE NEGATIVE: "no Runner.Worker found" is what authorises deleting a live job's cache.
 # A here-string is a temp file, so there is no second process to signal.
+# newest_mtime_under — DELETED by the #4169 review's P1 fix. It read the mtime of `_work/_temp` itself,
+# i.e. of a directory this class deletes into, so `rm` of one scratch entry made the next one look like a
+# running job. The witness is `work_witness_newest` below, which asks what a JOB WROTE.
 proc_has() { grep -F -q -- "$1" <<<"$CENSUS_TEXT"; }
 
-# newest_mtime_under <dir> — the newest mtime of any entry directly under <dir> (0 = "no answer").
-# Deliberately ONE level and bounded: this is a freshness witness, not an inventory, and walking a
-# 4 GB checkout to answer it is the cost this class exists to avoid.
-newest_mtime_under() {
-    local d="$1" f m best=0
+# work_witness_newest <work-dir> — the newest mtime a JOB WROTE under `_work`, never the mtime of the
+# directory this class deletes into (#4169 review, P1). ⛔ IT REPLACES `newest_mtime_under "$d/_work"`
+# ENTIRELY (that helper is deleted, not merely unused: a second, weaker witness left beside this one is
+# how the next reader re-introduces the bug). It IS re-read on every call, on purpose — the witness that
+# must be fresh per removal is the PROCESS CENSUS (`census_refresh`); this one only has to avoid being
+# a value the pass itself perturbed.
+#
+# ⛔ THE SELF-POISONING THIS CLOSES, stated as the mechanism because it is not obvious from a diff:
+# `_work/_temp` is a DIRECT CHILD of `_work`, and `rm` of an entry inside it sets `_temp`'s OWN mtime to
+# now. Taking `newest_mtime_under "$d/_work"` therefore read this class's own last delete as "a job is
+# running": entry #2 of the same pass was skipped `toctou:busy-work`, the whole `_diag` arm after it was
+# skipped too, and — because the poisoned mtime persists after the pass — the NEXT tick (10 min against
+# a 900 s window) classified a box with no job on it as LIVE and skipped that install's `.cache` whole.
+# So at most one aged scratch entry per install was ever reclaimable per pass, and the class halved its
+# own duty cycle exactly while the backlog it exists to bound was still there.
+#
+# ⛔ THE WITNESS IS NOT WEAKENED, IT IS RE-AIMED AT THE WRITER: a live job's own writes still show up —
+# files it creates inside `_temp` have fresh mtimes (so one bounded level DOWN `_temp` is asked), and
+# its checkout under `_work/<repo>` is untouched by this class. What is dropped is only the mtime of a
+# directory this class bumps itself. A job that merely EMPTIES `_temp` at a job boundary is no longer a
+# freshness reading — that is the disclosed cost of not poisoning the witness, and it points in the
+# keep-less direction only for a cache that the install-arm pressure gate (and the shared root's own
+# gate) already protects on a healthy box.
+work_witness_newest() {
+    local d="$1" f c m best=0
     [ -d "$d" ] || { printf '0'; return 0; }
     for f in "$d"/*; do
         [ -e "$f" ] || [ -L "$f" ] || continue
+        if [ "$f" = "$d/_temp" ]; then
+            for c in "$f"/*; do
+                [ -e "$c" ] || [ -L "$c" ] || continue
+                m="$(mtime_of "$c")" || continue
+                [ "$m" -gt "$best" ] && best="$m"
+            done
+            continue
+        fi
         m="$(mtime_of "$f")" || continue
         [ "$m" -gt "$best" ] && best="$m"
     done
     printf '%s' "$best"
+}
+
+# work_witness <install> — the `_work` freshness witness for one install.
+work_witness() {
+    work_witness_newest "${1%/}/_work"
 }
 
 # install_live <install-dir> — 0 LIVE (skip), 1 IDLE (safe to reap), 2 CANNOT ANSWER (skip).
@@ -440,7 +493,10 @@ install_live() {
     # witness that does not depend on argv. Content under `_work` written inside the job window is a job
     # running or just started whatever the process table spells; the conservative direction costs one
     # pass, the other costs a job. The cost is one bounded listing per install (one level, never a walk).
-    newest="$(newest_mtime_under "$d/_work")"
+    # ⛔ AND IT ASKS A WITNESS THIS CLASS CANNOT PERTURB (`work_witness`): this very function is the
+    # pre-removal re-probe, and re-deriving the freshness of the SINK'S OWN directory between two
+    # removals made the class skip its own remaining candidates (#4169 review, P1).
+    newest="$(work_witness "$d")"
     if [ "${newest:-0}" -gt 0 ] && [ "$(( $(now) - newest ))" -le "$JOB_WINDOW_S" ]; then
         LIVE_REASON="busy-work"; return 0
     fi
@@ -546,7 +602,7 @@ is_install() { [ -f "$1/bin/Runner.Listener" ] || [ -L "$1/bin/Runner.Listener" 
 
 SEEN_INSTALLS=" "
 sweep_install() { # <install-dir>
-    local d="$1" cache="$1/.cache" sz reading cutoff_s cutoff_l f fm newest_log newest_lm _lm
+    local d="$1" cache="$1/.cache" sz reading cutoff_s cutoff_l f fm newest_log newest_lm _lm _press=""
     INSTALLS=$((INSTALLS + 1))
     # ── the reading FIRST, so the line exists even for an install that is skipped ────────────────
     if [ -e "$cache" ] || [ -L "$cache" ]; then sz="$(du_mb "$cache")" || sz=""; else sz="0"; fi
@@ -576,6 +632,13 @@ sweep_install() { # <install-dir>
 
     # ── .cache: the whole directory, and the measured 445 GB ────────────────────────────────────
     if [ -e "$cache" ] || [ -L "$cache" ]; then
+        # ⛔ ONE FREE-SPACE READING PER INSTALL, TAKEN ON THE FILESYSTEM THAT HOLDS THIS INSTALL, and
+        # only when the gate is on and there is something to reap (an install with no `.cache` must not
+        # cost a `df`). Empty = the probe could not answer, which is NOT "safe to delete".
+        if [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && [ ! -L "$cache" ]; then
+            _press="$(free_mb_for_path "$d")" || _press=""
+            case "$_press" in ''|*[!0-9]*) _press="" ;; esac
+        fi
         # ⛔ A SYMLINKED CACHE IS NEVER FOLLOWED. `rm -rf` on a symlink removes the LINK (harmless),
         # but `du` and every later reading would then describe a tree this class does not own — and a
         # dangling link is a box whose big disk was unmounted, which is not a state to guess at.
@@ -589,6 +652,20 @@ sweep_install() { # <install-dir>
             # KEPT and NAMED, so "the cache is still there" has an answer other than "the reaper broke".
             KEPT=$((KEPT + 1))
             log_line "KEPT   $cache reason=below-min-cache (${sz}MB < ${MIN_CACHE_MB}MB — reaping it would cost the next job a re-download for no meaningful space)"
+        elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && [ -z "$_press" ]; then
+            # ⛔ AN UNANSWERABLE PROBE KEEPS THE CACHE. `df` failing is not evidence of pressure, and
+            # reading it as "reap" is the fail-open shape the numeric seams above already refuse. It is
+            # reported as UNMEASURABLE, so the pass's own verdict does not claim a clean run.
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "KEPT   $cache reason=install-free-unmeasurable ('$DF_BIN -Pk' could not answer for this install, so the free-space gate cannot say whether ITS filesystem is under pressure; NOT removed)"
+        elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && [ "$_press" -ge "$INSTALL_TRIGGER_FREE_MB" ]; then
+            # ⛔ PRESSURE-GATED, NOT AGE-GATED — THE SAME POLICY THE SHARED ROOT ALREADY HAD (#4169
+            # review, P2). Without this, EVERY pass reaped EVERY idle install's whole warm cache no
+            # matter how much space the box had: the frequent pass is what made that visible (a tmpfs
+            # `/tmp` in the trigger's prefix set fired it 144×/day over a healthy cache volume), but the
+            # HOURLY pass did the same thing. A cache is a WARM cache, not a leak.
+            KEPT=$((KEPT + 1))
+            log_line "KEPT   $cache reason=install-free-above-trigger free_mb=${_press} trigger_mb=${INSTALL_TRIGGER_FREE_MB} (a WARM cache on a filesystem with space: this filesystem does not need the bytes, and the next job would re-download them)"
         else
             # ⛔ RE-MEASURE AT THE MOMENT OF ACTION for the cap: the `sz` above is a reading, the
             # number that must respect the cap is the one taken immediately before the delete.
@@ -826,7 +903,7 @@ glob_matched_dirs() {
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
 : >"$LOG_FILE" 2>/dev/null || LOG_FILE=""
 
-log_line "reap-runner-cache: mode=$( is_dry && printf dry-run || printf apply ) install_globs='$RC_GLOBS' shared_globs='$SHARED_GLOBS' min_cache_mb=${MIN_CACHE_MB} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
+log_line "reap-runner-cache: mode=$( is_dry && printf dry-run || printf apply ) install_globs='$RC_GLOBS' shared_globs='$SHARED_GLOBS' min_cache_mb=${MIN_CACHE_MB} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB} install_trigger_free_mb=${INSTALL_TRIGGER_FREE_MB} shared_trigger_free_mb=${SHARED_TRIGGER_FREE_MB}"
 
 census_read || { CENSUS="unreadable"; log_line "reap-runner-cache: ⛔ CENSUS UNREADABLE — '$PS_BIN -axo pid=,command=' did not answer, so no install's liveness can be proved. NOTHING will be removed and this pass is FAIL-CLOSED (a cache deleted under a live job fails the job)."; }
 

@@ -102,12 +102,13 @@ unset DISK_REAPER_ONLY DISK_REAPER_REPOS DISK_REAPER_RUNNER_CACHE_GLOBS \
       DISK_REAPER_RUNNER_CACHE_SHARED_GLOBS DISK_REAPER_RUNNER_CACHE_MIN_MB \
       DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB \
       REAP_RC_GLOBS REAP_RC_SHARED_GLOBS REAP_RC_MIN_CACHE_MB REAP_RC_PS_BIN \
-      REAP_RC_DF_BIN 2>/dev/null || true
-# ⛔ THE FREE-SPACE GATE IS PINNED OFF FOR THE WHOLE SUITE, because it reads the BOX: this host has
-# 70+ GB free, so the 40960 default would keep every shared root and make the shared-arm cases
-# vacuous. `case_r` is the ONE place the gate is exercised, with a `df` STUB, so both directions and the
-# unmeasurable arm are deterministic instead of host-dependent.
+      REAP_RC_DF_BIN REAP_RC_INSTALL_TRIGGER_FREE_MB 2>/dev/null || true
+# ⛔ BOTH FREE-SPACE GATES ARE PINNED OFF FOR THE WHOLE SUITE, because they read the BOX: this host has
+# 70+ GB free, so the 40960 default would keep every shared root AND every install `.cache` and make the
+# reap cases vacuous. `case_r` exercises the shared gate and `case_t` the install gate, each with a `df`
+# STUB, so both directions and the unmeasurable arm are deterministic instead of host-dependent.
 export REAP_RC_SHARED_TRIGGER_FREE_MB=0
+export REAP_RC_INSTALL_TRIGGER_FREE_MB=0
 export HOME="$T/home"; mkdir -p "$HOME"
 
 # apply_mutation <src> <dest> <sed-expression> — write the mutant; FAIL LOUDLY when nothing changed.
@@ -139,11 +140,12 @@ mk_cache() {
     fi
 }
 # idle_work <install> — make the install's `_work` read IDLE. ⛔ THE FIXTURE MUST BE GENUINELY IDLE:
-# the class treats a listener PLUS content written under `_work` inside the freshness window as "a job
-# is running" (the conservative direction the brief asks for), and `mk_install` creates `_work/_temp`
-# just now — so an un-aged fixture is live for 15 minutes and every reap assertion would be vacuous.
-# Only the `_temp` DIRECTORY is aged (that is what `newest_mtime_under` reads); the files keep their own
-# mtimes, which is what the age gates read.
+# the class treats a listener PLUS content a JOB WROTE under `_work` inside the freshness window as "a job
+# is running" (the conservative direction the brief asks for). `mk_install` creates `_work/_temp` EMPTY,
+# and an empty sink contributes nothing to the witness (the sink's own mtime is deliberately NOT a
+# freshness reading — see `case_s`), so this helper only has to age the two directories the AGE gates
+# read. It ages `_temp` as well, which keeps every fixture honest about the pre-fix behaviour it was
+# written against: an aged sink is idle under both readings.
 idle_work() {
     age_path "$1/_work/_temp" 1
     age_path "$1/_diag" 1
@@ -235,7 +237,13 @@ case_b() { # <owner-script>
     inst="$base/gh-runner-b"
     mk_install "$inst"
     mk_cache "$inst" 0                       # 0 MB: below the DEFAULT size bound (256 MB)
-    printf 'young\n' >"$inst/_work/_temp/step.sh"
+    # ⛔ THE "YOUNG" ENTRY IS 1 DAY OLD, NOT FRESH. Two independent gates read this install: the AGE bound
+    # (`REAP_RC_SCRATCH_DAYS`) and the LIVENESS window (`REAP_RC_JOB_WINDOW_S`, 900 s). A file written a
+    # moment ago sits INSIDE the liveness window, so the install is LIVE and nothing under it is touched —
+    # the age assertion then passes for the wrong reason (and did, in `case_l`). 1 day is younger than the
+    # 7-day age bound and older than the 15-minute window, which is the only fixture that isolates the
+    # AGE gate from the liveness one.
+    printf 'young\n' >"$inst/_work/_temp/step.sh"; age_path "$inst/_work/_temp/step.sh" 1
     printf 'old\n'   >"$inst/_work/_temp/old-step.sh"; age_path "$inst/_work/_temp/old-step.sh" 9
     printf 'young\n' >"$inst/_diag/Runner_1.log"
     idle_work "$inst"
@@ -515,8 +523,13 @@ case_l() { # <owner-script>
     local owner="$1" base inst out rc
     base="$(mktemp -d "$T/l.XXXXXX")"
     inst="$base/gh-runner-l"
-    mk_install "$inst"; mk_cache "$inst" 2; idle_work "$inst"
-    printf 'old\n' >"$inst/_work/_temp/aged.sh"; age_path "$inst/_work/_temp/aged.sh" 9
+    # ⛔ THE INSTALL ARM IS GIVEN NOTHING TO DO, DELIBERATELY. The install is a legitimate target of
+    # `REAP_RC_GLOBS` in this fixture, so a cache above the size bound — or an aged scratch entry — is
+    # reaped by the INSTALL arm, correctly, and this case's "nothing was deleted" rows would then be
+    # describing the wrong arm. Worse, the pre-fix suite passed those rows for a FALSE reason: writing
+    # `aged.sh` into `_work/_temp` bumped the SINK's mtime, the install read `busy-work`, and nothing was
+    # swept because of the P1 self-poisoning bug rather than because of the refusal under test.
+    mk_install "$inst"; mk_cache "$inst" 0; idle_work "$inst"
     mk_ps "$base/ps" "$inst" idle
     # The seam names the INSTALL itself (the one-token error) as the shared cache root.
     out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
@@ -532,7 +545,8 @@ case_l() { # <owner-script>
                "the pass publishes census=refused (a state distinct from an abstention)"
     case_check "$([ -f "$inst/bin/Runner.Listener" ] && echo 0 || echo 1)" \
                "the install's MARKER survived (the pass never entered its entries)"
-    case_check "$([ -f "$inst/_work/_temp/aged.sh" ] && echo 0 || echo 1)" "and so did its scratch"
+    case_check "$(grep -qF 'reaped=0' <<<"$out" && echo 0 || echo 1)" \
+               "and NOTHING at all was removed by any arm in that pass (reaped=0) — the refusal is not a partial sweep"
     case_check "$(grep -qF 'refused=1' <<<"$out" && echo 0 || echo 1)" "the count is printed (refused=1), not implied"
     return $((CASE_FAIL > 0))
 }
@@ -624,7 +638,10 @@ case_o() { # <owner-script>
     base="$(mktemp -d "$T/o.XXXXXX")"
     inst="$base/gh-runner-o"
     mk_install "$inst"; mk_cache "$inst" 2
-    # A JOB JUST STARTED: `_work` content is FRESH (mk_install made `_work/_temp` a moment ago).
+    # A JOB JUST STARTED: it WRITES INTO `_work/_temp`, which is what a running job does (and what the
+    # witness must read). ⛔ NOT `_temp`'s OWN mtime: that is the directory this class deletes into, so
+    # reading it is the self-poisoning `case_s` pins (#4169 review, P1).
+    printf 'jobstep\n' >"$inst/_work/_temp/current-step.sh"
     printf '  4242 ./run.sh --startuptype service\n' >"$base/ps"           # argv the literal match misses
     out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
            REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
@@ -767,12 +784,109 @@ STUB
     return $((CASE_FAIL > 0))
 }
 
+# ── S: the class never poisons the witness it proves IDLENESS with (#4169 review, P1) ─────────
+# ⛔ THE DEFECT THIS PINS: `_work/_temp` is a DIRECT CHILD of `_work`, and `rm` of an entry inside it
+# sets `_temp`'s OWN mtime to now. While the witness read the SINK'S OWN mtime, the class's first scratch
+# delete made its own pass look like a running job: scratch entry #2 was skipped `toctou:busy-work`, the
+# `_diag` arm after it was skipped too, and the poisoned mtime OUTLIVED the pass — the next tick (10 min
+# against a 900 s window) reported a job that never ran and skipped that install's `.cache` whole. So the
+# fixture below is the normal state on the boxes #4168 measured (leftover aged `_temp` entries): TWO aged
+# scratch entries and TWO aged logs, all reclaimable, in ONE pass.
+# Mutant: the witness stops descending into the sink (MUT_S), i.e. it reads `_temp`'s own mtime again.
+case_s() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/s.XXXXXX")"
+    inst="$base/gh-runner-s"
+    mk_install "$inst"; mk_cache "$inst" 0
+    printf 'young\n' >"$inst/_work/_temp/young-step.sh"; age_path "$inst/_work/_temp/young-step.sh" 1
+    printf 'old one\n' >"$inst/_work/_temp/old-1.sh"; age_path "$inst/_work/_temp/old-1.sh" 9
+    printf 'old two\n' >"$inst/_work/_temp/old-2.sh"; age_path "$inst/_work/_temp/old-2.sh" 9
+    printf 'older\n' >"$inst/_diag/Runner_20200101-utc.log"; age_path "$inst/_diag/Runner_20200101-utc.log" 20
+    printf 'current\n' >"$inst/_diag/Runner_20200102-utc.log"; age_path "$inst/_diag/Runner_20200102-utc.log" 9
+    idle_work "$inst"
+    mk_ps "$base/ps" "$inst" idle
+    out="$(run_owner "$owner" "$base" "$base/ps" --apply --scratch-days 7 --log-days 7)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ ! -f "$inst/_work/_temp/old-1.sh" ] && echo 0 || echo 1)" \
+               "the FIRST aged scratch entry is reaped"
+    case_check "$([ ! -f "$inst/_work/_temp/old-2.sh" ] && echo 0 || echo 1)" \
+               'the SECOND aged scratch entry is reaped IN THE SAME PASS (removing the first must not look like a job)'
+    case_check "$([ ! -f "$inst/_diag/Runner_20200101-utc.log" ] && echo 0 || echo 1)" \
+               'and the `_diag` arm still runs after a scratch delete (it was skipped too)'
+    case_check "$([ -f "$inst/_diag/Runner_20200102-utc.log" ] && echo 0 || echo 1)" \
+               "while the listener's CURRENT log is still kept (the age policy is unchanged)"
+    case_check "$([ -f "$inst/_work/_temp/young-step.sh" ] && echo 0 || echo 1)" \
+               "and young scratch is still kept (the age gate still binds)"
+    case_check "$(grep -qF 'reason=toctou:busy-work' <<<"$out" && echo 1 || echo 0)" \
+               'the pass NEVER claims a job is running when none is (no reason=toctou:busy-work)'
+    return $((CASE_FAIL > 0))
+}
+
+# ── T: the per-install `.cache` is PRESSURE-gated on ITS OWN filesystem (#4169 review, P2) ─────
+# ⛔ The entry point's `--size-trigger` fires when ANY filesystem its glob PREFIXES resolve to is low,
+# and those prefixes include `/tmp` and `$HOME`. On a box whose `/tmp` is a small tmpfs it fired the pass
+# every 10 minutes while the RUNNERS' filesystem held hundreds of GB free — and the pass then flushed
+# every idle install's warm cache, because the install arm had no free-space condition at all (only the
+# shared root did). Three directions plus the unmeasurable arm, with a `df` STUB so the reading is a
+# fixture and not this host's disk.
+# Mutant: the install-arm gate removed (MUT_T).
+case_t() { # <owner-script>
+    local owner="$1" base inst out rc df_stub
+    base="$(mktemp -d "$T/t.XXXXXX")"
+    inst="$base/gh-runner-t"
+    df_stub="$base/df-stub"
+    cat >"$df_stub" <<'STUB'
+#!/bin/sh
+case "${RC_TEST_DF_MODE:-ok}" in
+    fail) exit 1 ;;
+esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture %s 0 %s 0%% /\n' 999999 "$(( ${RC_TEST_DF_FREE_MB:-0} * 1024 ))"
+STUB
+    chmod +x "$df_stub"
+    mk_install "$inst"; idle_work "$inst"
+    mk_ps "$base/ps" "$inst" idle
+    run_t() { # <free-mb> <mode> — one FRESH 2MB cache + one pass, prints the owner output
+        rm -rf "$inst/.cache"; mk_cache "$inst" 2
+        RC_TEST_DF_FREE_MB="$1" RC_TEST_DF_MODE="$2" REAP_RC_DF_BIN="$df_stub" \
+        RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+        REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+        REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_INSTALL_TRIGGER_FREE_MB=40960 \
+        REAP_RC_MIN_CACHE_MB=1 REAP_RC_STATE_DIR="$base/state" \
+        bash "$owner" --apply 2>&1
+    }
+    # (1) ABOVE the trigger: the install's filesystem does not need the bytes — keep the warm cache.
+    out="$(run_t 200000 ok)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'T1 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "above the trigger the pass exits 0 (rc=$rc)"
+    case_check "$([ -e "$inst/.cache/uv/blob" ] && echo 0 || echo 1)" \
+               'a WARM per-install cache on a filesystem with 200 GB free is KEPT (the trigger firing is not a delete licence)'
+    case_check "$(grep -qF 'reason=install-free-above-trigger' <<<"$out" && echo 0 || echo 1)" \
+               'and the keep NAMES its own filesystem reading (reason=install-free-above-trigger)'
+    # (2) BELOW the trigger: this filesystem needs the space, so the idle cache goes.
+    out="$(run_t 1000 ok)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'T2 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ ! -e "$inst/.cache" ] && echo 0 || echo 1)" \
+               'BELOW the trigger the install cache IS reaped (the gate is not an inert enforcer)'
+    # (3) THE PROBE CANNOT ANSWER: keep it and fail closed.
+    out="$(run_t 1000 fail)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'T3 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ -e "$inst/.cache/uv/blob" ] && echo 0 || echo 1)" \
+               'a df that cannot answer KEEPS the install cache (an unanswerable gate is not a delete permission)'
+    case_check "$(grep -qF 'reason=install-free-unmeasurable' <<<"$out" && echo 0 || echo 1)" \
+               'and it is named (reason=install-free-unmeasurable)'
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "and the pass fails closed (rc=$rc, want 3)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
 MUT_K="$T/mut-k.sh"; MUT_L="$T/mut-l.sh"; MUT_L2="$T/mut-l2.sh"; MUT_M="$T/mut-m.sh"
 MUT_N="$T/mut-n.sh"; MUT_O="$T/mut-o.sh"
 MUT_P="$T/mut-p.sh"; MUT_Q="$T/mut-q.sh"; MUT_R="$T/mut-r.sh"
+MUT_S="$T/mut-s.sh"; MUT_T="$T/mut-t.sh"; MUT_B2="$T/mut-b2.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -818,7 +932,7 @@ apply_mutation "$OWNER" "$MUT_N" 's/^        if \[ -n "\$newest_log" \] && \[ "\
     || { printf '  ❌ mutation N could not be applied (the newest-log keep moved)\n'; mut_ok=0; }
 # ⛔ O — the ARGV-INDEPENDENT `_work` witness is deleted (the pre-fix shape: only a literal listener
 # argv could make a job visible).
-apply_mutation "$OWNER" "$MUT_O" 's/^    newest="\$(newest_mtime_under "\$d\/_work")"$/    newest=0/' \
+apply_mutation "$OWNER" "$MUT_O" 's/^    newest="\$(work_witness "\$d")"$/    newest=0/' \
     || { printf '  ❌ mutation O could not be applied (the argv-independent _work witness moved)\n'; mut_ok=0; }
 # ⛔ P — the DERIVED shared root (the layout is the one source; the env-derived default was falsified by
 # the units' own environments).
@@ -830,6 +944,19 @@ apply_mutation "$OWNER" "$MUT_Q" 's/^        if proc_has "Runner.Listener" || pr
 # ⛔ R — the free-space gate on the shared root (a warm cache is not a leak).
 apply_mutation "$OWNER" "$MUT_R" 's/^    if \[ "\$SHARED_TRIGGER_FREE_MB" -gt 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation R could not be applied (the shared free-space gate moved)\n'; mut_ok=0; }
+# ⛔ S — the P1 fix's OWN mutant: the witness stops descending INTO the sink, i.e. it reads `_temp`'s own
+# mtime again (the pre-fix reading). `case_s` reddens because the second aged entry, and the whole `_diag`
+# arm, are then skipped as a job that is not running.
+apply_mutation "$OWNER" "$MUT_S" 's/^        if \[ "\$f" = "\$d\/_temp" \]; then$/        if false; then/' \
+    || { printf '  ❌ mutation S could not be applied (the sink-excluding witness moved)\n'; mut_ok=0; }
+# ⛔ T — the install-arm pressure gate removed: the pass returns to flushing every idle warm cache.
+apply_mutation "$OWNER" "$MUT_T" 's/^        elif \[ "\$INSTALL_TRIGGER_FREE_MB" -gt 0 \] && \[ "\$_press" -ge "\$INSTALL_TRIGGER_FREE_MB" \]; then$/        elif false; then/' \
+    || { printf '  ❌ mutation T could not be applied (the install free-space gate moved)\n'; mut_ok=0; }
+# ⛔ B2 — the #4169 review's rule-3 gap: the `_work/_temp` AGE gate shipped no mutant, so a regression that
+# WIDENED the bound was reachable but uncatchable. `case_b` asserts young scratch is kept BY NAME, so a
+# `false` here reaps it and reddens the case.
+apply_mutation "$OWNER" "$MUT_B2" 's/^        if \[ "\$fm" -gt "\$cutoff_s" \]; then$/        if false; then/' \
+    || { printf '  ❌ mutation B2 could not be applied (the _work/_temp age gate moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -850,6 +977,8 @@ expect_pass "O a fresh _work keeps the cache without a literal listener argv mat
 expect_pass "P the pool's cache root is reached from the LAYOUT, with no RUNNER_ROOT and no override" case_p "$OWNER"
 expect_pass "Q zero installs + an unattributable runner process keeps the shared root (rc 3)" case_q "$OWNER"
 expect_pass "R the shared root is pressure-gated: kept when warm, reaped when low, kept when unanswerable" case_r "$OWNER"
+expect_pass "S aged scratch and logs are ALL reclaimed in one pass (the class cannot poison its own witness)" case_s "$OWNER"
+expect_pass "T the install cache is pressure-gated on its own filesystem: warm kept, low reaped, unanswerable kept" case_t "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -874,7 +1003,10 @@ expect_fail "N mutant: the newest (open) _diag log is reaped too"       case_n "
 expect_fail "O mutant: the argv-independent _work witness deleted"      case_o "$MUT_O"
 expect_fail "P mutant: the derived shared candidate removed"             case_p "$MUT_P"
 expect_fail "Q mutant: the population witness removed (vacuous liveness)" case_q "$MUT_Q"
-expect_fail "R mutant: the shared free-space gate removed"              case_r "$MUT_R"
+expect_fail "R mutant: the shared free-space gate removed"               case_r "$MUT_R"
+expect_fail "S mutant: the witness reads the sink's own mtime again"      case_s "$MUT_S"
+expect_fail "T mutant: the install free-space gate removed"               case_t "$MUT_T"
+expect_fail "B2 mutant: the _work/_temp age gate removed"                 case_b "$MUT_B2"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an
