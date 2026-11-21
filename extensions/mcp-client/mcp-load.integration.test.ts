@@ -85,11 +85,33 @@ writeFileSync(
         args: ["-e", "process.exit(0)", "${AGENT_INFRA_PATH_4189_UNSET}/mcp-servers/x/server.py"],
         lazy: true,
       },
+      // #4189 review (finding 4) — the FAIL-OPEN shape the entry change created: a RELATIVE argv with a
+      // `cwd` whose variable does not resolve. `cwd: undefined` is an INHERITANCE, so the child would
+      // resolve the relative argv against pi's own cwd — inside an agent-infra checkout that silently
+      // loads THAT checkout's server (in a lane, possibly uncommitted code). Before the fix this loaded
+      // successfully from this repo's root; it must now be refused at stage `config`.
+      "relative-args-unresolved-cwd": {
+        command: process.execPath,
+        args: ["fixtures/server-4189.mjs"],
+        cwd: "${AGENT_INFRA_PATH_4189_UNSET}",
+        lazy: true,
+      },
+      // #4189 review (finding 5) — the placeholder whose variable IS set. `args` are never expanded, so
+      // the literal reaches the child either way and must still be NAMED. The pre-fix predicate
+      // (`findUnresolvedVars`) reports nothing here, which is why the headline capability was silent in
+      // the normal configuration.
+      "args-placeholder-set-var": {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)", "${AGENT_INFRA_PATH_4189_SET}/mcp-servers/x/server.py"],
+        lazy: true,
+      },
     },
   })
 );
 // The placeholder must really be unset, on every box this suite runs on.
 delete process.env.AGENT_INFRA_PATH_4189_UNSET;
+// ...and the other one must really be SET — that is the whole point of the finding-5 fixture.
+process.env.AGENT_INFRA_PATH_4189_SET = "/nonexistent-agent-infra-4189";
 
 function fakePi() {
   const tools = new Map<string, any>();
@@ -112,7 +134,7 @@ await test("lazy server is NOT connected at startup", async () => {
   await manager.connectAll(CONFIG_PATH);
   equal((manager as any).connections.length, 0, "no eager connections for a lazy-only config");
   const cat = manager.catalog();
-  equal(cat.length, 4, "every declared server is in the catalog");
+  equal(cat.length, 6, "every declared server is in the catalog");
   equal(cat[0]!.name, "echo-server");
   equal(cat[0]!.tier, "lazy");
   equal(cat[0]!.status, "sleeping");
@@ -203,10 +225,51 @@ await test("an unexpanded `${VAR}` in args is NAMED, with the #696 caveat (#4189
   ok(err.message.includes("NOT env-expanded"), `states the #696 caveat:\n${err.message}`);
 });
 
+await test("a relative argv with an UNRESOLVED cwd is refused at stage 'config' (no silent inheritance)", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("relative-args-unresolved-cwd");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.name, "McpConnectError", `typed error, got ${err.name}`);
+  equal(err.stage, "config", `stage, got ${err.stage}:\n${err.message}`);
+  ok(err.message.includes("args[0]"), `names the relative entry:\n${err.message}`);
+  ok(err.message.includes("INHERITS"), `says what would have happened instead:\n${err.message}`);
+});
+
+await test("an args placeholder whose variable IS set is still NAMED (args never expand)", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("args-placeholder-set-var");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  ok(
+    err.message.includes("${AGENT_INFRA_PATH_4189_SET}"),
+    `the placeholder is named even though the variable is set:\n${err.message}`
+  );
+  ok(err.message.includes("args[2]"), `names the field:\n${err.message}`);
+});
+
+// #4189 review: this assertion could not fail under ANY mutation (the `crash-server` fixture declares
+// no tools, so `mcp__crash-server__x` could never be registered) — dead weight, replaced with the
+// reachable fact it was standing in for: the failed loads left the OTHER servers' registrations intact
+// and left no half-open connection behind.
 await test("the failing servers registered no tools and left no connection behind", () => {
-  equal(pi.tools.has("mcp__crash-server__x"), false);
   equal(
-    (manager as any).connections.some((c: any) => c.serverName === "crash-server" || c.serverName === "missing-command"),
+    pi.tools.has("mcp__echo-server__ping"),
+    true,
+    "a failed connect must not disturb the servers that did load"
+  );
+  equal(
+    (manager as any).connections.some((c: any) =>
+      ["crash-server", "missing-command", "args-placeholder", "relative-args-unresolved-cwd"].includes(
+        c.serverName
+      )
+    ),
     false,
     "a failed connect must not leave a half-open connection"
   );

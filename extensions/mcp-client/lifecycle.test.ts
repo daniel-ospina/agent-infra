@@ -21,6 +21,10 @@ import {
   // #4189 — the connect-failure diagnostic
   expandExprTracked,
   findUnresolvedVars,
+  findArgPlaceholders,
+  isPathLikeArg,
+  describeCwd,
+  captureStdioDiagnostics,
   newConnectDiagnostics,
   classifyConnectStage,
   renderConnectFailure,
@@ -242,6 +246,27 @@ await test("findUnresolvedVars names the placeholder inside an args entry verbat
   deepEqual(findUnresolvedVars("-m"), []);
 });
 
+// #4189 review (finding 5): `args` are NEVER env-expanded, so the literal reaches the child whether
+// or not the variable is set. The predicate that matches the FIELD is "does the entry contain a
+// ${...}", not "is its variable unset" — the old predicate stayed silent in the normal config.
+await test("findArgPlaceholders fires for a SET variable too — args are never expanded", () => {
+  process.env.SET_4189 = "/nonexistent-agent-infra-4189";
+  // The pre-fix predicate (`findUnresolvedVars`) returns [] here, because the var IS set.
+  deepEqual(findUnresolvedVars("${SET_4189}/mcp-servers/x/server.py"), []);
+  deepEqual(findArgPlaceholders("${SET_4189}/mcp-servers/x/server.py"), ["${SET_4189}"]);
+  delete process.env.SET_4189;
+  deepEqual(findArgPlaceholders("-m"), []);
+});
+
+await test("isPathLikeArg separates a relative path from a flag or an inline program", () => {
+  equal(isPathLikeArg("mcp-servers/orchestrator/server.py"), true);
+  equal(isPathLikeArg("server.py"), true);
+  equal(isPathLikeArg("/abs/server.py"), true);
+  equal(isPathLikeArg("-e"), false);
+  equal(isPathLikeArg("--version"), false);
+  equal(isPathLikeArg("console.error('boom')"), false);
+});
+
 section("connect diagnostics — stage classification (#4189)");
 
 await test("timeout / spawn-error / never-started / started-then-closed are distinct", () => {
@@ -271,31 +296,73 @@ await test("the rendered message names the stage, the launch surface and the chi
     command: "python3",
     args: ["mcp-servers/x/server.py"],
     cwd: "/repo",
+    cwdDeclared: "/repo",
     timeoutMs: 15000,
     spawned: true,
     stderr: "python3: can't open file 'x': [Errno 2] No such file or directory\n",
   });
   const msg = renderConnectFailure("orchestrator", "handshake", new Error("MCP error -32000: Connection closed"), diag);
   ok(msg.includes("stage 'handshake'"), msg);
-  ok(msg.includes("command: python3 mcp-servers/x/server.py"), msg);
+  ok(msg.includes("command: python3"), msg);
   ok(msg.includes("cwd: /repo"), msg);
   ok(msg.includes("MCP error -32000: Connection closed"), msg);
   ok(msg.includes("can't open file 'x'"), msg);
 });
 
-await test("an empty `cwd` expansion is reported as NOT SET and never as cwd: ''", () => {
+// #4189 review (finding 1). `args` is where this repo documents credentials being INLINED IN PLAINTEXT
+// (that is the whole of #696), and this string is returned as `mcp_load` tool output — into the model's
+// context and every transcript that reads it. The pre-fix renderer joined the raw argv into the
+// `command:` line and printed it a SECOND time as `expandedTo`.
+await test("the rendered message NEVER prints argv — the arg count, relative-ness and placeholders only", () => {
+  const diag = newConnectDiagnostics({
+    command: "sentry-mcp",
+    args: [
+      "serve",
+      "--access-token=sk-live-2f9a8c7d6e5b4a3f",
+      "--api-key=AKIAIOSFODNN7EXAMPLE",
+      "mcp-servers/x/server.py",
+    ],
+    spawned: true,
+    stderr: "auth failed\n",
+  });
+  const msg = renderConnectFailure("sentry", "handshake", new Error("closed"), diag);
+  ok(!msg.includes("sk-live-2f9a8c7d6e5b4a3f"), `the token must not reach the transcript:\n${msg}`);
+  ok(!msg.includes("AKIAIOSFODNN7EXAMPLE"), `the api key must not reach the transcript:\n${msg}`);
+  ok(!msg.includes("mcp-servers/x/server.py"), `no argv entry is rendered verbatim:\n${msg}`);
+  ok(msg.includes("4 entries"), `the arg count is still named:\n${msg}`);
+  ok(msg.includes("args[3] is RELATIVE"), `which entry is relative is still named:\n${msg}`);
+  ok(msg.includes("agent-infra#696"), msg);
+});
+
+// #4189 review (finding 2): `cwd: undefined` collapsed TWO facts into one, and the renderer reported the
+// rarer one as the more common one — telling an operator their config was missing a field it has.
+await test("a declared cwd that expanded to nothing is reported as such, not as 'declares none'", () => {
   const diag = newConnectDiagnostics({
     command: "python3",
-    args: ["x.py"],
     cwd: undefined,
+    cwdDeclared: "${AGENT_INFRA_PATH_UNSET_4189}",
     spawned: true,
     unresolvedVars: [{ name: "AGENT_INFRA_PATH_UNSET_4189", field: "cwd", expandedTo: "" }],
   });
   const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
-  ok(msg.includes("(not set — the entry declares none)"), msg);
-  ok(!msg.includes("cwd: \"\""), msg);
+  ok(!msg.includes("the entry declares none"), `the entry DOES declare a cwd:\n${msg}`);
   ok(msg.includes("${AGENT_INFRA_PATH_UNSET_4189}"), msg);
-  ok(msg.includes("in cwd"), msg);
+  ok(msg.includes("expanded to \"\""), msg);
+  ok(msg.includes("INHERITS"), msg);
+  // The empty expansion must never be rendered as `cwd: ""` — spawn(…, {cwd: ""}) is an ENOENT report,
+  // not an empty directory.
+  ok(!msg.includes('cwd: ""'), msg);
+  equal(describeCwd(diag).includes("INHERITS"), true);
+});
+
+await test("an entry that declares no cwd still says so", () => {
+  const diag = newConnectDiagnostics({ command: "npx", cwd: undefined, cwdDeclared: undefined });
+  equal(describeCwd(diag), "(not set — the entry declares none)");
+});
+
+await test("a resolved cwd renders as the resolved directory", () => {
+  const diag = newConnectDiagnostics({ command: "npx", cwd: "/repo", cwdDeclared: "${REPO_4189}" });
+  equal(describeCwd(diag), "/repo");
 });
 
 await test("an unresolved placeholder in `args` states the #696 caveat (args are not expanded)", () => {
@@ -304,13 +371,61 @@ await test("an unresolved placeholder in `args` states the #696 caveat (args are
     args: ["${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py"],
     spawned: true,
     unresolvedVars: [
-      { name: "AGENT_INFRA_PATH_UNSET_4189", field: "args[0]", expandedTo: "${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py" },
+      { name: "${AGENT_INFRA_PATH_UNSET_4189}", field: "args[0]", expandedTo: "${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py" },
     ],
   });
   const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
   ok(msg.includes("args[0]"), msg);
   ok(msg.includes("NOT env-expanded"), msg);
   ok(msg.includes("agent-infra#696"), msg);
+  // An `args` placeholder whose variable IS set is the SAME fact (args never expand) — so it must NOT be
+  // filed under "unset environment variable(s)", which would be a false statement about the environment.
+  ok(!msg.includes("unset environment variable(s)"), `args must not be reported as unset env vars:\n${msg}`);
+});
+
+await test("an `args` placeholder whose variable IS set is still named", () => {
+  process.env.SET_ARG_4189 = "/nonexistent-agent-infra-4189";
+  const diag = newConnectDiagnostics({
+    command: "python3",
+    args: ["${SET_ARG_4189}/mcp-servers/x/server.py"],
+    spawned: true,
+    unresolvedVars: [{ name: "${SET_ARG_4189}", field: "args[0]", expandedTo: "${SET_ARG_4189}/mcp-servers/x/server.py" }],
+  });
+  delete process.env.SET_ARG_4189;
+  const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
+  ok(msg.includes("${SET_ARG_4189}"), `the variable being set does not make the literal go away:\n${msg}`);
+  ok(!msg.includes("unset environment variable(s)"), msg);
+});
+
+// #4189 review (finding 3): `stderr: "pipe"` alone SWALLOWED every diagnostic a healthy server writes
+// after a successful connect (the SDK default `inherit` put the child's fd 2 on the parent's fd 2). The
+// capture is additive: the same bytes must still reach the parent's stderr.
+await test("captured stderr is ALSO forwarded to the parent, not only buffered", async () => {
+  const { EventEmitter } = await import("node:events");
+  const stderrStream = new EventEmitter();
+  const fakeTransport: any = { stderr: stderrStream, start: async () => {} };
+  const diag = newConnectDiagnostics();
+  let forwarded = "";
+  captureStdioDiagnostics(fakeTransport, diag, {
+    forward: { write: (s: string) => { forwarded += s; return true; } } as any,
+  });
+  stderrStream.emit("data", "server says: warming cache\n");
+  await new Promise((r) => setImmediate(r));
+  equal(forwarded, "server says: warming cache\n", "the parent's stderr must still see the child's output");
+  equal(diag.stderr, "server says: warming cache\n", "and the tail is still captured for the failure message");
+});
+
+await test("a throwing parent stream cannot break the connect", async () => {
+  const { EventEmitter } = await import("node:events");
+  const stderrStream = new EventEmitter();
+  const fakeTransport: any = { stderr: stderrStream, start: async () => {} };
+  const diag = newConnectDiagnostics();
+  captureStdioDiagnostics(fakeTransport, diag, {
+    forward: { write: () => { throw new Error("EPIPE"); } } as any,
+  });
+  stderrStream.emit("data", "x\n");
+  await new Promise((r) => setImmediate(r));
+  equal(diag.stderr, "x\n");
 });
 
 await test("a silent child is reported as such, not as an empty box", () => {

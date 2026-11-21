@@ -141,18 +141,38 @@ LOADED: + 0 tools        # 0 tools is the probe: no ExtensionAPI is bound, so re
 `extensions/mcp-client/index.ts`:
 
 1. **Captures the child's stderr** for every stdio connect (`stderr: "pipe"`, drained for the life of the
-   connection, bounded to the last 8 KB) and puts it in the connect error.
+   connection, bounded to the last 8 KB) and puts it in the connect error. The capture is **additive**:
+   the same bytes are forwarded to the parent's stderr, so a healthy server's runtime output is not
+   swallowed by the pipe (the SDK's `"inherit"` default used to put the child's fd 2 on the parent's
+   fd 2, and every already-installed server was written against that).
 2. **Names the stage** — `config` / `spawn` / `handshake` / `timeout` — by wrapping the transport's
    public `start()`, so *never started* and *started then closed* are distinguishable.
-3. **Attributes unset `${VAR}`s** — the expansion reports which variables were unset **and** declared no
-   `${VAR:-default}`, and which field carried them — so the operator is told the variable, and that
-   `args` is one of the surfaces it is not resolved on.
+3. **Attributes `${VAR}`s, separately per KIND of field.** `command` and `cwd` are expanded, so an entry
+   there means "unset, and no default declared". `args` are NOT expanded (#696), so a `${VAR}` there
+   reaches the child LITERALLY whether or not the variable is set — a different fact, rendered in its
+   own block, and detected by "does the entry contain a `${…}`" rather than "is the variable unset"
+   (the second predicate was silent in the normal, variable-**set** configuration).
 4. **Stops passing `cwd: ""`**, which is what turned an unset variable into a false "interpreter
-   missing" ENOENT (or, here, a silent inheritance of the wrong directory), and reports that field as
-   unresolved instead.
+   missing" ENOENT (or a silent inheritance of the wrong directory), and reports the field as
+   unresolved instead — truthfully: "the entry declares none", "declares one that expanded to
+   nothing, so the child INHERITS the caller's cwd", and a resolved directory are three different
+   facts and are rendered as three different facts.
+5. **Refuses a relative argv whose `cwd` could not be resolved** (`stage: config`, before any spawn).
+   `cwd: undefined` is an INHERITANCE, not a refusal, so with `cwd`'s variable unset a relative `args[0]`
+   would resolve against whatever directory pi happens to run in — inside an agent-infra checkout that
+   silently loads *that* checkout's server (in a lane, possibly uncommitted code). The same
+   misconfiguration that used to be a deterministic `ENOENT` would have become "it works, with someone
+   else's code".
+6. **Never prints the argv.** `args` is the one field this repo documents as the place credentials get
+   inlined in plaintext — that is the whole of #696 — and the rendered failure is returned as `mcp_load`
+   tool output, i.e. into the model's context, the transcript, and routinely into PR/issue bodies. The
+   message names the arg **count**, which entries are **relative**, and the `${VAR}` **spans**; it never
+   names an argument's value.
 
 `spawn`-stage failures carrying a deterministic errno (`ENOENT`/`EACCES`/`ENOTDIR`) are **not retried** by
 the eager-connect retry: the cause is the config, and a retry only doubles the noise.
 
 `templates/.mcp.base.json` and `.mcp.json`: the `orchestrator` entry's `args[0]` becomes relative to its
-(expanded) `cwd`, so the shipped entry spawns on any box where `AGENT_INFRA_PATH` is set.
+(expanded) `cwd`, so the shipped entry spawns on any box where `AGENT_INFRA_PATH` is set. When the
+variable is **not** set, `cwd` is unresolved and the entry is now refused as a config error rather than
+inheriting pi's cwd — see item 5 above.
