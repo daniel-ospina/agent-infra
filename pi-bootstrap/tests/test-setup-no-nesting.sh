@@ -712,6 +712,16 @@ other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh other:orchestrator-harness/repo-slug.sh
 "
 
+# RE-CUT 2026-11-20 (computed from the CODE, never hand-typed): ONE PIN LINE added
+# (`foreign:nonblocking-dispatch.sh`), nothing removed — the 69 entries on `origin/main` plus this one.
+# It is a producer a farmed consumer EXECS whose derived site is a MEASURED example of a DEPLOYED path:
+# `scripts/pr-doctor.py:2520` quotes `chain=/home/cmux/orchestrator/nonblocking-dispatch.sh`, which
+# `deploy-crossbox.sh:153` and `deploy-harness.sh:504` write to `$O` — NOT to `$DEST/scripts/<base>`. No
+# farm array delivers it (measured 2026-11-20: no `nonblocking-dispatch` entry in `pi-bootstrap/setup.sh`,
+# rc 1), so a registration could not even substitute for the clone. It is therefore DISCLOSED as a
+# `foreign:` residual with an owner (#4067), the same disposition `orch-loop.sh:#2413` took — and the
+# entry records a FACT; it does not close #4067's divergence, so it is owed a DELETION by the change that
+# lands a delivery for the path `pr-doctor.py` names, so the record cannot outlive its reason (#1899).
 # RE-CUT 2026-11-11 (computed by `--cut` from the CODE, never hand-typed): ONE PIN LINE added
 # (`script:brief-gate.sh`), nothing removed. `worker-supply.sh` — farmed by `fleet_srcs` — now walks the
 # dispatcher's own four-rung ladder (#3958), and its FLAT rung `$HOME/.pi/agent/scripts/brief-gate.sh` is
@@ -1923,7 +1933,50 @@ STALE_FOREIGN_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-prob
 case "$STALE_FOREIGN_MSG" in
   *"STALE disclosure"*"foreign:orch-loop.sh"*)
     echo "ok: a foreign disclosure whose producer left the population is STALE (the FOREIGN stale leg is live)" ;;
-  *) fail "a foreign disclosure survived its producer leaving the population — the FOREIGN leg of the stale loop is missing, or kind-blind (#1899): $(printf '%s' "$STALE_FOREIGN_MSG" | grep 'STALE\|SUMMARY' | head -c 200)" ;;
+  *) fail "a foreign disclosure survived its producer leaving the population — the FOREIGN leg of the stale loop is missing (#1899): $(printf '%s' "$STALE_FOREIGN_MSG" | grep 'STALE\|SUMMARY' | head -c 200)" ;;
+esac
+# ...and the FOREIGN leg must be KIND-QUALIFIED, like the EXEMPT and STATE legs below. The probe directly
+# above cannot see that property: it removes `foreign:orch-loop.sh` from the population OUTRIGHT, so no
+# same-named producer of another kind survives to keep the entry alive, and a KIND-BLIND matcher
+# (`*":${item%%:*} "*`) still reads it stale — measured 2026-11-20, when that mutation left this whole
+# suite at rc 0. So the population is rebuilt the way `dispo-probe-stale-kind` does it: strip the
+# `foreign:` entry and re-introduce the same BASENAME as a `script:` producer, disclosed for the duration
+# so it reaches `applied` (`check_producer_farm_declared` records `applied` as `$kind:$name`).
+# Kind-qualified ⇒ the foreign entry is STILL stale; kind-blind ⇒ it reads as applied and stays silent.
+POP_STALE_FOREIGN_KIND="$(printf '%s\n' $LANE_PRODUCERS_CANONICAL | grep -vx 'foreign:orch-loop.sh' | tr '\n' ' ') script:orch-loop.sh"
+_STALE_FK_EXEMPT="$LANE_PRODUCERS_EXEMPT"
+LANE_PRODUCERS_EXEMPT="$_STALE_FK_EXEMPT orch-loop.sh:#9999"
+STALE_FOREIGN_KIND_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-stale-foreign-kind" "$POP_STALE_FOREIGN_KIND")"
+LANE_PRODUCERS_EXEMPT="$_STALE_FK_EXEMPT"
+# ⛔ THE PRECONDITION IS ASSERTED, because the property below is CONDITIONAL on it. The discrimination
+# only exists while the same-named `script:` producer actually REACHES `applied`: the day a farm array
+# delivers `orch-loop.sh`, `delivered_flat` returns BEFORE the EXEMPT arm (`delivered=$((delivered+1));
+# continue`), so `applied` never records `script:orch-loop.sh` — and then a KIND-BLIND matcher reads
+# `foreign:orch-loop.sh` stale exactly like the kind-qualified one, i.e. the probe stays GREEN while the
+# property it exists for is gone. Live today (`grep -c orch-loop pi-bootstrap/setup.sh` → 0), silently
+# vacuous the day that changes (review of #4067, P3). The DECLARED-GAP line echoes the names the EXEMPT
+# arm applied THIS run, so it is direct evidence of `applied`, not a proxy for it.
+case "$STALE_FOREIGN_KIND_MSG" in
+  *"DECLARED-GAP"*"orch-loop.sh(#9999)"*)
+    echo "ok: the FOREIGN kind probe's same-named OTHER-KIND producer reached \`applied\` (script:orch-loop.sh disclosed for the probe) — its discriminating power is live, not vacuous" ;;
+  *) fail "the FOREIGN kind probe is VACUOUS on this tree: 'script:orch-loop.sh' did not reach \`applied\` (no DECLARED-GAP line naming it), so a KIND-BLIND matcher would read foreign:orch-loop.sh stale exactly like the correct one and this probe could no longer witness the property — pick a basename no farm array delivers, or retire the probe if the whole class is gone (#1899)" ;;
+esac
+case "$STALE_FOREIGN_KIND_MSG" in
+  *"STALE disclosure"*"foreign:orch-loop.sh"*)
+    echo "ok: a FOREIGN disclosure is matched by KIND — a same-named producer in another kind does not keep it alive" ;;
+  *)
+    # ⛔ THIS ROW CANNOT, ON ITS OWN, TELL THE TWO CAUSES APART — a KIND-BLIND matcher and a MISSING
+    # FOREIGN leg are BOTH silent for a foreign entry. Naming one of them as the cause is what the
+    # liveness row above was corrected for (review of #4067, P3: a deletion of the FOREIGN loop made
+    # this row report KIND-BLIND, a cause it never observed). The leg-live probe IS the discriminator:
+    # it strips the entry from the population OUTRIGHT, so a LIVE leg reports it stale under ANY matcher,
+    # while a missing leg reports nothing. Attribute from its message, never from this row's own silence.
+    case "$STALE_FOREIGN_MSG" in
+      *"STALE disclosure"*"foreign:orch-loop.sh"*)
+        fail "a FOREIGN disclosure survived on the strength of a same-named producer in another kind — the FOREIGN staleness matcher is KIND-BLIND (#1899); probe said: $(printf '%s' "$STALE_FOREIGN_KIND_MSG" | grep 'STALE\|SUMMARY' | head -c 300)" ;;
+      *)
+        fail "the FOREIGN stale loop reported NOTHING for foreign:orch-loop.sh — the FOREIGN leg is MISSING (the leg-live row above names that same cause), so this row cannot witness the KIND property at all; it is NOT evidence of a kind-blind matcher (#1899); probe said: $(printf '%s' "$STALE_FOREIGN_KIND_MSG" | grep 'STALE\|SUMMARY' | head -c 300)" ;;
+    esac ;;
 esac
 # ...and staleness is KIND-QUALIFIED: `lane-triage.py` as a `script:` producer does NOT keep its
 # `state:` residual alive. This is the shape of a #1553 landing that farms the file — without the kind
