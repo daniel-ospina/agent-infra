@@ -63,6 +63,28 @@
 #      it, and KEPT when the probe cannot answer (a warm cache is not a leak, and an hourly pass must not
 #      empty it on a healthy box).
 #      Mutant: the free-space gate -> removed.
+#   V  THE REMOVAL IS A RENAME, THEN A DELETE: the candidate is `mv`d to `<path>.reaping.<pid>` (ONE
+#      syscall) before the recursive free, so the liveness probe has to be correct only up to the
+#      rename instead of for the whole 21–50 GB delete — the window in which a job that starts
+#      mid-pass reads a half-deleted cache. No `.reaping.` name survives a successful free.
+#      Mutant: `mv_path` neutered (the path never leaves, so nothing may be deleted either).
+#   W  AN UNSIZED CANDIDATE CLAIMS THE WHOLE CAP: a `du` that times out (`mb=?`) used to collapse to
+#      `pending=0`, leaving a `du`-timeout pass UNCAPPED while the record printed `max_mb=`. `freed_mb`
+#      stays a measured number (the claim is tracked apart from it).
+#      Mutant: the `?` -> `MAX_MB` claim removed.
+#   X  A SYMLINKED `.cache` IS A POLICY KEEP, NOT AN ABSTENTION: it used to be counted `unmeasurable`,
+#      and any unmeasurable forces rc 3 — so the ordinary operator remedy (symlink the cache onto a big
+#      disk) reddened the hourly reaper forever. Named, and the link and its target are untouched.
+#      Mutant: the symlink policy arm -> removed (the link becomes a reap candidate).
+#   Y  A CACHE THE PRESSURE GATE KEEPS COSTS ONE `df`, NOT A `du`: the free-space gate is read FIRST and
+#      the size only when the pass may act, so the reading prints `cache_mb=not-measured(<why>)` and the
+#      SUMMARY counts `cache_mb_unmeasured=` (cache_mb= is then a lower bound). Under pressure the size
+#      IS taken — the CONTROL that proves the cheap path is not a broken probe.
+#      Mutant: the warm arm measures anyway (the pre-fix `du` per install).
+#
+# ⛔ THE TWO AGE GATES EACH GET A MUTANT (`B2` scratch, `B3` logs) — the log one only became visible
+# after `case_b`'s fixture gained a SECOND young log: with a single one, the newest-log keep answered
+# for the age gate and the row passed on a tree where the gate had been deleted (#4169 review, P2).
 #
 # Hermetic: every fixture is under $T, HOME is redirected, the state dir and the install globs are
 # explicit `$T/...` paths, and the process census is a FIXTURE TABLE — NOTHING here can read or delete

@@ -1757,7 +1757,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**26 case runs + 29 mutants + 1 scope case — 56 outcomes**), covering every arm #4168 names. The table
+(**25 case runs + 29 mutants + 1 scope case — 55 outcomes**), covering every arm #4168 names. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
