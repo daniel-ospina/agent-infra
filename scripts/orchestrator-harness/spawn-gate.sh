@@ -3810,6 +3810,15 @@ PI_GATE_MEM_REFUSED=84
 # verified" to a caller, and the fork one is translated to 73 inside run_agent. Flagged rather than
 # silently tidied — renumbering it is main's decision to make, not this branch's.
 AGENT_BRIEF_REFUSED=80
+# The DISPATCH defect: the PR number a fixer was handed is not a pull request in this repo at all
+# (agent-infra#4182 arm 3 — measured 2026-11-21 on a lane dispatched for "PR #3301" while 3301 is an
+# ISSUE). It is 86 because 73-81 and 83/85 are all taken (see the census above), 86 is claimed by no
+# other gate in this deploy unit, and it is OUTSIDE the sysexits range the rest borrow — so no
+# third-party process can produce it by accident. `adopt-fix.sh` names it in the manual operator's log
+# for the reason its 71/80/83 arms record: a code the fixer classifies with no arm there is a run that
+# did nothing, silently (#1720). Deliberately NOT 78: that is the cannot-verify pair, whose remedy is a
+# verified redeploy, while this one is a re-dispatch with a real PR number (or a route to the issue).
+AGENT_NOT_A_PR_REFUSED=86
 # The CANNOT-VERIFY code (agent-infra#2258), shared with brief-gate.sh's own exit codes and declared
 # here because this file must be able to answer when the helper is MISSING — that is exactly the case
 # where nothing else can supply the constant.
