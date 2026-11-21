@@ -234,6 +234,20 @@ if [ -z "${HEAD:-}" ]; then
       echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, but anything below that depends on the head reports UNKNOWN instead of asserting" >> "$L.log" ;;
   esac
 fi
+# ⛔ THE BRIEF'S HEAD-DEPENDENT SENTENCES RENDER THE HEAD — AND RENDER UNKNOWN WHEN IT IS UNKNOWN
+# (#4190 review F1, P2). The staleness guards further down interpolated `$HEAD` VERBATIM, so with
+# HEAD empty — precisely the arm-2/arm-3 case this block exists for — the brief rendered
+# "THIS head (``)": the one sentence that could have exposed the mismatch was BLANKED by the same
+# failed read, while the WARN above claimed anything head-dependent "reports UNKNOWN instead of
+# asserting". Both halves are repaired here rather than by weakening the WARN: the head the brief
+# SHOWS is computed from THIS SAME observation, so a known head renders as itself and an unknown one
+# renders as an explicit UNKNOWN carrying its reason. The WARN above is therefore a true statement
+# about the brief below, and the empty-head arm is testing a behaviour instead of a message (#3442).
+if [ -n "${HEAD:-}" ]; then
+  FIX_BRIEF_HEAD="$HEAD"
+else
+  FIX_BRIEF_HEAD="UNKNOWN — $PR_RESOLVE_UNKNOWN"
+fi
 # [fixgate-prresolve:end]
 # ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
 # A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
@@ -980,9 +994,9 @@ $FIX_DELIVERY_BRIEF
 
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). $FIX_REVIEW_LEAD
 
-If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($FIX_BRIEF_HEAD), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
-If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
+If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($FIX_BRIEF_HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
 
 If $L-failing.txt is non-empty it carries THIS PR's failing checks and their logs, and EVERY heading in it says which kind of red each one is: \`=== failing required check:\` — it is in $OR's own required set, so it BLOCKS the merge and fixing it is your job; \`=== failing NON-required check (…):\` — it is RED but it is NOT a required context of $OR, so it does NOT block the merge and fixing it will NOT unblock this PR: fix it only if the cause is real and cheap inside this same change, otherwise say plainly in your final message that you left it alone and why — never spend the attempt on it and never report it as the reason the PR cannot merge; \`=== failing check (required-status UNKNOWN):\` — the required set could NOT be read, so no heading in the file claims anything about blocking, the build state is UNKNOWN rather than green, and you must read the PR's checks AND this repo's branch protection yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 

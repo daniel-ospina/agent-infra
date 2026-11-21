@@ -92,6 +92,10 @@ else
     # not reachable from a fallback — fix-one-prresolve.test.sh arm 8 pins that the brief renders
     # the variable, so a future edit cannot quietly restore the unconditional sentence.
     FIX_REVIEW_LEAD="REVIEW-LEAD-MARKER"
+    # The head the brief SHOWS is computed from the PR-resolution observation (#4190 review F1), so
+    # this driver supplies it too — arm 9 of fix-one-prresolve.test.sh pins that the two staleness
+    # guards render it (and render UNKNOWN rather than a blank when there is no head).
+    FIX_BRIEF_HEAD="HEAD-MARKER"
     mkdir -p "$O/state" "$WT"
     # shellcheck disable=SC1090
     . "$T/region.sh" ) > "$T/run.log" 2>&1

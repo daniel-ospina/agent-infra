@@ -33,6 +33,9 @@
 #   8  the rendered brief carries the OBSERVED lead, not the unconditional sentence — the literal
 #      appears exactly once in fix-one.sh (where the lead is computed) and the brief line reads
 #      `$FIX_REVIEW_LEAD`.
+#   9  the brief's two STALENESS GUARDS render the head it was given — RENDERED for real, not
+#      grepped: a known head appears in both, and an empty one renders `UNKNOWN — <reason>` in both
+#      instead of the blank `THIS head (``)` the pre-fix template produced (#4190 review F1, P2).
 #
 # Run:  bash scripts/orchestrator-harness/fix-one-prresolve.test.sh
 
@@ -52,6 +55,9 @@ ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 sed -n '/\[fixgate-prresolve:begin\]/,/\[fixgate-prresolve:end\]/p' "$FIXER" > "$T/prresolve.sh"
 sed -n '/\[fixgate-reviewread:begin\]/,/\[fixgate-reviewread:end\]/p' "$FIXER" > "$T/reviewread.sh"
 sed -n '/\[fixgate-refund:begin\]/,/\[fixgate-refund:end\]/p' "$FIXER" > "$T/refund.sh"
+# The fixer BRIEF itself, for arm 9: rendered from the shipped template exactly as fix-one-brief.test.sh
+# does it, so the head rendering is exercised through fix-one.sh's own code rather than a re-typed copy.
+awk '/cat > "\$L-fixer.txt" <<EOF/{f=1} f{print} f&&/^EOF$/{exit}' "$FIXER" > "$T/briefregion.sh"
 # ⛔ REFUSE, DO NOT CONTINUE: with an absent/emptied block every driver arm below would pass
 # vacuously — the pre-fix file has no markers at all, so this is the arm that makes the suite
 # FAIL on it instead of reporting a green it never earned.
@@ -85,6 +91,7 @@ run_pr() {
     . "$T/refund.sh" >/dev/null 2>&1
     . "$T/prresolve.sh" >/dev/null 2>&1
     printf '%s\n' "${PR_RESOLVE_UNKNOWN-__unset__}" > "$d/unknown"
+    printf '%s\n' "${FIX_BRIEF_HEAD-__unset__}" > "$d/briefhead"
   )
   printf '%s\n' "$?" > "$d/rc"
   printf '%s\n' "$(cat "$d/o/state/fixcount-3301" 2>/dev/null)" > "$d/refunded"
@@ -116,12 +123,16 @@ ck "3) an empty head on a REAL PR does not refuse (rc=$(cat "$T/run/rc"))" \
    "$([ "$(cat "$T/run/rc")" != 78 ] && echo 0 || echo 1)"
 grep -qF 'staleness guard cannot name this head' "$T/run/unknown"
 ck "3) the recorded reason names the BLANKED staleness guard instead of claiming a head" $?
+grep -qF 'UNKNOWN' "$T/run/briefhead" && ! grep -qx 'UNKNOWN$' "$T/run/briefhead"
+ck "3) and the head the BRIEF will show is UNKNOWN plus that reason, never a blank ($(head -c 60 "$T/run/briefhead")…)" $?
 
 # 4. a head was read — the probe must not cost a second gh call per dispatch
 run_pr "0123456789abcdef0123456789abcdef01234567" 0 ""
 [ -s "$T/run/ghcalls" ] && ck "4) no probe when the head is already known (gh calls: $(wc -l < "$T/run/ghcalls"))" 1 \
                         || ok "4) no probe when the head is already known (gh calls: 0)"
 ck "4) and nothing is recorded as UNKNOWN on the ordinary path" "$([ -z "$(cat "$T/run/unknown")" ] && echo 0 || echo 1)"
+grep -qx '0123456789abcdef0123456789abcdef01234567' "$T/run/briefhead"
+ck "4) and the head the BRIEF will show is the head that was read ($(cat "$T/run/briefhead"))" $?
 
 # ── the driver for the review-read block ──────────────────────────────────────────────────────
 # run_review <gh_rc> <payload>   → $T/run/o/logs/fix-3301{,-comments.txt,-comments.raw} + $T/run/lead
@@ -174,6 +185,56 @@ case "$_briefline" in
   *'$FIX_REVIEW_LEAD'*) ok "8) the fixer brief renders \$FIX_REVIEW_LEAD, not a literal claim" ;;
   *) bad "8) the fixer brief does not render \$FIX_REVIEW_LEAD — the unconditional claim is back" ;;
 esac
+
+# ── 9. the brief's staleness guards render the HEAD they were given (#4190 review F1, P2) ─────
+# ⛔ RENDERED, not grepped, and through fix-one.sh's own code: the driver sources the SHIPPED
+# prresolve block (which computes the head the brief shows) and then the SHIPPED heredoc, exactly as
+# fix-one-brief.test.sh's A2 does. Pre-fix, the template interpolated `$HEAD` verbatim, so with no
+# head it rendered `THIS head (``)` — a BLANK where the one sentence that could expose a stale brief
+# should be, while the WARN claimed the opposite.
+run_brief() {
+  local head="${1-}" gh_rc="${2:-0}" gh_out="${3-}" d="$T/brief"
+  rm -rf "$d"; mkdir -p "$d/o/logs" "$d/o/state" "$d/wt"
+  (
+    set -u
+    O="$d/o"; L="$d/o/logs/fix-3301"; PR=3301; OR=daniel-ospina/agent-infra; HEAD="$head"; CTRL=1
+    BR=fix/3301-worktree-reap-on-exit; WT="$d/wt"
+    FIX_RESEARCH_BRIEF="RESEARCH-MARKER"; FIX_DELIVERY_BRIEF="DELIVERY-MARKER"
+    FIX_REVIEW_LEAD="REVIEW-LEAD-MARKER"
+    : > "$L"
+    printf '1\n' > "$O/state/fixcount-3301"
+    gh() { [ -n "$gh_out" ] && printf '%s\n' "$gh_out"; return "$gh_rc"; }
+    is_num() { case "${1-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+    . "$T/refund.sh" >/dev/null 2>&1
+    . "$T/prresolve.sh" >/dev/null 2>&1
+    . "$T/briefregion.sh"
+  ) > "$d/run.log" 2>&1
+}
+_brief="$T/brief/o/logs/fix-3301-fixer.txt"
+_guards() { grep -F 'first 12 characters of THIS head' "$_brief" 2>/dev/null; }
+
+_nraw="$(grep -oF '$HEAD' "$T/briefregion.sh" | wc -l | tr -d ' ')"
+ck "9) the brief template interpolates no RAW \$HEAD — it renders \$FIX_BRIEF_HEAD instead (found $_nraw raw)" \
+   "$([ "$_nraw" = 0 ] && echo 0 || echo 1)"
+
+run_brief "0123456789abcdef0123456789abcdef01234567" 0 ""
+ck "9) the brief was written for a KNOWN head ($([ -s "$_brief" ] && echo "$(wc -c < "$_brief") bytes" || echo MISSING))" \
+   "$([ -s "$_brief" ] && echo 0 || echo 1)"
+_nk="$(_guards | grep -cF '0123456789abcdef0123456789abcdef01234567')"
+ck "9) BOTH staleness guards name the head that was read (found $_nk of 2)" \
+   "$([ "$_nk" = 2 ] && echo 0 || echo 1)"
+_nu="$(_guards | grep -cF 'UNKNOWN')"
+ck "9) and neither claims UNKNOWN when the head IS known (found $_nu)" \
+   "$([ "$_nu" = 0 ] && echo 0 || echo 1)"
+
+run_brief "" 0 '{"number":3301}'
+ck "9) the brief was written with NO head ($([ -s "$_brief" ] && echo "$(wc -c < "$_brief") bytes" || echo MISSING))" \
+   "$([ -s "$_brief" ] && echo 0 || echo 1)"
+_nu="$(_guards | grep -cF 'UNKNOWN')"
+ck "9) with no head BOTH staleness guards render UNKNOWN (found $_nu of 2) — the pre-fix blank is gone" \
+   "$([ "$_nu" = 2 ] && echo 0 || echo 1)"
+grep -qF 'staleness guard cannot name this head' "$_brief"
+ck "9) and they carry the REASON the head is unknown, not just the word" $?
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$fail" -eq 0 ]; then
