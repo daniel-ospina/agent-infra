@@ -822,10 +822,10 @@ marker, and a wide default costs a `stat` and no delete surface.
 
 | path | rule |
 |---|---|
-| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) **and** the filesystem holding THAT install has less than `REAP_RC_INSTALL_TRIGGER_FREE_MB` free (default 40960 MB; `0` on the CLASS seam disables the gate). It is a WARM cache, not a leak, and the install arm is pressure-gated for exactly the reason the shared root is — see ⛔ below |
+| `<install>/.cache` | the whole directory, when it is **at least** `REAP_RC_MIN_CACHE_MB` (default 256 MB — reaping a few MB of a content-addressed cache buys nothing and costs the next job a re-download) **and** the filesystem holding THAT install has less than `REAP_RC_INSTALL_TRIGGER_FREE_MB` free (default 40960 MB; `0` disables the gate — true when driving `reap-runner-cache.sh` directly, because `disk-reaper.sh` forwards BOTH class dials unconditionally from the ONE operator dial `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`, so through the units only that dial reaches them — and `0` there disarms both class gates and the fast pass; see the ONE DIAL paragraph). It is a WARM cache, not a leak, and the install arm is pressure-gated for exactly the reason the shared root is — see ⛔ below |
 | `<install>/_work/_temp/*` | entries older than `REAP_RC_SCRATCH_DAYS` (default 7 d) |
 | `<install>/_diag/*.log` | files older than `REAP_RC_LOG_DAYS` (default 7 d) — ⛔ **except the newest one per install**: a listener holds its CURRENT log open, so unlinking it reclaims no bytes while crediting the `du` figure to the ledger and costing the next failure its diagnostics (`reason=newest-log`) |
-| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` on the CLASS seam disables the gate). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
+| the shared per-box cache root | `<RUNNER_ROOT>/_cache` — the `XDG_CACHE_HOME` pool-started runners get — reclaimed **in place**, only when NO install on the box has a job running, and only when the filesystem holding it has **less than `REAP_RC_SHARED_TRIGGER_FREE_MB`** free (default 40960 MB; `0` disables the gate when the owner is driven directly — through the units the ONE operator dial is what reaches it, exactly as above). It is a WARM cache, not a leak: an hourly sweep over a box with 200 GB free made every job re-download the same packages |
 
 ⛔ **THE SHARED ROOT IS GLOB-DECIDED, SO IT IS SCOPE-CHECKED BEFORE ANY DELETE.** It must not **be** an
 install and must not **contain** one (`REFUSED … reason=shared-root-contains-an-install`): the
@@ -860,7 +860,9 @@ stop the 10-minute pass also turns the **hourly** pass into an ungated cache flu
 install's warm `.cache` and the shared root get reaped every hour on a box with hundreds of GB free.
 A pass with the dial at `0` therefore writes a `⚠ class=runner-cache pressure gates DISARMED` line to
 the pass journal and a `note_runner_cache=` entry into the record — the reversal is legitimate (it is
-the documented way to disable a gate) but it is never SILENT. **To stop only the 10-minute clock,
+the documented way to disable a gate) but it is never SILENT. ⛔ The `⚠` is on the STDOUT/journald copy
+of that line; the durable pass-journal copy carries the same sentence without the glyph, and both
+contain the substring a reader (or the suite) greps. **To stop only the 10-minute clock,
 disable the cache timer unit** (`systemctl disable --now eldato-disk-reaper-cache.timer`) or run
 `--uninstall`; do not reach for `0`.
 
@@ -1223,6 +1225,14 @@ interval at the threshold.
 `--size-trigger` (see `class=runner-cache` above for why a cache needs a second clock and why the other
 five classes must NOT get one), installed by the same verb. It fires nothing while the box is above
 `DISK_REAPER_RUNNER_CACHE_TRIGGER_FREE_MB`, so a tick costs one `df`.
+⛔ **AND WHEN IT FIRES, A TICK IS NOT A FULL PASS** (#4169 review, P3). The trigger is decided on the
+static prefixes its globs resolve to, and those prefixes include `/tmp` and `$HOME` — so on a box whose
+`/tmp` is a small tmpfs it fires every 10 minutes while the runners' own filesystem holds hundreds of
+GB free. That is why the owner reads FREE SPACE FIRST and takes `du` only on an entry it may act on
+(`scripts/reap-runner-cache.sh`, `sweep_install`): a fired tick costs one `df` per install, plus the
+`du` of a cache it is about to free — never a `du` of every warm cache. A cache kept by the pressure
+gate is reported `cache_mb=not-measured(<why>)` and counted in `cache_mb_unmeasured=`, because
+`cache_mb=` is then a LOWER BOUND and the record says so rather than implying a measured total.
 
 `templates/systemd/eldato-disk-reaper.{service,timer}` — hourly
 (`OnCalendar=hourly`, `Persistent=true`), installed and enabled by
@@ -1747,14 +1757,14 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**21 case runs + 24 mutants + 1 scope case — 46 outcomes**), covering every arm #4168 names. The table
+(**26 case runs + 29 mutants + 1 scope case — 56 outcomes**), covering every arm #4168 names. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
 | A | two installs, one with a **job in flight** and one idle: the idle `.cache` is reaped, the live one is **skipped whole** and named (`skipped-live`), and the per-install reading (`cache_mb=… live=yes`) is printed | `if [ "$live" = 0 ]; then` → `if false; then` |
-| B | **no churn**: a cache below the size bound and scratch younger than the age bound are KEPT and named, while an aged entry in the same install IS reaped | `elif [ -n "$sz" ] && [ "$sz" -lt "$MIN_CACHE_MB" ]; then` → `elif false; then` |
+| B | **no churn**: a cache below the size bound and scratch younger than the age bound are KEPT and named, while an aged entry in the same install IS reaped. ⛔ The `_diag` row is a **non-newest** young log beside a newer one, so only the AGE gate can keep it — with a single log the newest-log keep answered for the age gate and the row passed on a tree where the gate was deleted | the size bound → `elif false; then`; and the `_diag` age gate → `if false; then` |
 | C | the **size trigger, both directions**, through `disk-reaper.sh`: above the threshold no class runs (record `verdict_runner_cache=not-run`, with the reading); below it the class runs, and a pass STOPS at the per-pass cap leaving the rest (`reason=pass-cap`, `capped_runner_cache=1`) | `[ "$mb" -lt "$RUNNER_CACHE_TRIGGER_FREE_MB" ]` → `-gt` (trigger inverted); separately the cap test → `false` |
 | D | an **unreadable process census** removes nothing and exits 3 (`census=unreadable`) | the census gate deleted |
 | E | a directory the glob matches but which carries **no install marker** is untouched, while the real install in the same run is reaped — the neighbour's cache is **above** the size bound, so only the marker can protect it | `is_install() { … }` → `is_install() { true; }` |
@@ -1775,6 +1785,10 @@ because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 | S | the class never **poisons the witness it proves idleness with**: TWO aged `_work/_temp` entries and TWO aged `_diag` logs in one install are ALL reclaimed in ONE pass, because the freshness witness skips the sink's own mtime (`rm` inside `_temp` used to make the class skip its own remaining candidates, and the poisoned mtime outlived the pass) | the `_work/_temp` skip in the witness removed (`if [ "$f" = "$d/_temp" ]` → `if false`) |
 | T | the per-install `.cache` is **pressure-gated on ITS OWN filesystem**: kept with 200 GB free (`reason=install-free-above-trigger`), reaped below the trigger, and KEPT with rc 3 when `df` cannot answer (`reason=install-free-unmeasurable`) — a trigger fired by a small `/tmp` must not flush a warm cache on the runners' big volume | the install-arm gate removed (`elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && …` → `elif false; then`) |
 | U | with **ZERO installs discovered** the shared root's PER-ENTRY re-probe still asks the **freshly re-read census**: a `Runner.Worker` that appears mid-pass (and that no discovered install accounts for) keeps the entry (`reason=toctou:unattributed-runner-process`). The Q gate closes that shape at the pass-start position only — `any_live_now` answered "not live" having read nothing once the population was empty | the empty-population witness in `any_live_now` made unreachable (`if [ -n "$INSTALL_DIRS" ]` → `if true`) |
+| V | the removal is a **RENAME then a delete** (`how=rm-quarantined`): the probe has to be correct only up to one syscall, not for the whole 21–50 GB free, and no `.reaping.` name survives a successful free | `mv_path` neutered → the path never leaves, the entry is `ERR … reason=quarantine-failed` and the cache survives |
+| W | an **UNSIZED** candidate claims the whole cap: a `du` that times out (`mb=?`) caps the pass after one admission, `capped=1`, and `freed_mb` stays a measured number | the `?` → `MAX_MB` claim removed (both caches reaped against a 1 MB cap) |
+| X | a **symlinked** `.cache` is a POLICY keep (`reason=symlinked-cache`) and the pass exits 0 — it used to be counted `unmeasurable`, which forces rc 3, so the operator's own layout reddened the hourly reaper forever | the symlink policy arm → `if false; then` (the link becomes a reap candidate) |
+| Y | a cache the pressure gate KEEPS is **not `du`-measured**: the tick costs one `df`, the reading says `cache_mb=not-measured(free-above-trigger)`, the SUMMARY counts `cache_mb_unmeasured=1`, and under pressure the size IS taken (CONTROL) | the warm arm measures anyway (the pre-fix `du` per install) |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

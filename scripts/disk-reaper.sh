@@ -118,7 +118,16 @@
 #       GB in one install), so an hourly sweep can be correct and still never hold a reserve — the
 #       measured pass reclaimed 187 MB while a 40 GB cache sat untouched. A pass that only fires
 #       below a threshold costs one `df` when it is not needed, so it can run often without becoming
-#       load.
+#       load. ⛔ AND WHEN IT DOES FIRE, THE TICK IS NOT A FULL PASS (#4169 review, P3): the trigger
+#       fires on ANY filesystem its glob prefixes resolve to, and those prefixes include `/tmp` and
+#       `$HOME` — so on the very box the install-arm pressure gate exists for (a small tmpfs `/tmp`)
+#       the tick fires while the RUNNERS' filesystem holds hundreds of GB free. The owner therefore
+#       takes its free-space reading FIRST and `du` only an entry it may act on, so such a tick costs
+#       one `df` per install plus (when that entry is reaped) the `du` of what it is about to free —
+#       never a `du` of every warm cache. The trigger itself is still prefix-derived: a genuinely low
+#       tmpfs makes the tick run, and a "require ALL sink filesystems low" rule is NOT applied here
+#       because pre-created sinks legitimately do not exist yet (`$RUNNER_ROOT/_cache` is created by
+#       the pool's first start). The cost is bounded by the cap and by the owner's cheap-first reading.
 #     * WHY THE HOURLY PASS STAYS: the other five classes are not size-triggered and MUST NOT be — a
 #       worktree, venv or runner `_work` sweep is gated on AGE and emptiness, and firing it harder
 #       under pressure is exactly the "reclaim the box harder" instinct that deletes live work. The

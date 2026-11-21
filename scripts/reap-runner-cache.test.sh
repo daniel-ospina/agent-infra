@@ -245,7 +245,14 @@ case_b() { # <owner-script>
     # AGE gate from the liveness one.
     printf 'young\n' >"$inst/_work/_temp/step.sh"; age_path "$inst/_work/_temp/step.sh" 1
     printf 'old\n'   >"$inst/_work/_temp/old-step.sh"; age_path "$inst/_work/_temp/old-step.sh" 9
-    printf 'young\n' >"$inst/_diag/Runner_1.log"
+    # ⛔ TWO YOUNG `_diag` LOGS, AND THE ASSERTED ONE IS THE OLDER (#4169 review, P2). With a SINGLE
+    # young log the row could not redden when the age gate was deleted: the file was trivially
+    # `newest_log`, so the unconditional newest-log keep answered for the age gate and the assertion
+    # passed on a tree with no age bound at all — a dead-weight assertion under agent-infra#3442 rule 3.
+    # The asserted log is now 2 days old with a 1-day-old sibling beside it, so ONLY the age gate can
+    # keep it; `MUT_B3` deletes that gate and reddens the row.
+    printf 'younger-still\n' >"$inst/_diag/Runner_1.log"; age_path "$inst/_diag/Runner_1.log" 2
+    printf 'youngest\n'      >"$inst/_diag/Runner_2.log"; age_path "$inst/_diag/Runner_2.log" 1
     idle_work "$inst"
     mk_ps "$base/ps" "$inst" idle
     out="$(run_owner "$owner" "$base" "$base/ps" --apply --scratch-days 7 --log-days 7)"; rc=$?
@@ -259,6 +266,8 @@ case_b() { # <owner-script>
                "scratch YOUNGER than the age bound is NOT reclaimed"
     case_check "$(grep -qF 'reason=too-young' <<<"$out" && echo 0 || echo 1)" "and it is named (reason=too-young)"
     case_check "$([ -f "$inst/_diag/Runner_1.log" ] && echo 0 || echo 1)" "a young _diag log is NOT reclaimed"
+    case_check "$(grep -qF "KEPT   $inst/_diag/Runner_1.log reason=too-young" <<<"$out" && echo 0 || echo 1)" \
+               "and the OLDER of two young logs is kept BY THE AGE GATE (reason=too-young), not by the newest-log keep"
     case_check "$([ ! -f "$inst/_work/_temp/old-step.sh" ] && echo 0 || echo 1)" \
                "an AGED scratch entry in the SAME install WAS reaped (the age gate is the only difference)"
     return $((CASE_FAIL > 0))
@@ -926,6 +935,145 @@ STUB
     return $((CASE_FAIL > 0))
 }
 
+# ── V: THE REMOVAL IS A RENAME, THEN A DELETE (#4169 review, P2) ───────────────────────────────
+# ⛔ THE DEFECT THIS PINS: `census_refresh` → liveness probe → `rm -rf` is a check-then-act whose window
+# is the WHOLE recursive delete (`REAP_RC_DU_TIMEOUT=120` already concedes minutes on a 21–50 GB tree).
+# A listener that picks up a job one second after the probe reads a half-deleted `.cache` for the rest
+# of the free — the failing job the class exists to prevent. The candidate is therefore `mv`d to
+# `<path>.reaping.<pid>` FIRST (one syscall, so the probe only has to be correct up to it) and the
+# renamed tree is freed afterwards.
+# Mutant: `mv_path` neutered — the rename is what makes the path stop existing, so nothing is removed
+# and the entry is reported `quarantine-failed` (rc 4). That is the assertion's only discriminator.
+case_v() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/v.XXXXXX")"
+    inst="$base/gh-runner-v"
+    mk_install "$inst"; mk_cache "$inst" 2; idle_work "$inst"
+    mk_ps "$base/ps" "$inst" idle
+    out="$(run_owner "$owner" "$base" "$base/ps" --apply --min-cache-mb 1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'V rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ ! -e "$inst/.cache" ] && echo 0 || echo 1)" "the idle cache is reclaimed"
+    case_check "$(grep -qF "REAPED $inst/.cache how=rm-quarantined" <<<"$out" && echo 0 || echo 1)" \
+               "and the record says HOW (how=rm-quarantined: renamed out of a live job's reach, then freed)"
+    # ⛔ NO QUARANTINE MAY SURVIVE A SUCCESSFUL FREE: a leftover `.reaping.` tree is bytes nothing in
+    # this class matches again, i.e. a leak created by the very fix that closes the window.
+    case_check "$( [ -z "$(compgen -G "$inst/.cache.reaping.*" 2>/dev/null)" ] && echo 0 || echo 1)" \
+               "the quarantined name does not survive a successful free (no `.reaping.` leftover)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── W: AN UNSIZED CANDIDATE CLAIMS THE WHOLE CAP (#4169 review, P3) ─────────────────────────────
+# ⛔ THE DEFECT THIS PINS: `cap_reached "${size%%[!0-9]*}"` collapsed every `?` (a `du` that timed out
+# on a 40–50 GB tree) to `pending=0`, so such a pass was UNCAPPED while its record still printed
+# `max_mb=` and the docs promised the cap stops a pass that fires 144×/day. The `du` stub below fails
+# for every path, which is exactly the shape of a timed-out probe.
+# Mutant: the `?` -> `MAX_MB` claim removed — both caches are then reaped against a 1MB cap.
+case_w() { # <owner-script>
+    local owner="$1" base a b out rc du_stub
+    base="$(mktemp -d "$T/w.XXXXXX")"
+    a="$base/gh-runner-w1"; b="$base/gh-runner-w2"
+    mk_install "$a"; mk_install "$b"
+    mk_cache "$a" 2; mk_cache "$b" 2
+    idle_work "$a"; idle_work "$b"
+    mk_ps "$base/ps" "$a" idle
+    du_stub="$base/du-stub"
+    printf '#!/bin/sh\nexit 1\n' >"$du_stub"; chmod +x "$du_stub"
+    out="$(RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" REAP_RC_DU_BIN="$du_stub" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" \
+           REAP_RC_MIN_CACHE_MB=1 REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 1 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'W rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$( [ "$(grep -c '^REAPED ' <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+               "an UNSIZED candidate claims the whole cap: exactly ONE is reaped against --max-mb 1"
+    case_check "$(grep -qE 'capped=1' <<<"$out" && echo 0 || echo 1)" "and the pass reports capped=1"
+    case_check "$(grep -qF 'reason=pass-cap' <<<"$out" && echo 0 || echo 1)" \
+               "the candidate it did not reach is NAMED (reason=pass-cap)"
+    case_check "$(grep -qE 'freed_mb=0 ' <<<"$out" && echo 0 || echo 1)" \
+               "and freed_mb stays a MEASURED number: an unmeasured tree credits nothing to it"
+    return $((CASE_FAIL > 0))
+}
+
+# ── X: A SYMLINKED `.cache` IS A POLICY KEEP, NOT AN ABSTENTION (#4169 review, P3) ──────────────
+# ⛔ THE DEFECT THIS PINS: a symlinked `.cache` — the ordinary operator remedy for a small root volume
+# — was counted `unmeasurable`, and ANY unmeasurable forces rc 3, so the hourly reaper reddened on a
+# healthy box FOREVER with no seam to accept the layout. Nothing is unknown: the class never follows a
+# symlink in a delete path, and the line names the entry.
+# Mutant: the symlink arm deleted — the link is then a reap candidate and the operator's link is
+# destroyed (the class deletes the LINK, which is harmless to the target but is still not its to take).
+case_x() { # <owner-script>
+    local owner="$1" base inst target out rc
+    base="$(mktemp -d "$T/x.XXXXXX")"
+    inst="$base/gh-runner-x"; target="$base/big-disk-cache"
+    mk_install "$inst"; idle_work "$inst"
+    mkdir -p "$target/uv"; dd if=/dev/zero of="$target/uv/blob" bs=1M count=2 >/dev/null 2>&1
+    ln -s "$target" "$inst/.cache"
+    mk_ps "$base/ps" "$inst" idle
+    out="$(run_owner "$owner" "$base" "$base/ps" --apply --min-cache-mb 1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'X rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "a symlinked cache does NOT fail the pass closed (rc=$rc, want 0 — it used to force 3)"
+    case_check "$([ -L "$inst/.cache" ] && echo 0 || echo 1)" "the operator's LINK is untouched"
+    case_check "$([ -f "$target/uv/blob" ] && echo 0 || echo 1)" "and so is the tree it points at (never followed in a delete path)"
+    case_check "$(grep -qF "KEPT   $inst/.cache reason=symlinked-cache" <<<"$out" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME as the policy decision it is (reason=symlinked-cache)"
+    case_check "$(grep -qE 'unmeasurable=0' <<<"$out" && echo 0 || echo 1)" \
+               "it is NOT counted unmeasurable (an abstention would drive rc 3)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── Y: A CACHE THE PRESSURE GATE KEEPS COSTS ONE `df`, NOT A `du` (#4169 review, P3) ─────────────
+# ⛔ THE COST THIS PINS: `df` is one syscall, `du` on a 50 GB cache is minutes, and the gate that KEEPS
+# an entry does not need its size. The size used to be taken unconditionally at the TOP of
+# `sweep_install`, so a `--size-trigger` pass that fired on an unrelated small filesystem paid a `du`
+# of every install's cache to decide nothing — while the docs claimed a tick costs one `df`. The `du`
+# stub below RECORDS every invocation, so "was it measured?" is an observation and not a reading.
+# Mutant: the warm arm measures anyway (the pre-fix shape) — the recorded `du` calls appear.
+case_y() { # <owner-script>
+    local owner="$1" base inst warm_log cold_log out rc df_stub du_stub
+    base="$(mktemp -d "$T/y.XXXXXX")"
+    inst="$base/gh-runner-y"
+    df_stub="$base/df-stub"; du_stub="$base/du-stub"
+    cat >"$df_stub" <<'STUB'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture %s 0 %s 0%% /\n' 999999 "$(( ${RC_TEST_DF_FREE_MB:-0} * 1024 ))"
+STUB
+    chmod +x "$df_stub"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$RC_TEST_DU_LOG"\nprintf "2048\\t%%s\\n" "$2"\n' >"$du_stub"
+    chmod +x "$du_stub"
+    warm_log="$base/du-warm.log"; cold_log="$base/du-cold.log"
+    run_y() { # <free-mb> <du-log>
+        rm -rf "$inst/.cache"; mk_cache "$inst" 2
+        RC_TEST_DF_FREE_MB="$1" RC_TEST_DU_LOG="$2" \
+        REAP_RC_DF_BIN="$df_stub" REAP_RC_DU_BIN="$du_stub" \
+        RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+        REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+        REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_INSTALL_TRIGGER_FREE_MB=40960 \
+        REAP_RC_MIN_CACHE_MB=1 REAP_RC_STATE_DIR="$base/state" \
+        bash "$owner" --apply 2>&1
+    }
+    mk_install "$inst"; idle_work "$inst"; mk_ps "$base/ps" "$inst" idle
+    : >"$warm_log"; : >"$cold_log"
+    out="$(run_y 200000 "$warm_log")"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'Y1 rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ -e "$inst/.cache/uv/blob" ] && echo 0 || echo 1)" "a WARM cache is kept"
+    case_check "$([ ! -s "$warm_log" ] && echo 0 || echo 1)" \
+               "and it is NOT `du`-measured at all (the gate keeps it without needing its size)"
+    case_check "$(grep -qF "INSTALL $inst cache_mb=not-measured(free-above-trigger)" <<<"$out" && echo 0 || echo 1)" \
+               "the reading SAYS the size was not taken (cache_mb=not-measured(...)), not `?`-as-unmeasurable"
+    case_check "$(grep -qE 'cache_mb_unmeasured=1' <<<"$out" && echo 0 || echo 1)" \
+               "and the SUMMARY counts it, because cache_mb= is then a lower bound"
+    # CONTROL: under pressure the size IS measured, so the assertion above can vary.
+    out="$(run_y 1000 "$cold_log")"
+    case_check "$([ -s "$cold_log" ] && echo 0 || echo 1)" \
+               "CONTROL: under pressure the cache IS `du`-measured (the cheap path is not a broken probe)"
+    case_check "$(grep -qE 'cache_mb_unmeasured=0' <<<"$out" && echo 0 || echo 1)" \
+               "CONTROL: and nothing is reported unmeasured on that pass"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
@@ -933,6 +1081,8 @@ MUT_K="$T/mut-k.sh"; MUT_L="$T/mut-l.sh"; MUT_L2="$T/mut-l2.sh"; MUT_M="$T/mut-m
 MUT_N="$T/mut-n.sh"; MUT_O="$T/mut-o.sh"
 MUT_P="$T/mut-p.sh"; MUT_Q="$T/mut-q.sh"; MUT_R="$T/mut-r.sh"
 MUT_S="$T/mut-s.sh"; MUT_T="$T/mut-t.sh"; MUT_B2="$T/mut-b2.sh"; MUT_U="$T/mut-u.sh"
+MUT_B3="$T/mut-b3.sh"; MUT_V="$T/mut-v.sh"; MUT_W="$T/mut-w.sh"; MUT_X="$T/mut-x.sh"
+MUT_Y="$T/mut-y.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -946,7 +1096,7 @@ apply_mutation "$OWNER" "$MUT_E" 's/^is_install() { .*$/is_install() { true; }/'
     || { printf '  ❌ mutation E could not be applied (the install marker test moved)\n'; mut_ok=0; }
 apply_mutation "$REAPER" "$MUT_C" 's/\[ "\$mb" -lt "\$RUNNER_CACHE_TRIGGER_FREE_MB" \] && low=1/[ "$mb" -gt "$RUNNER_CACHE_TRIGGER_FREE_MB" ] \&\& low=1/' \
     || { printf '  ❌ mutation C could not be applied (the trigger comparison moved)\n'; mut_ok=0; }
-apply_mutation "$OWNER" "$MUT_C2" 's/^    \[ "\$(( FREED_MB + pending ))" -gt "\$MAX_MB" \]$/    false/' \
+apply_mutation "$OWNER" "$MUT_C2" 's/^    \[ "\$(( FREED_MB + UNSIZED_MB + pending ))" -gt "\$MAX_MB" \]$/    false/' \
     || { printf '  ❌ mutation C2 could not be applied (the cap test moved)\n'; mut_ok=0; }
 # ⛔ THE TOCTOU MUTANT NEUTERS THE RE-READ, NOT THE WHOLE ARM: with the refresh stubbed to `:` the probe
 # still runs and still consults a census — a FROZEN one — which is precisely the defect the finding
@@ -956,7 +1106,7 @@ apply_mutation "$OWNER" "$MUT_F" 's/^census_refresh() { census_read; }$/census_r
     || { printf '  ❌ mutation F could not be applied (the census re-read moved)\n'; mut_ok=0; }
 apply_mutation "$OWNER" "$MUT_J" 's/REAP_RC_LOG:-/REAP_RC_LOG_IGNORED:-/' \
     || { printf '  ❌ mutation J could not be applied (the log seam moved)\n'; mut_ok=0; }
-apply_mutation "$OWNER" "$MUT_I" 's/^    if \[ "\$pending" -gt "\$MAX_MB" \] && \[ "\$FREED_MB" -lt "\$MAX_MB" \]; then$/    if false; then/' \
+apply_mutation "$OWNER" "$MUT_I" 's/^    if \[ "\$pending" -gt "\$MAX_MB" \] && \[ "\$(( FREED_MB + UNSIZED_MB ))" -lt "\$MAX_MB" \]; then$/    if false; then/' \
     || { printf '  ❌ mutation I could not be applied (the oversized-candidate guard moved)\n'; mut_ok=0; }
 # ⛔ K — the EXPLICIT-seam refusal gate (the blocking #4169 finding). Without it a glob that matched a
 # directory but no install exits 0 with `census=ok installs=0`: an inert class reading healthy.
@@ -1008,6 +1158,25 @@ apply_mutation "$OWNER" "$MUT_B2" 's/^        if \[ "\$fm" -gt "\$cutoff_s" \]; 
 # WITHOUT consulting the census it was just handed — the pre-fix defect, exactly.
 apply_mutation "$OWNER" "$MUT_U" 's/^    if \[ -n "\$INSTALL_DIRS" \]; then$/    if true; then/' \
     || { printf '  ❌ mutation U could not be applied (the empty-population witness in any_live_now moved)\n'; mut_ok=0; }
+# ⛔ B3 — the SECOND age gate (`_diag` logs). The suite shipped a mutant for the scratch bound (`B2`) and
+# none for the log bound, so DELETING the log gate was invisible: the row that named it was kept by the
+# newest-log arm instead (#4169 review, P2). `case_b` now asserts an OLDER young log beside a newer one,
+# which only this gate can keep.
+apply_mutation "$OWNER" "$MUT_B3" 's/^        if \[ "\$fm" -gt "\$cutoff_l" \]; then$/        if false; then/' \
+    || { printf '  ❌ mutation B3 could not be applied (the _diag age gate moved)\n'; mut_ok=0; }
+# ⛔ V — the ATOMIC removal: `mv` out of the way, then free. Neutering the rename is the pre-fix
+# check-then-act (nothing is moved, so nothing may be deleted either).
+apply_mutation "$OWNER" "$MUT_V" 's/^mv_path() { mv -- "\$1" "\$2" 2>\/dev\/null; }$/mv_path() { :; }/' \
+    || { printf '  ❌ mutation V could not be applied (the quarantine rename moved)\n'; mut_ok=0; }
+# ⛔ W — an UNSIZED candidate claims the whole cap (reverting it makes a `du`-timeout pass uncapped).
+apply_mutation "$OWNER" "$MUT_W" 's/^    case "\$size" in .*_pending="\$MAX_MB" ;; esac$/    :/' \
+    || { printf '  ❌ mutation W could not be applied (the unsized-cap claim moved)\n'; mut_ok=0; }
+# ⛔ X — a symlinked `.cache` is KEPT as policy; deleting the arm makes the operator's link a candidate.
+apply_mutation "$OWNER" "$MUT_X" 's/^        if \[ -L "\$cache" \]; then$/        if false; then/' \
+    || { printf '  ❌ mutation X could not be applied (the symlink policy arm in the cache block moved)\n'; mut_ok=0; }
+# ⛔ Y — the warm-cache arm measures anyway (the pre-fix shape: a `du` per install on every tick).
+apply_mutation "$OWNER" "$MUT_Y" 's/^            warm)         _defer="free-above-trigger" ;;$/            warm)         _defer=""; sz="$(du_mb "$cache")" || sz="" ;;/' \
+    || { printf '  ❌ mutation Y could not be applied (the deferred-size arm moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -1031,6 +1200,10 @@ expect_pass "R the shared root is pressure-gated: kept when warm, reaped when lo
 expect_pass "S aged scratch and logs are ALL reclaimed in one pass (the class cannot poison its own witness)" case_s "$OWNER"
 expect_pass "T the install cache is pressure-gated on its own filesystem: warm kept, low reaped, unanswerable kept" case_t "$OWNER"
 expect_pass "U with ZERO installs the per-entry re-probe still asks the FRESH census (no vacuous liveness)" case_u "$OWNER"
+expect_pass "V the removal is a RENAME then a delete (how=rm-quarantined, no leftover)" case_v "$OWNER"
+expect_pass "W an UNSIZED candidate claims the whole per-pass cap" case_w "$OWNER"
+expect_pass "X a symlinked .cache is a POLICY keep, not an abstention (rc 0, link untouched)" case_x "$OWNER"
+expect_pass "Y a warm cache costs one df and no du (and says its size was not measured)" case_y "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -1060,6 +1233,11 @@ expect_fail "S mutant: the witness reads the sink's own mtime again"      case_s
 expect_fail "T mutant: the install free-space gate removed"               case_t "$MUT_T"
 expect_fail "B2 mutant: the _work/_temp age gate removed"                 case_b "$MUT_B2"
 expect_fail "U mutant: the empty-population witness in any_live_now is unreachable" case_u "$MUT_U"
+expect_fail "B3 mutant: the _diag age gate removed"                        case_b "$MUT_B3"
+expect_fail "V mutant: the rename that makes the path vanish is neutered"  case_v "$MUT_V"
+expect_fail "W mutant: an unsized candidate claims nothing of the cap"     case_w "$MUT_W"
+expect_fail "X mutant: the symlinked-cache policy arm deleted"             case_x "$MUT_X"
+expect_fail "Y mutant: a warm cache is du-measured anyway"                 case_y "$MUT_Y"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

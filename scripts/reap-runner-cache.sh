@@ -37,6 +37,12 @@
 #                                one per install: a listener holds its CURRENT log OPEN, so unlinking
 #                                it reclaims no bytes while crediting the `du` figure to the ledger and
 #                                costing the next failure its diagnostics (#4169 review).
+#                                ⛔ BOTH AGE GATES SHIP A MUTANT, and the log one needs a fixture that
+#                                can SEE it: with a single young log the unconditional newest-log keep
+#                                answers for the age gate, so the row passed on a tree where the gate
+#                                was deleted (#4169 review, P2 — a dead-weight assertion). The suite's
+#                                `case_b` now asserts an OLDER young log beside a newer one, which only
+#                                the age gate can keep.
 #
 # plus the SHARED per-box cache root (`XDG_CACHE_HOME` for pool-started runners, see
 # `scripts/ci_runner_pool.sh`), which is what stops the multiplication: N installs with a
@@ -50,6 +56,18 @@
 # `.cache` dirs, so on exactly the layout the durable half creates (writes go to `XDG_CACHE_HOME`, the
 # per-install caches stay empty) the record read `cache_mb=0` beside a non-zero `freed_mb` — a
 # self-contradicting number in a class whose rule is "the numbers are printed, not implied" (#4169).
+# ⛔ AND A CACHE THE PRESSURE GATE KEEPS IS NOT `du`'d (#4169 review, P3): `df` is one syscall, `du` on
+# a 50 GB cache is minutes, and the gate that KEEPS an entry does not need its size. So the size is
+# taken only when this pass might act on the entry, and every entry whose size was NOT read is counted
+# in `cache_mb_unmeasured=` and printed as `cache_mb=not-measured(<why>)` — a lower bound that SAYS it
+# is one, rather than a `du` per install on a pass that fires 144×/day.
+# ⛔ THE SYMLINKED-CACHE ARM IS A POLICY KEEP, NOT AN ABSTENTION. A `.cache` that is a symlink (the
+# ordinary operator remedy for a small root volume) used to be counted `unmeasurable`, and any
+# unmeasurable forces rc 3 — so the class failed closed FOREVER on a healthy box. Nothing is unknown
+# here: this class does not follow a symlink in a delete path, the link and its target belong to the
+# operator, and the journal names the entry. So it is `KEPT reason=symlinked-cache` like the other
+# policy keeps (`below-min-cache`, `*-free-above-trigger`), and the bytes under the target are outside
+# this class's scope BY DESIGN — which the line says.
 #
 # ⛔ THE INSTALL TREE ITSELF IS NEVER A CANDIDATE — not `bin/`, not `config/`, not `externals/`, not
 # `_work/<checkout>` (that is `reap-runner-work.sh`'s sink with its own mtime floor), not `_tool`,
@@ -86,6 +104,21 @@
 # root re-asks the POPULATION question ("does ANY install have a job in flight NOW?"), because that
 # root is what every install's listener reads.
 #
+# ⛔ AND THE PROBE IS ONLY HALF OF IT: THE REMOVAL IS A RENAME, THEN A DELETE. A probe followed by a
+# 21–50 GB `rm -rf` is a check-then-act whose window is the WHOLE recursive delete — minutes, at the
+# sizes this file's header measures, and `REAP_RC_DU_TIMEOUT=120` already concedes them. A listener
+# that picked up a job one second after the probe would read a half-deleted `.cache` for the rest of
+# the free, which is exactly the failing job this class exists to prevent. So `reap_one` first
+# `mv`s the candidate to `<path>.reaping.<pid>` and only then frees the renamed tree: the rename is
+# ONE syscall, so the probe has to be correct only up to it. A job that starts AFTER the rename finds
+# no path and re-creates a fresh directory; a job that started BEFORE it keeps its open inodes, since
+# unlinking a file another process holds open reclaims the name, not the content. The path is what a
+# job's toolchain resolves, and it stops existing at the rename.
+#   ⛔ A RENAME THAT CANNOT HAPPEN IS NOT A DELETE PERMISSION: the entry is reported
+#   `ERR … reason=quarantine-failed` and counted `failed` (rc 4). A delete that cannot first be made
+#   atomic is not attempted, and a failed FREE of the quarantined tree names the leftover
+#   (`reason=remove-failed-quarantined path=<q>`), so the bytes are never silently orphaned.
+#
 # ── CADENCE (agent-infra#4168 point 3) ───────────────────────────────────────────────────────────
 # This file is the POLICY OWNER; it holds no clock. `disk-reaper.sh` runs it on TWO cadences and its
 # header states why both exist: the hourly full pass (cheap to add here — this class is a `du` per
@@ -104,6 +137,15 @@
 # Admitting one such candidate drops the box by that much and leaves the rest for the next tick, so
 # the cap still bounds the pass's work per tick and the backlog still converges.
 #
+# ⛔ AN UNSIZED CANDIDATE CLAIMS THE WHOLE CAP (agent-infra#4169 review, P3). A `du` that times out —
+# the 21–50 GB trees this class exists for — yields `?`, and `${size%%[!0-9]*}` turned that into
+# `pending=0`, so such a pass was effectively UNCAPPED while its record still printed `max_mb=` and
+# the docs promised the cap stops a pass that fires 144×/day. `?` is now treated as at least `MAX_MB`:
+# the first one is still admitted (the oversized-candidate rule), and from then on the pass is capped.
+# `freed_mb` stays an honest MEASURED number — the claim is tracked separately (`UNSIZED_MB`), because
+# crediting megabytes nobody measured to `freed_mb` would be the same false number in the other
+# direction.
+#
 # ── EXIT CODES ───────────────────────────────────────────────────────────────────────────────────
 #   0  the sweep ran; nothing is wrong (this INCLUDES a sweep that found nothing to do)
 #   2  usage
@@ -113,7 +155,8 @@
 #      ⛔ EACH OF THOSE PUBLISHES ITS OWN CENSUS STATE (`census=no-roots` / `census=refused`) because the
 #      REMEDY differs; folding a refusal into a measured zero is how an operator widens a glob that was
 #      already matching instead of fixing the one token that is wrong.
-#   4  a removal FAILED (the path is still there after `rm`)
+#   4  a removal FAILED (the path is still there after `rm`, or it could not be renamed out of the
+#      way in the first place)
 #   5  DRY RUN with work present (the dry run's whole job is to say so)
 #
 # Env seams (each validated at startup; a garbage value is a refusal, never a default):
@@ -336,6 +379,11 @@ CAPPED=0
 REMAINING=0
 FREED_MB=0
 CACHE_TOTAL_MB=0
+# ⛔ WHAT AN UNSIZED CANDIDATE CLAIMS OF THE PER-PASS CAP, kept apart from `FREED_MB` on purpose: the
+# claim must BOUND the pass, while `freed_mb` must stay a measured number (#4169 review, P3).
+UNSIZED_MB=0
+# Entries whose size this pass did NOT read because a gate kept them without needing it.
+CACHE_NOT_MEASURED=0
 # A REFUSED SCOPE IS ITS OWN OUTCOME (see the exit-code table): it is not an abstention (a gate that
 # could not ANSWER) and it is emphatically not a measured zero.
 REFUSED=0
@@ -348,6 +396,12 @@ READINGS=""
 is_dry() { [ "$DRY_RUN" = "1" ]; }
 
 rm_path() { rm -rf -- "$1"; }
+# mv_path <from> <to> — the ATOMIC half of a removal. One rename is the whole of the window in which a
+# job could observe a disappearing cache; the recursive free happens afterwards, on a name no job's
+# toolchain resolves (#4169 review, P2). Silent on failure on purpose: the caller VERIFIES the move
+# (`[ ! -e "$path" ]`) and reports the refusal, so a `mv` that cannot run is never mistaken for one
+# that did.
+mv_path() { mv -- "$1" "$2" 2>/dev/null; }
 
 du_mb() { # <path> — blocks occupied in MiB, or empty when the probe could not answer
     local kb
@@ -537,10 +591,14 @@ cap_reached() {
     # Admit exactly one such candidate per pass, while the pass has not reached its cap yet (so a
     # small candidate earlier in the pass cannot lock the big one out), and let the cap bound
     # everything after it: FREED_MB then exceeds MAX_MB and every later candidate is deferred.
-    if [ "$pending" -gt "$MAX_MB" ] && [ "$FREED_MB" -lt "$MAX_MB" ]; then
+    # ⛔ THE CLAIM IS `FREED_MB + UNSIZED_MB`, NOT `FREED_MB`: an unsized (`?`) candidate claims the
+    # whole cap, so one admitted `du`-timeout tree caps the pass instead of leaving it uncapped
+    # (#4169 review, P3). With every size measured, `UNSIZED_MB` is 0 and this is the arithmetic it
+    # always was.
+    if [ "$pending" -gt "$MAX_MB" ] && [ "$(( FREED_MB + UNSIZED_MB ))" -lt "$MAX_MB" ]; then
         return 1
     fi
-    [ "$(( FREED_MB + pending ))" -gt "$MAX_MB" ]
+    [ "$(( FREED_MB + UNSIZED_MB + pending ))" -gt "$MAX_MB" ]
 }
 
 # reap_one <path> <size-mb|?-> <kind> <install|-> — the ONE destructive call, gated three ways.
@@ -550,8 +608,13 @@ cap_reached() {
 # `<install>` names the install whose liveness the re-probe re-asks; `-` is the SHARED cache root,
 # whose question is the population's (any install live), because that root is not one install's.
 reap_one() {
-    local path="$1" size="$2" kind="$3" install="$4" _live
-    if cap_reached "${size%%[!0-9]*}"; then
+    local path="$1" size="$2" kind="$3" install="$4" _live _pending _q
+    # ⛔ AN UNSIZED CANDIDATE CLAIMS THE WHOLE CAP (#4169 review, P3). `${size%%[!0-9]*}` collapsed
+    # every `?` (a `du` that timed out on a 40–50 GB tree) to 0, so such a pass was uncapped: the cap
+    # promised in the docs bounded nothing on exactly the population it was written for.
+    _pending="${size%%[!0-9]*}"
+    case "$size" in ''|*[!0-9]*) _pending="$MAX_MB" ;; esac
+    if cap_reached "$_pending"; then
         CAPPED=1; REMAINING=$((REMAINING + 1))
         log_line "KEPT   $path reason=pass-cap (per-pass cap ${MAX_MB}MB reached; the next tick continues)"
         return 0
@@ -560,7 +623,10 @@ reap_one() {
     if is_dry; then
         CAND_NAMES="${CAND_NAMES}${CAND_NAMES:+
 }REAP ${size}MB ${path} kind=${kind}"
-        case "$size" in ''|*[!0-9]*) ;; *) FREED_MB=$((FREED_MB + size)) ;; esac
+        case "$size" in
+            ''|*[!0-9]*) UNSIZED_MB=$((UNSIZED_MB + MAX_MB)) ;;
+            *)           FREED_MB=$((FREED_MB + size)) ;;
+        esac
         return 0
     fi
     # ⛔ RE-PROBE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL, AGAINST A FRESH CENSUS. The classification
@@ -597,15 +663,30 @@ reap_one() {
         log_line "GONE   $path reason=vanished-at-removal (nothing removed by this class, and not an abstention)"
         return 0
     fi
-    if rm_path "$path" 2>/dev/null && [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    # ⛔ RENAME FIRST, THEN FREE (#4169 review, P2). The probe above is only correct up to this
+    # syscall: without it the window was the whole recursive delete — minutes on a 21–50 GB tree —
+    # and a job that started inside it read a half-deleted cache, which is the failing job this class
+    # exists to prevent. After the rename the PATH a job resolves no longer exists (a job that starts
+    # now gets a fresh directory), while a job that started before it keeps its open inodes.
+    _q="${path}.reaping.$$"
+    if ! mv_path "$path" "$_q" || [ -e "$path" ] || [ -L "$path" ]; then
+        FAILED=$((FAILED + 1))
+        log_line "ERR    $path reason=quarantine-failed (the candidate could not be RENAMED out of the way, so it was NOT deleted: a removal that cannot first be made atomic is not attempted — a live job must never observe a half-deleted tree)"
+        log "REMOVAL REFUSED (quarantine) $path"
+        return 0
+    fi
+    if rm_path "$_q" 2>/dev/null && [ ! -e "$_q" ] && [ ! -L "$_q" ]; then
         REAPED=$((REAPED + 1))
-        case "$size" in ''|*[!0-9]*) ;; *) FREED_MB=$((FREED_MB + size)) ;; esac
-        log_line "REAPED $path how=rm kind=${kind} mb=${size}"
-        log "reaped $path kind=$kind mb=$size"
+        case "$size" in
+            ''|*[!0-9]*) UNSIZED_MB=$((UNSIZED_MB + MAX_MB)) ;;
+            *)           FREED_MB=$((FREED_MB + size)) ;;
+        esac
+        log_line "REAPED $path how=rm-quarantined kind=${kind} mb=${size}"
+        log "reaped $path kind=$kind mb=$size how=rm-quarantined"
     else
         FAILED=$((FAILED + 1))
-        log_line "ERR    $path reason=remove-failed"
-        log "REMOVAL FAILED $path"
+        log_line "ERR    $path reason=remove-failed-quarantined path=$_q (the tree was renamed out of a live job's reach but could not be freed; the bytes are still on disk under that name and nothing else in this class matches it)"
+        log "REMOVAL FAILED (quarantined) $path -> $_q"
     fi
     return 0
 }
@@ -618,16 +699,51 @@ is_install() { [ -f "$1/bin/Runner.Listener" ] || [ -L "$1/bin/Runner.Listener" 
 
 SEEN_INSTALLS=" "
 sweep_install() { # <install-dir>
-    local d="$1" cache="$1/.cache" sz reading cutoff_s cutoff_l f fm newest_log newest_lm _lm _press=""
+    local d="$1" cache="$1/.cache" sz="" reading cutoff_s cutoff_l f fm newest_log newest_lm _lm
+    local _press="" _press_state="none" _defer=""
     INSTALLS=$((INSTALLS + 1))
-    # ── the reading FIRST, so the line exists even for an install that is skipped ────────────────
-    if [ -e "$cache" ] || [ -L "$cache" ]; then sz="$(du_mb "$cache")" || sz=""; else sz="0"; fi
+    # ── THE CHEAP GATE FIRST, THE READING AFTER (#4169 review, P3) ───────────────────────────────
+    # `df` is ONE syscall on the install's own filesystem; `du -sk` of a measured cache is MINUTES
+    # (21–50 GB, and `REAP_RC_DU_TIMEOUT=120` already concedes it). The free-space gate is the only
+    # gate that can KEEP an entry WITHOUT knowing its size, so it is asked first and the size is read
+    # only when this pass might act. Without this, a `--size-trigger` pass that fired on an unrelated
+    # small filesystem (a tmpfs `/tmp`, `$HOME` on a small root) paid a `du` per install to decide
+    # nothing — the cost the docs claimed was "one `df`".
+    # ⛔ AND A SYMLINKED `.cache` IS NEVER `du`'d AT ALL: `du -sk <link>` dereferences its operand, so
+    # the old unconditional reading described a tree this class does not own and then threw the
+    # number away.
+    if [ -e "$cache" ] || [ -L "$cache" ]; then
+        if [ -L "$cache" ]; then
+            _press_state="symlinked"
+        elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ]; then
+            _press="$(free_mb_for_path "$d")" || _press=""
+            case "$_press" in ''|*[!0-9]*) _press="" ;; esac
+            if [ -z "$_press" ]; then _press_state="unanswerable"
+            elif [ "$_press" -ge "$INSTALL_TRIGGER_FREE_MB" ]; then _press_state="warm"
+            else _press_state="pressure"; fi
+        else
+            _press_state="gate-off"
+        fi
+        case "$_press_state" in
+            symlinked)    _defer="symlink" ;;
+            unanswerable) _defer="free-unmeasurable" ;;
+            warm)         _defer="free-above-trigger" ;;
+            *)            sz="$(du_mb "$cache")" || sz="" ;;
+        esac
+    else
+        sz="0"
+    fi
+    # ⛔ A DEFERRED SIZE IS SAID SO, NEVER PRINTED AS `?`-MEANS-UNMEASURABLE: `?` is "a probe could
+    # not answer"; this is "the pass did not need the number", and the two must not read alike. The
+    # count goes into the SUMMARY as `cache_mb_unmeasured=`, because `cache_mb=` is then a LOWER BOUND
+    # and a reader comparing it with `df` must be told why (#2344: print the reading, do not imply it).
+    [ -n "$_defer" ] && CACHE_NOT_MEASURED=$((CACHE_NOT_MEASURED + 1))
     install_live "$d"; local live=$?
     # ⛔ `ANY_LIVE` IS ACCUMULATED HERE, in the ONE place every install is read, and not by a second
     # pass over the population: two reads of the same answer is how the shared root's gate and the
     # per-install verdict drift apart.
     [ "$live" = 0 ] && ANY_LIVE=1
-    reading="INSTALL ${d} cache_mb=${sz:-?} live=$( [ "$live" = 0 ] && printf yes || { [ "$live" = 2 ] && printf unknown || printf no; } ) reason=${LIVE_REASON}"
+    reading="INSTALL ${d} cache_mb=$( [ -n "$_defer" ] && printf 'not-measured(%s)' "$_defer" || printf '%s' "${sz:-?}" ) live=$( [ "$live" = 0 ] && printf yes || { [ "$live" = 2 ] && printf unknown || printf no; } ) reason=${LIVE_REASON}"
     READINGS="${READINGS}${READINGS:+
 }${reading}"
     case "$sz" in ''|*[!0-9]*) ;; *) CACHE_TOTAL_MB=$((CACHE_TOTAL_MB + sz)) ;; esac
@@ -648,19 +764,17 @@ sweep_install() { # <install-dir>
 
     # ── .cache: the whole directory, and the measured 445 GB ────────────────────────────────────
     if [ -e "$cache" ] || [ -L "$cache" ]; then
-        # ⛔ ONE FREE-SPACE READING PER INSTALL, TAKEN ON THE FILESYSTEM THAT HOLDS THIS INSTALL, and
-        # only when the gate is on and there is something to reap (an install with no `.cache` must not
-        # cost a `df`). Empty = the probe could not answer, which is NOT "safe to delete".
-        if [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && [ ! -L "$cache" ]; then
-            _press="$(free_mb_for_path "$d")" || _press=""
-            case "$_press" in ''|*[!0-9]*) _press="" ;; esac
-        fi
-        # ⛔ A SYMLINKED CACHE IS NEVER FOLLOWED. `rm -rf` on a symlink removes the LINK (harmless),
-        # but `du` and every later reading would then describe a tree this class does not own — and a
-        # dangling link is a box whose big disk was unmounted, which is not a state to guess at.
+        # ⛔ A SYMLINKED CACHE IS NEVER FOLLOWED, AND IT IS A POLICY KEEP — NOT AN ABSTENTION
+        # (#4169 review, P3). `rm -rf` on a symlink removes the LINK (harmless), but `du` and every
+        # later reading would then describe a tree this class does not own — and a dangling link is a
+        # box whose big disk was unmounted, which is not a state to guess at. It used to be counted
+        # `unmeasurable`, and ANY unmeasurable forces rc 3 — so the ordinary operator remedy for a
+        # small root volume (symlink the per-install cache onto a big disk) reddened the hourly
+        # reaper FOREVER, with no seam to accept the layout. Nothing is unknown here: the line names
+        # the entry, and the bytes under the target are outside this class by design.
         if [ -L "$cache" ]; then
-            UNMEASURABLE=$((UNMEASURABLE + 1))
-            log_line "KEPT   $cache reason=symlinked-cache (this class never follows one in a delete path)"
+            KEPT=$((KEPT + 1))
+            log_line "KEPT   $cache reason=symlinked-cache (a POLICY keep, not an abstention: this class never follows a symlink in a delete path, so the link and its target stay the operator's; the bytes under the target are outside this class's scope and the pass does not fail closed over them)"
         elif [ -n "$sz" ] && [ "$sz" -lt "$MIN_CACHE_MB" ]; then
             # ⛔ THE SIZE BOUND, AND IT IS THE "NO CHURN" HALF OF THE POLICY. A cache is
             # content-addressed: reaping 40 GB costs every later job a re-download of what it needs,
@@ -673,7 +787,7 @@ sweep_install() { # <install-dir>
             # reading it as "reap" is the fail-open shape the numeric seams above already refuse. It is
             # reported as UNMEASURABLE, so the pass's own verdict does not claim a clean run.
             UNMEASURABLE=$((UNMEASURABLE + 1))
-            log_line "KEPT   $cache reason=install-free-unmeasurable ('$DF_BIN -Pk' could not answer for this install, so the free-space gate cannot say whether ITS filesystem is under pressure; NOT removed)"
+            log_line "KEPT   $cache reason=install-free-unmeasurable ('$DF_BIN -Pk' could not answer for this install, so the free-space gate cannot say whether ITS filesystem is under pressure; NOT removed, and not measured)"
         elif [ "$INSTALL_TRIGGER_FREE_MB" -gt 0 ] && [ "$_press" -ge "$INSTALL_TRIGGER_FREE_MB" ]; then
             # ⛔ PRESSURE-GATED, NOT AGE-GATED — THE SAME POLICY THE SHARED ROOT ALREADY HAD (#4169
             # review, P2). Without this, EVERY pass reaped EVERY idle install's whole warm cache no
@@ -681,7 +795,7 @@ sweep_install() { # <install-dir>
             # `/tmp` in the trigger's prefix set fired it 144×/day over a healthy cache volume), but the
             # HOURLY pass did the same thing. A cache is a WARM cache, not a leak.
             KEPT=$((KEPT + 1))
-            log_line "KEPT   $cache reason=install-free-above-trigger free_mb=${_press} trigger_mb=${INSTALL_TRIGGER_FREE_MB} (a WARM cache on a filesystem with space: this filesystem does not need the bytes, and the next job would re-download them)"
+            log_line "KEPT   $cache reason=install-free-above-trigger free_mb=${_press} trigger_mb=${INSTALL_TRIGGER_FREE_MB} cache_mb=not-measured (a WARM cache on a filesystem with space: this filesystem does not need the bytes, the next job would re-download them, and its size was NOT read — one `df` instead of a `du` of the whole tree)"
         else
             # ⛔ RE-MEASURE AT THE MOMENT OF ACTION for the cap: the `sz` above is a reading, the
             # number that must respect the cap is the one taken immediately before the delete.
@@ -770,8 +884,8 @@ sweep_shared() {
         return 0
     fi
     if [ -L "$root" ]; then
-        UNMEASURABLE=$((UNMEASURABLE + 1))
-        log_line "KEPT   $root reason=symlinked-cache (never followed in a delete path)"
+        KEPT=$((KEPT + 1))
+        log_line "KEPT   $root reason=symlinked-cache (a POLICY keep, not an abstention: this class never follows a symlink in a delete path — a symlinked shared root is the operator's own layout, named here so the pass does not fail closed on it forever)"
         return 0
     fi
     # ⛔ SCOPE, BEFORE ANY DELETE AND BEFORE ANY `du` (#4169 review, P2). The install arm is
@@ -1036,12 +1150,12 @@ if [ "$CENSUS" != ok ] || [ "$UNMEASURABLE" -gt 0 ] || [ "$REFUSED" -gt 0 ]; the
 fi
 if [ "$rc" = 0 ] && is_dry && [ "$CANDIDATES" -gt 0 ]; then rc=5; fi
 
-log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} refused=${REFUSED} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
+log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} cache_mb_unmeasured=${CACHE_NOT_MEASURED} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} refused=${REFUSED} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
 # ⛔ THE LOG LINE CARRIES THE POPULATION IT SCANNED (`install_globs=` / `shared_globs=`). The stdout
 # header already prints them, but the LOG is the durable artifact an operator reads after the fact, and
 # it is the only way a test can prove WHICH population a pass was pinned to — which is the whole point
 # of `disk-reaper.test.sh` pinning this class to its fixtures (agent-infra#4169): an unpinned suite ran
 # the destructive pass against the box's real `/opt/gh-runner*` installs while claiming to be hermetic.
-[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE refused=$REFUSED freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
+[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB cache_mb_unmeasured=$CACHE_NOT_MEASURED candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE refused=$REFUSED freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
 command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
 exit "$rc"
