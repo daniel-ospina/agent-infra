@@ -96,6 +96,26 @@ function seededOrigin(): string {
   return o;
 }
 
+/** #4149: a clone carrying the REAL `sync.sh` plus a stub farm (`pi-bootstrap/setup.sh`) that leaves a
+ * marker, so a test can assert both what sync.sh SAID and whether the farm actually RAN — the two
+ * facts the issue separates. The clone is BEHIND origin/main by one commit that touches `file.txt`.
+ * `localEdit` is left to the caller so it can build both the blocking shape (edit the INCOMING file,
+ * which git refuses to overwrite) and a clean one; `diverge` commits a DIFFERENT file locally, which
+ * leaves the tree dirty-free and makes the fast-forward impossible for a second, distinct reason. */
+function makeFarmFixture(opts: { diverge?: boolean } = {}): { repo: string; marker: string } {
+  const origin = seededOrigin();
+  const repo = makeClone(origin);
+  const marker = join(repo, "FARM_RAN");
+  mkdirSync(join(repo, "pi-bootstrap"), { recursive: true });
+  writeFileSync(join(repo, "pi-bootstrap", "setup.sh"), `#!/bin/bash\ntouch "${marker}"\n`, { mode: 0o755 });
+  writeFileSync(join(repo, "sync.sh"), syncShSource(), { mode: 0o755 });
+  const pusher = makeClone(origin);
+  commit(pusher, "remote ahead");
+  git(pusher, "push -q origin main");
+  if (opts.diverge) commit(repo, "local ahead", "sibling.txt");
+  return { repo, marker };
+}
+
 /** #1661: a checkout in the exact stuck shape — unmerged stage-2/3 entries with
  * NO MERGE_HEAD (an abandoned conflict), so pull --ff-only refuses forever.
  * `keepMergeHead=true` leaves an ACTIVE merge in progress (for op detection). */
@@ -467,6 +487,66 @@ async function main() {
     ok(out.includes("branch-ownership guard, #265"), `expected #265 reference, got: ${out}`);
     equal(git(repo, "rev-parse HEAD").trim(), headBefore, "HEAD must not move");
     equal(git(repo, "branch --show-current").trim(), "feature/xyz", "branch must not switch");
+  });
+
+  // ── #4149: a refused sync REPORTS the farm that did not run ─────────────
+  section("#4149 a refused sync reports farm=NOT-RUN");
+
+  await test("sync.sh: a dirty tracked file blocks the pull → loud block + token, and the farm did NOT run", async () => {
+    const { repo, marker } = makeFarmFixture({ localEdit: true });
+    // The local edit is on the SAME file the incoming commit touches, which is the shape that made
+    // `git pull --ff-only` refuse on the cell (#4149) — a dirty file git cannot overwrite.
+    writeFileSync(join(repo, "file.txt"), "change\nlocal edit\n");
+    let out = "";
+    let rc = 0;
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
+    ok(rc !== 0, `a dirty checkout must fail sync, got rc=${rc}: ${out}`);
+    ok(out.includes("THE FARM DID NOT RUN"), `expected the loud banner, got: ${out}`);
+    ok(/farm=NOT-RUN reason=dirty-checkout\b/.test(out), `expected the greppable token, got: ${out}`);
+    ok(out.includes("M file.txt"), `expected the dirty path named, got: ${out}`);
+    ok(!existsSync(marker), "the farm stub must NOT have run — that is the consequence the banner names");
+  });
+
+  await test("sync.sh: clean + behind → the farm RUNS and no NOT-RUN token is printed (non-vacuity control)", async () => {
+    const { repo, marker } = makeFarmFixture();
+    const out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" });
+    ok(existsSync(marker), `the farm stub MUST run on a clean checkout, got: ${out}`);
+    ok(!out.includes("farm=NOT-RUN"), `no refusal token on a successful sync, got: ${out}`);
+  });
+
+  await test("sync.sh: diverged is classified as diverged, NOT as a dirty checkout", async () => {
+    const { repo } = makeFarmFixture({ diverge: true });
+    let out = "";
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; }
+    ok(/farm=NOT-RUN reason=diverged\b/.test(out), `expected reason=diverged, got: ${out}`);
+    ok(!out.includes("reason=dirty-checkout"), `a diverged checkout must not be reported dirty, got: ${out}`);
+  });
+
+  await test("sync.sh: off main keeps exit 0 (#265) AND carries the NOT-RUN token", async () => {
+    const { repo, marker } = makeFarmFixture();
+    git(repo, "checkout -q -b feature/4149-token");
+    const out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" });
+    ok(/farm=NOT-RUN reason=not-on-main\b/.test(out), `expected the token, got: ${out}`);
+    ok(!existsSync(marker), "the farm must not run off main — the token is the only honest report");
+  });
+
+  await test("session_start: auto mode off main never claims '✅ updated' over a farm that did not run", async () => {
+    const origin = seededOrigin();
+    const repo = makeClone(origin);
+    const pusher = makeClone(origin);
+    commit(pusher, "remote ahead");
+    git(pusher, "push -q origin main");
+    git(repo, "checkout -q -b feature/4149-offmain");
+    const marker = join(repo, "SYNC_RAN");
+    writeStubSync(repo, marker);
+    const lines = await runSession(repo, { mode: "auto" });
+    const joined = lines.join("\n");
+    ok(!joined.includes("agent-infra updated"), `must NOT report success off main, got: ${joined}`);
+    ok(joined.includes('branch "feature/4149-offmain"'), `must name the branch, got: ${joined}`);
+    ok(joined.includes("auto mode could NOT run"), `must say auto could not act, got: ${joined}`);
+    ok(!existsSync(marker), "sync.sh is inert off main — it must not be run as if it could help");
   });
 
   // ── #1661: stuck-index + staleness signals ──────────────────────────────

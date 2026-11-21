@@ -231,21 +231,10 @@ export function stalenessThreshold(env: Record<string, string | undefined> = pro
  */
 export function stalenessBanner(repo: string, behind: number, threshold: number): string[] {
   if (behind < threshold) return [];
-  // #1663 / #1664 (review): sync.sh is INERT off main — its branch-ownership
-  // guard prints a notice and exits 0 (sync.sh, "checkout is not on main",
-  // #265). Handing that guard's own no-op to the reader is the same
-  // banner-contradicts-behaviour defect this banner was rewritten to remove,
-  // so a non-main checkout gets the extra step instead of a command that
-  // silently does nothing. An UNREADABLE branch keeps the plain remedy: an
-  // unread value must not invent a claim about which branch we are on.
-  const branch = currentBranch(repo);
-  const sync = branch !== "" && branch !== "main"
-    ? `[auto-sync]    Sync: this checkout is on branch "${branch}", not main — ./sync.sh refuses there (branch-ownership guard, #265). Switch first: cd "${repo}" && git checkout main && ./sync.sh`
-    : `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`;
   return [
     `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
     `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
-    sync,
+    syncRemedy(repo),
     // ⛔ THE PIN CORRECTION IS PRINTED AT THE HINT SITE, NOT HERE (review P2). The banner and the
     // `update available — run: …` hint both fire on the warn path, so carrying it in both showed the
     // reader the trap, the correction, the same trap, the same correction at every session start.
@@ -255,6 +244,24 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
     // site", which is true of the correction and false of the command, and the two comments
     // contradicted each other).
   ];
+}
+
+/** #1663 / #1664 / #4149: the remedy line for a BEHIND checkout, branch-aware.
+ *
+ * sync.sh is INERT off main — its branch-ownership guard prints a notice and exits 0
+ * (sync.sh, "checkout is not on main", #265). Handing that guard's own no-op to the
+ * reader is the banner-contradicts-behaviour defect #1664 removed from the banner, so
+ * the branch-aware form lives here and EVERY site that recommends a sync uses it — a
+ * single site keeping the plain form re-opens the hole for that site (#4149: the
+ * session_start `auto` path ran sync.sh off main, took its exit 0, and printed
+ * `✅ agent-infra updated` over a farm that never ran).
+ * An UNREADABLE branch keeps the plain remedy: an unread value must not invent a claim
+ * about which branch we are on. */
+export function syncRemedy(repo: string): string {
+  const branch = currentBranch(repo);
+  return branch !== "" && branch !== "main"
+    ? `[auto-sync]    Sync: this checkout is on branch "${branch}", not main — ./sync.sh refuses there (branch-ownership guard, #265). Switch first: cd "${repo}" && git checkout main && ./sync.sh`
+    : `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`;
 }
 
 /** Unmerged porcelain codes — the `U*`/`AA`/`DD` conflict shapes (#1661). */
@@ -1000,7 +1007,15 @@ export default function (pi: ExtensionAPI) {
     // recovery is convenience, never correctness-critical). Resolved BEFORE the
     // staleness banner because the banner must not claim a pin that a sync is
     // about to fix (#1664 review).
-    const autoSyncing = state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto";
+    // ⛔ #4149: AUTO-SYNC REQUIRES MAIN, and the reason is not tidiness — `sync.sh`'s branch guard
+    // exits 0 off main (#265), so `auto` mode ran the script, took a SUCCESSFUL exit status for a run
+    // that pulled nothing and farmed nothing, and printed `✅ agent-infra updated` over it. Measured
+    // on a cell: the box was 186 commits behind, its farmed review-pr.sh was 24 patches old, and
+    // every session start reported a successful update. Off main the state is now REPORTED below
+    // (branch-aware remedy + why auto could not act), never claimed as done.
+    const onMain = currentBranch(infraPath) === "main";
+    const autoMode = (process.env.AGENT_SYNC_MODE || "warn") === "auto";
+    const autoSyncing = state === "behind" && autoMode && onMain;
     const mutates = state === "diverged" || autoSyncing;
 
     // #1661 (2): surface a LARGE pin. The checkout could sit hundreds of commits
@@ -1080,7 +1095,13 @@ export default function (pi: ExtensionAPI) {
 
     if (state !== "behind") return; // current — silent
 
-    console.log(`[auto-sync] ⚠️  agent-infra update available (${behind} commit(s) behind) — run: ${syncHint}`);
+    console.log(`[auto-sync] ⚠️  agent-infra update available (${behind} commit(s) behind)`);
+    // #4149: when `auto` was REQUESTED and could not run (off main), say so explicitly — the reader
+    // asked for a sync and got none, and silence there is the false PASS this arm now avoids.
+    if (autoMode && !autoSyncing) {
+      console.log(`[auto-sync] ⛔ auto mode could NOT run: the farm only runs from main, so nothing was pulled or deployed.`);
+    }
+    console.log(syncRemedy(infraPath));
     // #10114: printed beside the warn-mode hint — the auto-sync/stash paths print `syncHint` too and
     // carry no correction, so this is scoped to the arm that actually shows it.
     for (const l of pinLines) console.log(l);
