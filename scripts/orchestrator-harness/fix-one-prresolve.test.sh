@@ -17,8 +17,10 @@
 # `[fixgate-prresolve:…]` / `[fixgate-reviewread:…]` markers, never a re-typed copy of the rule:
 #   0  both blocks are extractable (pre-fix code has neither marker, so this FAILS rather than
 #      passing vacuously), and the refund block this suite drives is extractable too.
-#   1  gh says the number is not a PR → REFUSED, exit 78, the reason names the dispatch defect, and
-#      the booked `fixcount` attempt is REFUNDED (a dispatch defect must not burn a repair round).
+#   1  the number is an ISSUE gh still reads while the PR read cannot → REFUSED with the DISPATCH
+#      code 86, the reason names the dispatch defect, and the booked `fixcount` attempt is REFUNDED
+#      (a dispatch defect must not burn a repair round). The verdict rests on a POSITIVE
+#      IDENTIFICATION — the issue read — never on gh's wording, which the gh-rest shim replaces.
 #   2  gh CANNOT answer (rate limit / auth / timeout) → NO refusal. This is the over-block arm: the
 #      ordinary "gh budget was spent" dispatch (#4182 arm 2) must still run, and it is recorded as
 #      UNKNOWN instead.
@@ -44,7 +46,11 @@
 #      instead of the blank `THIS head (``)` the pre-fix template produced (#4190 review F1, P2).
 #  10 the suite POLICES ITSELF: no `ck` row may pass a bare last-command status while its own
 #      message runs a command substitution. That shape is DEAD — the substitution's status is what
-#      `$?` then holds — and it is what made 7 of these 36 checks unable to fail (#4190 review F1).
+#      `$?` then holds — and it is what made 7 of the then-36 checks unable to fail (#4190 review F1).
+#  10b that self-policing detector's REACH is MEASURED against BOTH row styles the tree writes: one
+#      physical line AND `\`-continued. The first version only split one physical line, so its claim
+#      ('a future row cannot silently reintroduce it') was broader than what it could see — a
+#      two-line dead row walked past it (#4190 review F2, P3).
 #
 # ⛔ ARM 10 EXISTS BECAUSE THE FAILURE WAS MEASURED, NOT IMAGINED. At 6ec6eb79e3b5 five executed
 # mutants each left this suite 36/36 GREEN and printed a ✅ whose own annotation contradicted it:
@@ -129,8 +135,12 @@ run_pr() {
         *) return 1 ;;
       esac
     }
-    # spawn-gate.sh's predicate, which the refund block uses; the stub keeps this suite hermetic.
-    is_num() { case "${1-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+    # The refund block's predicate, MIRRORED from the shipped one — `fix-one.sh` and `spawn-gate.sh`
+    # define the SAME body (`''|*[!0-9]*` reject, `0` accept, `0*` reject for the octal read). Kept
+    # identical on purpose: a weaker stub would let a refund arm pass on a predicate the code under
+    # test does not have, and hand-rolling a second copy is how `08` grew an octal read to begin with.
+    # Stubbed only to keep this suite hermetic — it sources the EXTRACTED blocks, not the whole file.
+    is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
     . "$T/refund.sh" >/dev/null 2>&1
     . "$T/prresolve.sh" >/dev/null 2>&1
     printf '%s\n' "${PR_RESOLVE_UNKNOWN-__unset__}" > "$d/unknown"
@@ -305,7 +315,8 @@ run_brief() {
         *) return 1 ;;
       esac
     }
-    is_num() { case "${1-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+    # Same MIRRORED predicate as run_pr's — see the note there.
+    is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
     . "$T/refund.sh" >/dev/null 2>&1
     . "$T/prresolve.sh" >/dev/null 2>&1
     . "$T/briefregion.sh"
@@ -337,23 +348,69 @@ ck "9) with no head BOTH staleness guards render UNKNOWN (found $_nu of 2) — t
 grep -qF 'staleness guard cannot name this head' "$_brief"
 ck "9) and they carry the REASON the head is unknown, not just the word" $?
 
-# ── 10. the suite POLICES ITSELF (#4190 review F1, P1) ───────────────────────────────────────
+# ── 10. the suite POLICES ITSELF (#4190 review F1, P1 · reach repaired for F2, P3) ───────────
 # A row of the shape `ck "… $(cmd) …" $?` is DEAD: the message's command substitution runs FIRST, so
 # the status argument is the SUBSTITUTION's, never the guard's. Seven checks were in that shape and
 # five executed mutants left this suite green. This arm reads THIS file and refuses the shape, so a
 # future row cannot silently reintroduce it.
+#
+# ⛔ CONTINUATION LINES ARE JOINED BEFORE THE SHAPE IS TESTED (#4190 review F2, P3). The first version
+# split ONE PHYSICAL line and required `ck "`, `$(` and `$?` on that same line — so a dead row written
+# in the ordinary `\`-continued style THIS FILE already uses for long messages walked straight past
+# it. Measured on a two-row fixture: the single-line row reddened it, the two-line one did not, i.e.
+# the claim above was BROADER THAN ITS REACH — the exact shape of the defect it exists to refuse.
+#
+# WHAT IT SEES — a logical row (continuation lines joined) whose LAST whitespace-separated field is
+# `$?` (bare or double-quoted) and whose text carries BOTH `ck "` and `$(`.
+# WHAT IT CANNOT SEE, stated so nobody reads this as total: a status captured into a variable and
+# passed as `"$_rc"` (that row is CORRECT, not dead); a status spelled `${?}` or `$(echo $?)`; and a
+# `ck` row emitted from a helper function defined in another file. Arm 10b MEASURES both styles this
+# detector DOES claim, so a later narrowing reds here instead of certifying a hole.
+dead_rows() {  # print the START line of every dead row in the file named by $1
+  awk '
+    { line = $0; sub(/[ \t]+$/, "", line)
+      if (pend == "") start = NR
+      if (line ~ /\\$/) { sub(/\\$/, "", line); pend = pend line " "; next }
+      line = pend line; pend = ""
+      n = split(line, f, /[ \t]+/)
+      last = f[n]; gsub(/^"/, "", last); gsub(/"$/, "", last)
+      if (n > 0 && last == "$?" && index(line, "ck \"") > 0 && index(line, "$(") > 0) print start
+    }
+    END { if (pend != "") { n = split(pend, f, /[ \t]+/); last = f[n]
+            gsub(/^"/, "", last); gsub(/"$/, "", last)
+            if (n > 0 && last == "$?" && index(pend, "ck \"") > 0 && index(pend, "$(") > 0) print start } }
+  ' "$1"
+}
+
 SELF="${BASH_SOURCE[0]:-$0}"
-_dead="$(awk '
-  {
-    line = $0; sub(/[ \t]+$/, "", line)
-    n = split(line, f, /[ \t]+/)
-    if (n > 0 && f[n] == "$?" && index(line, "ck \"") > 0 && index(line, "$(") > 0) print NR
-  }' "$SELF")"
+_dead="$(dead_rows "$SELF" | tr '\n' ' ')"
 if [ -n "$_dead" ]; then
-  bad "10) no ck row takes a bare last-command status while its own message runs a command substitution — DEAD row(s) at line(s): $(printf '%s' "$_dead" | tr '\n' ' ')"
+  bad "10) no ck row takes a bare last-command status while its own message runs a command substitution — DEAD row(s) at line(s): $_dead"
 else
   ok "10) every ck row's status is the GUARD's — none is masked by a command substitution in its own message"
 fi
+
+# ── 10b. the detector's REACH is MEASURED, not asserted (#4190 review F2, P3) ────────────────
+# Both row styles are driven through the SAME `dead_rows` arm 10 uses. Every fixture row is EMITTED by
+# printf and each emitting line ends in its redirect, so this file's own source can never be mistaken
+# for the fixture it builds (the last field is the redirect target, never `$?`).
+_fxdir="$T/selfcheck"; mkdir -p "$_fxdir"
+: > "$_fxdir/dead.sh"
+printf '%s\n' 'true' >> "$_fxdir/dead.sh"
+printf '%s\n' 'ck "1) DEAD: the status is the substitution one, on ONE physical line $(echo 1)" $?' >> "$_fxdir/dead.sh"
+printf '%s\n' 'ck "2) DEAD: the SAME shape split across a continuation $(echo 2)" \' >> "$_fxdir/dead.sh"
+printf '%s\n' '   $?' >> "$_fxdir/dead.sh"
+_hit="$(dead_rows "$_fxdir/dead.sh" | tr '\n' ' ')"
+ck "10b) the detector flags BOTH dead styles — one physical line AND one split across a continuation (flagged lines: ${_hit:-none})" \
+   "$([ "$_hit" = '2 3 ' ] && echo 0 || echo 1)"
+: > "$_fxdir/live.sh"
+printf '%s\n' '_rc=$?' >> "$_fxdir/live.sh"
+printf '%s\n' 'ck "3) LIVE: the status is CAPTURED before the message ($_rc)" "$_rc"' >> "$_fxdir/live.sh"
+printf '%s\n' 'ck "4) LIVE: a continuation row whose last field is an ARG, not a status" \' >> "$_fxdir/live.sh"
+printf '%s\n' '   --arg' >> "$_fxdir/live.sh"
+_hit2="$(dead_rows "$_fxdir/live.sh" | tr '\n' ' ')"
+ck "10b) MUTATION control: the same detector stays SILENT on both LIVE styles, so a red above is the SHAPE and not an always-on predicate (flagged lines: ${_hit2:-none})" \
+   "$([ -z "$_hit2" ] && echo 0 || echo 1)"
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$fail" -eq 0 ]; then
