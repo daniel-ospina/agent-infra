@@ -34,7 +34,7 @@ import { execSync } from "node:child_process";
 import { existsSync, realpathSync, mkdirSync } from "node:fs";
 import { readFile, writeFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isPrintMode } from "../shared/print-mode.js";
 
 // ── OAuth config (#595) ────────────────────────────────────────────
@@ -337,6 +337,20 @@ export function isRetryableEagerConnectError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Missing transport config — deterministic.
   if (/has neither 'command' nor 'url'/.test(msg)) return false;
+  // #4189 review (note 1): the `config` refusals are MORE deterministic than a spawn errno — nothing
+  // was started, and no environment change between two attempts can alter the verdict — so a retry only
+  // re-logs the same refusal (and, for an eager server, doubles the noise at startup).
+  if (err instanceof McpConnectError && err.stage === "config") return false;
+  // #4189: a DETERMINISTIC spawn failure — the errno cross-spawn reports for a missing binary,
+  // directory or permission — is a config fault. Retrying re-runs the same argv and only doubles the
+  // noise; transient fork failures (EAGAIN/ENOMEM/EMFILE) stay retryable below.
+  if (
+    err instanceof McpConnectError &&
+    err.stage === "spawn" &&
+    DETERMINISTIC_SPAWN_CODES.has(err.diagnostics.spawnError?.code ?? "")
+  ) {
+    return false;
+  }
   // Auth outcomes (401/403, OAuth-required) are deterministic too, and a retry
   // rebuilds the OAuth provider with a FRESH PKCE verifier: it emits the
   // browser auth URL a second time and overwrites the stored verifier, while
@@ -496,11 +510,16 @@ interface McpConnection {
  */
 /**
  * Env for a stdio MCP server: the parent env (servers need API keys etc.)
- * plus expanded config.env — MINUS the task-heartbeat nonce (#176). MCP
- * servers inherit the child's fd 2 (MCP SDK stdio default stderr:"inherit");
- * with the nonce they could forge valid [task-heartbeat] markers on the very
- * pipe the parent parses. Without it, forged markers are rejected by the
- * parent's expectedNonce check. Exported for unit tests.
+ * plus expanded config.env — MINUS the task-heartbeat nonce (#176).
+ *
+ * Why the nonce still matters now that stderr is a PIPE (#4189): the child's stderr is captured AND
+ * forwarded to the parent's stderr, so an MCP server's output still reaches the very pipe the parent
+ * parses for markers — the forwarding reproduces the SDK's `stderr:"inherit"` default that this
+ * comment used to describe. So a child could still forge `[task-heartbeat]` lines; without the nonce
+ * they are rejected by the parent's expectedNonce check. (Before #4189 this happened through fd 2
+ * inheritance; after it, through the forwarder. Same exposure, same defence — the comment was wrong
+ * for one revision in between, when a pipe silently swallowed the output instead.)
+ * Exported for unit tests.
  */
 export function buildMcpServerEnv(config: { env?: Record<string, string> }): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env, ...(config.env ? expandEnvVars(config.env) : {}) };
@@ -518,7 +537,26 @@ export function expandEnvVars(obj: Record<string, string>): Record<string, strin
 
 /** Expand ${...} (optionally with a nested default) in one string. */
 function expandExpr(str: string): string {
+  return expandExprTracked(str).value;
+}
+
+/** A `${VAR}` that expanded to "" and declared no `${VAR:-default}`. */
+export interface ExpandedExpr {
+  value: string;
+  unresolved: string[];
+}
+
+/**
+ * #4189: expand, and REPORT what could not be resolved.
+ *
+ * `expandExpr` alone cannot describe a failure: `${TYPO}` and `${REAL_VAR}` set-to-empty both yield
+ * the same "", so the caller sees a value that is wrong without being able to say which variable made
+ * it wrong. This returns the names instead. A declared default is NOT unresolved — `${VAR:-}` is an
+ * author saying "empty is fine here".
+ */
+export function expandExprTracked(str: string): ExpandedExpr {
   let out = "";
+  const unresolved: string[] = [];
   let i = 0;
   while (i < str.length) {
     const start = str.indexOf("${", i);
@@ -550,16 +588,64 @@ function expandExpr(str: string): string {
 
     const expr = str.slice(start + 2, j - 1);
     const [name, ...rest] = expr.split(":-");
-    const direct = process.env[name.trim()];
+    const varName = name.trim();
+    const direct = process.env[varName];
     if (direct !== undefined && direct !== "") {
       out += direct;
-    } else {
+    } else if (rest.length > 0) {
+      // A default was declared (possibly empty) — the author chose the fallback.
       const def = rest.join(":-");
-      out += def ? expandExpr(def) : "";
+      const inner = expandExprTracked(def);
+      out += inner.value;
+      unresolved.push(...inner.unresolved);
+    } else {
+      // #4189: unset, and the entry declared no fallback. The value is impossible rather than empty,
+      // and the only place that can say so is here.
+      unresolved.push(varName);
     }
     i = j;
   }
+  return { value: out, unresolved };
+}
+
+/** Names of `${VAR}`s in `str` that are unset (or "") and declare no `${VAR:-default}`. */
+export function findUnresolvedVars(str: string): string[] {
+  return expandExprTracked(str).unresolved;
+}
+
+/**
+ * `${VAR}` expressions that appear in an argv entry, in order — the ONLY thing about `args` that is
+ * rendered into a diagnostic.
+ *
+ * #4189 review (finding 5): `findUnresolvedVars` is the wrong predicate for this field. It asks "is
+ * `process.env[NAME]` unset?", but `args` are NEVER env-expanded (agent-infra#696), so the placeholder
+ * reaches the child WHETHER OR NOT the variable is set. The headline capability — "name the
+ * placeholder" — fired only in the rarer configuration and stayed silent in the normal one.
+ * The predicate that matches the field is "does the entry contain a `${...}` at all".
+ *
+ * #4189 review (finding 1): this deliberately returns only the `${…}` spans, never the surrounding
+ * literal — `args` is where this repo documents credentials being inlined (that is why #696 exists),
+ * and the diagnostic is returned as `mcp_load` tool output, i.e. into the model's context and every
+ * transcript that reads it.
+ */
+export function findArgPlaceholders(arg: string): string[] {
+  const out: string[] = [];
+  for (const m of arg.matchAll(/\$\{[^}]*\}/g)) out.push(m[0]);
   return out;
+}
+
+/**
+ * Does this argv entry look like a PATH that the child would resolve against its cwd?
+ *
+ * Deliberately narrow: a flag (`-e`, `--version`) is not a path, and an inline program supplied to
+ * `-e` is not one either. This gate only decides whether a relative argv is DANGEROUS when no cwd
+ * could be resolved (see finding 4), so a false negative leaves today's behaviour and a false
+ * positive refuses a working entry — narrow is the right side to err on.
+ */
+export function isPathLikeArg(arg: string): boolean {
+  if (arg.startsWith("-")) return false;
+  if (arg.includes("/") || arg.includes("\\")) return true;
+  return /\.(?:py|js|mjs|cjs|ts|mts|sh|bash|rb|pl|jar|exe|cmd|bat)$/i.test(arg);
 }
 
 /**
@@ -1290,6 +1376,330 @@ export function resolveMcpConfigPaths(startDir: string = process.cwd()): McpConf
   return { base, repo };
 }
 
+// ── #4189: a failed stdio connect says WHICH STAGE failed ─────────────────────────────────────────
+/**
+ * The measured defect this exists for (docs/ops/mcp-load-diagnosability.md).
+ *
+ * `mcp_load orchestrator` failed with `MCP error -32000: Connection closed` on every attempt while the
+ * server started and exited 0 on an EOF probe. The child had said exactly what was wrong — its argv
+ * still carried the literal `${AGENT_INFRA_PATH}/…` placeholder (only `command`/`cwd`/`env`/`headers`
+ * are expanded), so python3 exited 2 naming the file — but the SDK's `stderr` option defaults to
+ * `"inherit"`, which writes the child's output to the PARENT's stderr where no tool result can see it.
+ * Every actionable fact was discarded and only the protocol's generic close message survived.
+ *
+ * So the error carries the facts: the stage, the resolved launch surface, the child's own stderr, and
+ * any `${VAR}` that came back empty with no default.
+ */
+export type McpConnectStage = "config" | "spawn" | "handshake" | "timeout";
+
+/** Bounded: a chatty server must not fill a transcript. The TAIL is kept — a crash lands at the end. */
+export const MAX_CAPTURED_STDERR_CHARS = 8192;
+
+/** cross-spawn errnos that mean "the config is wrong", so a retry can only fail the same way. */
+const DETERMINISTIC_SPAWN_CODES = new Set(["ENOENT", "EACCES", "ENOTDIR", "ENOTFOUND", "ERR_INVALID_ARG_VALUE"]);
+
+const STAGE_EXPLANATION: Record<McpConnectStage, string> = {
+  config: "the entry cannot be launched as declared — no process was started",
+  spawn: "the server process could not be started (the MCP handshake was never attempted)",
+  handshake: "the process started but closed its pipe before completing the MCP `initialize` handshake",
+  timeout: "the process started but did not answer the handshake within the timeout",
+};
+
+export interface McpConnectDiagnostics {
+  command?: string;
+  args?: string[];
+  /** The value actually handed to the transport. `undefined` means "no cwd passed" — an INHERITANCE. */
+  cwd?: string;
+  /**
+   * The entry's RAW `cwd` expression, before expansion, or `undefined` when the entry declares none.
+   * #4189 review (finding 2): `cwd` alone cannot separate "declares no cwd" from "declares a cwd that
+   * expanded to empty" — both collapse to `undefined` — so rendering the first fact from it told an
+   * operator their config was missing a field it has, in the exact failure this diagnostic exists for.
+   */
+  cwdDeclared?: string;
+  timeoutMs?: number;
+  /** True only once the transport's `start()` resolved — i.e. the child genuinely spawned. */
+  spawned: boolean;
+  spawnError?: { code?: string; message: string };
+  /** Bounded tail of the child's stderr. */
+  stderr: string;
+  stderrTruncated: boolean;
+  /**
+   * `field` is `command`, `cwd`, or `args[i]`. The first two are EXPANDED, so an entry here means
+   * "unset and no default". `args` is NOT expanded (agent-infra#696), so an `args[i]` entry means
+   * "this placeholder reaches the child literally, set or not" — a different fact, rendered apart.
+   */
+  unresolvedVars: Array<{ name: string; field: string; expandedTo: string }>;
+}
+
+export function newConnectDiagnostics(init: Partial<McpConnectDiagnostics> = {}): McpConnectDiagnostics {
+  return { spawned: false, stderr: "", stderrTruncated: false, unresolvedVars: [], ...init };
+}
+
+/** Append to the bounded stderr tail, keeping the MOST RECENT characters. */
+export function appendStderrTail(
+  diag: { stderr: string; stderrTruncated: boolean },
+  chunk: string
+): void {
+  diag.stderr += chunk;
+  if (diag.stderr.length > MAX_CAPTURED_STDERR_CHARS) {
+    diag.stderr = diag.stderr.slice(diag.stderr.length - MAX_CAPTURED_STDERR_CHARS);
+    diag.stderrTruncated = true;
+  }
+}
+
+/**
+ * Attach the stderr capture and the spawn/error split to a stdio transport, BEFORE it is started.
+ *
+ * `transport.stderr` is a PassThrough that exists immediately when `stderr: "pipe"` is requested (SDK
+ * 1.29.0 `client/stdio.ts` documents the guarantee), which is what makes a crash-at-startup visible.
+ * It must stay attached for the life of the connection: an unread pipe eventually blocks the child.
+ *
+ * `start()` resolves on the child's `spawn` event and rejects on `error`, so wrapping it is the public
+ * way to tell "never started" from "started then closed" — no private `_process` access.
+ */
+export function captureStdioDiagnostics(
+  transport: StdioClientTransport,
+  diag: McpConnectDiagnostics,
+  opts: { forward?: NodeJS.WritableStream } = {}
+): void {
+  const forward = opts.forward;
+  transport.stderr?.on("data", (chunk: unknown) => {
+    const text = String(chunk);
+    appendStderrTail(diag, text);
+    // #4189 review (finding 3): `stderr: "pipe"` is what makes a crash-at-startup visible, but on its
+    // own it also SWALLOWS every diagnostic a healthy server writes for the rest of the session — the
+    // SDK default it replaced ("inherit") put the child's fd 2 on the parent's fd 2. So the capture is
+    // additive, never exclusive: the same bytes are forwarded to the parent's stderr, which is the
+    // behaviour every already-installed server was written against. Best effort — a closed/absent
+    // parent stream must not break the connect.
+    if (forward) {
+      try {
+        forward.write(text);
+      } catch {
+        /* forwarding is a convenience; the capture below is the diagnostic of record */
+      }
+    }
+  });
+  const start = transport.start.bind(transport);
+  transport.start = async (): Promise<void> => {
+    try {
+      await start();
+      diag.spawned = true;
+    } catch (err: any) {
+      diag.spawnError = { code: err?.code, message: err?.message ?? String(err) };
+      throw err;
+    }
+  };
+}
+
+/** Which stage a failed stdio connect reached. Pure, so the classification is pinned by tests. */
+export function classifyConnectStage(cause: unknown, diag: McpConnectDiagnostics): McpConnectStage {
+  const msg = cause instanceof Error ? cause.message : String(cause);
+  // The timeout wrapper's own message is the only signal that separates "slow" from "closed".
+  if (/timed out after \d+ms/i.test(msg)) return "timeout";
+  if (diag.spawnError) return "spawn";
+  // start() never resolved and never rejected: the child was never handed to us.
+  if (!diag.spawned) return "spawn";
+  return "handshake";
+}
+
+/** Render the diagnostic. Exported so the wording is asserted by tests, not by eye. */
+export function renderConnectFailure(
+  serverName: string,
+  stage: McpConnectStage,
+  cause: unknown,
+  diag: McpConnectDiagnostics
+): string {
+  const causeMsg = cause instanceof Error ? cause.message : String(cause);
+  const lines: string[] = [
+    `MCP server '${serverName}' failed at stage '${stage}' — ${STAGE_EXPLANATION[stage]}.`,
+  ];
+  if (diag.command !== undefined) {
+    lines.push(`  command: ${diag.command}`);
+  }
+  // ⛔ THE ARGV IS NEVER RENDERED VERBATIM (#4189 review, finding 1). `args` is the one field this
+  // repo documents as the place credentials get INLINED IN PLAINTEXT (that is the whole of #696: the
+  // sibling `sentry` entry carried `--access-token=<the real token>` because args are not expanded),
+  // and this string is returned as `mcp_load` tool output — into the model's context, into the
+  // transcript, and routinely into PR/issue bodies. Naming the arg COUNT, which entries are relative,
+  // and the `${VAR}` spans keeps every diagnostically useful fact while keeping an argument's VALUE
+  // out of the transcript. (Rewritten from a review finding — do not "improve" this back to argv.)
+  const args = diag.args ?? [];
+  // The `${VAR}` spans come from `unresolvedVars`, which the connect path populates with
+  // `findArgPlaceholders` — the predicate for this FIELD ("does the entry contain a `${…}`"), not
+  // `findUnresolvedVars` ("is its variable unset"). Single-sourced deliberately: a renderer that
+  // re-derived the spans itself would leave the caller's population unobservable, i.e. dead weight.
+  const argPlaceholderFields = new Map<string, string[]>();
+  for (const v of diag.unresolvedVars) {
+    if (!v.field.startsWith("args[")) continue;
+    const list = argPlaceholderFields.get(v.field) ?? [];
+    if (!list.includes(v.name)) list.push(v.name);
+    argPlaceholderFields.set(v.field, list);
+  }
+  const argPlaceholders = [...argPlaceholderFields.entries()]
+    .map(([field, tokens]) => ({ field, tokens, i: Number(field.slice(5, -1)) }))
+    .sort((a, b) => a.i - b.i);
+  if (args.length > 0) {
+    lines.push(
+      `  args: ${args.length} entr${args.length === 1 ? "y" : "ies"} ` +
+        `(not printed — argv can carry inline credentials, agent-infra#696)`
+    );
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i] as string;
+      if (isPathLikeArg(arg) && !isAbsolute(arg)) {
+        lines.push(`    args[${i}] is RELATIVE — the child resolves it against its own cwd`);
+      }
+    }
+    for (const { field, tokens } of argPlaceholders) {
+      lines.push(`    ${field} carries the literal placeholder ${tokens.join(", ")}`);
+    }
+  }
+  lines.push(`  cwd: ${describeCwd(diag)}`);
+  if (diag.timeoutMs) lines.push(`  timeout: ${diag.timeoutMs}ms`);
+  lines.push(`  cause: ${causeMsg}`);
+  if (diag.spawnError) {
+    lines.push(
+      `  spawn error: ${diag.spawnError.code ? diag.spawnError.code + " — " : ""}${diag.spawnError.message}`
+    );
+  }
+
+  // A `${VAR}` in `command`/`cwd` was EXPANDED and came back empty with no default. That is one fact.
+  // A `${VAR}` in `args` was NEVER expanded (agent-infra#696, an owner ruling) and reaches the child
+  // LITERALLY whether or not the variable is set. Different fact, different fix — so a separate block.
+  // Sharing the "unset environment variable(s)" heading was wrong for the args case (#4189 finding 5).
+  const expandedFields = diag.unresolvedVars.filter((v) => !v.field.startsWith("args["));
+  const seen = new Map<string, { fields: string[]; expandedTo: string }>();
+  for (const v of expandedFields) {
+    const prev = seen.get(v.name);
+    if (prev) {
+      if (!prev.fields.includes(v.field)) prev.fields.push(v.field);
+    } else {
+      seen.set(v.name, { fields: [v.field], expandedTo: v.expandedTo });
+    }
+  }
+  if (seen.size > 0) {
+    const names = [...seen.keys()];
+    lines.push(`  ⛔ unset environment variable(s), no default declared: ${names.map((n) => "${" + n + "}").join(", ")}`);
+    for (const [name, info] of seen) {
+      lines.push(`     ${name} — in ${info.fields.join(", ")} — expanded to \"\" inside: ${info.expandedTo}`);
+    }
+    lines.push(
+      `     fix: export it in the process that launches pi, or declare a default — \${${names[0]}:-/real/path}.`
+    );
+  }
+  if (argPlaceholders.length > 0) {
+    lines.push(
+      "  ⛔ `args` entries are NOT env-expanded (deliberate — agent-infra#696), so a `${VAR}` there" +
+        " reaches the child LITERALLY whether or not the variable is set."
+    );
+    lines.push(
+      "     move the path into `cwd` (which IS expanded), or pass it as a RELATIVE argument and let" +
+        " the entry's own `cwd` — which must resolve — decide what it points at."
+    );
+  }
+
+  const stderrTail = diag.stderr.trimEnd();
+  if (stderrTail) {
+    lines.push(`  child stderr${diag.stderrTruncated ? " (tail, truncated)" : ""}:`);
+    for (const line of stderrTail.split("\n")) lines.push(`    | ${line}`);
+  } else {
+    lines.push("  child stderr: (the child wrote nothing to stderr)");
+  }
+  lines.push(`  recover: mcp_load ${serverName}   (mcp_catalog lists what is declared)`);
+  return lines.join("\n");
+}
+
+/**
+ * The truth about `cwd`, built from the two facts that `cwd` alone cannot separate (#4189 review,
+ * finding 2).
+ *
+ * The SDK documents `cwd: undefined` as "the current working directory will be inherited" — an
+ * INHERITANCE, not a refusal. So "no cwd was passed" has three distinct causes, and each one asks the
+ * operator to do something different:
+ *   - the entry declares no `cwd`                     → inheriting is what the entry asked for;
+ *   - the entry declares a `cwd` that expanded to ""   → inheriting is an ACCIDENT, the intent is lost;
+ *   - the entry declares a `cwd` that resolved         → the resolved directory.
+ * Rendering all three as "the entry declares none" told an operator their config was missing a field
+ * it has, in the exact failure this diagnostic exists for.
+ */
+export function describeCwd(diag: McpConnectDiagnostics): string {
+  if (diag.cwd !== undefined) return diag.cwd;
+  if (diag.cwdDeclared === undefined) return "(not set — the entry declares none)";
+  const unresolvedInCwd = diag.unresolvedVars.filter((v) => v.field === "cwd").map((v) => v.name);
+  // #4189 review 2: "declared but empty" has two spellings — an unresolved `${VAR}`, and a declared
+  // default (or literal `""`) that carried no path. Naming the wrong one would send an operator to fix
+  // a variable that is already set.
+  const which =
+    unresolvedInCwd.length > 0
+      ? ` (${unresolvedInCwd.map((n) => "${" + n + "}").join(", ")} resolved to nothing)`
+      : " (nothing in the declaration resolved to a directory)";
+  return (
+    `(declared ${JSON.stringify(diag.cwdDeclared)} but it expanded to ""${which} — so NO cwd is passed` +
+    ` and the child INHERITS the caller's cwd, ${process.cwd()})`
+  );
+}
+
+export class McpConnectError extends Error {
+  readonly stage: McpConnectStage;
+  readonly serverName: string;
+  readonly diagnostics: McpConnectDiagnostics;
+
+  constructor(
+    serverName: string,
+    stage: McpConnectStage,
+    cause: unknown,
+    diagnostics: McpConnectDiagnostics
+  ) {
+    super(renderConnectFailure(serverName, stage, cause, diagnostics));
+    this.name = "McpConnectError";
+    this.stage = stage;
+    this.serverName = serverName;
+    this.diagnostics = diagnostics;
+  }
+}
+
+/**
+ * Wait (bounded) for the child's already-written stderr to arrive before rendering the failure.
+ *
+ * A child that crashes on startup writes its explanation and exits, and the protocol's `close` can
+ * reach us BEFORE the stderr pipe has been read — so rendering immediately would report "the child
+ * wrote nothing to stderr" for a child that wrote exactly the right thing. That ordering is why this
+ * is a drain and not a `read()`. Skipped entirely when the process never spawned: there is no pipe to
+ * drain, and waiting would only slow a deterministic ENOENT down.
+ */
+export function drainStderrCapture(
+  transport: StdioClientTransport,
+  diag: McpConnectDiagnostics,
+  maxWaitMs = 250
+): Promise<void> {
+  const stream = (transport as any).stderr as NodeJS.ReadableStream | null; // eslint-disable-line @typescript-eslint/no-explicit-any
+  if (diag.spawnError || !stream) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, maxWaitMs);
+    stream.once("end", finish);
+    stream.once("close", finish);
+  });
+}
+
+/** Build the typed failure for a stdio connect that threw. */
+export function buildConnectError(
+  serverName: string,
+  cause: unknown,
+  diag: McpConnectDiagnostics,
+  timeoutMs?: number
+): McpConnectError {
+  const withTimeout = { ...diag, timeoutMs: timeoutMs ?? diag.timeoutMs };
+  return new McpConnectError(serverName, classifyConnectStage(cause, withTimeout), cause, withTimeout);
+}
+
 /** Connect to a single MCP server with a timeout. Cleans up on failure to avoid orphan processes. */
 async function connectWithTimeout(
   name: string,
@@ -1622,6 +2032,9 @@ export class McpServerManager {
 
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
     let oauthProvider: McpOAuthClientProvider | undefined;
+    // #4189: populated only for the stdio path — a URL connect failure keeps its existing handling,
+    // because there is no child and therefore no spawn/handshake split to make.
+    let stdioDiag: McpConnectDiagnostics | undefined;
 
     if (config.url) {
       // URL-based transport (e.g., Supabase MCP, remote servers)
@@ -1646,25 +2059,141 @@ export class McpServerManager {
       // servers like @houtini/gemini-mcp receive real values, not literal
       // "${VAR}" strings (e.g. GEMINI_API_KEY). See tortoise issue #240.
       const env = buildMcpServerEnv(config);
+      // #4189: resolve the launch surface ONCE, recording which `${VAR}`s came back empty and declared
+      // no default. A `cwd` that expands to "" is NOT "no cwd": measured, this path silently inherits
+      // the PARENT's cwd, and `spawnSync(…, {cwd: ""})` reports `spawnSync python3 ENOENT` — an unset
+      // variable reported as a missing interpreter. Passing nothing is the only honest reading.
+      const resolvedCommand = expandExprTracked(config.command);
+      const resolvedCwd = config.cwd ? expandExprTracked(config.cwd) : undefined;
+      stdioDiag = newConnectDiagnostics({
+        command: resolvedCommand.value,
+        args: config.args ?? [],
+        cwd: resolvedCwd?.value || undefined,
+        // #4189 review (finding 2): the RAW expression, kept so the renderer can tell "declares no
+        // cwd" from "declares a cwd that expanded to nothing". `cwd` alone collapses both to
+        // `undefined`, and the renderer used to report the second case as the first.
+        cwdDeclared: config.cwd,
+        timeoutMs,
+        unresolvedVars: [
+          ...resolvedCommand.unresolved.map((name) => ({
+            name,
+            field: "command",
+            expandedTo: resolvedCommand.value,
+          })),
+          ...(resolvedCwd
+            ? resolvedCwd.unresolved.map((name) => ({ name, field: "cwd", expandedTo: resolvedCwd.value }))
+            : []),
+          // ⛔ `args` are NOT expanded (agent-infra#696 is a category-B owner ruling, not a lane's call
+          // to reverse), so a `${VAR}` here reaches the child LITERALLY. Naming it is the difference
+          // between "the server crashed" and "the entry's argv was never resolved".
+          // #4189 review (finding 5): the predicate is "does the entry CONTAIN a ${…}", not "is its
+          // variable unset" — args are never expanded, so the literal arrives either way and the old
+          // predicate stayed silent in the normal (variable-set) configuration.
+          ...(config.args ?? []).flatMap((arg, i) =>
+            findArgPlaceholders(arg).map((token) => ({
+              name: token,
+              field: `args[${i}]`,
+              // Never rendered for `args` (argv is not printed — finding 1); kept for tests and for a
+              // caller that wants the raw entry. The renderer prints `name` (the `${…}` span) only.
+              expandedTo: arg,
+            }))
+          ),
+        ],
+      });
+      if (!resolvedCommand.value.trim()) {
+        throw new McpConnectError(
+          name,
+          "config",
+          new Error("'command' resolved to an empty string"),
+          stdioDiag
+        );
+      }
+      // #4189 review (finding 4): a RELATIVE argv whose `cwd` could not be resolved is refused, at
+      // stage `config`, before anything is spawned.
+      //
+      // The shipped entry now launches `args[0]` relative to its own `cwd`, which is what keeps the
+      // #696 ruling (args are not expanded) intact. But `cwd: undefined` is an INHERITANCE, not a
+      // refusal (SDK 1.29.0: "If not specified, the current working directory will be inherited") — so
+      // with the cwd variable unset, the child would resolve the relative argv against whatever
+      // directory pi happens to run in. When pi runs inside an agent-infra checkout (the hub, or any
+      // `.worktrees/<lane>`) that SILENTLY LOADS THAT CHECKOUT'S SERVER — in a lane, possibly
+      // uncommitted code. The same misconfiguration that used to be a deterministic ENOENT would become
+      // "it works, with someone else's code".
+      //
+      // ⛔ THE PREDICATE IS "did the entry's cwd produce a DIRECTORY", NOT "was a `${VAR}` in it
+      // unresolved" (#4189 review 2, finding 1). The narrower predicate let one spelling of the same
+      // fail-open through: `expandExprTracked` honours a DECLARED default even when that default is
+      // empty, so `"cwd": "${VAR:-}"` (or `"cwd": ""`) comes back `{value: "", unresolved: []}` —
+      // resolved by its own report, unusable in fact. `cwd: resolvedCwd?.value || undefined` then hands
+      // the transport `undefined`, the SDK inherits pi's cwd, and a relative `args[0]` resolves against
+      // a directory this entry never chose. The declared default loses the path but keeps the
+      // permission, which is exactly what the refusal exists to prevent.
+      const cwdUnusable =
+        resolvedCwd !== undefined &&
+        (resolvedCwd.unresolved.length > 0 || resolvedCwd.value === "");
+      if (cwdUnusable) {
+        const relative = (config.args ?? [])
+          .map((arg, i) => ({ arg, i }))
+          .filter(({ arg }) => isPathLikeArg(arg) && !isAbsolute(arg));
+        if (relative.length > 0) {
+          // Name the shape actually seen: an unresolved `${VAR}`, or a declared default that carried
+          // no path. Same refusal, different repair.
+          const why =
+            resolvedCwd!.unresolved.length > 0
+              ? `${resolvedCwd!.unresolved.map((n) => "${" + n + "}").join(", ")} expanded to "" — `
+              : `it expanded to "" (a declared default with no path, or an explicitly empty cwd) — `;
+          throw new McpConnectError(
+            name,
+            "config",
+            new Error(
+              `'cwd' is declared as ${JSON.stringify(config.cwd)} but ` +
+                why +
+                `and ${relative.map(({ i }) => `args[${i}]`).join(", ")} ${relative.length === 1 ? "is" : "are"} RELATIVE. ` +
+                `No cwd would be passed, so the child would inherit pi's cwd (${process.cwd()}) and resolve ` +
+                `the argv against a directory this entry never chose. Export the variable, or declare a ` +
+                `default in 'cwd' — \`\${VAR:-/real/path}\` — so the entry always picks its own directory.`
+            ),
+            stdioDiag
+          );
+        }
+      }
       transport = new StdioClientTransport({
         // #199: command may contain ${VAR} placeholders (e.g. the tortoise
         // base config points at ${TORTOISE_HOME}/.venv/bin/python3) — expand
         // like env/cwd, or the spawn fails with ENOENT.
-        command: expandExpr(config.command),
+        command: resolvedCommand.value,
         args: config.args ?? [],
         env,
         // cwd may contain ${VAR} placeholders (e.g. TORTOISE_HOME in the base
         // config) — expand like env/headers, or the spawn fails with ENOENT.
-        cwd: config.cwd ? expandEnvVars({ cwd: config.cwd }).cwd : undefined,
+        cwd: resolvedCwd?.value || undefined,
+        // #4189: the SDK default is "inherit", which writes the child's stderr to the PARENT's stderr —
+        // where no tool result can see it. That is how a child that named its own broken argument
+        // reached the operator as `MCP error -32000: Connection closed` and nothing else.
+        stderr: "pipe",
       });
+      // #4189 review (finding 3): a pipe on its own SWALLOWS every diagnostic a healthy server writes
+      // after a successful connect (the `inherit` default used to put the child's fd 2 on the parent's
+      // fd 2). The capture is additive — forward the same bytes to the parent's stderr.
+      captureStdioDiagnostics(transport, stdioDiag, { forward: process.stderr });
     } else {
       throw new Error(
         `Server '${name}' has neither 'command' nor 'url'`
       );
     }
 
-    // Connect with timeout
-    await connectWithTimeout(name, client, transport, timeoutMs);
+    // Connect with timeout. #4189: a stdio failure is re-thrown as a McpConnectError carrying the
+    // stage, the resolved launch surface and the child's own stderr — the reason this failure was
+    // undiagnosable is that every one of those facts used to be discarded here.
+    try {
+      await connectWithTimeout(name, client, transport, timeoutMs);
+    } catch (err) {
+      if (err instanceof McpConnectError || !stdioDiag) throw err;
+      if (transport instanceof StdioClientTransport) {
+        await drainStderrCapture(transport, stdioDiag);
+      }
+      throw buildConnectError(name, err, stdioDiag, timeoutMs);
+    }
 
     // #92: remember the stdio child pid for the orphan-kill path. Must be
     // captured here, right after connect: the SDK's pid getter reads the
