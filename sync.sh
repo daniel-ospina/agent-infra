@@ -118,7 +118,7 @@ fi
 
 echo "==> agent-infra sync"
 git fetch origin --quiet || {
-  farm_refused fetch-failed "FETCH FAILED — nothing was pulled" \
+  farm_refused fetch-failed "FETCH FAILED, so nothing was pulled" \
     "Remedy: check the network and the origin remote, then re-run: ./sync.sh"
   exit 1
 }
