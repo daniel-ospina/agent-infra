@@ -91,7 +91,7 @@ else
     # driver must supply every variable the template interpolates. Its default claim is deliberately
     # not reachable from a fallback — fix-one-prresolve.test.sh arm 8 pins that the brief renders
     # the variable, so a future edit cannot quietly restore the unconditional sentence.
-    FIX_REVIEW_LEAD="REVIEW-LEAD-MARKER"
+    FIX_REVIEW_LEAD="REVIEW-LEAD-MARKER"; HEAD12_DISPLAY="0123456789abcdef"
     mkdir -p "$O/state" "$WT"
     # shellcheck disable=SC1090
     . "$T/region.sh" ) > "$T/run.log" 2>&1
