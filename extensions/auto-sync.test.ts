@@ -559,6 +559,50 @@ async function main() {
     ok(!out.includes("reason=dirty-checkout"), `a diverged checkout must not be reported dirty, got: ${out}`);
   });
 
+  await test("sync.sh: DIVERGED + a dirty tracked file → still reason=diverged (the tree did not cause it)", async () => {
+    const { repo, marker } = makeFarmFixture({ diverge: true });
+    // ⛔ F1 (#4187 review P2): the ONLY diverged fixture is CLEAN by design (see makeFarmFixture), so
+    // the row above — the one that NAMES R2, "a diverged checkout is not reported dirty" — was GREEN
+    // with the defect present: hoisting the dirty arm above the ancestry probe reddened nothing.
+    // Divergence holds INDEPENDENTLY of the tree and `git pull --ff-only` refuses on it FIRST, so an
+    // edit to a file the incoming commits never touch must not claim the refusal. Pre-fix this printed
+    // `reason=dirty-checkout` over a stash remedy that changed nothing — measured: after following it,
+    // the re-run still said "fatal: Not possible to fast-forward, aborting."
+    commit(repo, "a file the incoming commits never touch", "untouched.txt");
+    writeFileSync(join(repo, "untouched.txt"), "change\nlocal edit\n");
+    let out = "";
+    let rc = 0;
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
+    ok(rc !== 0, `a diverged checkout must fail sync, got rc=${rc}: ${out}`);
+    ok(/farm=NOT-RUN reason=diverged\b/.test(out), `divergence is the cause that acted, got: ${out}`);
+    ok(!out.includes("reason=dirty-checkout"), `…so it must not be classified dirty, got: ${out}`);
+    ok(!out.includes("PULL BLOCKED BY A DIRTY CHECKOUT"), `the HEADLINE is what a reader acts on, got: ${out}`);
+    // …and the tree still belongs in the report as CONTEXT: the hoisted probe must not suppress it.
+    ok(out.includes("M untouched.txt"), `the dirty path stays in the report as context, got: ${out}`);
+    ok(!existsSync(marker), "nothing was pulled, so the farm must NOT have run");
+  });
+
+  await test("sync.sh: DIVERGED + an untracked collision → still reason=diverged, the collision stays CONTEXT", async () => {
+    const { repo } = makeFarmFixture({ diverge: true });
+    // The second half of F1: the untracked arm had the same precedence bug. A diverged checkout whose
+    // pull is refused by BOTH causes must name the one that can be acted on (integration).
+    const origin = git(repo, "remote get-url origin").trim();
+    const pusher = makeClone(origin);
+    commit(pusher, "incoming adds a path", "incoming.txt");
+    git(pusher, "push -q origin main");
+    writeFileSync(join(repo, "incoming.txt"), "my own untracked work\n");
+    let out = "";
+    let rc = 0;
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
+    ok(rc !== 0, `a diverged checkout must fail sync, got rc=${rc}: ${out}`);
+    ok(/farm=NOT-RUN reason=diverged\b/.test(out), `divergence is the cause that acted, got: ${out}`);
+    ok(!out.includes("reason=untracked-collision"), `it must not be classified as a collision, got: ${out}`);
+    ok(out.includes("An incoming commit adds these paths"), `the second blocker stays as CONTEXT, got: ${out}`);
+    ok(out.includes("incoming.txt"), `the colliding path must still be named, got: ${out}`);
+  });
+
   await test("sync.sh: off main keeps exit 0 (#265) AND carries the NOT-RUN token", async () => {
     const { repo, marker } = makeFarmFixture();
     git(repo, "checkout -q -b feature/4149-token");
@@ -644,6 +688,50 @@ async function main() {
     // Same reason as above: only OUR listing proves the second blocker was reported as context.
     ok(out.includes("An incoming commit adds these paths"), `the untracked blocker must be reported as context, got: ${out}`);
     ok(out.includes("incoming.txt"), `the untracked blocker must be named, got: ${out}`);
+  });
+
+  await test("sync.sh: an UNREADABLE working tree reports dirty=UNKNOWN, never dirty=0 (R3)", async () => {
+    const { repo, marker } = makeFarmFixture();
+    // ⛔ F2 (#4187 review P2): R3 had NO arm at all. The mutant `s/dirty=""; n=UNKNOWN/\ndirty=""; n=0/`
+    // — restoring precisely the value sync.sh's own comment calls "the value a reader takes as
+    // 'nothing blocked the pull'" — kept the whole suite GREEN. A corrupt `.git/index` is the reachable
+    // shape: `git status` fails, so no count exists and the report may not invent one. (This is why the
+    // report is asserted by its PROPERTIES — banner, dirty=UNKNOWN, the unreadable sentence — and not by
+    // a `reason=` token: which refusal path a corrupt index lands on is git's business, and it changed
+    // between `fetch` and `pull` across git versions.)
+    writeFileSync(join(repo, ".git", "index"), "CORRUPTED\x00not a git index\n");
+    let out = "";
+    let rc = 0;
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
+    ok(rc !== 0, `an unreadable tree must fail sync, got rc=${rc}: ${out}`);
+    ok(out.includes("THE FARM DID NOT RUN"), `expected the loud banner, got: ${out}`);
+    ok(out.includes("farm=NOT-RUN"), `expected the greppable token, got: ${out}`);
+    ok(/dirty=UNKNOWN\b/.test(out), `an unreadable tree must report dirty=UNKNOWN, got: ${out}`);
+    ok(!/dirty=0\b/.test(out), `dirty=0 means "nothing blocked the pull" — it must never stand in for an unreadable tree, got: ${out}`);
+    ok(out.includes("could not be read"), `the report must SAY the tree was unreadable, got: ${out}`);
+    ok(!existsSync(marker), "nothing was pulled, so the farm must NOT have run");
+  });
+
+  await test("sync.sh: a git-level refusal on a CLEAN tree → reason=pull-refused, no tree state invented", async () => {
+    const { repo, marker } = makeFarmFixture();
+    // ⛔ F2's second half: `reason=pull-refused` was asserted by NOTHING (`grep -c pull-refused` in this
+    // suite → 0), so the arm could be folded into `diverged` and every row stayed green. It is the
+    // DEFENSIVE arm and it is genuinely reachable: a concurrent process holding the repo (the lock a
+    // live lane leaves behind — this fleet's own common case) makes `git pull` exit non-zero while the
+    // checkout is BEHIND, CLEAN and collision-free, so no arm above fires. The contrast with the arm
+    // above is the point: `dirty=0` is the RIGHT answer here and the wrong answer there.
+    writeFileSync(join(repo, ".git", "index.lock"), "");
+    let out = "";
+    let rc = 0;
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = e.stdout?.toString() ?? ""; rc = e.status ?? 1; }
+    ok(rc !== 0, `a refused pull must fail sync, got rc=${rc}: ${out}`);
+    ok(/farm=NOT-RUN reason=pull-refused\b/.test(out), `expected the defensive token, got: ${out}`);
+    ok(/dirty=0\b/.test(out), `a readable, clean tree genuinely counts 0 — that is the contrast, got: ${out}`);
+    ok(out.includes("neither a modified tracked file nor an untracked collision was found"),
+      `the arm must say no tree state was classified, got: ${out}`);
+    ok(!existsSync(marker), "nothing was pulled, so the farm must NOT have run");
   });
 
   // ── #1661: stuck-index + staleness signals ──────────────────────────────

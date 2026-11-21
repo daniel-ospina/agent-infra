@@ -168,26 +168,49 @@ if ! git pull --ff-only origin main; then
   # ⛔ CLASSIFY BEFORE PRINTING. "local changes or divergence" named two states with different
   # remedies in one line, so it instructed nobody: the dirty case is cleared by committing or
   # stashing, the diverged case by integrating origin/main. Measure which one it is.
+  #
+  # ⛔ DIVERGENCE IS PROBED FIRST (review P2, #4187). It is the only condition in this chain that
+  # holds INDEPENDENTLY of the tree: `git pull --ff-only` refuses on divergence before it weighs an
+  # uncommitted change, which matters only where that change INTERSECTS the incoming changed set
+  # (git-checkout(1)). With the tree-state arms first, ANY dirty tracked edit — or any untracked path
+  # an incoming commit adds — claimed a DIVERGED checkout's refusal. Measured against this script, a
+  # diverged box carrying ONE edited tracked file the incoming commits never touch printed
+  # `reason=dirty-checkout` / "PULL BLOCKED BY A DIRTY CHECKOUT" with a stash remedy, and the re-run
+  # after following that remedy still said `fatal: Not possible to fast-forward, aborting.` That is a
+  # cause that did not act, sending the reader to a remedy that cannot unblock — the same defect class
+  # this file records as fixed once already for `fetch-failed`. A BEHIND checkout still passes this
+  # probe (HEAD IS an ancestor of origin/main), so every arm below is reached exactly as before.
   _dirty="$(git -c core.quotePath=true status --porcelain --untracked-files=no 2>/dev/null)" || _dirty=UNKNOWN
-  if [ -n "$_dirty" ] && [ "$_dirty" != UNKNOWN ]; then
+  if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+    farm_refused diverged "THIS CHECKOUT HAS DIVERGED FROM origin/main" \
+      "Inspect: git status   History: git log --oneline --left-right HEAD...origin/main" \
+      "Remedy: integrate origin/main (merge or rebase), then re-run: ./sync.sh"
+  elif [ -n "$_dirty" ] && [ "$_dirty" != UNKNOWN ]; then
+    # ⛔ THIS ARM KEEPS ITS PRECEDENCE over `untracked-collision` (round-2 arm:
+    # "a tracked edit AND an untracked collision → dirty-checkout wins, both named"). Both blockers are
+    # real and both are needed to unblock, and `farm_refused` prints BOTH listings whichever arm wins
+    # (the collision listing is emitted for every reason — see its own comment); what changed here is
+    # only that DIVERGENCE, which is condition-independent, no longer loses to a tree state.
     farm_refused dirty-checkout "PULL BLOCKED BY A DIRTY CHECKOUT" \
       "Remedy: commit or stash the tracked edits above — do NOT let a redeploy overwrite them — then: ./sync.sh" \
       "(hand-copying one farmed file is not a repair: the rest of the set stays stale)"
   elif [ -n "$(untracked_collisions)" ]; then
-    # The second classified blocker (see untracked_collisions). It MUST precede `pull-refused`:
-    # this state is behind, so the ancestor probe below is true and would claim the refusal for the
-    # un-classified arm — reporting `dirty=0` over the untracked path that actually blocked it.
+    # The second classified blocker (see untracked_collisions), reached only on a BEHIND checkout —
+    # the probe above did not fire. It MUST precede `pull-refused`: this state is behind, so the
+    # ancestor probe is true and would claim the refusal for the un-classified arm — reporting
+    # `dirty=0` over the untracked path that actually blocked it.
     farm_refused untracked-collision "AN UNTRACKED FILE BLOCKS THE PULL" \
       "Remedy: move or remove each path listed above — they are NOT in git, so nothing tracked is lost — then: ./sync.sh"
-  elif git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  else
+    # ⛔ THE DEFENSIVE ARM, AND IT IS REACHABLE — do not fold it into `diverged`. A checkout that is
+    # BEHIND, clean and collision-free can still have its pull refused by GIT itself: a concurrent
+    # process holding the repo. Measured with `.git/index.lock` present — `git pull` exits non-zero
+    # and names the lock, the tree is clean, and no arm above fires. Asserted by
+    # `sync.sh: a git-level refusal on a CLEAN tree → reason=pull-refused`.
     farm_refused pull-refused "THE PULL WAS REFUSED" \
       "Inspect: git status   History: git log --oneline --left-right HEAD...origin/main" \
       "Remedy: resolve what git reports, then re-run: ./sync.sh" \
-      "(neither a modified tracked file nor an untracked collision was found, so the cause is git's own message above — not a tree state this report classified)"
-  else
-    farm_refused diverged "THIS CHECKOUT HAS DIVERGED FROM origin/main" \
-      "Inspect: git status   History: git log --oneline --left-right HEAD...origin/main" \
-      "Remedy: integrate origin/main (merge or rebase), then re-run: ./sync.sh"
+      "(neither a modified tracked file nor an untracked collision was found — if the working tree could not be read, none was looked for — so the cause is git's own message above, not a tree state this report classified)"
   fi
   exit 1
 fi
