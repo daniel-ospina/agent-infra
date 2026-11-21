@@ -18,6 +18,16 @@ import {
   McpServerManager,
   DEFAULT_IDLE_TIMEOUT_MS,
   IDLE_SWEEP_INTERVAL_MS,
+  // #4189 — the connect-failure diagnostic
+  expandExprTracked,
+  findUnresolvedVars,
+  newConnectDiagnostics,
+  classifyConnectStage,
+  renderConnectFailure,
+  appendStderrTail,
+  MAX_CAPTURED_STDERR_CHARS,
+  McpConnectError,
+  isRetryableEagerConnectError,
 } from "./index.js";
 
 let passed = 0;
@@ -198,6 +208,137 @@ await test("loadServer without config rejects", async () => {
     ok(err.message.includes("No MCP config"), err.message);
   }
   equal(threw, true);
+});
+
+// ── connect-failure diagnostics (#4189) ──────────────────────────────────
+// The measured defect: `mcp_load orchestrator` reported only `MCP error -32000: Connection closed`
+// while the child had printed the exact reason (a never-expanded `${AGENT_INFRA_PATH}` in `args`) to a
+// stderr stream nobody read. These pin the two halves that make that impossible again: the expansion
+// says WHICH variable was unresolvable, and the renderer says WHICH stage failed + what the child said.
+section("connect diagnostics — unresolved `${VAR}` attribution (#4189)");
+
+await test("an unset var with no default is reported, and contributes nothing", () => {
+  const out = expandExprTracked("${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py");
+  equal(out.value, "/mcp-servers/x/server.py");
+  deepEqual(out.unresolved, ["AGENT_INFRA_PATH_UNSET_4189"]);
+});
+
+await test("a declared default is NOT unresolved (the author chose the fallback)", () => {
+  const out = expandExprTracked("${UNSET_4189:-/real/path}");
+  equal(out.value, "/real/path");
+  deepEqual(out.unresolved, []);
+});
+
+await test("a set var is not unresolved", () => {
+  process.env.PRESENT_4189 = "/present";
+  const out = expandExprTracked("${PRESENT_4189}/x");
+  equal(out.value, "/present/x");
+  deepEqual(out.unresolved, []);
+  delete process.env.PRESENT_4189;
+});
+
+await test("findUnresolvedVars names the placeholder inside an args entry verbatim", () => {
+  deepEqual(findUnresolvedVars("${UNSET_4189}/server.py"), ["UNSET_4189"]);
+  deepEqual(findUnresolvedVars("-m"), []);
+});
+
+section("connect diagnostics — stage classification (#4189)");
+
+await test("timeout / spawn-error / never-started / started-then-closed are distinct", () => {
+  equal(
+    classifyConnectStage(new Error("Connection to 'x' timed out after 15000ms"), newConnectDiagnostics()),
+    "timeout"
+  );
+  equal(
+    classifyConnectStage(
+      new Error("MCP error -32000: Connection closed"),
+      newConnectDiagnostics({ spawnError: { code: "ENOENT", message: "spawn x ENOENT" } })
+    ),
+    "spawn"
+  );
+  equal(
+    classifyConnectStage(new Error("boom"), newConnectDiagnostics({ spawned: false })),
+    "spawn"
+  );
+  equal(
+    classifyConnectStage(new Error("MCP error -32000: Connection closed"), newConnectDiagnostics({ spawned: true })),
+    "handshake"
+  );
+});
+
+await test("the rendered message names the stage, the launch surface and the child stderr", () => {
+  const diag = newConnectDiagnostics({
+    command: "python3",
+    args: ["mcp-servers/x/server.py"],
+    cwd: "/repo",
+    timeoutMs: 15000,
+    spawned: true,
+    stderr: "python3: can't open file 'x': [Errno 2] No such file or directory\n",
+  });
+  const msg = renderConnectFailure("orchestrator", "handshake", new Error("MCP error -32000: Connection closed"), diag);
+  ok(msg.includes("stage 'handshake'"), msg);
+  ok(msg.includes("command: python3 mcp-servers/x/server.py"), msg);
+  ok(msg.includes("cwd: /repo"), msg);
+  ok(msg.includes("MCP error -32000: Connection closed"), msg);
+  ok(msg.includes("can't open file 'x'"), msg);
+});
+
+await test("an empty `cwd` expansion is reported as NOT SET and never as cwd: ''", () => {
+  const diag = newConnectDiagnostics({
+    command: "python3",
+    args: ["x.py"],
+    cwd: undefined,
+    spawned: true,
+    unresolvedVars: [{ name: "AGENT_INFRA_PATH_UNSET_4189", field: "cwd", expandedTo: "" }],
+  });
+  const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
+  ok(msg.includes("(not set — the entry declares none)"), msg);
+  ok(!msg.includes("cwd: \"\""), msg);
+  ok(msg.includes("${AGENT_INFRA_PATH_UNSET_4189}"), msg);
+  ok(msg.includes("in cwd"), msg);
+});
+
+await test("an unresolved placeholder in `args` states the #696 caveat (args are not expanded)", () => {
+  const diag = newConnectDiagnostics({
+    command: "python3",
+    args: ["${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py"],
+    spawned: true,
+    unresolvedVars: [
+      { name: "AGENT_INFRA_PATH_UNSET_4189", field: "args[0]", expandedTo: "${AGENT_INFRA_PATH_UNSET_4189}/mcp-servers/x/server.py" },
+    ],
+  });
+  const msg = renderConnectFailure("s", "handshake", new Error("closed"), diag);
+  ok(msg.includes("args[0]"), msg);
+  ok(msg.includes("NOT env-expanded"), msg);
+  ok(msg.includes("agent-infra#696"), msg);
+});
+
+await test("a silent child is reported as such, not as an empty box", () => {
+  const msg = renderConnectFailure("s", "handshake", new Error("closed"), newConnectDiagnostics({ spawned: true }));
+  ok(msg.includes("the child wrote nothing to stderr"), msg);
+});
+
+await test("the stderr capture is bounded to its tail", () => {
+  const diag = newConnectDiagnostics();
+  appendStderrTail(diag, "A".repeat(MAX_CAPTURED_STDERR_CHARS + 100));
+  appendStderrTail(diag, "TAIL");
+  equal(diag.stderr.length, MAX_CAPTURED_STDERR_CHARS);
+  equal(diag.stderr.endsWith("TAIL"), true, "the most recent output survives");
+  equal(diag.stderrTruncated, true);
+});
+
+await test("a deterministic spawn failure is NOT retried; a handshake one still is", () => {
+  const mk = (stage: "spawn" | "handshake", code?: string) =>
+    new McpConnectError(
+      "s",
+      stage,
+      new Error("x"),
+      newConnectDiagnostics({ spawned: stage === "handshake", spawnError: code ? { code, message: "e" } : undefined })
+    );
+  equal(isRetryableEagerConnectError(mk("spawn", "ENOENT")), false);
+  equal(isRetryableEagerConnectError(mk("spawn", "EACCES")), false);
+  equal(isRetryableEagerConnectError(mk("spawn", "EAGAIN")), true, "a transient fork failure is still retried");
+  equal(isRetryableEagerConnectError(mk("handshake")), true);
 });
 
 // ── constants ────────────────────────────────────────────────────────────

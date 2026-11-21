@@ -64,9 +64,32 @@ writeFileSync(
         purpose: "test echo server",
         cost: "tiny",
       },
+      // #4189 — a child that SPAWNS, writes its reason to stderr and exits before the handshake.
+      // This is the shape the orchestrator entry had: the child knew exactly what was wrong and the
+      // client reported only `-32000 Connection closed`.
+      "crash-server": {
+        command: process.execPath,
+        args: ["-e", "console.error('boom: missing dependency 4189'); process.exit(3)"],
+        lazy: true,
+      },
+      // #4189 — a command that cannot be spawned at all (deterministic ENOENT).
+      "missing-command": {
+        command: join(TMP_DIR, "no-such-interpreter-4189"),
+        args: ["--version"],
+        lazy: true,
+      },
+      // #4189 — the measured orchestrator shape: a `${VAR}` placeholder that nothing expands, in
+      // `args` (which the client deliberately does not expand — agent-infra#696).
+      "args-placeholder": {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)", "${AGENT_INFRA_PATH_4189_UNSET}/mcp-servers/x/server.py"],
+        lazy: true,
+      },
     },
   })
 );
+// The placeholder must really be unset, on every box this suite runs on.
+delete process.env.AGENT_INFRA_PATH_4189_UNSET;
 
 function fakePi() {
   const tools = new Map<string, any>();
@@ -89,7 +112,8 @@ await test("lazy server is NOT connected at startup", async () => {
   await manager.connectAll(CONFIG_PATH);
   equal((manager as any).connections.length, 0, "no eager connections for a lazy-only config");
   const cat = manager.catalog();
-  equal(cat.length, 1);
+  equal(cat.length, 4, "every declared server is in the catalog");
+  equal(cat[0]!.name, "echo-server");
   equal(cat[0]!.tier, "lazy");
   equal(cat[0]!.status, "sleeping");
 });
@@ -132,6 +156,60 @@ await test("tool self-heals after idle stop (lazy proxy reconnects on next call)
 await test("mcp_load on an already-connected server short-circuits", async () => {
   const { alreadyLoaded } = await manager.loadServer("echo-server");
   equal(alreadyLoaded, true);
+});
+
+// ── #4189: a failed connect names its stage and carries the child's own words ──
+await test("a child that dies before the handshake: stage + the child's own stderr (#4189)", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("crash-server");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.name, "McpConnectError", `typed error, got ${err.name}`);
+  equal(err.stage, "handshake", `stage, got ${err.stage}:\n${err.message}`);
+  ok(
+    err.message.includes("boom: missing dependency 4189"),
+    `the child's stderr must be in the message (this is the whole defect):\n${err.message}`
+  );
+  ok(err.message.includes("Connection closed"), `the protocol cause is still named:\n${err.message}`);
+  ok(err.message.includes("mcp_load crash-server"), `names the recovery command:\n${err.message}`);
+});
+
+await test("a command that cannot be spawned: stage 'spawn' and the errno is named (#4189)", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("missing-command");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  equal(err.stage, "spawn", `stage, got ${err.stage}:\n${err.message}`);
+  ok(err.message.includes("ENOENT"), `the errno is named:\n${err.message}`);
+  ok(err.message.includes("no-such-interpreter-4189"), `the resolved command is named:\n${err.message}`);
+});
+
+await test("an unexpanded `${VAR}` in args is NAMED, with the #696 caveat (#4189)", async () => {
+  let err: any;
+  try {
+    await manager.loadServer("args-placeholder");
+  } catch (e) {
+    err = e;
+  }
+  ok(err, "loadServer rejected");
+  ok(err.message.includes("${AGENT_INFRA_PATH_4189_UNSET}"), `names the placeholder:\n${err.message}`);
+  ok(err.message.includes("args[2]"), `names the field:\n${err.message}`);
+  ok(err.message.includes("NOT env-expanded"), `states the #696 caveat:\n${err.message}`);
+});
+
+await test("the failing servers registered no tools and left no connection behind", () => {
+  equal(pi.tools.has("mcp__crash-server__x"), false);
+  equal(
+    (manager as any).connections.some((c: any) => c.serverName === "crash-server" || c.serverName === "missing-command"),
+    false,
+    "a failed connect must not leave a half-open connection"
+  );
 });
 
 // ── Cleanup ──────────────────────────────────────────────────────────────

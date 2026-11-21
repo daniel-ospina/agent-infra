@@ -1,0 +1,158 @@
+# `mcp_load` diagnosability — the six probes from agent-infra#4189
+
+**Status:** measured 2026-11-21 on the `cmux` box (Linux, `@modelcontextprotocol/sdk` 1.29.0).
+**Symptom (from the issue):** `mcp_load orchestrator` fails with
+`MCP error -32000: Connection closed` while the server itself starts and exits 0 on an EOF probe —
+so nothing in the failure distinguishes *crashed*, *handshake timed out*, *never spawned*, or
+*the loader gave up*.
+
+This document records what each of the issue's six probes answered, and which could not be answered
+here, **before** any code changed. It is the evidence the fix rests on. The first hypothesis was
+wrong and the probes are what corrected it, so the refuted reading is recorded too.
+
+---
+
+## The one-paragraph answer
+
+The orchestrator server is healthy; **the entry that launches it is not**, and the client's error
+reporting hid that. Measured, in order:
+
+1. **`args` are never `${VAR}`-expanded** — `command`, `cwd`, `env` and `headers` are, `args` are not
+   (measured: a child declared with `args: ["${SOME_UNSET_VAR}/x"]` receives the **literal** string).
+   The shipped entry (`templates/.mcp.base.json` and `.mcp.json`) declares
+   `"args": ["${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"]`, so `python3` is handed a file
+   named `${AGENT_INFRA_PATH}/…` and exits 2 immediately.
+2. **`cwd: "${AGENT_INFRA_PATH}"` expands to `""`, and `""` is not "no cwd"** — measured, the child
+   inherits the *parent's* cwd, which is why the error below resolves the placeholder against
+   `extensions/mcp-client/`. (Native `spawnSync` with `cwd: ""` instead fails `ENOENT` **naming the
+   command** — an error that accuses a present interpreter of being missing.)
+3. **The child's stderr was discarded and no stage was named.** The SDK's `stderr` option defaults to
+   `"inherit"`, which writes the child's output to the *parent process's* stderr — invisible to a tool
+   result — so the only thing that reached the operator was the protocol's generic close message.
+
+The fix is therefore **three** things: expand nothing new (see the decision note at the end), launch the
+entry through a surface that *is* expanded (`cwd` + a relative script path), and make a failed connect
+name its stage, its resolved command, and the child's own stderr.
+
+## Probe 1 — is the spawn ever attempted?
+
+**Answered: yes.** The child is spawned and runs; `python3` reaches its own argument parsing and exits 2
+with a message. Driven through the client's own path with the repo's real `.mcp.json`:
+
+```
+$ npx tsx …/probe3.mjs          # McpServerManager.connectAll(".mcp.json") → loadServer("orchestrator")
+catalog: { tier: 'lazy', status: 'sleeping' }
+raw cwd: "${AGENT_INFRA_PATH}"  raw args: ["${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"]
+python3: can't open file '/home/cmux/…/extensions/mcp-client/${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py': [Errno 2] No such file or directory
+ERR: MCP error -32000: Connection closed
+```
+
+Two facts in one line: the child **ran** (so the loader is not giving up), and it was given the
+**literal** placeholder (so `args` are not expanded). A direct EOF probe confirms the server itself is
+fine: `python3 mcp-servers/orchestrator/server.py < /dev/null` → `rc=0`.
+
+## Probe 2 — is it a handshake failure?
+
+**Answered: only in the protocol's degenerate sense.** The transport spawned, the child closed its end
+without ever answering `initialize`, and the protocol layer raised its generic `-32000 Connection
+closed`. The child's own explanation never reached the caller, because it was on a stream nobody read.
+Measured with the SDK directly, same failing command, two stderr modes:
+
+```
+inherit(default): err.name=McpError err.code=-32000 msg="MCP error -32000: Connection closed"
+inherit(default): captured stderr=""
+pipe:             err.name=McpError err.code=-32000 msg="MCP error -32000: Connection closed"
+pipe:             captured stderr="python3: can't open file '…': [Errno 2] No such file or directory"
+```
+
+The error object is identical in both cases — **only the capture differs**. That is the whole
+observability defect, and it is why "make the error diagnosable" is a real fix and not a retry.
+
+Distinguishing *never started* from *started then closed* is possible on the public API: the
+transport's `start()` resolves on the `spawn` event and rejects on `error`, so wrapping `start()`
+splits the two classes without touching the SDK's private `_process`.
+
+## Probe 3 — is it the `cwd`?
+
+**Answered: yes, as a second, independent defect.** `"cwd": "${AGENT_INFRA_PATH}"` expands to `""`,
+and `""` is silently treated as "inherit the parent's cwd" (proven by probe 1: the placeholder resolved
+against `extensions/mcp-client/`). The same empty value through native `spawnSync` instead fails:
+
+```
+$ node -e 'const{spawnSync}=require("node:child_process");console.log(spawnSync("python3",["-c","print(1)"],{cwd:""}).error.message)'
+spawnSync python3 ENOENT
+```
+
+i.e. an unset variable in `cwd` reports *"python3 is missing"* when python3 is present. Either way an
+empty expansion must not be passed through as a value.
+
+## Probe 4 — why do the other servers load?
+
+**Answered.** Of the six entries in the repo's `.mcp.json`, exactly **one** uses `${VAR}` in `args`:
+
+| entry | `${VAR}` sites | loads? |
+|---|---|---|
+| `seo-intelligence` | `command`, `cwd` — both expanded | yes |
+| `orchestrator` | `cwd` **and `args[0]`** — only `cwd` is expanded | **no** |
+| the rest | none | yes |
+
+The difference **is** the finding: every entry that survives only uses expansion surfaces the client
+actually expands.
+
+## Probe 5 — is it one box or every box?
+
+**Not answered here.** No cloud cell was reachable from this box without a `cmux` link, and the fix does
+not depend on the answer: the entry bug is in a **shipped template**
+(`templates/.mcp.base.json` → installed to `~/.pi/agent/.mcp.json` by `pi-bootstrap/setup.sh`), so it is
+every installation, not one box's state. Recorded as open rather than guessed.
+
+## Probe 6 — does the documented authority answer the same question?
+
+**Answered: partially, which is why this was filed as a diagnostics defect rather than an outage.**
+`tools/fleet/liveness.py` (via `tools/fleet/claim_lanes.py`) answers *"which lanes exist / is this lane
+alive"* from the ref-claim registry and does not go through MCP at all, so a lane census is **not**
+blocked by this failure. What *is* lost is `box.exec`, `lane.dispatch`, `fleet.census` and the PR verbs,
+which have no non-MCP equivalent — and `mcp_catalog` reports the entry as
+`[lazy, sleeping (mcp_load to start)]`, i.e. **available**, which is what made the failure read as a
+transient load problem for as long as it did.
+
+---
+
+## ⛔ The recorded decision this work had to route around
+
+`agent-infra#696` — *"`${VAR}` is expanded in command/env/cwd/headers but NOT in args"* — was closed by
+the owner as **category B** ("a functional config gap, not destruction or false PASS … reopen if this
+classification is wrong"). **Expanding `args` would reverse that ruling**, so this lane does not.
+
+Instead the entry is launched through a surface that is *already* expanded: `cwd` stays
+`${AGENT_INFRA_PATH}` and `args` becomes the **relative** `mcp-servers/orchestrator/server.py`, which the
+child resolves against its cwd. Measured proof that this restores the surface:
+
+```
+$ AGENT_INFRA_PATH=/home/cmux/agent-infra npx tsx …/probe4.mjs
+[mcp-client] Loaded 'orchestrator' on demand
+LOADED: + 0 tools        # 0 tools is the probe: no ExtensionAPI is bound, so registerServerTools returns []
+```
+
+`#696` is reopened with this evidence rather than reversed — that is the owner's call, not a lane's.
+
+## What the fix does
+
+`extensions/mcp-client/index.ts`:
+
+1. **Captures the child's stderr** for every stdio connect (`stderr: "pipe"`, drained for the life of the
+   connection, bounded to the last 8 KB) and puts it in the connect error.
+2. **Names the stage** — `config` / `spawn` / `handshake` / `timeout` — by wrapping the transport's
+   public `start()`, so *never started* and *started then closed* are distinguishable.
+3. **Attributes unset `${VAR}`s** — the expansion reports which variables were unset **and** declared no
+   `${VAR:-default}`, and which field carried them — so the operator is told the variable, and that
+   `args` is one of the surfaces it is not resolved on.
+4. **Stops passing `cwd: ""`**, which is what turned an unset variable into a false "interpreter
+   missing" ENOENT (or, here, a silent inheritance of the wrong directory), and reports that field as
+   unresolved instead.
+
+`spawn`-stage failures carrying a deterministic errno (`ENOENT`/`EACCES`/`ENOTDIR`) are **not retried** by
+the eager-connect retry: the cause is the config, and a retry only doubles the noise.
+
+`templates/.mcp.base.json` and `.mcp.json`: the `orchestrator` entry's `args[0]` becomes relative to its
+(expanded) `cwd`, so the shipped entry spawns on any box where `AGENT_INFRA_PATH` is set.
