@@ -277,6 +277,12 @@ ck "5) the raw read does not survive the block" "$([ $? -ne 0 ] && echo 0 || ech
 
 # 5b. a read that SUCCEEDED and delivered NOTHING (#4190 review F2, P1) — the measured artifact was
 # 0 BYTES while the brief asserted "a fresh-context reviewer found real issues".
+# ⛔ THE PREMISE IS MEASURED, NOT ASSUMED (#4190 review P3 called it UNVERIFIED). Redirected,
+# `gh pr view <PR> --comments` emits ONLY the comment blocks: on this repo at this head it printed
+# `author: mergify` as its FIRST line and zero occurrences of the PR's own title/body text
+# (`gh pr view 4190 --repo daniel-ospina/agent-infra --comments | grep -cF 'fix(fix-one)'` -> 0). So a
+# PR carrying no comment yields exit 0 AND ZERO BYTES — the state this arm drives — and a PR that does
+# carry comments never enters it.
 run_review 0 ''
 # PRE-FIX this file is 0 BYTES (gh printed nothing and `cat` copied nothing); post-fix it carries the
 # self-description, so the row reds on the pre-fix tree and can never be satisfied by an empty file.
