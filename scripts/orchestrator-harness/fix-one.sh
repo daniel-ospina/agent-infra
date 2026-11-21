@@ -211,28 +211,72 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 # brief still asserted a reviewer had found real issues. A lane that obeys that brief fixes nothing,
 # reports success, and pushes to a branch no PR tracks (#4182 arm 1) — and it materialises a worktree
 # and a claim for it before anyone can tell.
-# ⛔ THE POLARITY IS THE POINT: only gh POSITIVELY naming the number as not-a-PR refuses. An
-# unreadable read (exhausted gh budget, auth, timeout) is NOT proof the PR is missing, and refusing
-# on it would over-block every ordinary dispatch made while the box's gh budget was spent — that is
-# #4182's arm 2, whose correct handling is a brief that says its head is UNKNOWN, not a refusal. So
-# the transient case is recorded loudly and the run continues.
+# ⛔ THE POLARITY IS THE POINT, AND IT IS TWO INDEPENDENT NEGATIVES (fresh-context plan review, P1 —
+# VERIFIED against the shipped shim). The first version of this block keyed on gh's WORDING
+# (`Could not resolve to a PullRequest`). That is DEFEATED on exactly the boxes where the measured
+# dispatch happened: fix-one.sh prepends `$O/gh-rest` to PATH (line 56), `number` is in that shim's
+# `PR_FIELDS`, and its `pr view --json` arm serves the read through REST — where a 404 becomes
+# `gh-rest: API error: Not Found` / `die`, NOT the GraphQL sentence. A wording matcher therefore
+# answered "no signal" and the run continued on precisely the fleet's own config. Upstream gh cannot
+# help either: it documents ONE generic code for "fails for any reason" (`gh help exit-codes`: 0 ok,
+# 1 any failure, 2 cancelled, 4 auth), so the exit status does not discriminate.
+# So the decision uses TWO reads that do not share a transport, and refuses only when BOTH are
+# negative: gh produced no resource for this number (`--json number` rc != 0) AND the remote advertises
+# no `refs/pull/<N>/head` (measured on this repo: `refs/pull/4190/head` and a MERGED `refs/pull/4169/head`
+# both resolve; `refs/pull/3301/head` is absent because 3301 is an issue). Consequences, both deliberate:
+#   * a real PR + a transient gh failure -> the ref exists -> NO refusal (the ordinary "gh budget was
+#     spent" dispatch, #4182 arm 2, still runs);
+#   * a gh failure whose TEXT merely mentions the refusal phrase -> NO refusal; message text cannot
+#     decide anything here;
+#   * a refs probe that could not RUN (rc != 0) is not a negative -> NO refusal (fail-open, stated).
+# The residual over-block is a non-GitHub remote (no advertised `refs/pull/*`) plus a failing gh; the
+# log then names BOTH facts so the reader can see it is a cannot-verify, not a proof.
+# ⛔ THE POLARITY IS THE POINT: this refuses only on a POSITIVE identification — gh can still read
+# the ISSUE of that number while it cannot produce a PR for it. Two facts, two reads, no wording match:
+#
+#   * WHY NOT THE MESSAGE TEXT (fresh-context plan review, P1 — VERIFIED against the shipped shim).
+#     The first version of this block keyed on gh's sentence (`Could not resolve to a PullRequest`).
+#     That is DEFEATED on exactly the boxes where the measured dispatch happened: fix-one.sh
+#     prepends `$O/gh-rest` to PATH (line 56), `number` is in that shim's `PR_FIELDS`, and its
+#     `pr view --json` arm serves the read through REST — where a 404 arrives as
+#     `gh-rest: API error: Not Found`, not the GraphQL sentence. Upstream gh cannot help either: it
+#     documents ONE generic code for "fails for any reason" (`gh help exit-codes`: 0 ok, 1 any
+#     failure, 2 cancelled, 4 auth), so the exit status does not discriminate.
+#   * WHY NOT `refs/pull/<N>/head`. That was the second attempt, and it is a network round trip in a
+#     dispatch path plus a GitHub-only convention — MEASURED: it turned 41 fixture runs of
+#     spawn-gate.test.sh into rc=86, because a fixture's PR number is arbitrary.
+#   * WHY THE ISSUE READ IS THE RIGHT POSITIVE. The measured defect class IS "the number is an ISSUE":
+#     #3301 is an open issue in this repo, so `gh issue view 3301` succeeds while `gh pr view 3301`
+#     cannot. A fixture with a stubbed, failing gh fails BOTH reads and therefore never refuses —
+#     which is correct, because nothing in it proves the number is an issue.
+#   * STATED RESIDUAL: a pure typo (a number that is neither a PR nor an issue) is NOT refused here,
+#     because refusing it would require treating an unreadable read as an absence. It still gets the
+#     UNKNOWN brief and the #3608 artifact fix below.
 PR_RESOLVE_UNKNOWN=""
 if [ -z "${HEAD:-}" ]; then
   pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
-  case "$pr_probe" in
-    *"Could not resolve to a PullRequest"*)
-      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR (gh: $(printf '%s' "$pr_probe" | head -1)) — this is a DISPATCH defect (the number is an ISSUE, or belongs to another repo), not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a PR number." >> "$L.log"
-      echo "[fix $PR] REFUSED: no pull request #$PR in $OR — dispatch defect, no fixer started, attempt refunded" >&2
+  if [ "$pr_probe_rc" -ne 0 ]; then
+    issue_probe="$(gh issue view "$PR" --repo "$OR" --json number 2>&1)"; issue_probe_rc=$?
+    if [ "$issue_probe_rc" -eq 0 ] && printf '%s' "$issue_probe" | grep -q '[0-9]'; then
+      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR, but it DOES have an ISSUE with that number (gh issue view succeeded; gh pr view failed rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)). This is a DISPATCH defect — an ISSUE number routed to the PR fixer — not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a real PR number." >> "$L.log"
+      echo "[fix $PR] REFUSED: #$PR is an ISSUE in $OR, not a pull request — dispatch defect, no fixer started, attempt refunded" >&2
       refund_gate_attempt
-      exit 78 ;;
-    *)
-      if [ "$pr_probe_rc" -ne 0 ]; then
-        PR_RESOLVE_UNKNOWN="the PR-existence probe could not answer (gh rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) — NOT read as a missing PR, because an unreadable read is not an absence"
-      else
-        PR_RESOLVE_UNKNOWN="the PR exists but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
-      fi
-      echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, but anything below that depends on the head reports UNKNOWN instead of asserting" >> "$L.log" ;;
-  esac
+      exit "${AGENT_NOT_A_PR:-86}"
+    fi
+    PR_RESOLVE_UNKNOWN="gh produced no resource for this number (rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) and the issue probe did not identify it either (rc=$issue_probe_rc) — NOT read as a missing PR, because an unreadable read is not an absence"
+  else
+    PR_RESOLVE_UNKNOWN="the PR exists (gh answered) but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
+  fi
+  echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, and the brief below renders the head as UNKNOWN instead of a blank" >> "$L.log"
+fi
+# ⛔ THE BLANKED GUARD, FIXED AT THE ARTIFACT THE AGENT READS (plan-review P2 — the variable used to be
+# written and never consumed, while the brief still rendered `THIS head ()`). When the head could not be
+# read, the brief must SAY that its staleness check cannot be evaluated — an empty pair of parentheses
+# reads as a formatting slip, and it silently disables the one sentence that would expose a stale brief.
+if [ -n "${HEAD:-}" ]; then
+  HEAD12_DISPLAY="$HEAD"
+else
+  HEAD12_DISPLAY="⛔ UNKNOWN — the head read FAILED${PR_RESOLVE_UNKNOWN:+ ($PR_RESOLVE_UNKNOWN)}, so this brief's staleness check CANNOT be evaluated. Verify the head yourself (gh pr view $PR --repo $OR --json headRefOid) before trusting any artifact above"
 fi
 # [fixgate-prresolve:end]
 # ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
@@ -980,9 +1024,9 @@ $FIX_DELIVERY_BRIEF
 
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). $FIX_REVIEW_LEAD
 
-If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD12_DISPLAY\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
-If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
+If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD12_DISPLAY), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
 
 If $L-failing.txt is non-empty it carries THIS PR's failing checks and their logs, and EVERY heading in it says which kind of red each one is: \`=== failing required check:\` — it is in $OR's own required set, so it BLOCKS the merge and fixing it is your job; \`=== failing NON-required check (…):\` — it is RED but it is NOT a required context of $OR, so it does NOT block the merge and fixing it will NOT unblock this PR: fix it only if the cause is real and cheap inside this same change, otherwise say plainly in your final message that you left it alone and why — never spend the attempt on it and never report it as the reason the PR cannot merge; \`=== failing check (required-status UNKNOWN):\` — the required set could NOT be read, so no heading in the file claims anything about blocking, the build state is UNKNOWN rather than green, and you must read the PR's checks AND this repo's branch protection yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
