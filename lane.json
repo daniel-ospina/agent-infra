@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-14129-1795267705-p1248736-b7add012",
+  "_sha": "8fe1681b915143c2c19207aad5fa4dbfe4bc1aa9",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-14129.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/13899-fallout-comprehensive"
+    },
+    {
+      "kind": "sha",
+      "value": "a6b71f0e981f228c2654d6f32207a87f42179a0d"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-14129"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 9156,
+  "ended_at": 1795276861,
+  "exit_code": 0,
+  "heartbeat_at": 1795276861,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-14129-1795267705-p1248736-b7add012",
+  "lease_until": 1795313461,
+  "pid": 1248736,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795267705,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-14129",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-14129"
+}
