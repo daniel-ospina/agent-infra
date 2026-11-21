@@ -238,11 +238,14 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
     // ⛔ THE PIN CORRECTION IS PRINTED AT THE HINT SITE, NOT HERE (review P2). The banner and the
     // `update available — run: …` hint both fire on the warn path, so carrying it in both showed the
     // reader the trap, the correction, the same trap, the same correction at every session start.
-    // ⛔ `syncHint` ITSELF IS PRINTED AT THREE SITES — the warn hint, DIVERGED and the auto-sync
-    // FAILED path — but only the WARN-HINT arm appends `pinLines`; the other two print the command
-    // without the correction (review round 12, finding 6 — the previous sentence here said "one
-    // site", which is true of the correction and false of the command, and the two comments
-    // contradicted each other).
+    // ⛔ EVERY SITE THAT RECOMMENDS A SYNC PRINTS `syncRemedy()` (review P2). It is printed at THREE
+    // sites — the warn hint, DIVERGED and the auto-sync FAILED path — plus the two unmerged-conflict
+    // remedies; only the WARN-HINT arm appends `pinLines`, because the pin correction answers a
+    // different question (is this checkout the pin?) and the other arms already print their own cause.
+    // Keeping the plain `cd <dir> && ./sync.sh` at ANY one of them re-opens #4149 AT THAT SITE: off
+    // main the command is inert (exit 0, nothing pulled, nothing farmed) and the reader has no way to
+    // tell. (History: this comment said "one site", true of the correction and false of the command —
+    // review round 12, finding 6.)
   ];
 }
 
@@ -492,7 +495,7 @@ export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: Unmer
       `[auto-sync]    Finish: resolve each path, \`git -C "${repo}" add <path>\`, then \`git -C "${repo}" ${op} --continue\`.`,
       `[auto-sync]    Or abort: git -C "${repo}" ${op} --abort`,
       `[auto-sync]    (${sides}.)`,
-      `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+      syncRemedy(repo),
     ];
   }
 
@@ -503,7 +506,7 @@ export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: Unmer
     `[auto-sync]    Resolve one path at a time, then stage it:`,
     ...remedyCommands(repo, entries[0]).map((c) => `[auto-sync]      ${c}`),
     `[auto-sync]      (a [DD] path must be \`git rm\`d; --theirs needs stage 3, --ours needs stage 2)`,
-    `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+    syncRemedy(repo),
   ];
 }
 
@@ -993,7 +996,6 @@ export default function (pi: ExtensionAPI) {
     sweepOrphanRecords(infraPath);
 
     const state = syncState(infraPath);
-    const syncHint = `cd "${infraPath}" && ./sync.sh`;
     // #10114: the hint below is printed as THE remedy. When this checkout is not the pin, it names a
     // command that cannot deliver that remedy, so say so beside it rather than letting a reader follow
     // it and believe the harness was fixed.
@@ -1061,7 +1063,13 @@ export default function (pi: ExtensionAPI) {
           console.log(`    Inspect: git -C "${infraPath}" status`);
           console.log(`    History: git -C "${infraPath}" log --oneline --left-right HEAD...origin/main`);
           console.log(`    Next: stash or commit local work, then re-run sync:`);
-          console.log(`        ${syncHint}`);
+          // ⛔ BRANCH-AWARE, NOT THE PLAIN COMMAND (review P2). This arm is reachable in BOTH modes —
+          // `mutates` is `state === "diverged" || autoSyncing`, so it does not depend on the mode —
+          // and on a NON-main checkout the plain command was #4149's false PASS again: sync.sh's #265
+          // guard prints its notice, exits 0, and nothing is pulled or farmed. Unlike the `behind`
+          // arm this one prints no "auto could not run" line (that statement sits after this return),
+          // so this remedy is the ONLY thing the reader gets.
+          console.log(syncRemedy(infraPath));
           if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
           return;
         }
@@ -1076,16 +1084,33 @@ export default function (pi: ExtensionAPI) {
         }
         try {
           const out = execSync(`bash "${infraPath}/sync.sh" 2>&1`, { timeout: 180_000, encoding: "utf-8" });
-          console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);
-          const lines = out.trim().split("\n").filter(l => l.includes("warning") || l.includes("⚠"));
+          // ⛔ EXIT 0 IS NOT PROOF THE FARM RAN (review P3). `onMain` was read BEFORE this child ran,
+          // and sync.sh re-derives the branch itself — while the hub's branch belongs to whatever
+          // session is on it (#265). A switch in between makes sync.sh take its branch-ownership
+          // guard, print `farm=NOT-RUN reason=not-on-main` and exit 0; reading the exit status alone
+          // printed `✅ agent-infra updated` over a farm that never ran, which is precisely #4149.
+          // The token is the signal this PR introduced, so the consumer reads it.
+          const refusal = /\bfarm=NOT-RUN\s+reason=(\S+)/.exec(out);
+          // ⛔ `⛔`/`farm=NOT-RUN` ARE SURFACED TOO: the old filter kept only `warning`/`⚠`, so the
+          // refusal banner and the token — the two lines that say the farm did not run — were
+          // dropped even from the output that IS shown.
+          const lines = out.trim().split("\n")
+            .filter(l => l.includes("warning") || l.includes("⚠") || l.includes("⛔") || l.includes("farm=NOT-RUN"));
+          if (refusal) {
+            console.log(`[auto-sync] ⛔ sync.sh refused to farm (reason=${refusal[1]}) — nothing was pulled or deployed, so this box still runs the PRE-sync code.`);
+          } else {
+            console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);
+          }
           if (lines.length) console.log(lines.slice(0, 3).map(l => `    ${l}`).join("\n"));
+          if (refusal) console.log(syncRemedy(infraPath));
         } catch (e: any) {
           const err = e as { stdout?: Buffer | string; message?: string };
           const detail = (err.stdout ? err.stdout.toString() : err.message || "unknown error")
             .split("\n").filter(Boolean).slice(0, 4).join("\n    ");
           console.log(`[auto-sync] ⚠️  update available but auto-sync failed:`);
           console.log(`    ${detail}`);
-          console.log(`[auto-sync]    Run manually: ${syncHint}`);
+          // Branch read at CALL time, not from the `onMain` snapshot taken before the child ran.
+          console.log(syncRemedy(infraPath));
         }
         return;
       } finally {
@@ -1102,8 +1127,8 @@ export default function (pi: ExtensionAPI) {
       console.log(`[auto-sync] ⛔ auto mode could NOT run: the farm only runs from main, so nothing was pulled or deployed.`);
     }
     console.log(syncRemedy(infraPath));
-    // #10114: printed beside the warn-mode hint — the auto-sync/stash paths print `syncHint` too and
-    // carry no correction, so this is scoped to the arm that actually shows it.
+    // #10114: printed beside the warn-mode hint — the DIVERGED, auto-sync and conflict-remedy arms
+    // also print the sync line but carry no correction, so this is scoped to the arm that shows it.
     for (const l of pinLines) console.log(l);
   });
 }

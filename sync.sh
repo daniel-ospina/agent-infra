@@ -20,14 +20,38 @@ cd "$(dirname "$0")"   # agent-infra root
 # greppable `farm=NOT-RUN reason=<token>` line a fleet report can carry WITHOUT parsing prose, and
 # (c) the remedy. ⛔ EXIT CODES ARE UNCHANGED: the branch guard keeps its documented exit 0 (#265 —
 # callers rely on the inert-not-fatal contract), so this adds a report, never a new failure mode.
+# ⛔ UNTRACKED FILES **CAN** BLOCK A PULL — this is the second refusal shape, and the classifier below
+# used to miss it (review P3, #4187). `git pull --ff-only` refuses when the incoming commits ADD a path
+# that exists here but is UNTRACKED, because it will not overwrite it (`git-checkout(1)`: `-f` exists to
+# proceed "even if there are untracked files in the way"). The refusal reads:
+#     error: The following untracked working tree files would be overwritten by merge:
+#             <path>
+#     Please move or remove them before you merge.
+# Measured on git 2.43.0: `git status --porcelain --untracked-files=no` is EMPTY in that state, so the
+# old classifier fell through to `pull-refused` and printed `dirty=0` — the value this file's own
+# comment calls "nothing blocked the pull" — while never naming the blocking path.
+# This computes the collision set instead of parsing git's prose: paths the incoming commits ADD or
+# CHANGE (a deletion cannot collide) ∩ paths untracked here. Empty output = no untracked blocker.
+untracked_collisions() {
+  # `|| true`: called only from a refusal path that is already the thing the reader needs — a missing
+  # `comm` or an unreadable ref must degrade to "no collision listed", never abort the report.
+  comm -12 \
+    <(git diff --name-only --diff-filter=d HEAD origin/main 2>/dev/null | LC_ALL=C sort -u) \
+    <(git ls-files --others --exclude-standard 2>/dev/null | LC_ALL=C sort -u) || true
+}
+
 farm_refused() { # farm_refused <reason-token> <headline> [<remedy line>...]
-  local reason="$1" headline="$2" headsha dirty n i
+  local reason="$1" headline="$2" headsha dirty n i _collide _cn
   shift 2
   headsha="$(git rev-parse --short=12 HEAD 2>/dev/null)" || headsha=""
   [ -n "$headsha" ] || headsha=UNKNOWN
   # ⛔ A FAILED READ IS NOT A CLEAN TREE. `git status` failing (a corrupt index, an unreadable
   # directory) must report `dirty=UNKNOWN`, never 0 — 0 is the value a reader takes as "nothing
   # blocked the pull", and that inference is exactly what this block exists to stop being silent.
+  # ⛔ AND `dirty=0` IS NOT "NOTHING BLOCKED IT" EITHER (review P3). The count covers modified
+  # TRACKED files only: a pull refused by an UNTRACKED path an incoming commit adds reaches a refusal
+  # with `dirty=0`. `reason=` names the cause that actually acted, and the collision listing below
+  # names the path — the count is not, and never was, the whole story.
   if dirty="$(git -c core.quotePath=true status --porcelain --untracked-files=no 2>/dev/null)"; then
     n=0
     [ -z "$dirty" ] || n="$(printf '%s\n' "$dirty" | wc -l | tr -d ' ')"
@@ -38,15 +62,33 @@ farm_refused() { # farm_refused <reason-token> <headline> [<remedy line>...]
   echo "   farm=NOT-RUN reason=$reason head=$headsha ref=origin/main dirty=$n"
   echo "   The copies the fleet launches from (~/.pi/agent/scripts) still carry $headsha's bytes: every"
   echo "   gate, recorder and lane script on this box runs the PRE-sync code until the farm runs."
+  # ⛔ THE TREE LISTING IS CONTEXT, NEVER A CAUSE (review). `farm_refused` is called for reasons a
+  # dirty tree has nothing to do with — `fetch-failed` is the network, and the tree is dirty or not —
+  # so "Blocked by N modified tracked file(s)" under a `FETCH FAILED` headline named a cause that
+  # did not act, sending the reader to stash edits that were never in the way. Measured: a dead
+  # remote plus one edited file printed `reason=fetch-failed … Blocked by 1 modified tracked
+  # file(s)`. Causality belongs in the HEADLINE (each call site already states it: "PULL BLOCKED BY
+  # A DIRTY CHECKOUT", "THIS CHECKOUT HAS DIVERGED…"); this block describes the tree and stops there.
   if [ "$n" = UNKNOWN ]; then
-    echo "   The working tree could not be read, so this run cannot say what blocked the pull."
+    echo "   The working tree could not be read, so its state is UNKNOWN here — not 'clean'."
   elif [ "$n" -gt 0 ]; then
-    echo "   Blocked by $n modified tracked file(s) — untracked files do not block a pull and are not listed:"
+    echo "   The working tree carries $n modified tracked file(s) — untracked paths are NOT counted here (one blocks a pull only when an incoming commit adds the same path, listed below):"
     # ⛔ `sed -n '1,10p'`, NEVER `head -10`: under `set -o pipefail` a short reader closes the pipe,
     # the writer takes SIGPIPE (141) and the pipeline — hence this `set -e` script — dies BEFORE the
     # remedy is printed. The same trap has its own suite (tests/sigpipe-grep).
     printf '%s\n' "$dirty" | sed -n '1,10p' | sed 's/^/     /'
     [ "$n" -le 10 ] || echo "     … and $((n - 10)) more"
+  fi
+  # ⛔ A PULL IS REFUSED BY THESE TOO (review P3). Printed for EVERY reason, not only the collision
+  # one: this block describes the tree (which is context wherever the reason was elsewhere — a dead
+  # remote leaves the collision waiting behind the network fix), and the remedy for the reason above
+  # does not clear them. Same SIGPIPE-safe reader as the tracked listing.
+  _collide="$(untracked_collisions)"
+  if [ -n "$_collide" ]; then
+    _cn="$(printf '%s\n' "$_collide" | wc -l | tr -d ' ')"
+    echo "   An incoming commit adds these paths and they exist here UNTRACKED, so git refuses to overwrite them:"
+    printf '%s\n' "$_collide" | sed -n '1,10p' | sed 's/^/     /'
+    [ "$_cn" -le 10 ] || echo "     … and $((_cn - 10)) more"
   fi
   for i in "$@"; do echo "   $i"; done
 }
@@ -131,10 +173,17 @@ if ! git pull --ff-only origin main; then
     farm_refused dirty-checkout "PULL BLOCKED BY A DIRTY CHECKOUT" \
       "Remedy: commit or stash the tracked edits above — do NOT let a redeploy overwrite them — then: ./sync.sh" \
       "(hand-copying one farmed file is not a repair: the rest of the set stays stale)"
+  elif [ -n "$(untracked_collisions)" ]; then
+    # The second classified blocker (see untracked_collisions). It MUST precede `pull-refused`:
+    # this state is behind, so the ancestor probe below is true and would claim the refusal for the
+    # un-classified arm — reporting `dirty=0` over the untracked path that actually blocked it.
+    farm_refused untracked-collision "AN UNTRACKED FILE BLOCKS THE PULL" \
+      "Remedy: move or remove each path listed above — they are NOT in git, so nothing tracked is lost — then: ./sync.sh"
   elif git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
     farm_refused pull-refused "THE PULL WAS REFUSED" \
       "Inspect: git status   History: git log --oneline --left-right HEAD...origin/main" \
-      "Remedy: resolve what git reports, then re-run: ./sync.sh"
+      "Remedy: resolve what git reports, then re-run: ./sync.sh" \
+      "(neither a modified tracked file nor an untracked collision was found, so the cause is git's own message above — not a tree state this report classified)"
   else
     farm_refused diverged "THIS CHECKOUT HAS DIVERGED FROM origin/main" \
       "Inspect: git status   History: git log --oneline --left-right HEAD...origin/main" \
