@@ -652,9 +652,11 @@ export function findArgPlaceholders(arg: string): string[] {
  * on an entry that used to run. A scoped specifier resolves inside `node_modules`, never against the
  * child's cwd, so the one leading `@scope/` segment is excluded here.
  *
- * Residual, deliberate: an UNSCOPED specifier with a subpath (`pkg/bin.js`) is still read as a path.
- * It is indistinguishable from a genuine relative path (`fixtures/server.mjs`) without knowing which
- * argv the launcher consumes, and guessing there is how a working entry gets refused.
+ * Residual, deliberate: a specifier that carries a SUBPATH — `pkg/bin.js`, or `@scope/pkg/bin.js` —
+ * is still read as a path. Those are indistinguishable from a genuine relative path
+ * (`fixtures/server.mjs`) without knowing which argv the launcher consumes, and guessing there is how
+ * a working entry gets refused. The shipped templates carry no subpath specifier, so nothing reachable
+ * hits this residual today.
  */
 export function isPathLikeArg(arg: string): boolean {
   if (arg.startsWith("-")) return false;

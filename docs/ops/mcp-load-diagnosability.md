@@ -173,9 +173,9 @@ LOADED: + 0 tools        # 0 tools is the probe: no ExtensionAPI is bound, so re
    this repo's own `templates/.mcp.base.json` ships), because the launcher resolves those inside
    `node_modules` and never against the child's cwd. Reading `@scope/pkg` as a relative path would
    hard-refuse `{"command":"npx","args":["-y","@scope/pkg"],"cwd":"${UNSET}"}` — a false block on an
-   entry that had always run. Residual, deliberate: an unscoped specifier with a subpath (`pkg/bin.js`)
-   is still read as a path, because it is indistinguishable from a genuine relative path
-   (`fixtures/server.mjs`).
+   entry that had always run. Residual, deliberate: a specifier carrying a SUBPATH (`pkg/bin.js`, or
+   `@scope/pkg/bin.js`) is still read as a path, because it is indistinguishable from a genuine relative
+   path (`fixtures/server.mjs`). No shipped entry carries one.
 6. **Never prints the argv.** `args` is the one field this repo documents as the place credentials get
    inlined in plaintext — that is the whole of #696 — and the rendered failure is returned as `mcp_load`
    tool output, i.e. into the model's context, the transcript, and routinely into PR/issue bodies. The
