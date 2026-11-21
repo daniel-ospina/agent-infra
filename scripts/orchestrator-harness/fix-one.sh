@@ -201,6 +201,54 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 # refunded `fixcount` but could NOT refund the per-head budget, and after two such cycles the PR
 # parked as "2 red-fixer attempt(s) at this head did not clear it" having never run a fixer.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── IS THE NUMBER EVEN A PR? (agent-infra#4182 arm 3 — MEASURED 2026-11-21) ──────────────────
+# [fixgate-prresolve:begin]
+# A fixer is dispatched by PR NUMBER, and nothing here asked whether that number IS a pull request:
+# the read above discards its status, so a number that resolves to NOTHING — an ISSUE number, a
+# typo, a number from another repo — yields `HEAD=""` and the run continues. MEASURED: this box was
+# dispatched for "PR #3301" while #3301 in this repo is an ISSUE; `git ls-remote` showed the handed
+# branch at origin/main's tip with ZERO commits, `$L-comments.txt` held the GraphQL refusal, and the
+# brief still asserted a reviewer had found real issues. A lane that obeys that brief fixes nothing,
+# reports success, and pushes to a branch no PR tracks (#4182 arm 1) — and it materialises a worktree
+# and a claim for it before anyone can tell.
+# ⛔ THE POLARITY IS THE POINT: only gh POSITIVELY naming the number as not-a-PR refuses. An
+# unreadable read (exhausted gh budget, auth, timeout) is NOT proof the PR is missing, and refusing
+# on it would over-block every ordinary dispatch made while the box's gh budget was spent — that is
+# #4182's arm 2, whose correct handling is a brief that says its head is UNKNOWN, not a refusal. So
+# the transient case is recorded loudly and the run continues.
+PR_RESOLVE_UNKNOWN=""
+if [ -z "${HEAD:-}" ]; then
+  pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
+  case "$pr_probe" in
+    *"Could not resolve to a PullRequest"*)
+      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR (gh: $(printf '%s' "$pr_probe" | head -1)) — this is a DISPATCH defect (the number is an ISSUE, or belongs to another repo), not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a PR number." >> "$L.log"
+      echo "[fix $PR] REFUSED: no pull request #$PR in $OR — dispatch defect, no fixer started, attempt refunded" >&2
+      refund_gate_attempt
+      exit 78 ;;
+    *)
+      if [ "$pr_probe_rc" -ne 0 ]; then
+        PR_RESOLVE_UNKNOWN="the PR-existence probe could not answer (gh rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) — NOT read as a missing PR, because an unreadable read is not an absence"
+      else
+        PR_RESOLVE_UNKNOWN="the PR exists but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
+      fi
+      echo "[fix $PR] WARN: $PR_RESOLVE_UNKNOWN — continuing, but anything below that depends on the head reports UNKNOWN instead of asserting" >> "$L.log" ;;
+  esac
+fi
+# ⛔ THE BRIEF'S HEAD-DEPENDENT SENTENCES RENDER THE HEAD — AND RENDER UNKNOWN WHEN IT IS UNKNOWN
+# (#4190 review F1, P2). The staleness guards further down interpolated `$HEAD` VERBATIM, so with
+# HEAD empty — precisely the arm-2/arm-3 case this block exists for — the brief rendered
+# "THIS head (``)": the one sentence that could have exposed the mismatch was BLANKED by the same
+# failed read, while the WARN above claimed anything head-dependent "reports UNKNOWN instead of
+# asserting". Both halves are repaired here rather than by weakening the WARN: the head the brief
+# SHOWS is computed from THIS SAME observation, so a known head renders as itself and an unknown one
+# renders as an explicit UNKNOWN carrying its reason. The WARN above is therefore a true statement
+# about the brief below, and the empty-head arm is testing a behaviour instead of a message (#3442).
+if [ -n "${HEAD:-}" ]; then
+  FIX_BRIEF_HEAD="$HEAD"
+else
+  FIX_BRIEF_HEAD="UNKNOWN — $PR_RESOLVE_UNKNOWN"
+fi
+# [fixgate-prresolve:end]
 # ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
 # A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
 # git and gh call below would act on one while reporting about the other — the measured wrong-repo
@@ -909,7 +957,56 @@ for c in $FIX_REQ_FAIL $FIX_ADV_FAIL; do _fix_check_section "$c"; done
 # ── FIX-ONE-REQ-SPLIT:END ─────────────────────────────────────────────────────────────────────────
 
 # capture the reviewer's findings (the latest code-review comment on the PR)
-gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
+# ── THE FINDINGS ARTIFACT MUST SAY WHAT IT IS (agent-infra#3608 / #3937) ─────────────────────────
+# [fixgate-reviewread:begin]
+# `gh pr view --comments > file 2>&1` sends the FAILURE TEXT into the very file the brief calls "the
+# review", so neither a reader nor the brief itself could tell an UNREADABLE review from a review
+# with no findings. MEASURED (2026-11-21): the artifact held exactly `GraphQL: Could not resolve to a
+# PullRequest with the number of 3301.` and the brief went on to assert "a fresh-context reviewer
+# found real issues". The read is observed now: success keeps the comments verbatim, and a failure
+# writes a SELF-DESCRIBING header so the file can never be mistaken for a review — while the brief's
+# lead stops asserting a review it did not read.
+#
+# ⛔ A READ THAT SUCCEEDED AND DELIVERED NOTHING IS NOT A REVIEW EITHER (#4190 review F2, P1).
+# Redirected, `gh pr view --comments` prints ONLY comments and reviews (GitHub CLI manual;
+# cli/cli#14714), so a PR with none yields **exit 0 and zero bytes** — and the lead was computed from
+# `$FIX_REVIEW_READ_RC` ALONE, so the fixer was handed a 0-BYTE findings file under a sentence
+# asserting a reviewer found real issues. That is #3608's class surviving on the success path, and
+# nothing gates it: this script has no "findings must exist" precondition, and the CI-red dispatch
+# path is raised by a failing check rather than by a review comment. So the content is observed too.
+# The three states are therefore distinct, and each renders a lead that is TRUE of the artifact:
+#   read FAILED              → NOT-A-REVIEW header + "the review could not be read"
+#   read OK, NO content      → NOT-A-REVIEW header + "the PR carries no review comment"
+#   read OK, content present → verbatim (the artifact IS the PR's comments), and the lead claims
+#                              findings ONLY when a findings heading is actually present in it.
+# ⛔ The third state's lead says "no findings heading was DETECTED", never "the PR has no review":
+# the heading test is a text match, and asserting absence from a text match would rebuild the very
+# defect this block removes, one level down.
+FIX_REVIEW_READ_RC=0
+FIX_REVIEW_LEAD="A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full"
+FIX_REVIEW_FINDINGS_RE='^#{1,6}[[:space:]].*P[0-3]|\[P[0-3]\]'
+gh pr view "$PR" --repo "$OR" --comments > "$L-comments.raw" 2>&1 || FIX_REVIEW_READ_RC=$?
+if [ "$FIX_REVIEW_READ_RC" -eq 0 ]; then
+  cat "$L-comments.raw" > "$L-comments.txt"
+  if ! grep -q '[^[:space:]]' "$L-comments.txt"; then
+    echo "⛔ THIS FILE IS NOT A REVIEW — the comment read SUCCEEDED (gh rc=0) but delivered NO content. When its output is redirected, gh pr view --comments prints ONLY comments and reviews, so this PR carries none. There are no findings in this file because there is nothing in this file: do not invent work from an absent review." > "$L-comments.txt"
+    FIX_REVIEW_LEAD="⛔ THE PR CARRIES NO REVIEW COMMENT: the comment read succeeded but delivered an EMPTY findings file ($L-comments.txt says so on its first line), so this dispatch was not raised by reviewer findings — most likely by a failing check. Fix what the CI evidence names; if there is nothing to fix, say so plainly in your final message instead of manufacturing a change."
+    echo "[fix $PR] WARN: the comment read succeeded but delivered NO content — $L-comments.txt is marked NOT-A-REVIEW and the brief no longer asserts a review that does not exist (#3608/#4190)" >> "$L.log"
+  elif ! grep -qE "$FIX_REVIEW_FINDINGS_RE" "$L-comments.txt"; then
+    FIX_REVIEW_LEAD="the comment read SUCCEEDED and $L-comments.txt holds this PR's comments verbatim, but no findings heading ('### N. Px' or '[P1]') was DETECTED in it — read it and decide. If there is nothing to fix, say so plainly in your final message instead of manufacturing a change."
+    echo "[fix $PR] WARN: the comment read succeeded but no findings heading ('### N. Px' / '[P1]') was detected in $L-comments.txt — the brief no longer asserts findings it did not see (#4190 review F2)" >> "$L.log"
+  fi
+else
+  {
+    echo "⛔ THIS FILE IS NOT A REVIEW — the comment read FAILED (gh rc=$FIX_REVIEW_READ_RC), so this PR's comments were never read. Everything below is the raw failure text, kept so the failure is VISIBLE instead of absent."
+    echo
+    cat "$L-comments.raw"
+  } > "$L-comments.txt"
+  FIX_REVIEW_LEAD="⛔ THE REVIEW COULD NOT BE READ: the comment read failed (gh rc=$FIX_REVIEW_READ_RC), so $L-comments.txt holds a FAILURE, not a review. Do NOT invent work from it — read the PR itself (gh pr view $PR --repo $OR --comments) and, if there is nothing to fix, say so plainly in your final message instead of manufacturing a change."
+  echo "[fix $PR] WARN: the reviewer's findings could not be read (gh rc=$FIX_REVIEW_READ_RC) — $L-comments.txt is marked NOT-A-REVIEW and the brief no longer asserts one (#3608)" >> "$L.log"
+fi
+rm -f "$L-comments.raw"
+# [fixgate-reviewread:end]
 
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test bullet
 # below. The fixer's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for
@@ -920,11 +1017,11 @@ $FIX_RESEARCH_BRIEF
 
 $FIX_DELIVERY_BRIEF
 
-You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
+You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). $FIX_REVIEW_LEAD
 
-If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($FIX_BRIEF_HEAD), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
-If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
+If $O/state/reviewbrief-$PR.md exists, READ IT SECOND, AND BEFORE THE WORK: it was generated from THIS PR's REVIEW RECORD — the recorded verdict, the number of open findings, and the reviewer's own artifact (a review, or a comment on this PR) — not from a template. It is the reason this lane was dispatched when no CI failure named the work, and it is the reason the harness needed no agent to notice the verdict. It names the head it was generated at (head12: <12 chars>), and nothing deletes it: if that prefix is not the first 12 characters of THIS head ($FIX_BRIEF_HEAD), it is STALE — a later dispatch at a new head — so ignore it and work from the review the PR itself carries. Fix EVERY open finding the review names; a finding you will not fix must be recorded explicitly with the reason.
 
 If $L-failing.txt is non-empty it carries THIS PR's failing checks and their logs, and EVERY heading in it says which kind of red each one is: \`=== failing required check:\` — it is in $OR's own required set, so it BLOCKS the merge and fixing it is your job; \`=== failing NON-required check (…):\` — it is RED but it is NOT a required context of $OR, so it does NOT block the merge and fixing it will NOT unblock this PR: fix it only if the cause is real and cheap inside this same change, otherwise say plainly in your final message that you left it alone and why — never spend the attempt on it and never report it as the reason the PR cannot merge; \`=== failing check (required-status UNKNOWN):\` — the required set could NOT be read, so no heading in the file claims anything about blocking, the build state is UNKNOWN rather than green, and you must read the PR's checks AND this repo's branch protection yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
