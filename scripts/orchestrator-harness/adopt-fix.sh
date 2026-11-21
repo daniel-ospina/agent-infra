@@ -169,13 +169,15 @@ elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
 elif [ "$rc" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   echo "[adopt-fix $PR] fixer NOT started (BRIEF gate) — the generated fixer brief failed brief-gate.sh: a HARNESS defect in the brief's own build (missing research contract / previous-work block), NOT a capacity refusal and NOT a finding about this PR. The [brief-gate] block in $O/logs/fix-$PR.log names every missing element. Do NOT dispatch the PR elsewhere and do not repair the box — fix the brief's build and re-run. Nothing was consumed." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE DISPATCH DEFECT (86) — THE SAME SILENCE, ONE MORE CODE (agent-infra#4182 arm 3, measured
-# 2026-11-21). `fix-one.sh` refuses before any work when the PR number it was handed is not a pull
-# request in this repo (two independent reads agree: gh produced no resource, and the remote advertises
-# no `refs/pull/<N>/head`). Without this arm a manual `adopt-fix <PR>` on such a number exited 86 with
-# NO LINE in the log the manual operator reads (#1720) — and its remedy is neither a box repair nor a
-# redeploy, which is why it is not folded into 83 or 78: it is a RE-DISPATCH with a real PR number.
+# 2026-11-21, the refusal repaired for #4190 review F1). `fix-one.sh` refuses before any work when the
+# PR number it was handed is not a pull request in this repo — TWO reads, and the refusal rests on the
+# SECOND one DENYING that the number is an issue: the PR read consumed the number and produced nothing,
+# and the issue projection came back as an ISSUE (`…/issues/<N>`). Without this arm a manual
+# `adopt-fix <PR>` on such a number exited 86 with NO LINE in the log the manual operator reads
+# (#1720) — and its remedy is neither a box repair nor a redeploy, which is why it is not folded into
+# 83 or 78: it is a RE-DISPATCH with a real PR number.
 elif [ "$rc" = "${AGENT_NOT_A_PR_REFUSED:-86}" ]; then
-  echo "[adopt-fix $PR] fixer NOT started (NOT-A-PR) — $OR has no pull request numbered $PR: gh produced no resource for it AND the remote advertises no refs/pull/$PR/head. This is a DISPATCH defect (an ISSUE number, a typo, or a number from another repo), not a repair and not a property of this box, so nothing was consumed and no fixer ran. Re-dispatch with a real PR number (gh pr list --repo $OR --search ...), or route the number to the ISSUE path; see $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+  echo "[adopt-fix $PR] fixer NOT started (NOT-A-PR) — $OR has no pull request numbered $PR: the PR read produced no resource for it AND the number's issue projection is an ISSUE (…/issues/$PR), not a pull request. This is a DISPATCH defect — an ISSUE number routed to the PR fixer, not a repair and not a property of this box, so nothing was consumed and no fixer ran. Re-dispatch with a real PR number (gh pr list --repo $OR --search ...), or route the number to the ISSUE path; see $O/logs/fix-$PR.log. A pure typo is deliberately NOT refused (an unreadable read is not an absence), so this arm never fires for one." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return

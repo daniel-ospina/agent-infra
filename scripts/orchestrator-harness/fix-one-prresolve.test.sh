@@ -19,8 +19,13 @@
 #      passing vacuously), and the refund block this suite drives is extractable too.
 #   1  the number is an ISSUE gh still reads while the PR read cannot → REFUSED with the DISPATCH
 #      code 86, the reason names the dispatch defect, and the booked `fixcount` attempt is REFUNDED
-#      (a dispatch defect must not burn a repair round). The verdict rests on a POSITIVE
-#      IDENTIFICATION — the issue read — never on gh's wording, which the gh-rest shim replaces.
+#      (a dispatch defect must not burn a repair round). The verdict rests on a positive
+#      identification — the issue PROJECTION naming an ISSUE url — never on gh's wording, which the
+#      gh-rest shim replaces.
+#   1b the number IS A PULL REQUEST whose PR read failed (gh-rest REST 404, and a 403 permission
+#      split) while the issue read SUCCEEDS with the PR's own projection (`…/pull/<N>`) → NO refusal,
+#      nothing refunded, UNKNOWN recorded. `gh issue view` answers for a pull request, so its SUCCESS
+#      is not an identification — the measured defect a success-only predicate had (#4190 review F1).
 #   2  gh CANNOT answer (rate limit / auth / timeout) → NO refusal. This is the over-block arm: the
 #      ordinary "gh budget was spent" dispatch (#4182 arm 2) must still run, and it is recorded as
 #      UNKNOWN instead.
@@ -109,8 +114,16 @@ case "$_code_lines" in
   *) ok "0) no network probe: the guard decides from gh reads only" ;;
 esac
 case "$_code_lines" in
-  *'gh issue view'*) ok "0) the refusal rests on the POSITIVE identification (the number is an issue)" ;;
+  *'gh issue view'*) ok "0) the refusal reads the issue projection (the positive half of the predicate is present)" ;;
   *) bad "0) the block no longer reads the issue projection — the positive half of the predicate is gone" ;;
+esac
+# ⛔ THE IDENTIFICATION MUST DISCRIMINATE, NOT JUST SUCCEED (#4190 review F1, P1 — MEASURED).
+# `gh issue view N` answers rc=0 for a PULL REQUEST as well (GitHub: "every pull request is an
+# issue"), so requiring only that read refuses a LIVE PR whose PR read failed. The predicate must
+# require the projection to be an ISSUE's url.
+case "$_code_lines" in
+  *'/issues/[0-9]'*) ok "0) the identification DISCRIMINATES — it requires an /issues/<N> projection, which a pull request's /pull/<N> cannot satisfy" ;;
+  *) bad "0) the guard refuses on the issue read's SUCCESS alone — that read answers for a PULL REQUEST too, so a real PR whose PR read failed is refused (#4190 review F1)" ;;
 esac
 
 # ── the driver for the PR-existence block ──────────────────────────────────────────────────────
@@ -151,7 +164,10 @@ run_pr() {
 }
 
 # 1. the number IS an issue — the measured case (gh issue view answers, gh pr view cannot)
-run_pr "" 1 "GraphQL: Could not resolve to a PullRequest with the number of 3301. (repository.pullRequest)" 0 '{"number":3301}'
+# The projection is an ISSUE's url: `…/issues/3301`. A bare `{"number":3301}` is NOT that, and no arm
+# below passes one, because a success without the discriminating projection is not an identification.
+_ISSUE_URL='{"url":"https://github.com/daniel-ospina/agent-infra/issues/3301"}'
+run_pr "" 1 "GraphQL: Could not resolve to a PullRequest with the number of 3301. (repository.pullRequest)" 0 "$_ISSUE_URL"
 ck "1) a number that is an ISSUE is REFUSED with the DISPATCH code 86 (rc=$(cat "$T/run/rc"))" \
    "$([ "$(cat "$T/run/rc")" = 86 ] && echo 0 || echo 1)"
 grep -qF 'REFUSED' "$T/run/o/logs/fix-3301.log" && grep -qF 'it DOES have an ISSUE with that number' "$T/run/o/logs/fix-3301.log"
@@ -161,12 +177,33 @@ ck "1) the log says why it is not a repair (so the next reader does not re-deriv
 grep -qx '0' "$T/run/refunded"; _rc=$?
 ck "1) the booked attempt is REFUNDED (fixcount 1 -> $(cat "$T/run/refunded"))" "$_rc"
 
+# 1b. ⛔ THE ARM A SUCCESS-ONLY PREDICATE CANNOT PASS (#4190 review F1, P1 — MEASURED). The number
+# IS a pull request: `gh pr view` failed (the REST 404 the gh-rest shim prints), and the issue read
+# SUCCEEDS — because GitHub's issue endpoints answer for pull requests too — with the PR's OWN
+# projection, `…/pull/3301`. Pre-fix this REFUSED a live PR with rc=86, told the operator there is no
+# PR, and refunded it. Required: no refusal, nothing refunded, UNKNOWN recorded.
+run_pr "" 1 "gh-rest: API error: Not Found" 0 '{"url":"https://github.com/daniel-ospina/agent-infra/pull/3301"}'
+ck "1b) a PULL REQUEST whose PR read failed is NOT refused (rc=$(cat "$T/run/rc"), want not-86)" \
+   "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
+grep -qF 'did NOT identify it as an ISSUE' "$T/run/unknown"
+ck "1b) and the reason names what the projection actually said (a PR, not an absence)" $?
+grep -qx '1' "$T/run/refunded"; _rc=$?
+ck "1b) a live PR's attempt is NOT refunded (fixcount still $(cat "$T/run/refunded"))" "$_rc"
+# 1c. the SAME number under a fine-grained token that can read Issues but NOT Pull requests: the PR
+# read is DENIED (403) and the issue projection still says `…/pull/3301`. This is the deployment the
+# per-permission model makes real, and the reason the refusal cannot rest on the PR read's failure.
+run_pr "" 1 "gh: HTTP 403: Resource not accessible by personal access token (https://api.github.com/graphql)" 0 '{"url":"https://github.com/daniel-ospina/agent-infra/pull/3301"}'
+ck "1c) a PERMISSION split (issue-readable, PR-unreadable token) does not refuse the PR (rc=$(cat "$T/run/rc"))" \
+   "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
+grep -qx '1' "$T/run/refunded"; _rc=$?
+ck "1c) and it refunds nothing either (fixcount still $(cat "$T/run/refunded"))" "$_rc"
+
 # 2. gh cannot answer and the issue probe cannot identify it either — must NOT refuse (the over-block
 # arm: an unreadable read is not an absence, and #4182 arm 2's dispatch must still run)
 run_pr "" 1 "gh: HTTP 403: API rate limit exceeded for user ID 1 (https://api.github.com/graphql)" 1 "gh: HTTP 403: API rate limit exceeded"
 ck "2) an UNREADABLE pair does NOT refuse the dispatch (rc=$(cat "$T/run/rc"), want not-86)" \
    "$([ "$(cat "$T/run/rc")" != 86 ] && echo 0 || echo 1)"
-grep -qF 'did not identify it either' "$T/run/unknown"
+grep -qF 'did NOT identify it as an ISSUE' "$T/run/unknown"
 ck "2) and it is RECORDED as unreadable, never as a missing PR" $?
 grep -qx '1' "$T/run/refunded"; _rc=$?
 ck "2) nothing is refunded for a run that proceeds (fixcount still $(cat "$T/run/refunded"))" "$_rc"
@@ -175,7 +212,7 @@ ck "2) nothing is refunded for a run that proceeds (fixcount still $(cat "$T/run
 # `pr view --json` over REST, where a 404 arrives as `gh-rest: API error: Not Found` — NOT the GraphQL
 # sentence. Keying on the wording would mean the refusal NEVER FIRES on the fleet's own config, so the
 # decision must not depend on which transport answered.
-run_pr "" 1 "gh-rest: API error: Not Found" 0 '{"number":3301}'
+run_pr "" 1 "gh-rest: API error: Not Found" 0 "$_ISSUE_URL"
 ck "2b) the REST/shim wording also REFUSES (rc=$(cat "$T/run/rc"))" \
    "$([ "$(cat "$T/run/rc")" = 86 ] && echo 0 || echo 1)"
 

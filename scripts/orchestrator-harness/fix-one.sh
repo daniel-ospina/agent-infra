@@ -228,28 +228,50 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 #   * WHY NOT `refs/pull/<N>/head` (the second attempt, replaced here). It is a NETWORK round trip in
 #     a dispatch path and a GitHub-only convention — MEASURED: it turned 41 fixture runs of
 #     spawn-gate.test.sh into rc=86, which is what a guard that over-blocks looks like from inside.
-#   * WHY THE ISSUE READ IS THE RIGHT POSITIVE. The measured defect class IS "the number is an ISSUE":
-#     #3301 is an open issue in this repo, so `gh issue view 3301` succeeds while `gh pr view 3301`
-#     cannot. A fixture with a stubbed, failing gh fails BOTH reads and therefore never refuses —
-#     correct, because nothing in it proves the number is an issue.
-#   * STATED RESIDUAL: a pure typo (a number that is neither a PR nor an issue) is NOT refused here,
-#     because refusing it would require treating an unreadable read as an absence. It still gets the
-#     UNKNOWN brief below and the review-read fix in the same PR.
+#   * ⛔ WHY THE PROJECTION, AND NOT THE ISSUE READ'S SUCCESS (#4190 review F1, P1 — MEASURED).
+#     `gh issue view N` SUCCEEDS FOR A PULL REQUEST TOO, so its success proves only that SOME resource
+#     of that number exists. GitHub's own REST contract: "GitHub's REST API considers every pull
+#     request an issue, but not every issue is a pull request" (docs.github.com/rest/issues) —
+#     MEASURED here, where `gh issue view 4190 --json number,url` answers rc=0 for #4190, which IS a
+#     pull request, with the url `…/pull/4190`. This repo's own shim already knows it and DELEGATES
+#     rather than invent a payload for a PR-numbered target (`gh-rest/gh`, the `kind = issue` arm).
+#     So "the PR read failed and the issue read succeeded" reads as "the number exists", and every
+#     state where the PR read fails for a reason OTHER than absence would refuse a LIVE PR — a
+#     fine-grained PAT carries `Issues` and `Pull requests` as SEPARATE permissions, so an
+#     issue-readable, PR-unreadable token is a real deployment, and a quota/transport split between
+#     the two endpoints does the same. THE PREDICATE THEREFORE DEMANDS A DISCRIMINATING PROJECTION:
+#     `gh issue view N --json url` is `…/issues/N` for an issue and `…/pull/N` for a pull request
+#     (both measured on this repo and on the shipped shim, whose ISSUE_FIELDS carries `url`). Only
+#     `/issues/<N>` refuses. When the projection does NOT name an issue, the PR read merely failed:
+#     that is #4182 arm 2's recorded behaviour — UNKNOWN, proceed, refund nothing — never a refusal.
+#   * STATED RESIDUALS. (i) A pure typo (a number that is neither a PR nor an issue) is NOT refused
+#     here, because refusing it would require treating an unreadable read as an absence. It still gets
+#     the UNKNOWN brief below and the review-read fix in the same PR. (ii) An adapter that answers the
+#     issue read without a `url` projection is read as NOT identified — the fail-closed direction for
+#     this guard, since a missing projection is not a positive identification.
 PR_RESOLVE_UNKNOWN=""
 if [ -z "${HEAD:-}" ]; then
   pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
   if [ "$pr_probe_rc" -ne 0 ]; then
-    issue_probe="$(gh issue view "$PR" --repo "$OR" --json number 2>&1)"; issue_probe_rc=$?
+    issue_probe="$(gh issue view "$PR" --repo "$OR" --json url 2>&1)"; issue_probe_rc=$?
     # A here-string, not `printf … | grep -q`: under pipefail a quiet grep that matches early closes
     # the pipe and the writer takes SIGPIPE, so the pipeline reports 141 and this reads as "not an
     # issue" exactly when the payload matched (`check-no-sigpipe-grep.sh`, #841/#864).
-    if [ "$issue_probe_rc" -eq 0 ] && grep -q '[0-9]' <<<"$issue_probe"; then
-      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR, but it DOES have an ISSUE with that number (gh issue view succeeded; gh pr view failed rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)). This is a DISPATCH defect — an ISSUE number routed to the PR fixer — not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a real PR number." >> "$L.log"
+    # ⛔ `/issues/<N>` AND NOTHING LESS: `gh issue view` SUCCEEDING is not the identification — it
+    # answers for a pull request too (see the block comment). A pull request's projection is its
+    # `…/pull/<N>` url, which this pattern does not match.
+    if [ "$issue_probe_rc" -eq 0 ] && grep -qE '"url"[[:space:]]*:[[:space:]]*"[^"]*/issues/[0-9]+' <<<"$issue_probe"; then
+      echo "[fix $PR] REFUSED: $OR has no pull request numbered $PR, but it DOES have an ISSUE with that number (the issue projection is an ISSUE url: $(printf '%s' "$issue_probe" | head -1); gh pr view failed rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)). This is a DISPATCH defect — an ISSUE number routed to the PR fixer — not a repair: there is no PR to fix, no head to test and no findings artifact to read. No worktree was materialised, no branch was touched, and the attempt is refunded. Route the number to the ISSUE path, or re-dispatch it with a real PR number." >> "$L.log"
       echo "[fix $PR] REFUSED: #$PR is an ISSUE in $OR, not a pull request — dispatch defect, no fixer started, attempt refunded" >&2
       refund_gate_attempt
       exit "${AGENT_NOT_A_PR_REFUSED:-86}"
     fi
-    PR_RESOLVE_UNKNOWN="gh produced no resource for this number (rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) and the issue probe did not identify it either (rc=$issue_probe_rc) — NOT read as a missing PR, because an unreadable read is not an absence"
+    # ⛔ THE OTHER HALF OF THE SAME MEASUREMENT (#4190 review F1). Two arrivals here, and BOTH are
+    # "proceed, refund nothing": (a) the projection names a PULL REQUEST, i.e. the number is a live PR
+    # whose PR read failed on a permission/quota/transport split — the case a success-only predicate
+    # refused outright; (b) the read answered without a discriminating url, which is not a positive
+    # identification. Neither is an absence, so neither may spend the dispatch's attempt.
+    PR_RESOLVE_UNKNOWN="gh produced no PR for this number (rc=$pr_probe_rc: $(printf '%s' "$pr_probe" | head -1)) and the issue read did NOT identify it as an ISSUE (rc=$issue_probe_rc: $(printf '%s' "$issue_probe" | head -1) — a pull request's own projection is its /pull/<N> url) — NOT read as a missing PR, because neither an unreadable read nor a PR-shaped projection is an absence"
   else
     PR_RESOLVE_UNKNOWN="the PR exists (gh answered) but its head read returned EMPTY, so the brief's staleness guard cannot name this head (#4182 arm 2)"
   fi
