@@ -265,7 +265,13 @@ fi
 #     here, because refusing it would require treating an unreadable read as an absence. It still gets
 #     the UNKNOWN brief below and the review-read fix in the same PR. (ii) An adapter that answers the
 #     issue read without a `url` projection is read as NOT identified — the fail-closed direction for
-#     this guard, since a missing projection is not a positive identification.
+#     this guard, since a missing projection is not a positive identification. (iii) THE PER-HEAD
+#     REFUND IS UNREACHABLE FROM THIS ARM, and it is recorded rather than papered over: `refund_gate_
+#     attempt` books `fixgate-<PR>-<HEAD>` (and reads `spendcount-<PR>-<HEAD>`) ONLY when HEAD is
+#     non-empty, and this refusal fires only when the head read came back EMPTY — so a controller that
+#     pre-booked the head-keyed `redfix-<PR>` counter for this dispatch never sees it refunded by this
+#     call, while `fixcount` is refunded exactly as the log line says. Nothing here can name that
+#     head; the sentence in the log is therefore about `fixcount`, not about both.
 PR_RESOLVE_UNKNOWN=""
 if [ -z "${HEAD:-}" ]; then
   pr_probe="$(gh pr view "$PR" --repo "$OR" --json number 2>&1)"; pr_probe_rc=$?
