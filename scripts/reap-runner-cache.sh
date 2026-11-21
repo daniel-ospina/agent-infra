@@ -369,7 +369,8 @@ free_mb_for_path() {
     printf '%s' "$(( kb / 1024 ))"
 }
 
-mtime_of() { # <path> — epoch mtime, portable across GNU and BSD stat; empty when unstatable    local m
+mtime_of() { # <path> — epoch mtime, portable across GNU and BSD stat; empty when unstatable
+    local m
     m="$(tb_timeout 60 "$STAT_BIN" -f '%m' "$1" 2>/dev/null)"
     case "$m" in ''|*[!0-9]*) ;; *) printf '%s' "$m"; return 0 ;; esac
     m="$(tb_timeout 60 "$STAT_BIN" -c '%Y' "$1" 2>/dev/null)"
