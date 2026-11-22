@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "exit_code": null,
+  "heartbeat_at": 1795352454,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-bgskew-1795352454-p889245-03272470",
+  "lease_until": 1795353074,
+  "pid": 889245,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1795352454,
+  "state": "RUNNING",
+  "tag": "bgskew",
+  "worktree": "/tmp/tmp.xifvphPs8H/wt"
+}
