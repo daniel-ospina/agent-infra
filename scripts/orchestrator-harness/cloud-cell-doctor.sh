@@ -260,6 +260,9 @@ RAIL_TIMEOUT="${DOCTOR_RAIL_TIMEOUT:-900}"
 # deadline is still KILLed at RAIL_TIMEOUT, and the classification of that death is unchanged. This
 # only gives the rail a chance to answer FIRST, which is the only thing that turns a burn into data.
 RAIL_DEADLINE_MARGIN="${DOCTOR_RAIL_DEADLINE_MARGIN:-60}"
+# ⛔ AND IT MUST BE > 0, NOT MERELY NUMERIC (validated with the bounds below). A zero margin derives
+# `RAIL_TIMEOUT` itself, i.e. a deadline EQUAL to the outer KILL that started first — the rail then
+# races that kill instead of answering before it, which is the coin-flip #4200 removes.
 MERGE_MAX_PRS="${MERGE_MAX_PRS:-100}"
 # ⛔ The merge pass is bounded too, for the same reason as the reap read: without this, a queue of
 # MERGE_MAX_PRS candidates each allowed RAIL_TIMEOUT would block the ONE loop for hours, and the
@@ -364,16 +367,30 @@ case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WO
 #     is what this file's header names as the thing separating a wedge from a long call; at 0 the
 #     wedge test is vacuous and the reaper KILLS the live lane it exists to spare.
 #   REAP_MIN_S=0 — removes the age floor outright, so a lane younger than the window is eligible.
+#   RAIL_DEADLINE_MARGIN=0 — the derivation below (`RAIL_TIMEOUT - margin`) yields `RAIL_TIMEOUT`
+#     ITSELF, and that value IS positive, so the `-le 0` clamp further down cannot catch it. The rail
+#     would then be handed a deadline EQUAL to the outer `timeout`, whose clock started EARLIER in
+#     wall-clock terms: the rail's `elapsed >= RAIL_DEADLINE` races a KILL already in flight and which
+#     one wins is a sub-second coin-flip (`date +%s` truncation is the only reason the named refusal
+#     can win at all). It is also the antipattern the propagated-deadline rule forbids: a hop must
+#     derive a STRICTLY smaller budget than its parent's remaining time. And it fails SILENTLY in the
+#     worst direction — a deadline IS handed in, so nothing looks unconfigured, while `rc=124` still
+#     records nothing and is retried every pass. `num_ok` above accepts `0` by design (it is the shared
+#     whole-number predicate), which is exactly why the margin needs THIS loop too.
 for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT \
-          REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S REGISTRY_STEP_TIMEOUT REGISTRY_SYNC_NET_TIMEOUT; do
-  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor, a zero HYGIENE_TMP_MIN_AGE_S leaves a recycled pid as the ONLY proof a temp dir is idle, and a zero registry bound would kill every sync mid-record) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
+          REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S REGISTRY_STEP_TIMEOUT REGISTRY_SYNC_NET_TIMEOUT \
+          RAIL_DEADLINE_MARGIN; do
+  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor, a zero HYGIENE_TMP_MIN_AGE_S leaves a recycled pid as the ONLY proof a temp dir is idle, a zero registry bound would kill every sync mid-record, and a zero RAIL_DEADLINE_MARGIN hands the rail a deadline EQUAL to the outer KILL so the rail races it instead of answering first) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 # ⛔ THE RAIL DEADLINE IS DERIVED HERE, AFTER BOTH OF ITS OPERANDS ARE VALIDATED (agent-infra#4200).
-# A zero or negative DERIVED value is never handed to the rail: at RAIL_TIMEOUT=1 the shipped margin
-# of 60 s leaves no room to answer in, so NO deadline is handed in and the outer bound is the only
-# guard (exactly the pre-#4200 behaviour, still safe). `ADMIN_MERGE_RAIL_DEADLINE` must be a POSITIVE
-# integer or the rail refuses it BY NAME and exits 2 without running — so a negative derivation passed
-# through would not degrade, it would stop every landing on the cell.
+# `RAIL_TIMEOUT` passes the `> 0` loop and `RAIL_DEADLINE_MARGIN` passes `num_ok` AND that same `> 0`
+# loop, so the derivation is strictly smaller than the outer bound by construction (a margin of 0,
+# which would make them equal and re-introduce the race, is refused above by name). A zero or negative
+# DERIVED value is never handed to the rail either: an allowance at or below the margin leaves no room
+# to answer in, so NO deadline is handed in and the outer bound is the only guard (exactly the
+# pre-#4200 behaviour, still safe). `ADMIN_MERGE_RAIL_DEADLINE` must be a POSITIVE integer or the rail
+# refuses it BY NAME and exits 2 without running — so a negative derivation passed through would not
+# degrade, it would stop every landing on the cell.
 RAIL_INNER_DEADLINE=$(( RAIL_TIMEOUT - RAIL_DEADLINE_MARGIN ))
 if [ "$RAIL_INNER_DEADLINE" -le 0 ]; then RAIL_INNER_DEADLINE=""; fi
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
