@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-14186-embedseam-1795294197-p3821463-c52a3cef",
+  "_sha": "346209b4cdb1c93c1d8fb583509385a90bdbdb6f",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/14186-embedseam.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14186-embedder-seam-batching"
+    },
+    {
+      "kind": "sha",
+      "value": "2e0bff91cdd389a3eae4e072f62fb5d0245f98bf"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/14186-embedseam"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 15493,
+  "ended_at": 1795309690,
+  "exit_code": 0,
+  "heartbeat_at": 1795309690,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14186-embedseam-1795294197-p3821463-c52a3cef",
+  "lease_until": 1795346290,
+  "pid": 3821463,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795294197,
+  "state": "DONE",
+  "tag": "14186-embedseam",
+  "worktree": "/home/cmux/tortoise/.worktrees/14186-embedseam"
+}
