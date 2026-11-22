@@ -32,7 +32,7 @@
     "orchestrator": {
       "command": "python3",
       "args": [
-        "${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"
+        "mcp-servers/orchestrator/server.py"
       ],
       "cwd": "${AGENT_INFRA_PATH}",
       "lazy": true,
