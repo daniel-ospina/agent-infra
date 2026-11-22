@@ -695,7 +695,7 @@ printf '[{"number":64,"head":{"sha":"%s"},"draft":false}]\n' "$HEAD_G" > "$T/gh/
 printf '{"head_sha":"%s","verdict":"clean"}\n' "$HEAD_G" > "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-64.json"
 printf '0\n' > "$T/rail/rc"
 OUT="$(DOCTOR_RAIL_TIMEOUT=900 DOCTOR_RAIL_DEADLINE_MARGIN=0 bash "$DOCTOR" merge 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && result_has "RAIL_DEADLINE_MARGIN" \
+[ "$RC" -eq 2 ] && result_has "FATAL: RAIL_DEADLINE_MARGIN must be > 0" \
   && ok "merge: DOCTOR_RAIL_DEADLINE_MARGIN=0 aborts the pass BY NAME (rc=2) — not accepted as a 900 s deadline" \
   || bad "merge: DOCTOR_RAIL_DEADLINE_MARGIN=0 produced rc=$RC — the margin is NOT validated (it handed '$(rail_deadline_seen)' in): $OUT"
 # …and the refusal is UP FRONT: no rail call at all, so no PR is silently railed with the racy value.
