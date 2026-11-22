@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795370415,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-14326-1795370415-p263040-cc9290ec",
+  "lease_until": 1795407015,
+  "pid": 263040,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795370415,
+  "state": "RUNNING",
+  "tag": "prd-daniel-ospina-tortoise-14326",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-14326"
+}
