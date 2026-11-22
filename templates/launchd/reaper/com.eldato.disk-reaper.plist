@@ -91,6 +91,10 @@
              owner is never consulted. Both artifacts must pin the same set. -->
         <key>ABANDONED_WT_REAPER</key>
         <string>{{REAPER_DIR}}/reap-abandoned-worktrees.sh</string>
+        <!-- #4194: the repo-local `.worktrees` owner (landed trees). Both artifacts pin the same
+             set — T67 asserts it, so a class cannot land pinned in only one of them. -->
+        <key>LANDED_WT_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-landed-worktrees.sh</string>
         <key>DUP_INSTALL_REAPER</key>
         <string>{{REAPER_DIR}}/reap-duplicate-installs.sh</string>
         <!-- ⛔ AND THIS ONE, FOR THE SAME REASON AGAIN (#4169 review). `runner-cache` is in the DEFAULT

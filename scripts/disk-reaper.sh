@@ -515,6 +515,10 @@ AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""
 # delta is not ours" rule has to see THIS arm's removals too or a pass that reaped only landed trees
 # would report its own reclaim as another process's work.
 LW_FREED=0; LW_RAW=0; LW_MEASURED=1; LW_OUT=""; LW_NOTE=""; LW_REAPED=0; LW_SETUP_FAIL=0
+# The repos this arm OWNS: the ones the registered arm could NOT decide. Its whole purpose (the owner's
+# own header) is the provable subset when the PR surface is unverifiable — running it on a repo that
+# arm already answered would re-examine trees it just removed, i.e. one policy over another's row.
+LANDED_REPOS=""
 # Repos whose PR-state gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
 # each. A SKIPPED repo is not a failed CLASS: its own checkouts are untouched (fail closed) while the
 # other repos in the same class are still reclaimed. Reported per repo so a single unverifiable repo
@@ -2049,8 +2053,16 @@ reap_abandoned_arm() {
 # the registered arm resolved; when it could not run it CLEARS `REPOS` (its own fail-closed), so this
 # arm has nothing in scope and says so in `detail=` rather than claiming a removal it did not make.
 reap_landed_arm() {
-    local repo b a d out rc _r _ln
+    local repo b a d out rc _r _ln lw_main
     LW_FREED=0; LW_RAW=0; LW_MEASURED=1; LW_OUT=""; LW_NOTE=""; LW_REAPED=0; LW_SETUP_FAIL=0
+    lw_main="${REAP_LW_MAIN:-origin/main}"
+    # ⛔ SCOPE FIRST, AND NO NOTE WHEN IT IS EMPTY. This arm owns ONLY the repos the registered arm could
+    # not decide; with none, there is nothing it could add, so it is silent — a `detail=` note on every
+    # healthy pass is noise an operator learns to skip. The delegate's ABSENCE is a fault only when this
+    # arm actually had a repo to answer for.
+    if [ -z "${LANDED_REPOS:-}" ]; then
+        return 0
+    fi
     if [ -z "$LANDED_WT_REAPER_PATH" ]; then
         log_line "disk-reaper: ⛔ class=worktree arm=landed FAIL-CLOSED — reap-landed-worktrees.sh not found (looked at \$LANDED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         LW_NOTE="landed-worktree owner missing"
@@ -2059,14 +2071,20 @@ reap_landed_arm() {
         MISCONFIG="${MISCONFIG}${MISCONFIG:+, }landed-worktree-delegate-missing"
         return 0
     fi
-    if [ -z "$REPOS" ]; then
-        # Not a failure of THIS arm (the registered arm records the missing repo as its own) — but it is
-        # not an answer either, so it is named instead of being read as "nothing to do".
-        LW_NOTE="landed-worktree arm: no repo in scope (the registered arm resolved none)"
-        return 0
-    fi
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
+        # ⛔ SCOPE, NOT A SILENT SKIP. This arm's whole proof is "HEAD is an ancestor of the main ref", so
+        # a repo where that ref does not resolve is a row it cannot answer AT ALL — it belongs to the
+        # registered arm, which runs on the same repo. It is therefore REPORTED (a class row, not a
+        # `detail=` note) and the class is not failed: delegating would make the whole hourly pass red
+        # (exit 3) on every repo with no remote-tracking ref, which is a routine shape rather than a
+        # fault — and a red that fires every tick is how an operator learns to ignore the red.
+        # The delegate's OWN exit 3 stays red: that is a ref which resolved HERE and could not then be
+        # probed, i.e. a proof this arm believed it had.
+        if ! tb_timeout 60 git -C "$repo" rev-parse --verify --quiet "${lw_main}^{commit}" >/dev/null 2>&1; then
+            LW_OUT="${LW_OUT}${LW_OUT:+$'\n'}landed-arm repo=$repo SKIP reason=main-unresolved main=$lw_main"
+            continue
+        fi
         b="$(free_kb_for_path "$repo")"
         run_class bash "$LANDED_WT_REAPER_PATH" "$(mode_flag)" --repo "$repo"
         out="$CLASS_OUT"; rc="$CLASS_RC"
@@ -2090,7 +2108,7 @@ reap_landed_arm() {
             _ln="$(note_for reap-landed-worktrees.sh "$rc" worktree)"
             case "; ${LW_NOTE:-};" in *"; $_ln;"*) : ;; *) LW_NOTE="${LW_NOTE}${LW_NOTE:+; }$_ln" ;; esac
         fi
-    done <<<"$(printf '%s\n' "$REPOS" | tr ':' '\n')"
+    done <<<"$(printf '%s\n' "$LANDED_REPOS" | tr ':' '\n')"
     if [ "$LW_REAPED" = 0 ] && ! is_dry; then
         if [ "$LW_RAW" != 0 ]; then
             LW_NOTE="${LW_NOTE}${LW_NOTE:+; }nothing removed by the landed arm: the ${LW_RAW}MB df change belongs to another process (not attributed)"
@@ -2271,6 +2289,12 @@ reap_worktree() {
             SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
             SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
             log_line "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
+        fi
+        # #4194: a repo the registered arm could NOT decide is exactly the row this class's third arm
+        # owns. It is handed over BY NAME rather than re-swept blindly, so the two arms never run the same
+        # policy over the same trees in one pass.
+        if [ "$rc" -gt 0 ] || [ -n "$_skip" ]; then
+            LANDED_REPOS="${LANDED_REPOS}${LANDED_REPOS:+:}$repo"
         fi
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.
