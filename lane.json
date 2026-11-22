@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-14014-m4-1795274350-p2428556-6d6565dc",
+  "_sha": "05ffc7efd5b8946b06d6a854060b950a92e70d8e",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/14014-m4.log"
+    },
+    {
+      "kind": "branch",
+      "value": "chore/14014-m4-rebuild-peak"
+    },
+    {
+      "kind": "sha",
+      "value": "05d218fcafc5810995588a23f621893d0b168ef4"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/14014-m4"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 36095,
+  "ended_at": 1795310445,
+  "exit_code": 143,
+  "heartbeat_at": 1795310445,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14014-m4-1795274350-p2428556-6d6565dc",
+  "lease_until": 1795347045,
+  "pid": 2428556,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795274350,
+  "state": "FAILED",
+  "tag": "14014-m4",
+  "worktree": "/home/cmux/tortoise/.worktrees/14014-m4"
+}
