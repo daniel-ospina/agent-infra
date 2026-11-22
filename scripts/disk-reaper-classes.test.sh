@@ -924,10 +924,14 @@ case_p() { # <owner-script> <entry-point>
     ahead="$(mk_linked_wt "$repo" "$repo/.worktrees" ahead feat/p-ahead)"
     "$REAL_GIT" -C "$ahead" commit -qm unique --allow-empty
     mkdir -p "$base/bin"
-    # THE SIBLING OWNERS ARE STUBS. This case measures the landed arm's wiring; their own policies would
-    # otherwise act on the same fixture, and `reap-abandoned-worktrees.sh`'s DEFAULT scratch root is this
-    # box's real `/tmp` (the suite header records that arm already reaping four real checkouts once).
-    printf '#!/usr/bin/env bash\nexit 0\n' >"$base/bin/pi-reap-worktrees.sh"
+    # THE REGISTERED ARM IS A STUB THAT FAILS CLOSED (exit 3) — the measured #2443 shape
+    # (`reason=gh-timeout(rc=124)`, then `SKIPPED-REPO` and 0 trees decided), which is the ONLY case this
+    # arm exists for: a repo the PR surface could not decide. A succeeding registered arm OWNS its repos,
+    # and the landed arm stays silent there by design.
+    # The other sibling owner is a stub for fixture safety: `reap-abandoned-worktrees.sh`'s DEFAULT
+    # scratch root is this box's real `/tmp` (the suite header records that arm reaping four real
+    # checkouts once).
+    printf '#!/usr/bin/env bash\nexit 3\n' >"$base/bin/pi-reap-worktrees.sh"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$base/bin/reap-abandoned-worktrees.sh"
     chmod +x "$base/bin/pi-reap-worktrees.sh" "$base/bin/reap-abandoned-worktrees.sh"
     out="$(DISK_REAPER_STATE_DIR="$base/state" REAP_AW_ROOTS="$base/no-scratch" REAP_DI_ROOTS="$base/no-dups" \
@@ -945,8 +949,8 @@ case_p() { # <owner-script> <entry-point>
                "P and the pass ledger carries the removal the OWNER reported"
     case_check "$(grep -q '^freed_mb_worktree=[0-9]' <<<"$st" && echo 0 || echo 1)" \
                "P and the class record is a MEASURED number (the landed arm's removal is attributed)"
-    case_check "$(grep -q 'verdict_worktree=ok' <<<"$st" && echo 0 || echo 1)" \
-               "P and the class verdict is ok (a wired arm that cannot run would read fail-closed)"
+    case_check "$(grep -q 'verdict_worktree=fail-closed' <<<"$st" && echo 0 || echo 1)" \
+               "P and the REGISTERED arm's own failure is still reported (the landed arm does not launder it)"
     return $((CASE_FAIL > 0))
 }
 
