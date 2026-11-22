@@ -241,6 +241,25 @@ CONTROLLER_START_TIMEOUT="${CONTROLLER_START_TIMEOUT:-600}"
 # The rail can take ~30 s on a healthy PR and longer when it re-runs a flaky job. It is bounded so
 # one PR cannot stall the merge role for the whole interval.
 RAIL_TIMEOUT="${DOCTOR_RAIL_TIMEOUT:-900}"
+# ⛔ THE RAIL'S OWN BOUND IS HANDED IN, NOT ONLY ENFORCED FROM OUTSIDE (agent-infra#4200). A bound
+# applied from the OUTSIDE can only KILL the rail: rc=124 means the merge may or may not have landed,
+# the outcome is unknown, nothing is recorded for the PR, and the same head is offered again on the
+# next pass — measured 5/5 `rc=124 CANNOT-VERIFY` passes on ONE PR (tortoise#14303), 900 s each out of
+# a 2400 s pass budget, buying no information at all. That is an inert enforcer for a whole class of
+# PR: the rail's FIRST-CHECKS and RE-RUN phases are each allowed LONGER than this whole allowance
+# (`ADMIN_MERGE_FIRST_CHECKS_CEILING` 18064 s, `ADMIN_MERGE_RERUN_BUDGET` 1800 s), so any PR that
+# waits on CI long enough can never be answered from here.
+# The rail's OWN deadline guard runs at the head of every poll loop and exits 1 with a named verdict
+# (`REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)`), which this pass classifies, records
+# (`attempt_record`) and cools down exactly like any other refusal — a VERDICT instead of an unknown.
+# So the doctor hands its remaining allowance IN rather than guessing at it from outside:
+# `ADMIN_MERGE_RAIL_DEADLINE` = RAIL_TIMEOUT minus this margin. The margin covers the rail's own
+# start-up (the `cd` into the target checkout, the per-PR claim, the attestation re-read) so the
+# answer arrives BEFORE the outer KILL can land on it.
+# ⛔ IT IS NOT A LONGER LEASE ON THE PASS. The outer bound is unchanged: a rail that ignores its
+# deadline is still KILLed at RAIL_TIMEOUT, and the classification of that death is unchanged. This
+# only gives the rail a chance to answer FIRST, which is the only thing that turns a burn into data.
+RAIL_DEADLINE_MARGIN="${DOCTOR_RAIL_DEADLINE_MARGIN:-60}"
 MERGE_MAX_PRS="${MERGE_MAX_PRS:-100}"
 # ⛔ The merge pass is bounded too, for the same reason as the reap read: without this, a queue of
 # MERGE_MAX_PRS candidates each allowed RAIL_TIMEOUT would block the ONE loop for hours, and the
@@ -331,7 +350,7 @@ for _v in DOCTOR_INTERVAL MERGE_INTERVAL HYGIENE_INTERVAL LOOP_TICK REAP_MIN_S R
           CONTROLLER_STALE_S CONTROLLER_START_TIMEOUT RAIL_TIMEOUT MERGE_MAX_PRS MERGE_RETRY_S \
           HYGIENE_TIMEOUT STALE_WORKTREE_DAYS MIN_FREE_MB DOCTOR_GRACE_S REAP_TIMEOUT \
           READ_CALL_TIMEOUT MERGE_BUDGET_S MERGE_READ_TIMEOUT HYGIENE_TMP_MIN_AGE_S \
-          REGISTRY_STEP_TIMEOUT REGISTRY_SYNC_NET_TIMEOUT; do
+          REGISTRY_STEP_TIMEOUT REGISTRY_SYNC_NET_TIMEOUT RAIL_DEADLINE_MARGIN; do
   num_ok "${!_v}" || { printf 'FATAL: %s must be a whole number 0..999999999 (got "%s")\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WORKTREES must be auto|dry-run|apply (got "%s")\n' "$HYGIENE_WORKTREES" >&2; exit 2 ;; esac
@@ -349,6 +368,14 @@ for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER
           REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S REGISTRY_STEP_TIMEOUT REGISTRY_SYNC_NET_TIMEOUT; do
   [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor, a zero HYGIENE_TMP_MIN_AGE_S leaves a recycled pid as the ONLY proof a temp dir is idle, and a zero registry bound would kill every sync mid-record) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
 done
+# ⛔ THE RAIL DEADLINE IS DERIVED HERE, AFTER BOTH OF ITS OPERANDS ARE VALIDATED (agent-infra#4200).
+# A zero or negative DERIVED value is never handed to the rail: at RAIL_TIMEOUT=1 the shipped margin
+# of 60 s leaves no room to answer in, so NO deadline is handed in and the outer bound is the only
+# guard (exactly the pre-#4200 behaviour, still safe). `ADMIN_MERGE_RAIL_DEADLINE` must be a POSITIVE
+# integer or the rail refuses it BY NAME and exits 2 without running — so a negative derivation passed
+# through would not degrade, it would stop every landing on the cell.
+RAIL_INNER_DEADLINE=$(( RAIL_TIMEOUT - RAIL_DEADLINE_MARGIN ))
+if [ "$RAIL_INNER_DEADLINE" -le 0 ]; then RAIL_INNER_DEADLINE=""; fi
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
 # not that role's own duration — it is the sum of everything that can run in between. Building each
 # stale bound from only its own role's cost made a healthy-but-busy cell read STALE (and `status`
@@ -666,6 +693,23 @@ run_bounded() {
     "$BOUND_TIMEOUT_BIN" -k "$BOUND_KILL_S" "$s" "$@"; return $?
   fi
   bounded "$s" "$@"
+}
+
+# rail_invoke <rail> <pr> <owner/repo> — the merge rail, with this pass's REMAINING ALLOWANCE handed
+# IN (agent-infra#4200) so the rail answers with its OWN named refusal before the outer bound can kill
+# it as an unknown. `ADMIN_MERGE_RAIL_DEADLINE` is set for THIS child only (a prefix assignment, not an
+# export): nothing else the doctor runs reads it, and an operator's ambient value is not overwritten
+# outside this call. `RAIL_INNER_DEADLINE` is empty when RAIL_TIMEOUT leaves no room to answer in, and
+# then the rail is invoked exactly as before — the outer bound is still the whole guard either way.
+rail_invoke() {
+  # ⛔ `${N:-}` NOT `$N` — the two spellings the file's positional audit grades `defaulted`: a bare
+  # read dies on an absent argument under `set -u`, and a helper is exactly where that happens.
+  local r="${1:-}" p="${2:-}" o="${3:-}"
+  if [ -n "${RAIL_INNER_DEADLINE:-}" ]; then
+    ADMIN_MERGE_RAIL_DEADLINE="$RAIL_INNER_DEADLINE" run_bounded "$RAIL_TIMEOUT" bash "$r" "$p" --repo "$o"
+  else
+    run_bounded "$RAIL_TIMEOUT" bash "$r" "$p" --repo "$o"
+  fi
 }
 
 # ── REAP ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1469,7 +1513,10 @@ for p in d:
         skipped=$((skipped + 1)); continue
       fi
     fi
-    ( cd "$REPO" && run_bounded "$RAIL_TIMEOUT" bash "$rail" "$pr" --repo "$OR" ) >>"$out" 2>&1
+    # ⛔ THROUGH `rail_invoke`, NOT `run_bounded` DIRECTLY (agent-infra#4200): the rail is told what is
+    # left of this pass's allowance, so it refuses BY NAME at its own deadline instead of being killed
+    # here as an unknown outcome that records nothing and repeats on the next pass.
+    ( cd "$REPO" && rail_invoke "$rail" "$pr" "$OR" ) >>"$out" 2>&1
     rc=$?
     # Release only what is still OURS: a rail that outlived us must not have its claim deleted.
     [ "$(cat "$cl" 2>/dev/null)" = "$$" ] && rm -f "$cl" 2>/dev/null

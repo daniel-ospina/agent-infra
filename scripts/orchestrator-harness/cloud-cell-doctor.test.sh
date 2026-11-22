@@ -208,6 +208,9 @@ cat > "$T/bin/rail.sh" <<'SH'
 S="${DOCTOR_TEST_RAIL:?}"
 # The rail's flake reproduction runs `git -C "$PWD"`; the cell doctor must invoke it FROM $REPO.
 printf 'cwd=%s argv=%s\n' "$PWD" "$*" >> "$S/calls"
+# The bound the doctor HANDS IN (agent-infra#4200). `<unset>` means it handed none in — the arm that
+# proves a derivation too small to answer in is never passed through as a zero/negative.
+printf 'rail-deadline=%s\n' "${ADMIN_MERGE_RAIL_DEADLINE:-<unset>}" >> "$S/deadline"
 [ -f "$S/sleep" ] && "$REAL_SLEEP" "$(cat "$S/sleep")"
 # A TERM-DEFERRING rail: a shell waiting on a foreground child (the real hang shape) ignores TERM
 # until that child returns. Only a KILL ends it.
@@ -640,6 +643,52 @@ printf '0\n' > "$T/rail/rc"
 doc merge
 [ "$(awk 'END{print NR}' "$T/rail/calls" 2>/dev/null)" = "2" ] && ok "merge: a NEW head at the same PR is eligible again" \
   || bad "merge: a pushed head was permanently suppressed"
+
+# ── 8b) MERGE: the rail's own bound is HANDED IN, not only enforced from outside (agent-infra#4200) ──
+# A bound applied from outside can only KILL the rail (rc=124 = an unknown outcome, nothing recorded,
+# retried every pass). The rail's own deadline guard answers BY NAME at the head of every poll loop,
+# so the doctor tells it what is left of this pass's allowance instead of guessing at it from outside.
+# The arms below are DERIVED, never a constant: two different (timeout, margin) pairs, so a hardcoded
+# value cannot pass, plus the arm where the allowance leaves no room to answer in at all.
+say_case "merge: the rail is HANDED the remaining allowance as its own deadline (agent-infra#4200)"
+rail_deadline_seen() { sed -n 's/^rail-deadline=//p' "$T/rail/deadline" 2>/dev/null | tail -1; }
+rail_arm() { # <pr> <head> <timeout> <margin>
+  reset_state; rm -f "$T/rail/calls" "$T/rail/rc" "$T/rail/deadline"
+  printf '[{"number":%s,"head":{"sha":"%s"},"draft":false}]\n' "$1" "$2" > "$T/gh/prs.json"
+  printf '{"head_sha":"%s","verdict":"clean"}\n' "$2" > "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-$1.json"
+  printf '0\n' > "$T/rail/rc"
+  OUT="$(DOCTOR_RAIL_TIMEOUT="$3" DOCTOR_RAIL_DEADLINE_MARGIN="$4" bash "$DOCTOR" merge 2>&1)"; RC=$?
+}
+HEAD_E="eeee5555eeee5555eeee5555eeee5555eeee5555"
+HEAD_F="ffff6666ffff6666ffff6666ffff6666ffff6666"
+HEAD_G="9999aaaa9999aaaa9999aaaa9999aaaa9999aaaa"
+rail_arm 61 "$HEAD_E" 900 60
+[ "$(rail_deadline_seen)" = "840" ] \
+  && ok "merge: the rail is told 900 - 60 = 840s, so it answers before the outer KILL" \
+  || bad "merge: the rail was handed '$(rail_deadline_seen)' for RAIL_TIMEOUT=900/margin=60 — $OUT"
+# ⛔ PROOF IT IS DERIVED, NOT COINCIDENTAL. A hardcoded 840 (or one operand read twice) passes the arm
+# above and fails this one.
+rail_arm 62 "$HEAD_F" 300 120
+[ "$(rail_deadline_seen)" = "180" ] \
+  && ok "merge: the bound FOLLOWS its operands (300 - 120 = 180s, not the 840 of the arm above)" \
+  || bad "merge: a second (timeout, margin) pair was handed '$(rail_deadline_seen)' — the value is not derived"
+# ⛔ AND IT IS NEVER A NON-POSITIVE VALUE. With an allowance smaller than the margin there is no room to
+# answer in, so no deadline is handed in at all (the pre-#4200 behaviour) — never `0` or a negative,
+# which `admin-merge.sh` refuses BY NAME (exit 2), i.e. it would stop EVERY landing on the cell.
+rail_arm 63 "$HEAD_G" 1 60
+[ "$(rail_deadline_seen)" = "<unset>" ] \
+  && ok "merge: an allowance smaller than the margin hands NO deadline in (never 0 or negative)" \
+  || bad "merge: RAIL_TIMEOUT=1/margin=60 handed '$(rail_deadline_seen)' to the rail — $OUT"
+# ⛔ PUT THE FIXTURES BACK (measured leak: without this the NEXT case graded PR 63). These arms change
+# the candidate listing and add three clean attestations; the case below assumes the listing it was
+# written against (PR 42 at `$HEAD_B`), and its own `reset_state` does NOT touch `$T/gh/prs.json`. A
+# leaked fixture makes a later arm report a verdict about a PR it never set up.
+printf '[{"number":42,"head":{"sha":"%s"},"draft":false}]\n' "$HEAD_B" > "$T/gh/prs.json"
+rm -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-61.json" \
+      "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-62.json" \
+      "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-63.json"
+printf '0\n' > "$T/rail/rc"
+reset_state; rm -f "$T/rail/calls" "$T/rail/deadline"
 
 # An UNREADABLE review store is not "no attestation": every candidate would be skipped and the pass
 # would claim a clean `nothing to land` while reviewed PRs silently never land. It is rc=3, like every
