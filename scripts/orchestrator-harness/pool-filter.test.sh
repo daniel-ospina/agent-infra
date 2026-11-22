@@ -120,6 +120,41 @@ check_excluded 'leading whitespace' "$(iss 900002 '   epic: indented by a human,
 check_excluded 'analysis: (legacy kind)'      "$(iss 900003 'analysis: where the recall loss actually is')"
 check_excluded 'investigation: (legacy kind)'  "$(iss 900004 'investigation: why the container reaper double-fired')"
 
+# ── 1b. APPARATUS KINDS — the owner ruling of 2026-11-22 ─────────────────────────────────────
+# *"only P0/P1, with exceptions for massive bottleneck unblockers."* Priority labels are CUSTOMER
+# IMPACT: an apparatus row (`test(…):`, `docs(…):`, `pin(…):`, `census(…):`, `derive(…):`, `universe:`)
+# is a container around proof of OTHER work, not a customer-visible unit, and it was crowding the
+# pool. ⛔ TWO OF THESE WERE PINNED AS WORK BEFORE THIS RULING (`test(record):` and `docs(…)` sat in
+# §3's INCLUDED list): they are MOVED here rather than deleted, so the reversal is visible in the diff. The rest are
+# apparatus spellings the ruling names; adding a kind is a reviewed test change, exactly like §1.
+check_excluded 'test(record): (apparatus — was pinned as WORK)' \
+  "$(iss 9567 'test(record): capstone — prove the record works end to end')"
+check_excluded 'docs(...): (apparatus — was pinned as WORK)' \
+  "$(iss 900014 'docs(10000): the source vector embeds the NARRATIVE')"
+check_excluded 'tests(...)'        "$(iss 900060 'tests(harness): the refresh suite never runs on macOS')"
+check_excluded 'doc:'              "$(iss 900061 'doc: the onboarding page still shows the 0.x flags')"
+check_excluded 'pin(...)'          "$(iss 900062 'pin(selftest): the extraction contract moved without a witness')"
+check_excluded 'census(...)'       "$(iss 900063 'census(pool): count the container spellings per repo')"
+check_excluded 'cite(...)'         "$(iss 900064 'cite(ontology): every predicate needs a live example')"
+check_excluded 'derive(...)'       "$(iss 900065 'derive(events): the journal is replayed into the graph')"
+check_excluded 'derivation(...)'   "$(iss 900066 'derivation(read-model): one source of truth for the fold')"
+check_excluded 'universe:'         "$(iss 900067 'universe: enumerate every population the fleet grades')"
+
+# ── 1c. THE OPERATOR'S OVERRIDE — `queue-accelerator` LIFTS THE TITLE ARM ─────────────────────
+# The exception is the operator SAYING "this unblocks a bottleneck". It is the only way back in for an
+# excluded TITLE, and it must never lift the assignee arm (§6) or the `standing-constraint` arm (§2) —
+# a declared standing constraint is not dispatchable however urgent it looks.
+check_included 'apparatus + queue-accelerator (the exception)' \
+  "$(iss 900068 'test(record): capstone — prove the record works end to end' 'P2-moderate,queue-accelerator')"
+check_included 'epic + queue-accelerator (the exception)' \
+  "$(iss 900069 'epic(v4): the selection workstream is the bottleneck' 'P1-severe,queue-accelerator')"
+check_included 'override is case-insensitive' \
+  "$(iss 900072 'docs(10000): the vector embeds the NARRATIVE' 'Queue-Accelerator')"
+check_excluded 'standing-constraint + queue-accelerator (label arm is NOT lifted)' \
+  "$(iss 900070 'ops(capture): the hosted capture cap is HELD deliberately' 'P1-severe,standing-constraint,queue-accelerator')"
+check_included 'product work without queue-accelerator' \
+  "$(iss 900071 'fix(queue): a P1 is dispatched on severity alone' 'P1-severe')"
+
 # ── 2. THE DECLARED ARM — a standing constraint is excluded by DECLARATION, not by prose ──────
 # #10175 verbatim: its title is `ops(capture): …`, which no title rule can tell from work. The
 # label is what makes it excludable without an agent reading the words "HELD deliberately".
@@ -140,10 +175,8 @@ check_included 'epic label on a work title (not an exclusion)' \
 check_included 'feat(...)'    "$(iss 900010 'feat(4282): retire the five run_onboarding MCP tools (81 -> 76 live)')"
 check_included 'fix(...)'     "$(iss 900018 'fix(queue): a fix row is work, whatever its number')"
 check_included 'bug(...)'     "$(iss 900011 'bug(queue): the container-title filter misses the spellings the repo uses')"
-check_included 'test(...)'    "$(iss 9567 'test(record): capstone — prove the record works end to end')"
 check_included 'chore(...)'   "$(iss 900012 'chore(deps): bump uv to 0.6.0')"
 check_included 'refactor(...)' "$(iss 900013 'refactor(4282): collapse the five onboarding doors')"
-check_included 'docs(...)'    "$(iss 900014 'docs(10000): the source vector embeds the NARRATIVE')"
 check_included 'perf(...)'    "$(iss 900015 'perf(ask): the dense leg re-embeds every turn')"
 check_included 'defect(...)'  "$(iss 4051 'defect(quota): the commit lane only org-limit gate was the session cap')"
 check_included 'ops(...) unlabelled' "$(iss 900016 'ops(capture): arm the record in the hosted deployment')"
@@ -267,7 +300,7 @@ pin_site() {
   if [ "$tail" = "$want_tail" ]; then ok=$((ok+1))
   else bad=$((bad+1)); echo "FAIL [call site] $label - something was added around the jq argument (tail is '$tail', expected '$want_tail')"; fi
   # …and the PINNED program must still RUN and emit the right shape (quoting, not just bytes).
-  out="$(printf '[%s,%s]' "$(iss 900050 'epic(x): a container')" "$(iss 900051 'fix(y): work')" \
+  out="$(printf '[%s,%s]' "$(iss 900050 'epic(x): a container')" "$(iss 900051 'fix(y): work' 'queue-accelerator')" \
     | POOL_JQ="$SEL" pool_jq="$SEL" eval "jq -r $want" 2>&1)"
   if [ "$out" = "$want_out" ]; then ok=$((ok+1))
   else bad=$((bad+1)); echo "FAIL [call site] $label emitted '$out' - expected '$want_out'"; fi
@@ -283,12 +316,36 @@ SPLICE_LOCAL="'\"\$pool_jq\"'"
 # splice, whatever the fixture says — the same shape §9(b) uses for the definition itself.
 A0="'.[]|${SPLICE_POOL}|\"0 \\(.number)\"'"
 A1="'.[]|${SPLICE_POOL}|\"1 \\(.number)\"'"
-A2="'.[]|${SPLICE_POOL}|\"2 \\(.number)\"'"
+# ⛔ THE P2 ARGUMENT IS NO LONGER THE BARE SPLICE — by the owner ruling of 2026-11-22 the P2 TIER is
+# opt-in, so its query is `select(queue-accelerator) | <shared definition>`. The pin is still EQUALITY
+# against the full argument, so a second arm (either side of the gate), a widened gate or a removed gate
+# still reds; only the blessed gate text is accepted, and it is spelled once here.
+P2_GATE="'.[]|select(((.labels//[])|map(.name|ascii_downcase))|index(\"queue-accelerator\"))|"
+P2_GATE="${P2_GATE}${SPLICE_POOL}"
+A2="${P2_GATE}|\"2 \\(.number)\"'"
 AF="'.[]|${SPLICE_LOCAL}|.number'"
 pin_site 'P0 tier' '|"0 \(.number)"' "$A0" '2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"' '0 900051'
 pin_site 'P1 tier' '|"1 \(.number)"' "$A1" '2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"' '1 900051'
 pin_site 'P2 tier' '|"2 \(.number)"' "$A2" '2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"' '2 900051'
 pin_site 'emergency floor' '"$pool_jq"' "$AF" '> "$o/.emergency-issues" 2>/dev/null; then' '900051'
+
+# ⛔ THE P2 TIER GATE ITSELF, BOTH DIRECTIONS. The owner ruling makes `P2-moderate` opt-in: a P2 row
+# joins the pool ONLY when an operator labels it `queue-accelerator`. Driving the SHIPPED P2 argument
+# (the same `$A2` the equality pin above compares) proves the gate is live in both directions —
+# removing it would leak every P2 back into the pool, and over-applying it would hide a real
+# unblocker. A P2 row with no label must emit NOTHING; the same row with the label must emit its rank.
+p2_plain="$(printf '[%s]' "$(iss 900052 'fix(z): real work, nobody said it unblocks anything')" \
+  | POOL_JQ="$SEL" pool_jq="$SEL" eval "jq -r $A2" 2>&1)"
+p2_accel="$(printf '[%s]' "$(iss 900053 'fix(z): real work that unblocks the bottleneck' 'P2-moderate,queue-accelerator')" \
+  | POOL_JQ="$SEL" pool_jq="$SEL" eval "jq -r $A2" 2>&1)"
+if [ -z "$p2_plain" ] && [ "$p2_accel" = '2 900053' ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [P2 opt-in] the tier gate is not P2-opt-in both ways - unlabelled emitted '$p2_plain' (want empty), labelled emitted '$p2_accel' (want '2 900053')"; fi
+# …and P0/P1 must stay UNGATED: the owner's exception costs a P2 row nothing until the label is used,
+# but a severity P0/P1 must still dispatch with no operator action at all.
+p0_plain="$(printf '[%s]' "$(iss 900054 'bug(z): a P0 needs nobody to bless it')" \
+  | POOL_JQ="$SEL" pool_jq="$SEL" eval "jq -r $A0" 2>&1)"
+if [ "$p0_plain" = '0 900054' ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [P2 opt-in] the opt-in leaked into the P0 tier - an unlabelled P0 emitted '$p0_plain' (want '0 900054')"; fi
 
 # ── 9. THE DRIFT PINS — one definition, one binding, four call sites, no private copies ─────
 # (a) THE SPLICE CENSUS. `grep -c POOL_JQ` is satisfied by comments and by three of four sites, so it
@@ -354,9 +411,23 @@ else bad=$((bad+1)); echo "FAIL [drift] \`POOL_JQ\` is mentioned on ${pj_lines:-
 # UNRELATED listing (`--jq '.[].number'` → `--jq '.[]|select(.number>0)|.number'` at :2534) and accused
 # it of a private pool rule. A container rule necessarily reads `.title` or `.labels`, so those are the
 # queries this census owns; a query that filters on neither is not in the pool path.
-priv="$(printf '%s\n' "$NONCOMMENT" | grep -E -- '--jq.*(select\(|test\()' | grep -cE -- '\.title|\.labels' 2>/dev/null || true)"
-if [ "${priv:-0}" -eq 0 ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [drift] ${priv:-0} \`--jq\` program(s) carry a select(/test( WITHOUT splicing the shared definition - a private pool rule is the drift this file removes"; fi
+# ⛔ AND A QUERY THAT SPLICES THE SHARED DEFINITION IS NOT PRIVATE — that is the census's stated rule
+# ("does not splice the shared definition") finally implemented as written. The P2 tier gate of
+# 2026-11-22 is exactly such a query (`select(queue-accelerator) | $POOL_JQ`), so the census SKIPS
+# spliced lines, and nothing else is exempt: a non-splicing `.title`/`.labels` query reds here whatever
+# it contains. The blessed gate is pinned twice elsewhere — §8 compares the shipped P2 argument to `$A2`
+# byte-for-byte, and the count below pins the accelerator filter to exactly the two blessed sites.
+# ⛔ FIXED-STRING, because the splice text contains a literal `$`: an ERE `$POOL_JQ` is an end-of-line
+# anchor that matches nothing, so a regex filter here silently exempts EVERYTHING (measured).
+privs="$(printf '%s\n' "$NONCOMMENT" | grep -E -- '--jq.*(select\(|test\()' | grep -E -- '\.title|\.labels' | grep -vF -e '$POOL_JQ' -e '$pool_jq' 2>/dev/null || true)"
+priv_count="$(printf '%s\n' "$privs" | grep -c . 2>/dev/null || true)"
+if [ "${priv_count:-0}" -eq 0 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] ${priv_count:-0} \`--jq\` program(s) carry a select(/test( WITHOUT splicing the shared definition - a private pool rule is the drift this file removes"; printf '%s\n' "$privs" | sed 's/^/    /' | head -4; fi
+# …and the blessed exception is EXACTLY ONE, so the gate cannot be copied to a fifth site: the P2 tier
+# argument is pinned by name (§8), and this counts how many --jq programs carry the accelerator filter.
+qa_sites="$(printf '%s\n' "$NONCOMMENT" | grep -cF -- 'index("queue-accelerator")' 2>/dev/null || true)"
+if [ "${qa_sites:-0}" -eq 2 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] the queue-accelerator filter appears on ${qa_sites:-0} non-comment line(s) - expected exactly 2 (the shared definition's title-arm override and the P2 tier gate)"; fi
 
 # (b) THE WHOLE PROGRAM IS PINNED, ONCE, BY WHOLE-TEXT EQUALITY (review cycle 4, P2). The three
 # per-arm pins that used to live here could each be defeated by an ARM APPENDED to the shared program:
@@ -372,7 +443,7 @@ else bad=$((bad+1)); echo "FAIL [drift] ${priv:-0} \`--jq\` program(s) carry a s
 # test change the definition comment promises. If you are here because this check failed, the question
 # is not "how do I make it green" — it is "am I deliberately changing what counts as a work unit, and
 # have I said why in the PR?" `refs #8465` is what it costs when that question goes unasked.
-POOL_PROG_WANT='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+POOL_PROG_WANT='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((((.labels//[])|map(.name|ascii_downcase))|index("queue-accelerator"))!=null or (((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision|test|tests|docs|doc|pin|census|cite|derive|derivation|universe)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i"))|not))'
 if [ "$SEL" = "$POOL_PROG_WANT" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [membership] the pool program changed — update POOL_PROG_WANT in this suite (and say why in the PR) rather than widening, narrowing or re-arming the rule silently"; echo "    got:  $SEL"; echo "    want: $POOL_PROG_WANT"; fi
 

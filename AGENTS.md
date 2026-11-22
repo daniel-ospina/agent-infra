@@ -96,6 +96,29 @@ Every infra issue, gate, guard, workflow step, or refactor is classified **A** o
 
 **This rule exists because of a real drift (2026-09).** The backlog reached ~260 open issues, ~172 of them category B: false blocks, doc drift, gate-format negotiation, and observability of the gates themselves. An epic created to make the workflow *lean* produced six parallel verification passes, two revisions of its own analysis doc, and nine child issues — and its final artifact was a comment formatted to satisfy a check about comment formatting. Roughly two-thirds of measured agent effort went to process machinery. **The tell: you cannot name the product capability that improved.**
 
+## ⛔ HARD RULE: Priority labels are CUSTOMER IMPACT
+
+**A priority label says how much a CUSTOMER is hurt — never how hard the work is, how annoying the bug
+is, or how much an agent wants it done.** `P0-blocker` means the product is broken for someone now;
+`P1-severe` means a real user path is degraded; `P2-moderate` means it matters and can wait. If you
+cannot name the customer who is hurt and the path they lose, it is not a P0 or a P1.
+
+**The dispatch consequence (owner ruling, 2026-11-22):** *"only P0/P1, with exceptions for massive
+bottleneck unblockers."* `P0-blocker` and `P1-severe` dispatch on their label alone. **`P2-moderate` is
+opt-in**: a P2 row joins the pool only when an operator adds the **`queue-accelerator`** label — that
+human's statement that the row unblocks a bottleneck. The same label lifts an apparatus or container
+TITLE (`test(…)`, `docs(…)`, `pin(…)`, `epic: …`) out of `POOL_JQ`'s exclusion; it never lifts the
+`standing-constraint` arm, and never makes an assigned row dispatchable.
+
+**⛔ APPARATUS IS NOT CUSTOMER IMPACT, AND A LABEL IS NOT A WAY TO GET DISPATCH.** The kinds
+`test|tests|docs|doc|pin|census|cite|derive|derivation|universe` are containers around proof of other
+work, excluded from the pool in `refresh-candidates.sh`; that list is a queue-policy decision, and
+`pool-filter.test.sh` pins the exact program, so changing it is a reviewed test change — never a
+runtime guess. Relabelling a row `P1-severe` so it gets picked defeats the filter and lies about
+customer impact; the honest route is `queue-accelerator` plus one line saying what it unblocks.
+**Measured 2026-11-22:** only 13 of 17 open tortoise `P0-blocker` rows and 39 of 55 `P1-severe` rows
+were dispatchable work — the rest were containers, declared standing constraints, or assigned.
+
 ---
 
 ## ⛔ HARD RULE: Fix Broken Infrastructure — Never Silently Work Around It

@@ -3390,12 +3390,23 @@ esac
 # rate-limit answers healthy, so nothing but the POOL varies between cases.
 mk_gh_tiers() {
   local d="$1" p0="$2" p1="$3" p2="$4" label csv n sep rows
+  # ⛔ THE P2 ROWS CARRY `queue-accelerator` — AND THAT IS THE OWNER RULING, NOT A FIXTURE
+  # CONVENIENCE (2026-11-22): *"only P0/P1, with exceptions for massive bottleneck unblockers."* A
+  # `P2-moderate` row is now OPT-IN at the tier query in `refresh-candidates.sh`, so a P2 row with no
+  # operator label is not a pool candidate at all — and every case below is about the WALK (blocked
+  # heads, slot order, the ledger walk-past), not about the opt-in gate. Labelling the fixture's P2
+  # rows as accelerators keeps each case measuring what it says it measures. The gate itself is pinned
+  # in `pool-filter.test.sh` in both directions, so removing it reds there.
   for label in P0-blocker P1-severe P2-moderate; do
     case "$label" in P0-blocker) csv="$p0" ;; P1-severe) csv="$p1" ;; *) csv="$p2" ;; esac
     rows="["; sep=""
     if [ -n "$csv" ]; then
       for n in $(printf '%s' "$csv" | tr ',' ' '); do
-        rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"; sep=","
+        if [ "$label" = "P2-moderate" ]; then
+          rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"labels\":[{\"name\":\"queue-accelerator\"}],\"assignees\":[]}"; sep=","
+        else
+          rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"; sep=","
+        fi
       done
     fi
     printf '%s\n' "$rows]" > "$d/rows.$label"

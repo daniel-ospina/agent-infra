@@ -80,10 +80,25 @@ set -u
 # cannot record the absent-raw state` (#5212), `defect(quota): …` (#4051) — so excluding it would
 # hide work. Narrowing that label's usage is a queue policy decision, not a filter edit.
 #
+# ⛔ APPARATUS KINDS ARE CONTAINERS TOO — `test|tests|docs|doc|pin|census|cite|derive|derivation|universe`
+# (owner ruling, 2026-11-22: *"only P0/P1, with exceptions for massive bottleneck unblockers"*; priority
+# labels are CUSTOMER IMPACT, never effort or annoyance — see the new `## ⛔ HARD RULE: Priority labels are
+# CUSTOMER IMPACT` section in AGENTS.md). An apparatus row (`test(record): capstone — prove the record
+# works`, `pin(selftest): …`, `docs(10000): …`) is a container around proof of OTHER work: it is not a
+# customer-visible unit and it was crowding the queue. This is a DENYLIST addition, so the documented
+# failure direction is unchanged — an unknown spelling stays PICKABLE (#8465 is the silent-disappearance
+# failure this file exists to prevent, and it is the reason this is a reviewed test change rather than a
+# runtime guess: `pool-filter.test.sh` pins the exact program).
+#
+# ⛔ AND THE ONE DELIBERATE WAY OUT: `queue-accelerator` LIFTS the title arm (never the assignee arm and
+# never the `standing-constraint` arm — a declared standing constraint still cannot be dispatched). The
+# operator applies that label to say "this apparatus row is a massive bottleneck unblocker, dispatch it".
+# It is read case-insensitively, like every other label here.
+#
 # ⛔ THIS LINE IS EXTRACTED VERBATIM BY `pool-filter.test.sh`, so it stays ONE single-quoted
 # assignment on ONE line. `\\s` is doubled because a jq string literal needs it doubled; `$L`
 # and `$n` are jq variables and stay unexpanded inside the single quotes.
-POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((((.labels//[])|map(.name|ascii_downcase))|index("queue-accelerator"))!=null or (((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision|test|tests|docs|doc|pin|census|cite|derive|derivation|universe)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i"))|not))'
 OR_FROM_ENV="${OR:-}"
 # ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
 # `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
@@ -4132,8 +4147,15 @@ rm -f "$O/.pool-err" "$O/.pool-read" "$O/.pool-sat"
     --jq '.[]|'"$POOL_JQ"'|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
     [ "${REST_WINDOW_FILLED:-0}" = "1" ] && echo "P1-severe" >> "$O/.pool-sat"
   else echo "P1-severe" >> "$O/.pool-err"; fi
+  # ⛔ P2 IS OPT-IN (owner ruling, 2026-11-22): *"only P0/P1, with exceptions for massive bottleneck
+  # unblockers."* The `P2-moderate` TIER is now gated on the operator's `queue-accelerator` label, so a
+  # P2 row joins the pool only when a human has said it unblocks something — P0 and P1 are unaffected
+  # and still dispatch on severity alone. This is a TIER gate, not a pool-rule change, which is why it
+  # sits in this query and not in `$POOL_JQ`: the shared definition must stay tier-blind, or the same
+  # gate would silence P0/P1 containers-except-accelerators identically. `pool-filter.test.sh` §8 pins
+  # this exact argument by equality, so the gate cannot be quietly widened or removed.
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate --sort created --direction asc \
-    --jq '.[]|'"$POOL_JQ"'|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+    --jq '.[]|select(((.labels//[])|map(.name|ascii_downcase))|index("queue-accelerator"))|'"$POOL_JQ"'|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
     [ "${REST_WINDOW_FILLED:-0}" = "1" ] && echo "P2-moderate" >> "$O/.pool-sat"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
