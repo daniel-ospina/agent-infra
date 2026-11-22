@@ -107,6 +107,7 @@ assert_contains "$OUT" "kept-detached=1" "A: detached tree -> kept-detached"
 assert_contains "$OUT" "kept-ahead=1"  "A: branch with commits -> kept-ahead"
 assert_contains "$OUT" "kept-unprovable=0" "A: every tree was decidable"
 assert_contains "$OUT" "eligible=1"    "A: exactly the landed tree is eligible"
+assert_contains "$OUT" "kept=4"        "A: kept counts only the rows that were KEPT (eligible is not a keep)"
 assert_contains "$OUT" "removed=0"     "A: a dry-run removes nothing"
 assert_contains "$OUT" "skipped=1"     "A: the non-worktree directory is skipped, not examined"
 assert_contains "$OUT" "WOULD-REMOVE path=$R/.worktrees/landed" "A: the 0-ahead tree is named"
@@ -165,9 +166,18 @@ assert_contains "$OUT" "SKIP reason=no-repo" "F: the refusal names the cause"
 G="$(newbase G)"; mkfixture "$G" || exit 1
 run_sut "$G" --repo "$R" --print-config
 assert_eq "$SUT_RC" 0 "G: --print-config exits 0"
-assert_contains "$OUT" "main=origin/main" "G: it names the main ref"
+assert_contains "$OUT" "main=<derived>" "G: an UNDECLARED main ref is reported as derived, not as a value it assumed"
 assert_contains "$OUT" "mode=dry-run" "G: it names the mode"
 assert_contains "$OUT" "budget_seconds=300" "G: it names the time bound"
+# ⛔ A DECLARED VALUE IS NEVER REPLACED BY A DERIVED ONE (agent-infra#1974, point 3).
+run_sut "$G" --repo "$R" --print-config --main origin/main
+assert_contains "$OUT" "main=origin/main" "G: a DECLARED main ref is echoed verbatim"
+# …and the derivation is PRINTED per repo, so a pass record says which ref proved landability.
+run_sut "$G" --repo "$R"
+# The fixture carries refs/remotes/origin/main (the proof ref) and NO remote, so the DERIVED choice is
+# origin/main — the assertion is that the pass NAMES the ref it proved landability against, whichever
+# candidate the derivation picked.
+assert_contains "$OUT" "main=origin/main@" "G: the derivation is PRINTED per repo (which ref proved it)"
 
 # ── G2. THE TIME BOUND stops the pass and every unprobed tree is a KEEP ─────────────────────────
 # ⛔ MEASURED 2026-11-22 on cmux: an UNBOUNDED pass over 42 trees did not finish in 240 s, because one

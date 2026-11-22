@@ -347,6 +347,7 @@ refuse_transient_target() {
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
              reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
              reap-runner-cache.sh \
+             reap-landed-worktrees.sh \
              lib/live-paths.sh lib/cell-home.sh; do
         # ⛔ `reap-runner-cache.sh` IS A DELEGATE THE UNITS PIN (#4169 review, P3). It was missing here,
         # so a box whose install lacked it got a unit that named a class which fails closed (exit 3) every

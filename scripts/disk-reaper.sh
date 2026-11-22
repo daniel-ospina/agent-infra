@@ -975,11 +975,12 @@ find_delegate() { # find_delegate <env-value> <basename>
     return 1
 }
 
-CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""; RUNNER_WORK_REAPER_PATH=""
+CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; LANDED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""; RUNNER_WORK_REAPER_PATH=""
 CACHE_REAPER_PATH="$(find_delegate "${CACHE_REAPER:-}" pi-cache-reap.sh)" || CACHE_REAPER_PATH=""
 VENV_REAPER_PATH="$(find_delegate "${VENV_REAPER:-}" reap-lane-venvs.sh)" || VENV_REAPER_PATH=""
 WORKTREE_REAPER_PATH="$(find_delegate "${WORKTREE_REAPER:-}" pi-reap-worktrees.sh)" || WORKTREE_REAPER_PATH=""
 ABANDONED_WT_REAPER_PATH="$(find_delegate "${ABANDONED_WT_REAPER:-}" reap-abandoned-worktrees.sh)" || ABANDONED_WT_REAPER_PATH=""
+LANDED_WT_REAPER_PATH="$(find_delegate "${LANDED_WT_REAPER:-}" reap-landed-worktrees.sh)" || LANDED_WT_REAPER_PATH=""
 DUP_INSTALL_REAPER_PATH="$(find_delegate "${DUP_INSTALL_REAPER:-}" reap-duplicate-installs.sh)" || DUP_INSTALL_REAPER_PATH=""
 RUNNER_WORK_REAPER_PATH="$(find_delegate "${RUNNER_WORK_REAPER:-}" reap-runner-work.sh)" || RUNNER_WORK_REAPER_PATH=""
 RUNNER_CACHE_REAPER_PATH="$(find_delegate "${RUNNER_CACHE_REAPER:-}" reap-runner-cache.sh)" || RUNNER_CACHE_REAPER_PATH=""
@@ -2021,6 +2022,39 @@ reap_abandoned_arm() {
     return 0
 }
 
+# ── class: worktree, THIRD arm — a repo's own LANDED trees (#4194) ─────────────────────────────
+# WHY A THIRD ARM. The registered arm needs a PR surface (`gh pr list`) for the whole repo and ABORTS
+# the repo when it cannot read one — correctly, by its own policy (#2443/#2756). So on a box whose gh
+# is slow or unauthenticated the class reclaims NOTHING even for rows that need no PR signal. MEASURED
+# 2026-11-22 on cmux: `SKIPPED-REPO reason=gh-timeout(rc=124)`, 0 of 42 trees decided, while 2 of them
+# had a HEAD already on origin/main. `reap-landed-worktrees.sh` decides ONLY that provable subset
+# (clean + ancestor-of-main + no live holder; detached reported and never touched) and needs no
+# network. Its removal surface is a SUBSET of the registered arm's (`refs=merged`, 0-day floor), so it
+# cannot widen anything; it only removes the false block.
+LANDED_OUT=""; LANDED_RC=0; LANDED_REMOVED=0; LANDED_SETUP_FAIL=0
+reap_landed_repo() { # <repo> — sets LANDED_OUT / LANDED_RC / LANDED_REMOVED
+    local repo="$1" out rc rem
+    LANDED_OUT=""; LANDED_RC=0; LANDED_REMOVED=0
+    if [ -z "$LANDED_WT_REAPER_PATH" ]; then
+        LANDED_SETUP_FAIL=1; LANDED_RC=0
+        # ⛔ NOT AN rc=3: this is an ADDITIONAL arm, and reddening the class for it would make every
+        # un-re-farmed box report fail-closed for a sink its required arms are still handling. The
+        # units PIN it (T67), so a deployed box always resolves it; the note is what makes its absence
+        # visible instead of silent.
+        log_line "disk-reaper: note class=worktree arm=landed NOT-DEPLOYED — reap-landed-worktrees.sh not found (looked at \$LANDED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script); the other arms still run, and the #4194 sink is unowned on this box"
+        return 0
+    fi
+    run_class bash "$LANDED_WT_REAPER_PATH" "$(mode_flag)" --repo "$repo"
+    out="$CLASS_OUT"; rc="$CLASS_RC"
+    LANDED_OUT="$out"; LANDED_RC="$rc"
+    log_line "disk-reaper: class=worktree arm=landed repo=$repo $(printf '%s\n' "$out" | sed -n 's/^SUMMARY class=landed-worktree //p' | tail -1)"
+    # The delegate's OWN ledger decides attribution, exactly as the registered arm's does.
+    rem="$(sed -n 's/.* REMOVED=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+    case "${rem:-}" in ''|*[!0-9]*) rem=0 ;; esac
+    LANDED_REMOVED="$rem"
+    return 0
+}
+
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
     local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE="" REPO_ARM_OK=1 _rem WT_REMOVED=0 delegate_rows=""
@@ -2054,6 +2088,25 @@ reap_worktree() {
         wt_repos=$((wt_repos + 1))
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
+        # THE THIRD ARM RUNS INSIDE THIS REPO'S df WINDOW, so the attribution rule below ("the
+        # delegate's own REMOVED ledger decides the delta") covers both owners that worked in it.
+        # ⛔ THE RECORDED PER-REPO SKIP WINS (#2443 / T55): when the registered arm could not verify this
+        # repo's PR surface, the repo's checkouts are UNTOUCHED — and a "landed" tree provably holds no
+        # unique work but is still a checkout a reviewer may be reading. Crossing that invariant is a
+        # REOPEN of #2443, not an implementation detail, so the landed arm is OPT-IN for exactly that
+        # case (`DISK_REAPER_LANDED_ALLOW_UNVERIFIED=1`, a dated operator decision) and OFF by default.
+        case "$out" in
+            *"SKIPPED-REPO: skipped=$repo "*) _wt_skipped=1 ;;
+            *) _wt_skipped=0 ;;
+        esac
+        if [ "$_wt_skipped" = 1 ] && [ "${DISK_REAPER_LANDED_ALLOW_UNVERIFIED:-0}" != 1 ]; then
+            LANDED_OUT=""; LANDED_RC=0
+            log_line "disk-reaper: class=worktree arm=landed repo=$repo not-run reason=registered-arm-skipped (PR surface unverifiable; the landed arm is opt-in for that case: DISK_REAPER_LANDED_ALLOW_UNVERIFIED=1 — #2443)"
+        else
+            reap_landed_repo "$repo"
+            RC_WT="$(worst_rc "$RC_WT" "$LANDED_RC")"
+            rows="${rows}${rows:+$'\n'}${LANDED_OUT}"
+        fi
         a="$(free_kb_for_path "$repo")"
         # ⛔ THE OWNER'S OWN LEDGER DECIDES ATTRIBUTION — `armed pass complete: REMOVED=<n>` is the datum
         # it already publishes. Crediting the window's `df` change unconditionally let a pass with ZERO
@@ -2062,6 +2115,8 @@ reap_worktree() {
         # here as well.
         _rem="$(sed -n 's/.* REMOVED=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
         case "${_rem:-}" in ''|*[!0-9]*) _rem=0 ;; esac
+        # The landed arm's removals are in the SAME window and are attributed the same way.
+        _rem=$((_rem + LANDED_REMOVED))
         WT_REMOVED=$((WT_REMOVED + _rem))
         if [ -n "$b" ] && [ -n "$a" ]; then
             d=$(( (a - b) / 1024 )); raw=$((raw + d))
@@ -3226,7 +3281,7 @@ check_peer_locks
     # operator reads after the fact, and "which filesystem held this pass's lock" decides whether its
     # `df` deltas can be credited to it (agent-infra#2443).
     [ -n "$STATE_DIR_PRIMARY_NOTE" ] && log_line "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the delegates were given it too"
-    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING} runner-work=${RUNNER_WORK_REAPER_PATH:-MISSING} runner-cache=${RUNNER_CACHE_REAPER_PATH:-MISSING}"
+    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} landed=${LANDED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING} runner-work=${RUNNER_WORK_REAPER_PATH:-MISSING} runner-cache=${RUNNER_CACHE_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
 # Heartbeat after each class: a pass that is making progress must never be aged out of its own lock.

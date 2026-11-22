@@ -3832,6 +3832,39 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" \
 assert_contains "${OUT_ZERO}" "install_trigger_free_mb=0 shared_trigger_free_mb=0" \
     "T68 … while the class itself reports the two gates it was handed, at 0"
 
+# ── T69: the worktree class's THIRD arm — a repo's own LANDED trees (#4194) ─────────────────────
+# ⛔ THE ARM EXISTS BECAUSE THE REGISTERED ONE ABORTS THE WHOLE REPO when `gh pr list` fails (#2443),
+# and a row whose HEAD is already on origin/main needs no PR signal at all. MEASURED 2026-11-22 on
+# cmux: `SKIPPED-REPO reason=gh-timeout(rc=124)`, 0 of 42 trees decided, 2 provably removable. So the
+# assertion here is not "it reaps a lot": it is that the arm RUNS on the cadence path, prints its own
+# counters, and that its removal is attributed to its own df window (the `REMOVED=` ledger rule).
+ENVNAME=t69
+REPO_T69="$(mk_repo t69)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\n" "arm-landed-called" >>"${T69_CALLS:-/dev/null}"' \
+    'echo "reading repo=$2 main=origin/main@abc123abc123 mode=apply"' \
+    'echo "WOULD-REMOVE path=$2/.worktrees/x branch=fix/x head=abc123abc123 ahead=0 ancestor=yes"' \
+    'echo "SUMMARY class=landed-worktree repo=$2 mode=apply examined=4 eligible=1 removed=1 kept=2 kept-ahead=2 kept-dirty=0 kept-held=0 kept-detached=1 kept-unprovable=0 skipped=0 deferred=0 failed=0 budget=300s main=origin/main@abc123abc123"' \
+    'echo "reap-landed-worktrees: pass complete mode=apply REMOVED=1 eligible=1 examined=4 failed=0 skipped=0 deferred=0 census_rows=99 budget=300s"' \
+    'exit 0' >"$T/t69-landed.sh"
+chmod +x "$T/t69-landed.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$T/t69-registered.sh"
+chmod +x "$T/t69-registered.sh"
+OUT_T69="$(T69_CALLS="$T/t69/calls" LANDED_WT_REAPER="$T/t69-landed.sh" \
+           WORKTREE_REAPER="$T/t69-registered.sh" run_reaper --apply --repo "$REPO_T69" --only worktree 2>&1)"
+assert_contains "$(cat "$T/t69/calls" 2>/dev/null)" "arm-landed-called" \
+    "T69 the landed arm is INVOKED by the class (a wired arm that never runs is the inert-enforcer shape)"
+assert_contains "$OUT_T69" "arm=landed repo=$REPO_T69" \
+    "T69 the class line names the arm and its repo"
+assert_contains "$OUT_T69" "kept-ahead=2" \
+    "T69 … and carries the delegate's per-condition counters (#4194: each pass prints what it kept)"
+assert_contains "$OUT_T69" "kept-detached=1" \
+    "T69 … including the detached bucket, which is reported and never touched"
+# The removal is attributed: the class must NOT take the "nothing removed" branch that ignores the
+# window's df delta, because the ledger said REMOVED=1.
+assert_absent "$OUT_T69" "nothing removed: the" \
+    "T69 the landed arm's REMOVED=1 reaches the attribution ledger (the window is not read as empty)"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

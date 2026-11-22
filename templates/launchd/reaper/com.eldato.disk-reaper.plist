@@ -91,6 +91,11 @@
              owner is never consulted. Both artifacts must pin the same set. -->
         <key>ABANDONED_WT_REAPER</key>
         <string>{{REAPER_DIR}}/reap-abandoned-worktrees.sh</string>
+        <!-- #4194: the class's THIRD arm (a repo's own `.worktrees` trees whose HEAD is already on
+             the main ref). Pinned like the owners above, so a HOME holding an older farmed copy cannot
+             run a different delete rule than the one installed beside this unit. -->
+        <key>LANDED_WT_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-landed-worktrees.sh</string>
         <key>DUP_INSTALL_REAPER</key>
         <string>{{REAPER_DIR}}/reap-duplicate-installs.sh</string>
         <!-- ⛔ AND THIS ONE, FOR THE SAME REASON AGAIN (#4169 review). `runner-cache` is in the DEFAULT

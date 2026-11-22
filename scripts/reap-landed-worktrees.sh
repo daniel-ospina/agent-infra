@@ -91,7 +91,14 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SCRIPT_NAME="reap-landed-worktrees"
 
 DRY_RUN=1; MODE_EXPLICIT=0
-REPOS=""; MAIN_REF="${REAP_LW_MAIN:-origin/main}"
+REPOS=""; MAIN_EXPLICIT=0
+# ⛔ A DECLARED MAIN REF IS NEVER REPLACED BY A DERIVED ONE (agent-infra#1974, point 3), and an
+# UNDECLARED one is DERIVED rather than assumed: a fixture/consumer repo with no remote has `main`
+# and no `origin/main`, and assuming origin/main there made the arm fail closed on EVERY such repo —
+# which reddened the whole `class=worktree` on the cadence path (measured: 16 assertions in
+# disk-reaper.test.sh, T1/T2/T3/T14/T55/T61/T64). The candidates are tried in order, the chosen ref
+# is PRINTED, and if none resolves the pass still fails closed (nothing can be proven landable).
+if [ -n "${REAP_LW_MAIN:-}" ]; then MAIN_REF="$REAP_LW_MAIN"; MAIN_EXPLICIT=1; else MAIN_REF=""; fi
 PRINT_CONFIG=0
 GIT_TIMEOUT="${REAP_LW_GIT_TIMEOUT:-30}"
 # ⛔ THE TIME BUDGET IS THE REAL GUARD (the family's shape: REAP_WT_BUDGET_SECONDS,
@@ -116,7 +123,7 @@ while [ $# -gt 0 ]; do
         --repo)      [ $# -ge 2 ] || die "--repo needs a path"
                      REPOS="${REPOS}${REPOS:+:}$2"; shift 2 ;;
         --main)      [ $# -ge 2 ] || die "--main needs a ref"
-                     MAIN_REF="$2"; shift 2 ;;
+                     MAIN_REF="$2"; MAIN_EXPLICIT=1; shift 2 ;;
         --print-config) PRINT_CONFIG=1; shift ;;
         --help|-h)   usage ;;
         *)           die "unknown argument: $1 (see --help)" ;;
@@ -130,7 +137,7 @@ MODE_TEXT="dry-run"; [ "$DRY_RUN" = 0 ] && MODE_TEXT="apply"
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'repos=%s\n' "$REPOS"
-    printf 'main=%s\n' "$MAIN_REF"
+    printf 'main=%s\n' "${MAIN_REF:-<derived>}"
     printf 'mode=%s\n' "$MODE_TEXT"
     printf 'budget_seconds=%s\n' "$BUDGET_SECONDS"
     printf 'git_timeout=%s\n' "$GIT_TIMEOUT"
@@ -232,26 +239,47 @@ OFFSET_FILE="$STATEDIR/reap-landed-worktrees.offset"
 
 # ── per-repo sweep ───────────────────────────────────────────────────────────────────────────────
 sweep_repo() { # <repo-path>
-    local repo="$1" canon main_sha censusdir census c path br head12 ahead anc dirty_n
+    # ⛔ IFS IS PART OF THIS FUNCTION'S CONTRACT. The caller iterates `$REPOS` with IFS=':' (a
+    # colon-separated list), and that setting is STILL IN FORCE inside the body — so an unquoted
+    # candidate list here split into ONE word and every repo failed `main-unresolved`. Measured
+    # 2026-11-22: rc=3 on all 56 suite assertions with a ref the box demonstrably had.
+    local IFS=$' \t\n'
+    local repo="$1" canon main_sha main_ref censusdir census c path br head12 ahead anc dirty_n
     local examined=0 eligible=0 removed=0 failed=0 skipped=0 deferred=0 deadline now
     local CANDS="" n_cands=0 off=0 i=0 new_off=0
     local kept_ahead=0 kept_dirty=0 kept_held=0 kept_detached=0 kept_unprovable=0
     local self_pwd now_sha now_dirty why
 
     canon="$(cd "$repo" 2>/dev/null && pwd -P)" || { note "$SCRIPT_NAME: repo '$repo' is not a directory — skipped"; RC=3; return 1; }
-    [ -d "$canon/.worktrees" ] || { say "reading repo=$canon worktrees=none (no .worktrees directory)"; return 0; }
+    # ⛔ "NO .worktrees DIRECTORY" IS AN ANSWER, NOT A FAILURE: a repo that keeps no trees must not be
+    # recorded as a repo that could not be swept (that turned an empty sink into exit 3).
+    if [ ! -d "$canon/.worktrees" ]; then
+        say "reading repo=$canon worktrees=none (no .worktrees directory)"
+        REPO_N=$((REPO_N + 1))
+        return 0
+    fi
 
     # ⛔ THE MAIN REF IS THE PROOF. If it cannot be resolved, NOTHING in this repo can be shown to have
-    # landed, so the pass refuses the repo instead of degrading to a per-row guess.
-    main_sha="$(git_at "$canon" rev-parse --verify --quiet "$MAIN_REF^{commit}")" || main_sha=""
+    # landed, so the pass refuses the repo instead of degrading to a per-row guess. A DERIVED ref is
+    # tried against the box's own candidate list; a DECLARED one is taken as given.
+    if [ "$MAIN_EXPLICIT" = 1 ]; then
+        cands_main="$MAIN_REF"
+    else
+        cands_main="origin/main main master refs/remotes/origin/HEAD"
+    fi
+    main_sha=""; main_ref=""
+    for _m in $cands_main; do
+        main_sha="$(git_at "$canon" rev-parse --verify --quiet "$_m^{commit}")" || main_sha=""
+        if [ -n "$main_sha" ]; then main_ref="$_m"; break; fi
+    done
     if [ -z "$main_sha" ]; then
-        note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — main ref '$MAIN_REF' does not resolve in $canon; nothing in this repo was reaped (exit 3)"
-        say "SKIP reason=main-unresolved repo=$canon main=$MAIN_REF"
+        note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no main ref resolves in $canon (tried: $cands_main); nothing in this repo was reaped (exit 3)"
+        say "SKIP reason=main-unresolved repo=$canon main=${MAIN_REF:-<none>}"
         RC=3; return 1
     fi
 
     # Indicator 3 (#4194): each pass prints the reading it used.
-    say "reading repo=$canon main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
+    say "reading repo=$canon main=$main_ref@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
 
     censusdir="$(mktemp -d "${TMPDIR:-/tmp}/reap-landed.XXXXXX")" || {
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no scratch dir under ${TMPDIR:-/tmp}; nothing was reaped (exit 3)"
@@ -335,9 +363,9 @@ sweep_repo() { # <repo-path>
         # `kept-ahead` whatever its working-tree state).
         # BOTH readings are taken and printed: the count is the reading #4194 names, ancestry is the
         # proof the incumbent uses. Anything unreadable is NOT zero.
-        ahead="$(git_at "$path" rev-list --count "$MAIN_REF..$br")" || ahead=""
+        ahead="$(git_at "$path" rev-list --count "$main_ref..$br")" || ahead=""
         anc="no"
-        if git_at "$path" merge-base --is-ancestor "$head12" "$MAIN_REF" >/dev/null 2>&1; then anc="yes"; fi
+        if git_at "$path" merge-base --is-ancestor "$head12" "$main_ref" >/dev/null 2>&1; then anc="yes"; fi
         if guard_ahead "$ahead" "$anc" "$br"; then
             kept_ahead=$((kept_ahead + 1)); say "KEPT reason=$GUARD_REASON path=$path"
             continue
@@ -404,7 +432,7 @@ sweep_repo() { # <repo-path>
     TOTAL_REMOVED=$((TOTAL_REMOVED + removed)); TOTAL_FAILED=$((TOTAL_FAILED + failed))
     TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped)); REPO_N=$((REPO_N + 1)); TOTAL_DEFERRED=$((TOTAL_DEFERRED + deferred))
 
-    say "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - removed - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12)"
+    say "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - eligible - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$main_ref@$(printf '%s' "$main_sha" | cut -c1-12)"
     [ "$failed" -gt 0 ] && RC=1
     return 0
 }
