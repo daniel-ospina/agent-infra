@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-14232-ingest-async-1795298065-p3283945-0fcee47b",
+  "_sha": "e9b46bc0d2be502f49b67672a5fc40e17d281566",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/14232-ingest-async.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14232-ingest-ack-async"
+    },
+    {
+      "kind": "sha",
+      "value": "2285bebc1e966d744af228853b07e37f774c35bd"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/14232-ingest-async"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 26971,
+  "ended_at": 1795325036,
+  "exit_code": 0,
+  "heartbeat_at": 1795325036,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-14232-ingest-async-1795298065-p3283945-0fcee47b",
+  "lease_until": 1795361636,
+  "pid": 3283945,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795298065,
+  "state": "DONE",
+  "tag": "14232-ingest-async",
+  "worktree": "/home/cmux/tortoise/.worktrees/14232-ingest-async"
+}
