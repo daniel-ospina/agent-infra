@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795381183,
+  "host": "cmux",
+  "issue": 14314,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-14314-1795381183-p3715489-a4dbe13c",
+  "lease_until": 1795417783,
+  "pid": 3715489,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795381183,
+  "state": "RUNNING",
+  "tag": "14314",
+  "worktree": "/home/cmux/tortoise"
+}
