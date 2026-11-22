@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 2400,
+  "exit_code": null,
+  "heartbeat_at": 1795353665,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-stallfix-20261122T132031Z-1795353665-p2710241-02748fe8",
+  "lease_until": 1795356065,
+  "pid": 2710241,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795353665,
+  "state": "RUNNING",
+  "tag": "stallfix-20261122T132031Z",
+  "worktree": "/home/cmux/orchestrator/state/wt-stallfix"
+}
