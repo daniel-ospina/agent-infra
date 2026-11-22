@@ -49,6 +49,11 @@ Environment=REAP_WT_GH_TIMEOUT=120
 # surplus copies of the same runner install). Pinned for the same reason as the three above.
 Environment=ABANDONED_WT_REAPER={{REAPER_DIR}}/reap-abandoned-worktrees.sh
 Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
+# #4194: the THIRD `worktree` arm — a repo's OWN `.worktrees/*` trees whose work has LANDED. Pinned for
+# the same reason as every owner above: a pin that resolved to an older farmed copy (or to none, through
+# `find_delegate`'s `$HOME` fallback) would run a DIFFERENT delete rule, or report the class
+# `misconfigured` on every pass while the unit still said it was scheduled.
+Environment=LANDED_WT_REAPER={{REAPER_DIR}}/reap-landed-worktrees.sh
 # The runner `_work` sink: 19 G of dead job checkout on a box at 98% (2026-10-28). Pinned for the
 # same reason as the owners above — and this class is the one with no pre-existing policy owner,
 # so a pin that resolved to an older farmed copy would run a DIFFERENT delete rule.

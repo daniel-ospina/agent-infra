@@ -183,6 +183,119 @@ assert_contains "$OUT" "eligible=0" "G2: a spent budget proves nothing eligible"
 assert_contains "$OUT" "reason=budget" "G2: the deferral names the bound that stopped it"
 [ -d "$R/.worktrees/landed" ] && ok "G2: the eligible tree survives a spent budget" || bad "G2: a tree was removed past the budget"
 
+# ── G3. ZERO CANDIDATES is a PASS, not an unbound variable ─────────────────────────────────────
+# ⛔ THE TRIGGER IS THE STATE THIS SCRIPT ITSELF PRODUCES. A successful pass removes the checkout and
+# leaves `<repo>/.worktrees/` in place — so the very next pass over that repo has `.worktrees` with no
+# LINKED worktree in it (a plain directory, or nothing at all). `CANDS` was a SCALAR (`CANDS=""`) and
+# `${#CANDS[@]}` on a scalar under `set -u` aborts the whole function on bash 5.2: no SUMMARY (indicator
+# 3), `REPO_N` never incremented (so a one-repo pass exits 3 `no-sweepable-repo`, which a disk-reaper
+# class reads as fail-closed), and the `mktemp -d` census dir leaks once per repo per pass. No fixture
+# had zero candidates, so the suite could not see it.
+G3="$(newbase G3)"
+git init -q "$G3/repo" && git -C "$G3/repo" config user.email t@e && git -C "$G3/repo" config user.name t \
+    && printf 'one\n' >"$G3/repo/a.txt" && git -C "$G3/repo" add a.txt \
+    && git -C "$G3/repo" commit -qm one && git -C "$G3/repo" update-ref refs/remotes/origin/main HEAD \
+    || { echo "G3 fixture failed" >&2; exit 1; }
+mkdir -p "$G3/repo/.worktrees/plain" "$G3/proc/self" "$G3/proc/1"
+printf 'data\n' >"$G3/repo/.worktrees/plain/keep.txt"
+ln -s / "$G3/proc/self/cwd"; ln -s / "$G3/proc/1/cwd"; ln -s / "$G3/proc/1/exe"; printf 'sh\0' >"$G3/proc/1/cmdline"
+run_sut "$G3" --repo "$G3/repo"
+assert_eq "$SUT_RC" 0 "G3: a repo whose .worktrees holds no LINKED tree exits 0, not 3"
+assert_absent "$OUT" "unbound variable" "G3: …and nothing aborts on an empty candidate set"
+assert_contains "$OUT" "reading repo=" "G3: …the pass still announces the repo"
+assert_contains "$OUT" "SUMMARY class=landed-worktree repo=" "G3: …and still prints its SUMMARY (indicator 3)"
+assert_contains "$OUT" "examined=0 eligible=0 removed=0" "G3: …with a measured zero, not a crash"
+assert_contains "$OUT" "pass complete" "G3: …and the pass-complete ledger (the REMOVED= datum a caller reads)"
+# The mutation is the pre-fix shape: the scalar. A control that cannot go red proves nothing, so the
+# header's scalar form is reconstructed on a COPY and the same fixture must then FAIL.
+sed 's/^    local -a CANDS=()$/    local CANDS=""/; s/^        CANDS+=("\$c")$/        CANDS=(${CANDS[@]:+"${CANDS[@]}"} "$c")/' "$SUT" >"$T/m_scalar.sh"
+if cmp -s "$SUT" "$T/m_scalar.sh"; then
+    bad "G3 control: the scalar-CANDS mutation did not apply (the declaration moved) — the case is not checking it"
+else
+    bash -n "$T/m_scalar.sh" && ok "G3: the scalar-CANDS control parses" || bad "G3: the scalar-CANDS control does not parse"
+    OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G3/proc" REAP_LW_STATE_DIR="$G3/state" \
+               bash "$T/m_scalar.sh" --repo "$G3/repo" 2>&1)"; SUT_RC=$?
+    assert_contains "$OUT" "unbound variable" "G3 control: the SCALAR form really does abort (the pre-fix defect)"
+    assert_eq "$SUT_RC" 3 "G3 control: …and the abort turns the pass into a fail-closed exit 3"
+fi
+
+# ── G4. REAP_LW_LIVE_PATHS IS AUTHORITATIVE, AND A SET-BUT-MISSING VALUE REFUSES ────────────────
+# ⛔ THE CENSUS IS THE ENTIRE LIVE-HOLDER PREDICATE (`git worktree remove` cannot protect a live lane
+# sitting in a clean landed tree), so a silently substituted census implementation is the one hazard the
+# script's own `REAP_LW_PROC_ROOT` comment forbids one seam over. The seam was APPENDED to the ladder
+# after `$SELF_DIR/lib/live-paths.sh` — a file this repo SHIPS — so the shipped copy always won, and the
+# refusal branch below was unreachable in the normal layout.
+G4="$(newbase G4)"; mkfixture "$G4" || exit 1
+# (a) SET BUT MISSING is a REFUSAL, never a fallback to the shipped library.
+OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G4/proc" \
+           REAP_LW_LIVE_PATHS="/nonexistent/pinned-live-paths.sh" REAP_LW_STATE_DIR="$G4/state" \
+           bash "$SUT" --repo "$R" --apply 2>&1)"; SUT_RC=$?
+assert_eq "$SUT_RC" 3 "G4 a SET-but-missing REAP_LW_LIVE_PATHS is FAIL-CLOSED (exit 3)"
+assert_contains "$OUT" "SKIP reason=census-library-missing" "G4 …and the refusal names the census library"
+assert_contains "$OUT" "/nonexistent/pinned-live-paths.sh" "G4 …with the path the operator pinned"
+[ -d "$R/.worktrees/landed" ] && ok "G4 …and nothing was removed (the shipped library was NOT substituted)" \
+    || bad "G4 a tree was removed: the pinned-but-missing path fell through to the shipped library"
+# (b) A READABLE PIN IS THE ONE USED. This stub reports EVERY path as held, so a pass that consulted the
+# SHIPPED library instead would find the landed tree eligible and (with --apply) remove it.
+cat >"$T/pinned-live-paths.sh" <<'PIN'
+LP_CENSUS_ROWS=1; LP_CENSUS_PIDS=1; LP_CENSUS_MECH="pinned-stub"
+lp_census() { : >"$1/live-paths.tsv"; return 0; }
+LP_HOLD_WHY=""
+lp_path_held() { LP_HOLD_WHY="pinned-census"; return 0; }
+LP_NAME_WHY=""
+lp_path_named() { return 1; }
+PIN
+OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G4/proc" \
+           REAP_LW_LIVE_PATHS="$T/pinned-live-paths.sh" REAP_LW_STATE_DIR="$G4/state" \
+           bash "$SUT" --repo "$R" --apply 2>&1)"; SUT_RC=$?
+assert_eq "$SUT_RC" 0 "G4 a readable pin runs the pass"
+assert_contains "$OUT" "kept-held=5" "G4 …and the PINNED census answered for every tree (not the shipped one)"
+assert_contains "$OUT" "detail=pinned-census" "G4 …naming the pinned implementation as the reason"
+assert_contains "$OUT" "eligible=0" "G4 …so the landed tree is not eligible under the pin"
+[ -d "$R/.worktrees/landed" ] && ok "G4 …and nothing was removed" \
+    || bad "G4 a tree was removed: the pin was ignored and the shipped census decided"
+
+# ── G5. THE EXIT CONTRACT: 3 OUTRANKS 4, AND A FAILED REMOVAL IS 4 ─────────────────────────────
+# ⛔ THE CALLER IS `disk-reaper.sh`, whose `delegate_rc worktree` reads these codes: 3 = fail-closed,
+# 4 = a removal FAILED. This script published 1 for "a removal failed" while its header claimed the
+# caller "maps them unchanged" — `delegate_rc` has no arm for 1 and maps it to 3, so a failed removal
+# would surface as "it FAILED CLOSED, nothing was reaped". And `[ "$failed" -gt 0 ] && RC=1` overwrote
+# an earlier repo's 3, so one unprovable repo + one failed removal exited 1.
+# git wrapper: every subcommand passes through EXCEPT `worktree remove`, which is the one failure a
+# fixture cannot otherwise produce (a removal refused by git).
+REAL_GIT="$(command -v git)"
+cat >"$T/git-noremove.sh" <<GITWRAP
+#!/usr/bin/env bash
+for a in "\$@"; do [ "\$a" = remove ] && case " \$* " in *" worktree "*) exit 1 ;; esac; done
+exec "$REAL_GIT" "\$@"
+GITWRAP
+chmod +x "$T/git-noremove.sh"
+G5="$(newbase G5)"; mkfixture "$G5" || exit 1
+OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G5/proc" GIT_BIN="$T/git-noremove.sh" \
+           REAP_LW_STATE_DIR="$G5/state" bash "$SUT" --repo "$R" --apply 2>&1)"; SUT_RC=$?
+assert_eq "$SUT_RC" 4 "G5 a removal git refused exits 4 (the family's 'a removal FAILED'), not 1 and not 3"
+assert_contains "$OUT" "FAILED path=$R/.worktrees/landed" "G5 …and the row is named"
+assert_contains "$OUT" "failed=1" "G5 …and counted"
+[ -d "$R/.worktrees/landed" ] && ok "G5 …and the tree is still there" || bad "G5 the tree vanished from a refused removal"
+# (b) TWO REPOS: one cannot be proven (exit 3), one has a refused removal (4). 3 must survive.
+G5B="$(newbase G5B)"; mkfixture "$G5B" || exit 1
+G5C="$(newbase G5C)"; mkfixture "$G5C" || exit 1
+# repo G5C loses the proof ref: main is unresolvable THERE, so that sweep fails closed by itself.
+git -C "$G5C/repo" update-ref -d refs/remotes/origin/main
+OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G5B/proc" GIT_BIN="$T/git-noremove.sh" \
+           REAP_LW_STATE_DIR="$G5B/state" bash "$SUT" --repo "$G5C/repo" --repo "$G5B/repo" --apply 2>&1)"; SUT_RC=$?
+assert_contains "$OUT" "SKIP reason=main-unresolved repo=$G5C/repo" "G5 (b) the unprovable repo fails closed"
+assert_contains "$OUT" "FAILED path=$G5B/repo/.worktrees/landed" "G5 (b) …while the other repo's removal is attempted and fails"
+assert_eq "$SUT_RC" 3 "G5 (b) the pass keeps 3: 'nothing could be proven here' outranks 'a removal failed'"
+# (c) …and it is still 3 when that earlier repo DID remove trees (the other half of the same rule).
+G5D="$(newbase G5D)"; mkfixture "$G5D" || exit 1
+G5E="$(newbase G5E)"; mkfixture "$G5E" || exit 1
+git -C "$G5E/repo" update-ref -d refs/remotes/origin/main
+OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$G5D/proc" \
+           REAP_LW_STATE_DIR="$G5D/state" bash "$SUT" --repo "$G5E/repo" --repo "$G5D/repo" --apply 2>&1)"; SUT_RC=$?
+assert_contains "$OUT" "REMOVED path=$G5D/repo/.worktrees/landed" "G5 (c) the second repo really removed its tree"
+assert_eq "$SUT_RC" 3 "G5 (c) …and the pass still exits 3, so 'removed something' never masks 'unproven'"
+
 # ── H. THE MUTATION ARMS: delete ONE guard, and THAT arm must redden ────────────────────────────
 # mutant <guard> <function-name> <out-file> — replace the guarded function's body with `return 1`
 # (never keep), leaving a parseable script.

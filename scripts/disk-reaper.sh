@@ -50,12 +50,20 @@
 #                                                                 witnesses; fail-closed
 #   worktree   scripts/pi-reap-worktrees.sh   (#1095)             clean, reachable, holder-free,
 #              + scripts/reap-abandoned-worktrees.sh (#2542)       un-open-PR checkouts; merged heads
-#                                                                 are exempt from the 7-day floor.
+#              + scripts/reap-landed-worktrees.sh (#4194)         are exempt from the 7-day floor.
 #                                                                 The SECOND arm covers what that
 #                                                                 policy cannot reach: abandoned
 #                                                                 LINKED worktree dirs under a scratch
 #                                                                 root (age > 180 min AND no live
-#                                                                 process's cwd/exe inside)
+#                                                                 process's cwd/exe inside). The
+#                                                                 THIRD (landed) arm covers #4168
+#                                                                 class 7 — a repo's OWN
+#                                                                 `<repo>/.worktrees/*` trees — whose
+#                                                                 answer needs NO PR surface, and so
+#                                                                 is the one arm that still decides
+#                                                                 when `gh` cannot (that is exactly
+#                                                                 the box `pi-reap-worktrees.sh`
+#                                                                 aborts: exit 3, 0 trees decided)
 #   duplicate-install  scripts/reap-duplicate-installs.sh (#2542)  surplus copies of the same tool
 #                                                                 install (a runner family), removing
 #                                                                 only copies PROVEN idle, always
@@ -975,11 +983,12 @@ find_delegate() { # find_delegate <env-value> <basename>
     return 1
 }
 
-CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""; RUNNER_WORK_REAPER_PATH=""
+CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; LANDED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""; RUNNER_WORK_REAPER_PATH=""
 CACHE_REAPER_PATH="$(find_delegate "${CACHE_REAPER:-}" pi-cache-reap.sh)" || CACHE_REAPER_PATH=""
 VENV_REAPER_PATH="$(find_delegate "${VENV_REAPER:-}" reap-lane-venvs.sh)" || VENV_REAPER_PATH=""
 WORKTREE_REAPER_PATH="$(find_delegate "${WORKTREE_REAPER:-}" pi-reap-worktrees.sh)" || WORKTREE_REAPER_PATH=""
 ABANDONED_WT_REAPER_PATH="$(find_delegate "${ABANDONED_WT_REAPER:-}" reap-abandoned-worktrees.sh)" || ABANDONED_WT_REAPER_PATH=""
+LANDED_WT_REAPER_PATH="$(find_delegate "${LANDED_WT_REAPER:-}" reap-landed-worktrees.sh)" || LANDED_WT_REAPER_PATH=""
 DUP_INSTALL_REAPER_PATH="$(find_delegate "${DUP_INSTALL_REAPER:-}" reap-duplicate-installs.sh)" || DUP_INSTALL_REAPER_PATH=""
 RUNNER_WORK_REAPER_PATH="$(find_delegate "${RUNNER_WORK_REAPER:-}" reap-runner-work.sh)" || RUNNER_WORK_REAPER_PATH=""
 RUNNER_CACHE_REAPER_PATH="$(find_delegate "${RUNNER_CACHE_REAPER:-}" reap-runner-cache.sh)" || RUNNER_CACHE_REAPER_PATH=""
@@ -2021,9 +2030,105 @@ reap_abandoned_arm() {
     return 0
 }
 
+# ── class: worktree, THIRD arm — a repo's OWN `<repo>/.worktrees/*` whose work LANDED (#4194) ───
+# WHY A THIRD OWNER (#4168 class 7). The registered arm above answers "is this checkout finished?" and it
+# answers through BATCHED PR state — correctly, but `gh` unavailable means the whole repo ABORTS
+# (`SKIPPED-REPO … reason=gh-timeout`, exit 3) and 0 trees are decided. MEASURED 2026-11-22 on cmux,
+# `/home/cmux/agent-infra`, 42 trees, volume at 90%: the incumbent refused the repo outright while three
+# trees were provably ZERO commits ahead of `origin/main`. A tree whose HEAD is already on main cannot
+# hold work a PR surface would protect, so it needs no PR surface to decide — that is the entire arm.
+# #4168's inventory measured the population it covers: 48.3 GB / 78 trees on pi-cell-4, 13.3 GB / 391
+# trees on the Mac, and it was the one row of that inventory with NO owner.
+#
+# ⛔ IT IS A SEPARATE OWNER, NOT A RULE IN HERE — the same rule the abandoned arm states, for the same
+# reason (#2032: the entry point never becomes a fourth copy of a deletion policy). Its four conditions
+# (clean, 0-ahead AND an ancestor of main, holder-free per the SHARED census, not detached), its
+# fail-closed exits and its mutation-tested guard markers all live in
+# `scripts/reap-landed-worktrees.sh`. This function only accounts:
+#   * one `df` reading per repo, before and after, never a `du` sum;
+#   * the owner's own `REMOVED=<n>` from its pass-complete ledger is what ATTRIBUTES that delta — a pass
+#     that removed nothing does not get to claim another process's freed bytes (the family rule);
+#   * its rc goes through `delegate_rc worktree`, so 3 (fail-closed) stays 3 and 4 (a removal FAILED)
+#     stays 4. That mapping is why the owner publishes 4 and not 1: `delegate_rc` has no arm for 1, so
+#     a failed removal would have been reported as "it FAILED CLOSED, nothing was reaped".
+#   * ⛔ A MISSING OWNER IS `misconfigured`, NOT `fail-closed` — "there was nothing to run" and "the
+#     delegate ran and could not do the work" are different remedies (the abandoned arm's rule, and the
+#     installer WARNS on this file exactly as it does for every other pinned delegate).
+reap_landed_arm() {
+    local repo b a d out rc _rem _x _y _ln
+    LW_FREED=0; LW_RAW=0; LW_MEASURED=1; LW_OUT=""; LW_NOTE=""; LW_REMOVED=0; LW_SETUP_FAIL=0
+    LW_EXAMINED=""; LW_ELIGIBLE=""
+    if [ -z "$LANDED_WT_REAPER_PATH" ]; then
+        log_line "disk-reaper: ⛔ class=worktree arm=landed FAIL-CLOSED — reap-landed-worktrees.sh not found (looked at \$LANDED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
+        LW_NOTE="landed-worktree owner missing"
+        LW_SETUP_FAIL=1
+        RC_WT="$(worst_rc "$RC_WT" 3)"
+        MISCONFIG="${MISCONFIG}${MISCONFIG:+, }landed-worktree-delegate-missing"
+        return 0
+    fi
+    # ⛔ NO REPO, NO SWEEP — and NOT a second failure: `worktree-no-repo` is already the registered
+    # arm's finding for this pass, and stating it twice in `detail=` would name one cause as two.
+    [ -n "$REPOS" ] || return 0
+    while IFS= read -r repo; do
+        [ -n "$repo" ] || continue
+        b="$(free_kb_for_path "$repo")"
+        # ⛔ THE ROTATION OFFSET LIVES IN THE PASS'S OWN STATE DIR, not in a second one derived from
+        # `$HOME`. The owner's default is `$HOME/.pi/agent/state` — the same place this pass keeps its
+        # lock, its log and its record — so forwarding `$STATE_DIR` keeps ONE state dir per box (and
+        # follows an operator's `DISK_REAPER_STATE_DIR`), exactly as `REAP_WT_LOG`/`REAP_AW_LOG` are
+        # derived from it above. An empty value falls back to the owner's default.
+        run_class env REAP_LW_STATE_DIR="${REAP_LW_STATE_DIR:-${STATE_DIR:-}}" \
+                  bash "$LANDED_WT_REAPER_PATH" "$(mode_flag)" --repo "$repo"
+        out="$CLASS_OUT"; rc="$CLASS_RC"
+        a="$(free_kb_for_path "$repo")"
+        log_line "$out"
+        LW_OUT="${LW_OUT}${LW_OUT:+$'\n'}$out"
+        _rem="$(sed -n 's/.* REMOVED=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+        case "${_rem:-}" in ''|*[!0-9]*) _rem="" ;; esac
+        [ -n "$_rem" ] && LW_REMOVED=$((LW_REMOVED + _rem))
+        # The class line's `landed_*` fields come from the owner's OWN SUMMARY, per repo summed. Absent
+        # (`""`) means it printed no SUMMARY — an older copy, or a pass that died mid-write — and the
+        # class line then says `?` rather than inventing a zero.
+        _x="$(sed -n 's/^SUMMARY .* examined=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+        _y="$(sed -n 's/^SUMMARY .* eligible=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+        case "${_x:-}" in ''|*[!0-9]*) _x="" ;; esac
+        case "${_y:-}" in ''|*[!0-9]*) _y="" ;; esac
+        # BOTH or NEITHER: a half-parsed pair published as a sum would report `examined` from one repo
+        # and `eligible` from another, so an unparseable SUMMARY blanks BOTH (`?` on the class line).
+        if [ -n "$_x" ] && [ -n "$_y" ]; then
+            LW_EXAMINED=$(( ${LW_EXAMINED:-0} + _x )); LW_ELIGIBLE=$(( ${LW_ELIGIBLE:-0} + _y ))
+        else
+            LW_EXAMINED=""; LW_ELIGIBLE=""
+        fi
+        if [ -n "$b" ] && [ -n "$a" ]; then
+            d=$(( (a - b) / 1024 )); LW_RAW=$((LW_RAW + d))
+            if [ -n "$_rem" ] && [ "$_rem" -gt 0 ]; then
+                [ "$d" -lt 0 ] && d=0; LW_FREED=$((LW_FREED + d))
+            fi
+        else
+            LW_MEASURED=0
+        fi
+        RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
+        if [ "$rc" -gt 0 ]; then
+            _ln="$(note_for reap-landed-worktrees.sh "$rc" worktree)"
+            case "; ${LW_NOTE:-};" in *"; $_ln;"*) : ;; *) LW_NOTE="${LW_NOTE}${LW_NOTE:+; }$_ln" ;; esac
+        fi
+    done <<<"$(printf '%s\n' "$REPOS" | tr ':' '\n')"
+    # ⛔ NOTHING REMOVED MEANS THE DELTA IS NOT OURS — the same observation-vs-attribution rule the
+    # other two arms carry (measured: `freed_df=44MB` credited to a pass that removed no candidate).
+    if [ "${LW_REMOVED:-0}" = 0 ] && ! is_dry; then
+        [ "$LW_RAW" != 0 ] && LW_NOTE="${LW_NOTE}${LW_NOTE:+; }landed arm removed nothing: the ${LW_RAW}MB df change belongs to another process (not attributed)"
+        LW_FREED=0
+    fi
+    if [ -n "$LW_NOTE" ]; then
+        case "; $NOTE_WT;" in *"; $LW_NOTE;"*) : ;; *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }$LW_NOTE" ;; esac
+    fi
+    return 0
+}
+
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE="" REPO_ARM_OK=1 _rem WT_REMOVED=0 delegate_rows=""
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE="" REPO_ARM_OK=1 _rem WT_REMOVED=0 delegate_rows="" WT_SCAN_REPOS="" LANDED_EXTRA=""
     # ⛔ NEITHER OF THESE IS A `return` ANY MORE (#2542). The class has TWO arms, and the abandoned
     # arm needs no repo and no registered-checkout policy: returning here made the class's ONLY working
     # arm skip itself on exactly the cell #2443 measured — the one with no `--repo`, where the disk
@@ -2041,12 +2146,23 @@ reap_worktree() {
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         log_line "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — pi-reap-worktrees.sh not found (the abandoned arm still runs: it needs no repo)"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
-        REPO_ARM_OK=0; REPOS=""
-    elif ! resolve_repos; then
-        log_line "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); the abandoned arm still runs: it needs no repo"
-        NOTE_WT="no repo to scan"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-no-repo"
-        REPO_ARM_OK=0; REPOS=""
+        REPO_ARM_OK=0
     fi
+    # ⛔ THE REPO LIST IS RESOLVED ONCE, FOR BOTH REPO-SCOPED ARMS. The `REPOS=""` that used to sit in
+    # each failure arm is a ONE-VARIABLE BLOCKER: a missing/unresolvable registered owner silently
+    # disabled the LANDED arm's sweep too, and the record named one cause where the box had two.
+    if ! resolve_repos; then
+        if [ "$REPO_ARM_OK" = 1 ]; then
+            log_line "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); the abandoned arm still runs: it needs no repo"
+            NOTE_WT="no repo to scan"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-no-repo"
+            REPO_ARM_OK=0
+        fi
+        REPOS=""
+    fi
+    # ⛔ THE REGISTERED LOOP RUNS ONLY WITH ITS OWNER (`bash ""` is not a sweep), while `$REPOS` STAYS
+    # populated for the landed arm — which is the arm that can still decide this repo.
+    WT_SCAN_REPOS="$REPOS"
+    [ -n "$WORKTREE_REAPER_PATH" ] || WT_SCAN_REPOS=""
     # df is measured PER REPO: --repo may span filesystems.
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
@@ -2196,7 +2312,7 @@ reap_worktree() {
             _wn="$(note_for pi-reap-worktrees.sh "$rc" worktree)"
             case "; $NOTE_WT;" in *"; $_wn;"*) : ;; *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }$_wn" ;; esac
         fi
-    done <<<"$REPOS"
+    done <<<"$WT_SCAN_REPOS"
     # ⛔ THE REGISTERED DELEGATE'S OWN ROWS, KEPT APART FROM THE SECOND ARM'S (#2542 merge). The
     # abandoned arm prints an UNCONDITIONAL `SUMMARY` even when it found nothing, so the
     # refusal-vs-measurement gate below — which greps for a classification row — read a refusing
@@ -2212,6 +2328,21 @@ reap_worktree() {
     rows="${rows}${rows:+$'\n'}${AW_OUT}"
     freed=$((freed + AW_FREED)); raw=$((raw + AW_RAW))
     [ "$AW_MEASURED" = 1 ] || MEASURED=0
+    # ── the class's THIRD arm: a repo's OWN `.worktrees/*` whose work LANDED (#4194) ──────────────
+    # Folded into this class for the same reason, and it is the arm that still DECIDES on the box the
+    # registered arm aborts on (`gh` unverifiable -> exit 3, 0 trees decided). It needs `--repo`, so it
+    # inherits `$REPOS` — which the registered arm has already emptied when it could not resolve any.
+    reap_landed_arm
+    rows="${rows}${rows:+$'\n'}${LW_OUT}"
+    freed=$((freed + LW_FREED)); raw=$((raw + LW_RAW))
+    [ "$LW_MEASURED" = 1 ] || MEASURED=0
+    # The landed arm's own tally, lifted from its SUMMARY so the class line is not blind to it. This is
+    # the #4194 indicator-3 reading: `landed_eligible` is what the arm WOULD remove, which is exactly
+    # what a dry-run class line must not report as zero.
+    LANDED_EXTRA=""
+    if [ -n "$LW_OUT" ]; then
+        LANDED_EXTRA=" landed_examined=$(_tally_num "$([ -n "$LW_EXAMINED" ] && printf 1 || printf 0)" "${LW_EXAMINED:-0}") landed_eligible=$(_tally_num "$([ -n "$LW_ELIGIBLE" ] && printf 1 || printf 0)" "${LW_ELIGIBLE:-0}") landed_removed=${LW_REMOVED:-0}"
+    fi
     # A class whose REGISTERED arm could not be set up stays `misconfigured` even though its abandoned
     # arm ran: `cannot run: worktree-no-repo` in `detail=` is the truth about the half that did not
     # run, and the rc (3) already carries the red. The alternative — `fail-closed`, which means "the
@@ -2219,7 +2350,7 @@ reap_worktree() {
     # `misconfigured` is "a class that could not be SET UP at all" — so a missing ABANDONED delegate
     # belongs here too, not under `fail-closed` ("the delegate ran and could not do the work"), which
     # is what the record said beside `detail=cannot run: abandoned-worktree-delegate-missing`.
-    if [ "$REPO_ARM_OK" = 1 ] && [ "${AW_SETUP_FAIL:-0}" = 0 ]; then
+    if [ "$REPO_ARM_OK" = 1 ] && [ "${AW_SETUP_FAIL:-0}" = 0 ] && [ "${LW_SETUP_FAIL:-0}" = 0 ]; then
         VERDICT_WT="$(class_verdict "$RC_WT")"
     else
         VERDICT_WT="misconfigured"
@@ -2232,7 +2363,7 @@ reap_worktree() {
     # ⛔ CLASS LEVEL, OVER BOTH ARMS: a class that removed NOTHING in either arm does not get to claim
     # the window's `df` change (measured: `freed_df=110MB` on a pass whose registered arm failed closed
     # and whose abandoned arm found nothing, because two other lanes were writing).
-    if [ "$REPO_ARM_OK" = 1 ] && [ "$WT_REMOVED" = 0 ] && [ "$AW_REAPED" = 0 ] && ! is_dry; then
+    if [ "$REPO_ARM_OK" = 1 ] && [ "$WT_REMOVED" = 0 ] && [ "$AW_REAPED" = 0 ] && [ "${LW_REMOVED:-0}" = 0 ] && ! is_dry; then
         if [ "$raw" != 0 ]; then
             _wn="nothing removed: the ${raw}MB df change belongs to another process (not attributed)"
             case "; $NOTE_WT;" in *"; $_wn;"*) : ;; *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }$_wn" ;; esac
@@ -2370,16 +2501,16 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && log_line "$cands"
-        log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+        log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}${LANDED_EXTRA}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}${LANDED_EXTRA}"
         else
-            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}${LANDED_EXTRA}"
         fi
     fi
     # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
@@ -3226,7 +3357,7 @@ check_peer_locks
     # operator reads after the fact, and "which filesystem held this pass's lock" decides whether its
     # `df` deltas can be credited to it (agent-infra#2443).
     [ -n "$STATE_DIR_PRIMARY_NOTE" ] && log_line "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the delegates were given it too"
-    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING} runner-work=${RUNNER_WORK_REAPER_PATH:-MISSING} runner-cache=${RUNNER_CACHE_REAPER_PATH:-MISSING}"
+    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} landed=${LANDED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING} runner-work=${RUNNER_WORK_REAPER_PATH:-MISSING} runner-cache=${RUNNER_CACHE_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
 # Heartbeat after each class: a pass that is making progress must never be aged out of its own lock.

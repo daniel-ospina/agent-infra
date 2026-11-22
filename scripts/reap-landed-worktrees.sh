@@ -78,12 +78,21 @@
 #   REAP_LW_BUDGET_SECONDS  the per-repo TIME bound (default 300): past it nothing more is probed and
 #                           the remainder is reported `DEFERRED reason=budget` (a KEEP by construction)
 #
-# Exit codes (so `disk-reaper.sh` maps them unchanged):
+# Exit codes — THE WORKTREE FAMILY'S OWN VOCABULARY, because `disk-reaper.sh` IS the caller and its
+# `delegate_rc worktree` reads these numbers:
 #   0 the sweep ran and every action it took succeeded (including "nothing qualified")
-#   1 the sweep ran and a removal it attempted FAILED (reported by name)
 #   2 usage
 #   3 FAIL-CLOSED — census unreadable, main ref unresolvable, no repo, or the census library is missing.
 #     Nothing was reaped.
+#   4 the sweep ran and a removal it attempted FAILED (reported by name)
+# ⛔ NOT 1. This script first published 1 for "a removal failed", with a header claiming `disk-reaper.sh`
+# "maps them unchanged" — but `delegate_rc` has no arm for 1 and maps it to 3, so a failed removal would
+# have been reported to the operator as "it FAILED CLOSED, nothing was reaped" when trees HAD been
+# removed and one row had not (`note_for` reads the same number). 4 is the family's code for exactly
+# this (`pi-reap-worktrees.sh`, `reap-lane-venvs.sh`): one number, one meaning, no translation table.
+# ⛔ AND 3 OUTRANKS 4 (`worst_rc`'s rank order). A pass that fails closed for ONE repo keeps 3 even
+# when a DIFFERENT repo's removal failed, so the ledger never downgrades "nothing could be proven here"
+# to "a removal failed".
 
 set -uo pipefail
 
@@ -103,11 +112,21 @@ GIT_TIMEOUT="${REAP_LW_GIT_TIMEOUT:-30}"
 BUDGET_SECONDS="${REAP_LW_BUDGET_SECONDS:-300}"
 case "$BUDGET_SECONDS" in ''|*[!0-9]*) BUDGET_SECONDS=300 ;; esac
 
+# ⛔ NOT `say` (agent-infra #2910). macOS ships /usr/bin/say (text-to-speech), so a missed definition
+# is a voice on the speaker rather than a log line — measured during a live customer call, and the
+# `tests/no-tts` shard fails any shipped script that defines this name. `emit` collides with nothing.
 die()  { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
-say()  { printf '%s\n' "$*"; }
+emit() { printf '%s\n' "$*"; }
 note() { printf '%s\n' "$*" >&2; }
 
-usage() { sed -n '3,90p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0; }
+# ⛔ THE RANGE IS ANCHORED, NOT COUNTED. It used to be a hard `3,90p`, so every line added to the
+# header silently truncated `--help` MID-DOCUMENT (measured on this change: it cut the exit-code
+# contract in half, which is the one section a caller reads). From the `# Usage:` line to the last
+# header line before the code.
+usage() {
+    awk '/^# Usage:/{go=1} go && /^#/ {sub(/^# ?/, ""); print; next} go && !/^#/ {exit}' "${BASH_SOURCE[0]:-$0}"
+    exit 0
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -138,19 +157,31 @@ if [ "$PRINT_CONFIG" = 1 ]; then
 fi
 
 # ── the ONE census (never a second liveness implementation) ───────────────────────────────────────
+# ⛔ AN EXPLICIT OVERRIDE IS AUTHORITATIVE, INCLUDING WHEN IT IS WRONG — and it is NOT the last rung of
+# the ladder. This seam used to be APPENDED after `$SELF_DIR/lib/live-paths.sh`, which is a file this
+# repo SHIPS, so the shipped copy always won: an operator who pinned a hardened, patched or deliberately
+# broken census library was silently running a DIFFERENT file than the one they named, and the
+# set-but-missing refusal below was unreachable in the normal layout. That matters more here than
+# anywhere else in the family: the census is the ENTIRE live-holder predicate (`git worktree remove`
+# cannot protect a live lane sitting in a clean landed tree), so a silently substituted liveness
+# implementation is the one hazard this script's own `REAP_LW_PROC_ROOT` comment (#3278) forbids one
+# seam over. Same rule as `disk-reaper.sh`'s `find_delegate`.
 LP_LIB=""
-for cand in ${SELF_DIR:+"$SELF_DIR/lib/live-paths.sh"} \
-            ${HOME:+"$HOME/.pi/agent/scripts/lib/live-paths.sh"} \
-            ${REAP_LW_LIVE_PATHS:-}; do
-    [ -n "$cand" ] && [ -r "$cand" ] && { LP_LIB="$cand"; break; }
-done
+if [ -n "${REAP_LW_LIVE_PATHS:-}" ]; then
+    [ -r "${REAP_LW_LIVE_PATHS}" ] && LP_LIB="$REAP_LW_LIVE_PATHS"
+else
+    for cand in ${SELF_DIR:+"$SELF_DIR/lib/live-paths.sh"} \
+                ${HOME:+"$HOME/.pi/agent/scripts/lib/live-paths.sh"}; do
+        [ -n "$cand" ] && [ -r "$cand" ] && { LP_LIB="$cand"; break; }
+    done
+fi
 if [ -z "$LP_LIB" ]; then
     if [ -n "${REAP_LW_LIVE_PATHS:-}" ]; then
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — REAP_LW_LIVE_PATHS is set to '$REAP_LW_LIVE_PATHS' and is not readable; nothing was reaped (exit 3)"
     else
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — lib/live-paths.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts/lib); nothing was reaped (exit 3)"
     fi
-    say "SKIP reason=census-library-missing"
+    emit "SKIP reason=census-library-missing"
     exit 3
 fi
 # shellcheck source=lib/live-paths.sh
@@ -234,33 +265,40 @@ OFFSET_FILE="$STATEDIR/reap-landed-worktrees.offset"
 sweep_repo() { # <repo-path>
     local repo="$1" canon main_sha censusdir census c path br head12 ahead anc dirty_n
     local examined=0 eligible=0 removed=0 failed=0 skipped=0 deferred=0 deadline now
-    local CANDS="" n_cands=0 off=0 i=0 new_off=0
+    # ⛔ A DECLARED ARRAY, NOT `CANDS=""`. `${#CANDS[@]}` on a SCALAR under `set -u` is an unbound-variable
+    # error on bash 5.2 (reproduced), and the failure aborts the assignment AND the rest of this function:
+    # no SUMMARY line, `REPO_N` never incremented (a single-repo pass then exits 3 `no-sweepable-repo`),
+    # and the `mktemp -d` census dir above leaks once per repo per pass. The trigger is the state this
+    # script ITSELF produces after a successful pass — `.worktrees/` exists with no linked worktree left —
+    # so the second pass over a cleaned repo was guaranteed to hit it.
+    local -a CANDS=()
+    local n_cands=0 off=0 i=0 new_off=0
     local kept_ahead=0 kept_dirty=0 kept_held=0 kept_detached=0 kept_unprovable=0
     local self_pwd now_sha now_dirty why
 
     canon="$(cd "$repo" 2>/dev/null && pwd -P)" || { note "$SCRIPT_NAME: repo '$repo' is not a directory — skipped"; RC=3; return 1; }
-    [ -d "$canon/.worktrees" ] || { say "reading repo=$canon worktrees=none (no .worktrees directory)"; return 0; }
+    [ -d "$canon/.worktrees" ] || { emit "reading repo=$canon worktrees=none (no .worktrees directory)"; return 0; }
 
     # ⛔ THE MAIN REF IS THE PROOF. If it cannot be resolved, NOTHING in this repo can be shown to have
     # landed, so the pass refuses the repo instead of degrading to a per-row guess.
     main_sha="$(git_at "$canon" rev-parse --verify --quiet "$MAIN_REF^{commit}")" || main_sha=""
     if [ -z "$main_sha" ]; then
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — main ref '$MAIN_REF' does not resolve in $canon; nothing in this repo was reaped (exit 3)"
-        say "SKIP reason=main-unresolved repo=$canon main=$MAIN_REF"
+        emit "SKIP reason=main-unresolved repo=$canon main=$MAIN_REF"
         RC=3; return 1
     fi
 
     # Indicator 3 (#4194): each pass prints the reading it used.
-    say "reading repo=$canon main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
+    emit "reading repo=$canon main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
 
     censusdir="$(mktemp -d "${TMPDIR:-/tmp}/reap-landed.XXXXXX")" || {
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no scratch dir under ${TMPDIR:-/tmp}; nothing was reaped (exit 3)"
-        say "SKIP reason=scratch-unwritable repo=$canon"; RC=3; return 1; }
+        emit "SKIP reason=scratch-unwritable repo=$canon"; RC=3; return 1; }
     census="$censusdir/live-paths.tsv"
     if ! lp_census "$censusdir" >/dev/null 2>&1; then
         rm -rf "$censusdir" 2>/dev/null
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — the process census is unreadable (mechanism=${LP_CENSUS_MECH:-none}); no tree can be proven holder-free, so nothing was reaped (exit 3)"
-        say "SKIP reason=census-unreadable repo=$canon"
+        emit "SKIP reason=census-unreadable repo=$canon"
         RC=3; return 1
     fi
     CENSUS_TOTAL=$((CENSUS_TOTAL + ${LP_CENSUS_ROWS:-0}))
@@ -272,7 +310,7 @@ sweep_repo() { # <repo-path>
         # ⛔ A CANDIDATE IS A LINKED WORKTREE (`.git` exists), exactly the structural test the family
         # uses: a plain directory under `.worktrees/` is somebody's data, not a checkout.
         [ -e "$c/.git" ] || { skipped=$((skipped + 1)); continue; }
-        CANDS=(${CANDS[@]:+"${CANDS[@]}"} "$c")
+        CANDS+=("$c")
     done
     n_cands=${#CANDS[@]}
 
@@ -290,7 +328,7 @@ sweep_repo() { # <repo-path>
         case "$off" in ''|*[!0-9]*) off=0 ;; esac
     fi
     [ "$n_cands" -gt 0 ] && off=$(( off % n_cands )) || off=0
-    [ "$n_cands" -gt 0 ] && say "ROTATE on=1 offset=$off total=$n_cands offset-file=${OFFSET_FILE:-none}"
+    [ "$n_cands" -gt 0 ] && emit "ROTATE on=1 offset=$off total=$n_cands offset-file=${OFFSET_FILE:-none}"
 
     i=0
     while [ "$i" -lt "$n_cands" ]; do
@@ -300,28 +338,28 @@ sweep_repo() { # <repo-path>
         # ⛔ THE BUDGET IS CHECKED BEFORE ANY PROBE, so a spent pass costs O(1) per remaining entry.
         now=$(date +%s)
         if [ "$now" -ge "$deadline" ]; then
-            deferred=$((deferred + 1)); say "DEFERRED path=$c reason=budget (the pass spent its ${BUDGET_SECONDS}s)"; continue
+            deferred=$((deferred + 1)); emit "DEFERRED path=$c reason=budget (the pass spent its ${BUDGET_SECONDS}s)"; continue
         fi
-        path="$(cd "$c" 2>/dev/null && pwd -P)" || { kept_unprovable=$((kept_unprovable + 1)); say "KEPT reason=unprovable path=$c detail=no-canonical-path"; continue; }
+        path="$(cd "$c" 2>/dev/null && pwd -P)" || { kept_unprovable=$((kept_unprovable + 1)); emit "KEPT reason=unprovable path=$c detail=no-canonical-path"; continue; }
 
         # Self-protection: never this pass's own tree.
         case "$self_pwd/" in
-            "$path/"*) say "KEPT reason=self path=$path"; continue ;;
+            "$path/"*) emit "KEPT reason=self path=$path"; continue ;;
         esac
 
         if guard_held "$census" "$path"; then
-            kept_held=$((kept_held + 1)); say "KEPT reason=$GUARD_REASON path=$path"; continue
+            kept_held=$((kept_held + 1)); emit "KEPT reason=$GUARD_REASON path=$path"; continue
         fi
 
         br="$(git_at "$path" rev-parse --abbrev-ref HEAD)" || br=""
         head12="$(git_at "$path" rev-parse --verify --quiet 'HEAD^{commit}')" || head12=""
         if [ -z "$head12" ]; then
-            kept_unprovable=$((kept_unprovable + 1)); say "KEPT reason=unprovable path=$path detail=no-head"; continue
+            kept_unprovable=$((kept_unprovable + 1)); emit "KEPT reason=unprovable path=$path detail=no-head"; continue
         fi
         head12="$(printf '%s' "$head12" | cut -c1-12)"
 
         if guard_detached "$br"; then
-            kept_detached=$((kept_detached + 1)); say "KEPT reason=detached path=$path head=$head12"; continue
+            kept_detached=$((kept_detached + 1)); emit "KEPT reason=detached path=$path head=$head12"; continue
         fi
 
         dirty_n=""   # assigned by the expensive guard below
@@ -339,19 +377,19 @@ sweep_repo() { # <repo-path>
         anc="no"
         if git_at "$path" merge-base --is-ancestor "$head12" "$MAIN_REF" >/dev/null 2>&1; then anc="yes"; fi
         if guard_ahead "$ahead" "$anc" "$br"; then
-            kept_ahead=$((kept_ahead + 1)); say "KEPT reason=$GUARD_REASON path=$path"
+            kept_ahead=$((kept_ahead + 1)); emit "KEPT reason=$GUARD_REASON path=$path"
             continue
         fi
 
         dirty_n="$(git_at "$path" status --porcelain | head -100 | wc -l | tr -d ' ')" || dirty_n=""
         if guard_dirty "$dirty_n"; then
-            kept_dirty=$((kept_dirty + 1)); say "KEPT reason=$GUARD_REASON path=$path"
+            kept_dirty=$((kept_dirty + 1)); emit "KEPT reason=$GUARD_REASON path=$path"
             continue
         fi
 
         eligible=$((eligible + 1))
         if [ "$DRY_RUN" = 1 ]; then
-            say "WOULD-REMOVE path=$path branch=$br head=$head12 ahead=0 ancestor=yes"
+            emit "WOULD-REMOVE path=$path branch=$br head=$head12 ahead=0 ancestor=yes"
             continue
         fi
 
@@ -378,16 +416,16 @@ sweep_repo() { # <repo-path>
             esac
         fi
         if [ -n "$why" ]; then
-            kept_dirty=$((kept_dirty + 1)); say "KEPT reason=re-probe path=$path detail=$why"; continue
+            kept_dirty=$((kept_dirty + 1)); emit "KEPT reason=re-probe path=$path detail=$why"; continue
         fi
 
         # `git worktree remove` — NEVER `--force`. It refuses a dirty tree a second time (belt and
         # braces: the guard above already answered), and it removes the admin record with the
         # directory, so no `git worktree prune` is ever owed. The BRANCH REF IS KEPT.
         if git_at "$canon" worktree remove "$path" >/dev/null 2>&1; then
-            removed=$((removed + 1)); say "REMOVED path=$path branch=$br head=$head12 ahead=0"
+            removed=$((removed + 1)); emit "REMOVED path=$path branch=$br head=$head12 ahead=0"
         else
-            failed=$((failed + 1)); say "FAILED path=$path branch=$br detail=worktree-remove-refused"; RC=1
+            failed=$((failed + 1)); emit "FAILED path=$path branch=$br detail=worktree-remove-refused"; [ "$RC" = 0 ] && RC=4
         fi
     done
     # The next pass starts where this one stopped: the entries that were PROBED, not the deferred tail.
@@ -404,14 +442,18 @@ sweep_repo() { # <repo-path>
     TOTAL_REMOVED=$((TOTAL_REMOVED + removed)); TOTAL_FAILED=$((TOTAL_FAILED + failed))
     TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped)); REPO_N=$((REPO_N + 1)); TOTAL_DEFERRED=$((TOTAL_DEFERRED + deferred))
 
-    say "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - removed - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12)"
-    [ "$failed" -gt 0 ] && RC=1
+    emit "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - removed - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12)"
+    # ⛔ 3 OUTRANKS 4 AND 4 OUTRANKS 0. A blanket `RC=4` here published "a removal failed" over a
+    # DIFFERENT repo's fail-closed abort (an operator reads that as "retryable", not "nothing could be
+    # proven"), and it published it over THIS repo's own earlier abort too. The rank is the family's
+    # (`_rc_rank`): 3 fail-closed > 4 a removal failed > 0.
+    if [ "$failed" -gt 0 ] && [ "$RC" = 0 ]; then RC=4; fi
     return 0
 }
 
 if [ -z "$REPOS" ]; then
     note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no repo to scan (pass --repo PATH, or set REAP_LW_REPOS); nothing was reaped (exit 3)"
-    say "SKIP reason=no-repo"
+    emit "SKIP reason=no-repo"
     exit 3
 fi
 
@@ -424,11 +466,13 @@ IFS="$OLDIFS"
 
 if [ "$REPO_N" = 0 ]; then
     note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — none of the configured repos could be swept; nothing was reaped (exit 3)"
-    say "SKIP reason=no-sweepable-repo"
+    emit "SKIP reason=no-sweepable-repo"
     exit 3
 fi
 
-# The caller's attribution datum (disk-reaper reads `REMOVED=<n>` beside its df reading), and the
-# per-condition counters #4194 asks for, on one line a log reader can grep.
-say "reap-landed-worktrees: pass complete mode=$MODE_TEXT REMOVED=$TOTAL_REMOVED eligible=$TOTAL_ELIGIBLE examined=$TOTAL_EXAMINED failed=$TOTAL_FAILED skipped=$TOTAL_SKIPPED deferred=$TOTAL_DEFERRED census_rows=$CENSUS_TOTAL budget=${BUDGET_SECONDS}s"
+# The caller's attribution datum — `disk-reaper.sh`'s `class=worktree arm=landed` reads `REMOVED=<n>`
+# from THIS line and credits the window's `df` change only when it is > 0 (the family's rule: a pass that
+# removed nothing does not get to claim another process's freed bytes) — plus the per-condition counters
+# #4194 asks for, on one line a log reader can grep.
+emit "reap-landed-worktrees: pass complete mode=$MODE_TEXT REMOVED=$TOTAL_REMOVED eligible=$TOTAL_ELIGIBLE examined=$TOTAL_EXAMINED failed=$TOTAL_FAILED skipped=$TOTAL_SKIPPED deferred=$TOTAL_DEFERRED census_rows=$CENSUS_TOTAL budget=${BUDGET_SECONDS}s"
 exit "$RC"

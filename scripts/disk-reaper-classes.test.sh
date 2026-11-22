@@ -692,7 +692,7 @@ MUT_B='s/if remove_one "\$canon" "\$repo"; then/if false; then/'
 MUT_C='s/if ! lp_census "\$CENSUSDIR"; then/if false; then/'
 MUT_D='s/if pinned "\$canon" "\$base"; then/if false; then/'
 MUT_E='s/\[ "\$c" = "\$newest" \] \&\&/[ "$c" = "__never__" ] \&\&/'
-MUT_F='s/REPO_ARM_OK=0; REPOS=""/return 3/'
+MUT_F='s/^ *REPO_ARM_OK=0$/        return 3/'
 MUT_G='s/if \[ "\$reaped" = 0 \] \&\& ! is_dry; then/if false; then/'
 MUT_H='s/if \[ -L "\$d" \]; then/if false; then/'
 MUT_I='s/        dirty="?"$/        dirty="0"/'
@@ -746,9 +746,14 @@ if apply_mutation "$REAPER" "$T/mut-f/disk-reaper.sh" "$MUT_F"; then
     # ⚠️ The mutant entry point must find ITS OWN delegates: it resolves them beside itself, so the
     # real owners are symlinked next to it (a missing delegate would fail closed for a different
     # reason and the mutant would "pass" the wrong test).
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    # ⛔ AND `lib/`, for the third `worktree` arm: `reap-landed-worktrees.sh` resolves the SHARED census
+    # from `$SELF_DIR/lib/` — the SYMLINK's own directory, not its target — so a loop that links the
+    # owners but not the library hands the landed arm exit 3 `census-library-missing` and the mutant is
+    # graded on the wrong failure. Both arms that need a library are covered by the one line.
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-f/$d"
     done
+    [ -d "$HERE/lib" ] && ln -sfn "$HERE/lib" "$T/mut-f/lib"
     expect_fail "F mutation: returning early when no repo resolves turns the case RED" case_f "$AW_OWNER" "$T/mut-f/disk-reaper.sh"
 else
     bad "F mutation could not be applied (the repo-arm arms moved) — the case is not checking it any more"
@@ -758,9 +763,10 @@ fi
 mk_foreign_change_owner "$T/stub-foreign.sh"
 expect_pass "G a class that removed nothing does not claim another process' df change" case_g "$REAPER" "$T/stub-foreign.sh"
 if apply_mutation "$REAPER" "$T/mut-g/disk-reaper.sh" "$MUT_G"; then
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-g/$d"
     done
+    [ -d "$HERE/lib" ] && ln -sfn "$HERE/lib" "$T/mut-g/lib"
     expect_fail "G mutation: reporting the window's df change as freed turns the case RED" case_g "$T/mut-g/disk-reaper.sh" "$T/stub-foreign.sh"
 else
     bad "G mutation could not be applied (the attribution rule moved) — the case is not checking it any more"
@@ -795,9 +801,10 @@ fi
 
 expect_pass "K a missing owner is misconfigured, not fail-closed" case_k "$REAPER"
 if apply_mutation "$REAPER" "$T/mut-k/disk-reaper.sh" "$MUT_K"; then
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-k/$d"
     done
+    [ -d "$HERE/lib" ] && ln -sfn "$HERE/lib" "$T/mut-k/lib"
     expect_fail "K mutation: not recording the setup failure turns the case RED" case_k "$T/mut-k/disk-reaper.sh"
 else
     bad "K mutation could not be applied (the AW_SETUP_FAIL arm moved) — the case is not checking it any more"

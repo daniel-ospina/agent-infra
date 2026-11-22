@@ -67,8 +67,8 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # actually fires hourly. `disk-reaper.test.sh` T67 now asserts the pin SET is equal to the delegates the
 # pass resolves, in every artifact, so the next class cannot land pinned in only one of them.)
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh reap-runner-cache.sh
-lib/bounded.sh lib/cell-home.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh
+reap-runner-cache.sh lib/bounded.sh lib/cell-home.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF

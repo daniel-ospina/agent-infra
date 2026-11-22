@@ -93,6 +93,11 @@
         <string>{{REAPER_DIR}}/reap-abandoned-worktrees.sh</string>
         <key>DUP_INSTALL_REAPER</key>
         <string>{{REAPER_DIR}}/reap-duplicate-installs.sh</string>
+        <!-- ⛔ AND THE THIRD `worktree` ARM (#4194). Same rule as the keys above: a box whose HOME holds
+             an older farmed copy would run THAT delete policy for a repo's own `.worktrees/*` trees
+             while the installed owner went unconsulted. Both artifacts pin the same set (T67). -->
+        <key>LANDED_WT_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-landed-worktrees.sh</string>
         <!-- ⛔ AND THIS ONE, FOR THE SAME REASON AGAIN (#4169 review). `runner-cache` is in the DEFAULT
              class list, so this hourly job runs it too; the pin was added only to the FAST
              cache unit, leaving this artifact (and the systemd hourly unit) one delegate short. On a

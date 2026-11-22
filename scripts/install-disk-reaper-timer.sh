@@ -345,8 +345,8 @@ refuse_transient_target() {
     # F2): the delegate resolves it from `$SELF_DIR/lib/` and exits 3 without it, so leaving it out of
     # this list is how the abandoned-worktree class dies on every pass with nothing saying so.
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
-             reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
-             reap-runner-cache.sh \
+             reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh \
+             reap-runner-work.sh reap-runner-cache.sh \
              lib/live-paths.sh lib/cell-home.sh; do
         # ⛔ `reap-runner-cache.sh` IS A DELEGATE THE UNITS PIN (#4169 review, P3). It was missing here,
         # so a box whose install lacked it got a unit that named a class which fails closed (exit 3) every
