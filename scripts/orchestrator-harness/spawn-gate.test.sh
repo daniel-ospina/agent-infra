@@ -3925,7 +3925,7 @@ _armut_cls="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$_armut/fix-one.sh" \
   | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u | tr '\n' ' ')"
 case " $_armut_cls " in *" AGENT_NEW_ARM_REFUSED "*) rc=0 ;; *) rc=1 ;; esac
 ck "(arm derivation) a gate classified on a line carrying a \` #\` REACHES the derived set — with an inline comment strip it appears nowhere and both completeness checks pass over it ($_armut_cls)" $rc
-_arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
+_arm_nonclassifier="REPO_TARGET_REFUSED AGENT_NOT_A_PR_REFUSED"   # exited by fix-one.sh's repo-target refusal (`repo_target_assert`, and its branch/repo-mismatch arm) and by the [fixgate-prresolve] block (the DISPATCH defect: the number's issue projection is an ISSUE, not a PR — #4182 arm 3), never compared. ⛔ NAMED BY SYMBOL, NEVER BY LINE: the previous wording cited `fix-one.sh:228`/`:264`, both stale at this head (and `:228` stale on main already) — a reader who greps the named line lands on an unrelated comment block
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
