@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-fix-14342-1795386519-p1999433-b472cc7a",
+  "_sha": "fc52950df75f8e980ffa499fb3d9c32918c69ba3",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1795390437,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-fix-14342-1795386519-p1999433-b472cc7a",
+  "lease_until": 1795398237,
+  "pid": 1999433,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795386519,
+  "state": "RUNNING",
+  "tag": "fix-14342",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-14342"
+}
