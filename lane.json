@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-4197-1795435217-p3629526-38fef7f4",
+  "_sha": "160ee05d7df4d897ff95fc24cb5ae540124bb34f",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1795439141,
+  "host": "cmux",
+  "issue": 4197,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-4197-1795435217-p3629526-38fef7f4",
+  "lease_until": 1795446941,
+  "pid": 3629526,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795435217,
+  "state": "RUNNING",
+  "tag": "4197",
+  "worktree": "/home/cmux/agent-infra"
+}
