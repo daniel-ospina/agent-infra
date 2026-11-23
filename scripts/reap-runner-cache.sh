@@ -344,8 +344,13 @@ MAX_MB="${REAP_RC_MAX_MB:-0}"
 # documented default IS the per-pass cap and that cap is `--max-mb` — a value parsed below. Resolving it
 # here read `$MAX_MB` BEFORE the flag was applied and silently produced 0 (= the prune DISABLED) on
 # every `disk-reaper.sh` pass, i.e. the fix would have shipped inert while its record printed
-# `max_mb=20480 live_cache_cap_mb=0` (caught by `disk-reaper.test.sh`, not by the class's own suite).
-# `0` = no bound, which restores the pre-#4216 behaviour (a live install's cache is skipped whole).
+# `max_mb=20480 live_cache_cap_mb=0`. (This PR's body attributes that catch to `disk-reaper.test.sh`;
+# that file asserts nothing about `max_mb=`, `live_cache_cap_mb=` or `pruned=` — the arming line is now
+# pinned where it lives, by `CACHE-ARMED` in `scripts/reap-runner-cache.test.sh` plus the
+# `LIVE_CACHE_CAP_MB="$MAX_MB"` → `:` mutant. — #4220 review, P2)
+# `0` = no bound, which restores the pre-#4216 behaviour (a live install's cache is skipped whole) — and
+# because `--max-mb 0` resolves to exactly that, the reversal is NAMED at startup (see the warning below
+# the function definitions).
 LIVE_CACHE_CAP_MB="${REAP_RC_LIVE_CACHE_CAP_MB:-0}"
 LIVE_CACHE_CAP_SET=0
 [ -n "${REAP_RC_LIVE_CACHE_CAP_MB+set}" ] && LIVE_CACHE_CAP_SET=1
@@ -439,6 +444,21 @@ fi
 log_line() { printf '%s\n' "$*"; }
 log() { [ -n "${LOG_FILE:-}" ] && printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null; return 0; }
 now() { date +%s; }
+
+# ⛔ `--max-mb 0` IS THE PER-PASS CAP'S "UNCAPPED" AND THE LIVE BOUND'S "FREE NOTHING" — SAID OUT LOUD
+# (#4220 review, P3). `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB=0` is documented on the entry point as "0 =
+# uncapped", and it is forwarded verbatim as `--max-mb`, which the unset seam resolves into the LIVE CACHE
+# BOUND. As a bound, 0 means the strictest possible setting: every live install's cache is skipped whole,
+# i.e. the pre-#4216 behaviour restored. So the one dial that means "no limit on what this pass may free"
+# simultaneously disables the reclaim on exactly the population the cap was written for. Both are
+# legitimate configurations, so neither is refused — but the reversal is NAMED in the pass journal every
+# time it is in force, on the rule `scripts/disk-reaper.sh` already states for the sibling trigger dial
+# ("a policy that reverses on one dial must never reverse silently"), which that dial gets and this one
+# did not.
+if [ "$LIVE_CACHE_CAP_SET" = 0 ] && [ "$LIVE_CACHE_CAP_MB" -le 0 ]; then
+    log_line "reap-runner-cache: ⚠ live cache bound DISABLED by --max-mb 0 — the per-pass cap's '0 = uncapped' is ALSO this bound's default (REAP_RC_LIVE_CACHE_CAP_MB is unset), and as a BOUND 0 means 'free nothing': every live install's cache is skipped whole, which is the pre-#4216 behaviour. Set REAP_RC_LIVE_CACHE_CAP_MB to arm the bound on an uncapped pass."
+    log "live cache bound DISABLED by --max-mb 0 (per-pass cap 0 = uncapped; the same 0 as a bound = free nothing) — set REAP_RC_LIVE_CACHE_CAP_MB to arm it"
+fi
 
 # ── counters (one per outcome; every one is printed, so none can be inferred from another) ───────
 INSTALLS=0
@@ -893,20 +913,41 @@ prune_walk() {
 # silent arm here would be an install with no cache decision in the journal at all.
 live_cache_prune() {
     local inst="$1" cache="$2" before="$3" press="$4" reason="$5"
-    local excess_kb planned_mb _left after_mb pruned_mb
+    local excess_kb planned_mb _left after_mb pruned_mb _dial
     local legacy="SKIPPED-LIVE $inst reason=skipped-live:$reason cache_mb=${before:-?}"
     # ── the arms where NOTHING is pruned, said in the pre-#4216 words ────────────────────────────
     if [ "$LIVE_CACHE_CAP_MB" -le 0 ]; then
         SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
-        log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live cache bound is DISABLED by REAP_RC_LIVE_CACHE_CAP_MB=0)"
+        # ⛔ NAME THE DIAL THAT DID IT, because two different ones reach here and only one is the
+        # operator's explicit choice (#4220 review, P3): the seam set to 0, or `--max-mb 0` — which is
+        # the per-pass cap's documented "0 = uncapped" and, unset seam, ALSO the live bound's default.
+        if [ "$LIVE_CACHE_CAP_SET" = 1 ]; then
+            _dial="REAP_RC_LIVE_CACHE_CAP_MB=0 (the explicit seam)"
+        else
+            _dial="--max-mb 0, which is the live bound's DEFAULT because the seam is unset — the per-pass cap's 'uncapped' is this bound's 'free nothing'"
+        fi
+        log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live cache bound is DISABLED by $_dial)"
         return 0
     fi
-    if [ ! -e "$cache" ] || [ -L "$cache" ] || [ "$press" = "warm" ] || [ "$press" = "unanswerable" ] || [ "$press" = "symlinked" ] || [ "$press" = "none" ]; then
+    if [ ! -e "$cache" ] || [ -L "$cache" ] || [ "$press" = "warm" ] || [ "$press" = "symlinked" ] || [ "$press" = "none" ]; then
         # A WARM filesystem, a symlinked/absent cache, or a probe that cannot answer: the bound is not
         # the reason this cache stays, so it is reported as the whole-install skip it is (and the
         # `INSTALL …` reading above already named the free-space verdict and the reason).
         SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
         log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live bound applies only under the install's own free-space gate, and this cache is not a candidate: press=${press:-none})"
+        return 0
+    fi
+    if [ "$press" = "unanswerable" ]; then
+        # ⛔ THE SAME BROKEN `df` PROBE IS THE SAME VERDICT (#4220 review, P2). On an IDLE install an
+        # unanswerable free-space probe is an ABSTENTION (`reason=install-free-unmeasurable`, rc 3); here
+        # it was a clean `skipped_live` (rc 0). Same probe, one pass, two opposite verdicts — and the
+        # live population is exactly the one this bound exists for, so a broken `df` on a busy box read
+        # `verdict=ok` over a class that reclaimed nothing: the inert-enforcer shape #4216 removes.
+        # The gate cannot say whether this filesystem is under pressure, so nothing is pruned AND the
+        # pass does not claim a clean run.
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        KEPT=$((KEPT + 1))
+        log_line "KEPT   $cache reason=install-free-unmeasurable cache_mb=? live=$reason ('$DF_BIN -Pk' could not answer for this install, so the free-space gate cannot say whether ITS filesystem is under pressure; the live cache bound ${LIVE_CACHE_CAP_MB}MB is NOT applied and nothing is measured)"
         return 0
     fi
     if [ -z "$before" ]; then
@@ -956,7 +997,16 @@ live_cache_prune() {
         log_line "KEPT   $cache reason=prune-workspace-unavailable cache_mb=${before} live=$reason (a listing directory could not be created, so the oldest-first order could not be established; NOT pruned)"
         return 0
     fi
-    PW_NEED_KB=$excess_kb
+    # ⛔ THE PRUNE'S TARGET IS THE **BUDGET**, NOT THE INSTALL'S WHOLE EXCESS (#4220 review, P1).
+    # `PW_NEED_KB=$excess_kb` let one admission delete a unit up to the EXCESS, while the per-pass cap
+    # was only a pre-check per unit (`PW_FREED_KB -ge PW_BUDGET_KB`), so on this PR's own measured
+    # population (`39142`MB + `32721`MB at `--max-mb 20480`) install A shed 18662MB leaving 1818MB of
+    # budget, and install B's 12241MB excess still authorised a whole 12000MB `uv/` entry — ~30.6GB
+    # freed against a 20GB cap, in a pass this class runs 144×/day. The whole-cache path refuses exactly
+    # that candidate (`cap_reached`), and the dry run already previewed the CLAMPED `planned_mb`: the two
+    # modes must select the SAME candidates, so the walk gets the same clamped number. A unit larger
+    # than what is left of the budget is now DESCENDED into instead of deleted whole.
+    PW_NEED_KB=$(( planned_mb * 1024 ))
     PW_FREED_KB=0
     PW_UNITS=0
     PW_STOP=""
@@ -972,6 +1022,18 @@ live_cache_prune() {
         # ⛔ OVER THE BOUND AND NOTHING REMOVABLE: every candidate was unmeasurable (each already counted
         # `unmeasurable`, which forces rc 3). Reporting this as a `PRUNED … pruned_mb=0` row would read
         # as "the bound was met", which is the one thing this pass cannot claim.
+        # ⛔ AND IT IS COUNTED (#4220 review, P2). Every other keep in this file increments an outcome
+        # counter, and `kept=` is published in the entry point's class line; this arm incremented
+        # NOTHING, so an install kept OVER the bound vanished from `pruned=`, `kept=` and
+        # `skipped_live=` at once. `PW_STOP=listing-failed` (a full filesystem, i.e. exactly the box this
+        # class exists for) then exited rc 0 with `pruned=0 kept=0 skipped_live=0` — reading clean over a
+        # cache the pass could not even enumerate. The listing/quarantine stops are INFRASTRUCTURE
+        # failures, so they are an abstention (rc 3), not a clean skip. (`quarantine-failed` and
+        # `remove-failed-quarantined` already force rc 4 via `failed=`.)
+        KEPT=$((KEPT + 1))
+        case "$PW_STOP" in
+            listing-failed) UNMEASURABLE=$((UNMEASURABLE + 1)) ;;
+        esac
         log_line "KEPT   $cache reason=live-cache-no-prunable-entry cache_mb=${before} live=$reason cap_mb=${LIVE_CACHE_CAP_MB} (over the bound, but no entry could be removed${PW_STOP:+ (stopped=$PW_STOP)}; NOT reported as pruned)"
         return 0
     fi
