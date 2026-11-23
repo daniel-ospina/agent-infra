@@ -936,13 +936,16 @@ immediately before every removal** (`reason=toctou:…`), because classification
 box whose `du` is slow.
 
 **The record.** `freed_mb_runner_cache=`, `would_free_mb_runner_cache=`, `candidates_runner_cache=`,
-`reaped_runner_cache=`, **`skipped_live_runner_cache=`** (how many installs were NOT **pruned** — the
-count that answers *"why is my 40 GB cache still here"*. Its arms are the bound **disabled**, the cache
-**under** the bound, the per-pass **cap spent**, the install's filesystem **above the free-space
-trigger** (not a candidate), an **absent or symlinked** cache, a mid-pass liveness **re-probe**, and the
-**shared** root with a live install; ⛔ since #4216 a live install whose cache was PRUNED is not counted
-here, so a record reads `skipped_live=0` beside a `pruned=`/`pruned_mb=` pair on the class's own SUMMARY
-line — which the pass record also carries verbatim),
+`reaped_runner_cache=`, **`skipped_live_runner_cache=`** (how many installs the bound **declined to
+prune** — the count that answers *"why is my 40 GB cache still here"*. Its arms are the bound
+**disabled**, the cache **under** the bound, the per-pass **cap spent**, the install's filesystem
+**above the free-space trigger** (not a candidate), an **absent or symlinked** cache, a mid-pass
+liveness **re-probe**, and the **shared** root with a live install; ⛔ since #4216 a live install whose
+cache was PRUNED is not counted here, so a record reads `skipped_live=0` beside a
+`pruned=`/`pruned_mb=` pair on the class's own SUMMARY line — which the pass record also carries
+verbatim. ⛔ And an install that is not pruned for another reason is NOT counted here either: one with
+nothing removable lands in `kept=` (`reason=live-cache-no-prunable-entry`), and one whose `df` cannot
+answer lands in `kept=` + `unmeasurable=`),
 `unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took — ⛔ the class's
 **total**, so it INCLUDES the shared per-box root; it used to sum only the installs' `.cache` dirs and
 read `0` on exactly the layout the durable half creates, beside a non-zero `freed_mb`),

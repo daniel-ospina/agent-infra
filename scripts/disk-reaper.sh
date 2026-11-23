@@ -3192,9 +3192,11 @@ reap_runner_cache() {
     _rc_capped="$(kv_field "$_rc_line" capped)"
     _rc_remaining="$(kv_field "$_rc_line" remaining)"
     # ⛔ `skipped_live` IS THE FIELD THAT MATTERS MOST ON THIS CLASS, and it is a DECISION, not a
-    # failure: it is how many installs were NOT PRUNED — which is NOT the same as "how many were not
-    # touched because a job was running" (⛔ since #4216 a live install whose cache WAS pruned counts 0
-    # here, and its work sinks are untouched regardless; §record_body enumerates the arms). Published so
+    # failure: it is how many installs the bound DECLINED TO PRUNE on one of its own arms — not "how many
+    # were not touched because a job was running" (⛔ since #4216 a live install whose cache WAS pruned
+    # counts 0 here, and its work sinks are untouched regardless), and not every not-pruned install
+    # either: an over-bound install with nothing removable lands in `kept=`, and a `df`-unanswerable one
+    # in `kept=`+`unmeasurable=` with neither counted here. §record_body enumerates the arms. Published so
     # "the cache is still 40 GB" has an answer other than "the reaper is broken".
     case "${_rc_skipped:-}" in
         ''|*[!0-9]*) : ;; *) HAVE_RC_SKIPPED=1; SKIPPED_LIVE_RC="$_rc_skipped" ;;
@@ -3656,16 +3658,21 @@ record_body() {
     # not exist.
     printf 'note_runner_work=%s\n' "$NOTE_RW"
     # ── class=runner-cache (#4168). Its ledger is deliberately NOT a copy of runner-work's: this class
-    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (the
-    # install was NOT pruned, on ANY of the owner's arms: the bound is DISABLED; its cache is UNDER the
-    # bound; the per-pass cap is already spent; its own filesystem is ABOVE the free-space trigger, so
-    # the cache is not a candidate; the cache is ABSENT or SYMLINKED; a liveness re-probe found a job
-    # that started mid-pass (`reason=toctou`); or it is the SHARED per-box root with a live install —
-    # ⛔ since #4216 a live install whose cache WAS pruned is not counted here, and its work sinks are
-    # never touched either way), `kept` (kept BY NAME and untouched:
-    # over the bound but nothing in it could be removed), `pruned`/`pruned_mb` (bounded by SIZE, not by
+    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (how
+    # many installs the bound DECLINED TO PRUNE, on ANY of the owner's arms: the bound is DISABLED; its
+    # cache is UNDER the bound; the per-pass cap is already spent; its own filesystem is ABOVE the
+    # free-space trigger, so the cache is not a candidate; the cache is ABSENT or SYMLINKED; a liveness
+    # re-probe found a job that started mid-pass (`reason=toctou`); or it is the SHARED per-box root with
+    # a live install — ⛔ since #4216 a live install whose cache WAS pruned is not counted here, and its
+    # work sinks are never touched either way), `kept` (EVERY path this pass kept by name and left
+    # untouched: a cache below `REAP_RC_MIN_CACHE_MB`, a cache whose filesystem is above its free-space
+    # trigger, a symlinked cache, an open `_diag` log or an entry it could not age — and, over the bound,
+    # an install with no removable entry, `reason=live-cache-no-prunable-entry`; ⛔ it is the class's
+    # AGGREGATE keep counter, NOT an unremovable-entry count, and it is where a not-pruned install lands
+    # when the bound was never reached), `pruned`/`pruned_mb` (bounded by SIZE, not by
     # the absence of a holder), `cache_mb` (the reading it took), and `capped` (the per-pass cap stopped
-    # the prune, and the next tick continues — ⛔ including a prune CLAMPED to the budget it had left,
+    # a REMOVAL — a whole-cache candidate as well as the prune — and the next tick continues — ⛔ including
+    # a prune CLAMPED to the budget it had left,
     # which used to publish `capped=0 remaining=0` about the pass the cap had cut short).
     printf 'candidates_runner_cache=%s\n' "$(_class_rec "${VERDICT_RC:-not-run}" "${WANT_RC:-0}" "${HAVE_RC_CAND:-0}" "$CAND_RC")"
     _rc_tally_rec() {
