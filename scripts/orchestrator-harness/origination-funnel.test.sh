@@ -209,6 +209,14 @@ SH
 # duplicate in a second tier) and #50. A backlog re-sorted by issue number (`sort -n -u` — the exact
 # #8465 defect) puts the P2 #50 first, so `head -1` is the discriminating read; the duplicate proves
 # the queue dedupes across tiers instead of queueing the same issue twice.
+# ⛔ THE P2 ROWS CARRY `queue-accelerator` — THE OWNER RULING, NOT A FIXTURE CONVENIENCE (2026-11-22):
+# *"only P0/P1, with exceptions for massive bottleneck unblockers."* A `P2-moderate` row is now OPT-IN at
+# the tier query in `refresh-candidates.sh` (and `rest_list` applies that `--jq` CLIENT-SIDE, so this
+# mock's rows really do pass through the gate). An unlabelled P2 row is therefore not a pool candidate
+# at all: this case would queue #100 and #200 only — 2 lines instead of 3 — and §4c's "a cross-tier
+# duplicate must dedupe" arm would read RED for a reason that is not the rank order it grades. The
+# fixture is repaired exactly as `refresh-scout.test.sh`'s `mk_gh_tiers` was, for the same reason; the
+# gate itself is pinned in BOTH directions in `pool-filter.test.sh`, so deleting it reds there.
 mk_gh_tiered() {
   local d="$1"
   mk_gh_rest "$d"
@@ -220,7 +228,7 @@ case "$1 $2" in
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '[{"number":100,"title":"p0 candidate","assignees":[]}]' ;;
   *"labels=P1-severe"*) printf '%s\n' '[{"number":200,"title":"p1 candidate","assignees":[]}]' ;;
-  *"labels=P2-moderate"*) printf '%s\n' '[{"number":200,"title":"p2 duplicate","assignees":[]},{"number":50,"title":"p2 candidate","assignees":[]}]' ;;
+  *"labels=P2-moderate"*) printf '%s\n' '[{"number":200,"title":"p2 duplicate","labels":[{"name":"queue-accelerator"}],"assignees":[]},{"number":50,"title":"p2 candidate","labels":[{"name":"queue-accelerator"}],"assignees":[]}]' ;;
   *) printf '[]\n' ;;
 esac
 SH
