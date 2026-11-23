@@ -81,6 +81,21 @@
 #      SUMMARY counts `cache_mb_unmeasured=` (cache_mb= is then a lower bound). Under pressure the size
 #      IS taken — the CONTROL that proves the cheap path is not a broken probe.
 #      Mutant: the warm arm measures anyway (the pre-fix `du` per install).
+#   CACHE-LIVE  THE CACHE SINK IS BOUNDED BY SIZE, NOT BY THE ABSENCE OF A HOLDER (#4216). Two installs,
+#      both with a running job (a `Runner.Worker` in the fixture table), both above the bound → each is
+#      pruned DOWN TO the bound in the same pass, oldest entries first, with the cache directory and
+#      its newest entries left in place, and `pruned_mb=`/`cache_mb_before=`/`cache_mb_after=` reported
+#      per install. This is the measured defect: a real cell pass at 417 MB free reclaimed NOTHING with
+#      71 GB of cache behind two running jobs.
+#      Mutant: the excess computation forced to 0 (the bound removed → nothing is ever over the cap).
+#   CACHE-SKIP  UNDER the bound there is NO CHURN (every entry stays, `pruned_mb=0`, `pruned=0`), while
+#      the NON-cache sinks in the SAME live install — aged `_work/_temp` scratch, an aged `_diag` log —
+#      are STILL not reaped and the install still counts in `skipped_live`. The asymmetry is the point:
+#      a work sink under a live holder is work that cannot be re-downloaded.
+#      Mutant: the live arm deleted (`if [ "$live" = 0 ]` -> `if false`) — the scratch AND the cache go.
+#   CACHE-UNREADABLE  A cache this pass cannot SIZE is skipped and counted `unmeasurable` (rc 3): the
+#      excess over the bound IS the delete plan, so an unmeasured size is an abstention, not a licence.
+#      Mutant: the unreadable-size skip deleted (an empty size reads as "0, under the cap").
 #
 # ⛔ THE TWO AGE GATES EACH GET A MUTANT (`B2` scratch, `B3` logs) — the log one only became visible
 # after `case_b`'s fixture gained a SECOND young log: with a single one, the newest-log keep answered
@@ -161,6 +176,22 @@ mk_cache() {
         : >"$1/.cache/uv/blob"
     fi
 }
+# mk_cache_entries <install> <n> <mb-each> — <n> top-level cache entries of <mb> MiB each, with entry i
+# aged (n - i + 1) days: `ent1` is the OLDEST and `ent$n` the NEWEST. ⛔ DISTINCT MTIMES ARE THE WHOLE
+# FIXTURE for "oldest entries first" (#4216): with one shared mtime the order is undefined and a case
+# asserting which entries survived would be asserting nothing.
+mk_cache_entries() {
+    local inst="$1" n="$2" mb="$3" i
+    mkdir -p "$inst/.cache"
+    for i in $(seq 1 "$n"); do
+        mkdir -p "$inst/.cache/ent$i"
+        dd if=/dev/zero of="$inst/.cache/ent$i/blob" bs=1M count="$mb" >/dev/null 2>&1
+        age_path "$inst/.cache/ent$i" "$(( n - i + 1 ))"
+        age_path "$inst/.cache/ent$i/blob" "$(( n - i + 1 ))"
+    done
+}
+# kv <line> <key> — the `key=value` field of an owner report line, or empty.
+kv() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }
 # idle_work <install> — make the install's `_work` read IDLE. ⛔ THE FIXTURE MUST BE GENUINELY IDLE:
 # the class treats a listener PLUS content a JOB WROTE under `_work` inside the freshness window as "a job
 # is running" (the conservative direction the brief asks for). `mk_install` creates `_work/_temp` EMPTY,
@@ -1082,7 +1113,7 @@ STUB
     [ -n "${DRC_DEBUG:-}" ] && printf 'Y1 rc=%s\n%s\n' "$rc" "$out" >&2
     case_check "$([ -e "$inst/.cache/uv/blob" ] && echo 0 || echo 1)" "a WARM cache is kept"
     case_check "$([ ! -s "$warm_log" ] && echo 0 || echo 1)" \
-               "and it is NOT `du`-measured at all (the gate keeps it without needing its size)"
+               "and it is NOT du-measured at all (the gate keeps it without needing its size)"
     case_check "$(grep -qF "INSTALL $inst cache_mb=not-measured(free-above-trigger)" <<<"$out" && echo 0 || echo 1)" \
                "the reading SAYS the size was not taken (cache_mb=not-measured(...)), not `?`-as-unmeasurable"
     case_check "$(grep -qE 'cache_mb_unmeasured=1' <<<"$out" && echo 0 || echo 1)" \
@@ -1096,6 +1127,135 @@ STUB
     return $((CASE_FAIL > 0))
 }
 
+# ── CACHE-LIVE: the cache sink is bounded by SIZE, not by the absence of a holder (#4216) ────────
+# MEASURED 2026-11-23 on pi-cell-3: a real `--size-trigger --apply` pass reported `reaped=0
+# skipped_live=2` while two installs held 71 GB of cache between them and the box had 417 MB free —
+# every install with a big cache had a running job, so the class was CORRECT AND INERT AT ONCE. The
+# cache is the ONE sink where a live holder does not mean work to lose (it is content-addressed and
+# regenerates), so it is pruned to the bound WHILE the holder runs, oldest entries first, with the
+# directory and its newest entries left in place.
+# Mutant: the excess computation forced to 0 (the bound removed — nothing is ever over the cap).
+case_cache_live() { # <owner-script>
+    local owner="$1" base a b out rc cap=4 line after pruned
+    base="$(mktemp -d "$T/x.XXXXXX")"
+    a="$base/gh-runner-a"; b="$base/gh-runner-b"
+    mk_install "$a"; mk_install "$b"
+    # ~8 MB each against a 4 MB bound: both are ABOVE it, and both have a job in flight.
+    mk_cache_entries "$a" 4 2; mk_cache_entries "$b" 4 2
+    idle_work "$a"; idle_work "$b"
+    mk_ps "$base/ps" "$a" live
+    printf '  4244 %s/bin/Runner.Worker spawnclient 42 43\n' "$b" >>"$base/ps"
+    out="$(REAP_RC_LIVE_CACHE_CAP_MB="$cap" \
+           RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 100 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    line="$(grep -F "PRUNED $a/.cache" <<<"$out")"
+    after="$(kv "$line" cache_mb_after)"; pruned="$(kv "$line" pruned_mb)"
+    case_check "$([ -n "$line" ] && echo 0 || echo 1)" \
+               "an install WITH A RUNNING JOB still gets its cache PRUNED — the busy box reclaims"
+    case_check "$([ -n "$after" ] && [ "$after" -le "$cap" ] && echo 0 || echo 1)" \
+               "install A is pruned DOWN TO THE CAP (cache_mb_after=${after:-?} ≤ cap=${cap}MB)"
+    case_check "$([ "${pruned:-0}" -ge 1 ] && echo 0 || echo 1)" \
+               "and pruned_mb=${pruned:-?} is reported for THAT install (not only as a pass total)"
+    case_check "$(grep -qF 'cache_mb_before=8' <<<"$line" && echo 0 || echo 1)" \
+               "the row carries the BEFORE reading too (cache_mb_before=8)"
+    case_check "$([ -d "$a/.cache" ] && echo 0 || echo 1)" \
+               "the cache DIRECTORY is never removed for a live install (a job must always find a cache)"
+    case_check "$([ -d "$a/.cache/ent3" ] && [ -d "$a/.cache/ent4" ] && echo 0 || echo 1)" \
+               "its NEWEST entries are kept (ent3, ent4)"
+    case_check "$([ ! -e "$a/.cache/ent1" ] && [ ! -e "$a/.cache/ent2" ] && echo 0 || echo 1)" \
+               "and the OLDEST entries went first (ent1, ent2) — oldest-first, not an arbitrary sweep"
+    line="$(grep -F "PRUNED $b/.cache" <<<"$out")"
+    after="$(kv "$line" cache_mb_after)"
+    case_check "$([ -n "$after" ] && [ "$after" -le "$cap" ] && echo 0 || echo 1)" \
+               "the SECOND live install is pruned to the cap in the SAME pass (cache_mb_after=${after:-?} ≤ ${cap}MB)"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*pruned=2 ' <<<"$out" && echo 0 || echo 1)" \
+               "the SUMMARY counts both (pruned=2) — the count cannot be inferred from freed_mb"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*skipped_live=0' <<<"$out" && echo 0 || echo 1)" \
+               "and neither install is reported as skipped_live: the cache class ACTED on them"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*pruned_mb=[1-9][0-9]*' <<<"$out" && echo 0 || echo 1)" \
+               "with the bytes attributed to the prune (pruned_mb=) beside freed_mb"
+    return $((CASE_FAIL > 0))
+}
+
+# ── CACHE-SKIP: UNDER the bound there is NO CHURN, and the NON-cache sinks keep the live rule ─────
+# Two things at once, because they are one line of policy (#4216): the cache is bounded by SIZE (so an
+# install under the bound is untouched, live or not), while `_work/_temp` and `_diag` are still skipped
+# WHOLE for a live holder — there, a live holder means work that cannot be re-downloaded. Both sinks
+# sit in the SAME live install, so neither assertion can pass for the other's reason.
+# Mutant: the live arm deleted (`if [ "$live" = 0 ]` -> `if false`) — the aged scratch and the cache
+# are then reaped, and the case reddens on both faces.
+case_cache_skip() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/xs.XXXXXX")"
+    inst="$base/gh-runner-under"
+    mk_install "$inst"
+    mk_cache_entries "$inst" 2 2                 # ~4 MB against an 8 MB bound: UNDER it
+    # AGED in both non-cache sinks: only the live holder can keep them (the age bound is 7 days).
+    printf 'old\n' >"$inst/_work/_temp/old-step.sh"; age_path "$inst/_work/_temp/old-step.sh" 9
+    printf 'old\n' >"$inst/_diag/Runner_old.log";    age_path "$inst/_diag/Runner_old.log" 9
+    idle_work "$inst"
+    mk_ps "$base/ps" "$inst" live
+    out="$(REAP_RC_LIVE_CACHE_CAP_MB=8 \
+           RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 100 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$(grep -qF 'reason=live-cache-under-cap bound_mb=8' <<<"$out" && echo 0 || echo 1)" \
+               "a cache UNDER the bound is NOT pruned, and the keep NAMES the bound it was measured against"
+    case_check "$(grep -qF 'pruned_mb=0' <<<"$out" && echo 0 || echo 1)" \
+               "pruned_mb=0 is printed rather than left to be inferred"
+    case_check "$([ -f "$inst/.cache/ent1/blob" ] && [ -f "$inst/.cache/ent2/blob" ] && echo 0 || echo 1)" \
+               "NO CHURN: every cache entry is still there, byte for byte"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*pruned=0 ' <<<"$out" && echo 0 || echo 1)" \
+               "and the SUMMARY reports pruned=0 (not a blank field)"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*skipped_live=1' <<<"$out" && echo 0 || echo 1)" \
+               "the install still counts as skipped_live (a live holder, and nothing needed pruning)"
+    case_check "$([ -f "$inst/_work/_temp/old-step.sh" ] && echo 0 || echo 1)" \
+               "THE ASYMMETRY: aged scratch under a live holder is STILL not reaped (a non-cache sink)"
+    case_check "$([ -f "$inst/_diag/Runner_old.log" ] && echo 0 || echo 1)" \
+               "and neither is an aged _diag log — the prune is scoped to the cache sink only"
+    return $((CASE_FAIL > 0))
+}
+
+# ── CACHE-UNREADABLE: a cache this pass cannot SIZE is skipped and counted, never guessed at ─────
+# The excess over the bound IS the delete plan, so a size the probe could not answer leaves no plan: it
+# is an abstention (`unmeasurable`), the cache is untouched, and the pass fails closed (rc 3).
+# Mutant: the unreadable-size skip deleted — the empty size becomes "0, under the cap" and the pass
+# reports a clean run over a cache it never measured.
+case_cache_unreadable() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/xu.XXXXXX")"
+    inst="$base/gh-runner-unreadable"
+    mk_install "$inst"; mk_cache_entries "$inst" 2 2
+    idle_work "$inst"
+    mk_ps "$base/ps" "$inst" live
+    out="$(REAP_RC_LIVE_CACHE_CAP_MB=8 REAP_RC_DU_BIN=/nonexistent/du \
+           RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 100 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "an unreadable cache size FAILS CLOSED (rc=$rc, want 3)"
+    case_check "$(grep -qF 'reason=live-cache-unmeasurable' <<<"$out" && echo 0 || echo 1)" \
+               "the install is KEPT BY NAME with the reason (reason=live-cache-unmeasurable)"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*unmeasurable=1' <<<"$out" && echo 0 || echo 1)" \
+               "and counted (unmeasurable=1), so the pass's verdict is not a clean run"
+    case_check "$([ -f "$inst/.cache/ent1/blob" ] && [ -f "$inst/.cache/ent2/blob" ] && echo 0 || echo 1)" \
+               "NOTHING was pruned under a holder: an unmeasured excess is not a delete plan"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*pruned=0 ' <<<"$out" && echo 0 || echo 1)" \
+               "and the SUMMARY says pruned=0"
+    return $((CASE_FAIL > 0))
+}
+
 # ── mutations ─────────────────────────────────────────────────────────────────────────────────
 MUT_A="$T/mut-a.sh"; MUT_B="$T/mut-b.sh"; MUT_C="$T/mut-c.sh"; MUT_C2="$T/mut-c2.sh"; MUT_D="$T/mut-d.sh"
 MUT_E="$T/mut-e.sh"; MUT_F="$T/mut-f.sh"; MUT_I="$T/mut-i.sh"; MUT_J="$T/mut-j.sh"
@@ -1105,6 +1265,7 @@ MUT_P="$T/mut-p.sh"; MUT_Q="$T/mut-q.sh"; MUT_R="$T/mut-r.sh"
 MUT_S="$T/mut-s.sh"; MUT_T="$T/mut-t.sh"; MUT_B2="$T/mut-b2.sh"; MUT_U="$T/mut-u.sh"
 MUT_B3="$T/mut-b3.sh"; MUT_V="$T/mut-v.sh"; MUT_W="$T/mut-w.sh"; MUT_X="$T/mut-x.sh"
 MUT_Y="$T/mut-y.sh"
+MUT_CL="$T/mut-cl.sh"; MUT_CU="$T/mut-cu.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -1199,6 +1360,15 @@ apply_mutation "$OWNER" "$MUT_X" 's/^        if \[ -L "\$cache" \]; then$/      
 # ⛔ Y — the warm-cache arm measures anyway (the pre-fix shape: a `du` per install on every tick).
 apply_mutation "$OWNER" "$MUT_Y" 's/^            warm)         _defer="free-above-trigger" ;;$/            warm)         _defer=""; sz="$(du_mb "$cache")" || sz="" ;;/' \
     || { printf '  ❌ mutation Y could not be applied (the deferred-size arm moved)\n'; mut_ok=0; }
+# ⛔ CL — THE LIVE CACHE BOUND REMOVED (#4216). The excess is what authorises a prune at all, so forcing
+# it to 0 makes every live install "under the cap" and restores the measured defect: a busy box
+# reclaims nothing. `case_cache_live` reddens because the cache is still 20 MB against an 8 MB bound.
+apply_mutation "$OWNER" "$MUT_CL" 's/^    excess_kb=\$(( before \* 1024 - LIVE_CACHE_CAP_MB \* 1024 ))$/    excess_kb=0/' \
+    || { printf '  ❌ mutation CL could not be applied (the live-cache excess computation moved)\n'; mut_ok=0; }
+# ⛔ CU — THE UNREADABLE-SIZE SKIP REMOVED (#4216). An empty size then reads as "0, under the cap" and
+# the pass reports a clean run over a cache whose excess was never measured.
+apply_mutation "$OWNER" "$MUT_CU" 's/^    if \[ -z "\$before" \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation CU could not be applied (the unreadable-size skip moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -1226,6 +1396,9 @@ expect_pass "V the removal is a RENAME then a delete (how=rm-quarantined, no lef
 expect_pass "W an UNSIZED candidate claims the whole per-pass cap" case_w "$OWNER"
 expect_pass "X a symlinked .cache is a POLICY keep, not an abstention (rc 0, link untouched)" case_x "$OWNER"
 expect_pass "Y a warm cache costs one df and no du (and says its size was not measured)" case_y "$OWNER"
+expect_pass "CACHE-LIVE both live installs are pruned down to the bound, oldest entries first" case_cache_live "$OWNER"
+expect_pass "CACHE-SKIP under the bound no churn; non-cache sinks keep the live rule" case_cache_skip "$OWNER"
+expect_pass "CACHE-UNREADABLE an unsizeable cache is skipped, counted, and fails closed" case_cache_unreadable "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -1260,6 +1433,9 @@ expect_fail "V mutant: the rename that makes the path vanish is neutered"  case_
 expect_fail "W mutant: an unsized candidate claims nothing of the cap"     case_w "$MUT_W"
 expect_fail "X mutant: the symlinked-cache policy arm deleted"             case_x "$MUT_X"
 expect_fail "Y mutant: a warm cache is du-measured anyway"                 case_y "$MUT_Y"
+expect_fail "CACHE-LIVE mutant: the live cache bound removed"            case_cache_live "$MUT_CL"
+expect_fail "CACHE-UNREADABLE mutant: the unreadable-size skip removed"  case_cache_unreadable "$MUT_CU"
+expect_fail "CACHE-SKIP mutant: the live arm deleted (aged scratch is reaped under a live holder)" case_cache_skip "$MUT_A"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

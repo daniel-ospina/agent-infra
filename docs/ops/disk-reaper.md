@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-18
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-2032, issue-4168, disk-reclaim, uv-cache, runner-cache, lane-venvs, worktrees, systemd
+aboutObjects: agent-infra, issue-2032, issue-4168, issue-4216, disk-reclaim, uv-cache, runner-cache, lane-venvs, worktrees, systemd
 ---
 
 # Disk reaper (#2032)
@@ -30,7 +30,7 @@ only code that deletes:
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 | `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
 the shipped 3600 s was half of it — see the class note below), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
-| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. An install with a **job in flight** is skipped whole (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), pressure-gated on its OWN filesystem (`REAP_RC_INSTALL_TRIGGER_FREE_MB`, default 40 GB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated by the same dial (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
+| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. ⛔ The **cache** is bounded by SIZE, not by liveness: a live install's `.cache` is pruned to `REAP_RC_LIVE_CACHE_CAP_MB` (default = the per-pass cap), oldest entries first, so a busy box (every install with a big cache has a running job) still reclaims — measured 71 GB skipped at 417 MB free before #4216. Every **work** sink (`_work/_temp`, `_diag`) is still skipped whole under a live holder (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), pressure-gated on its OWN filesystem (`REAP_RC_INSTALL_TRIGGER_FREE_MB`, default 40 GB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated by the same dial (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
 
 ## Why one entry point
 
@@ -877,10 +877,33 @@ liveness skip is asked FIRST, so a root a job is actually using is always report
 `_actions` or `_update` (the runner's cross-job caches — reaping those makes every later CI run
 re-download, which is a different trade and not this class's to make).
 
-**The one correctness property: never delete a cache a live job is using.** A cache deleted mid-job
-fails the job, so an install with a job in flight is skipped WHOLE and reported — `skipped-live`, with
-the witness named — never partially reaped. The verdict comes from the process table, the only witness
-that can answer it:
+**The one correctness property: never delete a live job's WORK.** An install with a job in flight has
+nothing removed from its work sinks — `_work/_temp`, `_diag` — and it is reported `skipped-live`, with
+the witness named. ⛔ **THE CACHE IS THE ONE SINK THAT IS NOT SKIPPED BY LIVENESS** (#4216): it is
+**bounded by SIZE** instead. A package cache is content-addressed and regenerates, so the worst case of
+touching it under a live job is a **re-download inside that job** — not lost work, not corruption —
+while a worktree, a venv, a `_work` checkout or a duplicate install under a live holder is work that
+cannot be re-downloaded, which is why those keep the skip. The measured reason the asymmetry exists: a
+real `--size-trigger --apply` pass on `pi-cell-3` reported `reaped=0 skipped_live=2` with 71 GB of
+cache behind two running jobs at **417 MB free**, so the class was correct and inert at the same time —
+the busier the box, the less it reclaimed.
+
+**The cache bound.** A live install's `.cache` is pruned to `REAP_RC_LIVE_CACHE_CAP_MB` (defaults to
+the per-pass cap, i.e. `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB` / `--max-mb`; `0` disables the prune and
+restores the skip-whole behaviour), **oldest entries first, and only as far as the excess requires**:
+a unit that fits under the remaining excess goes whole, a unit larger than the excess is descended into
+(so a 39 GB `uv/` is not deleted whole to shed 19 GB), and a unit that cannot be subdivided goes whole
+and overshoots. The **directory and its newest entries always stay**, so a job can never find a missing
+cache, and every removal is still a rename-then-free, so the path a running job resolves stops existing
+in one syscall. The prune is charged against the per-pass cap (`reason=pass-cap`, `capped=1`, the next
+tick continues) and only runs when the install's own filesystem is under
+`REAP_RC_INSTALL_TRIGGER_FREE_MB` — a warm cache on a box with space is still kept, live or idle. A
+cache the pass cannot SIZE is kept and counted `unmeasurable` (rc 3): the excess over the bound **is**
+the delete plan. The per-install row is
+`PRUNED <dir>/.cache … cache_mb_before=<n> cache_mb_after=<n> pruned_mb=<n> entries=<n>`.
+
+**Which installs have a job in flight** is still decided by the process table, the only witness that
+can answer it (and it decides the work sinks, and the shared root):
 
 * `bin/Runner.Worker` in the install's process list → **a job is running** (`reason=worker-running`);
 * content under `_work` **written by a job** within `REAP_RC_JOB_WINDOW_S` (default 900 s) → a job is
@@ -906,7 +929,10 @@ box whose `du` is slow.
 
 **The record.** `freed_mb_runner_cache=`, `would_free_mb_runner_cache=`, `candidates_runner_cache=`,
 `reaped_runner_cache=`, **`skipped_live_runner_cache=`** (how many installs were NOT touched because a
-job was running — the count that answers *"why is my 40 GB cache still here"*),
+job was running — the count that answers *"why is my 40 GB cache still here"*; ⛔ since #4216 a live
+install whose cache was PRUNED is not counted here, so a record reads `skipped_live=0` beside a
+`pruned=`/`pruned_mb=` pair on the class's own SUMMARY line — which the pass record also carries
+verbatim),
 `unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took — ⛔ the class's
 **total**, so it INCLUDES the shared per-box root; it used to sum only the installs' `.cache` dirs and
 read `0` on exactly the layout the durable half creates, beside a non-zero `freed_mb`),
@@ -1757,7 +1783,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 `class=runner-cache` has its own mutation-checked suite, `scripts/reap-runner-cache.test.sh`
-(**25 case runs + 29 mutants + 1 scope case — 55 outcomes**), covering every arm #4168 names. The table
+(**28 case runs + 32 mutants + 1 scope case — 61 outcomes**), covering every arm #4168 and #4216 name. The table
 below is the whole suite, not a snapshot: a case that gains a row gets its row here in the same commit,
 because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 
@@ -1789,6 +1815,9 @@ because a doc that lists 5 of 20 outcomes tells a reader the rest are untested.
 | W | an **UNSIZED** candidate claims the whole cap: a `du` that times out (`mb=?`) caps the pass after one admission, `capped=1`, and `freed_mb` stays a measured number | the `?` → `MAX_MB` claim removed (both caches reaped against a 1 MB cap) |
 | X | a **symlinked** `.cache` is a POLICY keep (`reason=symlinked-cache`) and the pass exits 0 — it used to be counted `unmeasurable`, which forces rc 3, so the operator's own layout reddened the hourly reaper forever | the symlink policy arm → `if false; then` (the link becomes a reap candidate) |
 | Y | a cache the pressure gate KEEPS is **not `du`-measured**: the tick costs one `df`, the reading says `cache_mb=not-measured(free-above-trigger)`, the SUMMARY counts `cache_mb_unmeasured=1`, and under pressure the size IS taken (CONTROL) | the warm arm measures anyway (the pre-fix `du` per install) |
+| CACHE-LIVE | **the cache sink is bounded by SIZE, not by liveness** (#4216): TWO installs, both with a `Runner.Worker` in flight, both above the bound → each is pruned **down to the bound** in the SAME pass (`pruned=2`), **oldest entries first** (the oldest two gone, the newest two kept), the `.cache` DIRECTORY never removed, and `cache_mb_before=`/`cache_mb_after=`/`pruned_mb=` printed per install. This is the measured defect: a real cell pass at 417 MB free reclaimed nothing behind two running jobs | the excess computation (`before * 1024 - LIVE_CACHE_CAP_MB * 1024`) forced to `0` — the bound removed, so nothing is ever over the cap and both caches survive whole |
+| CACHE-SKIP | **under the bound there is NO CHURN** (every entry survives, `pruned_mb=0`, `pruned=0`) **while the non-cache sinks in the same live install keep the old rule**: aged `_work/_temp` scratch and an aged `_diag` log are still NOT reaped and the install still counts in `skipped_live` — the asymmetry is deliberate, because a work sink under a live holder is work that cannot be re-downloaded | `if [ "$live" = 0 ]` → `if false` (the live arm deleted: the aged scratch AND the whole cache go) |
+| CACHE-UNREADABLE | a cache this pass cannot **SIZE** is kept and counted `unmeasurable` (rc 3): the excess over the bound IS the delete plan, so an unmeasured size is an abstention, never a delete licence | the unreadable-size skip (`if [ -z "$before" ]`) deleted — the empty size reads as "0, under the cap" and the pass reports a clean run over a cache it never measured |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 43 mutants,
 66 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the

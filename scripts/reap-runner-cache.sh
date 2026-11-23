@@ -76,10 +76,12 @@
 # under the aged-AND-idle gate below, which is exactly the window `reap-runner-work.sh` refuses to
 # touch it in — see the note there.
 #
-# ── THE ONE CORRECTNESS PROPERTY: NEVER DELETE A CACHE A LIVE JOB IS USING ───────────────────────
-# A cache deleted mid-job fails the job (a half-written archive, a missing toolchain), so an install
-# with a job in flight is SKIPPED WHOLE and REPORTED (`skipped-live`), never partially reaped. The
-# verdict comes from the process table, which is the only witness that can answer it:
+# ── THE ONE CORRECTNESS PROPERTY: NEVER DELETE A LIVE JOB'S WORK ──────────────────────────────────
+# An install with a job in flight has NOTHING removed from its WORK sinks — `_work/_temp`, `_diag` —
+# and it is SKIPPED AND REPORTED (`skipped-live`). ⛔ THE CACHE IS THE ONE SINK THAT IS NOT SKIPPED by
+# liveness: it is bounded by SIZE instead, under the rule in the next section (#4216). The verdict
+# below — which install has a job in flight — is still what decides the work sinks, and the process
+# table is the only witness that can answer it:
 #
 #   * `bin/Runner.Worker` in an install's process list  → a JOB IS RUNNING. Skip.
 #   * CONTENT UNDER `_work` WRITTEN WITHIN REAP_RC_JOB_WINDOW_S (default 900 s) → a job is running or
@@ -119,6 +121,54 @@
 #   atomic is not attempted, and a failed FREE of the quarantined tree names the leftover
 #   (`reason=remove-failed-quarantined path=<q>`), so the bytes are never silently orphaned.
 #
+# ── THE CACHE CLASS'S OWN PREDICATE: BOUND BY SIZE, NOT BY ABSENCE OF A HOLDER (#4216) ──────────
+# MEASURED 2026-11-23 on pi-cell-3 with a real `disk-reaper.sh --size-trigger --apply` pass:
+#
+#   INSTALL /opt/gh-runner-x64      cache_mb=39142 live=yes reason=busy-work        → skipped
+#   INSTALL /opt/gh-runner-cell3-1  cache_mb=32721 live=yes reason=worker-running   → skipped
+#   reaped=0  skipped_live=2   … with 417 MB free on the box
+#
+# A manual `rm -rf /opt/gh-runner-*/.cache` — the same bytes — took that box to 71 GB. So the pass was
+# CORRECT AND INERT AT THE SAME TIME: it refuses to touch a live install's cache, and on a busy cell
+# EVERY install with a big cache has a running job. The busier the box, the less it reclaimed —
+# exactly inverted from what the disk needs.
+#
+# THE FLEET RULE IT WAS COPYING IS RIGHT FOR THE OTHER SINKS AND WRONG FOR THIS ONE. "Never delete
+# under a live holder" (#2787/#2800 destroyed a live lane's tree that way) is about WORK: worktrees,
+# venvs, `_work`, duplicate installs — a live holder there means uncommitted, unrecoverable work. A
+# PACKAGE CACHE is different in kind: it is content-addressed and regenerates, so the worst case of
+# touching it under a live job is a RE-DOWNLOAD inside that job, not lost work and not corruption.
+# Hence the asymmetry, which is deliberate and is what the suite's `case_cache_live`/`case_cache_skip`
+# pair pins from both sides:
+#
+#   cache sink (`.cache`)      BOUNDED BY SIZE. Pruned down to `LIVE_CACHE_CAP_MB` whether or not a
+#                              job is running, oldest entries first. The directory is never removed
+#                              for a live install — only its oldest entries.
+#   every other sink           SKIPPED WHOLE while a holder is live (`skipped_live`), unchanged.
+#
+# ⛔ THE PRUNE, precisely, because "delete some cache" without a rule is how a cache becomes empty:
+#   * THE BOUND is `REAP_RC_LIVE_CACHE_CAP_MB`, defaulting to `--max-mb` / `$MAX_MB` — the dial
+#     `disk-reaper.sh` already forwards as `DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB`, so the fleet needs
+#     no new unit env. `0` disables the bound and restores the pre-#4216 skip-whole behaviour.
+#   * OLDEST ENTRIES FIRST, by mtime, and only as far as the excess requires: a unit that fits under
+#     the remaining excess is deleted whole; a unit LARGER than the excess is descended into (the
+#     middle of a 39 GB `uv/` must not be deleted whole to shed 19 GB); a unit that cannot be
+#     subdivided (a single file) is deleted whole and overshoots — the directory itself remains.
+#   * THE PASS CAP STILL BOUNDS THE RUN. Reclaim from pruning is charged to the same per-pass budget
+#     as every other removal, so a prune stops at `--max-mb` and reports `capped=1 remaining=<n>` for
+#     the next tick. On the measured population that means one install per tick converges.
+#   * THE FREE-SPACE GATE STILL GATES. A prune happens only when the install's own filesystem is under
+#     `REAP_RC_INSTALL_TRIGGER_FREE_MB`, or when that gate is off — the same condition under which a
+#     whole-cache reap was allowed. A warm cache on a box with space is still KEPT, live or idle.
+#   * EVERY REMOVAL IS A RENAME, THEN A FREE (the `atomic_free` below), so the path a running job
+#     resolves stops existing in ONE syscall. That property matters MORE here than anywhere else in
+#     this file: the holder is live by construction.
+# ⛔ AND THE SHARED PER-BOX ROOT IS NOT PRUNED THIS WAY, on purpose. It is shared by EVERY install, so
+# "oldest first" would be deleting entries that some other install's job may be reading right now, and
+# it already has its own bound (the free-space gate) plus a whole-population liveness question. The
+# measured defect and its acceptance fixture are about the per-install `.cache`; widening the change
+# to the shared root would be a different trade, taken on its own measurement.
+
 # ── CADENCE (agent-infra#4168 point 3) ───────────────────────────────────────────────────────────
 # This file is the POLICY OWNER; it holds no clock. `disk-reaper.sh` runs it on TWO cadences and its
 # header states why both exist: the hourly full pass (cheap to add here — this class is a `du` per
@@ -203,6 +253,15 @@
 #   REAP_RC_LOG_DAYS       age bound for `_diag/*.log` files    (default 7)
 #   REAP_RC_JOB_WINDOW_S   "a job is running" freshness window  (default 900)
 #   REAP_RC_MAX_MB         per-pass cap, 0 = uncapped           (default 0; the entry point passes one)
+#   REAP_RC_LIVE_CACHE_CAP_MB
+#                          the size a LIVE install's `.cache` is PRUNED DOWN TO, oldest entries first,
+#                          with the directory and its newest entries left in place (#4216). This is what
+#                          makes the cache class reclaim on a BUSY box: liveness does not protect it,
+#                          size does — a package cache is content-addressed and regenerates, so the worst
+#                          case is a re-download inside a live job, not lost work. Defaults to the
+#                          per-pass cap (the dial the entry point already forwards); 0 disables the prune
+#                          and restores the skip-whole behaviour. Every OTHER sink (worktrees, venvs,
+#                          `_work`, `_diag`, duplicate installs) still refuses under a live holder.
 #   REAP_RC_PS_BIN         the process census binary            (default /bin/ps)
 #   REAP_RC_DU_BIN         (default du)  REAP_RC_STAT_BIN (default stat)
 #   REAP_RC_STATE_DIR      the state dir (also the log's default location)
@@ -280,6 +339,16 @@ SCRATCH_DAYS="${REAP_RC_SCRATCH_DAYS:-7}"
 LOG_DAYS="${REAP_RC_LOG_DAYS:-7}"
 JOB_WINDOW_S="${REAP_RC_JOB_WINDOW_S:-900}"
 MAX_MB="${REAP_RC_MAX_MB:-0}"
+# ⛔ THE CACHE SINK'S OWN BOUND (#4216, see the header): the size a LIVE install's `.cache` is pruned
+# down to, oldest entries first. ⛔ ITS DEFAULT IS RESOLVED **AFTER** THE ARGUMENT LOOP, because the
+# documented default IS the per-pass cap and that cap is `--max-mb` — a value parsed below. Resolving it
+# here read `$MAX_MB` BEFORE the flag was applied and silently produced 0 (= the prune DISABLED) on
+# every `disk-reaper.sh` pass, i.e. the fix would have shipped inert while its record printed
+# `max_mb=20480 live_cache_cap_mb=0` (caught by `disk-reaper.test.sh`, not by the class's own suite).
+# `0` = no bound, which restores the pre-#4216 behaviour (a live install's cache is skipped whole).
+LIVE_CACHE_CAP_MB="${REAP_RC_LIVE_CACHE_CAP_MB:-0}"
+LIVE_CACHE_CAP_SET=0
+[ -n "${REAP_RC_LIVE_CACHE_CAP_MB+set}" ] && LIVE_CACHE_CAP_SET=1
 PS_BIN="${REAP_RC_PS_BIN:-/bin/ps}"
 DU_BIN="${REAP_RC_DU_BIN:-du}"
 DF_BIN="${REAP_RC_DF_BIN:-df}"
@@ -328,6 +397,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ⛔ `--max-mb` IS THE CACHE LIVE BOUND'S DEFAULT (see its definition above): resolved HERE, after the
+# loop, so an operator's `--max-mb` — the only dial `disk-reaper.sh` forwards — actually bounds a live
+# install's cache. A set-but-empty seam is a REFUSAL via `_seam_ok` below, never the default.
+if [ "$LIVE_CACHE_CAP_SET" = 0 ]; then LIVE_CACHE_CAP_MB="$MAX_MB"; fi
 # ⛔ EVERY NUMERIC OPERAND HERE REACHES AN ARITHMETIC COMPARISON. A non-numeric value makes `[ -gt ]`
 # ERROR, and under `set -u` without `-e` the error status takes the `else` arm — which on this class
 # means "IDLE, reap it". So a typo in the age bound would turn a fail-closed gate into a delete
@@ -351,6 +424,7 @@ _seam_ok REAP_RC_SCRATCH_DAYS "$SCRATCH_DAYS" || exit 3
 _seam_ok REAP_RC_LOG_DAYS "$LOG_DAYS" || exit 3
 _seam_ok REAP_RC_JOB_WINDOW_S "$JOB_WINDOW_S" || exit 3
 _seam_ok REAP_RC_MAX_MB "$MAX_MB" || exit 3
+_seam_ok REAP_RC_LIVE_CACHE_CAP_MB "$LIVE_CACHE_CAP_MB" || exit 3
 # ⛔ A SET-BUT-EMPTY GLOB LIST IS A REFUSAL. An emptied seam would otherwise "scan nothing" and print a
 # MEASURED ZERO — an inert class reading healthy on the box it exists to free.
 if [ "$RC_GLOBS_SET" = 1 ] && [ -z "$RC_GLOBS" ]; then
@@ -379,6 +453,14 @@ CAPPED=0
 REMAINING=0
 FREED_MB=0
 CACHE_TOTAL_MB=0
+# ⛔ PRUNING IS ITS OWN OUTCOME (#4216): the cache class can now reclaim bytes from an install it did
+# NOT reap whole, so "how many installs had a cache pruned" and "how many bytes that bought" cannot be
+# inferred from `reaped`/`freed_mb` — and `freed_mb` alone would make a 19 GB prune and a 19 GB of
+# whole-cache reaps read identically. Every pruned unit is also counted in `reaped`/`candidates` (they
+# ARE removals, and the entry point's record reads them), while these two count the INSTALLS and the
+# bytes attributable to the prune.
+PRUNED=0
+PRUNED_MB=0
 # ⛔ WHAT AN UNSIZED CANDIDATE CLAIMS OF THE PER-PASS CAP, kept apart from `FREED_MB` on purpose: the
 # claim must BOUND the pass, while `freed_mb` must stay a measured number (#4169 review, P3).
 UNSIZED_MB=0
@@ -403,11 +485,37 @@ rm_path() { rm -rf -- "$1"; }
 # that did.
 mv_path() { mv -- "$1" "$2" 2>/dev/null; }
 
-du_mb() { # <path> — blocks occupied in MiB, or empty when the probe could not answer
+# atomic_free <path> — the ONE removal primitive: RENAME the path out of the way, then free it (#4216).
+# 0 = the path no longer exists and its bytes are gone; 1 = it could not be RENAMED (nothing deleted);
+# 2 = it was renamed but the quarantined tree could not be freed (the bytes are on disk under LAST_Q).
+# ⛔ BOTH CALLERS GO THROUGH THIS (`reap_one` and `prune_walk`) so the "probe is correct only up to one
+# syscall" property cannot hold for one delete path and not the other — a job that starts during the
+# free keeps its open inodes, a job that starts after the rename finds no path and re-creates it.
+LAST_Q=""
+atomic_free() {
+    local p="$1" q
+    LAST_Q=""
+    q="${p}.reaping.$$"
+    if ! mv_path "$p" "$q" || [ -e "$p" ] || [ -L "$p" ]; then return 1; fi
+    LAST_Q="$q"
+    if rm_path "$q" 2>/dev/null && [ ! -e "$q" ] && [ ! -L "$q" ]; then
+        LAST_Q=""
+        return 0
+    fi
+    return 2
+}
+
+du_kb() { # <path> — blocks occupied in KiB, or empty when the probe could not answer
     local kb
     kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
     kb="${kb%%[[:space:]]*}"
     case "$kb" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$kb"
+}
+
+du_mb() { # <path> — blocks occupied in MiB, or empty when the probe could not answer
+    local kb
+    kb="$(du_kb "$1")" || return 1
     printf '%s' "$(( kb / 1024 ))"
 }
 
@@ -608,7 +716,7 @@ cap_reached() {
 # `<install>` names the install whose liveness the re-probe re-asks; `-` is the SHARED cache root,
 # whose question is the population's (any install live), because that root is not one install's.
 reap_one() {
-    local path="$1" size="$2" kind="$3" install="$4" _live _pending _q
+    local path="$1" size="$2" kind="$3" install="$4" _live _pending _q _arc
     # ⛔ AN UNSIZED CANDIDATE CLAIMS THE WHOLE CAP (#4169 review, P3). `${size%%[!0-9]*}` collapsed
     # every `?` (a `du` that timed out on a 40–50 GB tree) to 0, so such a pass was uncapped: the cap
     # promised in the docs bounded nothing on exactly the population it was written for.
@@ -668,26 +776,210 @@ reap_one() {
     # and a job that started inside it read a half-deleted cache, which is the failing job this class
     # exists to prevent. After the rename the PATH a job resolves no longer exists (a job that starts
     # now gets a fresh directory), while a job that started before it keeps its open inodes.
-    _q="${path}.reaping.$$"
-    if ! mv_path "$path" "$_q" || [ -e "$path" ] || [ -L "$path" ]; then
+    atomic_free "$path"
+    _arc=$?
+    _q="$LAST_Q"
+    case "$_arc" in
+    1)
         FAILED=$((FAILED + 1))
         log_line "ERR    $path reason=quarantine-failed (the candidate could not be RENAMED out of the way, so it was NOT deleted: a removal that cannot first be made atomic is not attempted — a live job must never observe a half-deleted tree)"
         log "REMOVAL REFUSED (quarantine) $path"
-        return 0
-    fi
-    if rm_path "$_q" 2>/dev/null && [ ! -e "$_q" ] && [ ! -L "$_q" ]; then
-        REAPED=$((REAPED + 1))
-        case "$size" in
-            ''|*[!0-9]*) UNSIZED_MB=$((UNSIZED_MB + MAX_MB)) ;;
-            *)           FREED_MB=$((FREED_MB + size)) ;;
-        esac
-        log_line "REAPED $path how=rm-quarantined kind=${kind} mb=${size}"
-        log "reaped $path kind=$kind mb=$size how=rm-quarantined"
-    else
+        return 0 ;;
+    2)
         FAILED=$((FAILED + 1))
         log_line "ERR    $path reason=remove-failed-quarantined path=$_q (the tree was renamed out of a live job's reach but could not be freed; the bytes are still on disk under that name and nothing else in this class matches it)"
         log "REMOVAL FAILED (quarantined) $path -> $_q"
+        return 0 ;;
+    esac
+    REAPED=$((REAPED + 1))
+    case "$size" in
+        ''|*[!0-9]*) UNSIZED_MB=$((UNSIZED_MB + MAX_MB)) ;;
+        *)           FREED_MB=$((FREED_MB + size)) ;;
+    esac
+    log_line "REAPED $path how=rm-quarantined kind=${kind} mb=${size}"
+    log "reaped $path kind=$kind mb=$size how=rm-quarantined"
+    return 0
+}
+
+# ══ the CACHE sink's own predicate: a CAPPED PRUNE, not a liveness skip (#4216) ═════════════════
+# The header section states the policy and the measurement; this is the mechanism. Two rules keep it
+# from being a free hand at a live install's cache:
+#   * it stops at `LIVE_CACHE_CAP_MB` — the directory and its NEWEST entries stay, so the worst case
+#     inside a live job is a re-download of an OLD entry, never a missing toolchain it cannot rebuild;
+#   * it is charged against the per-pass cap like every other removal, so a tick that prunes cannot
+#     become the load problem the cap exists to prevent.
+
+# PRUNE_MAX_DEPTH — how far the descent may go before a unit is deleted whole. A cache is shallow
+# (`uv/archive-v0/<hash>`, `go-build/ab/<hash>`, `pip/http-v2/<a>/<b>`), so 8 is far past any real
+# layout; past it, deleting the unit whole is the disclosed OVERSHOOT (bounded by one subtree) rather
+# than an unbounded walk of a tree nobody has measured.
+PRUNE_MAX_DEPTH=8
+
+# prune_walk <dir> <depth> — remove the OLDEST entries under <dir> until the prune has shed what it
+# needs. Globals, because bash 3.2 has no by-reference locals:
+#   PW_NEED_KB    KiB the prune still has to shed   PW_FREED_KB  KiB it has shed
+#   PW_BUDGET_KB  KiB left of the per-pass cap when the prune started
+#   PW_UNITS      units removed   PW_STOP  "" | pass-cap | quarantine-failed | remove-failed-quarantined
+#   PW_SEQ/PW_TMP the per-directory listings (one bounded file per visited directory, cleaned up)
+prune_walk() {
+    local dir="$1" depth="$2" listing e m esize _arc
+    PW_SEQ=$((PW_SEQ + 1))
+    listing="$PW_TMP/list.$PW_SEQ"
+    if ! : >"$listing" 2>/dev/null; then PW_STOP="listing-failed"; return 0; fi
+    for e in "$dir"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        if [ -L "$e" ]; then
+            KEPT=$((KEPT + 1))
+            log_line "KEPT   $e reason=symlink (never followed in a delete path: the link holds none of the cache's bytes, so removing it would free nothing and lose the operator's layout)"
+            continue
+        fi
+        # ⛔ AN ENTRY THIS PASS CANNOT AGE IS NOT A CANDIDATE: "oldest first" is the whole safety story
+        # of pruning under a live holder, so an entry whose position in that order is UNKNOWN is kept
+        # (and counted, so the pass's verdict is not a clean run).
+        if ! m="$(mtime_of "$e")"; then
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "KEPT   $e reason=unmeasurable-mtime ('$STAT_BIN' could not age this cache entry, so its place in the oldest-first order is UNKNOWN; NOT removed)"
+            continue
+        fi
+        printf '%s\t%s\n' "$m" "$e" >>"$listing"
+    done
+    # OLDEST FIRST — the mtime ascending, one entry per line.
+    while IFS=$'\t' read -r m e; do
+        [ -n "$e" ] || continue
+        [ "$PW_NEED_KB" -gt 0 ] || break
+        [ -z "$PW_STOP" ] || break
+        # ⛔ THE PASS CAP BOUNDS THE PRUNE. Without this the bound on a tick is the excess of ONE
+        # install, and on a 40 GB cache that is a 20 GB delete in a pass that fires 144×/day.
+        if [ "$MAX_MB" -gt 0 ] && [ "$PW_FREED_KB" -ge "$PW_BUDGET_KB" ]; then
+            PW_STOP="pass-cap"; CAPPED=1; REMAINING=$((REMAINING + 1)); break
+        fi
+        if ! esize="$(du_kb "$e")"; then
+            # ⛔ AN UNSIZED UNIT CANNOT BE CHARGED TO THE CAP, so removing it would make the cap
+            # unbounded on exactly the tree shape that produced the timeout. Kept, and counted.
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "KEPT   $e reason=unmeasurable-size ('$DU_BIN -sk' could not size this cache entry, so it cannot be charged against the pass cap; NOT removed)"
+            continue
+        fi
+        if [ "$esize" -le "$PW_NEED_KB" ] || [ "$depth" -ge "$PRUNE_MAX_DEPTH" ] || [ ! -d "$e" ]; then
+            CANDIDATES=$((CANDIDATES + 1))
+            atomic_free "$e"
+            _arc=$?
+            case "$_arc" in
+                0) PW_FREED_KB=$((PW_FREED_KB + esize))
+                   PW_NEED_KB=$((PW_NEED_KB - esize))
+                   PW_UNITS=$((PW_UNITS + 1))
+                   REAPED=$((REAPED + 1)) ;;
+                1) FAILED=$((FAILED + 1)); PW_STOP="quarantine-failed"
+                   log_line "ERR    $e reason=quarantine-failed (a cache entry could not be RENAMED out of a live job's reach, so it was NOT deleted and the prune STOPS here: a removal that cannot be made atomic is not attempted by another route)" ;;
+                *) FAILED=$((FAILED + 1)); PW_STOP="remove-failed-quarantined"
+                   log_line "ERR    $e reason=remove-failed-quarantined path=$LAST_Q (renamed out of the job's reach but could not be freed; the bytes are still on disk under that name)" ;;
+            esac
+            continue
+        fi
+        # THE UNIT IS BIGGER THAN WHAT THE PRUNE STILL HAS TO SHED → DESCEND rather than delete it
+        # whole: shedding 19 GB from a 39 GB install must not mean deleting a 30 GB `uv/` tree.
+        prune_walk "$e" "$((depth + 1))"
+        # ...and take the husk when the descent emptied it, so its own blocks are credited too.
+        rmdir -- "$e" 2>/dev/null || true
+    done < <(sort -n -k1,1 "$listing" 2>/dev/null)
+    rm -f -- "$listing" 2>/dev/null
+    return 0
+}
+
+# live_cache_prune <install> <cache> <size-mb|""> <press-state> <live-reason> — the live arm's WHOLE
+# job, in one place, because the arms must be exhaustive: every non-pruning path falls back to the
+# legacy `SKIPPED-LIVE` line, so a box whose cache cannot be bounded can never be silently ignored.
+# ⛔ IT NEVER RETURNS EARLY BEFORE REPORTING: `sweep_install` returns immediately after this call, so a
+# silent arm here would be an install with no cache decision in the journal at all.
+live_cache_prune() {
+    local inst="$1" cache="$2" before="$3" press="$4" reason="$5"
+    local excess_kb planned_mb _left after_mb pruned_mb
+    local legacy="SKIPPED-LIVE $inst reason=skipped-live:$reason cache_mb=${before:-?}"
+    # ── the arms where NOTHING is pruned, said in the pre-#4216 words ────────────────────────────
+    if [ "$LIVE_CACHE_CAP_MB" -le 0 ]; then
+        SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
+        log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live cache bound is DISABLED by REAP_RC_LIVE_CACHE_CAP_MB=0)"
+        return 0
     fi
+    if [ ! -e "$cache" ] || [ -L "$cache" ] || [ "$press" = "warm" ] || [ "$press" = "unanswerable" ] || [ "$press" = "symlinked" ] || [ "$press" = "none" ]; then
+        # A WARM filesystem, a symlinked/absent cache, or a probe that cannot answer: the bound is not
+        # the reason this cache stays, so it is reported as the whole-install skip it is (and the
+        # `INSTALL …` reading above already named the free-space verdict and the reason).
+        SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
+        log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live bound applies only under the install's own free-space gate, and this cache is not a candidate: press=${press:-none})"
+        return 0
+    fi
+    if [ -z "$before" ]; then
+        # ⛔ THE SIZE IS WHAT DECIDES HERE, so a size the probe could not answer is an ABSTENTION, not a
+        # licence to prune: without it there is no excess to shed and any delete would be unbounded.
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $cache reason=live-cache-unmeasurable cache_mb=? live=$reason ('$DU_BIN -sk' could not size this cache, so the excess over the live bound ${LIVE_CACHE_CAP_MB}MB is UNKNOWN; NOT pruned)"
+        return 0
+    fi
+    excess_kb=$(( before * 1024 - LIVE_CACHE_CAP_MB * 1024 ))
+    if [ "$excess_kb" -le 0 ]; then
+        # NO CHURN: under the bound, the cache is a WARM cache and touching it buys nothing.
+        SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
+        log_line "$legacy (its cache is UNDER the live bound so nothing is pruned, and its scratch and logs are NOT touched; reason=live-cache-under-cap bound_mb=${LIVE_CACHE_CAP_MB} cache_mb_before=${before} cache_mb_after=${before} pruned_mb=0)"
+        return 0
+    fi
+    planned_mb=$(( excess_kb / 1024 ))
+    # ⛔ AN EXHAUSTED PASS BUDGET IS A KEEP, NOT A ZERO-BYTE "PRUNE". The same `reason=pass-cap` a
+    # whole-cache candidate gets, so the two arms read alike and the record's `capped=1 remaining=`
+    # means the same thing either way — the next tick continues where this one stopped.
+    if [ "$MAX_MB" -gt 0 ] && [ "$(( FREED_MB + UNSIZED_MB ))" -ge "$MAX_MB" ]; then
+        CAPPED=1; REMAINING=$((REMAINING + 1))
+        SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
+        log_line "KEPT   $cache reason=pass-cap (this cache is OVER the live bound ${LIVE_CACHE_CAP_MB}MB, but the per-pass cap ${MAX_MB}MB is already spent; the bound is enforced on the next tick)"
+        return 0
+    fi
+    if [ "$MAX_MB" -gt 0 ]; then
+        _left=$(( MAX_MB - FREED_MB - UNSIZED_MB )); [ "$_left" -lt 0 ] && _left=0
+        [ "$planned_mb" -gt "$_left" ] && planned_mb="$_left"
+    fi
+    if is_dry; then
+        # ⛔ THE DRY RUN SELECTS THE SAME CANDIDATE, so its preview is a preview of THIS pass: the owner
+        # emits the entry point's own `REAP` row, and the row says the prune would stop at the bound.
+        CANDIDATES=$((CANDIDATES + 1))
+        FREED_MB=$((FREED_MB + planned_mb))
+        CAND_NAMES="${CAND_NAMES}${CAND_NAMES:+
+}REAP ${planned_mb}MB ${cache} kind=live-cache-over-cap"
+        log_line "WOULD-PRUNE $cache reason=live-cache-over-cap live=$reason cap_mb=${LIVE_CACHE_CAP_MB} cache_mb_before=${before} cache_mb_after=not-measured would_prune_mb=${planned_mb} (dry run: the OLDEST entries would go and the directory with its newest entries would stay)"
+        return 0
+    fi
+    # ── the prune ───────────────────────────────────────────────────────────────────────────────
+    PW_TMP="$(mktemp -d "${TMPDIR:-/tmp}/rrc-prune.XXXXXX" 2>/dev/null)" || PW_TMP=""
+    if [ -z "$PW_TMP" ]; then
+        # A prune with nowhere to write its listings would either run unsorted (not oldest-first) or
+        # not at all. It does not run: the bound is not worth an unordered delete under a live job.
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $cache reason=prune-workspace-unavailable cache_mb=${before} live=$reason (a listing directory could not be created, so the oldest-first order could not be established; NOT pruned)"
+        return 0
+    fi
+    PW_NEED_KB=$excess_kb
+    PW_FREED_KB=0
+    PW_UNITS=0
+    PW_STOP=""
+    PW_SEQ=0
+    PW_BUDGET_KB=0
+    [ "$MAX_MB" -gt 0 ] && PW_BUDGET_KB=$(( (MAX_MB - FREED_MB - UNSIZED_MB) * 1024 ))
+    [ "$PW_BUDGET_KB" -lt 0 ] && PW_BUDGET_KB=0
+    prune_walk "$cache" 0
+    rm -rf -- "$PW_TMP" 2>/dev/null || true
+    pruned_mb=$(( PW_FREED_KB / 1024 ))
+    after_mb="$(du_mb "$cache")" || after_mb=""
+    if [ "$PW_UNITS" -eq 0 ]; then
+        # ⛔ OVER THE BOUND AND NOTHING REMOVABLE: every candidate was unmeasurable (each already counted
+        # `unmeasurable`, which forces rc 3). Reporting this as a `PRUNED … pruned_mb=0` row would read
+        # as "the bound was met", which is the one thing this pass cannot claim.
+        log_line "KEPT   $cache reason=live-cache-no-prunable-entry cache_mb=${before} live=$reason cap_mb=${LIVE_CACHE_CAP_MB} (over the bound, but no entry could be removed${PW_STOP:+ (stopped=$PW_STOP)}; NOT reported as pruned)"
+        return 0
+    fi
+    PRUNED=$((PRUNED + 1))
+    PRUNED_MB=$((PRUNED_MB + pruned_mb))
+    FREED_MB=$((FREED_MB + pruned_mb))
+    log_line "PRUNED $cache reason=live-cache-over-cap live=$reason cap_mb=${LIVE_CACHE_CAP_MB} cache_mb_before=${before} cache_mb_after=${after_mb:-not-measured} pruned_mb=${pruned_mb} entries=${PW_UNITS}${PW_STOP:+ stopped=$PW_STOP} (BOUNDED BY SIZE, not by the absence of a holder: the directory and its NEWEST entries stay, and a job that needs an older entry re-downloads it — which is why this cache is pruned while a live job holds the install and its scratch and logs are not touched at all)"
+    log "pruned $cache kind=live-cache-over-cap live=$reason cap_mb=$LIVE_CACHE_CAP_MB before=$before after=${after_mb:-?} pruned_mb=$pruned_mb entries=$PW_UNITS${PW_STOP:+ stopped=$PW_STOP}"
     return 0
 }
 
@@ -748,10 +1040,14 @@ sweep_install() { # <install-dir>
 }${reading}"
     case "$sz" in ''|*[!0-9]*) ;; *) CACHE_TOTAL_MB=$((CACHE_TOTAL_MB + sz)) ;; esac
 
-    # ── the ONE correctness property: a live install is skipped WHOLE, and reported ──────────────
+    # ── the CACHE sink gets its OWN predicate; the work sinks keep the unchanged one (#4216) ────
+    # ⛔ THE ASYMMETRY IS THE POINT, and it is one line: a package cache is content-addressed and
+    # regenerates, so liveness does not protect it — SIZE does (`live_cache_prune`, which prunes the
+    # oldest entries down to the bound and leaves the directory and its newest entries). Every other
+    # sink under this install — `_work/_temp`, `_diag` — is still skipped WHOLE while a job is in
+    # flight, because there a live holder means work that cannot be re-downloaded.
     if [ "$live" = 0 ]; then
-        SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
-        log_line "SKIPPED-LIVE $d reason=skipped-live:${LIVE_REASON} cache_mb=${sz:-?} (a job is running in this install; its cache and scratch are NOT touched)"
+        live_cache_prune "$d" "$cache" "${sz:-}" "${_press_state:-none}" "$LIVE_REASON"
         return 0
     fi
     if [ "$live" = 2 ]; then
@@ -1033,7 +1329,7 @@ glob_matched_dirs() {
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
 : >"$LOG_FILE" 2>/dev/null || LOG_FILE=""
 
-log_line "reap-runner-cache: mode=$( is_dry && printf dry-run || printf apply ) install_globs='$RC_GLOBS' shared_globs='$SHARED_GLOBS' min_cache_mb=${MIN_CACHE_MB} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB} install_trigger_free_mb=${INSTALL_TRIGGER_FREE_MB} shared_trigger_free_mb=${SHARED_TRIGGER_FREE_MB}"
+log_line "reap-runner-cache: mode=$( is_dry && printf dry-run || printf apply ) install_globs='$RC_GLOBS' shared_globs='$SHARED_GLOBS' min_cache_mb=${MIN_CACHE_MB} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB} live_cache_cap_mb=${LIVE_CACHE_CAP_MB} install_trigger_free_mb=${INSTALL_TRIGGER_FREE_MB} shared_trigger_free_mb=${SHARED_TRIGGER_FREE_MB}"
 
 census_read || { CENSUS="unreadable"; log_line "reap-runner-cache: ⛔ CENSUS UNREADABLE — '$PS_BIN -axo pid=,command=' did not answer, so no install's liveness can be proved. NOTHING will be removed and this pass is FAIL-CLOSED (a cache deleted under a live job fails the job)."; }
 
@@ -1150,12 +1446,12 @@ if [ "$CENSUS" != ok ] || [ "$UNMEASURABLE" -gt 0 ] || [ "$REFUSED" -gt 0 ]; the
 fi
 if [ "$rc" = 0 ] && is_dry && [ "$CANDIDATES" -gt 0 ]; then rc=5; fi
 
-log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} cache_mb_unmeasured=${CACHE_NOT_MEASURED} candidates=${CANDIDATES} reaped=${REAPED} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} refused=${REFUSED} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB}"
+log_line "reap-runner-cache: SUMMARY class=${CLASS_NAME} census=$CENSUS installs=${INSTALLS} cache_mb=${CACHE_TOTAL_MB} cache_mb_unmeasured=${CACHE_NOT_MEASURED} candidates=${CANDIDATES} reaped=${REAPED} pruned=${PRUNED} pruned_mb=${PRUNED_MB} skipped_live=${SKIPPED_LIVE} kept=${KEPT} unmeasurable=${UNMEASURABLE} refused=${REFUSED} gone=${GONE} failed=${FAILED} freed_mb=${FREED_MB} capped=${CAPPED} remaining=${REMAINING} scratch_days=${SCRATCH_DAYS} log_days=${LOG_DAYS} job_window=${JOB_WINDOW_S}s max_mb=${MAX_MB} live_cache_cap_mb=${LIVE_CACHE_CAP_MB}"
 # ⛔ THE LOG LINE CARRIES THE POPULATION IT SCANNED (`install_globs=` / `shared_globs=`). The stdout
 # header already prints them, but the LOG is the durable artifact an operator reads after the fact, and
 # it is the only way a test can prove WHICH population a pass was pinned to — which is the whole point
 # of `disk-reaper.test.sh` pinning this class to its fixtures (agent-infra#4169): an unpinned suite ran
 # the destructive pass against the box's real `/opt/gh-runner*` installs while claiming to be hermetic.
-[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB cache_mb_unmeasured=$CACHE_NOT_MEASURED candidates=$CANDIDATES reaped=$REAPED skipped_live=$SKIPPED_LIVE refused=$REFUSED freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
+[ -n "$LOG_FILE" ] && log "SUMMARY census=$CENSUS installs=$INSTALLS cache_mb=$CACHE_TOTAL_MB cache_mb_unmeasured=$CACHE_NOT_MEASURED candidates=$CANDIDATES reaped=$REAPED pruned=$PRUNED pruned_mb=$PRUNED_MB skipped_live=$SKIPPED_LIVE refused=$REFUSED freed_mb=$FREED_MB install_globs=$RC_GLOBS shared_globs=$SHARED_GLOBS"
 command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
 exit "$rc"
