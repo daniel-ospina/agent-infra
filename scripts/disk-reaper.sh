@@ -230,6 +230,13 @@
 #                              idle install's warm cache on a box the trigger fired for a tmpfs `/tmp` it
 #                              does not own (#4169 review, P2).
 #   DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB      per-pass reclaim cap (default 20480 = 20 GB; 0 = uncapped)
+#                              ⛔ IT IS ALSO THE LIVE CACHE BOUND'S DEFAULT (the class's `--max-mb`). As a
+#                              BOUND, 0 is not "uncapped" — it is the strictest setting: a live install's
+#                              cache is then skipped whole, the pre-#4216 behaviour. So this one dial both
+#                              removes the pass's ceiling and disables the reclaim on the population the
+#                              ceiling exists for. The class NAMES that reversal in its journal every time
+#                              it is in force (#4220 review, P3); set REAP_RC_LIVE_CACHE_CAP_MB to arm the
+#                              bound while keeping the pass uncapped.
 #   DISK_REAPER_CLASS_TIMEOUT  watchdog per class, secs  (default 1800)
 #   DISK_REAPER_DU_TIMEOUT     watchdog per dry-run `du`, secs (default 120)
 #   DISK_REAPER_STALE_SECONDS  a status older than this is STALE (default 7200)
@@ -3258,7 +3265,7 @@ reap_runner_cache() {
 }disk-reaper: WOULD-REMOVE class=runner-cache (? bytes unmeasured — the owner could not size it) ${path}" ;;
                         *) WOULD_RC=$((WOULD_RC + size))
                            cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the install has no job in flight — an install with one is skipped whole, see skipped_live=)" ;;
+}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound, see pruned_mb= in the pass record)" ;;
                     esac ;;
             esac
         done <<<"$rows"
