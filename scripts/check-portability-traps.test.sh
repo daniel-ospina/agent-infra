@@ -1395,6 +1395,37 @@ invalid="$(grep -c '^MUTANT-INVALID' "$TMP/mutants.log")"
 [ "$notapplied" = 0 ] && ok "D: every mutant applied" || bad "D: $notapplied MUTANT-NOT-APPLIED (dispatch table drifted from the source)"
 [ "$invalid" = 0 ] && ok "D: no MUTANT-INVALID (every mutant ran and reported findings, not a crash)" || bad "D: $invalid MUTANT-INVALID (a crash masqueraded as a kill)"
 
+# ── D3. THE TRIGGER PREFILTER IS LOAD-BEARING (agent-infra#4210) ────────────────────────────────
+# F10 asserts the fast path and the reference path AGREE. This arm proves that assertion is SENSITIVE
+# to the trigger list, which is the half F10 cannot show on its own: remove ONE literal (sed) from
+# the detector's trigger alternation and the sed findings must DISAPPEAR from the same run over the
+# same fixtures. Without it, F10 would pass just as green over a trigger list that was wrong in a way
+# the corpus happened not to reveal — the exact shape of an unguarded optimization over a gate.
+TMUT="$TMP/trigmut.sh"
+# the replacement targets the alternation LINE, identified by the two tokens that flank `sed` in it,
+# so a detector whose trigger list moved or changed shape fails this arm LOUDLY rather than silently
+# mutating nothing and "proving" the guard with an unchanged file.
+awk '{ if (index($0, "|sed|readlink|") > 0) gsub(/[|]sed[|]/, "|"); print }' "$CHECK" >"$TMUT"
+if cmp -s "$CHECK" "$TMUT"; then
+  bad "D3: the trigger-list mutant did NOT apply (no `|sed|readlink|` token in the alternation) — an unchanged file proves this guard vacuous"
+else
+  # control: the UNMUTATED detector does report the sed trap this arm then requires to vanish
+  run_mutant "$CHECK"; d3_ctl=$MUTANT_RC
+  if [ "$d3_ctl" != 1 ] || ! grep -q 'sed-in-place-gnu' "$OUT"; then
+    bad "D3: control failed — the unmutated detector did not report `sed-in-place-gnu` on the live sed fixture (rc=$d3_ctl), so the mutation below proves nothing"
+  else
+    run_mutant "$TMUT"; d3_rc=$MUTANT_RC
+    # rc=1 still holds (the other 17 live traps are still found); only the SED findings must be gone
+    if [ "$d3_rc" = 1 ] && ! grep -q 'sed-in-place-gnu' "$OUT"; then
+      ok "D3: dropping `sed` from the trigger alternation LOSES the sed finding — the prefilter genuinely gates the rule, so F10's equivalence is sensitive to the list"
+    elif [ "$d3_rc" != 1 ]; then
+      bad "D3: the trigger mutant exited $d3_rc, not 1 — it broke the scan instead of narrowing it, so it proves nothing about the prefilter"
+    else
+      bad "D3: the sed finding SURVIVED a trigger list without `sed` — the fast path is not gating that rule, so F10 cannot detect an incomplete list"
+    fi
+  fi
+fi
+
 # ── E. THE BASELINE RATCHET: it cannot swallow a regression, and it cannot pass without a reason ─
 E="$TMP/ratchet"; : >"$E"
 mkdir -p "$TMP/tree/ratchet"
@@ -1709,6 +1740,44 @@ if [ -f "$SHARDS" ]; then
     || bad "F7: SUITE_GLOBS is unreadable — the wiring arm above proved nothing"
 else
   unproven "run-bash-shards.sh absent — the CI-wiring arm cannot run here"
+fi
+
+# ── F10. THE TRIGGER PREFILTER IS AN OPTIMIZATION, NOT A RULE CHANGE (agent-infra#4210) ───────
+# The scan skips its whole rule block on a line whose RAW text carries none of the literals any rule
+# needs (the detector's `trig_atoms`). That is a FAST PATH OVER A GATE, so an incomplete trigger list
+# would be a FALSE CLEAN — the one direction this detector never takes. `--no-trigger-prefilter` is
+# the reference path, and this arm requires the two paths to agree BYTE FOR BYTE: first on the LIVE
+# FIXTURES (one per rule family — exactly the population where a dropped trigger shows), then on a
+# sample of REAL repo files, because a fixture corpus can agree while real prose does not.
+# ⚠️ WHAT THIS ARM DOES NOT PROVE ON ITS OWN: that the comparison is SENSITIVE to the trigger list.
+# That is D3, which mutates the list and requires the sed findings to DISAPPEAR — so an incomplete
+# list changes this comparison instead of hiding behind it.
+run_check "$A" --no-baseline; f10_fast_rc=$?
+cp "$OUT" "$TMP/f10-fast.out"
+run_check "$A" --no-baseline --no-trigger-prefilter; f10_ref_rc=$?
+cp "$OUT" "$TMP/f10-ref.out"
+if [ "$f10_fast_rc" = "$f10_ref_rc" ] && cmp -s "$TMP/f10-fast.out" "$TMP/f10-ref.out"; then
+  ok "F10a: the trigger prefilter is verdict-identical to the reference scan on the live fixtures (rc=$f10_fast_rc)"
+else
+  bad "F10a: the trigger prefilter CHANGED the verdict on the live fixtures (fast rc=$f10_fast_rc, reference rc=$f10_ref_rc) — an incomplete trigger list is a false CLEAN"
+fi
+# The real-code half. The three files are things this tree SHIPS (a trap-carrying script and two
+# siblings), named rather than globbed so the arm cost stays bounded and the sample is auditable.
+F10LIST="$TMP/f10-real.list"
+printf '%s\n' scripts/daily-backup.sh scripts/sweep-orphans.sh scripts/lib/lane-ceiling.sh >"$F10LIST"
+f10_root="$(cd "$HERE/.." && pwd)"
+bash "$CHECK" --root "$f10_root" --targets "$F10LIST" --no-baseline >"$TMP/f10-real-fast.out" 2>&1; f10r_fast=$?
+bash "$CHECK" --root "$f10_root" --targets "$F10LIST" --no-baseline --no-trigger-prefilter >"$TMP/f10-real-ref.out" 2>&1; f10r_ref=$?
+if [ "$f10r_fast" = 2 ] || [ "$f10r_ref" = 2 ]; then
+  # a refusal is NOT a verdict: two refusals compare equal and would read as a pass
+  bad "F10b: the real-file sample REFUSED (rc=2) — the equivalence was not measured at all"
+elif ! grep -qE ':[0-9]+: ' "$TMP/f10-real-fast.out"; then
+  # an empty sample proves nothing about the finding path, which is the only path that matters here
+  bad "F10b: the real-file sample produced NO finding — the equivalence was measured over silence"
+elif [ "$f10r_fast" = "$f10r_ref" ] && cmp -s "$TMP/f10-real-fast.out" "$TMP/f10-real-ref.out"; then
+  ok "F10b: the trigger prefilter is verdict-identical to the reference scan on real repo files (rc=$f10r_fast, findings compared line for line)"
+else
+  bad "F10b: the trigger prefilter CHANGED the verdict on real repo files (fast rc=$f10r_fast, reference rc=$f10r_ref) — an incomplete trigger list is a false CLEAN"
 fi
 
 # ⛔ THE REFUSAL PATHS OF THE RATCHET ARE PART OF THE RATCHET (review cycle-8 P2): a MALFORMED row

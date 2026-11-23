@@ -138,7 +138,14 @@
 #   bash scripts/check-portability-traps.sh --emit-baseline # print a baseline for the current tree
 #   bash scripts/check-portability-traps.sh --root DIR --targets FILE   # scan a fixture tree
 #   bash scripts/check-portability-traps.sh --baseline FILE             # ratchet against another file
+#   bash scripts/check-portability-traps.sh --no-trigger-prefilter      # REFERENCE scan: no fast path
 #   bash scripts/check-portability-traps.sh --help, -h                 # this text
+#
+# ⛔ `--no-trigger-prefilter` IS THE PROOF SURFACE FOR THE FAST PATH, not a debugging nicety: the scan
+# skips the rule block on a line whose RAW text carries none of the literals any rule needs (see
+# `trig_atoms`). That is a fast path over a GATE, so the suite runs BOTH paths and requires
+# byte-identical findings (F10) — which needs a supported way to ask for the unfiltered scan. The
+# default is the fast path; the reference path exists so an equivalence arm can exist at all.
 #
 # EXIT: 0 clean (possibly with grandfathered findings) · 1 a NEW trap is present · 2 usage/refusal
 #
@@ -164,6 +171,7 @@ ROOT="$(dirname "$HERE")"
 BASELINE="$HERE/portability-baseline.tsv"
 TARGETS=""
 USE_BASELINE=1
+USE_TRIGGER_PREFILTER=1
 MODE="scan"
 
 while [ $# -gt 0 ]; do
@@ -172,6 +180,8 @@ while [ $# -gt 0 ]; do
     --targets)       TARGETS="${2:?--targets needs a file}"; shift 2 ;;
     --baseline)      BASELINE="${2:?--baseline needs a file}"; shift 2 ;;
     --no-baseline)   USE_BASELINE=0; shift ;;
+    # see `trig_atoms` — the fast path this disables is a GATE surface, so it is selectable by flag
+    --no-trigger-prefilter) USE_TRIGGER_PREFILTER=0; shift ;;
     --list-rules)    MODE="list-rules"; shift ;;
     --emit-baseline) MODE="emit"; USE_BASELINE=0; shift ;;
     --help|-h)       MODE="help"; shift ;;
@@ -783,6 +793,56 @@ function atoms() {
   pctl = "((if|elif|while|until|then|do|else|!)[ \t]+)*"
 }
 
+# ── THE TRIGGER PREFILTER (agent-infra#4210) ─────────────────────────────────────────────────────
+# trig_atoms() — one alternation over every literal ANY rule below needs to see. A line whose raw
+# text matches none of them cannot produce a finding, so it skips the rule block and the ~100 regex
+# evaluations a rule-rich line costs.
+#
+# ⛔ WHY THIS EXISTS AT ALL, MEASURED (agent-infra#4210). The scan cost is per LINE and it is
+# interpreter-bound, not algorithmic: on a gawk 5.2 box the real tree (474 files, 561,330 lines)
+# took 1860 s, i.e. the WHOLE SHARD_BOUND by itself, so the shard was killed before printing a
+# single arm. CI measured the same suite at 1602 s inside a 2400 s step (job 137774562796, the only
+# shard over that rest of its slice did not explain). The SAME program under `mawk` runs 37x
+# faster, which is why this is not a rule bug and why the repair is a cheaper path to the same
+# verdicts rather than a weaker rule set. MEASURED: 20.0% of this tree lines match the alternation.
+#
+# ⛔ THE COMPLETENESS OBLIGATION, STATED IN FULL. This is a FAST PATH OVER A GATE: skipping a line a
+# rule would have fired on is a FALSE CLEAN, the one direction this file never takes. So every
+# literal below is REQUIRED by the rule named beside it, and a rule that stops requiring its literal
+# (or a new rule) must amend this list. Two mechanical guards mean it is not on trust:
+#   F10 asserts the fast path and `--no-trigger-prefilter` produce BYTE-IDENTICAL findings on the
+#       live fixtures AND on sampled REAL files;
+#   D3 MUTATES the alternation (drops `sed`) and requires the sed arms to go RED — an incomplete
+#       trigger list therefore reds a required arm instead of silently missing traps.
+# Per-rule justification, one line each:
+#   cpu-count-single-mechanism   nproc | (hw.ncpu + sysctl) | (_NPROCESSORS_ONLN + getconf)
+#   timeout-absent-on-macos      timeout
+#   setsid-absent-on-macos       setsid
+#   ps-etimes-macos-absent       ps (the elapsed word is beside it)
+#   sed-in-place-gnu / -bsd      sed
+#   readlink-f-bsd-absent        readlink
+#   grep-P-bsd-absent            grep
+#   date-d-gnu                   date
+#   stat-c-gnu                   stat
+#   free-macos-absent            free
+#   procfs-macos-absent          /proc/
+#   bash4-declare-A              declare | local | typeset
+#   bash4-mapfile                mapfile | readarray
+#   bash4-case-modify            [$][{]
+#   bash4-append-amp             &>>
+#   bash4-wait-n                 wait
+# `context-unbalanced` and `heredoc-unterminated` are END-block verdicts over state this fast path
+# does not touch (the quote stack and the heredoc tracker run for EVERY line, above), so they are
+# deliberately not gated here.
+# ⛔ TESTED AGAINST `raw`, NOT `code`, AND THAT IS DELIBERATE. `raw` is a superset of what
+# strip_code emits (the stripper drops quoted DATA and comment text), and one rule reads the raw
+# view on purpose (procfs-macos-absent quotes a path), so a test on `code` could skip a line the
+# raw-view rule would fire on. `/proc/` is the literal that arm reads.
+function trig_atoms() {
+  TRIG = "nproc|sysctl|hw[.]ncpu|NPROCESSORS_ONLN|getconf|timeout|setsid|ps|sed|readlink|grep|"
+  TRIG = TRIG "date|stat|free|declare|local|typeset|mapfile|readarray|wait|/proc/|&>>|[$][{]"
+}
+
 # conditioned(tool, code) — 1 when EVERY read of `tool` on this line is CONDITIONED on a presence
 # probe: joined to it by `&&`, or in the `then` arm of a same-line `if <probe> …; then`.
 # ⛔ THE PROBE DOES NOT GUARD THE LINE, ONLY THE CONDITIONED CALL (review cycle-8 P0). Cycle 7 fixed
@@ -1246,6 +1306,8 @@ BEGIN {
   SEP = "[|&;(){}" sprintf("%c", 96) QCH "]"
   # the shared command-position atoms — see atoms()
   atoms()
+  # the trigger prefilter — see trig_atoms()
+  trig_atoms()
   pfx = "([-./][^ \t]*/)?"
 }
 
@@ -1314,6 +1376,17 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
     if (tail ~ /[^ \t]/) next
     fail(FILENAME ":" FNR ": `# portability-ok:` with NO reason — a suppression without a reason is a silent pass")
   }
+
+  # ── guard lookback: a `command -v <tool>` probe within the previous 8 CODE lines guards the call
+  # ⛔ THE HISTORY IS RECORDED BEFORE THE PREFILTER BELOW, and that ordering is load bearing: the
+  # lookback is how a guarded call is recognised, so a line the fast path skips must still enter
+  # `hist` exactly as it did before the prefilter existed (a probe line is a line like any other).
+  p = (FNR - 1) % 8
+  hist[p] = code
+  # ── THE TRIGGER PREFILTER (agent-infra#4210) — see trig_atoms() for the completeness obligation
+  # and for why this is tested against the RAW view. `pfast + 0` so a `-v pfast=` STRING is read as
+  # the number it is under mawk and one-true-awk as well as gawk.
+  if (pfast + 0 != 0 && raw !~ TRIG) next
 
   hit("cpu-count-single-mechanism", cpu_rule(code), "box_ncpu (scripts/lib/box.sh)")
   hit("timeout-absent-on-macos",  bare_calls("timeout", code), "sleep+kill -0 watchdog, or bounded.sh (#2046)")
@@ -1405,10 +1478,6 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # demanded a space after the flag. A rule that only fires on `wait -n 2>/dev/null` measures almost
   # nothing.
   if (cp(code, "wait") && code ~ /wait[ \t]+-[A-Za-z]*n([^A-Za-z]|$)/) hit("bash4-wait-n", 1, "poll with kill -0")
-
-  # ── guard lookback: a `command -v <tool>` probe within the previous 8 CODE lines guards the call
-  p = (FNR - 1) % 8
-  hist[p] = code
 }
 
 # ── cpu-count-single-mechanism ───────────────────────────────────────────────────────────────────
@@ -1658,7 +1727,7 @@ scan() {
         echo "❌ target vanished before it was read: $f" >&2
         exit 2
       fi
-      awk "$SCAN_AWK" "$f" || exit 2
+      awk -v pfast="$USE_TRIGGER_PREFILTER" "$SCAN_AWK" "$f" || exit 2
     done )
 }
 
