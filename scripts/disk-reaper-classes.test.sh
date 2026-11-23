@@ -698,6 +698,7 @@ MUT_H='s/if \[ -L "\$d" \]; then/if false; then/'
 MUT_I='s/        dirty="?"$/        dirty="0"/'
 MUT_D2='s/^        PIN_PATHS="\$_pc"$/        :/'
 MUT_J='s/kill -0/false/'
+MUT_P='s/^    reap_landed_arm$/    :/'
 MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
 MUT_L='s/_lp_rel "\$_cand" "\$path"/_lp_rel "" "$path"/'
 MUT_C2='s/^if \[ -n "\${REAP_AW_PROC_ROOT:-}" \] && /if false \&\& /'
@@ -746,7 +747,7 @@ if apply_mutation "$REAPER" "$T/mut-f/disk-reaper.sh" "$MUT_F"; then
     # ⚠️ The mutant entry point must find ITS OWN delegates: it resolves them beside itself, so the
     # real owners are symlinked next to it (a missing delegate would fail closed for a different
     # reason and the mutant would "pass" the wrong test).
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-f/$d"
     done
     expect_fail "F mutation: returning early when no repo resolves turns the case RED" case_f "$AW_OWNER" "$T/mut-f/disk-reaper.sh"
@@ -758,7 +759,7 @@ fi
 mk_foreign_change_owner "$T/stub-foreign.sh"
 expect_pass "G a class that removed nothing does not claim another process' df change" case_g "$REAPER" "$T/stub-foreign.sh"
 if apply_mutation "$REAPER" "$T/mut-g/disk-reaper.sh" "$MUT_G"; then
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-g/$d"
     done
     expect_fail "G mutation: reporting the window's df change as freed turns the case RED" case_g "$T/mut-g/disk-reaper.sh" "$T/stub-foreign.sh"
@@ -795,7 +796,7 @@ fi
 
 expect_pass "K a missing owner is misconfigured, not fail-closed" case_k "$REAPER"
 if apply_mutation "$REAPER" "$T/mut-k/disk-reaper.sh" "$MUT_K"; then
-    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-landed-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
         [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-k/$d"
     done
     expect_fail "K mutation: not recording the setup failure turns the case RED" case_k "$T/mut-k/disk-reaper.sh"
@@ -905,6 +906,61 @@ if apply_mutation "$AW_OWNER" "$T/mut-n/reap-abandoned-worktrees.sh" "$MUT_N"; t
     expect_fail "N mutation: dropping the pre-removal re-probe turns the case RED" case_n "$T/mut-n/reap-abandoned-worktrees.sh"
 else
     bad "N mutation could not be applied (the re-probe arm moved) — the case is not checking it any more"
+fi
+
+# ═══ P: the LANDED arm (#4194) is INVOKED — an owner nothing calls reclaims nothing ═════════════
+# WHY THIS CASE EXISTS. `reap-landed-worktrees.sh` landed with its own suite and NO caller: the entry
+# point never ran it, so the 48 GB / 78 trees #4194 measured would have stayed while the pass reported
+# `ok` — the inert-enforcer false PASS. The owner's own suite cannot see that (it runs the owner
+# directly), so the WIRING is pinned here, through `disk-reaper.sh --only worktree --apply`.
+case_p() { # <owner-script> <entry-point>
+    local owner="$1" pass="$2" base repo landed ahead out rc st
+    base="$(newbase p)"; repo="$(mk_repo "$base")"
+    # `main` IS the repo's one commit. The remote-tracking ref is written directly so the owner's default
+    # `origin/main` resolves with no network and no configured remote (this entry point passes no
+    # `--main`).
+    "$REAL_GIT" -C "$repo" update-ref refs/remotes/origin/main "$("$REAL_GIT" -C "$repo" rev-parse HEAD)"
+    landed="$(mk_linked_wt "$repo" "$repo/.worktrees" landed feat/p-landed)"
+    ahead="$(mk_linked_wt "$repo" "$repo/.worktrees" ahead feat/p-ahead)"
+    "$REAL_GIT" -C "$ahead" commit -qm unique --allow-empty
+    mkdir -p "$base/bin"
+    # THE SIBLING OWNERS ARE STUBS. This case measures the landed arm's wiring; their own policies would
+    # otherwise act on the same fixture, and `reap-abandoned-worktrees.sh`'s DEFAULT scratch root is this
+    # box's real `/tmp` (the suite header records that arm already reaping four real checkouts once).
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$base/bin/pi-reap-worktrees.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$base/bin/reap-abandoned-worktrees.sh"
+    chmod +x "$base/bin/pi-reap-worktrees.sh" "$base/bin/reap-abandoned-worktrees.sh"
+    out="$(DISK_REAPER_STATE_DIR="$base/state" REAP_AW_ROOTS="$base/no-scratch" REAP_DI_ROOTS="$base/no-dups" \
+           WORKTREE_REAPER="$base/bin/pi-reap-worktrees.sh" \
+           ABANDONED_WT_REAPER="$base/bin/reap-abandoned-worktrees.sh" \
+           LANDED_WT_REAPER="$owner" REAP_LW_STATE_DIR="$base/lw" \
+           bash "$pass" --apply --only worktree --repo "$repo" 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'P rc=%s\n%s\n' "$rc" "$out" >&2
+    st="$(cat "$base/state/disk-reaper.status" 2>/dev/null)"
+    case_check "$([ ! -d "$landed" ] && echo 0 || echo 1)" \
+               "P the LANDED tree was reaped THROUGH THE ENTRY POINT (the owner has a caller)"
+    case_check "$([ -d "$ahead" ] && echo 0 || echo 1)" \
+               "P …and the tree holding a commit main lacks was KEPT (the wiring did not widen the rule)"
+    case_check "$(grep -qF 'REMOVED path=' <<<"$out" && echo 0 || echo 1)" \
+               "P and the pass ledger carries the removal the OWNER reported"
+    case_check "$(grep -q '^freed_mb_worktree=[0-9]' <<<"$st" && echo 0 || echo 1)" \
+               "P and the class record is a MEASURED number (the landed arm's removal is attributed)"
+    case_check "$(grep -q 'verdict_worktree=ok' <<<"$st" && echo 0 || echo 1)" \
+               "P and the class verdict is ok (a wired arm that cannot run would read fail-closed)"
+    return $((CASE_FAIL > 0))
+}
+
+expect_pass "P the LANDED arm is invoked by the entry point and its removals are attributed" case_p "$HERE/reap-landed-worktrees.sh" "$REAPER"
+if apply_mutation "$REAPER" "$T/mut-p/disk-reaper.sh" "$MUT_P"; then
+    # the mutant entry point resolves its delegates beside itself, so the real owners are symlinked next
+    # to it (a missing delegate would fail closed for a different reason, and `expect_fail` would then
+    # pass on the WRONG red).
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh reap-landed-worktrees.sh; do
+        [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-p/$d"
+    done
+    expect_fail "P mutation: not CALLING the arm turns the case RED (nothing else notices a dead owner)" case_p "$T/mut-p/reap-landed-worktrees.sh" "$T/mut-p/disk-reaper.sh"
+else
+    bad "P mutation could not be applied (the 'reap_landed_arm' call line moved) — the wiring is unguarded"
 fi
 
 echo
