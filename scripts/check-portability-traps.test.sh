@@ -1407,21 +1407,21 @@ TMUT="$TMP/trigmut.sh"
 # mutating nothing and "proving" the guard with an unchanged file.
 awk '{ if (index($0, "|sed|readlink|") > 0) gsub(/[|]sed[|]/, "|"); print }' "$CHECK" >"$TMUT"
 if cmp -s "$CHECK" "$TMUT"; then
-  bad "D3: the trigger-list mutant did NOT apply (no `|sed|readlink|` token in the alternation) — an unchanged file proves this guard vacuous"
+  bad "D3: the trigger-list mutant did NOT apply (no |sed|readlink| token in the alternation) — an unchanged file proves this guard vacuous"
 else
   # control: the UNMUTATED detector does report the sed trap this arm then requires to vanish
   run_mutant "$CHECK"; d3_ctl=$MUTANT_RC
   if [ "$d3_ctl" != 1 ] || ! grep -q 'sed-in-place-gnu' "$OUT"; then
-    bad "D3: control failed — the unmutated detector did not report `sed-in-place-gnu` on the live sed fixture (rc=$d3_ctl), so the mutation below proves nothing"
+    bad "D3: control failed — the unmutated detector did not report sed-in-place-gnu on the live sed fixture (rc=$d3_ctl), so the mutation below proves nothing"
   else
     run_mutant "$TMUT"; d3_rc=$MUTANT_RC
     # rc=1 still holds (the other 17 live traps are still found); only the SED findings must be gone
     if [ "$d3_rc" = 1 ] && ! grep -q 'sed-in-place-gnu' "$OUT"; then
-      ok "D3: dropping `sed` from the trigger alternation LOSES the sed finding — the prefilter genuinely gates the rule, so F10's equivalence is sensitive to the list"
+      ok "D3: dropping sed from the trigger alternation LOSES the sed finding — the prefilter genuinely gates the rule, so F10-equivalence is sensitive to the list"
     elif [ "$d3_rc" != 1 ]; then
       bad "D3: the trigger mutant exited $d3_rc, not 1 — it broke the scan instead of narrowing it, so it proves nothing about the prefilter"
     else
-      bad "D3: the sed finding SURVIVED a trigger list without `sed` — the fast path is not gating that rule, so F10 cannot detect an incomplete list"
+      bad "D3: the sed finding SURVIVED a trigger list without sed — the fast path is not gating that rule, so F10 cannot detect an incomplete list"
     fi
   fi
 fi
