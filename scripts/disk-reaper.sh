@@ -504,7 +504,7 @@ NOTE_RW=""
 # already does `s/^freed_mb_//p`.
 # ⛔ ITS OWN SENTINELS, NOT THE runner-work ONES. This class publishes a DIFFERENT ledger (a cache is
 # reaped whole; a `_work` entry is age-gated), and `skipped_live` is a state no other class has — the
-# number that matters most here is "how many installs did we NOT PRUNE". Its arms are enumerated once,
+# number that matters most here is "how many paths did we NOT prune". Its arms are enumerated once,
 # at `record_body` below; ⛔ since #4216 a live install whose cache WAS pruned is NOT counted here, so
 # "not touched because a job was running" has not been what this counter means since then.
 FREED_RC=0; RAW_RC=0
@@ -3192,9 +3192,10 @@ reap_runner_cache() {
     _rc_capped="$(kv_field "$_rc_line" capped)"
     _rc_remaining="$(kv_field "$_rc_line" remaining)"
     # ⛔ `skipped_live` IS THE FIELD THAT MATTERS MOST ON THIS CLASS, and it is a DECISION, not a
-    # failure: it is how many CANDIDATES the class DECLINED to prune. ⛔ It is NOT a liveness count —
+    # failure: it is how many PATHS the class DECLINED to prune — an install's `.cache`, a
+    # `_work/_temp`/`_diag` entry, or the shared per-box root. ⛔ It is NOT a liveness count —
     # since #4216 a live install whose cache WAS pruned counts 0 here, and its work sinks are untouched
-    # regardless — and it is NOT every not-pruned candidate either: an unmeasurable one counts in
+    # regardless — and it is NOT every not-pruned path either: an unmeasurable one counts in
     # `unmeasurable=`, and an over-bound one with nothing removable in `kept=`. §record_body points at the
     # owner's arms rather than restating them (every restatement was a completeness claim, and the
     # `SKIPPED_LIVE` increments are the authority). Published so "the cache is still 40 GB" has an answer
@@ -3279,7 +3280,7 @@ reap_runner_cache() {
 }disk-reaper: WOULD-REMOVE class=runner-cache (? bytes unmeasured — the owner could not size it) ${path}" ;;
                         *) WOULD_RC=$((WOULD_RC + size))
                            cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound, see pruned_mb= on the class's journal line)" ;;
+}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound; this line is printed by a DRY RUN, so see would_prune_mb= on its WOULD-PRUNE line, or pruned_mb= on the class SUMMARY under --apply)" ;;
                     esac ;;
             esac
         done <<<"$rows"
@@ -3660,13 +3661,15 @@ record_body() {
     printf 'note_runner_work=%s\n' "$NOTE_RW"
     # ── class=runner-cache (#4168). Its ledger is deliberately NOT a copy of runner-work's: this class
     # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (a
-    # CANDIDATE the class DECLINED to prune; ⛔ NOT a liveness count — since #4216 a live install whose
+    # PATH the class DECLINED to prune — an install's `.cache`, a `_work/_temp`/`_diag` entry, or the
+    # shared per-box root; ⛔ NOT a liveness count — since #4216 a live install whose
     # cache WAS pruned counts 0 here, and its work sinks are untouched either way; ⛔ and not every
-    # not-pruned candidate, because an unmeasurable one counts in `unmeasurable=` and an over-bound one
+    # not-pruned path, because an unmeasurable one counts in `unmeasurable=` and an over-bound one
     # with nothing removable in `kept=`. The arms are the `SKIPPED_LIVE` increments in
     # `scripts/reap-runner-cache.sh`, each of which returns before any delete), `kept` (a keep this pass
     # COUNTED — the class's AGGREGATE keep counter; ⛔ NOT every row the journal prints as `KEPT`: an
-    # unmeasurable keep counts in `unmeasurable=` and a cap-deferred whole-cache candidate in `capped=`),
+    # unmeasurable keep counts in `unmeasurable=`, and a cap-deferred candidate sets `capped=1` with
+    # `remaining=` counting them),
     # `pruned`/`pruned_mb` (bounded by SIZE, not by the absence of a holder), `cache_mb` (the reading it
     # took), and `capped` (the per-pass cap stopped a REMOVAL — a whole-cache candidate as well as the
     # prune — and the next tick continues; ⛔ including a prune CLAMPED to the budget it had left, which

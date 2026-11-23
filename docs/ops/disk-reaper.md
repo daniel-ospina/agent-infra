@@ -30,7 +30,7 @@ only code that deletes:
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 | `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
 the shipped 3600 s was half of it — see the class note below), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
-| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. ⛔ The **cache** is bounded by SIZE, not by liveness: a live install's `.cache` is pruned to `REAP_RC_LIVE_CACHE_CAP_MB` (default = the per-pass cap), oldest entries first, so a busy box (every install with a big cache has a running job) still reclaims — measured 71 GB skipped at 417 MB free before #4216. Every **work** sink (`_work/_temp`, `_diag`) is still skipped whole under a live holder (`skipped_live=`); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), pressure-gated on its OWN filesystem (`REAP_RC_INSTALL_TRIGGER_FREE_MB`, default 40 GB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated by the same dial (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
+| `runner-cache` | `scripts/reap-runner-cache.sh` (#4168) | the CI runners' per-install **package cache** (`/opt/gh-runner-*/.cache` — **50.1 GB** in one install, ≈**445 GB** across five boxes) plus aged `_work/_temp` and `_diag/*.log`. ⛔ The **cache** is bounded by SIZE, not by liveness: a live install's `.cache` is pruned to `REAP_RC_LIVE_CACHE_CAP_MB` (default = the per-pass cap), oldest entries first, so a busy box (every install with a big cache has a running job) still reclaims — measured 71 GB skipped at 417 MB free before #4216. Every **work** sink (`_work/_temp`, `_diag`) is still skipped whole under a live holder (⛔ though `skipped_live=` does NOT count that install when its `.cache` was pruned — see the record paragraph); an unreadable process census removes nothing and fails closed. Size-bounded (`REAP_RC_MIN_CACHE_MB`, default 256 MB), pressure-gated on its OWN filesystem (`REAP_RC_INSTALL_TRIGGER_FREE_MB`, default 40 GB), age-bounded (`REAP_RC_SCRATCH_DAYS`/`REAP_RC_LOG_DAYS`, default 7 d), and the shared per-box root (`$RUNNER_ROOT/_cache`, reached from the LAYOUT — a discovered install's parent — as well as from `REAP_RC_SHARED_GLOBS`) is pressure-gated by the same dial (`REAP_RC_SHARED_TRIGGER_FREE_MB`, default 40 GB) |
 
 ## Why one entry point
 
@@ -936,10 +936,11 @@ immediately before every removal** (`reason=toctou:…`), because classification
 box whose `du` is slow.
 
 **The record.** `freed_mb_runner_cache=`, `would_free_mb_runner_cache=`, `candidates_runner_cache=`,
-`reaped_runner_cache=`, **`skipped_live_runner_cache=`** (a **candidate the class declined to
-prune** — the count that answers *"why is my 40 GB cache still here"*. ⛔ It is **not** a liveness
+`reaped_runner_cache=`, **`skipped_live_runner_cache=`** (a **path the class declined to
+prune** — an install's `.cache`, a `_work/_temp`/`_diag` entry, or the shared per-box root — the count
+that answers *"why is my 40 GB cache still here"*. ⛔ It is **not** a liveness
 count: since #4216 a live install whose cache was PRUNED reads 0 here, so the class's own journal line
-can read `pruned=1 skipped_live=0`. ⛔ And it is **not** every not-pruned candidate — an unmeasurable
+can read `pruned=1 skipped_live=0`. ⛔ And it is **not** every not-pruned path — an unmeasurable
 one counts in `unmeasurable=`, and an over-bound one with nothing removable in `kept=`. The arms are the
 `SKIPPED_LIVE` increments in `scripts/reap-runner-cache.sh`, each of which returns before any delete),
 `unmeasurable_runner_cache=`, `cache_mb_runner_cache=` (the reading the pass took — ⛔ the class's
