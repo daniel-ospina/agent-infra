@@ -783,8 +783,9 @@ claim_orphan_reason() {
   # ⛔ THE PID RULE IS OPT-IN ON AN EXPLICIT PR KEY, NOT ON "NOT AN ISSUE". `ref` is OPTIONAL, and
     # defaulting to the destructive polarity put the whole duplicate window ONE OMITTED ARGUMENT away:
     # with no ref the `*)` arm judged an issue-keyed owner by its pid and deleted a live lane's shared
-    # barrier on a controller restart. A PR ref is `<ns>/<pr>-<sha12>` (a hyphen after the number), so
-    # only that shape may probe a process; an absent or unrecognised ref abstains (under-reap).
+    # barrier on a controller restart. A PR ref is `<ns>/<pr>-<sha12>` (a hyphen after the number) or
+    # the LANDING key `<ns>/pr-<N>`, so only those shapes may probe a process; an absent or unrecognised
+    # ref abstains (under-reap).
     # ⛔ AND "A HYPHEN" IS NOT THE TEST (P2, cycle-16 review): `*-*` also matched the BARE ISSUE KEY
     # `issue-<N>` that `claim_issue_key` prints, so `claim_orphan_reason "host:<dead pid>" "issue-1234"`
     # returned ORPHANED — the PR-only rule judging an ISSUE claim, i.e. exactly the shared-barrier window
@@ -796,7 +797,26 @@ claim_orphan_reason() {
     # `*"/issue-"*` arm above matches every issue ref this code produces, and a bare `issue-<N>` cannot
     # match the pattern below, so deleting it left every assertion green. An unpinnable duplicate is
     # deleted rather than defended, the same call this file made for the inert `declare -f` gate.
-    *[0-9]*-*)
+    # ⛔ THE LANDING KEY `refs/claims/pr-<N>` IS A PR CLAIM TOO, AND IT WAS THE HALF THIS ARM COULD NOT
+    # SEE (agent-infra#4183, #4197 — measured on the fleet box `cmux`). `claim_pr_key` prints `pr-<N>`
+    # (no digit-then-hyphen), so the landing key never matched the shape test below, fell through to the
+    # HOST rules, and a claim stamped with THIS box's own name returned *not orphaned* **without the pid
+    # ever being read**. The holder there is `merge-one.sh` itself — the longest-lived process on the
+    # path, exactly as probeable as the per-head key it sits beside — so the branch-key reasoning that
+    # `pr-` was copied from does not reach it (a branch claim's pid is the acquire CLI, dead by design;
+    # a LANDING claim's pid IS the merge lane).
+    # The block is fleet-wide and lasts the whole lease (~50 min): measured 5 of 11 landing claims held
+    # by a dead local pid in `daniel-ospina/tortoise`, each reading `held-by-live` to every box while
+    # `merge-one.sh` exited in ~1 s per dispatch, i.e. the drain stalled with lane slots free. One
+    # function, one dead owner, two ref shapes: `refs/claims/14213-c0286dcc55cd` → rc=0 ORPHANED while
+    # `refs/claims/pr-14213` → rc=1 held-by-live on the same tree and the same second.
+    # ⛔ NOTHING IS WEAKENED BY ADMITTING IT. The pid is still probed only when the owner host is LOCAL
+    # (`is_local` below), so a peer's landing claim abstains — the #4183 falsifier — a LIVE holder is
+    # untouched (`ps -p` answers), the reclaim is still a CAS (`--force-with-lease`), and the two keys
+    # can never be confused: `pr-<N>` is minted only by `claim_pr_key` and acquired only by
+    # `merge-one.sh`. The bare spelling is matched too, for the same reason `issue-<N>` is: a caller
+    # holding the key from `claim_pr_key` rather than the full ref must get the same verdict.
+    *[0-9]*-*|*"/pr-"*|pr-*)
       # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
       # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim
       # stamped `<oldName>:<live pid>` skipped the pid probe and fell through to the former-name rule,
