@@ -3280,7 +3280,7 @@ reap_runner_cache() {
 }disk-reaper: WOULD-REMOVE class=runner-cache (? bytes unmeasured — the owner could not size it) ${path}" ;;
                         *) WOULD_RC=$((WOULD_RC + size))
                            cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound; this line is printed by a DRY RUN, so see would_prune_mb= on its WOULD-PRUNE line, or pruned_mb= on the class SUMMARY under --apply)" ;;
+}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound; this line is printed by a DRY RUN, and only a LIVE install's cache also gets its own WOULD-PRUNE line carrying would_prune_mb=, while under --apply the class SUMMARY carries pruned_mb=)" ;;
                     esac ;;
             esac
         done <<<"$rows"
