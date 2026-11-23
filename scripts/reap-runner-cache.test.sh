@@ -12,8 +12,12 @@
 #
 # COVERAGE — the four arms the brief names, one case each:
 #   A  TWO INSTALLS, one with a job in flight and one idle → the idle `.cache` is REAPED, the live one
-#      is SKIPPED WHOLE and named (`skipped-live`). This is the class's one correctness property: a
-#      cache deleted under a live job fails the job.
+#      is KEPT and named (`skipped-live`). ⛔ THIS INVOCATION PASSES NO `--max-mb`, so the live bound
+#      resolves to `0` and what this case pins is the DISABLED-BOUND arm — the pre-#4216 skip-whole —
+#      NOT the class's default, which `CACHE-LIVE`/`CACHE-ARMED` pin. The class's one correctness
+#      property is "never delete a live job's WORK": the work sinks keep the skip, the `.cache` is
+#      bounded by SIZE (#4216), so "a cache deleted under a live job fails the job" is NOT this
+#      class's policy and is not what this case asserts.
 #      Mutant: `if [ "$live" = 0 ]; then` -> `if false; then` (the skip arm deleted).
 #   B  NO CHURN: a cache below the size bound and scratch younger than the age bound are BOTH KEPT and
 #      named, and nothing is removed — while an aged entry in the same install IS reaped, so the two
@@ -283,7 +287,7 @@ run_owner() {
     bash "$owner" "$@" 2>&1
 }
 
-# ── A: a live install is SKIPPED WHOLE, the idle one is reaped ───────────────────────────────────
+# ── A: a live install's cache is KEPT (the DISABLED-BOUND arm — no `--max-mb`), the idle one is reaped ──
 case_a() { # <owner-script>
     local owner="$1" base live idle out rc
     base="$(mktemp -d "$T/a.XXXXXX")"

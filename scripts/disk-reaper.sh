@@ -77,7 +77,9 @@
 #                                                                 five boxes) plus aged `_work/_temp`
 #                                                                 and `_diag/*.log`. An install with a
 #                                                                 JOB IN FLIGHT keeps its WORK sinks
-#                                                                 whole (`skipped-live`) while its
+#                                                                 whole (never touched, and counted
+#                                                                 in `skipped-live` only when its
+#                                                                 `.cache` is NOT pruned) while its
 #                                                                 `.cache` is PRUNED to a size bound
 #                                                                 (#4216); see the class comment below
 #                                                                 and the owner's header
@@ -502,7 +504,9 @@ NOTE_RW=""
 # already does `s/^freed_mb_//p`.
 # ⛔ ITS OWN SENTINELS, NOT THE runner-work ONES. This class publishes a DIFFERENT ledger (a cache is
 # reaped whole; a `_work` entry is age-gated), and `skipped_live` is a state no other class has — the
-# number that matters most here is "how many installs did we NOT touch because a job was running".
+# number that matters most here is "how many installs did we NOT PRUNE". Its arms are enumerated once,
+# at `record_body` below; ⛔ since #4216 a live install whose cache WAS pruned is NOT counted here, so
+# "not touched because a job was running" has not been what this counter means since then.
 FREED_RC=0; RAW_RC=0
 DF_RC_OK=1
 WOULD_RC=0; CAND_RC=0
@@ -3019,8 +3023,9 @@ reap_runner_work() {
 #
 # ⛔ THE SAFETY PROPERTY IS "NEVER DELETE A LIVE JOB'S WORK", and it lives in the OWNER
 # (`scripts/reap-runner-cache.sh`), not here: an install with a job in flight has NOTHING removed from
-# its work sinks — `_work/_temp`, `_diag` — and is reported `skipped-live` with the witness named, and an
-# install whose liveness cannot be proved is KEPT (fail-closed). ⛔ THE CACHE IS THE ONE SINK THAT IS
+# its work sinks — `_work/_temp`, `_diag` — and is counted `skipped_live` only when its `.cache` was NOT
+# pruned (a pruned cache reads `skipped_live=0` on that install; the sinks are untouched either way), and
+# an install whose liveness cannot be proved is KEPT (fail-closed). ⛔ THE CACHE IS THE ONE SINK THAT IS
 # NOT SKIPPED BY LIVENESS (#4216): it is bounded by SIZE instead, because a package cache is
 # content-addressed and regenerates while a work sink does not. This arm only measures the delta and
 # reports the numbers — it contains no `rm`, as it does for every other class.
@@ -3187,7 +3192,9 @@ reap_runner_cache() {
     _rc_capped="$(kv_field "$_rc_line" capped)"
     _rc_remaining="$(kv_field "$_rc_line" remaining)"
     # ⛔ `skipped_live` IS THE FIELD THAT MATTERS MOST ON THIS CLASS, and it is a DECISION, not a
-    # failure: it is how many installs were NOT touched because a job was running in them. Published so
+    # failure: it is how many installs were NOT PRUNED — which is NOT the same as "how many were not
+    # touched because a job was running" (⛔ since #4216 a live install whose cache WAS pruned counts 0
+    # here, and its work sinks are untouched regardless; §record_body enumerates the arms). Published so
     # "the cache is still 40 GB" has an answer other than "the reaper is broken".
     case "${_rc_skipped:-}" in
         ''|*[!0-9]*) : ;; *) HAVE_RC_SKIPPED=1; SKIPPED_LIVE_RC="$_rc_skipped" ;;
@@ -3650,9 +3657,12 @@ record_body() {
     printf 'note_runner_work=%s\n' "$NOTE_RW"
     # ── class=runner-cache (#4168). Its ledger is deliberately NOT a copy of runner-work's: this class
     # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (the
-    # install was NOT pruned: a job is running and its cache is under the bound, the pass cap is already
-    # spent, or the bound is disabled — ⛔ since #4216 a live install whose cache WAS pruned is not
-    # counted here, and its work sinks are never touched either way), `kept` (kept BY NAME and untouched:
+    # install was NOT pruned, on ANY of the owner's arms: the bound is DISABLED; its cache is UNDER the
+    # bound; the per-pass cap is already spent; its own filesystem is ABOVE the free-space trigger, so
+    # the cache is not a candidate; the cache is ABSENT or SYMLINKED; a liveness re-probe found a job
+    # that started mid-pass (`reason=toctou`); or it is the SHARED per-box root with a live install —
+    # ⛔ since #4216 a live install whose cache WAS pruned is not counted here, and its work sinks are
+    # never touched either way), `kept` (kept BY NAME and untouched:
     # over the bound but nothing in it could be removed), `pruned`/`pruned_mb` (bounded by SIZE, not by
     # the absence of a holder), `cache_mb` (the reading it took), and `capped` (the per-pass cap stopped
     # the prune, and the next tick continues — ⛔ including a prune CLAMPED to the budget it had left,

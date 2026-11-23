@@ -27,7 +27,8 @@
 #
 # The class never touches a live job's WORK: `scripts/reap-runner-cache.sh` proves liveness from the
 # process table (`Runner.Worker` present, or a listener with content written under `_work` inside its
-# freshness window) and leaves `_work/_temp` and `_diag` alone for that install whole (`skipped_live=`).
+# freshness window) and leaves `_work/_temp` and `_diag` alone for that install whole. It counts in
+# `skipped_live=` only when that install's `.cache` was NOT pruned (a pruned cache reads 0 there).
 # ⛔ ITS `.cache` IS THE ONE SINK THAT IS NOT SKIPPED BY LIVENESS (#4216): a package cache is
 # content-addressed and regenerates, so it is PRUNED to `REAP_RC_LIVE_CACHE_CAP_MB` (default: this pass's
 # `--max-mb`), oldest entries first, with the directory and its newest entries left in place. That is the
