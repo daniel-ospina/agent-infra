@@ -930,9 +930,10 @@ live_cache_prune() {
         return 0
     fi
     if [ ! -e "$cache" ] || [ -L "$cache" ] || [ "$press" = "warm" ] || [ "$press" = "symlinked" ] || [ "$press" = "none" ]; then
-        # A WARM filesystem, a symlinked/absent cache, or a probe that cannot answer: the bound is not
-        # the reason this cache stays, so it is reported as the whole-install skip it is (and the
-        # `INSTALL …` reading above already named the free-space verdict and the reason).
+        # A WARM filesystem, a symlinked/absent cache: the bound is not the reason this cache stays, so
+        # it is reported as the whole-install skip it is (and the `INSTALL …` reading above already named
+        # the free-space verdict and the reason). ⛔ AN UNANSWERABLE PROBE IS **NOT** IN THIS LIST: see the
+        # arm below — it is an abstention, the same one an idle install gets.
         SKIPPED_LIVE=$((SKIPPED_LIVE + 1))
         log_line "$legacy (a job is running in this install; its cache and scratch are NOT touched — the live bound applies only under the install's own free-space gate, and this cache is not a candidate: press=${press:-none})"
         return 0
