@@ -1042,7 +1042,7 @@ case_v() { # <owner-script>
     # ⛔ NO QUARANTINE MAY SURVIVE A SUCCESSFUL FREE: a leftover `.reaping.` tree is bytes nothing in
     # this class matches again, i.e. a leak created by the very fix that closes the window.
     case_check "$( [ -z "$(compgen -G "$inst/.cache.reaping.*" 2>/dev/null)" ] && echo 0 || echo 1)" \
-               "the quarantined name does not survive a successful free (no `.reaping.` leftover)"
+               "the quarantined name does not survive a successful free (no '.reaping.' leftover)"
     return $((CASE_FAIL > 0))
 }
 
@@ -1145,13 +1145,13 @@ STUB
     case_check "$([ ! -s "$warm_log" ] && echo 0 || echo 1)" \
                "and it is NOT du-measured at all (the gate keeps it without needing its size)"
     case_check "$(grep -qF "INSTALL $inst cache_mb=not-measured(free-above-trigger)" <<<"$out" && echo 0 || echo 1)" \
-               "the reading SAYS the size was not taken (cache_mb=not-measured(...)), not `?`-as-unmeasurable"
+               "the reading SAYS the size was not taken (cache_mb=not-measured(...)), not '?'-as-unmeasurable"
     case_check "$(grep -qE 'cache_mb_unmeasured=1' <<<"$out" && echo 0 || echo 1)" \
                "and the SUMMARY counts it, because cache_mb= is then a lower bound"
     # CONTROL: under pressure the size IS measured, so the assertion above can vary.
     out="$(run_y 1000 "$cold_log")"
     case_check "$([ -s "$cold_log" ] && echo 0 || echo 1)" \
-               "CONTROL: under pressure the cache IS `du`-measured (the cheap path is not a broken probe)"
+               "CONTROL: under pressure the cache IS du-measured (the cheap path is not a broken probe)"
     case_check "$(grep -qE 'cache_mb_unmeasured=0' <<<"$out" && echo 0 || echo 1)" \
                "CONTROL: and nothing is reported unmeasured on that pass"
     return $((CASE_FAIL > 0))
@@ -1217,8 +1217,18 @@ case_cache_live() { # <owner-script>
 # install under the bound is untouched, live or not), while `_work/_temp` and `_diag` are still skipped
 # WHOLE for a live holder — there, a live holder means work that cannot be re-downloaded. Both sinks
 # sit in the SAME live install, so neither assertion can pass for the other's reason.
-# Mutant: the live arm deleted (`if [ "$live" = 0 ]` -> `if false`) — the aged scratch and the cache
-# are then reaped, and the case reddens on both faces.
+# ⛔ THE MUTANT REDDENS EXACTLY ONE ROW, AND IT IS THE NAMING ONE (#4220 review, P3). The earlier text
+# here claimed `if false` makes "the aged scratch and the cache" get reaped — that cannot happen: with
+# `live_cache_prune` no longer called, the live install falls through to the IDLE path, where `reap_one`
+# re-probes liveness and keeps BOTH the cache and the aged scratch as `reason=toctou:worker-running`.
+# Nothing is deleted, so no delete-related row can distinguish. What the mutant actually removes is the
+# bound-naming keep (`reason=live-cache-under-cap bound_mb=8`), i.e. the "why is my cache still here"
+# answer; `skipped_live=1` still holds because the TOCTOU probe incremented it. The non-cache-sinks face
+# is therefore a POLICY assertion that no mutation of this diff can vary (the same class of row as
+# CACHE-LIVE's "the directory is never removed"); what pins the live-skip WITNESS is `case_a`, which the
+# same mutant reddens on its `reason=skipped-live:worker-running` row.
+# Mutant: the live arm deleted (`if [ "$live" = 0 ]` -> `if false`) — no prune is attempted, so the keep
+# stops naming the bound it was measured against.
 case_cache_skip() { # <owner-script>
     local owner="$1" base inst out rc
     base="$(mktemp -d "$T/xs.XXXXXX")"
@@ -1350,6 +1360,40 @@ case_cache_uncapped() { # <owner-script>
                "the record carries both resolutions (max_mb=0 live_cache_cap_mb=0)"
     case_check "$([ -f "$inst/.cache/ent1/blob" ] && echo 0 || echo 1)" \
                "and the documented behaviour still holds: the live cache is skipped WHOLE, untouched"
+    return $((CASE_FAIL > 0))
+}
+
+# ── CACHE-EMPTYSEAM: a SET-BUT-EMPTY bound seam is a REFUSAL, never a silent `0` ───────────────
+# ⛔ THE ONE LINE THAT ARMS THE FIX CARRIED A COMMENT CLAIMING A REFUSAL IT DID NOT PERFORM (#4220
+# review, P2). `LIVE_CACHE_CAP_MB="${REAP_RC_LIVE_CACHE_CAP_MB:-0}"` turns a set-but-EMPTY seam into the
+# string `0`, which `_seam_ok` then accepts as valid — so a unit rendered as
+# `Environment=REAP_RC_LIVE_CACHE_CAP_MB=` (no value: the ordinary way this mistake arrives) produced the
+# bound DISABLED (the pre-#4216 skip-whole — the fix shipping inert), the startup warning SILENT (it
+# requires the seam to be UNSET), and a per-install journal line MISATTRIBUTING it to "the explicit
+# seam" for a `0` nobody wrote. This pins the file's own contract: "Env seams (each validated at
+# startup; a garbage value is a refusal, never a default)".
+# Mutant: the refusal made unreachable.
+case_cache_emptyseam() { # <owner-script>
+    local owner="$1" base inst out rc
+    base="$(mktemp -d "$T/xe0.XXXXXX")"
+    inst="$base/gh-runner-emptyseam"
+    mk_install "$inst"; mk_cache_entries "$inst" 4 2      # 8 MB, over the 4 MB `--max-mb`
+    idle_work "$inst"; mk_ps "$base/ps" "$inst" live
+    # ⛔ SET but EMPTY — not absent. The suite unsets the seam globally, so this is the only state that
+    # reaches the `:-0` default with `LIVE_CACHE_CAP_SET=1`.
+    out="$(REAP_RC_LIVE_CACHE_CAP_MB= RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+           REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
+           REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
+           REAP_RC_STATE_DIR="$base/state" \
+           bash "$owner" --apply --max-mb 4 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "a SET-BUT-EMPTY seam FAILS CLOSED (rc=$rc, want 3)"
+    case_check "$(grep -qF 'REAP_RC_LIVE_CACHE_CAP_MB is SET but EMPTY' <<<"$out" && echo 0 || echo 1)" \
+               "the refusal NAMES the seam and the state (SET but EMPTY)"
+    case_check "$(grep -qE '^(PRUNED|SKIPPED-LIVE|WOULD-PRUNE|SUMMARY) ' <<<"$out" && echo 1 || echo 0)" \
+               "and NOTHING was swept or recorded — the refusal is a startup refusal, not a mid-pass skip"
+    case_check "$([ -f "$inst/.cache/ent1/blob" ] && echo 0 || echo 1)" \
+               "the cache is untouched (the silent-'0' path would have skipped it whole and exited 0)"
     return $((CASE_FAIL > 0))
 }
 
@@ -1490,6 +1534,15 @@ case_cache_budget() { # <owner-script>
                "the pass freed ${total}MB in total, never past its 20MB cap (admitting the unit whole took it to 26MB)"
     case_check "$([ "$(kv "$lb" pruned_mb)" -le 16 ] && echo 0 || echo 1)" \
                "install B's prune is bounded by its REMAINING budget (pruned_mb=$(kv "$lb" pruned_mb) ≤ 16, its excess is 19)"
+    # ⛔ A PRUNE THE CAP TRUNCATED MUST SAY SO IN THE RECORD (#4220 review, P3). The walk's own
+    # `reason=pass-cap` arm is unreachable once `PW_NEED_KB` is clamped to the same budget (the loop
+    # breaks on `PW_NEED_KB -gt 0` first), so this pass used to publish `capped=0 remaining=0` about the
+    # very prune the cap had cut short — and `capped` is the field `scripts/disk-reaper.sh` documents as
+    # "the per-pass cap stopped it, and the next tick continues". Install B above IS the clamped one.
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*capped=1 ' <<<"$out" && echo 0 || echo 1)" \
+               "and the pass SAYS the cap truncated it (capped=1, not the capped=0 a clamped prune used to report)"
+    case_check "$(grep -qE 'SUMMARY class=runner-cache .*remaining=1 ' <<<"$out" && echo 0 || echo 1)" \
+               "naming the one candidate it leaves for the next tick (remaining=1)"
     return $((CASE_FAIL > 0))
 }
 
@@ -1498,11 +1551,19 @@ case_cache_budget() { # <owner-script>
 # incremented NOTHING — not `kept`, not `skipped_live`, not `unmeasurable` — while `kept=` is published in
 # the entry point's class line. So an install whose cache is OVER the bound and was not pruned vanished
 # from `pruned=`, `kept=`, `skipped_live=` and `unmeasurable=` simultaneously. The fixture forces that arm
-# without needing a full filesystem: the cache's PARENT is made read-only, so the quarantine RENAME fails
-# (`quarantine-failed`, rc 4 via `failed=`) and the walk finishes having removed no unit at all — the same
-# state a `PW_STOP=listing-failed` full filesystem produces. The row must be counted, and nothing may be
-# reported as pruned. (`listing-failed` additionally forces `unmeasurable`, i.e. rc 3; it is not reachable
-# in a fixture whose temp dir is writable, so this case pins the counted-keep half on the stop it can.)
+# without needing a full filesystem: the quarantine RENAME fails, so the walk finishes having removed no
+# unit at all — the same state a `PW_STOP=listing-failed` full filesystem produces. The row must be
+# counted, and nothing may be reported as pruned. (`listing-failed` additionally forces `unmeasurable`,
+# i.e. rc 3; it is not reachable in a fixture whose temp dir is writable, so this case pins the
+# counted-keep half on the stop it can.)
+# ⛔ THE RENAME IS DEFEATED BY A STUBBED `mv`, NOT BY `chmod` (#4220 review, P3). It used to be
+# `chmod 555 "$inst/.cache"`, which rests on directory write permission denying the rename — a NON-ROOT
+# property (root's CAP_DAC_OVERRIDE bypasses it). On a uid-0 host (the fleet's container cells) the prune
+# SUCCEEDED, so the case false-REDDED for a reason that is not the code, and `CACHE-NOPRUNABLE mutant:`
+# then passed *because the case was already red* — the `KEPT++` removal recorded as covered while nothing
+# tested it (agent-infra#3442 rule 2, inverted). `atomic_free` renames first and VERIFIES the move, so a
+# `mv` that cannot run means nothing can be removed on any uid; shadowing it for this invocation is the
+# same shape as the `ps`/`df`/`du` stubs and needs no skip arm.
 # Mutant: the `KEPT++` on that arm removed.
 case_cache_noprunable() { # <owner-script>
     local owner="$1" base inst out rc line
@@ -1510,13 +1571,15 @@ case_cache_noprunable() { # <owner-script>
     inst="$base/gh-runner-stuck"
     mk_install "$inst"; mk_cache_entries "$inst" 4 2      # 8 MB against a 4 MB bound
     idle_work "$inst"; mk_ps "$base/ps" "$inst" live
-    chmod 555 "$inst/.cache"                              # the rename cannot land: nothing can be removed
-    out="$(REAP_RC_LIVE_CACHE_CAP_MB=4 RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
+    mkdir -p "$base/stubbin"                              # every removal is a rename, so nothing can go
+    printf '#!/bin/sh\nexit 1\n' >"$base/stubbin/mv"
+    chmod +x "$base/stubbin/mv"
+    out="$(PATH="$base/stubbin:$PATH" \
+           REAP_RC_LIVE_CACHE_CAP_MB=4 RC_TEST_PS_TABLE="$base/ps" REAP_RC_PS_BIN="$PS_STUB" \
            REAP_RC_GLOBS="$base/gh-runner-*" REAP_RC_EXPLICIT=1 \
            REAP_RC_SHARED_GLOBS="$base/no-shared" REAP_RC_MIN_CACHE_MB=1 \
            REAP_RC_STATE_DIR="$base/state" \
            bash "$owner" --apply --max-mb 100 2>&1)"; rc=$?
-    chmod 755 "$inst/.cache"
     [ -n "${DRC_DEBUG:-}" ] && printf '%s\n' "$out" >&2
     line="$(grep -F "reason=live-cache-no-prunable-entry" <<<"$out")"
     case_check "$([ -n "$line" ] && echo 0 || echo 1)" \
@@ -1543,6 +1606,7 @@ MUT_CL="$T/mut-cl.sh"; MUT_CU="$T/mut-cu.sh"
 MUT_CS="$T/mut-cs.sh"; MUT_CA="$T/mut-ca.sh"; MUT_CW="$T/mut-cw.sh"
 MUT_CN="$T/mut-cn.sh"; MUT_CD="$T/mut-cd.sh"; MUT_CP="$T/mut-cp.sh"
 MUT_CB="$T/mut-cb.sh"; MUT_CK="$T/mut-ck.sh"
+MUT_CT="$T/mut-ct.sh"; MUT_CE="$T/mut-ce.sh"
 mut_ok=1
 apply_mutation "$OWNER" "$MUT_A" 's/^    if \[ "\$live" = 0 \]; then$/    if false; then/' \
     || { printf '  ❌ mutation A could not be applied (the skip-live arm moved) — that case now covers nothing\n'; mut_ok=0; }
@@ -1684,6 +1748,18 @@ apply_mutation "$OWNER" "$MUT_CB" 's/^    PW_NEED_KB=\$(( planned_mb \* 1024 ))$
 # then vanishes from every outcome counter at once.
 apply_mutation "$OWNER" "$MUT_CK" '/^    if \[ "\$PW_UNITS" -eq 0 \]; then$/,/^        case "\$PW_STOP" in$/ s/^        KEPT=\$((KEPT + 1))$/        :/' \
     || { printf '  ❌ mutation CK could not be applied (the counted keep in the no-prunable-entry arm moved)\n'; mut_ok=0; }
+# ⛔ CT — THE CAP-TRUNCATION REPORT REMOVED (#4220 review, P3). A prune clamped to what was LEFT of the
+# per-pass budget reported `capped=0 remaining=0`, because the walk's own `reason=pass-cap` arm is
+# unreachable once the target is clamped to the same number. The record's own field then answered "no"
+# about the pass the cap had cut short, and `note_runner_cache=` said nothing remained for the next tick.
+apply_mutation "$OWNER" "$MUT_CT" 's/^    if \[ "\$MAX_MB" -gt 0 \] && \[ "\$planned_mb" -lt "\$(( excess_kb \/ 1024 ))" \]; then$/    if false; then/' \
+    || { printf '  ❌ mutation CT could not be applied (the cap-truncation report moved)\n'; mut_ok=0; }
+# ⛔ CE — THE SET-BUT-EMPTY SEAM REFUSAL REMOVED (#4220 review, P2). The seam then resolves to `0` via
+# `:-0`, which `_seam_ok` accepts — the bound is DISABLED (pre-#4216 skip-whole), the startup warning is
+# silent (it requires the seam to be UNSET), and the journal blames "the explicit seam" for a `0` nobody
+# wrote. `case_cache_emptyseam` reddens on the exit code and on the missing refusal.
+apply_mutation "$OWNER" "$MUT_CE" 's/^if \[ -n "\${REAP_RC_LIVE_CACHE_CAP_MB+set}" \] && \[ -z "\${REAP_RC_LIVE_CACHE_CAP_MB:-}" \]; then$/if false; then/' \
+    || { printf '  ❌ mutation CE could not be applied (the set-but-empty seam refusal moved)\n'; mut_ok=0; }
 
 printf '── ran with %s ──\n' "${BASH_VERSION%%(*}"
 expect_pass "A a live install is SKIPPED and the idle one is reaped" case_a "$OWNER"
@@ -1720,6 +1796,7 @@ expect_pass "CACHE-UNANSWERABLE a broken df probes the SAME verdict on a live in
 expect_pass "CACHE-DESCEND a unit bigger than the need is entered, not deleted whole" case_cache_descend "$OWNER"
 expect_pass "CACHE-BUDGET a unit is admitted up to the REMAINING BUDGET, never up to the excess" case_cache_budget "$OWNER"
 expect_pass "CACHE-NOPRUNABLE an over-bound install kept unremovable is COUNTED" case_cache_noprunable "$OWNER"
+expect_pass "CACHE-EMPTYSEAM a set-but-EMPTY bound seam is a REFUSAL, not a silent 0" case_cache_emptyseam "$OWNER"
 
 printf '\n── mutations: each arm must redden the case that covers it ──\n'
 [ "$mut_ok" = 1 ] || bad "one or more mutations could not be applied (see above)"
@@ -1764,7 +1841,9 @@ expect_fail "CACHE-DESCEND mutant: the descent arm forced to whole-delete" case_
 expect_fail "CACHE-DESCEND mutant: PRUNE_MAX_DEPTH reached at depth 0" case_cache_descend "$MUT_CP"
 expect_fail "CACHE-BUDGET mutant: the prune target back to the whole excess" case_cache_budget "$MUT_CB"
 expect_fail "CACHE-NOPRUNABLE mutant: the counted keep removed" case_cache_noprunable "$MUT_CK"
-expect_fail "CACHE-SKIP mutant: the live arm deleted (aged scratch is reaped under a live holder)" case_cache_skip "$MUT_A"
+expect_fail "CACHE-BUDGET mutant: the cap-truncation report removed (capped=0 over a cut-short prune)" case_cache_budget "$MUT_CT"
+expect_fail "CACHE-EMPTYSEAM mutant: the set-but-empty seam refusal removed (bound silently 0)" case_cache_emptyseam "$MUT_CE"
+expect_fail "CACHE-SKIP mutant: the live arm deleted (the keep stops NAMING the bound)" case_cache_skip "$MUT_A"
 
 printf '\n── the owner never removes anything it was not asked to ──\n'
 # ⛔ A SCOPE CASE, not a policy one: the owner is handed a tree that contains an install AND an

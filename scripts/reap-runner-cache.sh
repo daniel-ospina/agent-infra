@@ -260,7 +260,12 @@
 #                          size does — a package cache is content-addressed and regenerates, so the worst
 #                          case is a re-download inside a live job, not lost work. Defaults to the
 #                          per-pass cap (the dial the entry point already forwards); 0 disables the prune
-#                          and restores the skip-whole behaviour. Every OTHER sink (worktrees, venvs,
+#                          and restores the skip-whole behaviour. ⛔ SET-BUT-EMPTY IS A REFUSAL, for the
+#                          same reason the glob seams refuse it and one more: an emptied seam would
+#                          resolve to `0`, and `0` here is not "no limit" — it is the strictest possible
+#                          bound (free NOTHING), so a rendered `Environment=REAP_RC_LIVE_CACHE_CAP_MB=`
+#                          would silently restore the pre-#4216 behaviour while the journal blamed an
+#                          explicit `=0` nobody wrote. Every OTHER sink (worktrees, venvs,
 #                          `_work`, `_diag`, duplicate installs) still refuses under a live holder.
 #   REAP_RC_PS_BIN         the process census binary            (default /bin/ps)
 #   REAP_RC_DU_BIN         (default du)  REAP_RC_STAT_BIN (default stat)
@@ -351,6 +356,17 @@ MAX_MB="${REAP_RC_MAX_MB:-0}"
 # `0` = no bound, which restores the pre-#4216 behaviour (a live install's cache is skipped whole) — and
 # because `--max-mb 0` resolves to exactly that, the reversal is NAMED at startup (see the warning below
 # the function definitions).
+# ⛔ A SET-BUT-EMPTY SEAM IS A REFUSAL — and it must be refused HERE, BEFORE the `:-0` default below
+# turns it into a valid `0` that `_seam_ok` then accepts (#4220 review, P2). The state an operator gets
+# from a unit rendered as `Environment=REAP_RC_LIVE_CACHE_CAP_MB=` (the ordinary way this mistake
+# arrives) was: the bound DISABLED (= the pre-#4216 skip-whole, i.e. the fix shipping inert), the
+# startup warning SILENT (it requires the seam to be UNSET), and the per-install journal line
+# MISATTRIBUTING it to "REAP_RC_LIVE_CACHE_CAP_MB=0 (the explicit seam)" — telling the operator they
+# wrote a `0` they never wrote. Say `0` explicitly to mean it, or unset the seam to inherit `--max-mb`.
+if [ -n "${REAP_RC_LIVE_CACHE_CAP_MB+set}" ] && [ -z "${REAP_RC_LIVE_CACHE_CAP_MB:-}" ]; then
+    printf '%s: FAIL-CLOSED — REAP_RC_LIVE_CACHE_CAP_MB is SET but EMPTY. As a BOUND, 0 does not mean "no limit", it means "free NOTHING": an emptied seam would silently restore the pre-#4216 skip-whole behaviour while the journal blamed an explicit `=0`. Set it to a number, say 0 explicitly to mean it, or UNSET it to inherit --max-mb\n' "$SCRIPT_NAME" >&2
+    exit 3
+fi
 LIVE_CACHE_CAP_MB="${REAP_RC_LIVE_CACHE_CAP_MB:-0}"
 LIVE_CACHE_CAP_SET=0
 [ -n "${REAP_RC_LIVE_CACHE_CAP_MB+set}" ] && LIVE_CACHE_CAP_SET=1
@@ -979,6 +995,20 @@ live_cache_prune() {
         _left=$(( MAX_MB - FREED_MB - UNSIZED_MB )); [ "$_left" -lt 0 ] && _left=0
         [ "$planned_mb" -gt "$_left" ] && planned_mb="$_left"
     fi
+    # ⛔ A PRUNE THE PASS CAP TRUNCATED MUST SAY SO (#4220 review, P3). The walk's own `reason=pass-cap`
+    # arm (:874) fires only when `PW_FREED_KB` REACHES `PW_BUDGET_KB` — but `PW_NEED_KB` is now clamped to
+    # the same number, so the loop breaks on `PW_NEED_KB -gt 0` FIRST and that arm is unreachable on this
+    # path. The result was a record that said `capped=0 remaining=0` about a prune the cap HAD truncated:
+    # on this PR's own measured population (18662MB + 12241MB against `--max-mb 20480`) the second install
+    # was silently cut to 1818MB while `capped=` answered "the cap did not stop anything". `capped` is
+    # published for exactly one question — `scripts/disk-reaper.sh` documents it as "the per-pass cap
+    # stopped it, and the next tick continues" — so it is set HERE, from the clamp itself, in BOTH modes:
+    # the dry run previews the same truncation the apply would perform. (The clamp is the ONLY test: an
+    # indivisible unit that goes whole and lands just under the excess is not a cap truncation.)
+    if [ "$MAX_MB" -gt 0 ] && [ "$planned_mb" -lt "$(( excess_kb / 1024 ))" ]; then
+        CAPPED=1; REMAINING=$((REMAINING + 1))
+        log_line "CAPPED $cache reason=live-cache-pass-cap wanted_mb=$(( excess_kb / 1024 )) may_free_mb=${planned_mb} max_mb=${MAX_MB} (the per-pass cap truncated this prune; the bound is enforced on the next tick)"
+    fi
     if is_dry; then
         # ⛔ THE DRY RUN SELECTS THE SAME CANDIDATE, so its preview is a preview of THIS pass: the owner
         # emits the entry point's own `REAP` row, and the row says the prune would stop at the bound.
@@ -1005,8 +1035,16 @@ live_cache_prune() {
     # budget, and install B's 12241MB excess still authorised a whole 12000MB `uv/` entry — ~30.6GB
     # freed against a 20GB cap, in a pass this class runs 144×/day. The whole-cache path refuses exactly
     # that candidate (`cap_reached`), and the dry run already previewed the CLAMPED `planned_mb`: the two
-    # modes must select the SAME candidates, so the walk gets the same clamped number. A unit larger
-    # than what is left of the budget is now DESCENDED into instead of deleted whole.
+    # modes must select the SAME candidates, so the walk gets the same clamped number. ⛔ THE DESCENT ARM
+    # IS WHAT MAKES THAT TRUE FOR A **DIRECTORY** — it is NOT true for every unit: `[ ! -d "$e" ]` and
+    # `depth -ge PRUNE_MAX_DEPTH` still admit a unit of ANY size, so a single FILE larger than what is
+    # left of the budget goes whole and `freed_mb` can exceed `max_mb` by at most that one file. That is
+    # the disclosed OVERSHOOT (docs/ops/disk-reaper.md's "a unit that cannot be subdivided goes whole and
+    # overshoots"), and it is what comparable size-bounded caches do — ccache leaves a single object
+    # larger than the cleanup target alone, Go's build cache never splits an oversized output — so the
+    # behaviour is deliberate; the earlier wording here ("a unit larger than what is left of the budget
+    # is now DESCENDED into instead of deleted whole") overstated it for the two non-subdividable arms
+    # (#4220 review, P3).
     PW_NEED_KB=$(( planned_mb * 1024 ))
     PW_FREED_KB=0
     PW_UNITS=0
