@@ -76,9 +76,11 @@
 #                                                                 50.1 GB in ONE install, ≈445 GB across
 #                                                                 five boxes) plus aged `_work/_temp`
 #                                                                 and `_diag/*.log`. An install with a
-#                                                                 JOB IN FLIGHT is skipped whole
-#                                                                 (`skipped-live`); see the class
-#                                                                 comment below and the owner's header
+#                                                                 JOB IN FLIGHT keeps its WORK sinks
+#                                                                 whole (`skipped-live`) while its
+#                                                                 `.cache` is PRUNED to a size bound
+#                                                                 (#4216); see the class comment below
+#                                                                 and the owner's header
 #
 # ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir — by the
 # pass that acquired it, or a lock whose recorded owner is provably GONE and which is older than the
@@ -3015,11 +3017,13 @@ reap_runner_work() {
 # symptom from the other side). None of the five classes above matched this sink, so the hourly pass
 # reported `ignored-artifact:89 … live-process:2` and reclaimed 187 MB while a 40 GB cache sat there.
 #
-# ⛔ THE SAFETY PROPERTY IS "NEVER DELETE A CACHE A LIVE JOB IS USING", and it lives in the OWNER
-# (`scripts/reap-runner-cache.sh`), not here: an install with a job in flight is skipped WHOLE and
-# reported `skipped-live`, and an install whose liveness cannot be proved is KEPT (fail-closed). This
-# arm only measures the delta and reports the numbers — it contains no `rm`, as it does for every other
-# class.
+# ⛔ THE SAFETY PROPERTY IS "NEVER DELETE A LIVE JOB'S WORK", and it lives in the OWNER
+# (`scripts/reap-runner-cache.sh`), not here: an install with a job in flight has NOTHING removed from
+# its work sinks — `_work/_temp`, `_diag` — and is reported `skipped-live` with the witness named, and an
+# install whose liveness cannot be proved is KEPT (fail-closed). ⛔ THE CACHE IS THE ONE SINK THAT IS
+# NOT SKIPPED BY LIVENESS (#4216): it is bounded by SIZE instead, because a package cache is
+# content-addressed and regenerates while a work sink does not. This arm only measures the delta and
+# reports the numbers — it contains no `rm`, as it does for every other class.
 #
 # ⛔ TWO CADENCES, ONE POLICY (§SCHEDULING above): the hourly pass runs this class with the others; the
 # `--size-trigger` pass runs it ALONE, every 10 minutes, but only when free space is below
@@ -3645,9 +3649,14 @@ record_body() {
     # not exist.
     printf 'note_runner_work=%s\n' "$NOTE_RW"
     # ── class=runner-cache (#4168). Its ledger is deliberately NOT a copy of runner-work's: this class
-    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (an
-    # install with a JOB IN FLIGHT is never touched), `cache_mb` (the reading it took), and `capped`
-    # (the per-pass cap stopped it, and the next tick continues).
+    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (the
+    # install was NOT pruned: a job is running and its cache is under the bound, the pass cap is already
+    # spent, or the bound is disabled — ⛔ since #4216 a live install whose cache WAS pruned is not
+    # counted here, and its work sinks are never touched either way), `kept` (kept BY NAME and untouched:
+    # over the bound but nothing in it could be removed), `pruned`/`pruned_mb` (bounded by SIZE, not by
+    # the absence of a holder), `cache_mb` (the reading it took), and `capped` (the per-pass cap stopped
+    # the prune, and the next tick continues — ⛔ including a prune CLAMPED to the budget it had left,
+    # which used to publish `capped=0 remaining=0` about the pass the cap had cut short).
     printf 'candidates_runner_cache=%s\n' "$(_class_rec "${VERDICT_RC:-not-run}" "${WANT_RC:-0}" "${HAVE_RC_CAND:-0}" "$CAND_RC")"
     _rc_tally_rec() {
         case "${VERDICT_RC:-not-run}" in
