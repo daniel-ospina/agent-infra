@@ -1607,6 +1607,58 @@ O28LV="$(O28V landbox:$$ refs/claims/pr-9209428)"
 ck "O28 [PINNED] a LIVE local pid on the LANDING key is NOT orphaned (rc=$(field "$O28LV" RC))" $O28LV_RC
 
 echo
+echo "── O29: the PRUNE arm reaps a landing claim, and the edge abstentions ─────────────────"
+# ⛔ WHY A SECOND CASE AND NOT MORE ROWS IN O28. `claim_prune` is a DIFFERENT READER of the same
+# function — the third call site — and it is the one that must actually DELETE. The defect's own
+# statement is "`claim_prune`'s orphan arm calls the same function, so nothing reaped it early
+# either"; a predicate that answers correctly while the reaper still cannot remove the claim leaves
+# the block in place for the whole lease, which is the measured incident (5 of 11 landing claims held
+# by a dead local pid, each reading held-by-live to every box for ~50 min while `merge-one.sh` exited
+# in ~1s per dispatch — the drain stalled with lane slots free).
+ORIG29="$(mk_origin o29)"; ensure_work_repo "$ORIG29" || { echo "❌ fixture"; exit 2; }
+# HOURS of lease left, so EXPIRY cannot be what frees it — only the orphan arm can.
+as_box "$ORIG29" landbox 'c="$(_claim_commit "landbox:999999" "$(( $(date +%s) + 7200 ))")"
+  _git push -q origin "$c:refs/claims/pr-9209430" 2>/dev/null' >/dev/null
+# ...and a LIVE owner beside it, so the pass is shown to judge the OWNER and not the key.
+as_box "$ORIG29" landbox 'c="$(_claim_commit "landbox:$$" "$(( $(date +%s) + 7200 ))")"
+  _git push -q origin "$c:refs/claims/pr-9209432" 2>/dev/null' >/dev/null
+has_ref "$ORIG29" refs/claims/pr-9209430 && has_ref "$ORIG29" refs/claims/pr-9209432; O29S_RC=$?
+ck "O29 (setup) a dead-owner landing claim and a live-owner one both sit on the origin, each with hours of lease left" $O29S_RC
+PRUNE29="$(as_box "$ORIG29" landbox 'claim_prune' 2>&1)"
+grep -q 'pruned orphaned-host refs/claims/pr-9209430' <<<"$PRUNE29"; O29A_RC=$?
+ck "O29 [RED→GREEN] claim_prune REAPS the dead-owner LANDING claim through the ORPHAN arm (not expiry — its lease has hours left)" $O29A_RC
+has_ref "$ORIG29" refs/claims/pr-9209430 && rc=1 || rc=0
+ck "O29 [RED→GREEN] ...and the landing ref is gone from the origin" $rc
+has_ref "$ORIG29" refs/claims/pr-9209432; O29C_RC=$?
+ck "O29 [PINNED] CONTROL: the LIVE-owner landing claim SURVIVED the same pass — the arm judges the owner, not the key" $O29C_RC
+# ⛔ THE DECISIVE PAIR FROM THE INCIDENT, on ONE owner: the per-head key beside the landing key must
+# give the SAME verdict. Pre-fix they DISAGREED (per-head rc=0, landing rc=1), and that disagreement is
+# why the block went unnoticed — every reader looking at a per-head key saw a working orphan rule.
+O29V() { # O29V <owner> <ref>
+  as_box "$ORIG29" landbox 'claim_orphan_reason "$O29_OWNER" "$O29_REF" >/dev/null 2>&1; printf "RC=%s\n" "$?"' \
+    O29_OWNER="$1" O29_REF="$2"
+}
+O29P="$(O29V landbox:999999 refs/claims/9209430-0123456789ab)"
+O29L="$(O29V landbox:999999 refs/claims/pr-9209430)"
+[ "$(field "$O29P" RC)" = "0" ] && [ "$(field "$O29L" RC)" = "0" ]; O29D_RC=$?
+ck "O29 [RED→GREEN] one dead owner, both PR keyings, ONE verdict (per-head rc=$(field "$O29P" RC), landing rc=$(field "$O29L" RC)) — the disagreement that hid the defect" $O29D_RC
+# ⛔ THE EDGE ABSTENTIONS the `<digits>` requirement must also cover. Both are ONE character from a
+# shape this code mints, and both must abstain rather than authorise a delete: the fleet-wide `box`
+# sentinel is not an identity (it is the same string on every box), and a suffixless `pr-` is not a key.
+O29B="$(O29V 'box:999999' refs/claims/pr-9209430)"
+[ "$(field "$O29B" RC)" = "1" ]; O29E_RC=$?
+ck "O29 [PINNED] the fleet-wide 'box' sentinel abstains on a LANDING key too (rc=$(field "$O29B" RC))" $O29E_RC
+O29E="$(O29V landbox:999999 refs/claims/pr-)"
+[ "$(field "$O29E" RC)" = "1" ]; O29F_RC=$?
+ck "O29 [PINNED] a suffixless 'pr-' is not a key and abstains (rc=$(field "$O29E" RC))" $O29F_RC
+# ⛔ RESIDUAL, RECORDED RATHER THAN HIDDEN: the shipped pattern requires the FIRST digit only
+# (`*"/pr-"[0-9]*`), so a hand-pushed `refs/claims/pr-12abc` WOULD take the pid arm and be reapable.
+# `claim_pr_key` emits digits only and nothing in this code pushes that shape, so it is unmintable in
+# practice; reaping it needs a LOCAL owner with a dead pid, i.e. only the pusher's own junk ref. Left as
+# a residual rather than tightened here, because narrowing the pattern is a separate change to the arm
+# this PR is already widening — and an unmintable shape is not the defect class this PR closes.
+
+echo
 echo "─────────────────────────────────────────────────────────────"
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
