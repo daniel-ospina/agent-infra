@@ -76,9 +76,13 @@
 #                                                                 50.1 GB in ONE install, ≈445 GB across
 #                                                                 five boxes) plus aged `_work/_temp`
 #                                                                 and `_diag/*.log`. An install with a
-#                                                                 JOB IN FLIGHT is skipped whole
-#                                                                 (`skipped-live`); see the class
-#                                                                 comment below and the owner's header
+#                                                                 JOB IN FLIGHT keeps its WORK sinks
+#                                                                 whole (never touched, and counted
+#                                                                 in `skipped-live` only when its
+#                                                                 `.cache` is NOT pruned) while its
+#                                                                 `.cache` is PRUNED to a size bound
+#                                                                 (#4216); see the class comment below
+#                                                                 and the owner's header
 #
 # ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir — by the
 # pass that acquired it, or a lock whose recorded owner is provably GONE and which is older than the
@@ -500,7 +504,9 @@ NOTE_RW=""
 # already does `s/^freed_mb_//p`.
 # ⛔ ITS OWN SENTINELS, NOT THE runner-work ONES. This class publishes a DIFFERENT ledger (a cache is
 # reaped whole; a `_work` entry is age-gated), and `skipped_live` is a state no other class has — the
-# number that matters most here is "how many installs did we NOT touch because a job was running".
+# number that matters most here is "how many paths did we NOT prune". Its arms are enumerated once,
+# at `record_body` below; ⛔ since #4216 a live install whose cache WAS pruned is NOT counted here, so
+# "not touched because a job was running" has not been what this counter means since then.
 FREED_RC=0; RAW_RC=0
 DF_RC_OK=1
 WOULD_RC=0; CAND_RC=0
@@ -3015,11 +3021,14 @@ reap_runner_work() {
 # symptom from the other side). None of the five classes above matched this sink, so the hourly pass
 # reported `ignored-artifact:89 … live-process:2` and reclaimed 187 MB while a 40 GB cache sat there.
 #
-# ⛔ THE SAFETY PROPERTY IS "NEVER DELETE A CACHE A LIVE JOB IS USING", and it lives in the OWNER
-# (`scripts/reap-runner-cache.sh`), not here: an install with a job in flight is skipped WHOLE and
-# reported `skipped-live`, and an install whose liveness cannot be proved is KEPT (fail-closed). This
-# arm only measures the delta and reports the numbers — it contains no `rm`, as it does for every other
-# class.
+# ⛔ THE SAFETY PROPERTY IS "NEVER DELETE A LIVE JOB'S WORK", and it lives in the OWNER
+# (`scripts/reap-runner-cache.sh`), not here: an install with a job in flight has NOTHING removed from
+# its work sinks — `_work/_temp`, `_diag` — and is counted `skipped_live` only when its `.cache` was NOT
+# pruned (a pruned cache reads `skipped_live=0` on that install; the sinks are untouched either way), and
+# an install whose liveness cannot be proved is KEPT (fail-closed). ⛔ THE CACHE IS THE ONE SINK THAT IS
+# NOT SKIPPED BY LIVENESS (#4216): it is bounded by SIZE instead, because a package cache is
+# content-addressed and regenerates while a work sink does not. This arm only measures the delta and
+# reports the numbers — it contains no `rm`, as it does for every other class.
 #
 # ⛔ TWO CADENCES, ONE POLICY (§SCHEDULING above): the hourly pass runs this class with the others; the
 # `--size-trigger` pass runs it ALONE, every 10 minutes, but only when free space is below
@@ -3183,8 +3192,14 @@ reap_runner_cache() {
     _rc_capped="$(kv_field "$_rc_line" capped)"
     _rc_remaining="$(kv_field "$_rc_line" remaining)"
     # ⛔ `skipped_live` IS THE FIELD THAT MATTERS MOST ON THIS CLASS, and it is a DECISION, not a
-    # failure: it is how many installs were NOT touched because a job was running in them. Published so
-    # "the cache is still 40 GB" has an answer other than "the reaper is broken".
+    # failure: it is how many PATHS the class DECLINED to prune — an install's `.cache`, a
+    # `_work/_temp`/`_diag` entry, or the shared per-box root. ⛔ It is NOT a liveness count —
+    # since #4216 a live install whose cache WAS pruned counts 0 here, and its work sinks are untouched
+    # regardless — and it is NOT every not-pruned path either: an unmeasurable one counts in
+    # `unmeasurable=`, and an over-bound one with nothing removable in `kept=`. §record_body points at the
+    # owner's arms rather than restating them (every restatement was a completeness claim, and the
+    # `SKIPPED_LIVE` increments are the authority). Published so "the cache is still 40 GB" has an answer
+    # other than "the reaper is broken".
     case "${_rc_skipped:-}" in
         ''|*[!0-9]*) : ;; *) HAVE_RC_SKIPPED=1; SKIPPED_LIVE_RC="$_rc_skipped" ;;
     esac
@@ -3265,7 +3280,7 @@ reap_runner_cache() {
 }disk-reaper: WOULD-REMOVE class=runner-cache (? bytes unmeasured — the owner could not size it) ${path}" ;;
                         *) WOULD_RC=$((WOULD_RC + size))
                            cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound, see pruned_mb= in the pass record)" ;;
+}disk-reaper: WOULD-REMOVE class=runner-cache ${size}MB ${path} (du estimate; the class's cache bound is a SIZE bound, so a live holder does not exempt a cache — the install with one has its WORK sinks skipped and its cache pruned down to the bound; this line is printed by a DRY RUN, and only a LIVE install's cache also gets its own WOULD-PRUNE line carrying would_prune_mb=, while under --apply the class SUMMARY carries pruned_mb=)" ;;
                     esac ;;
             esac
         done <<<"$rows"
@@ -3645,9 +3660,20 @@ record_body() {
     # not exist.
     printf 'note_runner_work=%s\n' "$NOTE_RW"
     # ── class=runner-cache (#4168). Its ledger is deliberately NOT a copy of runner-work's: this class
-    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (an
-    # install with a JOB IN FLIGHT is never touched), `cache_mb` (the reading it took), and `capped`
-    # (the per-pass cap stopped it, and the next tick continues).
+    # publishes what an operator needs to answer "why did my 40 GB cache survive" — `skipped_live` (a
+    # PATH the class DECLINED to prune — an install's `.cache`, a `_work/_temp`/`_diag` entry, or the
+    # shared per-box root; ⛔ NOT a liveness count — since #4216 a live install whose
+    # cache WAS pruned counts 0 here, and its work sinks are untouched either way; ⛔ and not every
+    # not-pruned path, because an unmeasurable one counts in `unmeasurable=` and an over-bound one
+    # with nothing removable in `kept=`. The arms are the `SKIPPED_LIVE` increments in
+    # `scripts/reap-runner-cache.sh`, each of which returns before any delete), `kept` (a keep this pass
+    # COUNTED — the class's AGGREGATE keep counter; ⛔ NOT every row the journal prints as `KEPT`: an
+    # unmeasurable keep counts in `unmeasurable=`, and a cap-deferred candidate sets `capped=1` with
+    # `remaining=` counting them),
+    # `pruned`/`pruned_mb` (bounded by SIZE, not by the absence of a holder), `cache_mb` (the reading it
+    # took), and `capped` (the per-pass cap stopped a REMOVAL — a whole-cache candidate as well as the
+    # prune — and the next tick continues; ⛔ including a prune CLAMPED to the budget it had left, which
+    # used to publish `capped=0 remaining=0` about the pass the cap had cut short).
     printf 'candidates_runner_cache=%s\n' "$(_class_rec "${VERDICT_RC:-not-run}" "${WANT_RC:-0}" "${HAVE_RC_CAND:-0}" "$CAND_RC")"
     _rc_tally_rec() {
         case "${VERDICT_RC:-not-run}" in
