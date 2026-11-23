@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1795471314,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1795471314-p490459-6f140f6e",
+  "lease_until": 1795471919,
+  "pid": 490459,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795471314,
+  "state": "RUNNING",
+  "tag": "42",
+  "worktree": "/opt/gh-runner-ai-cell1-3/_work/agent-infra/agent-infra"
+}
