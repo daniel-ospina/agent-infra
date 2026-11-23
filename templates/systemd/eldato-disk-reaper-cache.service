@@ -25,10 +25,13 @@
 # run this pass every 10 minutes AND flush every idle install's warm cache while the runners' own volume
 # held hundreds of GB free (#4169 review, P2). One dial, so the unit and the class cannot disagree.
 #
-# The class never touches an install with a JOB IN FLIGHT: `scripts/reap-runner-cache.sh` proves
-# liveness from the process table (`Runner.Worker` present, or a listener with content written under
-# `_work` inside its freshness window) and SKIPS that install whole (`skipped_live=`). A cache deleted
-# mid-job fails the job, so that skip is the one correctness property the class has.
+# The class never touches a live job's WORK: `scripts/reap-runner-cache.sh` proves liveness from the
+# process table (`Runner.Worker` present, or a listener with content written under `_work` inside its
+# freshness window) and leaves `_work/_temp` and `_diag` alone for that install whole (`skipped_live=`).
+# ⛔ ITS `.cache` IS THE ONE SINK THAT IS NOT SKIPPED BY LIVENESS (#4216): a package cache is
+# content-addressed and regenerates, so it is PRUNED to `REAP_RC_LIVE_CACHE_CAP_MB` (default: this pass's
+# `--max-mb`), oldest entries first, with the directory and its newest entries left in place. That is the
+# trade the class exists for — the work sinks keep the skip, the cache keeps the size bound.
 #
 # This pass writes its OWN record (`disk-reaper-cache.status`), so it can never overwrite the hourly
 # pass's record; `disk-reaper.sh --print-status` still answers for the full pass.
