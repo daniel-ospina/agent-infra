@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1795392394,
+  "host": "cmux",
+  "issue": 81,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-81-1795392394-p1890468-14ec1dba",
+  "lease_until": 1795392999,
+  "pid": 1890468,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795392394,
+  "state": "RUNNING",
+  "tag": "81",
+  "worktree": "/tmp/tmp.UizdMin29U/lbdet"
+}
