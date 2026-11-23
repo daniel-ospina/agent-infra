@@ -816,7 +816,10 @@ claim_orphan_reason() {
     # can never be confused: `pr-<N>` is minted only by `claim_pr_key` and acquired only by
     # `merge-one.sh`. The bare spelling is matched too, for the same reason `issue-<N>` is: a caller
     # holding the key from `claim_pr_key` rather than the full ref must get the same verdict.
-    *[0-9]*-*|*"/pr-"*|pr-*)
+    # ⛔ AND THE LANDING SHAPE IS POSITIVE IN THE SAME WAY: `pr-<N>` must carry its NUMBER, so a ref
+    # like `refs/claims/pr-abc` (a shape this code never mints) still abstains — O25B pins that, and
+    # widening to a bare `*/pr-*` would have reaped it.
+    *[0-9]*-*|*"/pr-"[0-9]*|pr-[0-9]*)
       # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
       # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim
       # stamped `<oldName>:<live pid>` skipped the pid probe and fell through to the former-name rule,
