@@ -181,6 +181,36 @@ do
   not_flags "$1" "$G" && ok "B: guarded use NOT flagged — $1 in $2" || bad "B: FALSE POSITIVE — $1 flagged on the guarded form in $2"
 done
 
+# ── B8. THE GUARD LOOKBACK WINDOW IS 8 CODE LINES, AND A SKIPPED LINE STILL COUNTS (agent-infra#4210)
+# ⛔ THE DEFECT THIS PINS, MEASURED. The trigger prefilter records `hist` on the skip path, and its
+# first version recorded `hist` for EVERY line BEFORE the rule block. That overwrote the slot holding
+# the line 8 back before this line's rules read it, so the documented window silently became SEVEN
+# lines: a `command -v` probe exactly 8 lines above stopped guarding, and PORTABLE code reded as
+# `readlink-f-bsd-absent`. ⛔ F10 CANNOT SEE THIS — both the fast path and `--no-trigger-prefilter`
+# carried the same shift, so they agree with each other while both disagree with the reference the
+# header promises. The window is carried by `hist`, so the arm must measure the DOCUMENTED distance,
+# not the implementation: 8 lines back is guarded, 9 lines back is NOT (the declared limit, and the
+# half that proves this arm would notice a window that grew or shrank).
+B8="$TMP/lookback"
+mkb8() {   # mkb8 <name> <gap> — probe on line 2, `gap` filler lines, then the call, then `fi`.
+  local f="$1" gap="$2" i
+  mkdir -p "$TMP/tree/$(dirname "$f")"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'if command -v readlink >/dev/null 2>&1; then'
+    i=1; while [ "$i" -le "$gap" ]; do printf '  : %s\n' "$i"; i=$((i+1)); done
+    printf '%s\n' '  readlink -f "$p"' 'fi'
+  } >"$TMP/tree/$f"
+  printf '%s\n' "$f" >"$B8.$gap.list"
+}
+mkb8 lookback/at-8.sh 7   # the call lands on line 10 → the probe is exactly 8 lines back
+mkb8 lookback/at-9.sh 8   # the call lands on line 11 → 9 lines back, outside the declared window
+not_flags readlink-f-bsd-absent "$B8.7.list" \
+  && ok "B8: a probe 8 code lines above still guards — the lookback window is 8, not 7 (a prefilter-skipped line still records its hist slot)" \
+  || bad "B8: FALSE POSITIVE — a probe EXACTLY 8 lines above no longer guards (the prefilter narrowed the documented window to 7)"
+flags readlink-f-bsd-absent "$B8.8.list" \
+  && ok "B8-control: 9 lines back does NOT guard — the arm above is sensitive to the window, not to the fixture" \
+  || bad "B8-control: a probe 9 lines above guarded — the window is wider than the 8 lines the header promises"
+
 # ── C. FALSE-POSITIVE CONTROLS: a trap that is DATA, not code ───────────────────────────────────
 # A quoted string, a comment, and a heredoc body all CONTAIN the trap text and the shell never runs
 # it. Flagging any of them is the over-block that gets a gate switched off.

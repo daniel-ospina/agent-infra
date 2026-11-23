@@ -1377,16 +1377,24 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
     fail(FILENAME ":" FNR ": `# portability-ok:` with NO reason — a suppression without a reason is a silent pass")
   }
 
-  # ── guard lookback: a `command -v <tool>` probe within the previous 8 CODE lines guards the call
-  # ⛔ THE HISTORY IS RECORDED BEFORE THE PREFILTER BELOW, and that ordering is load bearing: the
-  # lookback is how a guarded call is recognised, so a line the fast path skips must still enter
-  # `hist` exactly as it did before the prefilter existed (a probe line is a line like any other).
-  p = (FNR - 1) % 8
-  hist[p] = code
   # ── THE TRIGGER PREFILTER (agent-infra#4210) — see trig_atoms() for the completeness obligation
   # and for why this is tested against the RAW view. `pfast + 0` so a `-v pfast=` STRING is read as
   # the number it is under mawk and one-true-awk as well as gawk.
-  if (pfast + 0 != 0 && raw !~ TRIG) next
+  # ⛔ A LINE THE FAST PATH SKIPS IS STILL A LINE (review finding, agent-infra#4210): it records its
+  # own `hist` slot BEFORE it leaves, because the guard lookback below reads the PREVIOUS 8 lines and
+  # a `command -v` probe the prefilter skipped must still guard the call under it.
+  # ⛔ AND A LINE THAT RUNS THE RULES RECORDS ITS SLOT AFTER THEM, EXACTLY AS BEFORE THIS CHANGE
+  # (the assignment is at the end of the block). Recording it here for EVERY line was the first
+  # version, and it OVERWROTE the slot holding the line 8 back before the rules of THIS line read it:
+  # the documented 8-line window silently became SEVEN, so a `command -v` probe exactly 8 lines above
+  # stopped guarding and portable code reded (measured; pinned by arm B8 in the suite). The window IS
+  # `hist`, so the write position decides it — and because the fast path and `--no-trigger-prefilter`
+  # both carried the same shift, the F10 equivalence comparison could never see it.
+  if (pfast + 0 != 0 && raw !~ TRIG) {
+    p = (FNR - 1) % 8
+    hist[p] = code
+    next
+  }
 
   hit("cpu-count-single-mechanism", cpu_rule(code), "box_ncpu (scripts/lib/box.sh)")
   hit("timeout-absent-on-macos",  bare_calls("timeout", code), "sleep+kill -0 watchdog, or bounded.sh (#2046)")
@@ -1478,6 +1486,14 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # demanded a space after the flag. A rule that only fires on `wait -n 2>/dev/null` measures almost
   # nothing.
   if (cp(code, "wait") && code ~ /wait[ \t]+-[A-Za-z]*n([^A-Za-z]|$)/) hit("bash4-wait-n", 1, "poll with kill -0")
+
+  # ── guard lookback: a `command -v <tool>` probe within the previous 8 CODE lines guards the call
+  # ⛔ THE HISTORY IS RECORDED HERE, AFTER THE RULE BLOCK, AND THE POSITION IS THE WINDOW: the
+  # lookback reads the PREVIOUS 8 lines, so the slot of this line must still hold the line 8 back
+  # while the rules above evaluate it. A line the prefilter skips writes its own slot on its way out
+  # (see the prefilter above), so a skipped probe is still visible to the call below it.
+  p = (FNR - 1) % 8
+  hist[p] = code
 }
 
 # ── cpu-count-single-mechanism ───────────────────────────────────────────────────────────────────

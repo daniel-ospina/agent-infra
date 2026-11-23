@@ -16,9 +16,9 @@
 # are pinned here, because `check-portability-traps.sh` is blind to all three (below).
 #
 # WHY THIS SUITE EXISTS — the gate could not see the bug it is about.
-# `scripts/check-portability-traps.sh`'s `stat-c-gnu` rule (`:1444`) fires on
+# `scripts/check-portability-traps.sh`'s `stat-c-gnu` rule (`:1452`) fires on
 # `stat -c` WITHOUT an `-f` counterpart. A ONE-SIDED BSD-first `stat -f %m`
-# matches no rule at all (`:1417` blesses the two-sided chain), so the gate
+# matches no rule at all (`:1425` blesses the two-sided chain), so the gate
 # returns "✅ no NEW cross-platform traps" on the broken code. Measured:
 #
 #   $ git show origin/main:scripts/monitor-worker.sh > /tmp/pitfall/scripts/monitor-worker.sh
@@ -109,7 +109,7 @@ executed_view() {
 echo
 echo "── executed-view pins (the rationale MAY name the trap; executed code may not) ──"
 # ⛔ WHAT IS PINNED IS THE SHAPE OF THE `||` CHAIN, NOT THE SPELLING `date -r`. Only a GNU-FIRST
-# two-sided chain is portable: `stat -c %Y … || stat -f %m …` (`scripts/check-portability-traps.sh:1417`,
+# two-sided chain is portable: `stat -c %Y … || stat -f %m …` (`scripts/check-portability-traps.sh:1425`,
 # already shipped at `orchestrator-harness/auto-rail.sh:341`).
 #
 # The #3434 defect is precise, and it is NOT "any BSD-first spelling": it is `stat -f %m` and its
