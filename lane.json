@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-14287-1795379167-p1286063-ecd7ddf4",
+  "_sha": "0626bddaef56518c0693a84601db4b2a2a7afbb1",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795397552,
+  "host": "cmux",
+  "issue": 14287,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-14287-1795379167-p1286063-ecd7ddf4",
+  "lease_until": 1795434152,
+  "pid": 1286063,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795379167,
+  "state": "RUNNING",
+  "tag": "14287",
+  "worktree": "/home/cmux/tortoise"
+}
