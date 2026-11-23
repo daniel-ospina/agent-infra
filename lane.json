@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-14362-1795429413-p2273616-cd954a14",
+  "_sha": "efd3f5109922c8bca54a191b2bf9d44b49babed5",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-14362.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14357-fallback-thinking"
+    },
+    {
+      "kind": "sha",
+      "value": "bbba164a7fb1d93eaedf10d3d4b6e81d566412ba"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-14362"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7319,
+  "ended_at": 1795436732,
+  "exit_code": 137,
+  "heartbeat_at": 1795436732,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-14362-1795429413-p2273616-cd954a14",
+  "lease_until": 1795444532,
+  "pid": 2273616,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795429413,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-14362",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-14362"
+}
