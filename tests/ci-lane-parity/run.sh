@@ -2530,8 +2530,13 @@ else
   # (b) THE DECLARED BUDGET IS ONE, and it is the SENTINEL's. A second declared call — appended after
   # the sentinel, which is the only shape that gets past the tally arm — must trip the budget and NAME
   # it, so a second sentinel cannot be added without raising `past_list_budget` deliberately.
-  cp "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-pastbudget.sh"
-  printf '%s\n' 'shard_past_list=1' "run_shard \"$CHEAP\"" 'shard_past_list=0' >>"$FIX/scripts/runner-pastbudget.sh"
+  # ⛔ INSERTED BEFORE THE TERMINAL EXIT, NOT APPENDED AT EOF (#4210). The runner now ends with
+  # `shard_exit 0` on the success path, so rows appended at EOF never execute — this arm went from
+  # passing to rc 0 (measured: 1 of 192 red) the moment that line landed. The mutation targets the
+  # terminal exit itself, which is the SHAPE the defect has: a call after the derived loop.
+  awk -v ins="shard_past_list=1\nrun_shard \"$CHEAP\"\nshard_past_list=0\n" \
+    '/^shard_exit 0$/ { printf "%s", ins } { print }' \
+    "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-pastbudget.sh"
   $FIXTURE_BOUND bash "$FIX/scripts/runner-pastbudget.sh" >"$TMP/runner-pastbudget.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-pastbudget.out")"

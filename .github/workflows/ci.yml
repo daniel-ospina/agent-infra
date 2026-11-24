@@ -1874,9 +1874,10 @@ jobs:
       # it died.
       fail-fast: false
       matrix:
-        # Slices, not shards. Width = the number of entries here; the per-slice sizes are DERIVED by
-        # the runner's own round-robin (`pos % n`) over whatever the list holds today, not asserted
-        # here — they shift when a `run_shard` line is added, and the runner re-derives them, so
+        # Slices, not shards. Width = the number of entries here; the per-slice MEMBERSHIP is DERIVED
+        # by the runner's own cost-aware assignment (bin-packed over `scripts/bash-shard-costs.tsv`
+        # since #4210; `pos % n` before that) over whatever the list holds today, not asserted here —
+        # it shifts when a suite is added or its measured cost moves, and the runner re-derives it, so
         # nothing in this file goes stale. The runner refuses a count wider than its own list.
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:

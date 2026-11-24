@@ -122,6 +122,8 @@ if [ "${1:-}" = "--hermetic-probe" ]; then
   printf 'HERMETIC-PROBE SHARD_BOUND=%s\n' "${SHARD_BOUND-<unset>}"
   printf 'HERMETIC-PROBE BASH_SHARDS_BUDGET_SECS=%s\n' "${BASH_SHARDS_BUDGET_SECS-<unset>}"
   printf 'HERMETIC-PROBE BASH_SHARD_SLICE=%s\n' "${BASH_SHARD_SLICE-<unset>}"
+  printf 'HERMETIC-PROBE SHARD_COSTS=%s\n' "${SHARD_COSTS-<unset>}"
+  printf 'HERMETIC-PROBE BASH_SHARD_STEP_BUDGET_SECS=%s\n' "${BASH_SHARD_STEP_BUDGET_SECS-<unset>}"
   exit 0
 fi
 
@@ -189,13 +191,16 @@ stage_fixture() {
 # So the pin belongs here, with the pollution INJECTED BY THE SUITE, not by whatever shell runs it.
 echo "0. THE SUITE IS HERMETIC: AN INHERITED BOUND, BUDGET OR SLICE CANNOT REACH A FIXTURE (#3220)"
 PROBE_OUT="$TMP/hermetic-probe.out"
-SHARD_BOUND=5 BASH_SHARDS_BUDGET_SECS=7800 BASH_SHARD_SLICE=1/3 bash "$SELF" --hermetic-probe >"$PROBE_OUT" 2>&1
+SHARD_BOUND=5 BASH_SHARDS_BUDGET_SECS=7800 BASH_SHARD_SLICE=1/3 SHARD_COSTS=/tmp/should-not-survive.tsv \
+  BASH_SHARD_STEP_BUDGET_SECS=2400 bash "$SELF" --hermetic-probe >"$PROBE_OUT" 2>&1
 PROBE_RC=$?
 if [ "$PROBE_RC" -eq 0 ] \
   && grep -qx 'HERMETIC-PROBE SHARD_BOUND=<unset>' "$PROBE_OUT" \
   && grep -qx 'HERMETIC-PROBE BASH_SHARDS_BUDGET_SECS=<unset>' "$PROBE_OUT" \
-  && grep -qx 'HERMETIC-PROBE BASH_SHARD_SLICE=<unset>' "$PROBE_OUT"; then
-  pass "a re-exec carrying all three runner variables (SHARD_BOUND=5, BUDGET_SECS=7800, SLICE=1/3) sees NONE of them — no fixture can inherit a bound, a budget or a slice"
+  && grep -qx 'HERMETIC-PROBE BASH_SHARD_SLICE=<unset>' "$PROBE_OUT" \
+  && grep -qx 'HERMETIC-PROBE SHARD_COSTS=<unset>' "$PROBE_OUT" \
+  && grep -qx 'HERMETIC-PROBE BASH_SHARD_STEP_BUDGET_SECS=<unset>' "$PROBE_OUT"; then
+  pass "a re-exec carrying ALL FIVE runner variables (SHARD_BOUND, BUDGET_SECS, SLICE, SHARD_COSTS, STEP_BUDGET_SECS) sees NONE of them — no fixture can inherit a bound, a budget, a slice, a cost table or a step budget"
 else
   fail "the suite is NOT hermetic (rc $PROBE_RC) — an inherited runner variable survives into the fixtures: $(tr '\n' '|' <"$PROBE_OUT" | head -c 300)"
 fi
@@ -1626,7 +1631,11 @@ else
 fi
 # The figure carries the per-shard dead time the runner adds to the model (+1 s/shard), so the
 # assertion pins the SHAPE and the bound rather than a literal that a documented model change moves.
-if grep -qE '🧮 slice 1/3: cost-aware assignment of 9 shard\(s\) — this arm models 90[0-9]s .*worst arm 90[0-9]s of the 2400s step bound' "$TMP/cost-yes-1.out"; then
+# ⛔ EXACT FIGURES, AND THE DISCLOSURE PINNED LITERALLY (review cycle 2, P3). `90[0-9]` matched 900 —
+# i.e. a model that DROPS the per-shard dead time — and the `.*` swallowed the disclosure text, so
+# deleting it left this arm green. The fixture's heavy shard is 900 s and its arm holds ONE shard, so
+# the model must read 901 (900 + 1 s dead time).
+if grep -qF '🧮 slice 1/3: cost-aware assignment of 9 shard(s) — this arm models 901s (~1 s/shard dead time, measured 1.16 s; syntax sweep excluded), worst arm 901s of the 2400s step bound (37%)' "$TMP/cost-yes-1.out"; then
   pass "the run reports its modelled load AND the declared step bound, so capacity is readable without bisecting a log"
 else
   fail "no modelled-load line against the declared bound: $(grep '🧮' "$TMP/cost-yes-1.out" | tr '\n' ' ')"
@@ -1637,7 +1646,7 @@ printf '5000\ttests/c1/run.sh\n' >"$TMP/over.tsv"
 for i in 2 3 4 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i" >>"$TMP/over.tsv"; done
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$TMP/over.tsv" \
   BASH_SHARD_SLICE=1/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-over.out" 2>&1 || true
-if grep -qE 'CAPACITY: the modelled worst arm is 500[0-9]s against a 2400s step bound' "$TMP/cost-over.out"; then
+if grep -qF 'CAPACITY: the modelled worst arm is 5001s against a 2400s step bound' "$TMP/cost-over.out"; then
   pass "a modelled arm OVER the step bound is named as a CAPACITY problem (the growth risk, said where a reader sees it)"
 else
   fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
@@ -1670,6 +1679,20 @@ else
   else
     fail "a broken deal was not caught on the set (rc $PIN_RC): $(tail -2 "$TMP/cost-pin0.out" | tr '\n' '|')"
   fi
+fi
+
+# ── N7b. "ABSENT" AND "UNPARSABLE" MUST NOT READ THE SAME (#4210 review, P3) ────────────────────
+# A table that EXISTS but yields no numeric row is a format problem, not a missing path, and the two
+# point an operator at different actions. The fixture is the same 9-shard tree, so the only difference
+# from N1 is the file's presence.
+printf '# only comments and junk\nnot-a-number\ttests/c1/run.sh\n' >"$TMP/empty-table.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/empty-table.tsv" BASH_SHARD_SLICE=1/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-empty.out" 2>&1
+if grep -qF "present but declares NO numeric cost row" "$TMP/cost-empty.out" \
+   && ! grep -qF "NO measured costs ($TMP/empty-table.tsv: absent)" "$TMP/cost-empty.out"; then
+  pass "a present-but-unparsable table is reported as a FORMAT problem, not as an absent path"
+else
+  fail "an unparsable table was reported as absent (or not at all): $(grep '🧮' "$TMP/cost-empty.out" | tr '\n' ' ')"
 fi
 
 # ── N8. A HOLE IN THE MAP IS A REFUSAL, NOT A SILENT SKIP (#4210 review, P2) ────────────────────

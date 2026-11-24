@@ -158,10 +158,11 @@
 #
 #   ⛔ THE DEAL IS COST-AWARE SINCE #4210, NOT ROUND-ROBIN — see COST-AWARE SLICE ASSIGNMENT below.
 #   The width still does not matter to this file (any `<i>/<n>` it is handed), but the MEMBERSHIP of a
-#   slice is now a bin-packing result over measured costs rather than `pos % n`. Two lanes at the same
-#   width therefore still describe the same arm (`admin-merge.sh`'s arm-k counterpart, which reads the
-#   list and the rule, not a second table), and a lane at a DIFFERENT width is as disjoint as it always
-#   was.
+#   slice is now a bin-packing result over measured costs rather than `pos % n`. Two checkouts at the
+#   same width describe the same arm ONLY while they read the SAME cost table — `admin-merge.sh`'s arm-k
+#   counterpart is therefore a candidate that is EXACT when (list, table, width) match and NAME-ONLY
+#   when the table differs, which is the transient case of a PR that edits the table (including the one
+#   that introduced it). A lane at a DIFFERENT width is as disjoint as it always was.
 
 set -uo pipefail
 
@@ -178,7 +179,7 @@ set -uo pipefail
 # ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the three
 # temp files in $TMPDIR. They are three small empty files and such a run has no recap to corrupt;
 # the alternative was corrupting the bookkeeping of runs that DID finish.
-shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}" "${slice_assign_log:-}" "${slice_assign_list:-}"; }
+shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}" "${slice_assign_log:-}" "${slice_assign_list:-}" "${assign_err:-}"; }
 shard_exit() { shard_cleanup; exit "${1:-0}"; }
 
 # ── the checkout this script BELONGS to ───────────────────────────────────────────────────────
@@ -501,6 +502,7 @@ fi
 
 slice_assign_ready=0
 slice_assign=()
+assign_err=""
 slice_assign_log=""
 slice_assign_list=""
 slice_costs_known=0
@@ -513,6 +515,9 @@ slice_load_worst=0
 # runs everything by definition and needs no map.
 build_slice_assignment() {
   [ "$slice_count" -gt 1 ] || return 0
+  # ⛔ `assign_err` IS DELIBERATELY NOT `local`: `shard_cleanup` (called from `shard_exit`, i.e. outside
+  # this function) is what deletes it, and a `local` is invisible there — measured: the `.err` file
+  # survived every GREEN sliced run while the cleanup list looked correct.
   local listf costs out assign_line
   listf="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-assign.$$")"
   slice_assign_list="$listf"
@@ -640,7 +645,7 @@ EOF
   # and a reader who can see the number is the only thing that catches the list outgrowing its bound
   # BEFORE the step bound kills three arms again.
   if [ "$slice_costs_known" -gt 0 ]; then
-    printf '🧮 slice %s/%s: cost-aware assignment of %s shard(s) — this arm models %ss (+1s/shard dead time, syntax sweep excluded), worst arm %ss' \
+    printf '🧮 slice %s/%s: cost-aware assignment of %s shard(s) — this arm models %ss (~1 s/shard dead time, measured 1.16 s; syntax sweep excluded), worst arm %ss' \
       "$((slice_index + 1))" "$slice_count" "$listed" "$slice_load_this" "$slice_load_worst"
   else
     if [ -f "$shard_costs_file" ]; then
@@ -667,8 +672,11 @@ EOF
   return 0
 }
 
-build_slice_assignment
-
+# ⛔ THE CALL IS *NOT* HERE (review cycle 2, P2/P3). It sits after every validation and after the
+# ran/skip/timeout logs exist, because this function ALLOCATES THREE TEMP FILES: called here, a bad
+# `SHARD_BOUND` (validated further down) refused with a bare `exit 2` and leaked them, and the
+# "refusals run before any work" contract at the top of the cleanup block became untrue.
+#
 # slice_skips <0-based position> — 0 (true) = this slice does NOT run it, 1 (false) = it does.
 # Slicing applies ONLY to list lines (`pos < listed`): the sentinels below sit past the list on
 # purpose, so the vacuity arms ALWAYS execute — a slice must never be able to leave "can a failing
@@ -691,7 +699,7 @@ case "$shard_bound_raw" in
   off|OFF|Off|disabled|DISABLED|none|NONE) shard_bound=0 ;;
   *[!0-9]*)
     echo "❌ SHARD_BOUND='$shard_bound_raw' is not a bound — want a whole number of seconds, or 0/off to disable. Refusing rather than running UNBOUNDED (a typo must not silently remove the bound that #3187 added)." >&2
-    exit 2 ;;
+    shard_exit 2 ;;
   ??????????*)
     # ⛔ WIDTH IS CHECKED BEFORE THE ARITHMETIC, because `$((10#$x))` WRAPS: a 19-digit value becomes
     # NEGATIVE (which the `-lt 1` test below would read as "disabled" — the exact fail-open this
@@ -699,7 +707,7 @@ case "$shard_bound_raw" in
     # instantly and kills EVERY shard at t≈0). Ten digits is ~317 years, far past any real bound, and
     # it is the same 9-digit-scale guard the repo's reapers apply to a numeric seam (`docs/ops/disk-reaper.md`).
     echo "❌ SHARD_BOUND='$shard_bound_raw' is TOO LARGE — at most 9 digits (a longer value wraps in shell arithmetic, and a wrapped bound is either NEGATIVE or rejected by sleep). Refusing." >&2
-    exit 2 ;;
+    shard_exit 2 ;;
   *) shard_bound=$((10#$shard_bound_raw)) ;;
 esac
 if [ "$shard_bound" -lt 1 ]; then
@@ -1622,6 +1630,9 @@ if [ "${#shard_array[@]}" -ne "$listed" ]; then
   echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
   shard_exit 1
 fi
+# The ONE assignment (see the note where it is defined): built after every validation, and after the
+# ran/skip/timeout logs exist, so each of its refusals goes through `shard_exit` and cleans up.
+build_slice_assignment
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
   shard_budget_trip "$shard"
   run_shard "$shard"
