@@ -614,8 +614,10 @@ jobs:
         # #4210). The list is 212 suites / 15,257 s at 1d048d372 (run 45284947925); the 152 suites /
         # 6189 s this comment used to carry was two lists behind. ⛔ THE DEAL IS NO LONGER `pos % n`:
         # cost-blind round-robin summed the same rows to a 3374 s worst arm (140% of this bound), and
-        # the runner now bin-packs by measured cost, giving **1946 s — 81% of 2400 s** including the
-        # measured 1.16 s/shard watchdog. 2400 s stays 2.8x the slowest single suite
+        # the runner now bin-packs by measured cost, giving **1946 s — 81% of 2400 s** on its own
+        # model constant of 1 s/shard dead time (the MEASURED dead time is 1.16 s/shard, which would
+        # make the same arm 1950 s — 81% either way). 2400 s stays 1.9x that model and 2.8x the
+        # slowest single suite
         # (`tests/atomic-land/run.sh`, 1294 s at that head) and well inside the 360 min platform step
         # maximum. The runner prints that figure on every run, so this comment cannot silently rot
         # again without the log disagreeing with it.

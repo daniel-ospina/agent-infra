@@ -1840,7 +1840,9 @@ declared_base_equivalent() {
       # `scripts/bash-shard-costs.tsv` from the CHECKOUT, so arm k matches arm k EXACTLY only when
       # (list, cost table, width) agree. When the two sides read DIFFERENT tables — every window where
       # that table is edited, including the PR that introduced it, whose BASE has no table at all — arm
-      # k in the PR and arm k in the base hold DISJOINT suites, and this mapping is NAME-ONLY.
+      # k in the PR and arm k in the base hold DIFFERENT suites — MEASURED on the committed table at
+      # n=8, base round-robin vs PR LPT: 1-3 of ~26 shards shared per arm, never the same set — and
+      # this mapping is NAME-ONLY.
       # ⚠️ THE FAIL-OPEN BOUND ON THAT: `base_owned_check` matches by NAME, so a PR-caused red in arm k
       # can be excluded as base-owned against a base arm that ran different suites. It is bounded by the
       # rail's other requirements (a base red must be MEASURED on the base's own surface), and it is a

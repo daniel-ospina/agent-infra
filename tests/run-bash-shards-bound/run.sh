@@ -1713,6 +1713,20 @@ if grep -q 'NO measured costs' "$TMP/cost-none-1.out"; then
 else
   fail "the cost-free run does not state which deal it used"
 fi
+# ⛔ THE UNMODELLED BRANCH IS PINNED HERE (review cycle 4, P2). The arms above run WITHOUT a budget,
+# so they never reach the branch that decides whether a stepped bound may report a load, and `/UNMODELLED/`
+# existed nowhere but the script — meaning the pre-fix behaviour (`3s of the 2400s step bound (0%)`, a
+# percentage computed from a table that does not exist, with `⚠️ CAPACITY` therefore inert) reverted
+# GREEN. A declared bound with NO cost table must now say it is unmodelled, and must print no
+# percentage at all.
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 BASH_SHARD_SLICE=1/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-none-budget.out" 2>&1 || true
+if grep -qF ' — step bound 2400s, UNMODELLED (no cost table: the split is positional, so no load can be reported)' "$TMP/cost-none-budget.out" \
+   && ! grep -q 'step bound (' "$TMP/cost-none-budget.out"; then
+  pass "a cost-free run with a DECLARED bound reports the bound as UNMODELLED — it prints no percentage it cannot stand behind"
+else
+  fail "a cost-free run with a bound either reported a load or said nothing about the bound: $(grep '🧮' "$TMP/cost-none-budget.out" | tr '\n' ' ')"
+fi
 
 # ── N3/N4. WITH the table: the heavy pair is SPLIT, coverage is still exact ─────────────────────
 for _i in 1 2 3; do

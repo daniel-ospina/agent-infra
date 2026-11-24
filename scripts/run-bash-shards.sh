@@ -177,11 +177,13 @@ set -uo pipefail
 # have nothing to clean up — this wording is a claim about the post-log exits, which is the only
 # place it can be true.
 # ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the temp
-# files in $TMPDIR — SIX since #4210, and two are not empty: the assignment's staged LIST and its
-# 212-row MAP (plus the awk stderr capture). `.expected`/`.expected.ran`/`.all`/`.acct` can also be left
-# by a kill inside the coverage check; that window removes them inline. None is reused by any later run
-# and a killed run has no recap to corrupt — the alternative was corrupting the bookkeeping of runs
-# that DID finish.
+# files in $TMPDIR — SIX since #4210, and FOUR of them hold content after any sliced run: the ran log
+# (one line per executed shard), the skip log (`.skipped`, one line per skipped shard, carrying the
+# reason), and the assignment's staged LIST and its 212-row MAP. The other two — the timeout marker and
+# the awk stderr capture — are empty unless the bound fired or awk complained. `.expected`/
+# `.expected.ran`/`.all`/`.acct` can also be left by a kill inside the coverage check; that window
+# removes them inline. None is reused by any later run and a killed run has no recap to corrupt — the
+# alternative was corrupting the bookkeeping of runs that DID finish.
 shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}" "${slice_assign_log:-}" "${slice_assign_list:-}" "${assign_err:-}"; }
 shard_exit() { shard_cleanup; exit "${1:-0}"; }
 
@@ -471,9 +473,10 @@ fi
 # the aliasing follows the cost ordering, not the width. Only BIN-PACKING fixes the shape.
 #
 # So positions are dealt by LPT (longest processing time first): heaviest shard to the currently
-# lightest slice, ties by list position. On the same rows that is a **1946 s worst arm** (dead time
-# included; the floor is total/n plus that overhead) — 19% under the bound — with NO suite dropped, NO
-# extra runner and no edit to any suite. ⛔ THESE NUMBERS ARE A PROPERTY OF THE COMMITTED TABLE, so they
+# lightest slice, ties by list position. **From the COMMITTED TABLE** (`scripts/bash-shard-costs.tsv`,
+# which sums to 15,354 s — not the 15,257 s above, which is the round-robin run's own total) that is a
+# **1946 s worst arm** including dead time — 19% under the bound — with NO suite dropped, NO extra
+# runner and no edit to any suite. ⛔ THESE NUMBERS ARE A PROPERTY OF THE COMMITTED TABLE, so they
 # move when it does: the run prints its own figure, and that printout is the authority, not this
 # comment.
 #

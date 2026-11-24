@@ -1852,18 +1852,21 @@ jobs:
     # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
     # remaining shards 26m25s).
     #
-    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
-    # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
-    # the log cannot see it), so NO width goes below 33 min and the step bound cannot either.
-    # ⛔ AND THE "worst slice ≈ 33 min + its 9 siblings ≈ 37 min" FIGURE IS RETIRED (#4210): it
-    # described contiguous/round-robin siblings and an arm of ~10 shards. The deal is now cost-aware
-    # (`scripts/bash-shard-costs.tsv`), an arm holds ~26 shards, and the measured model is **1946 s =
-    # 32.4 min** — only just above the floor, because the packing puts `atomic-land` on an arm whose
-    # other shards are among the cheapest. The shard step's own bound below is 70 min ≈ 2.2x that
-    # model: enough for runner variance, and it still fails fast against the unbounded 1h52m this job
-    # shipped with. The run prints its own figure (`🧮 …`), so this comment and the log agree.
-    # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
-    # of shard work) and nothing can make it shorter.
+    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is the
+    # slowest at **1294 s = 21.6 min** on its own (66 serial mutation re-runs, each <81 s — which is
+    # why a gap analysis over the log cannot see it), so NO width goes below 21.6 min and the step
+    # bound cannot either. ⛔ THE "~33 min ON ITS OWN / worst slice ≈ 33 min + 9 siblings ≈ 37 min"
+    # FIGURES ARE RETIRED (#4210): 33 min was the pre-#2483 profile, and the "9 siblings" described
+    # contiguous/round-robin neighbours. The deal is now cost-aware (`scripts/bash-shard-costs.tsv`,
+    # whose heaviest row is `atomic-land` at 1294 s), an arm holds ~26 shards, and the modelled worst
+    # arm is **1946 s = 32.4 min** — 652 s above the shard FLOOR, because the packing puts
+    # `atomic-land` on an arm whose other shards are among the cheapest, and most of that arm's load
+    # is the ~26 shards' own work rather than any single one. The shard step's own bound below is
+    # 70 min ≈ 2.2x that model: enough for runner variance, and it still fails fast against the
+    # unbounded 1h52m this job shipped with. The run prints its own figure (`🧮 …`), so this comment
+    # and the log agree.
+    # Splitting the two heaviest remains #2483's job; it is worth ~11 min of the 21.6 min floor, where
+    # slicing already took the wall from 73.6 min to ~32.4 min of shard work.
     #
     # ⛔ THIS JOB BOUND IS A PURE BACKSTOP, AND THE INVARIANT IS ARITHMETIC: it sits ABOVE the sum
     # of its steps' bounds, so it can never fire before the step that is actually running trips its
