@@ -2947,7 +2947,12 @@ else
 fi
 # NON-VACUITY: every slice running slice-1's set keeps the COUNT right (9 % 3 == 0 ⇒ 3 each) and
 # must still fail — on the SET, not on the number.
-awk '{ if ($0 ~ /-eq "\$slice_index" \] && return 1/) { sub(/-eq "\$slice_index"/, "-eq 0"); print; next } print }' \
+# ⛔ THE MUTATION TARGETS THE DEAL, WHATEVER SPELLS IT (#4210). It was `[ $((slice_pos % n)) -eq
+# "$slice_index" ] && return 1`; the deal is now a bin-packed ASSIGNMENT MAP keyed by position, and its
+# skip line is `[ "$slice_have" = "$slice_index" ] && return 1`. Both shapes are mutated so this control
+# cannot go vacuous when the mechanism changes again — a mutation that matches nothing leaves the runner
+# unchanged, and the `cmp` below reports exactly that rather than passing over it.
+awk '{ if ($0 ~ /\[ "\$slice_have" = "\$slice_index" \] && return 1/) { sub(/= "\$slice_index"/, "= 0"); print; next } if ($0 ~ /-eq "\$slice_index" \] && return 1/) { sub(/-eq "\$slice_index"/, "-eq 0"); print; next } print }' \
   "$RUNNER" >"$PROBE2/scripts/runner-badmod.sh"
 if cmp -s "$RUNNER" "$PROBE2/scripts/runner-badmod.sh"; then
   fail "the broken-modulus mutation did not change the runner"

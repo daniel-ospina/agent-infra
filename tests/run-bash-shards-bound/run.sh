@@ -1534,6 +1534,139 @@ else
 fi
 
 echo ""
+echo "N. THE SLICE DEAL IS COST-AWARE, AND WITHOUT COSTS IT IS THE OLD ROUND-ROBIN (#4210)"
+# ⛔ THE DEFECT THIS PINS, measured on head 1d048d372: `pos % n` is COST-BLIND, so the heavy suites
+# cluster by luck. Summed from the runner's own `▸` rows, the 8 arms of `script-validate` held 3374 s
+# worst against a 2400 s step bound (140%) and 730 s lightest, and three arms were killed at the bound
+# before printing a recap. The lane could not finish, so main stayed red for four consecutive heads.
+#
+# ⛔ AND IT PINS THE OTHER HALF, WHICH IS THE SAFETY PROPERTY: a tree with no measured cost table (every
+# fixture, every consumer) must keep the OLD membership byte for byte. That is what makes this a safe
+# change to the runner every lane depends on — so it is asserted against the arithmetic itself, not
+# claimed in a comment.
+#   tests/c1 … tests/c9, each `exit 0`
+#   the cost table marks c1 and c4 HEAVY — the pair round-robin deals to the SAME arm (positions 0 and 3
+#   with n=3), which is exactly the clustering the packing has to break.
+stage_cost_fixture() {
+  local root="$1" i
+  mkdir -p "$root/scripts/orchestrator-harness"
+  cp "$HELPER" "$root/scripts/orchestrator-harness/fixture-hermetic.sh"
+  cp "$RUNNER" "$root/scripts/runner.sh"
+  printf '#!/bin/bash\n:\n' >"$root/scripts/sweepable.sh"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    mkdir -p "$root/tests/c$i"
+    printf '#!/bin/bash\nexit 0\n' >"$root/tests/c$i/run.sh"
+    chmod +x "$root/tests/c$i/run.sh"
+  done
+}
+
+CFIX="$TMP/costfixture"
+stage_cost_fixture "$CFIX"
+COST_TABLE="$TMP/costs.tsv"
+{
+  printf '900\ttests/c1/run.sh\n'
+  printf '900\ttests/c4/run.sh\n'
+  for i in 2 3 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i"; done
+} >"$COST_TABLE"
+
+# slice_members <outfile> <slice> <count> — the paths the run executed, one per line, sorted.
+slice_members() {
+  grep -E '^  ▸ +[0-9]+s  ' "$1" | sed -E 's|^  ▸ +[0-9]+s  ||' | LC_ALL=C sort
+}
+
+# ── N1/N2. THE BASELINE: no table, round-robin, and the two heavy shards CLUSTER ────────────────
+for _i in 1 2 3; do
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=$_i/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-none-$_i.out" 2>&1
+done
+NONE_THREE_EACH=1
+for _i in 1 2 3; do
+  [ "$(slice_members "$TMP/cost-none-$_i.out" | grep -c .)" = 3 ] || NONE_THREE_EACH=0
+done
+NONE_UNION="$({ slice_members "$TMP/cost-none-1.out"; slice_members "$TMP/cost-none-2.out"; slice_members "$TMP/cost-none-3.out"; } | LC_ALL=C sort -u | grep -c .)"
+if [ "$NONE_THREE_EACH" -eq 1 ] && [ "$NONE_UNION" = 9 ]; then
+  pass "with NO cost table the deal covers all 9 shards, 3 per arm — the positional round-robin this change had to preserve"
+else
+  fail "the cost-free deal does not cover the list (three-each=$NONE_THREE_EACH, union=$NONE_UNION of 9)"
+fi
+NONE_CLUSTERED=0
+grep -q 'tests/c1/run.sh' "$TMP/cost-none-1.out" && grep -q 'tests/c4/run.sh' "$TMP/cost-none-1.out" && NONE_CLUSTERED=1
+if [ "$NONE_CLUSTERED" -eq 1 ]; then
+  pass "control: cost-blind round-robin puts BOTH heavy shards (c1, c4) on arm 1 — the clustering the packing exists to break"
+else
+  fail "the control did not cluster c1+c4 on one arm, so the packing arm below proves nothing: $(slice_members "$TMP/cost-none-1.out" | tr '\n' ' ')"
+fi
+if grep -q 'NO measured costs' "$TMP/cost-none-1.out"; then
+  pass "the cost-free run SAYS it is the positional round-robin (the mode is never left to be inferred)"
+else
+  fail "the cost-free run does not state which deal it used"
+fi
+
+# ── N3/N4. WITH the table: the heavy pair is SPLIT, coverage is still exact ─────────────────────
+for _i in 1 2 3; do
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$COST_TABLE" \
+    BASH_SHARD_SLICE=$_i/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-yes-$_i.out" 2>&1 || true
+done
+ARM_OF_C1="$(grep -l 'tests/c1/run.sh' "$TMP/cost-yes-1.out" "$TMP/cost-yes-2.out" "$TMP/cost-yes-3.out" 2>/dev/null | sed 's|.*cost-yes-||; s|\.out||')"
+ARM_OF_C4="$(grep -l 'tests/c4/run.sh' "$TMP/cost-yes-1.out" "$TMP/cost-yes-2.out" "$TMP/cost-yes-3.out" 2>/dev/null | sed 's|.*cost-yes-||; s|\.out||')"
+if [ -n "$ARM_OF_C1" ] && [ -n "$ARM_OF_C4" ] && [ "$ARM_OF_C1" != "$ARM_OF_C4" ]; then
+  pass "with measured costs the two heavy shards land on DIFFERENT arms (c1 → arm $ARM_OF_C1, c4 → arm $ARM_OF_C4)"
+else
+  fail "the heavy pair was not split (c1 → '${ARM_OF_C1}', c4 → '${ARM_OF_C4}')"
+fi
+YES_UNION="$({ slice_members "$TMP/cost-yes-1.out"; slice_members "$TMP/cost-yes-2.out"; slice_members "$TMP/cost-yes-3.out"; } | LC_ALL=C sort -u | grep -c .)"
+YES_TOTAL="$({ slice_members "$TMP/cost-yes-1.out"; slice_members "$TMP/cost-yes-2.out"; slice_members "$TMP/cost-yes-3.out"; } | grep -c .)"
+if [ "$YES_UNION" = 9 ] && [ "$YES_TOTAL" = 9 ]; then
+  pass "the packed deal still covers all 9 shards EXACTLY once (no shard dropped, none run twice)"
+else
+  fail "the packed deal changed coverage (union=$YES_UNION, executed=$YES_TOTAL, want 9/9)"
+fi
+if grep -qE '🧮 slice 1/3: cost-aware assignment of 9 shard\(s\) — this arm models 900s, worst arm 900s of the 2400s step bound' "$TMP/cost-yes-1.out"; then
+  pass "the run reports its modelled load AND the declared step bound, so capacity is readable without bisecting a log"
+else
+  fail "no modelled-load line against the declared bound: $(grep '🧮' "$TMP/cost-yes-1.out" | tr '\n' ' ')"
+fi
+
+# ── N5. AN OVER-BUDGET TABLE IS NAMED, NOT SILENT ──────────────────────────────────────────────
+printf '5000\ttests/c1/run.sh\n' >"$TMP/over.tsv"
+for i in 2 3 4 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i" >>"$TMP/over.tsv"; done
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$TMP/over.tsv" \
+  BASH_SHARD_SLICE=1/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-over.out" 2>&1 || true
+if grep -q 'CAPACITY: the modelled worst arm is 5000s against a 2400s step bound' "$TMP/cost-over.out"; then
+  pass "a modelled arm OVER the step bound is named as a CAPACITY problem (the growth risk, said where a reader sees it)"
+else
+  fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
+fi
+
+# ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
+printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-junk.out" 2>&1
+JUNK_RC=$?
+if [ "$JUNK_RC" -eq 0 ] && [ "$(slice_members "$TMP/cost-junk.out" | grep -c .)" = 3 ]; then
+  pass "a malformed cost table (non-numeric seconds, blank rows, a bare number) is tolerated: rc 0, the arm still runs its 3 shards"
+else
+  fail "a malformed cost table changed the run (rc $JUNK_RC, shards=$(slice_members "$TMP/cost-junk.out" | grep -c .)): $(tail -3 "$TMP/cost-junk.out" | tr '\n' '|')"
+fi
+
+# ── N7. THE COVERAGE IDENTITY CHECK STILL SEES A BROKEN DEAL (non-vacuity of the new map) ───────
+# The map is now a FILE, so the mutation is the one line `slice_skips` consults: pin every position to
+# arm 0. That keeps the COUNT right on a slice whose share happens to be 0 — the set assertion is what
+# must fire, and it is the whole reason the check compares identities rather than counts.
+awk '{ if ($0 ~ /\[ "\$slice_have" = "\$slice_index" \] && return 1/) { sub(/= "\$slice_index"/, "= 0"); print; next } print }' \
+  "$RUNNER" >"$CFIX/scripts/runner-pin0.sh"
+if cmp -s "$RUNNER" "$CFIX/scripts/runner-pin0.sh"; then
+  fail "the pin-to-arm-0 mutation did not change the runner — the identity-check arm below would be vacuous"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=2/3 bash "$CFIX/scripts/runner-pin0.sh" >"$TMP/cost-pin0.out" 2>&1
+  PIN_RC=$?
+  if [ "$PIN_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' "$TMP/cost-pin0.out"; then
+    pass "control: a deal that pins every position to arm 0 is caught by the SET assertion (rc 1), not reported green"
+  else
+    fail "a broken deal was not caught on the set (rc $PIN_RC): $(tail -2 "$TMP/cost-pin0.out" | tr '\n' '|')"
+  fi
+fi
+
+echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ run-bash-shards-bound suite passed (${checks} assertions)"
   exit 0

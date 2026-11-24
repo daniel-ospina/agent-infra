@@ -1830,8 +1830,9 @@ declared_base_equivalent() {
       # ⛔ ARM-KEYED SINCE #3174: main's `script-validate` is a MATRIX (`shard: [1..8]`), so it
       # publishes `script-validate (1)` … `(8)` and NO check named `script-validate` exists any more
       # — returning the bare name would be the FALSE ABSENCE this whole block exists to abolish.
-      # Both lanes run the SAME derived list under the SAME round-robin rule, so arm k is a
-      # candidate counterpart for arm k, which is strictly MORE precise than the whole-job name it
+      # Both lanes run the SAME derived list under the SAME deal (the cost-aware assignment of
+      # `scripts/run-bash-shards.sh`, #4210; round-robin `pos % n` before it), so at equal widths arm k
+      # is a candidate counterpart for arm k, which is strictly MORE precise than the whole-job name it
       # replaces (it is still a candidate, never an identity — an arm red can be its own slice's or
       # its setup steps').
       #
