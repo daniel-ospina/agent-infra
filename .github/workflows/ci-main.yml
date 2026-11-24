@@ -520,12 +520,17 @@ jobs:
     # ⛔ AND THE LIST HAS GROWN AGAIN SINCE THAT COMMENT, so its figures are superseded here rather
     # than left to rot. MEASURED 2026-11-01 from this job's OWN per-suite rows (`▸ <secs> <path>`,
     # run 41338741722 at 951e4c821): **152 suites, 6189 s = 103.2 min** of shard work, job wall
-    # 103.8 min — i.e. ~39 s of non-shard steps, so the duration WAS the shard work. Round-robin
-    # (`pos % n`) slice sums: 2415 s worst at n=4, **1478 s worst at n=8** (+ the runner's measured
-    # 1.16 s/shard watchdog ≈ 1500 s ⇒ ~25-26 min per arm against 103.2 min serial), 1261 s at
-    # n=12. The FLOOR is the single slowest suite (`tests/atomic-land/run.sh`, 852 s = 14.2 min),
-    # so no width goes below it — that is #2483, not this change. 8 matches the PR lane and the
-    # same list; 12 buys ~4 min of wall for 4 more runners on the shared pool.
+    # 103.8 min — i.e. ~39 s of non-shard steps, so the duration WAS the shard work.
+    # ⛔ THE ROUND-ROBIN FIGURES BELOW ARE A PRE-#4210 MEASUREMENT OF THE DEAL THIS CHANGE REMOVED, kept
+    # only to explain how 8 was chosen. Do NOT size anything from them today: the deal is now cost-aware,
+    # and the CURRENT numbers are in the `⛔ THE BOUND IS SIZED FROM A MEASURED ARM` block below (212
+    # suites / 15,257 s, cost-blind worst 3374 s raw, cost-aware worst 1946 s = 81% of 2400 s).
+    # As measured on 2026-11-01 under round-robin (`pos % n`): 2415 s worst at n=4, **1478 s worst at
+    # n=8** (+ the runner's measured 1.16 s/shard watchdog ≈ 1500 s ⇒ ~25-26 min per arm against
+    # 103.2 min serial), 1261 s at n=12. The FLOOR is the single slowest suite
+    # (`tests/atomic-land/run.sh`, 852 s then), so no width goes below it — that is #2483, not this
+    # change. 8 matches the PR lane and the same list; 12 buys ~4 min of wall for 4 more runners on the
+    # shared pool.
     #
     # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
     # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized

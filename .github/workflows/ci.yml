@@ -1854,10 +1854,14 @@ jobs:
     #
     # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
     # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
-    # the log cannot see it), so with 8 round-robin slices the worst slice is ≈ 33 min + its 9
-    # siblings ≈ 37 min, and no wider matrix goes below 33. The shard step's own bound below is 70
-    # min = ~1.9x that slice: enough for runner variance, and it still fails fast against the
-    # unbounded 1h52m this job shipped with.
+    # the log cannot see it), so NO width goes below 33 min and the step bound cannot either.
+    # ⛔ AND THE "worst slice ≈ 33 min + its 9 siblings ≈ 37 min" FIGURE IS RETIRED (#4210): it
+    # described contiguous/round-robin siblings and an arm of ~10 shards. The deal is now cost-aware
+    # (`scripts/bash-shard-costs.tsv`), an arm holds ~26 shards, and the measured model is **1946 s =
+    # 32.4 min** — only just above the floor, because the packing puts `atomic-land` on an arm whose
+    # other shards are among the cheapest. The shard step's own bound below is 70 min ≈ 2.2x that
+    # model: enough for runner variance, and it still fails fast against the unbounded 1h52m this job
+    # shipped with. The run prints its own figure (`🧮 …`), so this comment and the log agree.
     # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
     # of shard work) and nothing can make it shorter.
     #
@@ -1901,7 +1905,7 @@ jobs:
         # hand-kept number, and never a list: the list is the runner's).
         env:
           # ⛔ THE RUNNER'S OWN CAPACITY REPORT NEEDS THE BOUND THIS STEP ACTUALLY HAS (#4210). It
-          # prints `🧮 … this arm models Ns, worst arm Ns of the 2400s step bound (N%)`, and says
+          # prints `🧮 … this arm models Ns, worst arm Ns of the 4200s step bound (N%)`, and says
           # ⚠️ CAPACITY when the worst modelled arm no longer fits — which is how the list outgrowing
           # the matrix becomes visible in a run instead of arriving as a 40-minute kill with no recap.
           # MUST EQUAL this step's `timeout-minutes * 60` BELOW — and the two lanes differ on purpose,

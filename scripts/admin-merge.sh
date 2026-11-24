@@ -1836,6 +1836,18 @@ declared_base_equivalent() {
       # replaces (it is still a candidate, never an identity — an arm red can be its own slice's or
       # its setup steps').
       #
+      # ⛔ EQUAL WIDTH IS NOT ENOUGH SINCE #4210, AND THIS IS WHERE THAT MATTERS. The deal reads
+      # `scripts/bash-shard-costs.tsv` from the CHECKOUT, so arm k matches arm k EXACTLY only when
+      # (list, cost table, width) agree. When the two sides read DIFFERENT tables — every window where
+      # that table is edited, including the PR that introduced it, whose BASE has no table at all — arm
+      # k in the PR and arm k in the base hold DISJOINT suites, and this mapping is NAME-ONLY.
+      # ⚠️ THE FAIL-OPEN BOUND ON THAT: `base_owned_check` matches by NAME, so a PR-caused red in arm k
+      # can be excluded as base-owned against a base arm that ran different suites. It is bounded by the
+      # rail's other requirements (a base red must be MEASURED on the base's own surface), and it is a
+      # window that closes as soon as both sides carry the same table — but it is stated here rather
+      # than left for a reader of `declared_base_equivalent` to rediscover, and the durable fix is
+      # set-aware attribution (compare the arm's suite set, or key the equivalence on the table blob).
+      #
       # ⚠️ STATED RESIDUAL — BOTH DIRECTIONS OF A WIDTH DIVERGENCE, because they are NOT the same
       # severity (review cycle 2, P2-5).
       #   WIDENING (PR wider than main: a PR arm has no base arm): maps to a name the base does not

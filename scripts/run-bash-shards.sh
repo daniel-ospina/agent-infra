@@ -176,9 +176,12 @@ set -uo pipefail
 # `BASH_SHARD_SLICE`, `BASH_SHARDS_BUDGET_SECS`, the list/derivation refusals) `exit 2` directly and
 # have nothing to clean up — this wording is a claim about the post-log exits, which is the only
 # place it can be true.
-# ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the three
-# temp files in $TMPDIR. They are three small empty files and such a run has no recap to corrupt;
-# the alternative was corrupting the bookkeeping of runs that DID finish.
+# ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the temp
+# files in $TMPDIR — SIX since #4210, and two are not empty: the assignment's staged LIST and its
+# 212-row MAP (plus the awk stderr capture). `.expected`/`.expected.ran`/`.all`/`.acct` can also be left
+# by a kill inside the coverage check; that window removes them inline. None is reused by any later run
+# and a killed run has no recap to corrupt — the alternative was corrupting the bookkeeping of runs
+# that DID finish.
 shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}" "${slice_assign_log:-}" "${slice_assign_list:-}" "${assign_err:-}"; }
 shard_exit() { shard_cleanup; exit "${1:-0}"; }
 
@@ -457,7 +460,8 @@ fi
 # WHAT THE ROUND-ROBIN COST, measured on head 1d048d372 (per-suite `▸` rows of run 45284947925, the
 # 8 arms of `ci-main.yml`'s `script-validate`): 212 suites, 15,257 s of shard work, 2400 s step bound
 # per arm. `pos % n` is COST-BLIND, so the heavy suites cluster by luck: summed per slice those same
-# rows gave a **3374 s worst arm — 40% OVER the bound** — against a 730 s lightest arm, and THREE of
+# rows gave a **3374 s worst arm raw (3401 s with the per-shard dead time) — 40% OVER the bound** —
+# against a 730 s lightest arm, and THREE of
 # the eight arms were killed at the step bound before printing a recap. The lane could not finish, so
 # main stayed red for four consecutive heads (#4210).
 #
@@ -467,9 +471,11 @@ fi
 # the aliasing follows the cost ordering, not the width. Only BIN-PACKING fixes the shape.
 #
 # So positions are dealt by LPT (longest processing time first): heaviest shard to the currently
-# lightest slice, ties by list position. On the same rows that is a **1908 s worst arm** — 1 s from
-# the arithmetic floor (total/n) and 20% under the bound — with NO suite dropped, NO extra runner and
-# no edit to any suite.
+# lightest slice, ties by list position. On the same rows that is a **1946 s worst arm** (dead time
+# included; the floor is total/n plus that overhead) — 19% under the bound — with NO suite dropped, NO
+# extra runner and no edit to any suite. ⛔ THESE NUMBERS ARE A PROPERTY OF THE COMMITTED TABLE, so they
+# move when it does: the run prints its own figure, and that printout is the authority, not this
+# comment.
 #
 # ⛔ WITHOUT A COST TABLE THIS IS EXACTLY THE ROUND-ROBIN IT REPLACES. Equal weights make "lightest
 # slice first" pick 0,1,2,…,n-1 in order, which IS `pos % n` — so every fixture, every consumer with
@@ -656,7 +662,19 @@ EOF
     printf '🧮 slice %s/%s: %s shard(s) — NO measured costs (%s: %s), so this is the POSITIONAL round-robin (pos %% n)' \
       "$((slice_index + 1))" "$slice_count" "$listed" "$shard_costs_file" "$costs_why"
   fi
-  if [ "$shard_step_budget" -gt 0 ]; then
+  # ⛔ THE BOUND REPORT BELONGS TO THE MODELLED BRANCH ONLY (review cycle 3, P2). It used to print for
+  # BOTH, so a cost-free lane reported `%s%%` of the step bound computed from the sum of the WEIGHTS —
+  # which with no table are all ZERO plus 1 s/shard, i.e. `3s of the 2400s step bound (0%)` for a
+  # three-shard arm. `⚠️ CAPACITY` then could never fire in exactly the mode a new consumer starts in,
+  # while both workflows advertise that line as how a list outgrowing its matrix becomes visible. An
+  # unmodelled run says so instead of printing a number it cannot stand behind.
+  if [ "$slice_costs_known" -le 0 ]; then
+    if [ "$shard_step_budget" -gt 0 ]; then
+      printf ' — step bound %ss, UNMODELLED (no cost table: the split is positional, so no load can be reported)\n' "$shard_step_budget"
+    else
+      printf '\n'
+    fi
+  elif [ "$shard_step_budget" -gt 0 ]; then
     printf ' of the %ss step bound (%s%%)\n' "$shard_step_budget" "$((slice_load_this * 100 / shard_step_budget))"
     if [ "$slice_load_worst" -gt "$shard_step_budget" ]; then
       printf '⚠️  CAPACITY: the modelled worst arm is %ss against a %ss step bound — the list has outgrown its matrix. Add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope (#4210).\n' \
