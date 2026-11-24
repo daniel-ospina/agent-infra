@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-14481-1795497455-p320211-6c4ff1c6",
+  "_sha": "4d944ba7d5934722c3784202a9aae7c1a4957d52",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-14481.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/14439-restore-overcut-arms"
+    },
+    {
+      "kind": "sha",
+      "value": "8dd75dac3f995a894714261798ebaa3e220b32fc"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-14481"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 1508,
+  "ended_at": 1795498963,
+  "exit_code": 0,
+  "heartbeat_at": 1795498963,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-14481-1795497455-p320211-6c4ff1c6",
+  "lease_until": 1795506763,
+  "pid": 320211,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795497455,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-14481",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-14481"
+}
