@@ -1764,9 +1764,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
@@ -1827,9 +1836,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
@@ -1946,9 +1964,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue

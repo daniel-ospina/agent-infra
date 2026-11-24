@@ -625,9 +625,17 @@ jobs:
         # (`failure`, never a job-level `cancelled`) and a single hang is still bounded per shard by
         # `SHARD_BOUND` (default 1800 s, #3187). The lost naming is tracked on #3182.
         env:
+          # ⛔ THE RUNNER'S OWN CAPACITY REPORT NEEDS THE BOUND THIS STEP ACTUALLY HAS (#4210). It
+          # prints `🧮 … this arm models Ns, worst arm Ns of the 2400s step bound (N%)`, and says
+          # ⚠️ CAPACITY when the worst modelled arm no longer fits — which is how the list outgrowing
+          # the matrix becomes visible in a run instead of arriving as a 40-minute kill with no recap.
+          # MUST EQUAL this step's `timeout-minutes * 60` below; a stale number only misreports the
+          # percentage (it can never skip, add or red a shard), and both lanes carry the same value so
+          # their reports are comparable.
           # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
           # hand-kept number, and never a list: the list is the runner's).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+          BASH_SHARD_STEP_BUDGET_SECS: 2400
         timeout-minutes: 40
         run: bash scripts/run-bash-shards.sh
 
