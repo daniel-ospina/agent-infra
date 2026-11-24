@@ -1770,6 +1770,185 @@ else
   fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
 fi
 
+# ── N5b. THE GUARD SEES THE CLOCK, NOT ONLY THE MODEL (#4210) ──────────────────────────────────
+# ⛔ THE DEFECT THIS PINS, MEASURED ON 5ea9c70a4 (`script-validate` slice 7, job 138226499842):
+#   its shard phase ran 2356 s of the 2400 s step bound — 98.2 %, 44 s from the kill — and it printed
+#   `worst arm 1945s of the 2400s step bound (81%)` with NO `⚠️ CAPACITY` line. Correct by its own
+#   arithmetic and blind by construction: the guard compared the COST TABLE'S SUM to the bound and
+#   never the CLOCK. The table under-predicted by 411 s, so the warning was silent in exactly the run
+#   that needed it. A model that is optimistic is the case a capacity guard EXISTS for.
+#   Two shards, two slices (so one shard per arm), the shard `sleep 5`, a step bound of 4 s and a table
+#   that models 2 s: the model reads 3s of 4s (75 %, silent) while the arm fully overruns.
+stage_measured_fixture() {
+  local root="$1" secs="$2" failpath="$3"
+  mkdir -p "$root/scripts/orchestrator-harness"
+  cp "$HELPER" "$root/scripts/orchestrator-harness/fixture-hermetic.sh"
+  cp "$RUNNER" "$root/scripts/runner.sh"
+  printf '#!/bin/bash\n:\n' >"$root/scripts/sweepable.sh"
+  local p
+  for p in "${failpath:+"$failpath"}" tests/m1/run.sh tests/m2/run.sh; do
+    [ -n "$p" ] || continue
+    mkdir -p "$root/$(dirname "$p")"
+    if [ "$p" = "$failpath" ]; then
+      printf '#!/bin/bash\nsleep %s\nexit 1\n' "$secs" >"$root/$p"
+    else
+      printf '#!/bin/bash\nsleep %s\nexit 0\n' "$secs" >"$root/$p"
+    fi
+    chmod +x "$root/$p"
+  done
+}
+MFIX="$TMP/measuredfixture"
+stage_measured_fixture "$MFIX" 5 ""
+printf '2\ttests/m2/run.sh\n' >"$TMP/measured.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=4 SHARD_COSTS="$TMP/measured.tsv" \
+  BASH_SHARD_SLICE=1/2 bash "$MFIX/scripts/runner.sh" >"$TMP/measured.out" 2>&1
+MEASURED_RC=$?
+# ⛔ BOTH HALVES ARE ASSERTED: the MEASURED verdict fires on the CLOCK, and the MODEL verdict is silent
+# — asserting only the first would pass on a runner that fired the old model check.
+if [ "$MEASURED_RC" -eq 0 ] \
+   && grep -qE '⚠️  CAPACITY \(MEASURED\): this arm took [0-9]+s, [0-9]+% of the 4s step bound' "$TMP/measured.out" \
+   && grep -qF 'the cost table modelled 3s' "$TMP/measured.out" \
+   && ! grep -qF 'CAPACITY: the modelled worst arm' "$TMP/measured.out"; then
+  pass "an arm that OVERRUNS on the clock is named even while the cost table models it at 75 % of the bound — pre-fix this run printed the model and stayed silent"
+else
+  fail "a clock-overrunning arm was not named (rc $MEASURED_RC): $(grep '🧮\|⏱\|CAPACITY' "$TMP/measured.out" | tr '\n' ' ')"
+fi
+
+# ── N5c. A FAILED ARM STILL REPORTS ITS ACTUAL (#4210) ─────────────────────────────────────
+# ⛔ MEASURED: 0 occurrences of `this slice: Ns of shard work` in the RED `script-validate` jobs, and
+# present in the passing one. The recal was printed only on the SUCCESS path, so the arms that ran
+# longest — the ones at risk of the bound — had no actual number in their log at all. A red recap must
+# report its cost for the same reason it reports the bound that applied: a red whose cost is unknown is
+# a red whose next step (fix a suite, or add matrix arms) cannot be chosen from the log.
+FFIX="$TMP/failrecapfixture"
+stage_measured_fixture "$FFIX" 1 tests/m1/run.sh
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$FFIX/scripts/runner.sh" >"$TMP/failrecap.out" 2>&1
+FAIL_RECAP_RC=$?
+if [ "$FAIL_RECAP_RC" -eq 1 ] \
+   && grep -q 'bash shard(s) failed' "$TMP/failrecap.out" \
+   && grep -qE '^   ⏱  this slice: [0-9]+s of shard work over [0-9]+ shard\(s\)' "$TMP/failrecap.out"; then
+  pass "a RED recap prints its actual shard-phase cost with the same shape as the green one — the log of a failed arm answers 'how long did this cost?' without a timeline reconstruction"
+else
+  fail "a red recap printed no actual cost line (rc $FAIL_RECAP_RC): $(tail -4 "$TMP/failrecap.out" | tr '\n' '|')"
+fi
+
+
+# ── N5d. THE MODEL'S ERROR HAS A SIGN (#4210 review, P2) ────────────────────────────────────
+# ⛔ `shard_time - slice_load_this` is printed as "the MODEL UNDER-PREDICTS by Ns", but the difference
+# is NEGATIVE whenever the model comes in high — and the model adds `overhead = 1` second per shard that
+# `shard_time` excludes, so `slice_load_this ≈ shard_time + shard_ran` on an ACCURATE table. Every arm in
+# [90 %, model) of the bound therefore printed "UNDER-PREDICTS by -Ns": the opposite of the truth, in the
+# band a refreshed table (the issue's item 2) makes common. Here the table models 9s + 1s overhead for a
+# 5s arm, so the honest sentence is an OVER-prediction of 5s.
+OFFIX="$TMP/overpredictfixture"
+stage_measured_fixture "$OFFIX" 5 ""
+printf '9\ttests/m2/run.sh\n' >"$TMP/overpredict.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=4 SHARD_COSTS="$TMP/overpredict.tsv" \
+  BASH_SHARD_SLICE=1/2 bash "$OFFIX/scripts/runner.sh" >"$TMP/overpredict.out" 2>&1
+OVER_RC=$?
+if [ "$OVER_RC" -eq 0 ] \
+   && grep -qF 'the cost table modelled 10s' "$TMP/overpredict.out" \
+   && grep -qF 'the model OVER-predicts by 5s' "$TMP/overpredict.out" \
+   && ! grep -qF 'UNDER-PREDICTS by -' "$TMP/overpredict.out"; then
+  pass "a table that models MORE than the arm took is reported as an OVER-prediction — pre-fix this printed 'UNDER-PREDICTS by -5s', the opposite of the truth"
+else
+  fail "the model-vs-actual SIGN was not reported honestly (rc $OVER_RC): $(grep 'CAPACITY' "$TMP/overpredict.out" | tr '\n' ' ')"
+fi
+
+# ── N5e. "NO COST TABLE" IS A CLAIM ABOUT THE FILE, NOT ABOUT THIS RUN (#4210 review, P3) ──────
+# ⛔ The no-model arm tested `slice_costs_known`, which is only ever set by `build_slice_assignment` —
+# and that is a deliberate no-op for a WHOLE-LIST run. So a whole-list run that HAS
+# `scripts/bash-shard-costs.tsv` reported "it has NO cost table" about a table on disk. Existence is a
+# filesystem fact; whether THIS run consulted the table is a different one, and both are now said.
+PFIX="$TMP/presenttablefixture"
+stage_measured_fixture "$PFIX" 1 ""
+printf '1\ttests/m2/run.sh\n' >"$TMP/present.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2 SHARD_COSTS="$TMP/present.tsv" \
+  bash "$PFIX/scripts/runner.sh" >"$TMP/present.out" 2>&1
+PRES_RC=$?
+if [ "$PRES_RC" -eq 0 ] \
+   && grep -qF 'its cost table was NOT consulted for this run' "$TMP/present.out" \
+   && ! grep -qF 'it has NO cost table' "$TMP/present.out"; then
+  pass "a WHOLE-LIST run that HAS a cost table does not claim it has none — pre-fix the existence test was the assignment map's flag, which a whole-list run never sets"
+else
+  fail "the whole-list CAPACITY message misdescribed the table (rc $PRES_RC): $(grep 'CAPACITY' "$TMP/present.out" | tr '\n' ' ')"
+fi
+
+# ── N5f. THE RED RECAP STATES THE BOUND ONCE (#4210 review, P3) ─────────────────────────────
+# ⛔ `recap_timing_line` embeds `per-shard bound <desc>`, and the red block already prints
+# `⏱  per-shard bound applied: <desc>` (pinned above). Without `--no-bound` the red path repeated one
+# fact twice in three lines; the GREEN path keeps the bound inline and is unchanged by design.
+BFIX="$TMP/redboundfixture"
+stage_measured_fixture "$BFIX" 1 tests/m1/run.sh
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$BFIX/scripts/runner.sh" >"$TMP/redbound.out" 2>&1
+RB_RC=$?
+# ⛔ COUNTED PER LINE, NOT ACROSS THE CAPTURE: a sliced run also prints a start-up
+# `⏱  per-shard bound: <desc>` line (a different fact, and not this change's), so a whole-capture count
+# measured that line instead of the duplication. The duplicate is one thing exactly: the `this slice:`
+# line carrying the bound the dedicated `applied:` line already stated.
+RB_SLICE_BOUND="$(grep -E '^   ⏱  this slice:' "$TMP/redbound.out" | grep -c 'per-shard bound')"
+RB_APPLIED="$(grep -c 'per-shard bound applied' "$TMP/redbound.out")"
+if [ "$RB_RC" -eq 1 ] && [ "$RB_SLICE_BOUND" -eq 0 ] && [ "$RB_APPLIED" -eq 1 ]; then
+  pass "the RED recap states the per-shard bound ONCE — the this-slice line no longer repeats the dedicated 'bound applied' line"
+else
+  fail "the red recap duplicated the per-shard bound (this-slice copies=$RB_SLICE_BOUND, applied lines=$RB_APPLIED, want 0 and 1; rc $RB_RC): $(grep 'per-shard bound' "$TMP/redbound.out" | tr '\n' ' ')"
+fi
+
+# ── N5g. THE THIRD CAPACITY BRANCH IS REACHED BY A FIXTURE (#4210 review 3, P3) ─────────────────
+# ⛔ THE BRANCH THAT HAD NO ARM: `slice_costs_known == 0` AND `shard_costs_table_present == 0` — a run
+# with a declared step bound, a real per-shard cost, and NO `bash-shard-costs.tsv` on disk at all. It
+# existed only as a negative grep in N5e (`! grep 'it has NO cost table'`), so deleting the branch
+# reddened NOTHING: a new code path with no positive assertion is invisible to the mutation pass it was
+# added under. Every other no-table fixture (FFIX/BFIX) declares no step bound and returns before the
+# guard, which is exactly why this one declares a bound and sleeps its shards.
+AFIX="$TMP/absenttablefixture"
+stage_measured_fixture "$AFIX" 1 ""
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2 SHARD_COSTS="$TMP/absent-not-written.tsv" \
+  bash "$AFIX/scripts/runner.sh" >"$TMP/absent.out" 2>&1
+ABS_RC=$?
+if [ "$ABS_RC" -eq 0 ] \
+   && grep -qE '⚠️  CAPACITY \(MEASURED\): this arm took [0-9]+s, [0-9]+% of the 2s step bound — and it has NO cost table, so no model exists to compare it against' "$TMP/absent.out" \
+   && ! grep -qF 'its cost table was NOT consulted for this run' "$TMP/absent.out" \
+   && ! grep -qF 'the cost table modelled' "$TMP/absent.out"; then
+  pass "a run with NO cost table on disk gets the third CAPACITY branch and claims neither a model nor a table it did not read — pre-fix this branch had no arm at all"
+else
+  fail "the no-table CAPACITY message was not the third branch (rc $ABS_RC, table=$( [ -f "$TMP/absent-not-written.tsv" ] && echo PRESENT || echo absent )): $(grep 'CAPACITY' "$TMP/absent.out" | tr '\n' ' ')"
+fi
+
+
+# ── N5h. THE BOUND IS REPORTED ON THE UN-NAMED RED PATH TOO (#4210 review 3, P2) ──────────────
+# ⛔ WHY THIS ARM EXISTS. The head commit HOISTED `⏱  per-shard bound applied:` out of
+# `if [ -n "$shard_failed_list" ]`, because on the fall-through branches (failures COUNTED but none
+# NAMED) the red log carried the cost and no bound — i.e. the one justification for `--no-bound`
+# ("the next line prints the bound itself") did not hold on the branch it was written for. Nothing
+# asserted the hoist: N5f's fixture is always a NAMED failure, so moving that echo back inside the
+# branch left BOTH suites green (measured by a reviewer: 0 rows reddened). An unasserted remediation
+# is one the next refactor deletes silently — that is #3442's whole lesson, one commit later.
+# The fixture reaches that branch the only way a run can: the recorder is GUTTED, so the failure is
+# still COUNTED (rc 1, the counter is untouched) while `shard_failed_list` stays empty. That is the
+# same mutation §8am of tests/ci-lane-parity/run.sh uses for the naming arm, and it is why the two
+# arms divide the work: that suite pins what a red log NAMES, this one pins what it still REPORTS.
+GFIX="$TMP/guttedrecapfixture"
+stage_measured_fixture "$GFIX" 1 tests/m1/run.sh
+awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+  "$GFIX/scripts/runner.sh" >"$GFIX/scripts/runner-gutted.sh"
+if cmp -s "$GFIX/scripts/runner.sh" "$GFIX/scripts/runner-gutted.sh"; then
+  fail "the gutted-recorder mutation did not change the fixture (shard_record_failure moved — update this arm's awk)"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$GFIX/scripts/runner-gutted.sh" >"$TMP/guttedrecap.out" 2>&1
+  GR_RC=$?
+  # ⛔ COUNTED PER LINE AND ANCHORED AT COLUMN 0, like N5f: the sliced run also prints a start-up
+  # `⏱  per-shard bound: <desc>` row (a DIFFERENT fact), so an unanchored count would measure it.
+  GR_NAMED="$(grep -c '^❌ failing shard(s)' "$TMP/guttedrecap.out")"
+  GR_APPLIED="$(grep -c '^   ⏱  per-shard bound applied: ' "$TMP/guttedrecap.out")"
+  if [ "$GR_RC" -eq 1 ] && [ "$GR_NAMED" -eq 0 ] && [ "$GR_APPLIED" -eq 1 ]; then
+    pass "a red path that COUNTED a failure without NAMING it still reports the bound that applied, exactly once — pre-hoist that log carried the cost and no bound at all"
+  else
+    fail "the un-named red recap did not report the bound (rc $GR_RC, named lines=$GR_NAMED, applied lines=$GR_APPLIED, want 0 and 1): $(grep 'per-shard bound\|failing shard' "$TMP/guttedrecap.out" | tr '\n' ' ')"
+  fi
+fi
+
+
 # ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
 printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \

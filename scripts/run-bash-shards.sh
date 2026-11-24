@@ -496,6 +496,20 @@ fi
 TAB="$(printf '\t')"
 shard_costs_file="${SHARD_COSTS:-$SHARD_ROOT/scripts/bash-shard-costs.tsv}"
 shard_step_budget=0
+# ⛔ THE MEASURED GUARD'S THRESHOLD — percent of `BASH_SHARD_STEP_BUDGET_SECS` at which elapsed shard
+# work is reported as a CAPACITY problem even when the cost table says the arm is comfortable.
+# ⛔ NOT AN ENV KNOB, DELIBERATELY: this file's env contract is pinned by an arm in
+# `tests/run-bash-shards-bound/run.sh` (a caller may not inherit or inject runner behaviour), and a
+# threshold a caller can LOWER is a threshold a caller can silence — the exact failure class this fix
+# exists to close. 90 % leaves one tenth of the bound as the actionable margin; slice 7 measured 98 %
+# while reporting 81 %.
+shard_capacity_actual_pct=90
+# ⛔ WHETHER THE TABLE EXISTS, WHICH IS NOT WHETHER THIS RUN READ IT (#4210 review, P3). `slice_costs_known`
+# is only ever set by `build_slice_assignment`, which is a deliberate no-op for a whole-list run — so using
+# it as the existence test made a whole-list run that DOES have `scripts/bash-shard-costs.tsv` report "it has
+# NO cost table" about a table sitting on disk. Existence is a filesystem fact and is measured as one.
+shard_costs_table_present=0
+if [ -f "$shard_costs_file" ]; then shard_costs_table_present=1; fi
 if [ -n "${BASH_SHARD_STEP_BUDGET_SECS:-}" ]; then
   case "$BASH_SHARD_STEP_BUDGET_SECS" in
     off|OFF|Off|disabled|DISABLED|none|NONE|0) shard_step_budget=0 ;;
@@ -1389,6 +1403,86 @@ shard_note() {
   printf '  ▸ %4ss  %s\n' "$2" "$1"
 }
 
+# recap_timing_line — the SLICE'S ACTUAL COST, printed on every recap that reaches it (the GREEN tail
+# and both RED tails: `shard_errors > 0`, and the TRUNCATED/partial recap), plus the
+# capacity verdict when the CLOCK — not only the model — says the arm is near its step bound.
+# ⛔⛔ WHAT THIS FIXES, MEASURED ON 5ea9c70a4 (agent-infra#4210): slice 7's shard phase ran 2356 s of
+# the 2400 s step bound — 98.2 %, 44 s from the kill this runner exists to warn about — and it printed
+# `worst arm 1945s of the 2400s step bound (81%)` with NO `⚠️ CAPACITY` line. It was correct by its own
+# arithmetic and blind by construction: the guard compared the COST TABLE'S SUM to the bound and never
+# once compared the bound to elapsed time. A table that under-predicts (that one did, by 411 s on the
+# worst arm) silences the warning exactly when the margin is gone.
+# ⛔ "EVERY recap that reaches it" IS NARROWER THAN "every recap", DELIBERATELY (#4210 review 3, P3).
+# `shard_budget_trip` is a THIRD red exit (`shard_exit 1`) and it does NOT call this function: it prints
+# its own cost in its own shape (`Ns of shard work against BASH_SHARDS_BUDGET_SECS=…`), so no cost is
+# lost there — but a contract comment that claims a call graph it does not have is the claim-mismatch
+# this change exists to remove, so the exception is named instead of averaged away.
+# ⛔ AND THE ARMS MOST AT RISK PRINTED THE LEAST: a FAILED recap printed no `this slice: Ns` line at
+# all (0 occurrences in the killed-at-recency jobs), so the longest-running arms had no actual number
+# anywhere in their log — the one reader who needed it could not see it. Both are why this is a
+# function called from BOTH exits instead of two echoes on the success path.
+# ⛔ `shard_time` is the SUM OF THE PER-SHARD ROWS, so it EXCLUDES the model's ~1 s/shard dead time and
+# any inter-shard overhead: it is a strict LOWER BOUND on the shard phase. That direction is the safe
+# one — the verdict fires only when the bound is genuinely near — and it is why the model figure is
+# printed beside it rather than replaced by it.
+# ⛔ `--no-bound` EXISTS BECAUSE THE RED AND PARTIAL RECAPS ALREADY PRINT THE BOUND (#4210 review, P3).
+# Both emit their own `⏱  per-shard bound applied:` line (an assertion in `tests/run-bash-shards-bound/run.sh`
+# pins it), so repeating the bound inside this line printed ONE fact twice in three lines on the red path.
+# The GREEN path passes nothing and is unchanged byte for byte — it is the only caller with no bound line.
+recap_timing_line() {
+  local with_bound=1
+  [ "${1:-}" = "--no-bound" ] && with_bound=0
+  local bound_suffix=""
+  [ "$with_bound" -gt 0 ] && bound_suffix="; per-shard bound ${shard_bound_desc}"
+  if [ "$slice_count" -gt 0 ]; then
+    echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}${bound_suffix}"
+  else
+    echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}${bound_suffix}"
+  fi
+  # No declared step bound ⇒ there is no margin to report (the workflows declare one; a consumer or a
+  # fixture that declares none gets the actual and nothing else).
+  [ "$shard_step_budget" -gt 0 ] || return 0
+  # The sentinel run past the list leaves `shard_ran` restored and `shard_time` untouched (#2838), so a
+  # red-capable self-check never inflates this figure.
+  [ "$shard_ran" -gt 0 ] || return 0
+  local pct=$((shard_time * 100 / shard_step_budget))
+  [ "$pct" -ge "$shard_capacity_actual_pct" ] || return 0
+  if [ "$slice_costs_known" -gt 0 ]; then
+    # ⛔ THE SIGN IS COMPUTED, NEVER ASSUMED (#4210 review, P2). The model adds `overhead = 1` second per
+    # shard while `shard_time` is the shards' own wall time, so on an ACCURATE table
+    # `slice_load_this ≈ shard_time + shard_ran` and the difference is NEGATIVE. The old sentence hard-coded
+    # "the MODEL UNDER-PREDICTS by <n>s", so every arm in [90 %, model) of the bound printed
+    # "UNDER-PREDICTS by -10s" — the opposite of the truth — and a refreshed table (the issue's item 2) makes
+    # that band COMMON. Both directions are said out loud, and the exact match is its own word.
+    local model_pct=$((slice_load_this * 100 / shard_step_budget))
+    # ⛔ `shard_time - slice_load_this`, i.e. ACTUAL MINUS MODEL: positive means the model came in LOW.
+    # Signing it the other way would relabel every over-prediction as an under-prediction — the exact
+    # defect this branch replaces — so the direction of the subtraction is asserted by a fixture.
+    local delta=$((shard_time - slice_load_this))
+    local verdict
+    if [ "$delta" -gt 0 ]; then
+      verdict="so the MODEL UNDER-PREDICTS by ${delta}s"
+    elif [ "$delta" -lt 0 ]; then
+      verdict="so the model OVER-predicts by $((-delta))s (it adds ~1 s/shard of dead time, which the actual excludes)"
+    else
+      verdict="so the model MATCHES the actual"
+    fi
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — the cost table modelled %ss (%s%% of it), %s. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+      "$shard_time" "$pct" "$shard_step_budget" "$slice_load_this" "$model_pct" "$verdict"
+  elif [ "$shard_costs_table_present" -gt 0 ]; then
+    # ⛔ "NO COST TABLE" IS A CLAIM ABOUT THE FILESYSTEM (#4210 review, P3), and this arm used to make it
+    # about a table that exists. ⛔ AND THE CAUSE IS NOT ONLY THE WHOLE-LIST RUN (#4210 review 2, P3):
+    # `slice_costs_known` is ALSO 0 for a SLICED run whose table parsed to zero numeric rows (the `known=`
+    # line at the parse), which the startup line already reports as "present but declares NO numeric cost
+    # row" — so a single-cause sentence contradicted the log two hundred lines above it. Both are named.
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — its cost table was NOT consulted for this run (either a whole-list run, which builds no assignment map, or a table that declares no numeric cost row), so no modelled figure exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+      "$shard_time" "$pct" "$shard_step_budget"
+  else
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — and it has NO cost table, so no model exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+      "$shard_time" "$pct" "$shard_step_budget"
+  fi
+}
+
 # One line on purpose: the execution and the counter that proves it happened are inseparable,
 # so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion. The skip
 # branch is that explicit rewrite, and it is COUNTED (`shard_skipped`) so a skipped shard can never
@@ -1496,6 +1590,19 @@ shard_partial_recap() {
     printf '❌ NOTHING IS PROVEN: no shard had failed yet at %s/%s, and %s shard(s) had not run — this is NOT a green baseline, it is a run that was killed before it finished\n' \
       "$shard_done" "$listed" "$shard_notrun"
   fi
+  # ⛔ THE TRUNCATED RECAP CARRIES ITS ACTUAL TOO (#4210 review, P2). The killed arm is the ONE arm shape
+  # this change exists for — a step killed at its bound — and it was the only exit still printing no cost
+  # at all: `this slice:` lived on the success path alone, the per-shard `▸` row never prints for a shard
+  # that never returned, so on a 2400 s kill the run's cost appeared NOWHERE. `shard_time` here is the sum
+  # of the shards that DID return — a strict lower bound, which is the safe direction for the verdict.
+  # `--no-bound` because the line below reports the bound.
+  recap_timing_line --no-bound
+  # ⛔ AND IT SAYS THE FIGURE IS A LOWER BOUND, IN THE LINE A READER SEES (#4210 review 2, P3). `shard_time`
+  # is the sum of the terms of the shards that FINISHED; the shard still in flight when the signal arrived
+  # — on a step killed at its bound, the ONLY shard — contributes nothing. So this log line can read
+  # `⏱  8s of shard work` on a 2400 s kill, and a reader takes that as "this arm was cheap" when the arm
+  # burned its whole bound. The disclosure belongs beside the number, not only in a code comment.
+  printf '   ⚠️ the cost above sums only the shard(s) that FINISHED before the signal — a shard still in flight (or killed at its bound) contributes no time, so on a step killed at its bound this figure is a LOWER BOUND and will read SMALL while the arm burned its whole bound\n'
   # ⛔ THE TRUNCATED RECAP REPORTS THE BOUND TOO (#3187 review, P2). "Every recap reports the bound that
   # applied" was false for exactly the recap a TRUNCATED run emits — the one whose reader most needs to
   # know whether a bound was in force at all.
@@ -1805,6 +1912,19 @@ shard_budget_trip "(end of list)"
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
+  # ⛔ THE FAILED ARM CARRIES ITS ACTUAL TOO (#4210, measured: 0 occurrences of `this slice: Ns` on the
+  # red arms, which are the long ones). Printed ONCE, at the verdict, so the cost is read before the
+  # failure detail — and printed even when the naming arm could not name the failures, which is the
+  # shape that used to lose it entirely.
+  # ⛔ `--no-bound`: the NEXT line prints `⏱  per-shard bound applied:` itself, so passing the bound here
+  # too would state it twice in three lines (#4210 review, P3).
+  # ⛔ AND THAT PREMISE IS NOW UNCONDITIONAL (#4210 review 3, P3). The bound line used to live INSIDE the
+  # `shard_failed_list` non-empty branch, so on the fall-through branches (failures COUNTED but none
+  # NAMED, or a broken naming arm) this red log carried the cost and no per-shard bound — i.e. the one
+  # justification for `--no-bound` did not hold on the branch it was written for. It is printed here, on
+  # every red path, exactly once.
+  recap_timing_line --no-bound
+  echo "   ⏱  per-shard bound applied: ${shard_bound_desc}"
   # ⛔ THE VERDICT NAMES WHAT IT COUNTED (#2643). A red slice's log ends here, and the merge rail reads
   # its failure identity from the `❌ FAILED SHARD: <path>` line printed at the point of failure
   # (`scripts/ci_exemption.py`'s bash-shard pass); `❌ 1 bash shard(s) failed` alone is a red with no
@@ -1831,8 +1951,8 @@ if [ "$shard_errors" -gt 0 ]; then
       echo "⏱  TIMEOUT after ${shard_bound}s (SHARD_BOUND): $shard_timeout_list — killed its process group, counted as failed, and the run CONTINUED to the remaining shards"
     fi
     # ⛔ EVERY recap REPORTS THE BOUND THAT APPLIED (a red without a bound is a red whose truncation
-    # the reader has to guess at), not only the recaps where it fired.
-    echo "   ⏱  per-shard bound applied: ${shard_bound_desc}"
+    # the reader has to guess at), not only the recaps where it fired. ⛔ PRINTED ONCE, ABOVE, on ALL
+    # red paths (#4210 review 3, P3) — not here, where only a NAMED failure reached it.
     # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
     # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
     # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
@@ -1865,11 +1985,10 @@ if [ "$shard_errors" -gt 0 ]; then
 fi
 if [ "$slice_count" -gt 0 ]; then
   echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
-  echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
-  echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 fi
+recap_timing_line
 # ⛔ THE SUCCESS PATH IS AN EXIT TOO (#4210 review, P3). It was two bare `echo`s, so `shard_cleanup`
 # never ran on a GREEN run — the ran/skip/timeout logs (pre-existing) and this change's assignment map
 # were left in $TMPDIR on every successful slice. The cleanup contract is stated on `shard_cleanup`;
