@@ -1916,6 +1916,39 @@ else
 fi
 
 
+# ── N5h. THE BOUND IS REPORTED ON THE UN-NAMED RED PATH TOO (#4210 review 3, P2) ──────────────
+# ⛔ WHY THIS ARM EXISTS. The head commit HOISTED `⏱  per-shard bound applied:` out of
+# `if [ -n "$shard_failed_list" ]`, because on the fall-through branches (failures COUNTED but none
+# NAMED) the red log carried the cost and no bound — i.e. the one justification for `--no-bound`
+# ("the next line prints the bound itself") did not hold on the branch it was written for. Nothing
+# asserted the hoist: N5f's fixture is always a NAMED failure, so moving that echo back inside the
+# branch left BOTH suites green (measured by a reviewer: 0 rows reddened). An unasserted remediation
+# is one the next refactor deletes silently — that is #3442's whole lesson, one commit later.
+# The fixture reaches that branch the only way a run can: the recorder is GUTTED, so the failure is
+# still COUNTED (rc 1, the counter is untouched) while `shard_failed_list` stays empty. That is the
+# same mutation §8am of tests/ci-lane-parity/run.sh uses for the naming arm, and it is why the two
+# arms divide the work: that suite pins what a red log NAMES, this one pins what it still REPORTS.
+GFIX="$TMP/guttedrecapfixture"
+stage_measured_fixture "$GFIX" 1 tests/m1/run.sh
+awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+  "$GFIX/scripts/runner.sh" >"$GFIX/scripts/runner-gutted.sh"
+if cmp -s "$GFIX/scripts/runner.sh" "$GFIX/scripts/runner-gutted.sh"; then
+  fail "the gutted-recorder mutation did not change the fixture (shard_record_failure moved — update this arm's awk)"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$GFIX/scripts/runner-gutted.sh" >"$TMP/guttedrecap.out" 2>&1
+  GR_RC=$?
+  # ⛔ COUNTED PER LINE AND ANCHORED AT COLUMN 0, like N5f: the sliced run also prints a start-up
+  # `⏱  per-shard bound: <desc>` row (a DIFFERENT fact), so an unanchored count would measure it.
+  GR_NAMED="$(grep -c '^❌ failing shard(s)' "$TMP/guttedrecap.out")"
+  GR_APPLIED="$(grep -c '^   ⏱  per-shard bound applied: ' "$TMP/guttedrecap.out")"
+  if [ "$GR_RC" -eq 1 ] && [ "$GR_NAMED" -eq 0 ] && [ "$GR_APPLIED" -eq 1 ]; then
+    pass "a red path that COUNTED a failure without NAMING it still reports the bound that applied, exactly once — pre-hoist that log carried the cost and no bound at all"
+  else
+    fail "the un-named red recap did not report the bound (rc $GR_RC, named lines=$GR_NAMED, applied lines=$GR_APPLIED, want 0 and 1): $(grep 'per-shard bound\|failing shard' "$TMP/guttedrecap.out" | tr '\n' ' ')"
+  fi
+fi
+
+
 # ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
 printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \

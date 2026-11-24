@@ -2405,14 +2405,26 @@ else
   OUT="$(cat "$TMP/runner-named.out")"
   # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
   # printed mid-run and is NOT what a parser sees at the end, so assert on the block.
+  # ⛔ BUT THE BLOCK ALSO CARRIES A COST DIAGNOSTIC THAT *LEGITIMATELY* NAMES A SHARD (#4210 review, P2).
+  # `recap_timing_line` prints `⏱  … slowest Ns (<path>)` on the RED path too (it is the two echoes the
+  # GREEN tail always printed, moved into one function), and the shard it names is whichever was
+  # SLOWEST — pass or fail. Asserting "the passing stand-in's path does not appear in this block" over
+  # the WHOLE tail therefore reddens whenever the PASSING stand-in happens to be the slowest one, and
+  # `SECONDS` is integer-second while these two stand-ins are milliseconds apart: a timing-dependent
+  # FALSE RED on the very suite #4210 exists to de-flake.
+  # The subject of these two assertions is ATTRIBUTION, and attribution is the `❌` identity lines —
+  # the shape `scripts/ci_exemption.py` splits into `bash-shard::<path>`. So the timing rows are
+  # dropped and the assertions run on what is left. This does not weaken them: pre-#4210 the timing
+  # line lived only on the GREEN path, and on the red path naming the SLOWEST shard attributes nothing.
   VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-named.out")"
-  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$VERDICT"; then
+  ATTRIB="$(grep -v '^   ⏱  ' <<<"$VERDICT")"
+  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$ATTRIB"; then
     pass "a failed shard is NAMED in the verdict block (rc 1)"
   else
-    fail "the verdict did not name the failed shard (rc $RC): $VERDICT"
+    fail "the verdict did not name the failed shard (rc $RC): $ATTRIB"
   fi
-  if grep -qF "$PASS_SHARD" <<<"$VERDICT"; then
-    fail "the verdict names the PASSING stand-in too — a block naming every shard attributes nothing: $VERDICT"
+  if grep -qF "$PASS_SHARD" <<<"$ATTRIB"; then
+    fail "the attribution lines name the PASSING stand-in too — a block naming every shard attributes nothing: $ATTRIB"
   else
     pass "…and it names only the shard that actually failed"
   fi
@@ -2430,16 +2442,21 @@ else
     env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
     RC=$?
     NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
-    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
+    # ⛔ SAME COST-LINE EXCLUSION AS ABOVE, AND IT IS LOAD-BEARING HERE (#4210 review, P2). The red
+    # `⏱  this slice: … slowest Ns (<path>)` row names the slowest shard whether or not the recorder
+    # was gutted — so on a slow tick this control's `! grep -qF "$FAIL_SHARD"` would red for a reason
+    # that has nothing to do with naming. "Named nothing" means no ATTRIBUTION line names it.
+    NONAME_ATTRIB="$(grep -v '^   ⏱  ' <<<"$NONAME_VERDICT")"
+    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_ATTRIB"; then
       pass "RED CONTROL: a gutted recorder still fails the run (rc 1) and names nothing in the verdict"
     else
-      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_VERDICT"
+      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_ATTRIB"
     fi
     # …and it must SAY SO rather than end on a bare count: an unnamed failure has to read as unnamed.
-    if grep -q 'could NOT be named' <<<"$NONAME_VERDICT"; then
+    if grep -q 'could NOT be named' <<<"$NONAME_ATTRIB"; then
       pass "…and an unnamed failure says so, instead of ending as a silent count"
     else
-      fail "an unnamed failure did not announce that it could not be named: $NONAME_VERDICT"
+      fail "an unnamed failure did not announce that it could not be named: $NONAME_ATTRIB"
     fi
   fi
 fi
