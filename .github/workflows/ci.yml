@@ -1846,9 +1846,10 @@ jobs:
     # check over a hole.
     runs-on: ubuntu-latest
     # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
-    # measurements (PR #2412 job 120365087427: the list then held 74 shards — it is 78 today, and
-    # the per-slice sizes are DERIVED, so no number here goes stale — 73.6 min, 59.7 s/shard
-    # mean; #2483's
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards at a 59.7 s/shard mean,
+    # 73.6 min serially — it holds **212** today at a 72.4 s/shard mean, 15,354 s serially and ~32.4
+    # min per arm under the cost-aware deal, which is why the count is spelled out here instead of
+    # "N today", and #2483's
     # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
     # remaining shards 26m25s).
     #
@@ -1931,8 +1932,10 @@ jobs:
         # A STEP that trips its own bound takes the other branch in the same file: at
         # `StepsRunner.cs:324-329`, `timeoutMinutes` fires with `jobCancellationToken` NOT
         # cancelled, so the result is `TaskResult.Failed` — which the job reports as `failure`,
-        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays ~1.9x
-        # the measured worst slice (~37 min), so it cannot false-block a slow-but-healthy slice.
+        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays **2.2x
+        # the MODELLED worst arm** (1946 s = 32.4 min, the figure the run prints), so it cannot
+        # false-block a slow-but-healthy slice. ⛔ "~1.9x the measured worst slice (~37 min)" was the
+        # retired round-robin figure — 1.9x was 4200/2220 s, and 2220 s is 37 min.
         timeout-minutes: 70
         run: bash scripts/run-bash-shards.sh
 

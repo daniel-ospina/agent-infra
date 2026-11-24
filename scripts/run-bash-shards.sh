@@ -769,8 +769,11 @@ shard_timeout_marker="${shard_ran_log}.timeout"
 # `shard_exit`, which every exit after these three files exist goes through, and by
 # `shard_driver_signal` (which calls `shard_cleanup` itself).
 # ⚠️ STATED RESIDUAL: a shell that forked BEFORE those calls (a crash, `kill -9` of the driver) leaves
-# the three temp files in $TMPDIR. They are three small empty files; a killed run has nothing to
-# report anyway, and the alternative was corrupting the bookkeeping of runs that DID finish.
+# the temp files in $TMPDIR — see the residual at the top of this file for the exact inventory (#4210
+# made it SIX files, four of them non-empty). A killed run has nothing to report anyway, and the
+# alternative was corrupting the bookkeeping of runs that DID finish. ⛔ NOT RESTATED HERE: this block
+# said "three small empty files" after that inventory changed, which is exactly the drift the single
+# statement exists to prevent.
 # ⛔ A HUP IS NOT THAT RESIDUAL: it is an ordinary exit path, so `shard_driver_signal` routes it through
 # `shard_exit` too. Pinned — like the no-wipe property itself — by `tests/run-bash-shards-bound`
 # (arm 2d, and the HUP cleanup assertion that reads back what a `mktemp` shim handed out).

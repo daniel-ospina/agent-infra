@@ -559,8 +559,9 @@ jobs:
     # ⛔ THE ARITHMETIC IS NOW PER ARM, AND THAT IS THE WHOLE HAZARD OF THIS CHANGE. A matrix turns
     # each slice into its OWN JOB, so a per-arm JOB-level bound is EXACTLY the silent fail-open
     # described above — one arm `cancelled` while its co-arms report, and only the cancelled arm's
-    # shards ungated. Every arm therefore carries its own STEP bound (40 min, 1.6x the 1500 s worst
-    # arm and 2.8x the 852 s slowest single suite) and the job bound sits above its steps' sum,
+    # shards ungated. Every arm therefore carries its own STEP bound (40 min = 1.2x the MODELLED
+    # 1946 s worst arm and 1.9x the slowest single suite, 1294 s) and the job bound sits above its
+    # steps' sum,
     # identically to the single-job form this replaced.
     timeout-minutes: 80
     strategy:
@@ -616,7 +617,7 @@ jobs:
         # cost-blind round-robin summed the same rows to a 3374 s worst arm (140% of this bound), and
         # the runner now bin-packs by measured cost, giving **1946 s — 81% of 2400 s** on its own
         # model constant of 1 s/shard dead time (the MEASURED dead time is 1.16 s/shard, which would
-        # make the same arm 1950 s — 81% either way). 2400 s stays 1.9x that model and 2.8x the
+        # make the same arm 1950 s — 81% either way). 2400 s is 1.2x that model and 1.9x the
         # slowest single suite
         # (`tests/atomic-land/run.sh`, 1294 s at that head) and well inside the 360 min platform step
         # maximum. The runner prints that figure on every run, so this comment cannot silently rot
