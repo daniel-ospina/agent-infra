@@ -296,6 +296,15 @@ if grep -qE '^   ⏱  [0-9]+s of shard work' <<<"$KOUT"; then
 else
   bad "(e) the interrupted recap printed no cost total (#4210): $(grep -F '⏱' <<<"$KOUT" | tr '\n' '|' | cut -c1-200)"
 fi
+# ⛔ THE NUMBER MUST NOT READ AS THE WHOLE STORY (#4210 review 2, P3): `shard_time` sums only the shards
+# that FINISHED, and on a step killed at its bound the shard that burned it contributes nothing — so this
+# very capture can print a small cost for an arm that spent its entire bound. The disclosure is asserted
+# because a comment is not read by the operator looking at the red log.
+if grep -q 'LOWER BOUND' <<<"$KOUT"; then
+  ok "(f) — and the same recap says that figure is a LOWER BOUND (the in-flight shard contributes no time)"
+else
+  bad "(f) the interrupted recap's cost figure carries no LOWER BOUND disclosure — a red log could read 'cheap' on an arm that burned its whole bound: $(grep -F '⏱' <<<"$KOUT" | tr '\n' '|' | cut -c1-200)"
+fi
 
 # ⛔ THE COUPLING ARM (review of this change, cycle 2, P2): the marker the RUNNER prints must be the
 # marker the PARSER recognises. Without this, the two literals could drift and every fixture would

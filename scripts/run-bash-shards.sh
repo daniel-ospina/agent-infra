@@ -1465,8 +1465,11 @@ recap_timing_line() {
       "$shard_time" "$pct" "$shard_step_budget" "$slice_load_this" "$model_pct" "$verdict"
   elif [ "$shard_costs_table_present" -gt 0 ]; then
     # ⛔ "NO COST TABLE" IS A CLAIM ABOUT THE FILESYSTEM (#4210 review, P3), and this arm used to make it
-    # about a table that exists — a whole-list run never builds an assignment map, so it never reads one.
-    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — its cost table was NOT consulted for this run (a whole-list run builds no assignment map), so no modelled figure exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+    # about a table that exists. ⛔ AND THE CAUSE IS NOT ONLY THE WHOLE-LIST RUN (#4210 review 2, P3):
+    # `slice_costs_known` is ALSO 0 for a SLICED run whose table parsed to zero numeric rows (the `known=`
+    # line at the parse), which the startup line already reports as "present but declares NO numeric cost
+    # row" — so a single-cause sentence contradicted the log two hundred lines above it. Both are named.
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — its cost table was NOT consulted for this run (either a whole-list run, which builds no assignment map, or a table that declares no numeric cost row), so no modelled figure exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
       "$shard_time" "$pct" "$shard_step_budget"
   else
     printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — and it has NO cost table, so no model exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
@@ -1588,6 +1591,12 @@ shard_partial_recap() {
   # of the shards that DID return — a strict lower bound, which is the safe direction for the verdict.
   # `--no-bound` because the line below reports the bound.
   recap_timing_line --no-bound
+  # ⛔ AND IT SAYS THE FIGURE IS A LOWER BOUND, IN THE LINE A READER SEES (#4210 review 2, P3). `shard_time`
+  # is the sum of the terms of the shards that FINISHED; the shard still in flight when the signal arrived
+  # — on a step killed at its bound, the ONLY shard — contributes nothing. So this log line can read
+  # `⏱  8s of shard work` on a 2400 s kill, and a reader takes that as "this arm was cheap" when the arm
+  # burned its whole bound. The disclosure belongs beside the number, not only in a code comment.
+  printf '   ⚠️ the cost above sums only the shard(s) that FINISHED before the signal — a shard still in flight (or killed at its bound) contributes no time, so on a step killed at its bound this figure is a LOWER BOUND and will read SMALL while the arm burned its whole bound\n'
   # ⛔ THE TRUNCATED RECAP REPORTS THE BOUND TOO (#3187 review, P2). "Every recap reports the bound that
   # applied" was false for exactly the recap a TRUNCATED run emits — the one whose reader most needs to
   # know whether a bound was in force at all.
