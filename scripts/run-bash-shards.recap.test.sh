@@ -124,7 +124,10 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
   echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
 fi
-unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
+# ⛔ FIVE, NOT THREE (#4210): the runner's env contract grew `SHARD_COSTS` and
+# `BASH_SHARD_STEP_BUDGET_SECS`, and its own `shard_exec` now strips all five — a suite that clears only
+# the original three leaves its fixture printing the caller's step-bound margin.
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE SHARD_COSTS BASH_SHARD_STEP_BUDGET_SECS
 
 # ⛔ THE FIXTURE MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING (#3011): a copy of the runner calls
 # `fixture_guard_placement` with the DEFAULT root set, so on a box with a live cell controller the
@@ -222,7 +225,7 @@ rm -f "$SLOW_SHARD_MARKER"
 # repro shell that exports the slice and runs THIS FILE rather than the runner) relies on this guard
 # alone.
 set -m
-env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS \
   bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
 kpid=$!
 set +m

@@ -1842,8 +1842,8 @@ declared_base_equivalent() {
       #   publish, so the answer degrades to the pre-#2610 `NO BASE COUNTERPART` — the status quo ante,
       #   fail-closed, not a new worse state.
       #   ⛔ NARROWING (main wider than the PR): every PR arm DOES have a base arm, so the map succeeds
-      #   — but arm k is then a DISJOINT set of suites in the two lanes (both use the same `pos % n`
-      #   rule against different n), so the rail would print `base-caused via script-validate (3) ≡
+      #   — but arm k is then a DISJOINT set of suites in the two lanes (both use the same cost-aware
+      #   assignment rule against different n), so the rail would print `base-caused via script-validate (3) ≡
       #   bash-suites (3)` about two different bodies of work: a false ATTRIBUTION rather than a
       #   missing one. Nothing pins the two widths equal today; `check-ci-lane-parity.mjs` parses both
       #   axes and could compare them, which is the follow-up (agent-infra#3233).

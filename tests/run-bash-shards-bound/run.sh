@@ -112,7 +112,7 @@ FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # the same way per invocation: `env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`. Nothing is weakened
 # here — every bound this file asserts is still passed explicitly at its call site (§0 pins the
 # sanitisation, and reddens if this line is removed).
-unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE SHARD_COSTS BASH_SHARD_STEP_BUDGET_SECS
 trap 'rm -rf "$TMP"' EXIT
 
 # ⛔ THE HERMETICITY PROBE — how §0 asks THIS script what the environment handed it. It sits
@@ -280,7 +280,11 @@ if stage_fixture "$ENVFIX" 0; then
   MUTENV="$TMP/envfix-mutant"
   if stage_fixture "$MUTENV" 0; then
     probe_shard "$MUTENV"
-    sed 's|env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash|bash|' \
+    # ⛔ THE MUTATION MUST NAME THE SHAPE, NOT ONE SPELLING OF IT (#4210). It used to spell out the
+    # three `-u` pairs; the contract grew two more, `shard_exec` changed, and the `sed` then matched
+    # NOTHING — the `cmp` below correctly reported a vacuous control rather than passing over it. A
+    # whole-handover strip is what the arm means: remove every `-u`, keep the `bash`.
+    sed -E 's|env -u [^ ]+( -u [^ ]+)* bash|bash|' \
       "$RUNNER" >"$MUTENV/scripts/runner-mutant.sh"
     if cmp -s "$RUNNER" "$MUTENV/scripts/runner-mutant.sh"; then
       fail "the dispatch-env mutation did not change the runner — the handover is not one \`env -u\` line, so this control has no control"
@@ -1620,7 +1624,9 @@ if [ "$YES_UNION" = 9 ] && [ "$YES_TOTAL" = 9 ]; then
 else
   fail "the packed deal changed coverage (union=$YES_UNION, executed=$YES_TOTAL, want 9/9)"
 fi
-if grep -qE '🧮 slice 1/3: cost-aware assignment of 9 shard\(s\) — this arm models 900s, worst arm 900s of the 2400s step bound' "$TMP/cost-yes-1.out"; then
+# The figure carries the per-shard dead time the runner adds to the model (+1 s/shard), so the
+# assertion pins the SHAPE and the bound rather than a literal that a documented model change moves.
+if grep -qE '🧮 slice 1/3: cost-aware assignment of 9 shard\(s\) — this arm models 90[0-9]s .*worst arm 90[0-9]s of the 2400s step bound' "$TMP/cost-yes-1.out"; then
   pass "the run reports its modelled load AND the declared step bound, so capacity is readable without bisecting a log"
 else
   fail "no modelled-load line against the declared bound: $(grep '🧮' "$TMP/cost-yes-1.out" | tr '\n' ' ')"
@@ -1631,7 +1637,7 @@ printf '5000\ttests/c1/run.sh\n' >"$TMP/over.tsv"
 for i in 2 3 4 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i" >>"$TMP/over.tsv"; done
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$TMP/over.tsv" \
   BASH_SHARD_SLICE=1/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-over.out" 2>&1 || true
-if grep -q 'CAPACITY: the modelled worst arm is 5000s against a 2400s step bound' "$TMP/cost-over.out"; then
+if grep -qE 'CAPACITY: the modelled worst arm is 500[0-9]s against a 2400s step bound' "$TMP/cost-over.out"; then
   pass "a modelled arm OVER the step bound is named as a CAPACITY problem (the growth risk, said where a reader sees it)"
 else
   fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
@@ -1663,6 +1669,26 @@ else
     pass "control: a deal that pins every position to arm 0 is caught by the SET assertion (rc 1), not reported green"
   else
     fail "a broken deal was not caught on the set (rc $PIN_RC): $(tail -2 "$TMP/cost-pin0.out" | tr '\n' '|')"
+  fi
+fi
+
+# ── N8. A HOLE IN THE MAP IS A REFUSAL, NOT A SILENT SKIP (#4210 review, P2) ────────────────────
+# The map is the ONE artifact both the skip decision and the coverage check read, so a missing position
+# is the one shape that could hide: the skip would drop the shard and the identity check would agree
+# with the drop. `slice_skips` therefore refuses. This arm builds that state (the builder's row loop
+# starts at position 1 instead of 0) and requires the NAMED refusal at rc 2 — not the coverage check's
+# "DIFFERENT SET", which would name the symptom instead of the hole.
+awk '{ if ($0 ~ /for \(i = 0; i < listn; i\+\+\) printf "%d\\t%d\\t%s\\n", i, asg\[i\], pos\[i\]/) { sub(/i = 0;/, "i = 1;"); print; next } print }' \
+  "$RUNNER" >"$CFIX/scripts/runner-hole.sh"
+if cmp -s "$RUNNER" "$CFIX/scripts/runner-hole.sh"; then
+  fail "the map-hole mutation did not change the runner — the refusal arm below would be vacuous"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=2/3 bash "$CFIX/scripts/runner-hole.sh" >"$TMP/cost-hole.out" 2>&1
+  HOLE_RC=$?
+  if [ "$HOLE_RC" -eq 2 ] && grep -q 'NO slice in the assignment map' "$TMP/cost-hole.out"; then
+    pass "control: a position missing from the assignment map REFUSES the run (rc 2) and names the hole — it is never skipped"
+  else
+    fail "a hole in the map was not refused by name (rc $HOLE_RC): $(tail -2 "$TMP/cost-hole.out" | tr '\n' '|')"
   fi
 fi
 

@@ -1903,11 +1903,13 @@ jobs:
           # prints `🧮 … this arm models Ns, worst arm Ns of the 2400s step bound (N%)`, and says
           # ⚠️ CAPACITY when the worst modelled arm no longer fits — which is how the list outgrowing
           # the matrix becomes visible in a run instead of arriving as a 40-minute kill with no recap.
-          # MUST EQUAL this step's `timeout-minutes * 60` below; a stale number only misreports the
-          # percentage (it can never skip, add or red a shard), and both lanes carry the same value so
-          # their reports are comparable.
+          # MUST EQUAL this step's `timeout-minutes * 60` BELOW — and the two lanes differ on purpose,
+          # because their steps do: this one is 70 min (4200 s), `ci-main.yml`'s is 40 min (2400 s).
+          # A stale number only misreports the percentage; it can never skip, add or red a shard
+          # (measured: an earlier value of 2400 here read the PR lane against a bound 1800 s tighter
+          # than the step it describes).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
-          BASH_SHARD_STEP_BUDGET_SECS: 2400
+          BASH_SHARD_STEP_BUDGET_SECS: 4200
         # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
         # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
         # `cancelled`: the service cancels the job, the job-cancellation callback sets

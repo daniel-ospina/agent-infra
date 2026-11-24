@@ -82,7 +82,10 @@
 #   BASH_SHARD_STEP_BUDGET_SECS  whole seconds (0/'off' disables), OPTIONAL. The CI step bound this
 #                         slice has to fit inside. It is used ONLY to report each run's modelled load
 #                         against that bound (and to name the growth risk when it stops fitting); it
-#                         changes nothing about which shards run. Absent = no margin is reported.
+#                         changes nothing about which shards run. Absent OR SET-BUT-EMPTY = no
+#                         margin is reported (deliberate divergence from `BASH_SHARDS_BUDGET_SECS`, which
+#                         REFUSES an empty value: that one is a deadline a run can overrun, this one is
+#                         an informational scale factor, so the fail-open argument does not apply).
 #   SHARD_BOUND           whole seconds; the PER-SHARD bound (#3187). Unset or EMPTY takes the
 #                         default 1800 s; `0`/'off' DISABLES it; any other non-integer — or one wide
 #                         enough to wrap negative — is REFUSED (rc 2) rather than silently running
@@ -488,10 +491,10 @@ if [ -n "${BASH_SHARD_STEP_BUDGET_SECS:-}" ]; then
     off|OFF|Off|disabled|DISABLED|none|NONE|0) shard_step_budget=0 ;;
     *[!0-9]*)
       echo "❌ BASH_SHARD_STEP_BUDGET_SECS='$BASH_SHARD_STEP_BUDGET_SECS' is not a whole number of seconds (or 0/off) — refusing to report a margin against a bound it cannot read." >&2
-      exit 2 ;;
+      shard_exit 2 ;;
     ??????????*)
       echo "❌ BASH_SHARD_STEP_BUDGET_SECS='$BASH_SHARD_STEP_BUDGET_SECS' is TOO LARGE — at most 9 digits (a longer value wraps in shell arithmetic)." >&2
-      exit 2 ;;
+      shard_exit 2 ;;
     *) shard_step_budget=$((10#$BASH_SHARD_STEP_BUDGET_SECS)) ;;
   esac
 fi
@@ -516,19 +519,29 @@ build_slice_assignment() {
   slice_assign_log="${listf}.map"
   printf '%s\n' "$shard_paths" > "$listf" 2>/dev/null || {
     echo "❌ cannot stage the derived list for the slice assignment ($listf) — refusing to run a ${slice_count}-way slice whose coverage map is unknown" >&2
-    exit 2
+    shard_exit 2
   }
   # An ABSENT table is a supported mode, not an error (every fixture tree has none): /dev/null makes
   # every weight 0, and the packing then degenerates to `pos % n` exactly.
   costs="$shard_costs_file"
   [ -f "$costs" ] || costs=/dev/null
+  # ⛔ STDERR IS NOT DATA (#4210 review, P2). `2>&1` here fed an awk diagnostic into the parse below:
+  # a message containing a tab would have reached `slice_assign[<position>]` with a non-numeric index,
+  # and under `set -u` an indexed-array subscript is ARITHMETIC — the shell would die with its own
+  # unbound-variable error instead of this function's refusal. It also threw the diagnostic away.
+  assign_err="$slice_assign_log.err"
   out="$(awk -v n="$slice_count" -v costsf="$costs" -v want="$slice_index" '
     function numeric(x) { return x ~ /^[0-9]+$/ }
     # ⛔ INITIALISED, not left to the awk rule for uninitialised variables: a bare `listn` used as a
     # SUBSCRIPT is the empty STRING, not 0, so `pos[listn]` filed the first shard under `pos[""]` and
     # every later position shifted — the map then had no entry for position 0 and the run refused
     # (measured in the first fixture run of this change, not in theory).
-    BEGIN { listn = 0; known = 0 }
+    # ⛔ THE MODEL CARRIES THE PER-SHARD DEAD TIME (#4210 review, P2). The runner documents ~1.16 s of
+    # watchdog/list overhead per shard (`SHARD_BOUND` section above, and the bracket a shard row
+    # excludes), so a sum of raw suite seconds understates the arm by ~1 s x shards — and this
+    # number exists to be a WARNING. Omitted and stated: the syntax sweep (`SWEEP_GLOBS`), which runs
+    # inside the same step.
+    BEGIN { listn = 0; known = 0; overhead = 1 }
     FILENAME == costsf {
       if ($0 ~ /^[ \t]*#/ || NF < 2 || !numeric($1)) next
       p = $0; sub(/^[ \t]*[0-9]+[ \t]+/, "", p); sub(/[ \t]+$/, "", p)
@@ -577,7 +590,7 @@ build_slice_assignment() {
         # Counting breaks the tie the way
         # round-robin does: 0,1,2,…,n-1,0,1,… — so the degenerate case really is `pos % n`.
         for (i = 1; i < n; i++) if (load[i] < load[m] || (load[i] == load[m] && cnt[i] < cnt[m])) m = i
-        asg[p] = m; load[m] += c[p]; cnt[m]++
+        asg[p] = m; load[m] += c[p] + overhead; cnt[m]++
       }
       worst = 0
       for (i = 0; i < n; i++) if (load[i] > worst) worst = load[i]
@@ -586,13 +599,13 @@ build_slice_assignment() {
       # `<position>\t<slice>\t<path>`: the POSITION is the key the skip decision and the coverage check
       # both need (a `<slice>\t<path>` row cannot answer "which arm runs position 7" without a scan).
       for (i = 0; i < listn; i++) printf "%d\t%d\t%s\n", i, asg[i], pos[i]
-    }' "$costs" "$listf" 2>&1)" || {
-    echo "❌ the cost-aware slice assignment could not be computed (awk refused) — refusing to run a ${slice_count}-way slice whose coverage map is unknown (#4210)" >&2
-    exit 2
+    }' "$costs" "$listf" 2>"$assign_err")" || {
+    echo "❌ the cost-aware slice assignment could not be computed (awk refused) — refusing to run a ${slice_count}-way slice whose coverage map is unknown (#4210): $(tail -3 "$assign_err" 2>/dev/null | tr '\n' ' ')" >&2
+    shard_exit 2
   }
   printf '%s\n' "$out" > "$slice_assign_log" 2>/dev/null || {
     echo "❌ cannot write the slice assignment map ($slice_assign_log) — refusing to run with a map the coverage check cannot read" >&2
-    exit 2
+    shard_exit 2
   }
   while IFS= read -r assign_line; do
     case "$assign_line" in
@@ -612,7 +625,10 @@ build_slice_assignment() {
       *"$TAB"*)
         assign_pos="${assign_line%%"$TAB"*}"
         assign_rest="${assign_line#*"$TAB"}"
-        slice_assign["$assign_pos"]="${assign_rest%%"$TAB"*}" ;;
+        case "$assign_pos" in
+          ''|*[!0-9]*) ;;   # not a position — ignore it (an indexed subscript is ARITHMETIC in bash)
+          *) slice_assign["$assign_pos"]="${assign_rest%%"$TAB"*}" ;;
+        esac ;;
       *) ;;
     esac
   done <<EOF
@@ -624,11 +640,16 @@ EOF
   # and a reader who can see the number is the only thing that catches the list outgrowing its bound
   # BEFORE the step bound kills three arms again.
   if [ "$slice_costs_known" -gt 0 ]; then
-    printf '🧮 slice %s/%s: cost-aware assignment of %s shard(s) — this arm models %ss, worst arm %ss' \
+    printf '🧮 slice %s/%s: cost-aware assignment of %s shard(s) — this arm models %ss (+1s/shard dead time, syntax sweep excluded), worst arm %ss' \
       "$((slice_index + 1))" "$slice_count" "$listed" "$slice_load_this" "$slice_load_worst"
   else
-    printf '🧮 slice %s/%s: %s shard(s) — NO measured costs (%s absent), so this is the POSITIONAL round-robin (pos %% n)' \
-      "$((slice_index + 1))" "$slice_count" "$listed" "$shard_costs_file"
+    if [ -f "$shard_costs_file" ]; then
+      costs_why="present but declares NO numeric cost row"
+    else
+      costs_why="absent"
+    fi
+    printf '🧮 slice %s/%s: %s shard(s) — NO measured costs (%s: %s), so this is the POSITIONAL round-robin (pos %% n)' \
+      "$((slice_index + 1))" "$slice_count" "$listed" "$shard_costs_file" "$costs_why"
   fi
   if [ "$shard_step_budget" -gt 0 ]; then
     printf ' of the %ss step bound (%s%%)\n' "$shard_step_budget" "$((slice_load_this * 100 / shard_step_budget))"
@@ -1139,7 +1160,12 @@ shard_kill_group() {
 # "cosmetic" because the rc was assumed intact; it is not on that path). Restoring exact pid identity
 # would mean inlining the `env -u` at the `&` site, which moves the string the three ci-lane-parity
 # mutants pin — the P0 this branch already had to repair once.
-shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
+# ⛔ THE STRIP IS THE WHOLE CONTRACT, NOT THE THREE VARIABLES IT STARTED WITH (review, #4210): a
+# shard that re-runs this runner must not inherit its caller's dispatch OR its caller's cost table and
+# step budget — the last two are REPORT knobs, so inheriting them cannot drop a shard, but it does make
+# a fixture print ` of the 2400s step bound (N%)` and emit a CAPACITY line, i.e. output that depends on
+# who launched it. `tests/run-bash-shards-bound`/`recap.test.sh` unset the same five for the same reason.
+shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS bash "$1"; }
 
 shard_run_bounded() {
   if [ "$shard_bound" -lt 1 ]; then shard_exec "$1" </dev/null; return $?; fi
@@ -1806,6 +1832,11 @@ else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
   echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 fi
+# ⛔ THE SUCCESS PATH IS AN EXIT TOO (#4210 review, P3). It was two bare `echo`s, so `shard_cleanup`
+# never ran on a GREEN run — the ran/skip/timeout logs (pre-existing) and this change's assignment map
+# were left in $TMPDIR on every successful slice. The cleanup contract is stated on `shard_cleanup`;
+# this makes the tail honour it instead of describing an exit path that did not exist.
+shard_exit 0
 
 
 # ── the per-suite notes that used to ride on each `run_shard` line are NOT reproduced here ────────
