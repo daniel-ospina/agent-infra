@@ -597,12 +597,15 @@ build_slice_assignment() {
       for (i = 0; i < n; i++) { load[i] = 0; cnt[i] = 0 }
       for (k = 0; k < listn; k++) {
         p = order[k]; m = 0
-        # ⛔ TIES BREAK ON THE ELEMENT COUNT, not on the bin index. Load alone is not enough: with equal
-        # costs every load stays 0, `load[i] < load[0]` is never true, and EVERY shard would be filed on
-        # arm 0 — which is not the round-robin this is documented to degenerate to, it is one arm doing
-        # the whole list (measured in this change: its first fixture run filed every shard on arm 0).
-        # Counting breaks the tie the way
-        # round-robin does: 0,1,2,…,n-1,0,1,… — so the degenerate case really is `pos % n`.
+        # ⛔ TIES BREAK ON THE ELEMENT COUNT, not on the bin index. The dead time added below means a
+        # load ALWAYS advances, so an equal-cost list already lands in round-robin order WITHOUT this
+        # clause (measured on this awk: no table, 9 shards at n=3 — the assignment is identical either
+        # way, 0,3,6 / 1,4,7 / 2,5,8). What the clause still decides is the case the shipped table
+        # never produces — two arms whose loads tie with DIFFERENT counts: dropping it reassigns a
+        # contrived 14-shard n=2 table (positions 7 and 8 swap arms, the arm-0 load 40 s → 42 s), so it
+        # is not dead code. The narrative origin was the pre-dead-time iteration of this change, whose
+        # first fixture run filed every shard on arm 0. Counting breaks the tie the way round-robin
+        # does: 0,1,2,…,n-1,0,1,… — so the no-table case really is `pos % n`.
         for (i = 1; i < n; i++) if (load[i] < load[m] || (load[i] == load[m] && cnt[i] < cnt[m])) m = i
         asg[p] = m; load[m] += c[p] + overhead; cnt[m]++
       }
