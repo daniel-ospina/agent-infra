@@ -314,7 +314,13 @@ fi
 # it is and is not. (Deliberately NOT a line number, here or in that note: a same-file pin drifts on
 # every edit above it, and this comment's own first draft carried one that had already gone stale.)
 # Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
-env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+# ⛔ FIVE, NOT THREE, HERE TOO (#4210 review, P3): this spawn site is the SAME fixture contract as ARM 1's
+# child above, and it still spelled the original three after the contract grew `SHARD_COSTS` and
+# `BASH_SHARD_STEP_BUDGET_SECS` — so under `ci.yml` (which exports `BASH_SHARD_STEP_BUDGET_SECS: 4200`)
+# this fixture could print the caller's step-bound margin, the exact hazard the ARM-1 comment names.
+# Its assertions did not red on the extra line, which is why a stated contract and its implementation can
+# drift apart silently: both spawn sites now carry the SAME five.
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS \
   bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
 COUT="$(cat "$TMP/complete.out" 2>/dev/null)"

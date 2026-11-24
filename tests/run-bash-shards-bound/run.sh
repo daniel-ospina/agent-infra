@@ -241,7 +241,7 @@ fi
 # real runner WITH a slice and a bound in its env, and require a shard to see neither. This arm is the
 # only place in the repo that can fail if someone restores the plain `bash "$1"` — the 18 affected
 # suites pass on a laptop, where nothing exports these, which is exactly why the leak survived.
-echo "0b. A SHARD CANNOT SEE THIS PROCESS'S SLICE, BUDGET OR BOUND (#3415/#2741)"
+echo "0b. A SHARD CANNOT SEE THIS PROCESS'S SLICE, BUDGET, BOUND, COST TABLE OR STEP BUDGET (#3415/#2741)"
 ENVFIX="$TMP/envfix"
 probe_shard() { # <root> — add a shard that reports the runner env it was handed
   mkdir -p "$1/tests/nnn-envprobe"
@@ -250,6 +250,13 @@ probe_shard() { # <root> — add a shard that reports the runner env it was hand
     printf 'printf "PROBE SHARD_BOUND=%%s\\n" "${SHARD_BOUND-<unset>}"\n'
     printf 'printf "PROBE BUDGET=%%s\\n" "${BASH_SHARDS_BUDGET_SECS-<unset>}"\n'
     printf 'printf "PROBE SLICE=%%s\\n" "${BASH_SHARD_SLICE-<unset>}"\n'
+    # ⛔ THE FIVE-VARIABLE CONTRACT, NOT THE THREE IT STARTED WITH (#4210 review, P2 — this is the
+    # mutation-attribution gap measured in the third review). `shard_exec` now strips all five; a probe
+    # that reports only three leaves `-u SHARD_COSTS` and `-u BASH_SHARD_STEP_BUDGET_SECS` asserted by
+    # NOTHING, so deleting either from the definition left every arm green while the comment above
+    # `shard_exec` ("THE STRIP IS THE WHOLE CONTRACT") claimed a guard that did not exist.
+    printf 'printf "PROBE COSTS=%%s\\n" "${SHARD_COSTS-<unset>}"\n'
+    printf 'printf "PROBE STEPBUDGET=%%s\\n" "${BASH_SHARD_STEP_BUDGET_SECS-<unset>}"\n'
     printf 'exit 0\n'
   } >"$1/tests/nnn-envprobe/run.sh"
 }
@@ -266,13 +273,22 @@ if stage_fixture "$ENVFIX" 0; then
   # `shard_exec` still passed the arm. `0` is an accepted companion to a slice (only a POSITIVE budget
   # conflicts, run-bash-shards.sh:407-411 — tests/ci-lane-parity/run.sh:1162 pins that pair), so a set
   # value is what makes this arm able to see the leak.
-  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
+  # ⛔ AND THE TWO REPORT KNOBS ARE SET FOR THAT SAME REASON (#4210 review, P2). `SHARD_COSTS` points at
+  # a path that does not exist on purpose: a nonexistent table is a SUPPORTED mode (the runner reads it
+  # as "no costs" and the deal degenerates to `pos % n`), so the value is legitimate config that changes
+  # NOTHING about the run — and a set-but-meaningful value is exactly what a shard would have inherited.
+  # `BASH_SHARD_STEP_BUDGET_SECS=0` is the accepted "off" spelling of the step-bound report for the same
+  # reason (`-u BASH_SHARDS_BUDGET_SECS=0` precedent above). Both are REPORT knobs: inheriting them can
+  # never drop a shard, but it makes a fixture print the caller's bound — which is the contract.
+  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 SHARD_COSTS="$TMP/envprobe-caller-costs.tsv" BASH_SHARD_STEP_BUDGET_SECS=0 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
   ENV_RC=$?
   if [ "$ENV_RC" -eq 0 ] \
     && grep -qx 'PROBE SHARD_BOUND=<unset>' "$TMP/envprobe.out" \
     && grep -qx 'PROBE BUDGET=<unset>' "$TMP/envprobe.out" \
-    && grep -qx 'PROBE SLICE=<unset>' "$TMP/envprobe.out"; then
-    pass "a shard run under BASH_SHARD_SLICE=1/1 SHARD_BOUND=0 sees NONE of them — a re-entrant suite cannot inherit its caller's dispatch"
+    && grep -qx 'PROBE SLICE=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE COSTS=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE STEPBUDGET=<unset>' "$TMP/envprobe.out"; then
+    pass "a shard run under BASH_SHARD_SLICE=1/1 SHARD_BOUND=0 sees NONE of the FIVE contract variables — a re-entrant suite cannot inherit its caller's dispatch, cost table or step budget"
   elif ! grep -q 'PROBE ' "$TMP/envprobe.out"; then
     fail "the probe shard did not run at all (rc $ENV_RC) — this arm cannot see an inherited value: $(printf '%s' "$(cat "$TMP/envprobe.out")" | tail -3 | tr '\n' '|')"
   else
@@ -294,13 +310,15 @@ if stage_fixture "$ENVFIX" 0; then
     if cmp -s "$RUNNER" "$MUTENV/scripts/runner-mutant.sh"; then
       fail "the dispatch-env mutation did not change the runner — the handover is not one \`env -u\` line, so this control has no control"
     else
-      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
+      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 SHARD_COSTS="$TMP/envprobe-caller-costs.tsv" BASH_SHARD_STEP_BUDGET_SECS=0 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
       MUTENV_RC=$?
       if [ "$MUTENV_RC" -eq 0 ] \
         && grep -qx 'PROBE SHARD_BOUND=0' "$TMP/envprobe-mutant.out" \
         && grep -qx 'PROBE BUDGET=0' "$TMP/envprobe-mutant.out" \
-        && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out"; then
-        pass "control: with the handover restored the same probe DOES see SLICE=1/1, BUDGET=0 and SHARD_BOUND=0 — this arm can see the leak it guards"
+        && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out" \
+        && grep -qxF "PROBE COSTS=$TMP/envprobe-caller-costs.tsv" "$TMP/envprobe-mutant.out" \
+        && grep -qx 'PROBE STEPBUDGET=0' "$TMP/envprobe-mutant.out"; then
+        pass "control: with the handover restored the same probe DOES see all FIVE injected values (SLICE=1/1, BUDGET=0, SHARD_BOUND=0, COSTS, STEPBUDGET=0) — this arm can see the leak it guards"
       else
         fail "the dispatch-env control did not observe the injected values (rc $MUTENV_RC): $(grep 'PROBE ' "$TMP/envprobe-mutant.out" | tr '\n' '|')"
       fi
@@ -924,7 +942,93 @@ else
     pass "a HUP carries the driver's bookkeeping away with it (all $((HUP_MADE * 3)) temp artifacts removed)"
   fi
 fi
-# 6f. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
+# 6f. THE SUCCESS PATH IS AN EXIT TOO — AND A GREEN RUN MUST LEAVE NOTHING BEHIND (#4210 review, P2;
+# the mutation-attribution gaps measured as rows 11 and 12). `shard_cleanup` is only ever reached through
+# `shard_exit`, and the run's tail used to be two bare `echo`s, so a GREEN sliced run left the
+# ran/skip/timeout logs, the assignment LIST, its `.map` and its `.map.err` in $TMPDIR on EVERY success —
+# while the contract stated lower in this suite's subject claims cleanup holds on every exit past the
+# logs' creation. Before this arm, deleting `shard_exit 0` OR dropping `${slice_assign_log}` /
+# `${slice_assign_list}` / `${assign_err}` from `shard_cleanup` left EVERY arm in this suite green.
+# ⛔ THE SHIM IS THE POINT: the paths are decided by `mktemp` at runtime, so the only hermetic way to see
+# them is to shim it and read back what it handed out. ⛔ AND THE CONTROL RE-INSTALLS BOTH DEFECTS on a
+# copy — a tail `exit 0` instead of `shard_exit 0`, and a `shard_cleanup` naming only the three logs —
+# and requires the SAME green fixture to leave `.map`, `.map.err` AND a bare path behind. Without that
+# half, an arm that could not observe a leak would certify the very cleanup it exists to forbid.
+GREENSIG="$TMP/green-slice"
+stage_fixture "$GREENSIG" 0
+mkdir -p "$TMP/mktemp-shim-green" "$TMP/green-tmp"
+cat >"$TMP/mktemp-shim-green/mktemp" <<MKTEMP
+#!/bin/bash
+p="\$(/usr/bin/mktemp "$TMP/green-tmp/tmp.XXXXXXXX")" || exit 1
+printf '%s\\n' "\$p" >>"$TMP/green-tmp/made"
+printf '%s\\n' "\$p"
+MKTEMP
+chmod +x "$TMP/mktemp-shim-green/mktemp"
+# Slice 1/2, not 1/1: `build_slice_assignment` returns early for a whole-list slice, and the assignment
+# list, its `.map` and its `.map.err` are three of the six artifacts this arm pins.
+green_leftovers() { # <made-file> — print every surviving artifact, one per line
+  local _p _s
+  while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    for _s in "" .skipped .timeout .map .map.err; do
+      [ -e "$_p$_s" ] && printf '%s\n' "$_p$_s"
+    done
+  done <"$1"
+  return 0
+}
+PATH="$TMP/mktemp-shim-green:$PATH" BASH_SHARD_SLICE=1/2 HANG_PID_DIR="$TMP/pids-green" \
+  bash "$GREENSIG/scripts/runner.sh" >"$TMP/green.out" 2>&1
+GREEN_RC=$?
+if [ "$GREEN_RC" -ne 0 ]; then
+  fail "the green-slice fixture did not pass (rc $GREEN_RC), so the success-path cleanup could not be measured: $(tail -3 "$TMP/green.out" | tr '\n' '|')"
+elif [ ! -s "$TMP/green-tmp/made" ]; then
+  fail "the mktemp shim was never used by the green run — the success-path cleanup assertion below would be vacuous"
+else
+  GREEN_LEFT="$(green_leftovers "$TMP/green-tmp/made")"
+  GREEN_N=0
+  [ -n "$GREEN_LEFT" ] && GREEN_N="$(printf '%s\n' "$GREEN_LEFT" | grep -c .)"
+  if [ "$GREEN_N" -ne 0 ]; then
+    fail "a GREEN sliced run left $GREEN_N temp artifact(s) behind (the success path did not reach shard_cleanup): $(printf '%s' "$GREEN_LEFT" | tr '\n' ' ')"
+  else
+    pass "a GREEN sliced run leaves NOTHING behind — ran/skip/timeout logs, the assignment list, its .map and its .map.err are all removed by the success exit"
+  fi
+fi
+# The control: both defects re-installed on a copy of the driver this suite stages.
+GREENMUT="$GREENSIG/scripts/runner-mutant-green.sh"
+sed -E 's#^shard_cleanup\(\) \{.*$#shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }#' \
+  "$GREENSIG/scripts/runner.sh" | sed -E 's/^shard_exit 0$/exit 0/' >"$GREENMUT"
+GREENMUT_OK=1
+cmp -s "$GREENSIG/scripts/runner.sh" "$GREENMUT" && GREENMUT_OK=0
+[ "$(grep -cxF 'exit 0' "$GREENMUT")" -eq $(( $(grep -cxF 'exit 0' "$GREENSIG/scripts/runner.sh") + 1 )) ] || GREENMUT_OK=0
+grep -qxF 'shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }' "$GREENMUT" || GREENMUT_OK=0
+if [ "$GREENMUT_OK" -eq 0 ]; then
+  fail "the success-path mutation did not apply to BOTH halves (tail \`shard_exit 0\` → \`exit 0\` and the cleanup list) — this control has no control"
+else
+  mkdir -p "$TMP/mktemp-shim-greenmut" "$TMP/greenmut-tmp"
+  cat >"$TMP/mktemp-shim-greenmut/mktemp" <<MKTEMP
+#!/bin/bash
+p="\$(/usr/bin/mktemp "$TMP/greenmut-tmp/tmp.XXXXXXXX")" || exit 1
+printf '%s\\n' "\$p" >>"$TMP/greenmut-tmp/made"
+printf '%s\\n' "\$p"
+MKTEMP
+  chmod +x "$TMP/mktemp-shim-greenmut/mktemp"
+  PATH="$TMP/mktemp-shim-greenmut:$PATH" BASH_SHARD_SLICE=1/2 HANG_PID_DIR="$TMP/pids-greenmut" \
+    bash "$GREENMUT" >"$TMP/greenmut.out" 2>&1
+  GREENMUT_RC=$?
+  GREENMUT_LEFT="$(green_leftovers "$TMP/greenmut-tmp/made")"
+  GREENMUT_N=0
+  [ -n "$GREENMUT_LEFT" ] && GREENMUT_N="$(printf '%s\n' "$GREENMUT_LEFT" | grep -c .)"
+  if [ "$GREENMUT_RC" -ne 0 ] || [ "$GREENMUT_N" -eq 0 ]; then
+    fail "the success-path control left NOTHING behind (rc $GREENMUT_RC) — this arm cannot see the leak it guards"
+  elif ! printf '%s\n' "$GREENMUT_LEFT" | grep -q '\.map\.err$' \
+    || ! printf '%s\n' "$GREENMUT_LEFT" | grep -q '\.map$' \
+    || ! printf '%s\n' "$GREENMUT_LEFT" | grep -qE '/tmp\.[A-Za-z0-9]+$'; then
+    fail "the control did not produce BOTH defect signatures with a leak ($GREENMUT_N artifact(s): $(printf '%s' "$GREENMUT_LEFT" | tr '\n' ' ')) — a .map/.map.err pair from the shortened cleanup, and a bare path from the missing \`shard_exit 0\`"
+  else
+    pass "control: with the tail \`exit 0\` and a \`shard_cleanup\` naming only the three logs, the SAME green sliced run leaves $GREENMUT_N artifact(s) — the idempotent exit and the map/.err removals are both load-bearing"
+  fi
+fi
+# 6g. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
 # is orphaned but still holding the bound — so this arm pins BOTH halves of the truth the PR body states:
 # with a bound on, the shard dies at the bound; with `SHARD_BOUND=0` there is no watchdog and it does not.
 KILLRES="$TMP/killres"
