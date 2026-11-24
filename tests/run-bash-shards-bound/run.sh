@@ -1894,6 +1894,27 @@ else
   fail "the red recap duplicated the per-shard bound (this-slice copies=$RB_SLICE_BOUND, applied lines=$RB_APPLIED, want 0 and 1; rc $RB_RC): $(grep 'per-shard bound' "$TMP/redbound.out" | tr '\n' ' ')"
 fi
 
+# ── N5g. THE THIRD CAPACITY BRANCH IS REACHED BY A FIXTURE (#4210 review 3, P3) ─────────────────
+# ⛔ THE BRANCH THAT HAD NO ARM: `slice_costs_known == 0` AND `shard_costs_table_present == 0` — a run
+# with a declared step bound, a real per-shard cost, and NO `bash-shard-costs.tsv` on disk at all. It
+# existed only as a negative grep in N5e (`! grep 'it has NO cost table'`), so deleting the branch
+# reddened NOTHING: a new code path with no positive assertion is invisible to the mutation pass it was
+# added under. Every other no-table fixture (FFIX/BFIX) declares no step bound and returns before the
+# guard, which is exactly why this one declares a bound and sleeps its shards.
+AFIX="$TMP/absenttablefixture"
+stage_measured_fixture "$AFIX" 1 ""
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2 SHARD_COSTS="$TMP/absent-not-written.tsv" \
+  bash "$AFIX/scripts/runner.sh" >"$TMP/absent.out" 2>&1
+ABS_RC=$?
+if [ "$ABS_RC" -eq 0 ] \
+   && grep -qE '⚠️  CAPACITY \(MEASURED\): this arm took [0-9]+s, [0-9]+% of the 2s step bound — and it has NO cost table, so no model exists to compare it against' "$TMP/absent.out" \
+   && ! grep -qF 'its cost table was NOT consulted for this run' "$TMP/absent.out" \
+   && ! grep -qF 'the cost table modelled' "$TMP/absent.out"; then
+  pass "a run with NO cost table on disk gets the third CAPACITY branch and claims neither a model nor a table it did not read — pre-fix this branch had no arm at all"
+else
+  fail "the no-table CAPACITY message was not the third branch (rc $ABS_RC, table=$( [ -f "$TMP/absent-not-written.tsv" ] && echo PRESENT || echo absent )): $(grep 'CAPACITY' "$TMP/absent.out" | tr '\n' ' ')"
+fi
+
 
 # ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
 printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"

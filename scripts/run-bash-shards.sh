@@ -1403,7 +1403,8 @@ shard_note() {
   printf '  ▸ %4ss  %s\n' "$2" "$1"
 }
 
-# recap_timing_line — the SLICE'S ACTUAL COST, printed on EVERY recap (green and red), plus the
+# recap_timing_line — the SLICE'S ACTUAL COST, printed on every recap that reaches it (the GREEN tail
+# and both RED tails: `shard_errors > 0`, and the TRUNCATED/partial recap), plus the
 # capacity verdict when the CLOCK — not only the model — says the arm is near its step bound.
 # ⛔⛔ WHAT THIS FIXES, MEASURED ON 5ea9c70a4 (agent-infra#4210): slice 7's shard phase ran 2356 s of
 # the 2400 s step bound — 98.2 %, 44 s from the kill this runner exists to warn about — and it printed
@@ -1411,6 +1412,11 @@ shard_note() {
 # arithmetic and blind by construction: the guard compared the COST TABLE'S SUM to the bound and never
 # once compared the bound to elapsed time. A table that under-predicts (that one did, by 411 s on the
 # worst arm) silences the warning exactly when the margin is gone.
+# ⛔ "EVERY recap that reaches it" IS NARROWER THAN "every recap", DELIBERATELY (#4210 review 3, P3).
+# `shard_budget_trip` is a THIRD red exit (`shard_exit 1`) and it does NOT call this function: it prints
+# its own cost in its own shape (`Ns of shard work against BASH_SHARDS_BUDGET_SECS=…`), so no cost is
+# lost there — but a contract comment that claims a call graph it does not have is the claim-mismatch
+# this change exists to remove, so the exception is named instead of averaged away.
 # ⛔ AND THE ARMS MOST AT RISK PRINTED THE LEAST: a FAILED recap printed no `this slice: Ns` line at
 # all (0 occurrences in the killed-at-recency jobs), so the longest-running arms had no actual number
 # anywhere in their log — the one reader who needed it could not see it. Both are why this is a
@@ -1910,9 +1916,15 @@ if [ "$shard_errors" -gt 0 ]; then
   # red arms, which are the long ones). Printed ONCE, at the verdict, so the cost is read before the
   # failure detail — and printed even when the naming arm could not name the failures, which is the
   # shape that used to lose it entirely.
-  # ⛔ `--no-bound`: the block below prints `⏱  per-shard bound applied:` itself, so passing the bound here
+  # ⛔ `--no-bound`: the NEXT line prints `⏱  per-shard bound applied:` itself, so passing the bound here
   # too would state it twice in three lines (#4210 review, P3).
+  # ⛔ AND THAT PREMISE IS NOW UNCONDITIONAL (#4210 review 3, P3). The bound line used to live INSIDE the
+  # `shard_failed_list` non-empty branch, so on the fall-through branches (failures COUNTED but none
+  # NAMED, or a broken naming arm) this red log carried the cost and no per-shard bound — i.e. the one
+  # justification for `--no-bound` did not hold on the branch it was written for. It is printed here, on
+  # every red path, exactly once.
   recap_timing_line --no-bound
+  echo "   ⏱  per-shard bound applied: ${shard_bound_desc}"
   # ⛔ THE VERDICT NAMES WHAT IT COUNTED (#2643). A red slice's log ends here, and the merge rail reads
   # its failure identity from the `❌ FAILED SHARD: <path>` line printed at the point of failure
   # (`scripts/ci_exemption.py`'s bash-shard pass); `❌ 1 bash shard(s) failed` alone is a red with no
@@ -1939,8 +1951,8 @@ if [ "$shard_errors" -gt 0 ]; then
       echo "⏱  TIMEOUT after ${shard_bound}s (SHARD_BOUND): $shard_timeout_list — killed its process group, counted as failed, and the run CONTINUED to the remaining shards"
     fi
     # ⛔ EVERY recap REPORTS THE BOUND THAT APPLIED (a red without a bound is a red whose truncation
-    # the reader has to guess at), not only the recaps where it fired.
-    echo "   ⏱  per-shard bound applied: ${shard_bound_desc}"
+    # the reader has to guess at), not only the recaps where it fired. ⛔ PRINTED ONCE, ABOVE, on ALL
+    # red paths (#4210 review 3, P3) — not here, where only a NAMED failure reached it.
     # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
     # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
     # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
