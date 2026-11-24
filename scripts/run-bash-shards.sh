@@ -496,6 +496,14 @@ fi
 TAB="$(printf '\t')"
 shard_costs_file="${SHARD_COSTS:-$SHARD_ROOT/scripts/bash-shard-costs.tsv}"
 shard_step_budget=0
+# ⛔ THE MEASURED GUARD'S THRESHOLD — percent of `BASH_SHARD_STEP_BUDGET_SECS` at which elapsed shard
+# work is reported as a CAPACITY problem even when the cost table says the arm is comfortable.
+# ⛔ NOT AN ENV KNOB, DELIBERATELY: this file's env contract is pinned by an arm in
+# `tests/run-bash-shards-bound/run.sh` (a caller may not inherit or inject runner behaviour), and a
+# threshold a caller can LOWER is a threshold a caller can silence — the exact failure class this fix
+# exists to close. 90 % leaves one tenth of the bound as the actionable margin; slice 7 measured 98 %
+# while reporting 81 %.
+shard_capacity_actual_pct=90
 if [ -n "${BASH_SHARD_STEP_BUDGET_SECS:-}" ]; then
   case "$BASH_SHARD_STEP_BUDGET_SECS" in
     off|OFF|Off|disabled|DISABLED|none|NONE|0) shard_step_budget=0 ;;
@@ -1389,6 +1397,45 @@ shard_note() {
   printf '  ▸ %4ss  %s\n' "$2" "$1"
 }
 
+# recap_timing_line — the SLICE'S ACTUAL COST, printed on EVERY recap (green and red), plus the
+# capacity verdict when the CLOCK — not only the model — says the arm is near its step bound.
+# ⛔⛔ WHAT THIS FIXES, MEASURED ON 5ea9c70a4 (agent-infra#4210): slice 7's shard phase ran 2356 s of
+# the 2400 s step bound — 98.2 %, 44 s from the kill this runner exists to warn about — and it printed
+# `worst arm 1945s of the 2400s step bound (81%)` with NO `⚠️ CAPACITY` line. It was correct by its own
+# arithmetic and blind by construction: the guard compared the COST TABLE'S SUM to the bound and never
+# once compared the bound to elapsed time. A table that under-predicts (that one did, by 411 s on the
+# worst arm) silences the warning exactly when the margin is gone.
+# ⛔ AND THE ARMS MOST AT RISK PRINTED THE LEAST: a FAILED recap printed no `this slice: Ns` line at
+# all (0 occurrences in the killed-at-recency jobs), so the longest-running arms had no actual number
+# anywhere in their log — the one reader who needed it could not see it. Both are why this is a
+# function called from BOTH exits instead of two echoes on the success path.
+# ⛔ `shard_time` is the SUM OF THE PER-SHARD ROWS, so it EXCLUDES the model's ~1 s/shard dead time and
+# any inter-shard overhead: it is a strict LOWER BOUND on the shard phase. That direction is the safe
+# one — the verdict fires only when the bound is genuinely near — and it is why the model figure is
+# printed beside it rather than replaced by it.
+recap_timing_line() {
+  if [ "$slice_count" -gt 0 ]; then
+    echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
+  else
+    echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
+  fi
+  # No declared step bound ⇒ there is no margin to report (the workflows declare one; a consumer or a
+  # fixture that declares none gets the actual and nothing else).
+  [ "$shard_step_budget" -gt 0 ] || return 0
+  # The sentinel run past the list leaves `shard_ran` restored and `shard_time` untouched (#2838), so a
+  # red-capable self-check never inflates this figure.
+  [ "$shard_ran" -gt 0 ] || return 0
+  local pct=$((shard_time * 100 / shard_step_budget))
+  [ "$pct" -ge "$shard_capacity_actual_pct" ] || return 0
+  if [ "$slice_costs_known" -gt 0 ]; then
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — the cost table modelled %ss (%s%% of it), so the MODEL UNDER-PREDICTS by %ss. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+      "$shard_time" "$pct" "$shard_step_budget" "$slice_load_this" "$((slice_load_this * 100 / shard_step_budget))" "$((shard_time - slice_load_this))"
+  else
+    printf '⚠️  CAPACITY (MEASURED): this arm took %ss, %s%% of the %ss step bound — and it has NO cost table, so no model exists to compare it against. The list has outgrown its matrix (#4210): add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope.\n' \
+      "$shard_time" "$pct" "$shard_step_budget"
+  fi
+}
+
 # One line on purpose: the execution and the counter that proves it happened are inseparable,
 # so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion. The skip
 # branch is that explicit rewrite, and it is COUNTED (`shard_skipped`) so a skipped shard can never
@@ -1805,6 +1852,11 @@ shard_budget_trip "(end of list)"
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
+  # ⛔ THE FAILED ARM CARRIES ITS ACTUAL TOO (#4210, measured: 0 occurrences of `this slice: Ns` on the
+  # red arms, which are the long ones). Printed ONCE, at the verdict, so the cost is read before the
+  # failure detail — and printed even when the naming arm could not name the failures, which is the
+  # shape that used to lose it entirely.
+  recap_timing_line
   # ⛔ THE VERDICT NAMES WHAT IT COUNTED (#2643). A red slice's log ends here, and the merge rail reads
   # its failure identity from the `❌ FAILED SHARD: <path>` line printed at the point of failure
   # (`scripts/ci_exemption.py`'s bash-shard pass); `❌ 1 bash shard(s) failed` alone is a red with no
@@ -1865,11 +1917,10 @@ if [ "$shard_errors" -gt 0 ]; then
 fi
 if [ "$slice_count" -gt 0 ]; then
   echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
-  echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
-  echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 fi
+recap_timing_line
 # ⛔ THE SUCCESS PATH IS AN EXIT TOO (#4210 review, P3). It was two bare `echo`s, so `shard_cleanup`
 # never ran on a GREEN run — the ran/skip/timeout logs (pre-existing) and this change's assignment map
 # were left in $TMPDIR on every successful slice. The cleanup contract is stated on `shard_cleanup`;

@@ -1770,6 +1770,69 @@ else
   fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
 fi
 
+# ── N5b. THE GUARD SEES THE CLOCK, NOT ONLY THE MODEL (#4210) ──────────────────────────────────
+# ⛔ THE DEFECT THIS PINS, MEASURED ON 5ea9c70a4 (`script-validate` slice 7, job 138226499842):
+#   its shard phase ran 2356 s of the 2400 s step bound — 98.2 %, 44 s from the kill — and it printed
+#   `worst arm 1945s of the 2400s step bound (81%)` with NO `⚠️ CAPACITY` line. Correct by its own
+#   arithmetic and blind by construction: the guard compared the COST TABLE'S SUM to the bound and
+#   never the CLOCK. The table under-predicted by 411 s, so the warning was silent in exactly the run
+#   that needed it. A model that is optimistic is the case a capacity guard EXISTS for.
+#   Two shards, two slices (so one shard per arm), the shard `sleep 5`, a step bound of 4 s and a table
+#   that models 2 s: the model reads 3s of 4s (75 %, silent) while the arm fully overruns.
+stage_measured_fixture() {
+  local root="$1" secs="$2" failpath="$3"
+  mkdir -p "$root/scripts/orchestrator-harness"
+  cp "$HELPER" "$root/scripts/orchestrator-harness/fixture-hermetic.sh"
+  cp "$RUNNER" "$root/scripts/runner.sh"
+  printf '#!/bin/bash\n:\n' >"$root/scripts/sweepable.sh"
+  local p
+  for p in "${failpath:+"$failpath"}" tests/m1/run.sh tests/m2/run.sh; do
+    [ -n "$p" ] || continue
+    mkdir -p "$root/$(dirname "$p")"
+    if [ "$p" = "$failpath" ]; then
+      printf '#!/bin/bash\nsleep %s\nexit 1\n' "$secs" >"$root/$p"
+    else
+      printf '#!/bin/bash\nsleep %s\nexit 0\n' "$secs" >"$root/$p"
+    fi
+    chmod +x "$root/$p"
+  done
+}
+MFIX="$TMP/measuredfixture"
+stage_measured_fixture "$MFIX" 5 ""
+printf '2\ttests/m2/run.sh\n' >"$TMP/measured.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=4 SHARD_COSTS="$TMP/measured.tsv" \
+  BASH_SHARD_SLICE=1/2 bash "$MFIX/scripts/runner.sh" >"$TMP/measured.out" 2>&1
+MEASURED_RC=$?
+# ⛔ BOTH HALVES ARE ASSERTED: the MEASURED verdict fires on the CLOCK, and the MODEL verdict is silent
+# — asserting only the first would pass on a runner that fired the old model check.
+if [ "$MEASURED_RC" -eq 0 ] \
+   && grep -qE '⚠️  CAPACITY \(MEASURED\): this arm took [0-9]+s, [0-9]+% of the 4s step bound' "$TMP/measured.out" \
+   && grep -qF 'the cost table modelled 3s' "$TMP/measured.out" \
+   && ! grep -qF 'CAPACITY: the modelled worst arm' "$TMP/measured.out"; then
+  pass "an arm that OVERRUNS on the clock is named even while the cost table models it at 75 % of the bound — pre-fix this run printed the model and stayed silent"
+else
+  fail "a clock-overrunning arm was not named (rc $MEASURED_RC): $(grep '🧮\|⏱\|CAPACITY' "$TMP/measured.out" | tr '\n' ' ')"
+fi
+
+# ── N5c. A FAILED ARM STILL REPORTS ITS ACTUAL (#4210) ─────────────────────────────────────
+# ⛔ MEASURED: 0 occurrences of `this slice: Ns of shard work` in the RED `script-validate` jobs, and
+# present in the passing one. The recal was printed only on the SUCCESS path, so the arms that ran
+# longest — the ones at risk of the bound — had no actual number in their log at all. A red recap must
+# report its cost for the same reason it reports the bound that applied: a red whose cost is unknown is
+# a red whose next step (fix a suite, or add matrix arms) cannot be chosen from the log.
+FFIX="$TMP/failrecapfixture"
+stage_measured_fixture "$FFIX" 1 tests/m1/run.sh
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$FFIX/scripts/runner.sh" >"$TMP/failrecap.out" 2>&1
+FAIL_RECAP_RC=$?
+if [ "$FAIL_RECAP_RC" -eq 1 ] \
+   && grep -q 'bash shard(s) failed' "$TMP/failrecap.out" \
+   && grep -qE '^   ⏱  this slice: [0-9]+s of shard work over [0-9]+ shard\(s\)' "$TMP/failrecap.out"; then
+  pass "a RED recap prints its actual shard-phase cost with the same shape as the green one — the log of a failed arm answers 'how long did this cost?' without a timeline reconstruction"
+else
+  fail "a red recap printed no actual cost line (rc $FAIL_RECAP_RC): $(tail -4 "$TMP/failrecap.out" | tr '\n' '|')"
+fi
+
+
 # ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
 printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \
