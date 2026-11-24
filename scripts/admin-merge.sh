@@ -1830,10 +1830,25 @@ declared_base_equivalent() {
       # ⛔ ARM-KEYED SINCE #3174: main's `script-validate` is a MATRIX (`shard: [1..8]`), so it
       # publishes `script-validate (1)` … `(8)` and NO check named `script-validate` exists any more
       # — returning the bare name would be the FALSE ABSENCE this whole block exists to abolish.
-      # Both lanes run the SAME derived list under the SAME round-robin rule, so arm k is a
-      # candidate counterpart for arm k, which is strictly MORE precise than the whole-job name it
+      # Both lanes run the SAME derived list under the SAME deal (the cost-aware assignment of
+      # `scripts/run-bash-shards.sh`, #4210; round-robin `pos % n` before it), so at equal widths arm k
+      # is a candidate counterpart for arm k, which is strictly MORE precise than the whole-job name it
       # replaces (it is still a candidate, never an identity — an arm red can be its own slice's or
       # its setup steps').
+      #
+      # ⛔ EQUAL WIDTH IS NOT ENOUGH SINCE #4210, AND THIS IS WHERE THAT MATTERS. The deal reads
+      # `scripts/bash-shard-costs.tsv` from the CHECKOUT, so arm k matches arm k EXACTLY only when
+      # (list, cost table, width) agree. When the two sides read DIFFERENT tables — every window where
+      # that table is edited, including the PR that introduced it, whose BASE has no table at all — arm
+      # k in the PR and arm k in the base hold DIFFERENT suites — MEASURED on the committed table at
+      # n=8, base round-robin vs PR LPT: 1-3 of ~26 shards shared per arm, never the same set — and
+      # this mapping is NAME-ONLY.
+      # ⚠️ THE FAIL-OPEN BOUND ON THAT: `base_owned_check` matches by NAME, so a PR-caused red in arm k
+      # can be excluded as base-owned against a base arm that ran different suites. It is bounded by the
+      # rail's other requirements (a base red must be MEASURED on the base's own surface), and it is a
+      # window that closes as soon as both sides carry the same table — but it is stated here rather
+      # than left for a reader of `declared_base_equivalent` to rediscover, and the durable fix is
+      # set-aware attribution (compare the arm's suite set, or key the equivalence on the table blob).
       #
       # ⚠️ STATED RESIDUAL — BOTH DIRECTIONS OF A WIDTH DIVERGENCE, because they are NOT the same
       # severity (review cycle 2, P2-5).
@@ -1841,8 +1856,8 @@ declared_base_equivalent() {
       #   publish, so the answer degrades to the pre-#2610 `NO BASE COUNTERPART` — the status quo ante,
       #   fail-closed, not a new worse state.
       #   ⛔ NARROWING (main wider than the PR): every PR arm DOES have a base arm, so the map succeeds
-      #   — but arm k is then a DISJOINT set of suites in the two lanes (both use the same `pos % n`
-      #   rule against different n), so the rail would print `base-caused via script-validate (3) ≡
+      #   — but arm k is then a DISJOINT set of suites in the two lanes (both use the same cost-aware
+      #   assignment rule against different n), so the rail would print `base-caused via script-validate (3) ≡
       #   bash-suites (3)` about two different bodies of work: a false ATTRIBUTION rather than a
       #   missing one. Nothing pins the two widths equal today; `check-ci-lane-parity.mjs` parses both
       #   axes and could compare them, which is the follow-up (agent-infra#3233).

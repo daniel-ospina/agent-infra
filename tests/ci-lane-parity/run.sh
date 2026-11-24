@@ -1764,9 +1764,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
@@ -1827,9 +1836,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
@@ -1946,9 +1964,18 @@ awk '{ a[NR] = $0 }
        dropfrom = 0; dropto = 0
        for (i = 1; i <= NR; i++)
          if (a[i] == "        env:") {
-           j = i + 1
-           while (j <= NR && a[j] ~ /^          #/) j++
-           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+           # ⛔ DROP THE WHOLE BLOCK, NOT "up to the BASH_SHARD_SLICE line". The block is every
+           # following line indented deeper than `        env:` — keys and comments alike — and the arm
+           # only fires when that block declares a slice. Dropping up to the slice line alone left a
+           # SIBLING key (the #4210 budget) dangling under no parent, so the fixture failed to PARSE and
+           # the arm reported a parse refusal instead of the placement it names (measured: 5 of 192 red
+           # the moment a second key joined that mapping).
+           j = i + 1; has = 0
+           while (j <= NR && a[j] ~ /^          /) {
+             if (a[j] ~ /^          BASH_SHARD_SLICE:/) has = 1
+             j++
+           }
+           if (has) { dropfrom = i; dropto = j - 1; break }
          }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
@@ -2503,8 +2530,13 @@ else
   # (b) THE DECLARED BUDGET IS ONE, and it is the SENTINEL's. A second declared call — appended after
   # the sentinel, which is the only shape that gets past the tally arm — must trip the budget and NAME
   # it, so a second sentinel cannot be added without raising `past_list_budget` deliberately.
-  cp "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-pastbudget.sh"
-  printf '%s\n' 'shard_past_list=1' "run_shard \"$CHEAP\"" 'shard_past_list=0' >>"$FIX/scripts/runner-pastbudget.sh"
+  # ⛔ INSERTED BEFORE THE TERMINAL EXIT, NOT APPENDED AT EOF (#4210). The runner now ends with
+  # `shard_exit 0` on the success path, so rows appended at EOF never execute — this arm went from
+  # passing to rc 0 (measured: 1 of 192 red) the moment that line landed. The mutation targets the
+  # terminal exit itself, which is the SHAPE the defect has: a call after the derived loop.
+  awk -v ins="shard_past_list=1\nrun_shard \"$CHEAP\"\nshard_past_list=0\n" \
+    '/^shard_exit 0$/ { printf "%s", ins } { print }' \
+    "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-pastbudget.sh"
   $FIXTURE_BOUND bash "$FIX/scripts/runner-pastbudget.sh" >"$TMP/runner-pastbudget.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-pastbudget.out")"
@@ -2947,7 +2979,12 @@ else
 fi
 # NON-VACUITY: every slice running slice-1's set keeps the COUNT right (9 % 3 == 0 ⇒ 3 each) and
 # must still fail — on the SET, not on the number.
-awk '{ if ($0 ~ /-eq "\$slice_index" \] && return 1/) { sub(/-eq "\$slice_index"/, "-eq 0"); print; next } print }' \
+# ⛔ THE MUTATION TARGETS THE DEAL, WHATEVER SPELLS IT (#4210). It was `[ $((slice_pos % n)) -eq
+# "$slice_index" ] && return 1`; the deal is now a bin-packed ASSIGNMENT MAP keyed by position, and its
+# skip line is `[ "$slice_have" = "$slice_index" ] && return 1`. Both shapes are mutated so this control
+# cannot go vacuous when the mechanism changes again — a mutation that matches nothing leaves the runner
+# unchanged, and the `cmp` below reports exactly that rather than passing over it.
+awk '{ if ($0 ~ /\[ "\$slice_have" = "\$slice_index" \] && return 1/) { sub(/= "\$slice_index"/, "= 0"); print; next } if ($0 ~ /-eq "\$slice_index" \] && return 1/) { sub(/-eq "\$slice_index"/, "-eq 0"); print; next } print }' \
   "$RUNNER" >"$PROBE2/scripts/runner-badmod.sh"
 if cmp -s "$RUNNER" "$PROBE2/scripts/runner-badmod.sh"; then
   fail "the broken-modulus mutation did not change the runner"

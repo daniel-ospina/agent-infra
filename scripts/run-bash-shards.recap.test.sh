@@ -124,7 +124,10 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
   echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
 fi
-unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
+# ⛔ FIVE, NOT THREE (#4210): the runner's env contract grew `SHARD_COSTS` and
+# `BASH_SHARD_STEP_BUDGET_SECS`, and its own `shard_exec` now strips all five — a suite that clears only
+# the original three leaves its fixture printing the caller's step-bound margin.
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE SHARD_COSTS BASH_SHARD_STEP_BUDGET_SECS
 
 # ⛔ THE FIXTURE MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING (#3011): a copy of the runner calls
 # `fixture_guard_placement` with the DEFAULT root set, so on a box with a live cell controller the
@@ -222,7 +225,7 @@ rm -f "$SLOW_SHARD_MARKER"
 # repro shell that exports the slice and runs THIS FILE rather than the runner) relies on this guard
 # alone.
 set -m
-env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS \
   bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
 kpid=$!
 set +m
@@ -311,7 +314,13 @@ fi
 # it is and is not. (Deliberately NOT a line number, here or in that note: a same-file pin drifts on
 # every edit above it, and this comment's own first draft carried one that had already gone stale.)
 # Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
-env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+# ⛔ FIVE, NOT THREE, HERE TOO (#4210 review, P3): this spawn site is the SAME fixture contract as ARM 1's
+# child above, and it still spelled the original three after the contract grew `SHARD_COSTS` and
+# `BASH_SHARD_STEP_BUDGET_SECS` — so under `ci.yml` (which exports `BASH_SHARD_STEP_BUDGET_SECS: 4200`)
+# this fixture could print the caller's step-bound margin, the exact hazard the ARM-1 comment names.
+# Its assertions did not red on the extra line, which is why a stated contract and its implementation can
+# drift apart silently: both spawn sites now carry the SAME five.
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS \
   bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
 COUT="$(cat "$TMP/complete.out" 2>/dev/null)"

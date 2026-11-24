@@ -112,7 +112,7 @@ FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # the same way per invocation: `env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`. Nothing is weakened
 # here — every bound this file asserts is still passed explicitly at its call site (§0 pins the
 # sanitisation, and reddens if this line is removed).
-unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE SHARD_COSTS BASH_SHARD_STEP_BUDGET_SECS
 trap 'rm -rf "$TMP"' EXIT
 
 # ⛔ THE HERMETICITY PROBE — how §0 asks THIS script what the environment handed it. It sits
@@ -122,6 +122,8 @@ if [ "${1:-}" = "--hermetic-probe" ]; then
   printf 'HERMETIC-PROBE SHARD_BOUND=%s\n' "${SHARD_BOUND-<unset>}"
   printf 'HERMETIC-PROBE BASH_SHARDS_BUDGET_SECS=%s\n' "${BASH_SHARDS_BUDGET_SECS-<unset>}"
   printf 'HERMETIC-PROBE BASH_SHARD_SLICE=%s\n' "${BASH_SHARD_SLICE-<unset>}"
+  printf 'HERMETIC-PROBE SHARD_COSTS=%s\n' "${SHARD_COSTS-<unset>}"
+  printf 'HERMETIC-PROBE BASH_SHARD_STEP_BUDGET_SECS=%s\n' "${BASH_SHARD_STEP_BUDGET_SECS-<unset>}"
   exit 0
 fi
 
@@ -189,13 +191,16 @@ stage_fixture() {
 # So the pin belongs here, with the pollution INJECTED BY THE SUITE, not by whatever shell runs it.
 echo "0. THE SUITE IS HERMETIC: AN INHERITED BOUND, BUDGET OR SLICE CANNOT REACH A FIXTURE (#3220)"
 PROBE_OUT="$TMP/hermetic-probe.out"
-SHARD_BOUND=5 BASH_SHARDS_BUDGET_SECS=7800 BASH_SHARD_SLICE=1/3 bash "$SELF" --hermetic-probe >"$PROBE_OUT" 2>&1
+SHARD_BOUND=5 BASH_SHARDS_BUDGET_SECS=7800 BASH_SHARD_SLICE=1/3 SHARD_COSTS=/tmp/should-not-survive.tsv \
+  BASH_SHARD_STEP_BUDGET_SECS=2400 bash "$SELF" --hermetic-probe >"$PROBE_OUT" 2>&1
 PROBE_RC=$?
 if [ "$PROBE_RC" -eq 0 ] \
   && grep -qx 'HERMETIC-PROBE SHARD_BOUND=<unset>' "$PROBE_OUT" \
   && grep -qx 'HERMETIC-PROBE BASH_SHARDS_BUDGET_SECS=<unset>' "$PROBE_OUT" \
-  && grep -qx 'HERMETIC-PROBE BASH_SHARD_SLICE=<unset>' "$PROBE_OUT"; then
-  pass "a re-exec carrying all three runner variables (SHARD_BOUND=5, BUDGET_SECS=7800, SLICE=1/3) sees NONE of them — no fixture can inherit a bound, a budget or a slice"
+  && grep -qx 'HERMETIC-PROBE BASH_SHARD_SLICE=<unset>' "$PROBE_OUT" \
+  && grep -qx 'HERMETIC-PROBE SHARD_COSTS=<unset>' "$PROBE_OUT" \
+  && grep -qx 'HERMETIC-PROBE BASH_SHARD_STEP_BUDGET_SECS=<unset>' "$PROBE_OUT"; then
+  pass "a re-exec carrying ALL FIVE runner variables (SHARD_BOUND, BUDGET_SECS, SLICE, SHARD_COSTS, STEP_BUDGET_SECS) sees NONE of them — no fixture can inherit a bound, a budget, a slice, a cost table or a step budget"
 else
   fail "the suite is NOT hermetic (rc $PROBE_RC) — an inherited runner variable survives into the fixtures: $(tr '\n' '|' <"$PROBE_OUT" | head -c 300)"
 fi
@@ -236,7 +241,7 @@ fi
 # real runner WITH a slice and a bound in its env, and require a shard to see neither. This arm is the
 # only place in the repo that can fail if someone restores the plain `bash "$1"` — the 18 affected
 # suites pass on a laptop, where nothing exports these, which is exactly why the leak survived.
-echo "0b. A SHARD CANNOT SEE THIS PROCESS'S SLICE, BUDGET OR BOUND (#3415/#2741)"
+echo "0b. A SHARD CANNOT SEE THIS PROCESS'S SLICE, BUDGET, BOUND, COST TABLE OR STEP BUDGET (#3415/#2741)"
 ENVFIX="$TMP/envfix"
 probe_shard() { # <root> — add a shard that reports the runner env it was handed
   mkdir -p "$1/tests/nnn-envprobe"
@@ -245,6 +250,13 @@ probe_shard() { # <root> — add a shard that reports the runner env it was hand
     printf 'printf "PROBE SHARD_BOUND=%%s\\n" "${SHARD_BOUND-<unset>}"\n'
     printf 'printf "PROBE BUDGET=%%s\\n" "${BASH_SHARDS_BUDGET_SECS-<unset>}"\n'
     printf 'printf "PROBE SLICE=%%s\\n" "${BASH_SHARD_SLICE-<unset>}"\n'
+    # ⛔ THE FIVE-VARIABLE CONTRACT, NOT THE THREE IT STARTED WITH (#4210 review, P2 — this is the
+    # mutation-attribution gap measured in the third review). `shard_exec` now strips all five; a probe
+    # that reports only three leaves `-u SHARD_COSTS` and `-u BASH_SHARD_STEP_BUDGET_SECS` asserted by
+    # NOTHING, so deleting either from the definition left every arm green while the comment above
+    # `shard_exec` ("THE STRIP IS THE WHOLE CONTRACT") claimed a guard that did not exist.
+    printf 'printf "PROBE COSTS=%%s\\n" "${SHARD_COSTS-<unset>}"\n'
+    printf 'printf "PROBE STEPBUDGET=%%s\\n" "${BASH_SHARD_STEP_BUDGET_SECS-<unset>}"\n'
     printf 'exit 0\n'
   } >"$1/tests/nnn-envprobe/run.sh"
 }
@@ -261,13 +273,22 @@ if stage_fixture "$ENVFIX" 0; then
   # `shard_exec` still passed the arm. `0` is an accepted companion to a slice (only a POSITIVE budget
   # conflicts, run-bash-shards.sh:407-411 — tests/ci-lane-parity/run.sh:1162 pins that pair), so a set
   # value is what makes this arm able to see the leak.
-  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
+  # ⛔ AND THE TWO REPORT KNOBS ARE SET FOR THAT SAME REASON (#4210 review, P2). `SHARD_COSTS` points at
+  # a path that does not exist on purpose: a nonexistent table is a SUPPORTED mode (the runner reads it
+  # as "no costs" and the deal degenerates to `pos % n`), so the value is legitimate config that changes
+  # NOTHING about the run — and a set-but-meaningful value is exactly what a shard would have inherited.
+  # `BASH_SHARD_STEP_BUDGET_SECS=0` is the accepted "off" spelling of the step-bound report for the same
+  # reason (`-u BASH_SHARDS_BUDGET_SECS=0` precedent above). Both are REPORT knobs: inheriting them can
+  # never drop a shard, but it makes a fixture print the caller's bound — which is the contract.
+  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 SHARD_COSTS="$TMP/envprobe-caller-costs.tsv" BASH_SHARD_STEP_BUDGET_SECS=0 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
   ENV_RC=$?
   if [ "$ENV_RC" -eq 0 ] \
     && grep -qx 'PROBE SHARD_BOUND=<unset>' "$TMP/envprobe.out" \
     && grep -qx 'PROBE BUDGET=<unset>' "$TMP/envprobe.out" \
-    && grep -qx 'PROBE SLICE=<unset>' "$TMP/envprobe.out"; then
-    pass "a shard run under BASH_SHARD_SLICE=1/1 SHARD_BOUND=0 sees NONE of them — a re-entrant suite cannot inherit its caller's dispatch"
+    && grep -qx 'PROBE SLICE=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE COSTS=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE STEPBUDGET=<unset>' "$TMP/envprobe.out"; then
+    pass "a shard run under BASH_SHARD_SLICE=1/1 SHARD_BOUND=0 sees NONE of the FIVE contract variables — a re-entrant suite cannot inherit its caller's dispatch, cost table or step budget"
   elif ! grep -q 'PROBE ' "$TMP/envprobe.out"; then
     fail "the probe shard did not run at all (rc $ENV_RC) — this arm cannot see an inherited value: $(printf '%s' "$(cat "$TMP/envprobe.out")" | tail -3 | tr '\n' '|')"
   else
@@ -280,18 +301,24 @@ if stage_fixture "$ENVFIX" 0; then
   MUTENV="$TMP/envfix-mutant"
   if stage_fixture "$MUTENV" 0; then
     probe_shard "$MUTENV"
-    sed 's|env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash|bash|' \
+    # ⛔ THE MUTATION MUST NAME THE SHAPE, NOT ONE SPELLING OF IT (#4210). It used to spell out the
+    # three `-u` pairs; the contract grew two more, `shard_exec` changed, and the `sed` then matched
+    # NOTHING — the `cmp` below correctly reported a vacuous control rather than passing over it. A
+    # whole-handover strip is what the arm means: remove every `-u`, keep the `bash`.
+    sed -E 's|env -u [^ ]+( -u [^ ]+)* bash|bash|' \
       "$RUNNER" >"$MUTENV/scripts/runner-mutant.sh"
     if cmp -s "$RUNNER" "$MUTENV/scripts/runner-mutant.sh"; then
       fail "the dispatch-env mutation did not change the runner — the handover is not one \`env -u\` line, so this control has no control"
     else
-      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
+      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 SHARD_COSTS="$TMP/envprobe-caller-costs.tsv" BASH_SHARD_STEP_BUDGET_SECS=0 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
       MUTENV_RC=$?
       if [ "$MUTENV_RC" -eq 0 ] \
         && grep -qx 'PROBE SHARD_BOUND=0' "$TMP/envprobe-mutant.out" \
         && grep -qx 'PROBE BUDGET=0' "$TMP/envprobe-mutant.out" \
-        && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out"; then
-        pass "control: with the handover restored the same probe DOES see SLICE=1/1, BUDGET=0 and SHARD_BOUND=0 — this arm can see the leak it guards"
+        && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out" \
+        && grep -qxF "PROBE COSTS=$TMP/envprobe-caller-costs.tsv" "$TMP/envprobe-mutant.out" \
+        && grep -qx 'PROBE STEPBUDGET=0' "$TMP/envprobe-mutant.out"; then
+        pass "control: with the handover restored the same probe DOES see all FIVE injected values (SLICE=1/1, BUDGET=0, SHARD_BOUND=0, COSTS, STEPBUDGET=0) — this arm can see the leak it guards"
       else
         fail "the dispatch-env control did not observe the injected values (rc $MUTENV_RC): $(grep 'PROBE ' "$TMP/envprobe-mutant.out" | tr '\n' '|')"
       fi
@@ -915,7 +942,93 @@ else
     pass "a HUP carries the driver's bookkeeping away with it (all $((HUP_MADE * 3)) temp artifacts removed)"
   fi
 fi
-# 6f. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
+# 6f. THE SUCCESS PATH IS AN EXIT TOO — AND A GREEN RUN MUST LEAVE NOTHING BEHIND (#4210 review, P2;
+# the mutation-attribution gaps measured as rows 11 and 12). `shard_cleanup` is only ever reached through
+# `shard_exit`, and the run's tail used to be two bare `echo`s, so a GREEN sliced run left the
+# ran/skip/timeout logs, the assignment LIST, its `.map` and its `.map.err` in $TMPDIR on EVERY success —
+# while the contract stated lower in this suite's subject claims cleanup holds on every exit past the
+# logs' creation. Before this arm, deleting `shard_exit 0` OR dropping `${slice_assign_log}` /
+# `${slice_assign_list}` / `${assign_err}` from `shard_cleanup` left EVERY arm in this suite green.
+# ⛔ THE SHIM IS THE POINT: the paths are decided by `mktemp` at runtime, so the only hermetic way to see
+# them is to shim it and read back what it handed out. ⛔ AND THE CONTROL RE-INSTALLS BOTH DEFECTS on a
+# copy — a tail `exit 0` instead of `shard_exit 0`, and a `shard_cleanup` naming only the three logs —
+# and requires the SAME green fixture to leave `.map`, `.map.err` AND a bare path behind. Without that
+# half, an arm that could not observe a leak would certify the very cleanup it exists to forbid.
+GREENSIG="$TMP/green-slice"
+stage_fixture "$GREENSIG" 0
+mkdir -p "$TMP/mktemp-shim-green" "$TMP/green-tmp"
+cat >"$TMP/mktemp-shim-green/mktemp" <<MKTEMP
+#!/bin/bash
+p="\$(/usr/bin/mktemp "$TMP/green-tmp/tmp.XXXXXXXX")" || exit 1
+printf '%s\\n' "\$p" >>"$TMP/green-tmp/made"
+printf '%s\\n' "\$p"
+MKTEMP
+chmod +x "$TMP/mktemp-shim-green/mktemp"
+# Slice 1/2, not 1/1: `build_slice_assignment` returns early for a whole-list slice, and the assignment
+# list, its `.map` and its `.map.err` are three of the six artifacts this arm pins.
+green_leftovers() { # <made-file> — print every surviving artifact, one per line
+  local _p _s
+  while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    for _s in "" .skipped .timeout .map .map.err; do
+      [ -e "$_p$_s" ] && printf '%s\n' "$_p$_s"
+    done
+  done <"$1"
+  return 0
+}
+PATH="$TMP/mktemp-shim-green:$PATH" BASH_SHARD_SLICE=1/2 HANG_PID_DIR="$TMP/pids-green" \
+  bash "$GREENSIG/scripts/runner.sh" >"$TMP/green.out" 2>&1
+GREEN_RC=$?
+if [ "$GREEN_RC" -ne 0 ]; then
+  fail "the green-slice fixture did not pass (rc $GREEN_RC), so the success-path cleanup could not be measured: $(tail -3 "$TMP/green.out" | tr '\n' '|')"
+elif [ ! -s "$TMP/green-tmp/made" ]; then
+  fail "the mktemp shim was never used by the green run — the success-path cleanup assertion below would be vacuous"
+else
+  GREEN_LEFT="$(green_leftovers "$TMP/green-tmp/made")"
+  GREEN_N=0
+  [ -n "$GREEN_LEFT" ] && GREEN_N="$(printf '%s\n' "$GREEN_LEFT" | grep -c .)"
+  if [ "$GREEN_N" -ne 0 ]; then
+    fail "a GREEN sliced run left $GREEN_N temp artifact(s) behind (the success path did not reach shard_cleanup): $(printf '%s' "$GREEN_LEFT" | tr '\n' ' ')"
+  else
+    pass "a GREEN sliced run leaves NOTHING behind — ran/skip/timeout logs, the assignment list, its .map and its .map.err are all removed by the success exit"
+  fi
+fi
+# The control: both defects re-installed on a copy of the driver this suite stages.
+GREENMUT="$GREENSIG/scripts/runner-mutant-green.sh"
+sed -E 's#^shard_cleanup\(\) \{.*$#shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }#' \
+  "$GREENSIG/scripts/runner.sh" | sed -E 's/^shard_exit 0$/exit 0/' >"$GREENMUT"
+GREENMUT_OK=1
+cmp -s "$GREENSIG/scripts/runner.sh" "$GREENMUT" && GREENMUT_OK=0
+[ "$(grep -cxF 'exit 0' "$GREENMUT")" -eq $(( $(grep -cxF 'exit 0' "$GREENSIG/scripts/runner.sh") + 1 )) ] || GREENMUT_OK=0
+grep -qxF 'shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }' "$GREENMUT" || GREENMUT_OK=0
+if [ "$GREENMUT_OK" -eq 0 ]; then
+  fail "the success-path mutation did not apply to BOTH halves (tail \`shard_exit 0\` → \`exit 0\` and the cleanup list) — this control has no control"
+else
+  mkdir -p "$TMP/mktemp-shim-greenmut" "$TMP/greenmut-tmp"
+  cat >"$TMP/mktemp-shim-greenmut/mktemp" <<MKTEMP
+#!/bin/bash
+p="\$(/usr/bin/mktemp "$TMP/greenmut-tmp/tmp.XXXXXXXX")" || exit 1
+printf '%s\\n' "\$p" >>"$TMP/greenmut-tmp/made"
+printf '%s\\n' "\$p"
+MKTEMP
+  chmod +x "$TMP/mktemp-shim-greenmut/mktemp"
+  PATH="$TMP/mktemp-shim-greenmut:$PATH" BASH_SHARD_SLICE=1/2 HANG_PID_DIR="$TMP/pids-greenmut" \
+    bash "$GREENMUT" >"$TMP/greenmut.out" 2>&1
+  GREENMUT_RC=$?
+  GREENMUT_LEFT="$(green_leftovers "$TMP/greenmut-tmp/made")"
+  GREENMUT_N=0
+  [ -n "$GREENMUT_LEFT" ] && GREENMUT_N="$(printf '%s\n' "$GREENMUT_LEFT" | grep -c .)"
+  if [ "$GREENMUT_RC" -ne 0 ] || [ "$GREENMUT_N" -eq 0 ]; then
+    fail "the success-path control left NOTHING behind (rc $GREENMUT_RC) — this arm cannot see the leak it guards"
+  elif ! printf '%s\n' "$GREENMUT_LEFT" | grep -q '\.map\.err$' \
+    || ! printf '%s\n' "$GREENMUT_LEFT" | grep -q '\.map$' \
+    || ! printf '%s\n' "$GREENMUT_LEFT" | grep -qE '/tmp\.[A-Za-z0-9]+$'; then
+    fail "the control did not produce BOTH defect signatures with a leak ($GREENMUT_N artifact(s): $(printf '%s' "$GREENMUT_LEFT" | tr '\n' ' ')) — a .map/.map.err pair from the shortened cleanup, and a bare path from the missing \`shard_exit 0\`"
+  else
+    pass "control: with the tail \`exit 0\` and a \`shard_cleanup\` naming only the three logs, the SAME green sliced run leaves $GREENMUT_N artifact(s) — the idempotent exit and the map/.err removals are both load-bearing"
+  fi
+fi
+# 6g. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
 # is orphaned but still holding the bound — so this arm pins BOTH halves of the truth the PR body states:
 # with a bound on, the shard dies at the bound; with `SHARD_BOUND=0` there is no watchdog and it does not.
 KILLRES="$TMP/killres"
@@ -1530,6 +1643,193 @@ else
     pass "control: a timer firing at HALF the configured bound reds that same shard — the arm can see a mistimed bound"
   else
     fail "control: a half-length timer did not red the 4s shard (rc $HALF_RC): $(printf '%s' "$HOUT" | tail -2 | tr '\n' '|')"
+  fi
+fi
+
+echo ""
+echo "N. THE SLICE DEAL IS COST-AWARE, AND WITHOUT COSTS IT IS THE OLD ROUND-ROBIN (#4210)"
+# ⛔ THE DEFECT THIS PINS, measured on head 1d048d372: `pos % n` is COST-BLIND, so the heavy suites
+# cluster by luck. Summed from the runner's own `▸` rows, the 8 arms of `script-validate` held 3374 s
+# worst against a 2400 s step bound (140%) and 730 s lightest, and three arms were killed at the bound
+# before printing a recap. The lane could not finish, so main stayed red for four consecutive heads.
+#
+# ⛔ AND IT PINS THE OTHER HALF, WHICH IS THE SAFETY PROPERTY: a tree with no measured cost table (every
+# fixture, every consumer) must keep the OLD membership byte for byte. That is what makes this a safe
+# change to the runner every lane depends on — so it is asserted against the arithmetic itself, not
+# claimed in a comment.
+#   tests/c1 … tests/c9, each `exit 0`
+#   the cost table marks c1 and c4 HEAVY — the pair round-robin deals to the SAME arm (positions 0 and 3
+#   with n=3), which is exactly the clustering the packing has to break.
+stage_cost_fixture() {
+  local root="$1" i
+  mkdir -p "$root/scripts/orchestrator-harness"
+  cp "$HELPER" "$root/scripts/orchestrator-harness/fixture-hermetic.sh"
+  cp "$RUNNER" "$root/scripts/runner.sh"
+  printf '#!/bin/bash\n:\n' >"$root/scripts/sweepable.sh"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    mkdir -p "$root/tests/c$i"
+    printf '#!/bin/bash\nexit 0\n' >"$root/tests/c$i/run.sh"
+    chmod +x "$root/tests/c$i/run.sh"
+  done
+}
+
+CFIX="$TMP/costfixture"
+stage_cost_fixture "$CFIX"
+COST_TABLE="$TMP/costs.tsv"
+{
+  printf '900\ttests/c1/run.sh\n'
+  printf '900\ttests/c4/run.sh\n'
+  for i in 2 3 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i"; done
+} >"$COST_TABLE"
+
+# slice_members <outfile> <slice> <count> — the paths the run executed, one per line, sorted.
+slice_members() {
+  grep -E '^  ▸ +[0-9]+s  ' "$1" | sed -E 's|^  ▸ +[0-9]+s  ||' | LC_ALL=C sort
+}
+
+# ── N1/N2. THE BASELINE: no table, round-robin, and the two heavy shards CLUSTER ────────────────
+for _i in 1 2 3; do
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=$_i/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-none-$_i.out" 2>&1
+done
+NONE_THREE_EACH=1
+for _i in 1 2 3; do
+  [ "$(slice_members "$TMP/cost-none-$_i.out" | grep -c .)" = 3 ] || NONE_THREE_EACH=0
+done
+NONE_UNION="$({ slice_members "$TMP/cost-none-1.out"; slice_members "$TMP/cost-none-2.out"; slice_members "$TMP/cost-none-3.out"; } | LC_ALL=C sort -u | grep -c .)"
+if [ "$NONE_THREE_EACH" -eq 1 ] && [ "$NONE_UNION" = 9 ]; then
+  pass "with NO cost table the deal covers all 9 shards, 3 per arm — the positional round-robin this change had to preserve"
+else
+  fail "the cost-free deal does not cover the list (three-each=$NONE_THREE_EACH, union=$NONE_UNION of 9)"
+fi
+NONE_CLUSTERED=0
+grep -q 'tests/c1/run.sh' "$TMP/cost-none-1.out" && grep -q 'tests/c4/run.sh' "$TMP/cost-none-1.out" && NONE_CLUSTERED=1
+if [ "$NONE_CLUSTERED" -eq 1 ]; then
+  pass "control: cost-blind round-robin puts BOTH heavy shards (c1, c4) on arm 1 — the clustering the packing exists to break"
+else
+  fail "the control did not cluster c1+c4 on one arm, so the packing arm below proves nothing: $(slice_members "$TMP/cost-none-1.out" | tr '\n' ' ')"
+fi
+if grep -q 'NO measured costs' "$TMP/cost-none-1.out"; then
+  pass "the cost-free run SAYS it is the positional round-robin (the mode is never left to be inferred)"
+else
+  fail "the cost-free run does not state which deal it used"
+fi
+# ⛔ THE UNMODELLED BRANCH IS PINNED HERE (review cycle 4, P2). The arms above run WITHOUT a budget,
+# so they never reach the branch that decides whether a stepped bound may report a load, and `/UNMODELLED/`
+# existed nowhere but the script — meaning the pre-fix behaviour (`3s of the 2400s step bound (0%)`, a
+# percentage computed from a table that does not exist, with `⚠️ CAPACITY` therefore inert) reverted
+# GREEN. A declared bound with NO cost table must now say it is unmodelled, and must print no
+# percentage at all.
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 BASH_SHARD_SLICE=1/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-none-budget.out" 2>&1 || true
+if grep -qF ' — step bound 2400s, UNMODELLED (no cost table: the split is positional, so no load can be reported)' "$TMP/cost-none-budget.out" \
+   && ! grep -q 'step bound (' "$TMP/cost-none-budget.out"; then
+  pass "a cost-free run with a DECLARED bound reports the bound as UNMODELLED — it prints no percentage it cannot stand behind"
+else
+  fail "a cost-free run with a bound either reported a load or said nothing about the bound: $(grep '🧮' "$TMP/cost-none-budget.out" | tr '\n' ' ')"
+fi
+
+# ── N3/N4. WITH the table: the heavy pair is SPLIT, coverage is still exact ─────────────────────
+for _i in 1 2 3; do
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$COST_TABLE" \
+    BASH_SHARD_SLICE=$_i/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-yes-$_i.out" 2>&1 || true
+done
+ARM_OF_C1="$(grep -l 'tests/c1/run.sh' "$TMP/cost-yes-1.out" "$TMP/cost-yes-2.out" "$TMP/cost-yes-3.out" 2>/dev/null | sed 's|.*cost-yes-||; s|\.out||')"
+ARM_OF_C4="$(grep -l 'tests/c4/run.sh' "$TMP/cost-yes-1.out" "$TMP/cost-yes-2.out" "$TMP/cost-yes-3.out" 2>/dev/null | sed 's|.*cost-yes-||; s|\.out||')"
+if [ -n "$ARM_OF_C1" ] && [ -n "$ARM_OF_C4" ] && [ "$ARM_OF_C1" != "$ARM_OF_C4" ]; then
+  pass "with measured costs the two heavy shards land on DIFFERENT arms (c1 → arm $ARM_OF_C1, c4 → arm $ARM_OF_C4)"
+else
+  fail "the heavy pair was not split (c1 → '${ARM_OF_C1}', c4 → '${ARM_OF_C4}')"
+fi
+YES_UNION="$({ slice_members "$TMP/cost-yes-1.out"; slice_members "$TMP/cost-yes-2.out"; slice_members "$TMP/cost-yes-3.out"; } | LC_ALL=C sort -u | grep -c .)"
+YES_TOTAL="$({ slice_members "$TMP/cost-yes-1.out"; slice_members "$TMP/cost-yes-2.out"; slice_members "$TMP/cost-yes-3.out"; } | grep -c .)"
+if [ "$YES_UNION" = 9 ] && [ "$YES_TOTAL" = 9 ]; then
+  pass "the packed deal still covers all 9 shards EXACTLY once (no shard dropped, none run twice)"
+else
+  fail "the packed deal changed coverage (union=$YES_UNION, executed=$YES_TOTAL, want 9/9)"
+fi
+# The figure carries the per-shard dead time the runner adds to the model (+1 s/shard), so the
+# assertion pins the SHAPE and the bound rather than a literal that a documented model change moves.
+# ⛔ EXACT FIGURES, AND THE DISCLOSURE PINNED LITERALLY (review cycle 2, P3). `90[0-9]` matched 900 —
+# i.e. a model that DROPS the per-shard dead time — and the `.*` swallowed the disclosure text, so
+# deleting it left this arm green. The fixture's heavy shard is 900 s and its arm holds ONE shard, so
+# the model must read 901 (900 + 1 s dead time).
+if grep -qF '🧮 slice 1/3: cost-aware assignment of 9 shard(s) — this arm models 901s (~1 s/shard dead time, measured 1.16 s; syntax sweep excluded), worst arm 901s of the 2400s step bound (37%)' "$TMP/cost-yes-1.out"; then
+  pass "the run reports its modelled load AND the declared step bound, so capacity is readable without bisecting a log"
+else
+  fail "no modelled-load line against the declared bound: $(grep '🧮' "$TMP/cost-yes-1.out" | tr '\n' ' ')"
+fi
+
+# ── N5. AN OVER-BUDGET TABLE IS NAMED, NOT SILENT ──────────────────────────────────────────────
+printf '5000\ttests/c1/run.sh\n' >"$TMP/over.tsv"
+for i in 2 3 4 5 6 7 8 9; do printf '10\ttests/c%s/run.sh\n' "$i" >>"$TMP/over.tsv"; done
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2400 SHARD_COSTS="$TMP/over.tsv" \
+  BASH_SHARD_SLICE=1/3 bash "$CFIX/scripts/runner.sh" >"$TMP/cost-over.out" 2>&1 || true
+if grep -qF 'CAPACITY: the modelled worst arm is 5001s against a 2400s step bound' "$TMP/cost-over.out"; then
+  pass "a modelled arm OVER the step bound is named as a CAPACITY problem (the growth risk, said where a reader sees it)"
+else
+  fail "an over-budget arm printed no CAPACITY line: $(grep '🧮\|CAPACITY' "$TMP/cost-over.out" | tr '\n' ' ')"
+fi
+
+# ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
+printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-junk.out" 2>&1
+JUNK_RC=$?
+if [ "$JUNK_RC" -eq 0 ] && [ "$(slice_members "$TMP/cost-junk.out" | grep -c .)" = 3 ]; then
+  pass "a malformed cost table (non-numeric seconds, blank rows, a bare number) is tolerated: rc 0, the arm still runs its 3 shards"
+else
+  fail "a malformed cost table changed the run (rc $JUNK_RC, shards=$(slice_members "$TMP/cost-junk.out" | grep -c .)): $(tail -3 "$TMP/cost-junk.out" | tr '\n' '|')"
+fi
+
+# ── N7. THE COVERAGE IDENTITY CHECK STILL SEES A BROKEN DEAL (non-vacuity of the new map) ───────
+# The map is now a FILE, so the mutation is the one line `slice_skips` consults: pin every position to
+# arm 0. That keeps the COUNT right on a slice whose share happens to be 0 — the set assertion is what
+# must fire, and it is the whole reason the check compares identities rather than counts.
+awk '{ if ($0 ~ /\[ "\$slice_have" = "\$slice_index" \] && return 1/) { sub(/= "\$slice_index"/, "= 0"); print; next } print }' \
+  "$RUNNER" >"$CFIX/scripts/runner-pin0.sh"
+if cmp -s "$RUNNER" "$CFIX/scripts/runner-pin0.sh"; then
+  fail "the pin-to-arm-0 mutation did not change the runner — the identity-check arm below would be vacuous"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=2/3 bash "$CFIX/scripts/runner-pin0.sh" >"$TMP/cost-pin0.out" 2>&1
+  PIN_RC=$?
+  if [ "$PIN_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' "$TMP/cost-pin0.out"; then
+    pass "control: a deal that pins every position to arm 0 is caught by the SET assertion (rc 1), not reported green"
+  else
+    fail "a broken deal was not caught on the set (rc $PIN_RC): $(tail -2 "$TMP/cost-pin0.out" | tr '\n' '|')"
+  fi
+fi
+
+# ── N7b. "ABSENT" AND "UNPARSABLE" MUST NOT READ THE SAME (#4210 review, P3) ────────────────────
+# A table that EXISTS but yields no numeric row is a format problem, not a missing path, and the two
+# point an operator at different actions. The fixture is the same 9-shard tree, so the only difference
+# from N1 is the file's presence.
+printf '# only comments and junk\nnot-a-number\ttests/c1/run.sh\n' >"$TMP/empty-table.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/empty-table.tsv" BASH_SHARD_SLICE=1/3 \
+  bash "$CFIX/scripts/runner.sh" >"$TMP/cost-empty.out" 2>&1
+if grep -qF "present but declares NO numeric cost row" "$TMP/cost-empty.out" \
+   && ! grep -qF "NO measured costs ($TMP/empty-table.tsv: absent)" "$TMP/cost-empty.out"; then
+  pass "a present-but-unparsable table is reported as a FORMAT problem, not as an absent path"
+else
+  fail "an unparsable table was reported as absent (or not at all): $(grep '🧮' "$TMP/cost-empty.out" | tr '\n' ' ')"
+fi
+
+# ── N8. A HOLE IN THE MAP IS A REFUSAL, NOT A SILENT SKIP (#4210 review, P2) ────────────────────
+# The map is the ONE artifact both the skip decision and the coverage check read, so a missing position
+# is the one shape that could hide: the skip would drop the shard and the identity check would agree
+# with the drop. `slice_skips` therefore refuses. This arm builds that state (the builder's row loop
+# starts at position 1 instead of 0) and requires the NAMED refusal at rc 2 — not the coverage check's
+# "DIFFERENT SET", which would name the symptom instead of the hole.
+awk '{ if ($0 ~ /for \(i = 0; i < listn; i\+\+\) printf "%d\\t%d\\t%s\\n", i, asg\[i\], pos\[i\]/) { sub(/i = 0;/, "i = 1;"); print; next } print }' \
+  "$RUNNER" >"$CFIX/scripts/runner-hole.sh"
+if cmp -s "$RUNNER" "$CFIX/scripts/runner-hole.sh"; then
+  fail "the map-hole mutation did not change the runner — the refusal arm below would be vacuous"
+else
+  HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=2/3 bash "$CFIX/scripts/runner-hole.sh" >"$TMP/cost-hole.out" 2>&1
+  HOLE_RC=$?
+  if [ "$HOLE_RC" -eq 2 ] && grep -q 'NO slice in the assignment map' "$TMP/cost-hole.out"; then
+    pass "control: a position missing from the assignment map REFUSES the run (rc 2) and names the hole — it is never skipped"
+  else
+    fail "a hole in the map was not refused by name (rc $HOLE_RC): $(tail -2 "$TMP/cost-hole.out" | tr '\n' '|')"
   fi
 fi
 

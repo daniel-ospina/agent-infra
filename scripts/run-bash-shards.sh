@@ -74,6 +74,18 @@
 #
 # ENVIRONMENT CONTRACT (complete — a caller that sets anything else changes nothing here):
 #   BASH_SHARD_SLICE      <i>/<n> — run only slice i of n. Slicing is a MATRIX concern (below).
+#   SHARD_COSTS           path to the MEASURED cost table the slice assignment packs by. Default
+#                         `<checkout>/scripts/bash-shard-costs.tsv`; that file's own header carries the
+#                         format and the refresh procedure. ABSENT IS NOT AN ERROR: with no table every
+#                         shard weighs the same and the deal is the POSITIONAL round-robin it replaced,
+#                         which the run states in its own recap rather than leaving a reader to infer.
+#   BASH_SHARD_STEP_BUDGET_SECS  whole seconds (0/'off' disables), OPTIONAL. The CI step bound this
+#                         slice has to fit inside. It is used ONLY to report each run's modelled load
+#                         against that bound (and to name the growth risk when it stops fitting); it
+#                         changes nothing about which shards run. Absent OR SET-BUT-EMPTY = no
+#                         margin is reported (deliberate divergence from `BASH_SHARDS_BUDGET_SECS`, which
+#                         REFUSES an empty value: that one is a deadline a run can overrun, this one is
+#                         an informational scale factor, so the fail-open argument does not apply).
 #   SHARD_BOUND           whole seconds; the PER-SHARD bound (#3187). Unset or EMPTY takes the
 #                         default 1800 s; `0`/'off' DISABLES it; any other non-integer — or one wide
 #                         enough to wrap negative — is REFUSED (rc 2) rather than silently running
@@ -143,6 +155,14 @@
 #   derived count, and every slice also asserts `executed + skipped == listed`. The slices' counts
 #   therefore sum to the whole list — a slice that silently runs nothing (or runs a neighbour's
 #   shards twice) fails its own assertion instead of reporting a green check over a hole.
+#
+#   ⛔ THE DEAL IS COST-AWARE SINCE #4210, NOT ROUND-ROBIN — see COST-AWARE SLICE ASSIGNMENT below.
+#   The width still does not matter to this file (any `<i>/<n>` it is handed), but the MEMBERSHIP of a
+#   slice is now a bin-packing result over measured costs rather than `pos % n`. Two checkouts at the
+#   same width describe the same arm ONLY while they read the SAME cost table — `admin-merge.sh`'s arm-k
+#   counterpart is therefore a candidate that is EXACT when (list, table, width) match and NAME-ONLY
+#   when the table differs, which is the transient case of a PR that edits the table (including the one
+#   that introduced it). A lane at a DIFFERENT width is as disjoint as it always was.
 
 set -uo pipefail
 
@@ -156,10 +176,15 @@ set -uo pipefail
 # `BASH_SHARD_SLICE`, `BASH_SHARDS_BUDGET_SECS`, the list/derivation refusals) `exit 2` directly and
 # have nothing to clean up — this wording is a claim about the post-log exits, which is the only
 # place it can be true.
-# ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the three
-# temp files in $TMPDIR. They are three small empty files and such a run has no recap to corrupt;
-# the alternative was corrupting the bookkeeping of runs that DID finish.
-shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }
+# ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the temp
+# files in $TMPDIR — SIX since #4210, and FOUR of them hold content after any sliced run: the ran log
+# (one line per executed shard), the skip log (`.skipped`, one line per skipped shard, carrying the
+# reason), and the assignment's staged LIST and its 212-row MAP. The other two — the timeout marker and
+# the awk stderr capture — are empty unless the bound fired or awk complained. `.expected`/
+# `.expected.ran`/`.all`/`.acct` can also be left by a kill inside the coverage check; that window
+# removes them inline. None is reused by any later run and a killed run has no recap to corrupt — the
+# alternative was corrupting the bookkeeping of runs that DID finish.
+shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}" "${slice_assign_log:-}" "${slice_assign_list:-}" "${assign_err:-}"; }
 shard_exit() { shard_cleanup; exit "${1:-0}"; }
 
 # ── the checkout this script BELONGS to ───────────────────────────────────────────────────────
@@ -433,11 +458,255 @@ if [ -n "${BASH_SHARD_SLICE:-}" ]; then
   fi
 fi
 
+# ── COST-AWARE SLICE ASSIGNMENT (#4210) — MEASURED, NOT STYLE ────────────────────────────────
+# WHAT THE ROUND-ROBIN COST, measured on head 1d048d372 (per-suite `▸` rows of run 45284947925, the
+# 8 arms of `ci-main.yml`'s `script-validate`): 212 suites, 15,257 s of shard work, 2400 s step bound
+# per arm. `pos % n` is COST-BLIND, so the heavy suites cluster by luck: summed per slice those same
+# rows gave a **3374 s worst arm raw (3401 s with the per-shard dead time) — 40% OVER the bound** —
+# against a 730 s lightest arm, and THREE of
+# the eight arms were killed at the step bound before printing a recap. The lane could not finish, so
+# main stayed red for four consecutive heads (#4210).
+#
+# ⛔ SORTING THE LIST BY COST AND KEEPING `pos % n` DOES NOT FIX IT, and that was measured too: it
+# still deals 2630 s worst (consecutive heavy shards land on consecutive slices, then the tail
+# re-clusters). Widening the matrix did not fix it either — 2487 s at 12 arms, 2811 s at 16 — because
+# the aliasing follows the cost ordering, not the width. Only BIN-PACKING fixes the shape.
+#
+# So positions are dealt by LPT (longest processing time first): heaviest shard to the currently
+# lightest slice, ties by list position. **From the COMMITTED TABLE** (`scripts/bash-shard-costs.tsv`,
+# which sums to 15,354 s — not the 15,257 s above, which is the round-robin run's own total) that is a
+# **1946 s worst arm** including dead time — 19% under the bound — with NO suite dropped, NO extra
+# runner and no edit to any suite. ⛔ THESE NUMBERS ARE A PROPERTY OF THE COMMITTED TABLE, so they
+# move when it does: the run prints its own figure, and that printout is the authority, not this
+# comment.
+#
+# ⛔ WITHOUT A COST TABLE THIS IS EXACTLY THE ROUND-ROBIN IT REPLACES. Equal weights make "lightest
+# slice first" pick 0,1,2,…,n-1 in order, which IS `pos % n` — so every fixture, every consumer with
+# no measured table and every cost-free tree keeps the old membership byte for byte, and the recap
+# SAYS which mode was used instead of leaving a reader to infer it. That property is what makes this
+# a safe change to the runner every lane depends on, and it is pinned by an arm in
+# `tests/run-bash-shards-bound/run.sh` rather than asserted here.
+#
+# ⛔ THE MAP IS ONE ARTIFACT, USED BY BOTH THE SKIP DECISION AND THE COVERAGE IDENTITY CHECK. They
+# were both derived from one modulus before (see `slice_skips`); they are both derived from one FILE
+# now, for the same reason — two derivations of one assignment is how a slice runs the right NUMBER
+# of the wrong shards and still reports green.
+# One tab, spelled once: the assignment map, the skip log and the cost table are all tab-separated, and
+# a second spelling of it is how a delimiter silently becomes a space.
+TAB="$(printf '\t')"
+shard_costs_file="${SHARD_COSTS:-$SHARD_ROOT/scripts/bash-shard-costs.tsv}"
+shard_step_budget=0
+if [ -n "${BASH_SHARD_STEP_BUDGET_SECS:-}" ]; then
+  case "$BASH_SHARD_STEP_BUDGET_SECS" in
+    off|OFF|Off|disabled|DISABLED|none|NONE|0) shard_step_budget=0 ;;
+    *[!0-9]*)
+      echo "❌ BASH_SHARD_STEP_BUDGET_SECS='$BASH_SHARD_STEP_BUDGET_SECS' is not a whole number of seconds (or 0/off) — refusing to report a margin against a bound it cannot read." >&2
+      shard_exit 2 ;;
+    ??????????*)
+      echo "❌ BASH_SHARD_STEP_BUDGET_SECS='$BASH_SHARD_STEP_BUDGET_SECS' is TOO LARGE — at most 9 digits (a longer value wraps in shell arithmetic)." >&2
+      shard_exit 2 ;;
+    *) shard_step_budget=$((10#$BASH_SHARD_STEP_BUDGET_SECS)) ;;
+  esac
+fi
+
+slice_assign_ready=0
+slice_assign=()
+assign_err=""
+slice_assign_log=""
+slice_assign_list=""
+slice_costs_known=0
+slice_costs_fallback=0
+slice_costs_median=0
+slice_load_this=0
+slice_load_worst=0
+
+# build_slice_assignment — the ONE assignment (see above). No-op for a whole-list slice (`1/1`), which
+# runs everything by definition and needs no map.
+build_slice_assignment() {
+  [ "$slice_count" -gt 1 ] || return 0
+  # ⛔ `assign_err` IS DELIBERATELY NOT `local`: `shard_cleanup` (called from `shard_exit`, i.e. outside
+  # this function) is what deletes it, and a `local` is invisible there — measured: the `.err` file
+  # survived every GREEN sliced run while the cleanup list looked correct.
+  local listf costs out assign_line
+  listf="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-assign.$$")"
+  slice_assign_list="$listf"
+  slice_assign_log="${listf}.map"
+  printf '%s\n' "$shard_paths" > "$listf" 2>/dev/null || {
+    echo "❌ cannot stage the derived list for the slice assignment ($listf) — refusing to run a ${slice_count}-way slice whose coverage map is unknown" >&2
+    shard_exit 2
+  }
+  # An ABSENT table is a supported mode, not an error (every fixture tree has none): /dev/null makes
+  # every weight 0, and the packing then degenerates to `pos % n` exactly.
+  costs="$shard_costs_file"
+  [ -f "$costs" ] || costs=/dev/null
+  # ⛔ STDERR IS NOT DATA (#4210 review, P2). `2>&1` here fed an awk diagnostic into the parse below:
+  # a message containing a tab would have reached `slice_assign[<position>]` with a non-numeric index,
+  # and under `set -u` an indexed-array subscript is ARITHMETIC — the shell would die with its own
+  # unbound-variable error instead of this function's refusal. It also threw the diagnostic away.
+  assign_err="$slice_assign_log.err"
+  out="$(awk -v n="$slice_count" -v costsf="$costs" -v want="$slice_index" '
+    function numeric(x) { return x ~ /^[0-9]+$/ }
+    # ⛔ INITIALISED, not left to the awk rule for uninitialised variables: a bare `listn` used as a
+    # SUBSCRIPT is the empty STRING, not 0, so `pos[listn]` filed the first shard under `pos[""]` and
+    # every later position shifted — the map then had no entry for position 0 and the run refused
+    # (measured in the first fixture run of this change, not in theory).
+    # ⛔ THE MODEL CARRIES THE PER-SHARD DEAD TIME (#4210 review, P2). The runner documents ~1.16 s of
+    # watchdog/list overhead per shard (`SHARD_BOUND` section above, and the bracket a shard row
+    # excludes), so a sum of raw suite seconds understates the arm by ~1 s x shards — and this
+    # number exists to be a WARNING. Omitted and stated: the syntax sweep (`SWEEP_GLOBS`), which runs
+    # inside the same step.
+    BEGIN { listn = 0; known = 0; overhead = 1 }
+    FILENAME == costsf {
+      if ($0 ~ /^[ \t]*#/ || NF < 2 || !numeric($1)) next
+      p = $0; sub(/^[ \t]*[0-9]+[ \t]+/, "", p); sub(/[ \t]+$/, "", p)
+      if (p == "") next
+      if (!(p in cost)) { cost[p] = $1 + 0; known++; w[known] = $1 + 0 }
+      next
+    }
+    { pos[listn] = $0; listn++ }
+    END {
+      # MEDIAN, for a shard the table has never measured. Not 0 and not 1: a NEW heavy suite weighted
+      # at "free" is exactly the imbalance this change exists to remove, so an unmeasured shard is
+      # given what the middle suite costs and the count of them is printed.
+      med = 0
+      if (known > 0) {
+        for (i = 1; i <= known; i++) v[i] = w[i]
+        for (i = 1; i <= known; i++) {
+          mi = i
+          for (j = i + 1; j <= known; j++) if (v[j] < v[mi]) mi = j
+          t = v[i]; v[i] = v[mi]; v[mi] = t
+        }
+        med = v[int((known + 1) / 2)]
+      }
+      fb = 0
+      for (i = 0; i < listn; i++) {
+        if (pos[i] in cost) c[i] = cost[pos[i]]
+        else { c[i] = med; fb++ }
+      }
+      # LPT. `known` can be 0 (no table): every c[] is 0, every comparison ties, and the tie-break is
+      # list position — so the whole loop IS the positional round-robin.
+      for (i = 0; i < listn; i++) order[i] = i
+      for (i = 0; i < listn; i++) {
+        mi = i
+        for (j = i + 1; j < listn; j++) {
+          a = order[j]; b = order[mi]
+          if (c[a] > c[b] || (c[a] == c[b] && a < b)) mi = j
+        }
+        t = order[i]; order[i] = order[mi]; order[mi] = t
+      }
+      for (i = 0; i < n; i++) { load[i] = 0; cnt[i] = 0 }
+      for (k = 0; k < listn; k++) {
+        p = order[k]; m = 0
+        # ⛔ TIES BREAK ON THE ELEMENT COUNT, not on the bin index. The dead time added below means a
+        # load ALWAYS advances, so an equal-cost list already lands in round-robin order WITHOUT this
+        # clause (measured on this awk: no table, 9 shards at n=3 — the assignment is identical either
+        # way, 0,3,6 / 1,4,7 / 2,5,8). What the clause still decides is the case the shipped table
+        # never produces — two arms whose loads tie with DIFFERENT counts: dropping it reassigns a
+        # contrived 14-shard n=2 table (positions 7 and 8 swap arms, the arm-0 load 40 s → 42 s), so it
+        # is not dead code. The narrative origin was the pre-dead-time iteration of this change, whose
+        # first fixture run filed every shard on arm 0. Counting breaks the tie the way round-robin
+        # does: 0,1,2,…,n-1,0,1,… — so the no-table case really is `pos % n`.
+        for (i = 1; i < n; i++) if (load[i] < load[m] || (load[i] == load[m] && cnt[i] < cnt[m])) m = i
+        asg[p] = m; load[m] += c[p] + overhead; cnt[m]++
+      }
+      worst = 0
+      for (i = 0; i < n; i++) if (load[i] > worst) worst = load[i]
+      printf "# costs known=%d fallback=%d median=%d listed=%d\n", known, fb, med, listn
+      printf "# load this=%d worst=%d arms=%d\n", load[want], worst, n
+      # `<position>\t<slice>\t<path>`: the POSITION is the key the skip decision and the coverage check
+      # both need (a `<slice>\t<path>` row cannot answer "which arm runs position 7" without a scan).
+      for (i = 0; i < listn; i++) printf "%d\t%d\t%s\n", i, asg[i], pos[i]
+    }' "$costs" "$listf" 2>"$assign_err")" || {
+    echo "❌ the cost-aware slice assignment could not be computed (awk refused) — refusing to run a ${slice_count}-way slice whose coverage map is unknown (#4210): $(tail -3 "$assign_err" 2>/dev/null | tr '\n' ' ')" >&2
+    shard_exit 2
+  }
+  printf '%s\n' "$out" > "$slice_assign_log" 2>/dev/null || {
+    echo "❌ cannot write the slice assignment map ($slice_assign_log) — refusing to run with a map the coverage check cannot read" >&2
+    shard_exit 2
+  }
+  while IFS= read -r assign_line; do
+    case "$assign_line" in
+      '# costs '*)                  # known=K fallback=F median=M listed=N
+        set -- ${assign_line#\# costs }
+        slice_costs_known="${1#known=}"
+        slice_costs_fallback="${2#fallback=}"
+        slice_costs_median="${3#median=}" ;;
+      '# load '*)                   # this=L worst=W arms=N
+        set -- ${assign_line#\# load }
+        slice_load_this="${1#this=}"
+        slice_load_worst="${2#worst=}" ;;
+      # DATA ROWS LAST AND BY SHAPE: a row is `<position><TAB><slice><TAB><path>`, so the array is
+      # keyed by POSITION — the key both the skip decision and the coverage check look up. A line with
+      # no tab is malformed (it cannot carry a path) and is ignored; the empty-map refusal in
+      # `slice_skips` is what stops a mis-parse from becoming a coverage hole.
+      *"$TAB"*)
+        assign_pos="${assign_line%%"$TAB"*}"
+        assign_rest="${assign_line#*"$TAB"}"
+        case "$assign_pos" in
+          ''|*[!0-9]*) ;;   # not a position — ignore it (an indexed subscript is ARITHMETIC in bash)
+          *) slice_assign["$assign_pos"]="${assign_rest%%"$TAB"*}" ;;
+        esac ;;
+      *) ;;
+    esac
+  done <<EOF
+$out
+EOF
+  slice_assign_ready=1
+  # ⛔ SAID OUT LOUD, EVERY RUN. A slice that reports its modelled load is a run whose reader can see
+  # the capacity arithmetic without downloading an 18,000-line log and bisecting it by timing rows —
+  # and a reader who can see the number is the only thing that catches the list outgrowing its bound
+  # BEFORE the step bound kills three arms again.
+  if [ "$slice_costs_known" -gt 0 ]; then
+    printf '🧮 slice %s/%s: cost-aware assignment of %s shard(s) — this arm models %ss (~1 s/shard dead time, measured 1.16 s; syntax sweep excluded), worst arm %ss' \
+      "$((slice_index + 1))" "$slice_count" "$listed" "$slice_load_this" "$slice_load_worst"
+  else
+    if [ -f "$shard_costs_file" ]; then
+      costs_why="present but declares NO numeric cost row"
+    else
+      costs_why="absent"
+    fi
+    printf '🧮 slice %s/%s: %s shard(s) — NO measured costs (%s: %s), so this is the POSITIONAL round-robin (pos %% n)' \
+      "$((slice_index + 1))" "$slice_count" "$listed" "$shard_costs_file" "$costs_why"
+  fi
+  # ⛔ THE BOUND REPORT BELONGS TO THE MODELLED BRANCH ONLY (review cycle 3, P2). It used to print for
+  # BOTH, so a cost-free lane reported `%s%%` of the step bound computed from the sum of the WEIGHTS —
+  # which with no table are all ZERO plus 1 s/shard, i.e. `3s of the 2400s step bound (0%)` for a
+  # three-shard arm. `⚠️ CAPACITY` then could never fire in exactly the mode a new consumer starts in,
+  # while both workflows advertise that line as how a list outgrowing its matrix becomes visible. An
+  # unmodelled run says so instead of printing a number it cannot stand behind.
+  if [ "$slice_costs_known" -le 0 ]; then
+    if [ "$shard_step_budget" -gt 0 ]; then
+      printf ' — step bound %ss, UNMODELLED (no cost table: the split is positional, so no load can be reported)\n' "$shard_step_budget"
+    else
+      printf '\n'
+    fi
+  elif [ "$shard_step_budget" -gt 0 ]; then
+    printf ' of the %ss step bound (%s%%)\n' "$shard_step_budget" "$((slice_load_this * 100 / shard_step_budget))"
+    if [ "$slice_load_worst" -gt "$shard_step_budget" ]; then
+      printf '⚠️  CAPACITY: the modelled worst arm is %ss against a %ss step bound — the list has outgrown its matrix. Add arms to the matrix (a LANE WIDTH, ci-main.yml / ci.yml) or cut a slow suite; do NOT re-slice and hope (#4210).\n' \
+        "$slice_load_worst" "$shard_step_budget"
+    fi
+  else
+    printf '\n'
+  fi
+  if [ "$slice_costs_known" -gt 0 ] && [ "$slice_costs_fallback" -gt 0 ]; then
+    printf '   ℹ  %s of %s shard(s) have no measured cost in %s and weigh the median %ss — refresh that table (its header says how)\n' \
+      "$slice_costs_fallback" "$listed" "$shard_costs_file" "$slice_costs_median"
+  fi
+  return 0
+}
+
+# ⛔ THE CALL IS *NOT* HERE (review cycle 2, P2/P3). It sits after every validation and after the
+# ran/skip/timeout logs exist, because this function ALLOCATES THREE TEMP FILES: called here, a bad
+# `SHARD_BOUND` (validated further down) refused with a bare `exit 2` and leaked them, and the
+# "refusals run before any work" contract at the top of the cleanup block became untrue.
+#
 # slice_skips <0-based position> — 0 (true) = this slice does NOT run it, 1 (false) = it does.
 # Slicing applies ONLY to list lines (`pos < listed`): the sentinels below sit past the list on
 # purpose, so the vacuity arms ALWAYS execute — a slice must never be able to leave "can a failing
-# shard fail this run?" untested. Positions are dealt round-robin (pos % n), so slow shards spread
-# across slices instead of clustering in one (contiguous chunks would stack the expensive suites).
+# shard fail this run?" untested. Positions are dealt by the COST-AWARE ASSIGNMENT above (bin-packed
+# by measured cost, so the expensive suites land on different arms), which degenerates to `pos % n`
+# exactly when there is no cost table.
 #
 # ⛔ THE EXECUTED PATHS ARE RECORDED, not only counted (#2482 review, 2026-10-23). A COUNT cannot
 # distinguish "ran my 10" from "ran MY NEIGHBOUR's 10": with the modulus broken so every slice runs
@@ -454,7 +723,7 @@ case "$shard_bound_raw" in
   off|OFF|Off|disabled|DISABLED|none|NONE) shard_bound=0 ;;
   *[!0-9]*)
     echo "❌ SHARD_BOUND='$shard_bound_raw' is not a bound — want a whole number of seconds, or 0/off to disable. Refusing rather than running UNBOUNDED (a typo must not silently remove the bound that #3187 added)." >&2
-    exit 2 ;;
+    shard_exit 2 ;;
   ??????????*)
     # ⛔ WIDTH IS CHECKED BEFORE THE ARITHMETIC, because `$((10#$x))` WRAPS: a 19-digit value becomes
     # NEGATIVE (which the `-lt 1` test below would read as "disabled" — the exact fail-open this
@@ -462,7 +731,7 @@ case "$shard_bound_raw" in
     # instantly and kills EVERY shard at t≈0). Ten digits is ~317 years, far past any real bound, and
     # it is the same 9-digit-scale guard the repo's reapers apply to a numeric seam (`docs/ops/disk-reaper.md`).
     echo "❌ SHARD_BOUND='$shard_bound_raw' is TOO LARGE — at most 9 digits (a longer value wraps in shell arithmetic, and a wrapped bound is either NEGATIVE or rejected by sleep). Refusing." >&2
-    exit 2 ;;
+    shard_exit 2 ;;
   *) shard_bound=$((10#$shard_bound_raw)) ;;
 esac
 if [ "$shard_bound" -lt 1 ]; then
@@ -503,8 +772,11 @@ shard_timeout_marker="${shard_ran_log}.timeout"
 # `shard_exit`, which every exit after these three files exist goes through, and by
 # `shard_driver_signal` (which calls `shard_cleanup` itself).
 # ⚠️ STATED RESIDUAL: a shell that forked BEFORE those calls (a crash, `kill -9` of the driver) leaves
-# the three temp files in $TMPDIR. They are three small empty files; a killed run has nothing to
-# report anyway, and the alternative was corrupting the bookkeeping of runs that DID finish.
+# the temp files in $TMPDIR — see the residual at the top of this file for the exact inventory (#4210
+# made it SIX files, four of them non-empty). A killed run has nothing to report anyway, and the
+# alternative was corrupting the bookkeeping of runs that DID finish. ⛔ NOT RESTATED HERE: this block
+# said "three small empty files" after that inventory changed, which is exactly the drift the single
+# statement exists to prevent.
 # ⛔ A HUP IS NOT THAT RESIDUAL: it is an ordinary exit path, so `shard_driver_signal` routes it through
 # `shard_exit` too. Pinned — like the no-wipe property itself — by `tests/run-bash-shards-bound`
 # (arm 2d, and the HUP cleanup assertion that reads back what a `mktemp` shim handed out).
@@ -923,7 +1195,12 @@ shard_kill_group() {
 # "cosmetic" because the rc was assumed intact; it is not on that path). Restoring exact pid identity
 # would mean inlining the `env -u` at the `&` site, which moves the string the three ci-lane-parity
 # mutants pin — the P0 this branch already had to repair once.
-shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
+# ⛔ THE STRIP IS THE WHOLE CONTRACT, NOT THE THREE VARIABLES IT STARTED WITH (review, #4210): a
+# shard that re-runs this runner must not inherit its caller's dispatch OR its caller's cost table and
+# step budget — the last two are REPORT knobs, so inheriting them cannot drop a shard, but it does make
+# a fixture print ` of the 2400s step bound (N%)` and emit a CAPACITY line, i.e. output that depends on
+# who launched it. `tests/run-bash-shards-bound`/`recap.test.sh` unset the same five for the same reason.
+shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS bash "$1"; }
 
 shard_run_bounded() {
   if [ "$shard_bound" -lt 1 ]; then shard_exec "$1" </dev/null; return $?; fi
@@ -1022,7 +1299,23 @@ slice_skips() {
   [ "$slice_count" -gt 0 ] || return 1
   # A DECLARED sentinel always runs: a slice must not leave the failure arm untested.
   [ "$slice_pos" -lt "$listed" ] || return 1
-  [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
+  # `1/1` runs the whole list by definition and needs no map (`build_slice_assignment` builds none).
+  [ "$slice_count" -gt 1 ] || return 1
+  # ⛔ AN EMPTY MAP IS A REFUSAL, NEVER A SKIP. A missing entry would silently skip a listed shard, and
+  # the coverage self-checks compare against this same map — so they would agree on the HOLE. Measured
+  # against the alternative (falling back to `pos % n` here while the identity check kept the map): the
+  # two derivations then disagree and the run reds with "executed a DIFFERENT SET", which is slower and
+  # says less than this.
+  if [ "$slice_assign_ready" -ne 1 ]; then
+    echo "❌ the cost-aware slice assignment is not ready for a ${slice_count}-way slice — refusing to deal the list from an unknown map (#4210)" >&2
+    shard_exit 2
+  fi
+  slice_have="${slice_assign[$slice_pos]:-}"
+  if [ -z "$slice_have" ]; then
+    echo "❌ listed position $slice_pos ('$1') has NO slice in the assignment map ($slice_assign_log) — refusing rather than skipping a shard the map does not describe (#4210)" >&2
+    shard_exit 2
+  fi
+  [ "$slice_have" = "$slice_index" ] && return 1
   shard_skipped=$((shard_skipped + 1))
   printf '%s\tslice %s/%s\n' "$1" "$((slice_index + 1))" "$slice_count" >> "$shard_skip_log" 2>/dev/null || true
   return 0
@@ -1364,6 +1657,9 @@ if [ "${#shard_array[@]}" -ne "$listed" ]; then
   echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
   shard_exit 1
 fi
+# The ONE assignment (see the note where it is defined): built after every validation, and after the
+# ran/skip/timeout logs exist, so each of its refusals goes through `shard_exit` and cleans up.
+build_slice_assignment
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
   shard_budget_trip "$shard"
   run_shard "$shard"
@@ -1413,20 +1709,28 @@ fi
 # wrong subset (off-by-one in the modulus, an unreadable env var, a stray `continue`) fails here,
 # and so does an unsharded run that skipped anything.
 if [ "$slice_count" -gt 0 ]; then
-  # ⛔ IDENTITY, not a count. The expected set is DERIVED from the same list and the same round-robin
-  # the skips use (`pos % n == i`), and compared as a SORTED SET, so a slice that runs the right
-  # number of the WRONG shards fails here — the hole a count assertion reports as green.
+  # ⛔ IDENTITY, not a count. The expected set is DERIVED FROM THE SAME ASSIGNMENT MAP the skips read
+  # (`slice_assign_log`, #4210 — it was `(NR-1) % n == i` while the deal was round-robin), and compared
+  # as a SORTED SET, so a slice that runs the right number of the WRONG shards fails here — the hole a
+  # count assertion reports as green. `1/1` has no map by construction and is the whole list.
   exp_log="$shard_ran_log.expected"
-  printf '%s\n' "$shard_paths" \
-    | awk -v i="$slice_index" -v n="$slice_count" '(NR - 1) % n == i' | sort > "$exp_log"
+  if [ "$slice_count" -le 1 ]; then
+    printf '%s\n' "$shard_paths" | awk 'NF' | sort > "$exp_log"
+  else
+    awk -F"$TAB" -v i="$slice_index" '$0 !~ /^#/ && NF >= 3 && $2 == i { print $3 }' "$slice_assign_log" | sort > "$exp_log"
+  fi
   sort "$shard_ran_log" > "$exp_log.ran"
   if ! cmp -s "$exp_log" "$exp_log.ran"; then
     echo "❌ slice $((slice_index + 1))/$slice_count executed a DIFFERENT SET of shards than its index derives (expected $(wc -l <"$exp_log" | tr -d ' '), ran $(wc -l <"$exp_log.ran" | tr -d ' ')); first difference: $(diff "$exp_log" "$exp_log.ran" | head -4 | tr '\n' ' ')"
     rm -f "$exp_log" "$exp_log.ran"
     shard_exit 1
   fi
+  # ⛔ COUNTED FROM THE MAP, not from the closed form `((listed - 1 - i) / n + 1)`: that formula IS the
+  # round-robin, so keeping it would assert the old deal against a cost-aware one — and for a slice that
+  # legitimately gets one more shard than another (bin sizes differ by at most one) it would false-red.
+  expected=$(wc -l <"$exp_log" | tr -d ' ')
+  [ -n "$expected" ] || expected=0
   rm -f "$exp_log" "$exp_log.ran"
-  expected=$(( (listed - 1 - slice_index) / slice_count + 1 ))
   if [ "$shard_ran" -ne "$expected" ]; then
     echo "❌ slice $((slice_index + 1))/$slice_count executed $shard_ran shard(s), expected $expected — the slice does not cover its share of the list"
     shard_exit 1
@@ -1566,6 +1870,11 @@ else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
   echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 fi
+# ⛔ THE SUCCESS PATH IS AN EXIT TOO (#4210 review, P3). It was two bare `echo`s, so `shard_cleanup`
+# never ran on a GREEN run — the ran/skip/timeout logs (pre-existing) and this change's assignment map
+# were left in $TMPDIR on every successful slice. The cleanup contract is stated on `shard_cleanup`;
+# this makes the tail honour it instead of describing an exit path that did not exist.
+shard_exit 0
 
 
 # ── the per-suite notes that used to ride on each `run_shard` line are NOT reproduced here ────────

@@ -520,12 +520,17 @@ jobs:
     # ⛔ AND THE LIST HAS GROWN AGAIN SINCE THAT COMMENT, so its figures are superseded here rather
     # than left to rot. MEASURED 2026-11-01 from this job's OWN per-suite rows (`▸ <secs> <path>`,
     # run 41338741722 at 951e4c821): **152 suites, 6189 s = 103.2 min** of shard work, job wall
-    # 103.8 min — i.e. ~39 s of non-shard steps, so the duration WAS the shard work. Round-robin
-    # (`pos % n`) slice sums: 2415 s worst at n=4, **1478 s worst at n=8** (+ the runner's measured
-    # 1.16 s/shard watchdog ≈ 1500 s ⇒ ~25-26 min per arm against 103.2 min serial), 1261 s at
-    # n=12. The FLOOR is the single slowest suite (`tests/atomic-land/run.sh`, 852 s = 14.2 min),
-    # so no width goes below it — that is #2483, not this change. 8 matches the PR lane and the
-    # same list; 12 buys ~4 min of wall for 4 more runners on the shared pool.
+    # 103.8 min — i.e. ~39 s of non-shard steps, so the duration WAS the shard work.
+    # ⛔ THE ROUND-ROBIN FIGURES BELOW ARE A PRE-#4210 MEASUREMENT OF THE DEAL THIS CHANGE REMOVED, kept
+    # only to explain how 8 was chosen. Do NOT size anything from them today: the deal is now cost-aware,
+    # and the CURRENT numbers are in the `⛔ THE BOUND IS SIZED FROM A MEASURED ARM` block below (212
+    # suites / 15,257 s, cost-blind worst 3374 s raw, cost-aware worst 1946 s = 81% of 2400 s).
+    # As measured on 2026-11-01 under round-robin (`pos % n`): 2415 s worst at n=4, **1478 s worst at
+    # n=8** (+ the runner's measured 1.16 s/shard watchdog ≈ 1500 s ⇒ ~25-26 min per arm against
+    # 103.2 min serial), 1261 s at n=12. The FLOOR is the single slowest suite
+    # (`tests/atomic-land/run.sh`, 852 s then), so no width goes below it — that is #2483, not this
+    # change. 8 matches the PR lane and the same list; 12 buys ~4 min of wall for 4 more runners on the
+    # shared pool.
     #
     # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
     # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
@@ -554,8 +559,9 @@ jobs:
     # ⛔ THE ARITHMETIC IS NOW PER ARM, AND THAT IS THE WHOLE HAZARD OF THIS CHANGE. A matrix turns
     # each slice into its OWN JOB, so a per-arm JOB-level bound is EXACTLY the silent fail-open
     # described above — one arm `cancelled` while its co-arms report, and only the cancelled arm's
-    # shards ungated. Every arm therefore carries its own STEP bound (40 min, 1.6x the 1500 s worst
-    # arm and 2.8x the 852 s slowest single suite) and the job bound sits above its steps' sum,
+    # shards ungated. Every arm therefore carries its own STEP bound (40 min = 1.2x the MODELLED
+    # 1946 s worst arm and 1.9x the slowest single suite, 1294 s) and the job bound sits above its
+    # steps' sum,
     # identically to the single-job form this replaced.
     timeout-minutes: 80
     strategy:
@@ -605,12 +611,17 @@ jobs:
         # call that `check-ci-lane-parity` asserts (an argument there is a MENTION, not the call, and
         # the lane un-wires — the #1369 class).
         #
-        # ⛔ THE BOUND IS SIZED FROM A MEASURED ARM, NOT FROM THE OLD WHOLE-LIST FIGURE (#3174). The
-        # list is 152 suites / 6189 s at 951e4c821 (run 41338741722); the 147 suites / 6468 s this
-        # comment used to carry was already one list behind. Round-robin (`pos % n`) slice sums over
-        # those same own rows: worst arm 1478 s raw, 1500 s with the runner's measured 1.16 s/shard
-        # watchdog. 40 min (2400 s) is 1.6x that, 2.8x the slowest single suite
-        # (`tests/atomic-land/run.sh`, 852 s), and well inside the 360 min platform step maximum.
+        # ⛔ THE BOUND IS SIZED FROM A MEASURED ARM, NOT FROM A WHOLE-LIST FIGURE (#3174, restated for
+        # #4210). The list is 212 suites / 15,257 s at 1d048d372 (run 45284947925); the 152 suites /
+        # 6189 s this comment used to carry was two lists behind. ⛔ THE DEAL IS NO LONGER `pos % n`:
+        # cost-blind round-robin summed the same rows to a 3374 s worst arm (140% of this bound), and
+        # the runner now bin-packs by measured cost, giving **1946 s — 81% of 2400 s** on its own
+        # model constant of 1 s/shard dead time (the MEASURED dead time is 1.16 s/shard, which would
+        # make the same arm 1950 s — 81% either way). 2400 s is 1.2x that model and 1.9x the
+        # slowest single suite
+        # (`tests/atomic-land/run.sh`, 1294 s at that head) and well inside the 360 min platform step
+        # maximum. The runner prints that figure on every run, so this comment cannot silently rot
+        # again without the log disagreeing with it.
         #
         # ⛔ `BASH_SHARDS_BUDGET_SECS` IS DELIBERATELY GONE, AND CANNOT COME BACK HERE. The runner
         # REFUSES a positive budget combined with a slice (scripts/run-bash-shards.sh, the
@@ -625,9 +636,18 @@ jobs:
         # (`failure`, never a job-level `cancelled`) and a single hang is still bounded per shard by
         # `SHARD_BOUND` (default 1800 s, #3187). The lost naming is tracked on #3182.
         env:
+          # ⛔ THE RUNNER'S OWN CAPACITY REPORT NEEDS THE BOUND THIS STEP ACTUALLY HAS (#4210). It
+          # prints `🧮 … this arm models Ns, worst arm Ns of the 2400s step bound (N%)`, and says
+          # ⚠️ CAPACITY when the worst modelled arm no longer fits — which is how the list outgrowing
+          # the matrix becomes visible in a run instead of arriving as a 40-minute kill with no recap.
+          # MUST EQUAL this step's `timeout-minutes * 60` BELOW — and the two lanes deliberately carry
+          # DIFFERENT values, because their steps differ: this one is 40 min (2400 s), `ci.yml`'s
+          # `bash-suites` is 70 min (4200 s). A stale number only misreports the percentage; it can
+          # never skip, add or red a shard.
           # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
           # hand-kept number, and never a list: the list is the runner's).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+          BASH_SHARD_STEP_BUDGET_SECS: 2400
         timeout-minutes: 40
         run: bash scripts/run-bash-shards.sh
 

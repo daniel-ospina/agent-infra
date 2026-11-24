@@ -1846,20 +1846,28 @@ jobs:
     # check over a hole.
     runs-on: ubuntu-latest
     # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
-    # measurements (PR #2412 job 120365087427: the list then held 74 shards — it is 78 today, and
-    # the per-slice sizes are DERIVED, so no number here goes stale — 73.6 min, 59.7 s/shard
-    # mean; #2483's
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards at a 59.7 s/shard mean,
+    # 73.6 min serially — it holds **212** today at a 72.4 s/shard mean, 15,354 s serially and ~32.4
+    # min per arm under the cost-aware deal, which is why the count is spelled out here instead of
+    # "N today", and #2483's
     # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
     # remaining shards 26m25s).
     #
-    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
-    # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
-    # the log cannot see it), so with 8 round-robin slices the worst slice is ≈ 33 min + its 9
-    # siblings ≈ 37 min, and no wider matrix goes below 33. The shard step's own bound below is 70
-    # min = ~1.9x that slice: enough for runner variance, and it still fails fast against the
-    # unbounded 1h52m this job shipped with.
-    # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
-    # of shard work) and nothing can make it shorter.
+    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is the
+    # slowest at **1294 s = 21.6 min** on its own (66 serial mutation re-runs, each <81 s — which is
+    # why a gap analysis over the log cannot see it), so NO width goes below 21.6 min and the step
+    # bound cannot either. ⛔ THE "~33 min ON ITS OWN / worst slice ≈ 33 min + 9 siblings ≈ 37 min"
+    # FIGURES ARE RETIRED (#4210): 33 min was the pre-#2483 profile, and the "9 siblings" described
+    # contiguous/round-robin neighbours. The deal is now cost-aware (`scripts/bash-shard-costs.tsv`,
+    # whose heaviest row is `atomic-land` at 1294 s), an arm holds ~26 shards, and the modelled worst
+    # arm is **1946 s = 32.4 min** — 652 s above the shard FLOOR, because the packing puts
+    # `atomic-land` on an arm whose other shards are among the cheapest, and most of that arm's load
+    # is the ~26 shards' own work rather than any single one. The shard step's own bound below is
+    # 70 min ≈ 2.2x that model: enough for runner variance, and it still fails fast against the
+    # unbounded 1h52m this job shipped with. The run prints its own figure (`🧮 …`), so this comment
+    # and the log agree.
+    # Splitting the two heaviest remains #2483's job; it is worth ~11 min of the 21.6 min floor, where
+    # slicing already took the wall from 73.6 min to ~32.4 min of shard work.
     #
     # ⛔ THIS JOB BOUND IS A PURE BACKSTOP, AND THE INVARIANT IS ARITHMETIC: it sits ABOVE the sum
     # of its steps' bounds, so it can never fire before the step that is actually running trips its
@@ -1874,9 +1882,10 @@ jobs:
       # it died.
       fail-fast: false
       matrix:
-        # Slices, not shards. Width = the number of entries here; the per-slice sizes are DERIVED by
-        # the runner's own round-robin (`pos % n`) over whatever the list holds today, not asserted
-        # here — they shift when a `run_shard` line is added, and the runner re-derives them, so
+        # Slices, not shards. Width = the number of entries here; the per-slice MEMBERSHIP is DERIVED
+        # by the runner's own cost-aware assignment (bin-packed over `scripts/bash-shard-costs.tsv`
+        # since #4210; `pos % n` before that) over whatever the list holds today, not asserted here —
+        # it shifts when a suite is added or its measured cost moves, and the runner re-derives it, so
         # nothing in this file goes stale. The runner refuses a count wider than its own list.
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
@@ -1899,7 +1908,17 @@ jobs:
         # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
         # hand-kept number, and never a list: the list is the runner's).
         env:
+          # ⛔ THE RUNNER'S OWN CAPACITY REPORT NEEDS THE BOUND THIS STEP ACTUALLY HAS (#4210). It
+          # prints `🧮 … this arm models Ns, worst arm Ns of the 4200s step bound (N%)`, and says
+          # ⚠️ CAPACITY when the worst modelled arm no longer fits — which is how the list outgrowing
+          # the matrix becomes visible in a run instead of arriving as a 40-minute kill with no recap.
+          # MUST EQUAL this step's `timeout-minutes * 60` BELOW — and the two lanes differ on purpose,
+          # because their steps do: this one is 70 min (4200 s), `ci-main.yml`'s is 40 min (2400 s).
+          # A stale number only misreports the percentage; it can never skip, add or red a shard
+          # (measured: an earlier value of 2400 here read the PR lane against a bound 1800 s tighter
+          # than the step it describes).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+          BASH_SHARD_STEP_BUDGET_SECS: 4200
         # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
         # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
         # `cancelled`: the service cancels the job, the job-cancellation callback sets
@@ -1913,8 +1932,10 @@ jobs:
         # A STEP that trips its own bound takes the other branch in the same file: at
         # `StepsRunner.cs:324-329`, `timeoutMinutes` fires with `jobCancellationToken` NOT
         # cancelled, so the result is `TaskResult.Failed` — which the job reports as `failure`,
-        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays ~1.9x
-        # the measured worst slice (~37 min), so it cannot false-block a slow-but-healthy slice.
+        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays **2.2x
+        # the MODELLED worst arm** (1946 s = 32.4 min, the figure the run prints), so it cannot
+        # false-block a slow-but-healthy slice. ⛔ "~1.9x the measured worst slice (~37 min)" was the
+        # retired round-robin figure — 1.9x was 4200/2220 s, and 2220 s is 37 min.
         timeout-minutes: 70
         run: bash scripts/run-bash-shards.sh
 

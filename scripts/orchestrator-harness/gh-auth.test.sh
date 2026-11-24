@@ -715,9 +715,23 @@ ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (
 # be read off this suite, so a red here means the paragraph must be re-derived — never that the tree is
 # wrong (the same shape as B9g, one file over).
 SHARDS="$HERE/../run-bash-shards.sh"
+# ⛔ THE PIN NAMES THE SHAPE, NOT ONE SPELLING OF IT (#4210 review, P1 — measured). It used to spell
+# out the THREE `-u` pairs `shard_exec` carried when this paragraph was written; #4210 grew the contract
+# to five (`SHARD_COSTS`, `BASH_SHARD_STEP_BUDGET_SECS`), the definition widened, and this `grep` then
+# matched NOTHING on a healthy tree. The suite is a derived shard, so the effect was a red `B9l` on a
+# shard nobody touched — the "the lane cannot finish" symptom #4210 exists to remove, reproduced by its
+# own fix. What the arm means is "every shard is launched as a NEW `env -u … bash`, one or more strips":
+# `env -u [^ ]+( -u [^ ]+)* bash` is that property, and it is the SAME shape `tests/run-bash-shards-bound`
+# already uses for its own control. A future sixth variable cannot red it; dropping the handover still can.
 { grep -q '^set -uo pipefail' "$SHARDS" \
-  && grep -q 'shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash ' "$SHARDS"; }; rc=$?
+  && grep -qE 'shard_exec\(\) \{ env -u [^ ]+( -u [^ ]+)* bash ' "$SHARDS"; }; rc=$?
 ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND \`shard_exec\` runs each shard as a NEW \`env -u … bash\`" $rc
+# ⛔ AND THE SHAPE IS NOT VACUOUS (the same non-vacuity rule as B9t): a definition that hands the shard
+# the caller's environment — no `env -u` at all — must be REFUSED by that same pattern, or the arm above
+# would certify the very handover it exists to forbid the moment someone rewrote it as a plain `bash`.
+printf '%s\n' 'shard_exec() { bash "$1"; }' >"$TMP/b9l-shape.sh"
+grep -qE 'shard_exec\(\) \{ env -u [^ ]+( -u [^ ]+)* bash ' "$TMP/b9l-shape.sh" && rc=1 || rc=0
+ck "B9l2 …and the shape is not vacuous: a \`shard_exec\` that hands the shard the caller's env (no \`env -u\`) is refused by the very same pattern" $rc
 # ⛔ THE WHOLE DEFINITION, CONTINUATIONS FOLDED (review round 15, P3): the literal pins above both end at
 # `… bash `, so `-o pipefail` appended on the SAME line OR on a wrapped continuation line matched them and
 # left every arm green while making the paragraph false. Fold first, then refuse the word anywhere in the
@@ -772,9 +786,12 @@ ck "B9t …a \`}\` in a TRAILING COMMENT on the definition line still ends the r
 # 14, P3): `export SHELLOPTS` in the driver makes a child inherit pipefail without touching `shard_exec`,
 # and only a live launch shows it. This probe says nothing about the FILE — B9m reads the file; this one
 # measures what a child launched in `shard_exec`'s shape actually reports on the bash running this suite.
-_pf_opts="$(set -uo pipefail; env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash -c 'set -o')"
+# ⛔ FIVE, NOT THREE (#4210 review, P1): this probe models "shard_exec's own env shape", and that shape
+# now strips five variables. It stays GREEN with three (the probe is not asserting them), but a title
+# claiming the real shape while spelling a stale one is how the NEXT reader concludes the shape is three.
+_pf_opts="$(set -uo pipefail; env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND -u SHARD_COSTS -u BASH_SHARD_STEP_BUDGET_SECS bash -c 'set -o')"
 ! grep -q '^pipefail[[:space:]]*on' <<<"$_pf_opts"; rc=$?
-ck "B9n …and PROBED: launched from a shell with pipefail ON, in shard_exec's own env shape, the child still reports pipefail OFF (an exported SHELLOPTS reddens this)" $rc
+ck "B9n …and PROBED: launched from a shell with pipefail ON, in shard_exec's own FIVE-variable env shape, the child still reports pipefail OFF (an exported SHELLOPTS reddens this)" $rc
 _pb_place="$(printf '%s\n' "$_place" | wc -c | tr -d ' ')"
 _pb_gha="$(printf '%s' "$_gha_flat" | wc -c | tr -d ' ')"
 [ "$_pb_place" -lt 65536 ] && [ "$_pb_gha" -lt 65536 ]; rc=$?
