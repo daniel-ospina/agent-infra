@@ -1833,6 +1833,68 @@ else
 fi
 
 
+# ── N5d. THE MODEL'S ERROR HAS A SIGN (#4210 review, P2) ────────────────────────────────────
+# ⛔ `shard_time - slice_load_this` is printed as "the MODEL UNDER-PREDICTS by Ns", but the difference
+# is NEGATIVE whenever the model comes in high — and the model adds `overhead = 1` second per shard that
+# `shard_time` excludes, so `slice_load_this ≈ shard_time + shard_ran` on an ACCURATE table. Every arm in
+# [90 %, model) of the bound therefore printed "UNDER-PREDICTS by -Ns": the opposite of the truth, in the
+# band a refreshed table (the issue's item 2) makes common. Here the table models 9s + 1s overhead for a
+# 5s arm, so the honest sentence is an OVER-prediction of 5s.
+OFFIX="$TMP/overpredictfixture"
+stage_measured_fixture "$OFFIX" 5 ""
+printf '9\ttests/m2/run.sh\n' >"$TMP/overpredict.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=4 SHARD_COSTS="$TMP/overpredict.tsv" \
+  BASH_SHARD_SLICE=1/2 bash "$OFFIX/scripts/runner.sh" >"$TMP/overpredict.out" 2>&1
+OVER_RC=$?
+if [ "$OVER_RC" -eq 0 ] \
+   && grep -qF 'the cost table modelled 10s' "$TMP/overpredict.out" \
+   && grep -qF 'the model OVER-predicts by 5s' "$TMP/overpredict.out" \
+   && ! grep -qF 'UNDER-PREDICTS by -' "$TMP/overpredict.out"; then
+  pass "a table that models MORE than the arm took is reported as an OVER-prediction — pre-fix this printed 'UNDER-PREDICTS by -5s', the opposite of the truth"
+else
+  fail "the model-vs-actual SIGN was not reported honestly (rc $OVER_RC): $(grep 'CAPACITY' "$TMP/overpredict.out" | tr '\n' ' ')"
+fi
+
+# ── N5e. "NO COST TABLE" IS A CLAIM ABOUT THE FILE, NOT ABOUT THIS RUN (#4210 review, P3) ──────
+# ⛔ The no-model arm tested `slice_costs_known`, which is only ever set by `build_slice_assignment` —
+# and that is a deliberate no-op for a WHOLE-LIST run. So a whole-list run that HAS
+# `scripts/bash-shard-costs.tsv` reported "it has NO cost table" about a table on disk. Existence is a
+# filesystem fact; whether THIS run consulted the table is a different one, and both are now said.
+PFIX="$TMP/presenttablefixture"
+stage_measured_fixture "$PFIX" 1 ""
+printf '1\ttests/m2/run.sh\n' >"$TMP/present.tsv"
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_STEP_BUDGET_SECS=2 SHARD_COSTS="$TMP/present.tsv" \
+  bash "$PFIX/scripts/runner.sh" >"$TMP/present.out" 2>&1
+PRES_RC=$?
+if [ "$PRES_RC" -eq 0 ] \
+   && grep -qF 'its cost table was NOT consulted for this run' "$TMP/present.out" \
+   && ! grep -qF 'it has NO cost table' "$TMP/present.out"; then
+  pass "a WHOLE-LIST run that HAS a cost table does not claim it has none — pre-fix the existence test was the assignment map's flag, which a whole-list run never sets"
+else
+  fail "the whole-list CAPACITY message misdescribed the table (rc $PRES_RC): $(grep 'CAPACITY' "$TMP/present.out" | tr '\n' ' ')"
+fi
+
+# ── N5f. THE RED RECAP STATES THE BOUND ONCE (#4210 review, P3) ─────────────────────────────
+# ⛔ `recap_timing_line` embeds `per-shard bound <desc>`, and the red block already prints
+# `⏱  per-shard bound applied: <desc>` (pinned above). Without `--no-bound` the red path repeated one
+# fact twice in three lines; the GREEN path keeps the bound inline and is unchanged by design.
+BFIX="$TMP/redboundfixture"
+stage_measured_fixture "$BFIX" 1 tests/m1/run.sh
+HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=1/2 bash "$BFIX/scripts/runner.sh" >"$TMP/redbound.out" 2>&1
+RB_RC=$?
+# ⛔ COUNTED PER LINE, NOT ACROSS THE CAPTURE: a sliced run also prints a start-up
+# `⏱  per-shard bound: <desc>` line (a different fact, and not this change's), so a whole-capture count
+# measured that line instead of the duplication. The duplicate is one thing exactly: the `this slice:`
+# line carrying the bound the dedicated `applied:` line already stated.
+RB_SLICE_BOUND="$(grep -E '^   ⏱  this slice:' "$TMP/redbound.out" | grep -c 'per-shard bound')"
+RB_APPLIED="$(grep -c 'per-shard bound applied' "$TMP/redbound.out")"
+if [ "$RB_RC" -eq 1 ] && [ "$RB_SLICE_BOUND" -eq 0 ] && [ "$RB_APPLIED" -eq 1 ]; then
+  pass "the RED recap states the per-shard bound ONCE — the this-slice line no longer repeats the dedicated 'bound applied' line"
+else
+  fail "the red recap duplicated the per-shard bound (this-slice copies=$RB_SLICE_BOUND, applied lines=$RB_APPLIED, want 0 and 1; rc $RB_RC): $(grep 'per-shard bound' "$TMP/redbound.out" | tr '\n' ' ')"
+fi
+
+
 # ── N6. A MALFORMED TABLE IS TOLERATED, NEVER FATAL, AND NEVER A DROPPED SHARD ─────────────────
 printf 'not-a-number\ttests/c1/run.sh\n\n# a comment\n\t\n900\n' >"$TMP/junk.tsv"
 HARNESS_SUITE_ALLOW_LIVE_CELL=1 SHARD_COSTS="$TMP/junk.tsv" BASH_SHARD_SLICE=2/3 \
