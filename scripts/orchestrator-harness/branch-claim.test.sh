@@ -552,6 +552,21 @@ eq "the PR branch did NOT move (=> no head superseded, no attestation invalidate
 eq "the scope covers rescue/* — a stray push on an OWNED rescue branch is refused" "$?" "1"
 
 
+echo "== 12. the scope list is NOT pathname-expanded (review P2, MEASURED fail-open)"
+# ⛔ `for pat in $BRANCH_CLAIM_PATTERN` runs the list through word-splitting AND pathname expansion, so a
+# checkout containing a top-level `integration/` (or `fix/`) DIRECTORY rewrote the patterns into that
+# directory's entries — measured `PAT=[integration/sub]` instead of `integration/*` — after which no
+# branch matched and the gate refused nothing. It fails OPEN, silently, for exactly the branch class the
+# gate exists to refuse. `set -f` in `branch_matches_pattern` is the fix; this arm is its detector, and
+# it must be run from a checkout that HAS such a directory (the hook always runs from the repo root, so
+# this is the real posture, not a contrived one).
+GLOBBR="integration/globscope-3696"; GLOBREF="refs/heads/$GLOBBR"
+( cd "$T/stray" && git push -q origin "HEAD:$GLOBREF" && mkdir -p integration && : > integration/sub ) \
+  || bad "fixture: cannot seed the glob-scope branch/directory"
+acquire_from owner "$GLOBBR"; eq "owner acquires the glob-scope branch" "$?" "0"
+( cd "$T/stray" && "$BC" hook-ref "$GLOBREF" >/dev/null 2>&1 )
+eq "a checkout with an \`integration/\` DIR still gates that branch (the list is not glob-expanded)" "$?" "1"
+
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ] || exit 1

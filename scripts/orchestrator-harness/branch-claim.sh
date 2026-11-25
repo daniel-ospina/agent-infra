@@ -41,8 +41,14 @@
 # other's head-bound review attestation. The scope below only decides which branches the GUARD looks
 # at — a branch nobody claimed still pushes freely (case 1: an unclaimed branch is never refused), so
 # covering the PR-branch prefixes costs nothing to a lane that does not claim, and refuses only a
-# STRAY push on top of a live owner. The prefixes are the ones the fixer/rescue loops actually push
-# to; a claim on any other branch is still honoured if taken, it just is not guarded by default.
+# STRAY push on top of a live owner.
+# ⛔ THE SCOPE IS NOT THE WHOLE OF THE FIXER'S TERRITORY, AND THIS COMMENT USED TO CLAIM IT WAS
+# (review P2, verified against `orch-loop.sh`'s own target filter). The fixer/merge loops also work on
+# `design/…`, `scope/…` and `…-tm` / `…-cap` heads. `fix-one.sh` acquires the claim for whatever branch
+# it was handed — the ACQUIRE is pattern-independent — so for those a claim exists that the GUARD does
+# not read. That direction is harmless (the claim still refuses a peer's `acquire`, and an unguarded
+# push is simply the status quo before this change); it is stated here rather than hidden, and the
+# prefixes are the ones whose stray push was measured, not a claim that they are all of them.
 set -u
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,12 +92,22 @@ claim_repo_init_local() {
 }
 
 # branch_matches_pattern <branch> — the SCOPE decision, in one place.
+# ⛔ PATHNAME EXPANSION IS DISABLED FOR THE SPLIT (review P2, MEASURED). `for pat in $VAR` runs
+# `$VAR` through word-splitting **and then pathname expansion**, so a checkout that happens to contain a
+# top-level `integration/` or `fix/` DIRECTORY rewrote the pattern list into that directory's entries
+# (measured: `PAT=[integration/sub]` instead of `integration/*`) — after which the branch matched
+# nothing and the gate refused nothing. It fails OPEN, it fails silently, and it fails exactly for the
+# branch class the gate exists to refuse. `set -f` is the one-token fix; it is scoped to this function
+# so nothing else in the script inherits it.
 branch_matches_pattern() {
-  local br="${1:-}" pat
+  local br="${1:-}" pat _had_f=0
+  case "$-" in *f*) _had_f=1 ;; esac
+  set -f
   for pat in $BRANCH_CLAIM_PATTERN; do
     # shellcheck disable=SC2254  # the glob is the point
-    case "$br" in $pat) return 0 ;; esac
+    case "$br" in $pat) [ "$_had_f" -eq 0 ] && set +f; return 0 ;; esac
   done
+  [ "$_had_f" -eq 0 ] && set +f
   return 1
 }
 
