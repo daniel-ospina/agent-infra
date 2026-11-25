@@ -4477,6 +4477,178 @@ assert_eq "$RC" "0" "T29 control: an EXPLICIT HARNESS_APPLY_STATE_DIR still inst
 assert_contains "$(cat "$T29/units2/eldato-harness-apply.service" 2>/dev/null)" "$T29/explicit-state" \
     "T29 control: …and is honoured verbatim, so the row above measures the DEFAULT"
 
+# ── T30: #4237 — THE RED IS CONSUMED ─────────────────────────────────────────────────────────
+# MEASURED (cell-1): six `rc=24` records ten minutes apart, `deployed=` never moving, and nothing read
+# them — while a merged fix sat inert on the box and two PRs became unverdictable because the reader
+# there was six days old. The detection existed and was tested; the DESIGN HAD NO LAST MILE. This case
+# is the last mile, and every arm below is one of the issue's own acceptance criteria:
+#   · ONE issue naming the box, the pinned head and the ref — never one per tick;
+#   · the retry STOPS while the pin, the ref, the farm and the checker are unchanged (proved by the
+#     checker NOT being executed again, not merely by the issue count);
+#   · ANY of those changing re-arms the grade (the other half of "until the pin or the farm changes");
+#   · the first pass that GRADES the farm clean closes it (an alarm with no auto-close is an orphan);
+#   · the consumer never changes the verdict: disarmed, absent `gh`, and a failing `gh` all keep rc=24.
+say_case "T30 a stale farm is CONSUMED — one issue, suppressed retries, auto-close (#4237)"
+mk_origin t30; mk_clone t30; write_sync_stub
+mkdir -p "$CLONE/scripts"
+cat >"$CLONE/scripts/check-farm-drift.sh" <<'FARM'
+#!/usr/bin/env bash
+# The argv log is the SUPPRESSION observable: a pass that re-grades writes here again, and the whole
+# claim "the timer stopped retrying" is false if it does.
+printf '%s\n' "$*" >>"${FARM_ARGV:-/dev/null}"
+if [ "${FARM_CLEAN:-0}" = 1 ]; then
+    printf 'check-farm-drift: ok — 0 stale (0 farm-declared; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) (1 sourced, 1 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+    exit 0
+fi
+printf 'pr-doctor.py | aaaa11112222 | bbbb11112222 | STALE\n' >&2
+printf 'check-farm-drift: DRIFT — 1 stale (1 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) (1 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+printf '   Next: re-run the farm (bash pi-bootstrap/setup.sh) for the files above, then re-run this.\n'
+exit 1
+FARM
+chmod +x "$CLONE/scripts/check-farm-drift.sh"
+# A `gh` double: records every invocation and answers the three verbs the consumer uses. `issue create`
+# prints a NUMBER and nothing else, because that is what the pass parses.
+cat >"$T/gh-stub" <<'GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GH_LOG:-/dev/null}"
+case "${1:-} ${2:-}" in
+    "issue create")
+        n="$(cat "${GH_COUNTER:?}" 2>/dev/null || printf '0')"
+        n=$((n + 1)); printf '%s' "$n" >"$GH_COUNTER"; printf '%s\n' "$n" ;;
+    "issue comment") exit "${GH_COMMENT_RC:-0}" ;;
+    "issue close")   exit "${GH_CLOSE_RC:-0}" ;;
+    *) exit 1 ;;
+esac
+GH
+chmod +x "$T/gh-stub"
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t30/home/.pi/agent/scripts"; printf 'old bytes\n' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
+export GH_LOG="$T/t30/gh.log" GH_COUNTER="$T/t30/gh.n" FARM_ARGV="$T/t30/argv"
+: >"$GH_LOG"; printf '0' >"$GH_COUNTER"
+# run_pass30 — the pass with the CONSUMER wired to the double. Never the real `gh`: that is what keeps
+# this arm hermetic on a box with no network and no auth, and it is the seam the shipped unit does not set.
+run_pass30() { local d="$1"; shift
+    HARNESS_APPLY_ALARM_GH="${HARNESS_APPLY_ALARM_GH:-$T/gh-stub}" HARNESS_APPLY_ALARM_REPO="acme/infra" \
+    HARNESS_APPLY_BOX="cell-9" HARNESS_APPLY_ALARM="${ALARM_P:-1}" \
+    run_pass "$d" "$@"
+}
+RECP="$T/t30/state/harness-apply.status"
+STATEP="$T/t30/state/harness-apply-alarm.state"
+rec30() { grep -m1 "^$1=" "$RECP" 2>/dev/null | sed "s/^$1=//" || true; }
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 control: the stale farm still REDDENS with its own code (a consumer never turns a red green)"
+assert_eq "$(rec30 alarm)" "1" "T30 the red is CONSUMED — the record names the issue it was filed as"
+assert_contains "$(cat "$GH_LOG")" "issue create --repo acme/infra" "T30 and an ISSUE CREATE really went to the repo that owns the code"
+TITLE30="$(grep -m1 'issue create' "$GH_LOG" || true)"
+assert_contains "$TITLE30" "stale-farm: cell-9 runs" "T30 the issue NAMES THE BOX and the commit it runs (the two facts the alarm is keyed on)"
+assert_contains "$TITLE30" "while origin/main ships" "T30 …and the ref it should be running, so a reader needs no log"
+assert_contains "$TITLE30" "--body" "T30 the issue carries a body (a bare title is a ticket nobody can act on)"
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "box=cell-9" \
+    "T30 the alarm's identity is written down, which is what makes 'exactly once' checkable"
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "farm=fp:" "T30 …including the FARM's fingerprint, the third input to the grade"
+case "$(rec30 pin_behind)" in ''|*[!0-9]*) bad "T30 the pinned-vs-ref DISTANCE is not published as a number (got '$(rec30 pin_behind)')" ;;
+    *) ok "T30 the pass publishes the pinned-vs-REF distance (staleness as a number, not a mood)" ;; esac
+case "$(rec30 deployed_age_s)" in ''|*[!0-9]*) bad "T30 the age of the deployed commit is not a number (got '$(rec30 deployed_age_s)')" ;;
+    *) ok "T30 …and the AGE of the deployed commit, which is what turns 'behind' into 'running old code'" ;; esac
+# ── ARM 2: THE RETRY STOPS. Same pin, same ref, same farm, same checker ⇒ the grade cannot differ, and
+# re-running it every ten minutes IS the defect. The observable is the CHECKER not being executed: an
+# issue-count assertion alone would pass a pass that re-graded and re-filed nothing.
+ARGV_BEFORE="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 the suppressed tick is STILL RED — a green tick over a stale farm is the false PASS this removes"
+assert_eq "$(wc -l <"$T/t30/argv" | tr -d ' ')" "$ARGV_BEFORE" "T30 …but the checker was NOT run again: a permanent failure is not retried"
+assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …and no second issue was filed for the same (box, pinned head)"
+assert_eq "$(grep -c 'issue comment' "$GH_LOG" | tr -d ' ')" "0" "T30 …and no comment spam either — silence is the right amount of noise when nothing changed"
+assert_eq "$(rec30 retry)" "suppressed" "T30 the record SAYS the retry was suppressed, so the silence is a state and not an absence"
+assert_eq "$(rec30 alarm)" "1" "T30 …and still names the standing issue"
+assert_contains "$OUT" "retry=suppressed" "T30 the log line says it too — the operator's own surface"
+# ── ARM 2b: THE SILENCE IS BOUNDED. A suppression that never expires would let a hand-closed issue
+# leave the box invisible for ever, which is #4237 reintroduced by its own fix. Past the window the
+# grade runs once more (and does NOT re-file the same box+pin).
+sleep 2
+ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+OUT="$(HARNESS_APPLY_ALARM_REPEAT=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 past the repeat window the farm is still red"
+case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+    "$ARGV_MID") bad "T30 the repeat window NEVER elapsed — the suppression would be a permanent blind spot" ;;
+    *) ok "T30 …and the window ELAPSING forces one real re-verification (a bounded silence, not a blind spot)" ;;
+esac
+assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …which still does not duplicate the (box, pinned head) issue"
+# ── ARM 3: THE RE-ARM. One extra byte in the farm and the grade must run again — otherwise the
+# suppression is an inert guard that would hide the NEXT drift.
+printf 'new bytes\n' >>"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
+ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 a CHANGED farm is still red"
+case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+    "$ARGV_MID") bad "T30 a CHANGED farm did not re-arm the grade — the suppression would hide the next drift" ;;
+    *) ok "T30 …and the farm changing RE-ARMS the grade (the falsifiable half of 'until the pin or the farm changes')" ;;
+esac
+assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …while the same (box, pinned head) is still ONE issue, not a second"
+# A changed CHECKER re-arms too: installing or repairing the instrument is an event the farm's bytes do
+# not reflect, and a key that ignored it would refuse to grade for ever (the inert-enforcer class).
+printf '\n# repaired\n' >>"$CLONE/scripts/check-farm-drift.sh"
+ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 a repaired CHECKER still reds the unchanged farm"
+case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+    "$ARGV_MID") bad "T30 a CHANGED checker did not re-arm the grade — fixing the instrument would never be graded again" ;;
+    *) ok "T30 …and repairing the CHECKER re-arms the grade too" ;;
+esac
+# ── ARM 4: THE PIN MOVING. One comment on the standing issue, never a second issue: the condition is the
+# same condition, and filing per commit rebuilds the 144-issues-a-day alarm this replaces.
+advance_origin t30 Z.txt zz >/dev/null
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 a MOVED pin over a still-stale farm is still red"
+assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …and the moved pin does NOT file a second issue (one condition, one ticket)"
+assert_contains "$(cat "$GH_LOG")" "issue comment 1" \
+    "T30 …it records the new head ON the standing issue, which is the fact that issue's reader needs"
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "issue=1" \
+    "T30 …and the key follows the head, so the next unchanged tick suppresses again"
+# ── ARM 5: AUTO-CLOSE on the first pass that GRADES the farm clean — which in reality is the pass AFTER
+# a re-farm (the farm's bytes changed, so the suppression re-armed and the grade really ran).
+printf 'fixed bytes\n' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_CLEAN=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T30 control: a farm that now MATCHES is a green pass again"
+assert_eq "$(rec30 alarm)" "closed:1" "T30 the alarm CLOSED ITSELF on the clean grade (an alarm with no auto-close is an orphan)"
+assert_contains "$(cat "$GH_LOG")" "issue close 1" "T30 …by really closing the issue it filed"
+[ -f "$STATEP" ] && bad "T30 the alarm state survived its own closure (the next drift would not re-file)" \
+    || ok "T30 …and the alarm's key is cleared, so the NEXT drift files a fresh issue"
+# A stale farm must re-arm after a closure — a dead key would make the consumer a one-shot.
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 re-armed: the still-stale farm reds again"
+assert_eq "$(cat "$GH_COUNTER")" "2" "T30 …and files a FRESH issue after a closure (issue 2)"
+# A SKIPPED or DISARMED farm check must NEVER close a live alarm: that is a false clear, harder to
+# notice even than a false pass.
+BEFORE_CLOSE="$(grep -c 'issue close' "$GH_LOG" | tr -d ' ')"
+OUT="$(HARNESS_APPLY_FARM_CHECK=0 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$(grep -c 'issue close' "$GH_LOG" | tr -d ' ')" "$BEFORE_CLOSE" \
+    "T30 a DISARMED farm check does not close a live alarm (a false clear is worse than a false pass)"
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "issue=2" "T30 …and the live alarm is still recorded"
+# ── ARM 6: THE CONSUMER NEVER CHANGES THE VERDICT. Three ways it is absent or broken, three times the
+# pass must still red for the farm — a consumer that could silence the red would be worse than none.
+: >"$GH_LOG"
+OUT="$(ALARM_P=0 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 with the consumer DISARMED the stale farm still reds"
+assert_eq "$(rec30 alarm)" "disarmed" "T30 …and the record says it was disarmed, not that nobody was told"
+assert_eq "$(wc -l <"$GH_LOG" | tr -d ' ')" "0" "T30 …and gh was not called at all"
+rm -f "$STATEP"
+OUT="$(HARNESS_APPLY_ALARM_GH="$T/no-such-gh" run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 with NO gh binary the stale farm still reds (the consumer is not the gate)"
+assert_eq "$(rec30 alarm)" "failed:gh-issue-create" \
+    "T30 …and the record says the filing FAILED, so an unfiled alarm is visible rather than silent"
+rm -f "$STATEP"
+OUT="$(run_pass30 "$T/t30" 2>&1)"   # warm: a successful filing (issue 3)
+# ⛔ THE FARM'S BYTES CHANGE HERE ON PURPOSE. Cleaning a farm is a RE-FARM, so the fingerprint moves and
+# the grade really runs; forcing the checker's answer without touching the farm would be suppressed (by
+# design) and the arm would grade nothing while appearing to test the close.
+printf 'fixed again
+' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_CLEAN=1 GH_CLOSE_RC=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T30 a FAILING close does not change the pass verdict"
+assert_eq "$(rec30 alarm)" "3" "T30 …and the alarm stays recorded (and named) because it could not be closed — no silent orphan"
+unset GH_LOG GH_COUNTER FARM_ARGV
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"

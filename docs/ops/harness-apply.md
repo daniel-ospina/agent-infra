@@ -122,6 +122,10 @@ drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`
 farm_rows=none               <- `none` (farm matched), `not-graded` (NO USABLE grade), `unwritable` (rows write failed), or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's completeness could not be PROVEN (rows did not match this pass's extractor, or no readable `DRIFT` summary was printed; the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
+pin_behind=0                 <- DISTANCE from the commit the box RUNS to the ref (a MEASUREMENT; no rule decides on it)
+deployed_age_s=0             <- AGE of that commit — "8 commits behind" and "running 6-day-old code" are different sentences
+alarm=none                   <- `none` · `disarmed` · `skipped:<why>` · `failed:<why>` · a bare ISSUE NUMBER (filed) · `closed:<n>` · `rekeyed:<n>`
+retry=suppressed             <- `suppressed` = this tick did NOT re-grade a permanent failure (see *Consuming the farm red*)
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
 lanes=none-signalled
@@ -383,6 +387,57 @@ reading about the checkout while the exit code is about the pass. A refusal (ahe
 unpreservable dirt) and a stale record alarm too. `fleet-health` exits non-zero on any of
 them, so a scheduler can see it.
 
+## Consuming the farm red (#4237)
+
+⛔ **MEASURED, and it is why this section exists.** On a cell, `harness-apply` emitted six consecutive
+`rc=24` records ten minutes apart — `head=` and `deployed=` pinned at one commit while `origin/main` had
+moved — and **nothing read them**. The pass was behaving exactly as designed; the design had **no last
+mile**. The cost was not the log line: a merged fix (`#4234`, the verdict parser) never reached the box,
+because the farmed copy there was six days old, and **both open PRs then became unverdictable** — with
+no way for a reader to tell "the PR is fine" from "the reader is six days old". `ok=0` on every tick, in
+a retry loop, is the most convincing possible disguise for a permanent failure.
+
+So the pass consumes its own permanent code. Four rules, each falsifiable in `T30`:
+
+1. **One issue per (box, pinned head)** — the identity, not the event. The alarm's key (`box`, `head`,
+   `ref_sha`, the farm's content fingerprint, the checker's fingerprint) is written to
+   `harness-apply-alarm.state` beside the record. A tick with an unchanged key makes **no `gh` call at
+   all**; a **moved pin** that is still stale adds **one comment** to the standing issue, never a second
+   issue (an alarm that files 144 issues a day is an alarm nobody reads).
+2. **A permanent failure is not retried.** If the pinned head, the ref, the farm's bytes and the checker
+   are all unchanged, the grade **cannot** differ — so the next tick does not re-grade, does not
+   re-file and does not re-publish the rows list. It re-asserts the **standing red** and records
+   `retry=suppressed`. ⛔ **The exit code stays 24**: a green tick over a stale farm is the false PASS
+   this whole feature exists to delete, so "stop retrying" is never spelled "report success".
+3. **The silence is BOUNDED.** Past `HARNESS_APPLY_ALARM_REPEAT` (default 86400 s) the grade runs once
+   more and the key is refreshed — otherwise a hand-closed issue could leave the box invisible for
+   ever, which is `#4237` reintroduced by its own fix. This is the `repeat_interval` every mature
+   alerter has.
+4. **An alarm with no auto-close is an orphan.** The first pass that **grades the farm clean** closes
+   it and clears the key, so the next drift files a fresh issue. Only a real clean grade counts
+   (`farm_n=0`): a pass where the farm was **skipped, disarmed or unreadable** never closes a live
+   alarm — a false clear is harder to notice than a false pass.
+
+**Staleness is published as a number.** `behind=` says whether the box is on the ref's line; `pin_behind=`
+is the distance from the commit it **runs**, and `deployed_age_s` is that commit's **age**.
+`tools/fleet/fleet-health.py` prints both (`… 42 commit(s) behind the ref; running code 6d old`) and
+names the alarm (`filed as issue #N`), and a red whose alarm could **not** be delivered
+(`alarm=failed:…`) is its own finding — the whole defect was a red that reached nobody.
+
+**The consumer never changes the verdict.** An absent `gh`, a missing auth, an unreachable network, a
+non-GitHub origin (every test fixture) and `HARNESS_APPLY_ALARM=0` all leave the red exactly as it was
+and say so in the record (`alarm=failed:…` / `skipped:…` / `disarmed`). A consumer that could silence
+the red would be worse than no consumer.
+
+**Seams** (the unit sets none): `HARNESS_APPLY_ALARM` (`1|0`, default 1), `HARNESS_APPLY_ALARM_GH`
+(the `gh` binary), `HARNESS_APPLY_ALARM_REPO` (`owner/repo`, default resolved from the origin **and
+only when it is a github.com URL**), `HARNESS_APPLY_BOX` (default `uname -n`), and
+`HARNESS_APPLY_ALARM_REPEAT` (seconds, default 86400).
+
+**Declared residual:** the key lives on the box, so a box that loses its state directory can file **one**
+duplicate issue for a condition it had already alarmed. Bounded by the next clean grade, which closes
+whatever is open at the id it knows.
+
 ## Exit vocabulary
 
 Adopted verbatim from `scripts/orchestrator-harness/harness-refresh.sh`, because both
@@ -546,7 +601,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 652 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 799 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -566,6 +621,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T12 | a unit rendered from **transient scratch** (`/tmp/tmp.XXXX`) is refused — the measured 127-every-tick unit |
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
+| T30 | the farm red is **CONSUMED** (`#4237`): one issue naming the box, the pinned head and the ref; the second tick with an unchanged key does **not** run the checker again (proved on the checker's own argv log, not on the issue count) and records `retry=suppressed` while **staying RED**; the repeat window **elapsing** forces one real re-verification; a changed **farm**, a changed **checker** and a **moved pin** each re-arm the grade (the moved pin as ONE comment on the standing issue, never a second issue); the first pass that **grades clean closes it** and the next drift files a fresh issue; a **disarmed** farm check never closes a live alarm; and a **disarmed consumer**, **no `gh` binary**, a **failing create** and a **failing close** all leave the pass's own verdict untouched |
 | T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
 | T24r | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
 | T26 | the materialiser is **TOLD which cell home to pin into**: under the rendered unit's own environment (`env -i`, `HOME` and no `CELL_HOME`) a stub that reproduces `cloud-cell-supervisor.sh`'s defaulting pins under the pass's own root and the farm grade is then reachable (**24**); reverted one edit, the same stub pins into the scratch default and the pass reports **25** "nothing moved this box" — never reaching predicate 4 (agent-infra#3593) |
@@ -585,4 +641,8 @@ checkout can use the documented hatch. The same interaction is recorded for
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`
 alarms on the number, an ahead refusal alarms, and stale / future-dated / epoch-less
-records alarm.
+records alarm. It also pins `#4237`: the pinned-vs-ref **distance** and the **age** of the
+deployed commit are published, a **consumed** red names the issue it was filed as, a red
+whose alarm could **not** be delivered is its own finding, a **disarmed** consumer is
+named, and a pre-`#4237` record is named (`staleness=<not recorded…>`) rather than alarmed
+on.

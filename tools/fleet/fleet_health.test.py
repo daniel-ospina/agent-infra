@@ -519,6 +519,29 @@ def leg_harness_apply(mod):
         detail, alarm = rec(rc=0, behind=91)
         check(alarm and "BEHIND" in detail and "91" in detail,
               "HARNESS: a clean exit code does NOT suppress a behind=91 reading")
+        # ── #4237: the STALENESS readings, and whether the red ever reached anyone ─────────────────
+        # MEASURED on a cell: `ok=0 rc=24` on every tick for six days, `deployed=` frozen at a commit
+        # `origin/main` had long left, two PRs left unverdictable because the reader there was six days
+        # old — and NOTHING computed "the cells are N commits behind, running code M days old".
+        detail, alarm = rec(rc=24, action="farm-drift", farm_n="not-graded",
+                            pin_behind=42, deployed_age_s=6 * 86400, alarm="77",
+                            detail="farm: DRIFT")
+        check(alarm and "42 commit(s) behind the ref" in detail and "running code 6d old" in detail,
+              "HARNESS: the pinned-vs-ref DISTANCE and the AGE of deployed code are PUBLISHED (#4237)")
+        check("filed as issue #77" in detail,
+              "HARNESS: a red that was actually CONSUMED says which issue it was filed as")
+        detail, alarm = rec(rc=24, action="farm-drift", alarm="failed:gh-issue-create",
+                            detail="farm: DRIFT")
+        check(alarm and "UNDELIVERED" in detail and "NOT delivered" in detail,
+              "HARNESS: a red whose alarm could NOT be filed is its own finding, not a silent red")
+        detail, alarm = rec(rc=24, action="farm-drift", alarm="disarmed", detail="farm: DRIFT")
+        check(alarm and "DISARMED" in detail,
+              "HARNESS: a DISARMED consumer is named on the red it would have delivered")
+        # An empty key is a pre-#4237 record: NAMED, never alarmed on — alarming would red every box once
+        # for a field it is about to gain, which is how an instrument teaches operators to ignore it.
+        detail, alarm = rec()
+        check(not alarm and "staleness=<not recorded by this pass>" in detail,
+              "HARNESS: a record from before the staleness fields is NAMED, not alarmed")
         detail, alarm = rec(rc=21, action="refused-ahead", ahead=3)
         check(alarm and "refused-ahead" in detail,
               "HARNESS: an ahead refusal alarms and names the action")
