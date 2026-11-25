@@ -28,8 +28,22 @@
 #      it) AND the FENCING TOKEN is written for the worktree — see arm E for why that is not optional.
 #   2b no worktree path → no token, and the log says so rather than leaving a silent hole.
 #   3  the registry is UNREADABLE (rc=2) → proceed and say so. The over-block arm: an abstention is not
-#      a refusal, and the per-head CAS is still the backstop.
+#      a refusal, and the per-head CAS is still the backstop. SPLIT INTO FOUR SUB-CASES because rc=2 is
+#      NOT one state (review F1 at c5243820f):
+#      3a  rc=2 with NO commit surfaced — nothing was created, so nothing is held and nothing released;
+#      3b  rc=2 WITH `CLAIM_COMMIT` set — `_claim_acquire_at` returns 2 on three paths where the CAS may
+#          have LANDED (claims.sh:1634-1643, :1717-1726, :1742-1754), so the block MUST adopt the commit
+#          and attempt the FENCED release. Without it the arm holds the branch for `CLAIM_BRANCH_TTL`
+#          (4 h) while logging "proceeding WITHOUT branch exclusion" — a fail-open that says the
+#          opposite of the state, which is what the pre-fix block did (the old arm 3 pinned it);
+#      3c  the pre-fix arm AS A MUTANT, so 3b measures the fix and not the fixture;
+#      3d  the fenced release FAILS → `BRANCH_OWN` stays set so the EXIT trap retries it (the same
+#          possession rule arm R2 pins on the release function itself).
 #   4  a claims.sh that PREDATES #3328 (no `claim_branch_acquire`) → proceed, and NAME it in the log.
+#   4b the SAME state made observable: the primitive EXISTS and records a call, while `command -v`
+#      reports it absent — so "the block did not call it" can actually fail (review F2: with no stub
+#      defined nothing could write a `branch_acquire` line, so the row could not vary under ANY
+#      mutation, and it stayed green with the guard deleted). Its own mutant deletes the guard.
 #   5  the acquire is made with NO ttl argument, so the BRANCH key's own term governs — see the arm's
 #      own note: this is the KEY'S ceiling, and the residual that it is shorter than the lane bound is
 #      stated in fix-one.sh rather than papered over by a per-dispatch clamp warning.
@@ -102,9 +116,12 @@ fi
 
 # ── the driver (arms 1–5, C) ──────────────────────────────────────────────────────────────────
 # run_block <block-file> <claim-rc> <claim-result> [has-acquire:0|1] [wt:path|none]
+#                                                [surfaced-commit:set|none] [release-rc:0|1]
+#                                                [command-v:real|absent]
 #   → $T/run/{rc,calls,branchown,token,fenced} + $T/run/o/state/fixbail-* + $T/run/o/logs/fix-3696.log
 run_block() {
   local block="$1" rc="$2" res="$3" has="${4:-1}" wt="${5:-$T/run/wt}" d="$T/run"
+  local commit="${6:-set}" relrc="${7:-0}" cmdv="${8:-real}"
   rm -rf "$d"; mkdir -p "$d/o/state" "$d/o/logs" "$d/wt"
   (
     set -u
@@ -120,8 +137,29 @@ run_block() {
       # the ttl could not tell "no ttl given" from "the fixer's 10 h head-claim lease handed over".
       claim_branch_acquire() {
         printf 'branch_acquire repo=%s branch=%s ttl=%s\n' "${1-}" "${2-}" "${3-<none>}" >> "$CALLS"
-        CLAIM_RESULT="$res"; CLAIM_COMMIT=deadbeefcafebabe; return "$rc"
+        CLAIM_RESULT="$res"
+        # ⛔ `CLAIM_COMMIT` IS NOT ALWAYS SURFACED (review F1 at c5243820f), and the branch matters INSIDE
+        # the stub: the paths of `_claim_acquire_at` that created nothing return 2 with it empty. The
+        # old stub set it UNCONDITIONALLY, so the only rc=2 shape this suite could produce was the one
+        # where a commit may have landed — and the "nothing is held for release" row was true only for
+        # the other shape, which is how the block's missing recovery stayed green.
+        if [ "$commit" = none ]; then unset CLAIM_COMMIT; else CLAIM_COMMIT=deadbeefcafebabe; fi
+        return "$rc"
       }
+    fi
+    # The block calls `release_branch_claim` on the rc=2-with-a-surfaced-commit path. The REAL function
+    # is pinned by arms R/R2/T (extracted from fix-one.sh); here it is a recorder, so arm 3 can see
+    # WHETHER the fenced release was attempted, with WHICH commit, and what a FAILED one leaves behind.
+    release_branch_claim() {
+      printf 'branch_release repo=%s branch=%s own=%s\n' "${REPO-}" "${BR-}" "${BRANCH_OWN-}" >> "$CALLS"
+      return "$relrc"
+    }
+    if [ "$cmdv" = absent ]; then
+      # ⛔ THE GUARD IS ONLY OBSERVABLE IF THE THING IT CHECKS FOR EXISTS: `claim_branch_acquire` is
+      # defined by the has=1 branch above and records every call, so the block calling it against an
+      # OLD claims.sh is what arm 4b detects. `command` is a builtin, but a function of the same name
+      # shadows it — and the block's guard is the only `command` call it makes.
+      command() { case "${1:-}" in -v) return 1 ;; *) builtin command "$@" ;; esac; }
     fi
     # The token seams, stubbed so arm 2 can see whether the block WROTE one and where. Arm E exercises
     # the real ones; these two must therefore mirror the real signatures, not an invented one.
@@ -212,15 +250,59 @@ grep -qF 'WARNING: no worktree path is set' "$T/run/o/logs/fix-3696.log"
 ck "2b) with no WT the missing token is stated, not silently skipped" $?
 
 # 3. the registry is unreadable — an ABSTENTION is not a refusal (over-block arm)
-run_block "$T/branchclaim.sh" 2 'branch-claim: REFUSED branch=fix/3696-claims-block-push reason=registry-unreadable'
-ck "3) an UNREADABLE registry does NOT refuse the fixer (rc=$(cat "$T/run/rc"))" \
+# 3a. rc=2 with NO commit surfaced: the claim was never created, so nothing is held and nothing is freed.
+run_block "$T/branchclaim.sh" 2 'branch-claim: REFUSED branch=fix/3696-claims-block-push reason=registry-unreadable' 1 "$T/run/wt" none
+ck "3a) an UNREADABLE registry does NOT refuse the fixer (rc=$(cat "$T/run/rc"))" \
    "$([ "$(cat "$T/run/rc")" = 0 ] && echo 0 || echo 1)"
 grep -qF 'branch claim UNAVAILABLE' "$T/run/o/logs/fix-3696.log"
-ck "3) and it says the exclusion did not happen, instead of reading as 'nobody owns it'" $?
-ck "3) nothing is held for release (BRANCH_OWN is empty: '$(cat "$T/run/branchown")')" \
+ck "3a) and it says the exclusion did not happen, instead of reading as 'nobody owns it'" $?
+ck "3a) nothing is held for release (BRANCH_OWN is empty: '$(cat "$T/run/branchown")')" \
    "$([ -z "$(cat "$T/run/branchown")" ] && echo 0 || echo 1)"
+grep -q '^branch_release' "$T/run/calls"
+ck "3a) ...and no fenced release is attempted (there is no commit to fence on)" \
+   "$([ $? -ne 0 ] && echo 0 || echo 1)"
 grep -q '^head_acquire' "$T/run/calls"
-ck "3) the per-head CAS still runs — it is the backstop when the branch key cannot be read" $?
+ck "3a) the per-head CAS still runs — it is the backstop when the branch key cannot be read" $?
+
+# 3b. rc=2 WITH a surfaced commit — the CAS may have LANDED, so the claim may be OURS (review F1)
+run_block "$T/branchclaim.sh" 2 'branch-claim: REFUSED branch=fix/3696-claims-block-push reason=registry-unreadable' 1 "$T/run/wt" set
+ck "3b) the fixer still proceeds (fail-open on purpose, rc=$(cat "$T/run/rc"))" \
+   "$([ "$(cat "$T/run/rc")" = 0 ] && echo 0 || echo 1)"
+grep -qx 'branch_release repo=/repo branch=fix/3696-claims-block-push own=deadbeefcafebabe' "$T/run/calls"; _3b_rel=$?
+ck "3b) the surfaced commit is ADOPTED and the FENCED release attempted: $(grep '^branch_release' "$T/run/calls")" "$_3b_rel"
+ck "3b) and BRANCH_OWN is cleared afterwards, so the EXIT trap is a clean no-op (own='$(cat "$T/run/branchown")')" \
+   "$([ -z "$(cat "$T/run/branchown")" ] && echo 0 || echo 1)"
+grep -qF 'released the orphaned claim commit deadbeefcafe' "$T/run/o/logs/fix-3696.log"
+ck "3b) the log records the release, not that no exclusion happened" $?
+grep -qF 'proceeding WITHOUT branch exclusion' "$T/run/o/logs/fix-3696.log"
+ck "3b) ...and it does NOT assert the opposite of the state (the no-commit sentence is absent)" \
+   "$([ $? -ne 0 ] && echo 0 || echo 1)"
+grep -q '^head_acquire' "$T/run/calls"
+ck "3b) the per-head CAS still runs after the fenced release" $?
+
+# 3c. THE MUTANT — the PRE-FIX arm, so 3b measures the fix and not the fixture. `if false; then` takes
+# the else branch the pre-fix block had unconditionally: no adopt, no release, and the log says the
+# exclusion did not happen while a claim may be held.
+sed 's|if \[ -n "${CLAIM_COMMIT:-}" \]; then|if false; then|' "$T/branchclaim.sh" > "$T/branchclaim-noadopt.sh"
+if cmp -s "$T/branchclaim.sh" "$T/branchclaim-noadopt.sh"; then
+  bad "3c) the mutant is IDENTICAL to the block — the adopt arm was not found to defuse, so 3b cannot be attributed to it"
+else
+  bash -n "$T/branchclaim-noadopt.sh"
+  ck "3c) the mutant is still a VALID program (a syntax-error mutant proves nothing)" $?
+  run_block "$T/branchclaim-noadopt.sh" 2 'branch-claim: REFUSED branch=fix/3696-claims-block-push reason=registry-unreadable' 1 "$T/run/wt" set
+  grep -qx 'branch_release repo=/repo branch=fix/3696-claims-block-push own=deadbeefcafebabe' "$T/run/calls"
+  ck "3c) with the adopt arm defused the fenced release is NEVER attempted — so 3b measures the fix" \
+     "$([ $? -ne 0 ] && echo 0 || echo 1)"
+  grep -qF 'proceeding WITHOUT branch exclusion' "$T/run/o/logs/fix-3696.log"
+  ck "3c) ...and the pre-fix sentence comes back: that IS the wrong state 3b refuses" $?
+fi
+
+# 3d. the fenced release FAILS — `BRANCH_OWN` must stay set so the EXIT trap retries it (arm R2's rule)
+run_block "$T/branchclaim.sh" 2 'branch-claim: REFUSED branch=fix/3696-claims-block-push reason=registry-unreadable' 1 "$T/run/wt" set 1
+ck "3d) a FAILED fenced release KEEPS the claim for the EXIT trap (BRANCH_OWN='$(cat "$T/run/branchown")')" \
+   "$(grep -qx 'deadbeefcafebabe' "$T/run/branchown" && echo 0 || echo 1)"
+grep -qF 'the CAS may have LANDED and the FENCED release of deadbeefcafe did NOT' "$T/run/o/logs/fix-3696.log"
+ck "3d) ...and the log says so, naming the check to run, instead of claiming no exclusion happened" $?
 
 # 4. a claims.sh that predates #3328
 run_block "$T/branchclaim.sh" 0 'unused' 0
@@ -228,9 +310,34 @@ ck "4) an OLD claims.sh does not refuse the fixer (rc=$(cat "$T/run/rc"))" \
    "$([ "$(cat "$T/run/rc")" = 0 ] && echo 0 || echo 1)"
 grep -qF 'defines no claim_branch_acquire' "$T/run/o/logs/fix-3696.log"
 ck "4) and the missing primitive is NAMED as a named state, not silently read as freedom" $?
+# ⛔ THE OLD ROW HERE COULD NOT FAIL (review F2, MEASURED): with `has=0` no stub exists, so nothing could
+# write a `branch_acquire` line — not with the block as shipped, and not with its `command -v` guard
+# deleted (that mutation only makes bash print `command not found`, discarded into /dev/null). agent-infra
+# #3442 rule 3: an assertion whose value cannot vary under any mutation is a false PASS, not a pin.
+# The reachable half of that intent is the row below (it CAN vary: a block that returns on the legacy arm
+# leaves the head CAS unrun), and the guard itself is pinned by arm 4b.
+grep -q '^head_acquire' "$T/run/calls"
+ck "4) the legacy path still runs the per-head CAS — the missing primitive degrades one key, not the run" $?
+
+# 4b. the same state, MADE OBSERVABLE: the primitive exists and records, while `command -v` reports it
+# absent. So "the block did not call it" can fail — which is what makes the guard a decision rather than
+# a bash accident.
+run_block "$T/branchclaim.sh" 0 'unused' 1 "$T/run/wt" set 0 absent
+grep -qF 'defines no claim_branch_acquire' "$T/run/o/logs/fix-3696.log"
+ck "4b) a primitive that \`command -v\` reports ABSENT is named in the log, not called" $?
 grep -q '^branch_acquire' "$T/run/calls"
-ck "4) no branch claim was attempted when the function does not exist" \
+ck "4b) ...and the block did NOT call it (the call is guarded, not left to a \`command not found\`)" \
    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+sed 's|if command -v claim_branch_acquire >/dev/null 2>&1; then|if true; then|' "$T/branchclaim.sh" > "$T/branchclaim-noguard.sh"
+if cmp -s "$T/branchclaim.sh" "$T/branchclaim-noguard.sh"; then
+  bad "4b) the mutant is IDENTICAL to the block — the \`command -v\` guard was not found to delete, so 4b cannot be attributed to it"
+else
+  bash -n "$T/branchclaim-noguard.sh"
+  ck "4b) the mutant is still a VALID program" $?
+  run_block "$T/branchclaim-noguard.sh" 0 'unused' 1 "$T/run/wt" set 0 absent
+  grep -q '^branch_acquire' "$T/run/calls"
+  ck "4b) with the guard deleted the call DOES happen on a primitive `command -v` called absent — so 4b measures the guard" $?
+fi
 
 # 5. the TERM handed to the branch key
 run_block "$T/branchclaim.sh" 0 'acquired refs/claims/branch-fix-3696-claims-block-push'

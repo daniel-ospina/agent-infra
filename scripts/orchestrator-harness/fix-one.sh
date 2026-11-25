@@ -915,7 +915,35 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
          esac
          : > "$O/state/fixbail-$PR-$HEAD"
          exit 0 ;;
-      *) echo "[fix $PR] single-owner branch claim UNAVAILABLE (rc=$BR_RC: $CLAIM_RESULT) — proceeding WITHOUT branch exclusion (fail-open on purpose, same polarity as the head claim below; ask the holder to release it: branch-claim.sh release $BR, or with no cooperation possible: git push origin :refs/claims/branch-$(claim_branch_slug "$BR") after confirming no worker is live)" >> "$L.log" ;;
+      *)
+         # ⛔ rc=2 IS NOT PROOF THAT NOTHING WAS TAKEN (P2, review at c5243820f; verified against
+         # `claims.sh:1634-1643`, `:1717-1726` and `:1742-1754`). `_claim_acquire_at` returns 2 **with
+         # `CLAIM_COMMIT` set** on three paths where the CAS may have LANDED: the create push reported
+         # success and the read-back differed; the reclaim push landed with a differing read-back; and
+         # "the push exited non-zero, but it may have LANDED and only the immediate re-read failed".
+         # That third site states this exact cost in its own words — returning 2 without the commit
+         # left the caller "PROCEED[ING] fail-open while genuinely owning the ref, so every other box
+         # refused that head until the lease expired".
+         # ⛔ SO THE BRANCH ARM DOES WHAT THE HEAD-CLAIM ARM 19 LINES BELOW ALREADY DOES (`:937-941`):
+         # adopt the surfaced commit and attempt the FENCED release. That release is a no-op when the
+         # ref is a PEER's (the fence is on OUR commit), so it can never delete another lane's claim.
+         # Without it the claim is unreleasable by anything: `release_branch_claim` returns early on an
+         # empty `BRANCH_OWN` (`:821`) so the EXIT trap is a no-op, no fencing token is written on this
+         # path (it is written only in the rc=0 arm), and branch keys have NO independent reaper
+         # (`claims.sh:200-203`: `claim-reaper.sh` ABSTAINS on them) — so a "fail-open" arm would hold
+         # the branch for `CLAIM_BRANCH_TTL` (4 h) and refuse every peer fixer and every peer push,
+         # while telling the operator the opposite of the state.
+         if [ -n "${CLAIM_COMMIT:-}" ]; then
+           BRANCH_OWN="$CLAIM_COMMIT"
+           if release_branch_claim; then
+             BRANCH_OWN=""
+             echo "[fix $PR] single-owner branch claim: released the orphaned claim commit ${CLAIM_COMMIT:0:12} fenced (rc=$BR_RC: $CLAIM_RESULT) — this box no longer excludes $BR" >> "$L.log"
+           else
+             echo "[fix $PR] single-owner branch claim: the CAS may have LANDED and the FENCED release of ${CLAIM_COMMIT:0:12} did NOT (rc=$BR_RC: $CLAIM_RESULT) — this box may still hold $BR; the EXIT trap retries it, and no fencing token exists on this path so a same-box lane cannot release it either: 'branch-claim.sh status $BR' if peers stay refused" >> "$L.log"
+           fi
+         else
+           echo "[fix $PR] single-owner branch claim UNAVAILABLE (rc=$BR_RC: $CLAIM_RESULT) — proceeding WITHOUT branch exclusion (fail-open on purpose, same polarity as the head claim below; ask the holder to release it: branch-claim.sh release $BR, or with no cooperation possible: git push origin :refs/claims/branch-$(claim_branch_slug "$BR") after confirming no worker is live)" >> "$L.log"
+         fi ;;
     esac
   else
     echo "[fix $PR] single-owner branch claim UNAVAILABLE: claims.sh defines no claim_branch_acquire (it predates agent-infra#3328) — proceeding WITHOUT branch exclusion, so a peer lane writing $BR is NOT excluded. Re-provision claims.sh (install.sh seeds it)" >> "$L.log"

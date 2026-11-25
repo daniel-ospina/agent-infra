@@ -579,6 +579,60 @@ acquire_from owner "$GLOBBR"; eq "owner acquires the glob-scope branch" "$?" "0"
 ( cd "$T/stray" && "$BC" hook-ref "$GLOBREF" >/dev/null 2>&1 )
 eq "a checkout with an \`integration/\` DIR still gates that branch (the list is not glob-expanded)" "$?" "1"
 
+echo "== 13. branch_matches_pattern RESTORES the caller's \`-f\` (review F3: the restore had no mutant)"
+# ⛔ THE SCOPE FIX IS `set -f` INSIDE `branch_matches_pattern`, AND ITS PRIMARY TOOTH IS CASE 12 ABOVE.
+# The RESTORE half — the `_had_f` capture and the `[ "$_had_f" -eq 0 ] && set +f` on both exits — was
+# pinned by NOTHING: a mutant that never restores `-f`, or one that unconditionally clears it over a
+# caller who had it, reddened no arm in either suite (agent-infra#3442 rule 1: a new guard with no
+# mutant reads to the next reader as covered). It is inert in the SHIPPED process (\`cmd_hook_ref\` does
+# no globbing afterwards and the script exits), which is exactly why it needed a pin rather than an
+# argument: an unconditional \`set +f\` would re-enable pathname expansion in a caller's shell — this
+# gate's own fail-open class.
+BM="$T/bmp.sh"
+sed -n '/^branch_matches_pattern() {/,/^}/p' "$BC" > "$BM"
+[ -s "$BM" ] && ok "13) branch_matches_pattern is extractable for a same-shell \`\$-\` observation" \
+  || bad "13) cannot extract branch_matches_pattern from $BC"
+# run_bmp <fn-file> <caller-had--f:0|1> <branch> → "<rc>:<-f-after>" measured in ONE shell, because the
+# property is about the caller's options and a subshell boundary would hide the leak it exists to catch.
+run_bmp() {
+  local fn="$1" hadf="$2" br="$3"
+  ( set +f
+    [ "$hadf" = 1 ] && set -f
+    BRANCH_CLAIM_PATTERN='integration/* fix/*'
+    . "$fn"
+    branch_matches_pattern "$br"; _rc=$?
+    case "$-" in *f*) _f=1 ;; *) _f=0 ;; esac
+    printf '%s:%s\n' "$_rc" "$_f"
+  )
+}
+eq "13) a caller WITHOUT -f gets it back OFF after a MATCH (the function does not leak -f)" \
+   "$(run_bmp "$BM" 0 integration/x)" "0:0"
+eq "...and after a NON-match, so BOTH exits restore" \
+   "$(run_bmp "$BM" 0 chore/x)" "1:0"
+eq "...and -f the CALLER already had is PRESERVED, not cleared over it" \
+   "$(run_bmp "$BM" 1 integration/x)" "0:1"
+eq "...on the non-match exit too" \
+   "$(run_bmp "$BM" 1 chore/x)" "1:1"
+# the mutant: delete BOTH restores. The function then leaks `set -f` into its caller, and row 1 reddens.
+sed 's|\[ "$_had_f" -eq 0 \] && set +f|:|' "$BM" > "$T/bmp-norestore.sh"
+if cmp -s "$BM" "$T/bmp-norestore.sh"; then
+  bad "13) the mutant is IDENTICAL — the restore was not found to delete, so the rows above cannot be attributed to it"
+else
+  bash -n "$T/bmp-norestore.sh" && ok "13) the mutant is still a VALID program" || bad "13) the mutant does not parse"
+  eq "13) with the restores deleted the caller's -f LEAKS — so the rows above measure the restore" \
+     "$(run_bmp "$T/bmp-norestore.sh" 0 integration/x)" "0:1"
+  # the other direction: never CAPTURE, so it always clears. A caller that had -f loses it.
+  sed 's|_had_f=1 ;;|_had_f=0 ;;|' "$BM" > "$T/bmp-alwaysclear.sh"
+  if cmp -s "$BM" "$T/bmp-alwaysclear.sh"; then
+    bad "13) the always-clear mutant is IDENTICAL — the capture was not found to defuse"
+  else
+    bash -n "$T/bmp-alwaysclear.sh" && ok "13) the always-clear mutant is still a VALID program" \
+      || bad "13) the always-clear mutant does not parse"
+    eq "13) a function that never CAPTURES clears a caller's -f — so the capture is measured too" \
+       "$(run_bmp "$T/bmp-alwaysclear.sh" 1 integration/x)" "0:0"
+  fi
+fi
+
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ] || exit 1
