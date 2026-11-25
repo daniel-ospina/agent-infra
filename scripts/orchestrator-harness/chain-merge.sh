@@ -266,12 +266,23 @@ release_issue_claim() {
   # that PR merged at some point, and the release decision must still ask whether the merge CLOSED the
   # issue. That is why the consult is not gated on "merge-one ran on this chain" — the wait-loop gap
   # above has no such marker of its own.
+  # ⛔ THE MARKER IS READ FROM `$O` — THE **STATE** DIR — NOT `${_CM_WORK:-$O}`, AND THE TWO ARE NOT THE
+  # SAME ON EVERY DEPLOYMENT (review finding, P2, #4230). `merge-one.sh:165-167` states this repo's own
+  # rule verbatim: *"Everything this file SOURCES OR EXECUTES lives in the work root; everything it
+  # WRITES (`logs/`, `state/`) stays on `$O`"* — and the header of this file says the same. So the
+  # WRITER (`merge-one.sh`) and this file's OTHER TWO READERS (`state/merged-$PR.done` in the merge-phase
+  # wait loop, and again in the post-merge block below) all resolve `$O/state/…`. A consult on the WORK
+  # root is INERT wherever the controller exports `O_WORK != O` (an isolated instance / a named
+  # `ORC_STATE_DIR`, the shape `orch-loop.sh` deliberately creates): the marker never appears there,
+  # `_merged` stays 0, and the TERM-in-the-gap path this block was added for releases an OPEN issue's
+  # claim anyway — the duplicate-PR root of #4230, on exactly the path nobody watches. The `_CM_WORK`
+  # uses elsewhere in this file are CORRECT and must stay: those name files this chain EXECUTES.
   local _merged="${CHAIN_MERGED:-0}"
   if [ "$_merged" != 1 ]; then
     case "${PR:-}" in
       ''|*[!0-9]*) : ;;   # no PR number yet -> no merge to consult
       *)
-        if [ -f "${_CM_WORK:-$O}/state/merged-$PR.done" ]; then
+        if [ -f "$O/state/merged-$PR.done" ]; then
           # The marker alone is evidence, exactly as it is in the post-merge block below; the
           # confirmation can only DOWNGRADE it (rc=1: this repo's PR is not merged, so the marker
           # belongs to another repo's PR of the same number — the defect #4230's P1 review measured).
