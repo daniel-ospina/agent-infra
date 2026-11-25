@@ -71,10 +71,29 @@ fi
 command -v gh >/dev/null 2>&1 || { echo "❌ REFUSING: gh is not installed — the run history is not readable, and an unreadable answer is not a fresh one" >&2; exit 2; }
 
 # ── THE TWO READS, EACH A REFUSAL ON FAILURE ─────────────────────────────────────────────────────
+# The stderr of each read is captured: a 404 has to be told apart from an outage (see below).
+TMP_GH_ERR="$(mktemp "${TMPDIR:-/tmp}/portability-alive-XXXXXX")" || { echo "❌ mktemp" >&2; exit 2; }
+trap 'rm -f "$TMP_GH_ERR"' EXIT
+: >"$TMP_GH_ERR"
 # ⛔ `|| true` WOULD BE THE WHOLE DEFECT: an empty read would fall through to the bootstrap window and
 # certify a workflow that never ran. Every failure path here exits 2.
-runs_json="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?status=success&per_page=1" 2>/dev/null)" || {
-  echo "❌ REFUSING: could not read the successful runs of $WORKFLOW in $REPO (the Actions API refused or is unreachable)" >&2
+gh_err="$TMP_GH_ERR"
+runs_json="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?status=success&per_page=1" 2>"$gh_err")" || {
+  # ⛔ A 404 IS A DIFFERENT ANSWER FROM AN OUTAGE, AND THE DIFFERENCE MATTERS MOST ON THE PR THAT LANDS
+  # THE WORKFLOW. A workflow file that is in THIS TREE but not yet registered in the repository is
+  # "not landed yet" (the landing PR itself, which must not red on its own change); one that is in
+  # NEITHER is a real absence and must refuse. Reading both as "cannot read" would red every PR until
+  # the first merge, and reading both as bootstrap would let a deleted workflow stay green — so the
+  # tree is the disambiguator, and any other failure still exits 2 below.
+  if grep -Eq 'Not Found|HTTP 404|status 404' "$gh_err"; then
+    if [ -f "$REPO_ROOT/.github/workflows/$WORKFLOW" ]; then
+      echo "NOTE bootstrap: $WORKFLOW is in this tree but not yet registered in $REPO (it lands with this change). The freshness window starts when it is registered: the first successful scheduled run must appear within ${MAX_HOURS}h. Until then this guard cannot answer, and it says so rather than passing silently."
+      exit 0
+    fi
+    echo "❌ REFUSING: $WORKFLOW is NOT registered in $REPO and is NOT present in this tree — the whole-tree portability assertion has no lane at all" >&2
+    exit 2
+  fi
+  echo "❌ REFUSING: could not read the successful runs of $WORKFLOW in $REPO (the Actions API refused or is unreachable): $(head -2 "$gh_err" | tr '\n' ' ')" >&2
   exit 2
 }
 last_iso="$(printf '%s' "$runs_json" | awk -F'"' '{ for (i = 1; i <= NF; i++) if ($i == "updated_at") { print $(i + 2); exit } }')"

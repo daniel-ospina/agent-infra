@@ -216,6 +216,24 @@ PATH="$TMP/gh-future:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b7.out" 2>&1; rc=$?
 [ "$rc" = 2 ] && ok "B7: a FUTURE timestamp REFUSES (a negative age would sail under every bound forever)" \
   || bad "B7: a future timestamp produced rc=$rc"
 
+# B8/B9 — A 404 IS NOT AN OUTAGE, AND THE DIFFERENCE IS THE LANDING PR. The workflow file exists in
+# THIS tree but not yet in the repository: treating that as "cannot read" would red every PR until the
+# first merge, and treating it as unconditional bootstrap would let a DELETED workflow stay green. The
+# tree is the disambiguator.
+mkdir -p "$TMP/gh-404"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "gh: Not Found (HTTP 404)" >&2' 'exit 1' >"$TMP/gh-404/gh"
+chmod +x "$TMP/gh-404/gh"
+PATH="$TMP/gh-404:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b8.out" 2>&1; rc=$?
+if [ "$rc" = 0 ] && grep -q 'NOTE bootstrap' "$TMP/b8.out" && grep -q 'not yet registered' "$TMP/b8.out"; then
+  ok "B8: a workflow present in this tree but not yet registered passes WITH a named bootstrap note (the landing PR does not red on its own change)"
+else
+  bad "B8: the landing-PR case produced rc=$rc: $(head -2 "$TMP/b8.out")"
+fi
+PATH="$TMP/gh-404:$PATH" bash "$ALIVE" --repo o/r --workflow definitely-absent-workflow.yml >"$TMP/b9.out" 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q 'NOT present in this tree' "$TMP/b9.out" \
+  && ok "B9: a workflow that is in NEITHER the repository NOR the tree REFUSES (a deleted workflow cannot ride the bootstrap window)" \
+  || bad "B9: an absent workflow produced rc=$rc"
+
 # ── C1..C6. THE WIRING, READ FROM THE FILES THAT RUN IT ─────────────────────────────────────────
 # ⛔ THESE ARE DERIVED TEXT ASSERTIONS, AND THEY ARE THE POINT: a suite that stopped running, or a lane
 # that dropped the scope switch, cannot be caught by any arm of the suite itself.

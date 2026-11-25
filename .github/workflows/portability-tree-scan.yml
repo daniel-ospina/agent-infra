@@ -107,6 +107,12 @@ jobs:
         run: bash scripts/check-portability-traps.test.sh
 
       - name: Report — ONE issue on a rise, then fail (a red nobody reads is not a report)
+        # ⛔ `if: always()` ON PURPOSE: the arms step between the scan and here can fail for its own
+        # reasons, and a NEW TRAP in the tree must still be FILED when it does — a report that only runs
+        # on an otherwise-green run is exactly the "detected but unreported" shape this job exists to
+        # avoid. This step fails closed on a missing rc record, so `always()` cannot turn a crash into
+        # a pass.
+        if: always()
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
