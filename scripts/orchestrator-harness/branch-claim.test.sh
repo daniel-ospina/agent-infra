@@ -17,7 +17,8 @@
 #   4 FENCING              a token that is no longer the claim ref's tip cannot push (the property
 #                          is inherited from claims.sh, not re-derived here).
 #   5 FENCED RELEASE       a peer cannot release the holder's claim.
-#   6 SCOPE                an ordinary feature branch is never gated.
+#   6 SCOPE                an ordinary feature branch is never gated — and its subject is CLAIMED first,
+#                          so the arm can fail (cycle-3 review F2: unclaimed, rc was 0 either way).
 #   7 RECOVERY             after the holder releases, it can re-acquire AND push — the gate is not
 #                          a dead end.
 #   8 MUTANT               with the hook removed the same stray push SUCCEEDS and the head MOVES,
@@ -195,10 +196,21 @@ if push_in stray "refs/heads/chore/whatever" "$T/p6.err"; then
 else
   bad "scope too broad: $(cat "$T/p6.err")"
 fi
-( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 )
-case "$?" in
-  0) ok "hook-ref SKIPS an out-of-scope branch before any registry read" ;;
-  *) bad "hook-ref gated an out-of-scope branch (rc=$?) — the scope has swallowed everything" ;;
+# ⛔ THE SUBJECT IS CLAIMED BEFORE THIS ARM READS IT (cycle-3 review F2, MEASURED INERT). Against an
+# UNCLAIMED subject the arm could not fail for the reason its own `bad` sentence names: `hook-ref` skips
+# an out-of-scope branch (rc 0) and ALSO allows an in-scope UNCLAIMED one (case 1's polarity), so a scope
+# that had swallowed everything was indistinguishable from a correct one — MEASURED: with the default
+# widened to `*` this case stayed 100% green. Claiming it first makes the two outcomes differ: a claimed
+# IN-SCOPE branch IS refused (cases 11/12), so rc 0 below can only mean the scope SKIPPED it. The
+# `guard` line is the control proving that refusal was armed.
+acquire_from owner "chore/whatever"
+eq "fixture: the out-of-scope subject is CLAIMED before the scope reads it" "$?" "0"
+guard_from stray "chore/whatever"
+eq "the guard DOES refuse that branch — so rc 0 below is the scope's doing, not an unarmed claim" "$?" "1"
+( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 ); _rc6=$?
+case "$_rc6" in
+  0) ok "hook-ref SKIPS a CLAIMED out-of-scope branch before any registry read" ;;
+  *) bad "hook-ref gated an out-of-scope branch (rc=$_rc6) — the scope has swallowed everything" ;;
 esac
 
 echo "== 7. recovery: the holder releases, re-acquires and pushes again"

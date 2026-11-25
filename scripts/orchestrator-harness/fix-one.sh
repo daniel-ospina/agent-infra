@@ -806,8 +806,12 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
 # BRANCH right now?* That is `refs/claims/branch-<slug>` — the key, CAS, fencing token, guard and
 # reaper that #3328 already built and reviewed for batch branches, deliberately reused rather than
 # a second registry. See branch-claim.sh's header for the loss it was built for; it is the same shape.
-# ⛔ IT IS NOT THE LANDING KEY `pr-<N>` ON PURPOSE (claims.sh:1855-1858 records that `pr-<N>` is taken
+# ⛔ IT IS NOT THE LANDING KEY `pr-<N>` ON PURPOSE (claims.sh:963-970 RECORDS that `pr-<N>` is taken
 # ONLY by the landing path, and ps_held in pr-sickness.sh reads it as "someone is LANDING this PR").
+# ⛔ THE CITATION IS THE RECORD, NOT A PARAPHRASE OF IT (cycle-3 review F3b, verified against the tree):
+# this used to read `claims.sh:1855-1858`, which is the PR-SICKNESS QUEUE comment — it says the decision
+# lives elsewhere, it is not the decision. A conclusion resting on a pointer to a different paragraph is
+# how the next lane re-derives and concludes the opposite, the failure mode agent-infra#2258 records.
 # Taking `pr-<N>` here would reverse that recorded decision and make a live FIXER read as a live
 # MERGER; the branch key answers the writer question without touching the landing one.
 BRANCH_OWN=""

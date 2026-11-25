@@ -38,6 +38,8 @@
 #   R  `release_branch_claim` fences the CAS on (REPO, BR, claim commit) and DELETES the token, and the
 #      EXIT trap actually calls it. Both were unpinned: deleting `; release_branch_claim` from the trap
 #      left every other arm green, and a stranded branch claim refuses every peer fixer until it expires.
+#   R2 a FAILED fenced release KEEPS the token (the claim is still ours; it is the only possession proof),
+#      with a mutant deleting the `[ "$rc" -eq 0 ]` guard — the detector cycle-3 review F1 found missing.
 #   T  the trap line names it.
 #   E  END TO END, the composition that ships: REAL `claims.sh`, REAL `branch-claim.sh install-hook`, the
 #      block's own acquire, then a real `git push` from the worktree. It must SUCCEED as `held-by-you`.
@@ -255,6 +257,52 @@ ck "R) release fences on (REPO, BR, the claim commit): $(cat "$T/rel-call" 2>/de
 ck "R) and it FORGETS the token (a stale token would later pass the fence): $(cat "$T/rel-forget" 2>/dev/null)" \
    "$(grep -qx 'forget /tmp/tok-unused' "$T/rel-forget" 2>/dev/null && echo 0 || echo 1)"
 ck "R) a successful release returns 0 (rc=$(cat "$T/rel-rc"))" "$([ "$(cat "$T/rel-rc")" = 0 ] && echo 0 || echo 1)"
+
+# R2. a FAILED fenced release must KEEP the token — the one case where it is still the proof of ownership
+# ⛔ THE CODE FIX SHIPPED BEFORE THIS DETECTOR (cycle-3 review F1: "Detector: none exists"). Arm R stubs
+# `claim_branch_release` to return 0, so nothing drove the failure path. `_claim_release_at` returns 1
+# WITHOUT deleting the ref when the fenced push fails or the 20 s watchdog TERMs it — an expected outcome,
+# documented by this file's own 20 s bound — and on that path the claim is STILL OURS, with the token as
+# the only possession proof: recovery path (1) in fix-one.sh's lifetime note is "any same-box lane that
+# holds the token can `branch-claim.sh release <br>`", and an unconditional forget kills it, refusing
+# that lane by design and stranding the claim for the whole 4 h branch lease.
+(
+  set -u
+  REPO=/repo; BR=fix/x; BRANCH_OWN=deadbeefcafebabe; BRANCH_TOKEN=/tmp/tok-keep
+  rm -f "$T/rel-forget-fail"
+  claim_branch_release() { return 1; }
+  claim_branch_forget() { printf 'forget %s\n' "$1" > "$T/rel-forget-fail"; return 0; }
+  . "$T/release.sh" >/dev/null 2>&1
+  release_branch_claim
+  printf '%s\n' "$?" > "$T/rel-rc-fail"
+)
+ck "R2) a FAILED fenced release is propagated as rc=1 (rc=$(cat "$T/rel-rc-fail"))" \
+   "$([ "$(cat "$T/rel-rc-fail")" = 1 ] && echo 0 || echo 1)"
+[ -e "$T/rel-forget-fail" ]; _r2_forgot=$?
+ck "R2) ...and it does NOT forget the token (the claim is still ours; the token is the only possession proof)" \
+   "$([ "$_r2_forgot" -ne 0 ] && echo 0 || echo 1)"
+# ⛔ AND THE MUTANT, so R2 is attributed to the rc guard rather than to the fixture: delete the guard and
+# the token IS forgotten. The mutant must still be a VALID program (cycle-2 F2's lesson: a mutant that
+# does not parse proves only that a file which does not parse does nothing).
+sed 's|^  \[ "\$rc" -eq 0 \] && ||' "$T/release.sh" > "$T/release-mutant.sh"
+if cmp -s "$T/release.sh" "$T/release-mutant.sh"; then
+  bad "R2) the mutant is IDENTICAL to the shipped release — the rc guard was not found to delete, so R2 cannot be attributed to it"
+else
+  bash -n "$T/release-mutant.sh"
+  ck "R2) the mutant is still a VALID program (a syntax-error mutant proves nothing)" $?
+  (
+    set -u
+    REPO=/repo; BR=fix/x; BRANCH_OWN=deadbeefcafebabe; BRANCH_TOKEN=/tmp/tok-keep
+    rm -f "$T/rel-forget-mutant"
+    claim_branch_release() { return 1; }
+    claim_branch_forget() { printf 'forget %s\n' "$1" > "$T/rel-forget-mutant"; return 0; }
+    . "$T/release-mutant.sh" >/dev/null 2>&1
+    release_branch_claim
+  ) >/dev/null 2>&1
+  [ -e "$T/rel-forget-mutant" ]; _r2m=$?
+  ck "R2) with the rc guard deleted the token IS forgotten on a failed release — so R2 measures the guard" \
+     "$([ "$_r2m" -eq 0 ] && echo 0 || echo 1)"
+fi
 
 # E. END TO END — the composition that ships: real claims.sh, real hook, real push
 # ⛔ THIS ARM EXISTS BECAUSE EACH HALF WAS GREEN WHILE THE PAIR WAS BROKEN (review P2 → measured P0).
