@@ -1560,6 +1560,38 @@ grep -q 'SCOPED to the target list' "$ERR" \
   && ok "E22: a scoped verdict SAYS it is scoped — 'no new traps' over a diff and over the tree are different claims" \
   || bad "E22: the scoped verdict is indistinguishable from a whole-tree one"
 
+# ⛔ E23: THE FILTER IS SCOPED BY THE `--targets` FLAG, NEVER BY THE TARGET LIST (#4210 review P1,
+# measured). `targets()` IS the whole tree in `--root` mode, so gating `inscope` on `TARGET_LIST` also
+# silenced the `--root` run — the scheduled batch lane and F4, the only surfaces that still read the
+# WHOLE baseline — for a baseline row whose file left the scan set entirely (deleted, renamed, or
+# shebang removed). That row then keeps its old, higher count as STANDING HEADROOM, and `NOJUST` is
+# skipped for it too, so a justification-less row that used to exit 1 passes. E20..E22 cannot see any
+# of this: their fixtures keep the out-of-scope file INSIDE the tree's scan set, so only `--targets`
+# ever excludes it — the `--root` direction had no arm at all.
+mkdir -p "$TMP/roottree/keep"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/roottree/keep/a.sh"
+rgit() { git -C "$TMP/roottree" "$@" >/dev/null 2>&1; }
+rgit init -q -b main
+rgit config user.email scope@example.invalid
+rgit config user.name scope-arm
+rgit add -A
+rgit commit -q -m fixture
+printf 'keep/a.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this file holds ONE live trap while the baseline claims THREE\n' >"$TMP/base-root-vanished.tsv"
+printf 'gone/gone.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this file is NOT in the scan set, so a --root run must still speak about its row\n' >>"$TMP/base-root-vanished.tsv"
+bash "$CHECK" --root "$TMP/roottree" --baseline "$TMP/base-root-vanished.tsv" >"$OUT" 2>"$ERR"; rc=$?
+if [ "$rc" = 0 ] && grep -q 'gone/gone.sh' "$ERR" && grep -q 'SHRANK' "$ERR"; then
+  ok "E23: a WHOLE-TREE run still reports the baseline row of a file no longer in the scan set (the scope filter is the FLAG, not the target list)"
+else
+  bad "E23: a --root run went SILENT about a vanished baseline row (rc=$rc) — deleting or renaming a baselined file erases its re-emit notice and keeps its headroom"
+fi
+printf 'keep/a.sh\n' >"$TMP/root-keep-only"
+bash "$CHECK" --root "$TMP/roottree" --targets "$TMP/root-keep-only" --baseline "$TMP/base-root-vanished.tsv" >"$OUT" 2>"$ERR"; rc=$?
+if [ "$rc" = 0 ] && grep -q 'keep/a.sh' "$ERR" && ! grep -q 'gone/gone.sh' "$ERR"; then
+  ok "E23b: the SAME baseline SCOPED to keep/a.sh says NOTHING about the vanished row — E23 cannot pass by reporting everything"
+else
+  bad "E23b: the scoped control diverged (rc=$rc) — E23 would then pass on a filter that never applies"
+fi
+
 # ── E8..E10: `--emit-baseline` IS A DOCUMENTED REGENERATION PATH, SO IT IS A GATE SURFACE ────────
 # ⛔ THE DEFECT THESE PIN (review cycle-18 P1). The rule table reached awk as `-v rules="$RULES"` with
 # LITERAL NEWLINES in it; one-true-awk — macOS, the host this class exists for — refuses that, the

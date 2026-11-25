@@ -139,11 +139,22 @@ bash "$SCOPE" --root "$FIX" --base HEAD~1 >"$TMP/a5b.out" 2>&1; rc=$?
   || bad "A5b: the extensionless trap was not caught (rc=$rc)"
 
 # A6 — A REFUSAL FROM THE DETECTOR IS NOT A CLEAN RUN. If the detector exits 2 (a scan refusal) the
-# wrapper must not translate it into a pass. Exercised by pointing the wrapper at an empty scan set:
-# an intersection of zero files is A3, so instead a broken detector copy stands in.
+# wrapper must not translate it into a pass.
+# ⛔ THE STUB MUST REACH THE SCAN, WHICH IS THE CODE THIS ARM NAMES (review P2, measured). The first
+# version refused EVERY invocation, so the wrapper died at its own `--print-targets` call
+# (check-portability-traps-changed.sh:95-100) and the arm's rc 2 was produced THERE — never by the
+# tail that translates the scan's rc. Mutating that tail to "only rc 1 fails" left this arm GREEN: a
+# refusing detector would have read as CLEAN in the required lane, which is the fail-open class the
+# wrapper's own header refuses. (Its second `printf` also overwrote the first, so line :145 was a
+# dead statement — one stub now, and it answers the two calls differently.)
 mkdir -p "$TMP/broken"
-printf '%s\n' '#!/usr/bin/env bash' 'echo "refusing on purpose" >&2' 'exit 2' >"$TMP/broken/check-portability-traps.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'echo refusing' >&2 'exit 2' >"$TMP/broken/check-portability-traps.sh"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  "  *' --print-targets '*) printf '%s\\n' 'scripts/two.sh'; exit 0 ;;" \
+  'esac' \
+  'echo "refusing at the SCAN" >&2' \
+  'exit 2' >"$TMP/broken/check-portability-traps.sh"
 chmod +x "$TMP/broken/check-portability-traps.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'echo base' 'n="$(nproc)"' >"$FIX/scripts/two.sh"
 fgit add scripts/two.sh
@@ -291,14 +302,31 @@ else
   bad "C5: the batch lane does not file an issue (or files a new one every run)"
 fi
 
-# C6 — the SUITE's own scope gate is the one predicate, and it is exercised in both positions.
-# `tree_scan_enabled` must appear exactly twice: its definition, and the single branch that reads it.
+# C6 — the SUITE's own scope gate is the one predicate, and EACH F arm sits BEHIND it.
+# ⛔ A COUNT IS A PROXY, NOT THE PROPERTY (#4210 review P2, measured). `uses` used to be
+# `-ge 2 && -le 4`, so BOTH directions it names stayed green: deleting F4's gate (`if tree_scan_enabled`
+# → `if true`) took the readers 3→2 and the bounded lane silently went back to the tree scan, and
+# adding a SECOND copy of the predicate (4 readers) — the "a second copy is a second truth" case its own
+# message names — also passed. C6b cannot see either, because it reads only the --scope-self-test branch.
+# So the count is pinned EXACTLY and each F body is asserted to sit behind a guard: a count alone can be
+# kept at 3 while the F arms are unguarded (delete one guard, add one reader), which is the fail-open
+# direction that costs 2356 s in the bounded lane.
 defs="$(grep -c 'tree_scan_enabled()' "$SUITE")"
-uses="$(grep -c 'if tree_scan_enabled' "$SUITE")"
-if [ "$defs" = 1 ] && [ "$uses" -ge 2 ] && [ "$uses" -le 4 ]; then
-  ok "C6: the suite gates F4/F5 through ONE predicate (one definition, $uses readers: the self-test and the F arms)"
+# ⛔ A GUARD LINE, NOT A MENTION: the bare substring `if tree_scan_enabled` also matches the pattern
+# this very check carries, so the count would include itself (measured: 4 readers, C6 red on a clean
+# tree). Anchored to a whole guard line it counts only real branch sites.
+uses="$(grep -c '^[[:space:]]*if tree_scan_enabled; then$' "$SUITE")"
+guarded() {  # guarded <unique F-body anchor>: that body's line is inside a tree_scan_enabled guard
+  local ln
+  ln="$(grep -nF -- "$1" "$SUITE" | head -1 | cut -d: -f1)"
+  [ -n "$ln" ] || return 1
+  sed -n "$(( ln > 2 ? ln - 2 : 1 )),${ln}p" "$SUITE" | grep -q '^[[:space:]]*if tree_scan_enabled; then$'
+}
+if [ "$defs" = 1 ] && [ "$uses" = 3 ] \
+   && guarded 'real_out="$(bash "$CHECK" --root' && guarded '<<<"$real_out"'; then
+  ok "C6: the suite gates F4/F5 through ONE predicate (one definition, $uses readers — the self-test, F4 and F5 — and both F bodies sit behind the guard)"
 else
-  bad "C6: the suite scope gate is missing or duplicated (definitions=$defs readers=$uses) — a second copy is a second truth"
+  bad "C6: the suite scope gate is missing, duplicated, or an F arm lost its guard (definitions=$defs readers=$uses; want 1/3 AND both F bodies guarded) — a second copy is a second truth, and an unguarded arm runs the whole-tree scan in the bounded lane"
 fi
 run_out="$(PORTABILITY_TREE_SCAN=1 bash "$SUITE" --scope-self-test 2>&1)"
 skip_out="$(PORTABILITY_TREE_SCAN=0 bash "$SUITE" --scope-self-test 2>&1)"

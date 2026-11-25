@@ -1987,9 +1987,16 @@ awk '{ a[NR] = $0 }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
          print a[i]
-         if (a[i] == "    timeout-minutes: 80") {
+         # ⛔ ONE JOB, NOT EVERY JOB WITH THAT BOUND (#4210). Same shape as the job-level-env arm
+         # above: the insertion used to fire on EVERY `    timeout-minutes: 80`, and this PR is what
+         # puts a SECOND such bound into ci-main.yml (script-validate and script-validate-gate). The
+         # mutation is about the JOB that declares the slice, so it lands once, at the first match —
+         # otherwise the arm also rewrites an unrelated job, and then passes on that job returning rc 2.
+         # (No apostrophes here: this awk body sits inside a SINGLE-QUOTED shell string.)
+         if (a[i] == "    timeout-minutes: 80" && !placed) {
            print "    container:"; print "      image: ubuntu:22.04"; print "      env:"
            print "        BASH_SHARD_SLICE: ${{ matrix.shard }}/12"
+           placed = 1
          }
        }
      }' "$MAIN" >"$TMP/ci-main-containerenv.yml"

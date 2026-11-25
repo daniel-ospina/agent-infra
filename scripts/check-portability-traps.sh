@@ -1882,11 +1882,11 @@ fi
 # row — i.e. the gate REDS on every grandfathered finding on the one host whose traps it exists for,
 # and the `just` column silently became empty (a justification-less baseline). `split(line, F, "\t")`
 # inside awk is portable, so the whole join is done there instead.
-join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" -v scope_flat="${TARGET_LIST//$'\n'/$'\034'}" '
+join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" -v scoped="$([ -n "$TARGETS" ] && printf 1 || printf 0)" -v scope_flat="${TARGET_LIST//$'\n'/$'\034'}" '
       BEGIN {
         # ⛔ THE SCAN SCOPE IS TRANSPORTED FLATTENED, never with literal newlines in a `-v` value:
         # one-true-awk refuses those (see the rule-table transport note). Rows whose FILE this run
-        # never opened are OUT OF SCOPE, not SHRUNK — a scoped run is not evidence about an unscanned
+        # never opened are OUT OF SCOPE, not SHRUNK — a SCOPED run is not evidence about an unscanned
         # file, and reporting it as a fall is the notice that would stop detecting a real scan loss.
         nscan = split(scope_flat, S, "\034")
         for (i = 1; i <= nscan; i++) scanned[S[i]] = 1
@@ -1931,11 +1931,17 @@ join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" -v scop
         }
         for (k in base) {
           split(k, parts, SUBSEP)
-          # ⛔ `inscope` GUARDS BOTH DIAGNOSTICS: a missing justification in an unscanned file is not
-          # this run finding either — the full-tree lane still checks the whole baseline.
+          # ⛔ `inscope` GUARDS BOTH DIAGNOSTICS, AND ONLY A SCOPED RUN MAY APPLY IT (#4210 review P1).
+          # The scope is `$TARGETS`, NOT `TARGET_LIST`: `targets()` is the whole tree in `--root` mode
+          # too, so gating on the list made the filter reach the two surfaces that still read the
+          # WHOLE baseline — the scheduled batch job and F4 — and turned the row of a file that is
+          # gone (deleted, renamed, or shebang removed) from a live `SHRANK … UNSCANNED` notice into
+          # SILENCE. That row then keeps its old, higher count as standing headroom, and `NOJUST` is
+          # skipped for it as well, so a justification-less baseline row that used to exit 1 passes.
+          # A whole-tree run therefore keeps the pre-#4210 behaviour for rows the run did not open.
           # (No apostrophes in this awk body: it is inside a SINGLE-QUOTED shell string, and one
           # apostrophe terminates the program exactly as it did in the heredoc that cost #2828/#2930.)
-          inscope = (parts[1] in scanned)
+          inscope = (!scoped || (parts[1] in scanned))
           if (inscope && (!(k in live) || live[k] + 0 < base[k] + 0)) {
             printf "SHRUNK\t%s\t%s\t%d\t%d\n", parts[1], parts[2], base[k], (k in live ? live[k] : 0)
           }
