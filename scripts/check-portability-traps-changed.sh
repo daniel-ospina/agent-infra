@@ -91,7 +91,10 @@ changed="$(git -C "$ROOT" diff --name-only --diff-filter=ACMR "$base_sha" HEAD 2
 }
 
 # ── THE SCAN SET, FROM THE DETECTOR'S OWN DERIVATION ────────────────────────────────────────────
-scan_set="$(bash "$CHECK" --print-targets 2>/dev/null)" || {
+# ⛔ `--root` IS PASSED THROUGH: the set must describe the tree being scanned, or a fixture (and a
+# consumer repo running this from a vendored copy) is intersected against the WRONG repository's
+# file list — which reads as "nothing in scope" and passes.
+scan_set="$(bash "$CHECK" --root "$ROOT" --print-targets 2>/dev/null)" || {
   echo "❌ REFUSING: the detector could not publish its scan set (--print-targets failed) — an empty set would read as 'nothing to scan'" >&2
   exit 2
 }

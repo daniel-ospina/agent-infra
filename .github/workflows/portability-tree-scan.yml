@@ -1,0 +1,203 @@
+name: Portability tree scan
+# The WHOLE-TREE half of the cross-platform portability gate (agent-infra#4210).
+#
+# WHY THIS JOB EXISTS, AND WHY IT IS NOT ON THE MERGE PATH
+# -------------------------------------------------------
+# The detector answers two questions with very different costs:
+#
+#   `--targets <the change's shell files>`   did THIS PR introduce a trap?     proportional to the diff
+#   `--root`  (the whole tree)               is the accumulated tree clean?     proportional to the REPO
+#
+# The second one grows on every merge no matter what the diff does — measured 2356 s of a 2400 s CI
+# step at 5ea9c70a4, i.e. it outlived the bounded lane's own bound and made that lane unable to answer
+# ANY question. Owner decision 2026-11-25 on #4210: the required lane keeps `--targets` (every PR,
+# cheap, still fails a PR that introduces a trap — `scripts/check-portability-traps-changed.sh`), and
+# the tree-wide assertion moves HERE, where a slow run buys information that has actually changed.
+#
+# The trade is stated plainly on the issue and repeated here, because it is a real one: a trap that
+# appears from the INTERACTION of two merges — neither of which introduced it alone — is caught at this
+# batch run instead of at the second merge. Detection is delayed, not lost. That is exactly why this
+# job must FILE AN ISSUE on a rise rather than merely go red: a red X on a page nobody visits is a
+# report in name only.
+#
+# ⛔ A SCHEDULED JOB CANNOT DETECT ITS OWN ABSENCE, so this file is not trusted to be alive. The
+# bounded lanes ask `scripts/check-portability-tree-scan-alive.sh` for this workflow's last successful
+# run on every push, and a stale or never-successful answer REDS there (72 h bound; a just-landed
+# workflow gets one bootstrap window, reported as a NOTE). #4210 acceptance 4.
+#
+# ⛔ THE ASSERTION IS STEP 1, DELIBERATELY, AND IT IS THE SAME ONE AS THE SUITE'S F4. `F4` in
+# `check-portability-traps.test.sh` runs `--root` under the shipped baseline; step 1 runs exactly that
+# command so its findings are machine-readable for the issue body. The suite's own rule arms run in
+# every lane already (they are ~30 s with the tree arm switched off), so re-running them here would buy
+# a second species of silence, not coverage.
+
+on:
+  schedule:
+    # Daily. The tree changes on every merge, so a daily sweep catches an interaction trap within a day
+    # — and the freshness guard gives the schedule three misses before it reds.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this manual run (recorded in the run summary)'
+        required: false
+        default: 'manual'
+
+permissions:
+  contents: read
+  issues: write
+
+# One at a time: two overlapping whole-tree scans answer the same question twice and compete for the
+# same runner pool. `cancel-in-progress` stays FALSE — a cancelled run is non-red to this repo's rail,
+# and the point of this job is that its verdicts exist.
+concurrency:
+  group: portability-tree-scan
+  cancel-in-progress: false
+
+jobs:
+  tree-scan:
+    name: portability tree scan (--root)
+    runs-on: ubuntu-latest
+    # Same arithmetic as the rest of this repo: the job bound sits ABOVE the sum of the step bounds
+    # (10 + 60 + 20 + 10 = 100 < 120), so a running step always trips its OWN bound first — `failure`
+    # (red), never the job-level `cancelled` that `scripts/admin-merge.sh` reads as non-red.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+        with:
+          # The scan reads files, not history; but the run summary names the sha it covered, and an
+          # explicit shallow depth keeps the checkout cheap on a repo this size.
+          fetch-depth: 1
+
+      - name: Whole-tree scan under the shipped baseline (the assertion the bounded lane no longer runs)
+        # ⛔ THIS STEP DOES NOT DECIDE THE JOB OUTCOME, AND IT DOES NOT SWALLOW IT EITHER: the exit code
+        # is written to a file and the NEXT step reads it. A step that pre-decided could not file the
+        # issue; a step that `exit 0`ed with no record would be the no-op gate this repo refuses. If the
+        # record is missing (a crash), the reporting step fails CLOSED.
+        timeout-minutes: 60
+        run: |
+          set -uo pipefail
+          mkdir -p scan-out
+          rc=0
+          bash scripts/check-portability-traps.sh --root "$PWD" \
+            > scan-out/findings.txt 2> scan-out/verdict.txt || rc=$?
+          printf '%s\n' "$rc" > scan-out/rc.txt
+          echo "── verdict ──"
+          cat scan-out/verdict.txt
+          echo "── findings (machine-readable: path:line: rule — replacement) ──"
+          cat scan-out/findings.txt
+          echo "SCAN rc=$rc"
+          case "$rc" in
+            0) echo "✅ the accumulated tree is clean under the shipped baseline" ;;
+            1) echo "ℹ️ NEW trap(s) in the accumulated tree — the next step files ONE issue and fails this run" ;;
+            *) echo "⚠️ the detector REFUSED (rc=$rc) — that is not a clean tree, and the next step fails closed" ;;
+          esac
+
+      - name: The detector's own arms, in the mode the bounded lanes use
+        # ⛔ THE SUITE IS RUN HERE WITH THE TREE ARM OFF ON PURPOSE. Step 1 IS that arm's assertion (the
+        # same command, the same baseline, with machine-readable output for the issue body), so running
+        # F4 again from here would scan the tree twice and buy nothing. What this step DOES buy: the
+        # arms the bounded lanes execute are provably runnable in the mode they execute them in, and
+        # the F4/F5 SKIP lines are exercised on the lane they point at — so "the coverage moved" is
+        # checkable in this run log rather than asserted in a comment.
+        timeout-minutes: 20
+        env:
+          PORTABILITY_TREE_SCAN: "0"
+        run: bash scripts/check-portability-traps.test.sh
+
+      - name: Report — ONE issue on a rise, then fail (a red nobody reads is not a report)
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [ ! -f scan-out/rc.txt ]; then
+            echo "::error::the whole-tree scan wrote no exit record — treating this run as FAILED (a missing verdict is not a clean one)"
+            exit 1
+          fi
+          rc="$(cat scan-out/rc.txt)"
+          sha="${GITHUB_SHA}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          n="$(grep -c . scan-out/findings.txt || true)"
+
+          {
+            echo "## Whole-tree portability scan (\`--root\`)"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| head | \`${sha}\` |"
+            echo "| run | ${run_url} |"
+            echo "| exit | \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal) |"
+            echo "| findings | ${n} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" = "0" ]; then
+            # The run itself IS the published last-success timestamp the bounded lanes read
+            # (scripts/check-portability-tree-scan-alive.sh): no state is written anywhere else, so the
+            # record cannot outlive the run that was supposed to produce it.
+            echo "✅ tree clean at ${sha} — this run is the published last-success timestamp for #4210's freshness guard"
+            echo "- ✅ clean at \`${sha}\` (this run is the published last-success)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$rc" = "1" ]; then
+            echo "❌ ${n} NEW cross-platform trap(s) in the accumulated tree"
+            first_file="$(awk -F: 'NF>=2 { print $1; exit }' scan-out/findings.txt)"
+            first_rule="$(awk -F': ' 'NF>=2 { split($2, w, " "); print w[1]; exit }' scan-out/findings.txt)"
+            title="portability(tree): ${n} new trap(s) — first: ${first_file:-unknown} ${first_rule:-unknown}"
+          else
+            echo "❌ the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict, which is not a clean one"
+            title="portability(tree): the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict"
+          fi
+
+          {
+            echo "The scheduled whole-tree portability scan **${GITHUB_WORKFLOW}** reported a rise."
+            echo ""
+            echo "This is the batch half of #4210: it owns the tree-wide assertion that was moved off the"
+            echo "required lane because its cost tracks repository size, not the diff. It is opened **once**"
+            echo "per incident — later runs comment on this issue instead of opening a new one."
+            echo ""
+            echo "- head: \`${sha}\`"
+            echo "- run: ${run_url}"
+            echo "- exit: \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal)"
+            echo ""
+            echo "## Findings"
+            echo ""
+            echo '```'
+            cat scan-out/findings.txt
+            echo '```'
+            echo ""
+            echo "## Verdict"
+            echo ""
+            echo '```'
+            cat scan-out/verdict.txt
+            echo '```'
+            echo ""
+            echo "## What to do"
+            echo ""
+            echo "1. Read the rule name on each finding: a genuine trap is repaired, or — if the mechanism is"
+            echo "   required — the LINE is annotated with \`# portability-ok: <reason>\` (the detector's own"
+            echo "   escape hatch, which is a statement about one line, not about the tree)."
+            echo "2. Only a PRE-EXISTING finding may be grandfathered, via \`bash scripts/check-portability-traps.sh --emit-baseline\`."
+            echo "   Never re-emit to silence a NEW trap: the baseline ratchet exists so a rise cannot be made quiet."
+            echo "3. Re-run: \`gh workflow run portability-tree-scan.yml\`."
+            echo ""
+            echo "_Opened automatically by \`.github/workflows/portability-tree-scan.yml\`._"
+          } > issue-body.md
+
+          label="portability-tree-scan"
+          gh label create "$label" --color BFD4F2 --description "Whole-tree portability scan findings (#4210)" >/dev/null 2>&1 || true
+          existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "ℹ️ updating the ONE open issue (#${existing}) instead of filing a peer"
+            gh issue comment "$existing" --body-file issue-body.md
+          else
+            gh issue create --title "$title" --label "$label" --body-file issue-body.md
+          fi
+          # ⛔ THE JOB STILL FAILS. Filing the issue is the REPORT; the red is the signal that this run
+          # did not certify the tree. A run that filed and exited 0 would be the "detected but reported
+          # as passing" shape this repo's admin-merge-detector exists to avoid.
+          echo "::error::${n} new cross-platform trap(s) in the accumulated tree — filed/updated an issue"
+          exit 1

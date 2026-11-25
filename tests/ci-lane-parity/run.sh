@@ -1780,8 +1780,15 @@ awk '{ a[NR] = $0 }
        for (i = 1; i <= NR; i++) {
          if (i >= dropfrom && i <= dropto) continue
          print a[i]
-         if (a[i] == "    timeout-minutes: 80") {
+         # ⛔ ONE JOB, NOT EVERY JOB WITH THAT BOUND (#4210). The insertion used to fire on EVERY
+         # `timeout-minutes: 80`, so the moment a SECOND job in this file carried that same bound the
+         # mutation produced two `BASH_SHARD_SLICE` keys and this arm reported "did not land cleanly"
+         # — a fixture failing over an unrelated job edit, which reads as a parity defect. The
+         # mutation is about the JOB that declares the slice, so it lands once, at the first match.
+         # (No apostrophes here: this awk body sits inside a SINGLE-QUOTED shell string.)
+         if (a[i] == "    timeout-minutes: 80" && !placed) {
            print "    env:"; print "      BASH_SHARD_SLICE: ${{ matrix.shard }}/12"
+           placed = 1
          }
        }
      }' "$MAIN" >"$TMP/ci-main-jobenv12.yml"

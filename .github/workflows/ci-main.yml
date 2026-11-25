@@ -26,6 +26,11 @@ on:
 permissions:
   contents: read
   issues: write
+  # ⛔ `actions: read` IS REQUIRED BY #4210'S FRESHNESS STEP in `script-validate-gate`: it reads this
+  # repo's own workflow-run history through the Actions API (the published last-success of the
+  # scheduled whole-tree portability scan). Unlisted scopes are NONE once `permissions` is declared,
+  # so without this key the step 403s — which that script treats as a REFUSAL (red), never a pass.
+  actions: read
 
 jobs:
   extension-tests:
@@ -648,6 +653,14 @@ jobs:
           # hand-kept number, and never a list: the list is the runner's).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
           BASH_SHARD_STEP_BUDGET_SECS: 2400
+          # ⛔ THE WHOLE-TREE PORTABILITY ARM IS OFF THIS LANE (agent-infra#4210, owner decision
+          # 2026-11-25). `check-portability-traps.test.sh`'s F4 runs `--root` over the whole tree; its
+          # cost tracks REPOSITORY SIZE, not the diff — it grew to 2356 s of this step's 2400 s bound
+          # and is why the lane could not finish, which the two prior perf fixes could not move
+          # because they optimised the arm rather than the tree. F4/F5 print an explicit SKIP naming
+          # the lane that owns them (`.github/workflows/portability-tree-scan.yml`, scheduled, which
+          # files an issue on a rise); the DIFF half runs once per run in `script-validate-gate`.
+          PORTABILITY_TREE_SCAN: "0"
         timeout-minutes: 40
         run: bash scripts/run-bash-shards.sh
 
@@ -664,12 +677,23 @@ jobs:
     # call it guards is still the bare call in `script-validate` above.
     runs-on: ubuntu-latest
     # SAME ARITHMETIC AS THE MATRIX ABOVE: the job bound sits ABOVE the sum of the step bounds below
-    # (10 + 10 + 10 + 5 + 15 = 50 < 60), so a running step always trips its OWN bound first — which is
-    # `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
-    timeout-minutes: 60
+    # (10 + 10 + 10 + 5 + 10 + 5 + 15 = 65 < 80), so a running step always trips its OWN bound first —
+    # which is `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
+    # ⛔ 60 → 80 IS THE #4210 STEPS (the changed-files gate 10 + the freshness guard 5), not slack: a
+    # job bound at or below the new sum is what the bounds guard refuses, because then the non-red
+    # `cancelled` can win the race against the red `failure`.
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
+        with:
+          # ⛔ TWO COMMITS, FOR THE CHANGED-FILES GATE BELOW (#4210). That gate diffs `HEAD^..HEAD`;
+          # a depth-1 checkout has no parent, and the gate REFUSES then (rc 2 — fail closed) rather
+          # than reading an unanswerable diff as "nothing changed". On a main PUSH the parent is
+          # main's previous commit, so this is exactly the change the merge introduced. A batch of
+          # merges pushed together is beyond HEAD^, and is covered by the scheduled whole-tree run
+          # (`.github/workflows/portability-tree-scan.yml`) — stated, not hidden.
+          fetch-depth: 2
       # Same pin as the matrix arms: one runtime for the list in both lanes, and `node --check`
       # below needs Node to exist at all.
       - uses: actions/setup-node@v4
@@ -695,6 +719,22 @@ jobs:
         # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
         timeout-minutes: 5
         run: bash scripts/check-ci-lane-parity.sh
+      - name: Portability — THIS change's shell files only (#4210 — the diff, not the tree)
+        # The required half of the scope split (owner decision 2026-11-25). The whole-tree arm was
+        # moved to the scheduled batch lane because its cost tracks repository size; this step keeps
+        # the per-change assertion, which is the one a merge can actually affect — and it still FAILS
+        # on a change that introduces a trap.
+        timeout-minutes: 10
+        run: bash scripts/check-portability-traps-changed.sh --base HEAD^
+      - name: Portability — is the whole-tree scan still ALIVE? (#4210 acceptance 4)
+        # A scheduled job that stops is an ABSENCE, and an absence is not a pass. This reads the
+        # batch workflow's last successful run: older than 72 h reds, never-succeeded reds once the
+        # registration is older than that (one NAMED bootstrap window for a just-landed workflow),
+        # and an API it cannot read is a refusal (rc 2) rather than a fresh-looking pass.
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check-portability-tree-scan-alive.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
         # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
         # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the
