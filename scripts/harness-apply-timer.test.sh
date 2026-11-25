@@ -4595,6 +4595,8 @@ assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …and no second issue was filed for t
 assert_eq "$(grep -c 'issue comment' "$GH_LOG" | tr -d ' ')" "0" "T30 …and no comment spam either — silence is the right amount of noise when nothing changed"
 assert_eq "$(rec30 retry)" "suppressed" "T30 the record SAYS the retry was suppressed, so the silence is a state and not an absence"
 assert_eq "$(rec30 alarm)" "1" "T30 …and still names the standing issue"
+# ⛔ THE RESTORE IS KEY-DRIVEN, NOT A BLANKET LABEL (review round 2 F1): the common case must not regress either.
+assert_eq "$(rec30 action)" "farm-drift" "T30 the suppressed tick re-asserts the standing DRIFT action (restored from the key, not guessed)"
 assert_contains "$OUT" "retry=suppressed" "T30 the log line says it too — the operator's own surface"
 # ── ARM 2b: THE SILENCE IS BOUNDED. A suppression that never expires would let a hand-closed issue
 # leave the box invisible for ever, which is #4237 reintroduced by its own fix. Past the window the
@@ -4758,6 +4760,67 @@ assert_eq "$(cat "$GH_COUNTER")" "$N_BEFORE" \
 assert_eq "$RC" "23" \
     "T30 …and the unusable state dir is REFUSED as 23 (a pass with no record says so, it does not claim a verdict)"
 rm -f "$T/t30/state"; mkdir -p "$T/t30/state"
+# ── ARM 9 (review round 2 F1): A SUPPRESSED TICK RE-ASSERTS THE STANDING ACTION, IT DOES NOT GUESS ONE ─────
+# `detail=` is the sentence an operator ACTS on, and the three post-gate arms that finish `rc=24`
+# (`:2698`, `:2718`, `:3017`) leave a `farm-unknown` alarm standing. The suppressed path used to hardcode
+# `REC_ACTION=farm-drift` and the key carried no `action=` to read — so the record said "the farm is not
+# the code the ref ships" beside `farm_n=not-graded` (the pair the doc calls contradictory) and told the
+# operator to fix the FARM while `remedy=` said fix the CHECKER. Reachable on #4237's own box: its
+# measured farm was six days old, i.e. exactly the farmed-checker vocabulary this pass may not parse.
+# The mute checker is the fixture: exit 0, print NOTHING — no verdict line, so no match can be certified.
+rm -rf "$T/t30/state"; mkdir -p "$T/t30/state"; : >"$GH_LOG"
+cat >"$T/t30/mute-checker.sh" <<'MUTE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FARM_ARGV:-/dev/null}"
+exit 0
+MUTE
+chmod +x "$T/t30/mute-checker.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t30/mute-checker.sh" run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 F1 control: a checker that proves nothing still REDDENS (cannot-verify is not a pass)"
+assert_eq "$(rec30 action)" "farm-unknown" "T30 F1 control: …and the record names NO USABLE GRADE"
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "action=farm-unknown" \
+    "T30 F1 the alarm KEY carries the action, which is what lets a tick that did not grade re-assert it"
+ARGV_F1="$(grep -c . "$T/t30/argv" 2>/dev/null || true)"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t30/mute-checker.sh" run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 F1 the unchanged tick is still red"
+assert_eq "$(rec30 retry)" "suppressed" "T30 F1 …and it is suppressed (the arm only means something on a suppressed tick)"
+assert_eq "$(grep -c . "$T/t30/argv" 2>/dev/null || true)" "$ARGV_F1" \
+    "T30 F1 …without re-grading the checker"
+assert_eq "$(rec30 action)" "farm-unknown" \
+    "⛔ T30 F1 the suppressed tick RESTORES the standing action — it does not relabel an UNKNOWN grade as drift"
+case "$(rec30 detail)" in
+    *UNKNOWN*) ok "T30 F1 …and its verdict sentence is the UNKNOWN one, which is the class the alarm actually is" ;;
+    *) bad "T30 F1 the suppressed detail does not name the standing class (got '$(rec30 detail)')" ;;
+esac
+case "$(rec30 detail)" in
+    *"fix the farm"*) bad "⛔ T30 F1 the suppressed detail tells the operator to fix the FARM for a grade no checker ever produced — re-farming cannot clear a checker that cannot grade" ;;
+    *) ok "T30 F1 …and it does NOT prescribe re-farming, which would not clear this class" ;;
+esac
+assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "action=farm-unknown" \
+    "T30 F1 …and the re-keyed state keeps it, so the class survives every suppressed tick"
+# ── ARM 10 (review round 2 F2): THE PIN-MOVED LIMB RECONCILES THE SURFACE TOO ────────────────
+# `gh issue comment` SUCCEEDS on a CLOSED issue and does NOT reopen it, so a pin-moved tick that never
+# read the state recorded `alarm=<n>` — which `fleet-health` prints as "filed as issue #n" — for an alarm
+# whose surface reached nobody, and then re-keyed `graded_at=now`, pushing the only reopening path a full
+# window into the future. The state is an operator doing the natural repair in the natural order: advance
+# the pin, re-farm later.
+rm -rf "$T/t30/state"; mkdir -p "$T/t30/state"; : >"$GH_LOG"
+OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 F2 control: a stale farm reds and files"
+ISSUE_F2="$(rec30 alarm)"
+case "$ISSUE_F2" in
+    ''|*[!0-9]*) bad "T30 F2 control: no standing issue was filed (alarm=$ISSUE_F2)" ;;
+    *) ok "T30 F2 control: the standing issue is #$ISSUE_F2" ;;
+esac
+BEFORE_REOPEN_F2="$(grep -c 'issue reopen' "$GH_LOG" | tr -d ' ')"
+advance_origin t30 F2.txt f2 >/dev/null            # the pin MOVES while the farm is still stale
+OUT="$(GH_ISSUE_STATE=CLOSED run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 F2 a moved pin over a still-stale farm is still red"
+case "$(grep -c 'issue reopen' "$GH_LOG" | tr -d ' ')" in
+    "$BEFORE_REOPEN_F2") bad "⛔ T30 F2 the PIN-MOVED limb never reconciled the standing issue — a hand-closed alarm was recorded as 'filed' (alarm=$(rec30 alarm)) while its surface reached nobody" ;;
+    *) ok "T30 F2 …and the PIN-MOVED limb REOPENS a hand-closed standing issue before it comments" ;;
+esac
+assert_eq "$(rec30 alarm)" "$ISSUE_F2" "T30 F2 …on the SAME issue (one condition, one ticket, never a duplicate for a moved pin)"
 unset GH_LOG GH_COUNTER FARM_ARGV GH_OUT GH_CREATE_MODE GH_ISSUE_STATE GH_REOPEN_RC GH_BREAK_STATE_DIR HARNESS_APPLY_ALARM_REPO
 
 echo

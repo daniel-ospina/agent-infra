@@ -121,11 +121,11 @@ pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
 farm_rows=none               <- `none` (farm matched), `not-graded` (NO USABLE grade), `unwritable` (rows write failed), or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's completeness could not be PROVEN (rows did not match this pass's extractor, or no readable `DRIFT` summary was printed; the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
-preserved=none
 pin_behind=0                 <- DISTANCE from the commit the box RUNS to the ref (a MEASUREMENT; no rule decides on it)
 deployed_age_s=0             <- AGE of that commit — "8 commits behind" and "running 6-day-old code" are different sentences
 alarm=none                   <- `none` · `disarmed` · `skipped:<why>` · `failed:<why>` · a bare ISSUE NUMBER (filed) · `closed:<n>` · `unclosed:<n>` (the close FAILED)
-retry=suppressed             <- `suppressed` = this tick did NOT re-grade a permanent failure (see *Consuming the farm red*)
+retry=none                   <- `suppressed` = this tick did NOT re-grade a permanent failure. A CLEAN pass always reads `retry=none`: the field is assigned on the `rc=24` suppression path only, so `suppressed` here would document a state the writer cannot emit
+preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
 lanes=none-signalled
@@ -400,15 +400,21 @@ a retry loop, is the most convincing possible disguise for a permanent failure.
 So the pass consumes its own permanent code. Four rules, each falsifiable in `T30`:
 
 1. **One issue per (box, pinned head)** — the identity, not the event. The alarm's key (`box`, `head`,
-   `ref_sha`, the farm's content fingerprint, the checker's fingerprint) is written to
-   `harness-apply-alarm.state` beside the record. A tick with an unchanged key makes **no `gh` call at
-   all**; a **moved pin** that is still stale adds **one comment** to the standing issue, never a second
-   issue (an alarm that files 144 issues a day is an alarm nobody reads).
+   `ref_sha`, the farm's content fingerprint, the checker's fingerprint, and the `action=` the grade
+   stood behind) is written to `harness-apply-alarm.state` beside the record. A tick with an unchanged
+   key makes **no `gh` call at all**; a **moved pin** that is still stale adds **one comment** to the
+   standing issue, never a second issue (an alarm that files 144 issues a day is an alarm nobody reads).
 2. **A permanent failure is not retried.** If the pinned head, the ref, the farm's bytes and the checker
    are all unchanged, the grade **cannot** differ — so the next tick does not re-grade, does not
    re-file and does not re-publish the rows list. It re-asserts the **standing red** and records
    `retry=suppressed`. ⛔ **The exit code stays 24**: a green tick over a stale farm is the false PASS
    this whole feature exists to delete, so "stop retrying" is never spelled "report success".
+   ⛔ **And it re-asserts the standing `action=`, it does not guess one.** The three post-gate arms that
+   finish `rc=24` can leave a `farm-unknown` (or `farm-unverifiable`) alarm standing, and a suppressed
+   tick that hardcoded `farm-drift` would then publish `action=farm-drift` beside `farm_n=not-graded` —
+   the pair this doc calls contradictory — with a `detail=` saying *fix the farm* next to a `remedy=`
+   saying *fix the checker*. The key carries the action for exactly this reason, and the suppressed
+   tick restores it and derives its verdict sentence from it.
 3. **The silence is BOUNDED.** Past `HARNESS_APPLY_ALARM_REPEAT` (default 86400 s) the grade runs once
    more and the key is refreshed — otherwise a hand-closed issue could leave the box invisible for
    ever, which is `#4237` reintroduced by its own fix. This is the `repeat_interval` every mature
@@ -440,7 +446,10 @@ record, not a red one).
 **A hand-closed issue is reopened, not ignored.** The suppression window would otherwise re-verify a grade
 whose alarm surface had been closed by hand — an inert guard one level up. So on a tick that *really
 graded* the standing issue's state is read, and a `CLOSED` one is **reopened** with a comment saying the
-condition is still true; if it cannot be reopened the key is dropped and a fresh issue is filed.
+condition is still true; if it cannot be reopened the key is dropped and a fresh issue is filed. That
+read happens **before** the limb decides what to say, so both the same-head tick **and the pin-moved
+tick** reconcile the surface — `gh issue comment` succeeds on a closed issue without reopening it, so a
+pin-moved-only leg would record `alarm=<n>` for an alarm that reaches nobody.
 
 **Declared residuals.** (a) The key lives on the box, so a box that loses its state directory can file
 **one** duplicate issue for a condition it had already alarmed — bounded by the next clean grade, which
@@ -638,7 +647,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T12 | a unit rendered from **transient scratch** (`/tmp/tmp.XXXX`) is refused — the measured 127-every-tick unit |
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
-| T30 | the farm red is **CONSUMED** (`#4237`): one issue naming the box, the pinned head and the ref; the second tick with an unchanged key does **not** run the checker again (proved on the checker's own argv log, not on the issue count) and records `retry=suppressed` while **staying RED**; the repeat window **elapsing** forces one real re-verification; a changed **farm**, a changed **checker** and a **moved pin** each re-arm the grade (the moved pin as ONE comment on the standing issue, never a second issue); the first pass that **grades clean closes it** and the next drift files a fresh issue; a **disarmed** farm check never closes a live alarm; and a **disarmed consumer**, **no `gh` binary**, a **failing create** and a **failing close** all leave the pass's own verdict untouched |
+| T30 | the farm red is **CONSUMED** (`#4237`): one issue naming the box, the pinned head and the ref; the second tick with an unchanged key does **not** run the checker again (proved on the checker's own argv log, not on the issue count) and records `retry=suppressed` while **staying RED**; a suppressed tick **restores** the standing `action=` from the key rather than labelling every silence `farm-drift` (a `farm-unknown` alarm keeps its class and its "re-farming will not clear this" sentence); the repeat window **elapsing** forces one real re-verification; a changed **farm**, a changed **checker** and a **moved pin** each re-arm the grade (the moved pin as ONE comment on the standing issue, never a second issue); a **hand-closed** issue is reopened on a tick that really graded **and on the pin-moved tick too**; the first pass that **grades clean closes it** and the next drift files a fresh issue; a **disarmed** farm check never closes a live alarm; and a **disarmed consumer**, **no `gh` binary**, a **failing create** and a **failing close** all leave the pass's own verdict untouched |
 | T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
 | T24r | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
 | T26 | the materialiser is **TOLD which cell home to pin into**: under the rendered unit's own environment (`env -i`, `HOME` and no `CELL_HOME`) a stub that reproduces `cloud-cell-supervisor.sh`'s defaulting pins under the pass's own root and the farm grade is then reachable (**24**); reverted one edit, the same stub pins into the scratch default and the pass reports **25** "nothing moved this box" — never reaching predicate 4 (agent-infra#3593) |
