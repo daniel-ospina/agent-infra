@@ -184,7 +184,10 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
 # this box's declaration that the issue is IN FLIGHT. Holding it after the chain is over would keep
 # a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (13 h 20 m since agent-infra#4034; 4-5 h before it) — so
-# it is released on EVERY exit path: a clean merge, a failed one, and the "no PR appeared" timeout.
+# it is released on every exit path — a failed merge and the "no PR appeared" timeout included —
+# ⛔ EXCEPT after a merge that did NOT close the issue (agent-infra#4230): there the work is not
+# finished, the follow-up must stay un-dispatchable, and the claim is KEPT and RENEWED instead. See
+# the RELEASE CONDITION below, which is what decides between the two.
 #
 # ⛔ THE RELEASE IS FENCED (`--force-with-lease=<ref>:<own>`), so it refuses to delete a ref that no
 # longer points at the commit THIS box pushed: a holder whose lease expired and was reclaimed by a
@@ -246,7 +249,49 @@ release_issue_claim() {
   # ⛔ RENEW, DO NOT MERELY SKIP. The term was minted when the issue was DISPATCHED; by now hours of it
   # are gone, so a kept-but-unrenewed claim expires mid-follow-up and the same issue is dispatched again
   # — the same duplicate, one lease later. The renewal preserves the holder and extends the term.
-  if [ "${CHAIN_MERGED:-0}" = 1 ]; then
+  #
+  # ⛔ THE FLAG IS NOT THE ONLY EVIDENCE OF A MERGE (reviewer finding, P2, #4230). `CHAIN_MERGED` is
+  # set on the paths that NOTICED the merge, and every one of them runs AFTER the merge became a fact:
+  # `merge-one.sh` writes `state/merged-<PR>.done` at the instant the rail merges (so the marker —
+  # not this process's flag — is the evidence), and the flag is only assigned once that call RETURNS.
+  # A TERM in that gap (a lane killed, a box reaped, a controller stop) therefore reached the trap
+  # with the marker present and the flag still 0, and RELEASED an open issue's claim — the exact
+  # duplicate this change exists to stop, on the one path nobody watches. The same gap exists in the
+  # wait loop, which confirms the marker at most once per CHAIN_POLL. So the trap re-reads the SAME
+  # pair the loop reads: the marker, confirmed against THIS repo's PR. An unreadable confirmation
+  # (rc=2) counts as merged for the same asymmetry the post-merge block below states — keeping a claim
+  # one lease too long is bounded and recovered by `claim_prune`; freeing an issue whose work just
+  # merged is the duplicate.
+  # ⛔ THE MARKER IS NEVER PRUNED, so this is a fact about the PR, not about this run: if it exists,
+  # that PR merged at some point, and the release decision must still ask whether the merge CLOSED the
+  # issue. That is why the consult is not gated on "merge-one ran on this chain" — the wait-loop gap
+  # above has no such marker of its own.
+  local _merged="${CHAIN_MERGED:-0}"
+  if [ "$_merged" != 1 ]; then
+    case "${PR:-}" in
+      ''|*[!0-9]*) : ;;   # no PR number yet -> no merge to consult
+      *)
+        if [ -f "${_CM_WORK:-$O}/state/merged-$PR.done" ]; then
+          # The marker alone is evidence, exactly as it is in the post-merge block below; the
+          # confirmation can only DOWNGRADE it (rc=1: this repo's PR is not merged, so the marker
+          # belongs to another repo's PR of the same number — the defect #4230's P1 review measured).
+          _merged=1
+          if [ -n "${OR:-}" ] && declare -f chain_merged_confirmed >/dev/null 2>&1; then
+            local _mmc=0
+            chain_merged_confirmed "$PR"; _mmc=$?
+            case "$_mmc" in
+              0) echo "[chain $N] a TERM/failure raced the merge flag, but state/merged-$PR.done is present and repos/$OR/pulls/$PR confirms it merged — asking the ISSUE state before releasing (agent-infra#4230)" >> "$LOG" ;;
+              1) _merged=0
+                 echo "[chain $N] state/merged-$PR.done is present but repos/$OR/pulls/$PR reports no merged_at — NOT counting this as a merge for the claim release (the marker may belong to another repo's PR #$PR)" >> "$LOG" ;;
+              2) echo "[chain $N] state/merged-$PR.done is present but the merge confirmation could not be READ — treating it as MERGED for the claim release: keeping a claim too long is recoverable, freeing an issue whose work already merged is the duplicate #4230 measures" >> "$LOG" ;;
+            esac
+          else
+            echo "[chain $N] state/merged-$PR.done is present but this context cannot confirm it (no OR/registry) — treating it as MERGED for the claim release (fail-closed, agent-infra#4230)" >> "$LOG"
+          fi
+        fi ;;
+    esac
+  fi
+  if [ "$_merged" = 1 ]; then
     case "${N:-}" in ''|*[!0-9]*) : ;;   # no issue key -> the claim below is the PR/head one; nothing to ask
     *)
       local _ist="" _irc=0 _keep=0 _why="" _rout="" _rrc=0
@@ -259,7 +304,10 @@ release_issue_claim() {
           closed) _keep=0
                   echo "[chain $N] the merge CLOSED issue #$N, so there is nothing left to dispatch — releasing refs/claims/issue-$N" >> "$LOG" ;;
           open)   _keep=1
-                  _why="PR #$PR is MERGED but issue #$N is still OPEN — the merge did NOT finish its work, so the claim is KEPT and RENEWED (releasing it lets the refresh re-dispatch an issue whose follow-up is already in an open PR: the duplicate-PR root, agent-infra#4230)" ;;
+                  # ⛔ `${PR:-?}`, NOT `$PR`: this function is extracted and driven on its own, so a
+                  # variable assigned at the top of the file is UNBOUND here and `set -u` would abort
+                  # the log line on the OPEN arm — the arm that must never be silent.
+                  _why="PR #${PR:-?} is MERGED but issue #$N is still OPEN — the merge did NOT finish its work, so the claim is KEPT and RENEWED (releasing it lets the refresh re-dispatch an issue whose follow-up is already in an open PR: the duplicate-PR root, agent-infra#4230)" ;;
           *)      _keep=1
                   _why="the issue state for #$N came back as '${_ist:-<empty>}', which is neither open nor closed — claim KEPT and RENEWED (an answer this code cannot interpret is not 'closed')" ;;
         esac

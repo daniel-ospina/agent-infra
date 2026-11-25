@@ -4841,7 +4841,15 @@ reap. The decisions that are not obvious:
   claim and RENEWS it** (`claim_issue_renew_record`, holder preserved, fenced on this box's own commit)
   so the follow-up stays un-dispatchable and does not expire mid-flight; an unreadable or
   uninterpretable answer **keeps and renews** too (fail-closed: the duplicate is likeliest exactly when
-  the API is rate-limited). A chain that merged NOTHING still releases on every path — an open issue a
+  the API is rate-limited). Two weaker bars are also counted as merged, deliberately, and a reader must
+  be able to predict them: an **unreadable merge confirmation** (`gh` failed, so `_mrc=2` — the marker
+  may belong to another repo's PR of the same number) and a **marker the trap finds before the chain's
+  own flag** (a signal arriving between `merge-one.sh` writing `state/merged-<PR>.done` and the chain
+  assigning `CHAIN_MERGED`, which would otherwise release an open issue's claim on the one path nobody
+  watches) both take the keep-and-renew side: keeping a claim one lease too long is bounded and reaped
+  by `claim_prune`, while freeing an issue whose work already merged is the duplicate #4230 measures.
+  Only a **confirmation that this repo's PR is NOT merged** (`_mrc=1`) drops the marker, and then the
+  claim is released. A chain that merged NOTHING still releases on every path — an open issue a
   peer could work must not be stranded on this box for a lease.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on

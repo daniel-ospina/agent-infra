@@ -28,11 +28,10 @@ mkdir -p "$T/bin" "$T/repo" "$T/home"
 # `$O/gh-limit` and `$O/gh-rest` — ABSOLUTE paths it puts AHEAD of the caller's PATH — so a stub that
 # only lives on the inherited PATH loses to the real, authenticated `gh` on any box that has one (and to
 # /opt/homebrew/bin on a Mac). The suite then silently made REAL API calls instead of asserting against a
-# fixture. Seed the same helper into both prepended dirs so the shim resolves to the stub.
-for _d in gh-limit gh-rest; do
-  mkdir -p "$T/o/$_d"
-  cp "$T/bin/gh" "$T/o/$_d/gh"; chmod +x "$T/o/$_d/gh"
-done
+# fixture. `rig()` seeds the same helper into both prepended dirs — ⛔ IT IS THE ONLY PLACE THAT CAN:
+# it runs AFTER this heredoc creates `$T/bin/gh`, whereas the loop that used to sit here copied a file
+# that did not exist yet, so it printed `cp: cannot stat` on every run and seeded nothing (noise that
+# hides a real red). `rig()` also recreates `$T/o` per arm, so both dirs are re-seeded there anyway.
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 # TWO different questions reach this stub, and a stub that always prints a value makes the merge
@@ -77,13 +76,26 @@ rig() { # rig — fresh $O with a stub chain (records RAN) and no claims.sh (the
   cat > "$T/o/merge-one.sh" <<EOF
 #!/usr/bin/env bash
 printf 'RAN\n' >> "$T/chain-ran"
+# ⛔ THE GAP ARM (#4230 review, P2). The real merge-one writes state/merged-<PR>.done at the instant the
+# rail merges, and THIS caller sets its own CHAIN_MERGED only once this script RETURNS — so a signal in
+# between used to reach the EXIT trap with the marker present and the flag still 0. The stub reproduces
+# that gap on demand (state/kill-at-merge), leaving every other arm untouched.
+if [ -f "$T/o/state/kill-at-merge" ]; then
+  printf 'x\n' > "$T/o/state/merged-5.done"
+  kill -TERM "\$PPID" 2>/dev/null
+fi
 EOF
   chmod +x "$T/o/merge-one.sh"
   # The claim release is the EXIT path's other job; record it so "the early exit released the claim"
   # is an ASSERTION, not a hope. (Without a captured generation chain-merge deliberately refuses.)
+  # ⛔ THE RENEWAL STUB RECORDS ITS FOURTH ARGUMENT TOO (#4230 review, P3): the generation the chain
+  # captured at dispatch start is the fence that stops an hours-old chain renewing a lease it no longer
+  # holds, and a stub that dropped it left `"${CHAIN_CLAIM_COMMIT:-}"` at the call site UNPINNED — a
+  # mutant passing "" kept all five arms green. `<none>` names the empty value explicitly, so the
+  # assertion cannot pass on an absent argument either.
   cat > "$T/o/claims.sh" <<EOF
 claim_issue_release_record() { printf 'RELEASED %s\n' "\$3" >> "$T/released"; return 0; }
-claim_issue_renew_record() { printf 'RENEWED %s\n' "\$3" >> "$T/released"; return 0; }
+claim_issue_renew_record() { printf 'RENEWED %s %s\n' "\$3" "\${4:-<none>}" >> "$T/released"; return 0; }
 EOF
   rm -f "$T/chain-ran" "$T/released"
   # rig() recreates $T/o, so the PATH-prepended shim dirs must be re-seeded with it.
@@ -95,7 +107,14 @@ ran() { [ -f "$T/chain-ran" ]; }
 PID=""
 drive() { # drive <phase-grace> <handoff-wait> — starts the chain, sets $PID (never echoes: a caller
            # running this in $( ) would own the child in a SUBSHELL and could not wait/kill it)
-  PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" MERGED_API_FAIL="${MERGED_API_FAIL-0}" \
+  # ⛔ `O_WORK` IS PINNED INTO THE THROWAWAY TREE (#4230 review, measured). chain-merge.sh resolves its
+  # WORK ROOT as `${O_WORK:-$O}` and prepends `${O_WORK}/gh-rest` and `${O_WORK}/gh-limit` to PATH —
+  # ABSOLUTE paths, AHEAD of `$T/bin`. On a fleet box (any agent/controller session, or anything that
+  # exports it) `O_WORK` names the LIVE harness, so the REAL `gh` outranked this suite's stub: `gh pr
+  # list` answered nothing, the chain sat out all 90 polls, and the suite reported a FALSE RED on arms
+  # it never reached (measured here: arms 1-2 red then a 90-minute hang, with the stub provably working).
+  # Pinning it keeps the shim dirs the rig seeds — and makes the HERMETIC claim at the top true.
+  PATH="$T/bin:$PATH" O="$T/o" O_WORK="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" MERGED_API_FAIL="${MERGED_API_FAIL-0}" \
     ISSUE_STATE_STUB="${ISSUE_STATE_STUB-open}" ISSUE_API_FAIL="${ISSUE_API_FAIL-0}" \
     LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" CHAIN_POLL="${CHAIN_POLL:-15}" \
     CHAIN_CONFIRM_RETRY="${CHAIN_CONFIRM_RETRY:-60}" GH_PULLS_COUNT="${GH_PULLS_COUNT:-}" \
@@ -238,6 +257,8 @@ ck "an OPEN issue after a CONFIRMED merge KEEPS its claim — the trap does not 
       && ! grep -q "RELEASED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
 ck "…and the KEPT claim is RENEWED (a term minted at DISPATCH perishes mid-follow-up — the same duplicate, one lease later)" \
    $(grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+ck "…and the renewal carries the CAPTURED GENERATION (deadbeef), the fence that stops an hours-old chain renewing a lease it no longer holds" \
+   $(grep -q "RENEWED 42 deadbeef" "$T/released" 2>/dev/null && echo 0 || echo 1)
 
 # ── 5c. the SAME merge with the issue CLOSED releases, as before — the pair is what makes the
 #        condition discriminating rather than "never release again" ─────────────────────────────
@@ -278,6 +299,26 @@ ck "a chain that merged NOTHING still RELEASES its claim (an open issue must sta
    $(ran && grep -q "RELEASED 42" "$T/released" 2>/dev/null \
       && ! grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
 
+# ── 5f. A SIGNAL IN THE GAP BETWEEN THE MERGE AND THE CHAIN'S OWN FLAG (agent-infra#4230, review P2) ──
+# ⛔ THE MEASURED DEFECT: `merge-one.sh` writes `state/merged-<PR>.done` at the instant the rail merges,
+# and this chain assigns `CHAIN_MERGED=1` only after that call RETURNS. A TERM in between (a reaped
+# lane, a stopped cell, a killed box) fired the EXIT trap with the evidence present and the flag still
+# 0 — RELEASING an open issue's claim: the exact duplicate #4230 measures, on the one path nobody
+# watches. The same shape exists on the wait loop, which confirms the marker at most once per poll. So
+# the trap must consult the MARKER (the same pair the loop uses), not only its own flag. The stub above
+# reproduces the gap exactly: it writes the marker and then TERMs its parent.
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'BLOCKED_ATTEMPTS the rail refused twice\n' > "$T/o/state/lanemerge-5.verdict"
+: > "$T/o/state/kill-at-merge"
+MERGED_AT_STUB='2026-10-19T00:00:00Z' ISSUE_STATE_STUB=open drive 0 30
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "a TERM in the GAP between merge-one's marker and CHAIN_MERGED still KEEPS the open issue's claim — the marker is the evidence, not the flag (#4230)" \
+   $([ "$RC" = 143 ] && ran && grep -q "still OPEN" "$T/o/logs/chain-42.log" \
+      && ! grep -q "RELEASED 42" "$T/released" 2>/dev/null \
+      && grep -q "RENEWED 42 deadbeef" "$T/released" 2>/dev/null && echo 0 || echo 1)
+
 echo
 # ── 13. the confirmation is asked ONCE PER RETRY WINDOW, and a later window may still ask ───────
 # ⛔ THIS GATE WAS UNPINNED (reviewer finding, P2, measured): reverting `if [ "${_marker_read:-0}" = 0 ]`
@@ -292,10 +333,20 @@ printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
 printf 'x\n' > "$T/o/state/merged-5.done"
 : > "$T/pulls-count"
 GH_PULLS_COUNT="$T/pulls-count" CHAIN_POLL=1 CHAIN_CONFIRM_RETRY=600 MERGED_API_FAIL=1 drive 0 8
-sleep 5; stop
+sleep 5
+# ⛔ THE COUNT IS TAKEN **BEFORE** `stop`, and that is the property being pinned: `stop` kills the
+# chain, and its EXIT/TERM trap re-verifies the marker itself (the #4230 gap arm — otherwise a signal
+# between merge-one's marker and the chain's own flag releases an open issue's claim). That is ONE read
+# on the way out, not a tick, and folding it into this count would make the row fail for doing the
+# right thing. So: the WAIT spends exactly one read, and the whole RUN spends at most one more.
 _n="$(grep -c READ "$T/pulls-count" 2>/dev/null || true)"
+stop
+sleep 1
+_n_all="$(grep -c READ "$T/pulls-count" 2>/dev/null || true)"
 ck "several wait ticks inside ONE retry window cost exactly ONE confirmation read (the gate has teeth)" \
    $([ "${_n:-0}" = 1 ] && echo 0 || echo 1)
+ck "…and the EXIT path adds at most ONE more read (the trap re-verifies the marker, it does not re-poll)" \
+   $([ "${_n_all:-9}" -ge 1 ] && [ "${_n_all:-9}" -le 2 ] && echo 0 || echo 1)
 
 # ── 14. …and a LATER retry window DOES re-ask, so one transient failure is not permanent ────────
 rig
@@ -320,7 +371,7 @@ ck "a LATER retry window re-asks: a transient read failure is not permanent (≥
 rig
 printf 'open\n' > "$T/o/state/lanemerge-5.phase"; printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
 printf 'x\n' > "$T/o/state/merged-5.done"
-PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
+PATH="$T/bin:$PATH" O="$T/o" O_WORK="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
   CHAIN_POLL=abc CHAIN_CONFIRM_RETRY=1 LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 \
   bash "$SCRIPT" "$T/repo" o/r 5 feat/5-x >/dev/null 2>"$T/poll-err.log" &
 PID=$!
@@ -343,7 +394,7 @@ ck "a NON-NUMERIC CHAIN_POLL is refused: the WAIT IS ENTERED, stays bounded, kee
 rig
 printf 'open\n' > "$T/o/state/lanemerge-5.phase"; printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
 printf 'x\n' > "$T/o/state/merged-5.done"
-PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
+PATH="$T/bin:$PATH" O="$T/o" O_WORK="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
   CHAIN_POLL=0 CHAIN_CONFIRM_RETRY=0 LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 \
   bash "$SCRIPT" "$T/repo" o/r 5 feat/5-x >/dev/null 2>"$T/zero-err.log" &
 PID=$!
