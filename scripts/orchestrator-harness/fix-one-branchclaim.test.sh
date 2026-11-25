@@ -74,8 +74,18 @@ if [ ! -s "$T/branchclaim.sh" ]; then
   echo "❌ fix-one branch-claim suite: the block is not extractable — refusing to run arm 1+"
   exit 1
 fi
-grep -qF 'claim_branch_acquire' "$T/branchclaim.sh"
-ck "0) the block is extractable and calls claim_branch_acquire ($(wc -l < "$T/branchclaim.sh" | tr -d ' ') lines)" $?
+# ⛔ THE STATUS IS CAPTURED BEFORE THE MESSAGE IS BUILT (review F4, MEASURED FALSE PASS). The message's
+# `$(wc -l … | tr …)` runs BEFORE a later word's `$?` is expanded, and `$?` is "the most recently
+# executed command" (GNU Bash manual §3.4.2) — so a bare `$?` here delivered the `wc|tr` status, which is
+# 0 whenever the block file is readable (and `:71-76` already exits 1 if it is not). Measured: with a
+# FAILING grep this arm still printed a green ✅. The "calls claim_branch_acquire" half was asserted
+# nowhere. Capture first, print second — the same rule as arm 2's token check below.
+# ⛔ AND THE PATTERN MATCHES THE **CALL**, NOT ANY MENTION (review F4's second half): a bare
+# `grep -qF claim_branch_acquire` is satisfied by the block's own `echo "… defines no
+# claim_branch_acquire …"` prose, so it stayed green with the call deleted — the prose-vs-code confusion
+# this file strips comments for at arm M. Anchoring on the first token asserts the call itself.
+grep -qE '^[[:space:]]*claim_branch_acquire[[:space:]]' "$T/branchclaim.sh"; _acq_rc=$?
+ck "0) the block is extractable and calls claim_branch_acquire ($(wc -l < "$T/branchclaim.sh" | tr -d ' ') lines)" "$_acq_rc"
 bash -n "$FIXER"; ck "0) fix-one.sh still parses" $?
 # The braces are part of the extracted program, not decoration: a block whose `if`/`fi` moved would
 # otherwise be sourced as a truncated statement and fail for a reason unrelated to the rule.
@@ -161,8 +171,15 @@ ck "1) NO head claim was attempted (a bailed lane must not stamp ownership on a 
 # 2. acquired — and the token that makes the claim pushable
 run_block "$T/branchclaim.sh" 0 'acquired refs/claims/branch-fix-3696-claims-block-push'
 ck "2) an acquired branch proceeds (rc=$(cat "$T/run/rc"))" "$([ "$(cat "$T/run/rc")" = 0 ] && echo 0 || echo 1)"
-grep -qx 'deadbeefcafebabe' "$T/run/branchown"
-ck "2) BRANCH_OWN carries the claim commit ($(cat "$T/run/branchown")) — the EXIT trap can release it" $?
+# ⛔ SAME SHAPE AS ARM 2'S TOKEN CHECK (review F2, MEASURED FALSE PASS) — cycle 2's fix generalised to
+# the token arm and NOT to this one. The message's `$(cat …)` is executed before `$?` is expanded, so
+# `ck` received cat's status (always 0, the record always exists) and the arm printed a green ✅ beside a
+# message that contradicted it. `BRANCH_OWN` is what makes `release_branch_claim` (`fix-one.sh:819`)
+# release at all: an empty one strands the claim for `CLAIM_BRANCH_TTL` on EVERY fixer run. The
+# mutation is caught only incidentally by the line-2 fence check below, which is exactly why the named
+# assertion must be made LIVE rather than deleted.
+grep -qx 'deadbeefcafebabe' "$T/run/branchown"; _own_rc=$?
+ck "2) BRANCH_OWN carries the claim commit ($(cat "$T/run/branchown")) — the EXIT trap can release it" "$_own_rc"
 # ⛔ THE P0 ARM (see arm E for the measured end-to-end form): without this file the guard refuses the
 # fixer's OWN push as held-by-live, because it decides by POSSESSION.
 # ⛔ THE STATUS IS CAPTURED BEFORE THE MESSAGE IS BUILT (cycle-2 review F1, MEASURED FALSE PASS). The
@@ -217,8 +234,13 @@ ck "4) no branch claim was attempted when the function does not exist" \
 
 # 5. the TERM handed to the branch key
 run_block "$T/branchclaim.sh" 0 'acquired refs/claims/branch-fix-3696-claims-block-push'
-grep -q 'ttl=<none>' "$T/run/calls"
-ck "5) the acquire passes NO ttl ($(grep '^branch_acquire' "$T/run/calls")) — the branch key's own CLAIM_BRANCH_TTL governs" $?
+# ⛔ CAPTURED, NOT INHERITED (review F3, MEASURED FALSE PASS): `$?` would be the message's inner
+# `grep '^branch_acquire'` status. Measured on a `calls` file whose ttl is 37200 (so `ttl=<none>` is
+# absent and the TESTED grep fails), this arm still printed a green ✅ while its own message showed
+# `ttl=37200`. The intent is covered by the NEXT assertion (`ttl=[0-9]`), so this was a dead arm rather
+# than an unguarded property — but a dead arm is a false PASS, which is the class this PR exists to fix.
+grep -q 'ttl=<none>' "$T/run/calls"; _ttl_rc=$?
+ck "5) the acquire passes NO ttl ($(grep '^branch_acquire' "$T/run/calls")) — the branch key's own CLAIM_BRANCH_TTL governs" "$_ttl_rc"
 # ⛔ THE REASON IS NOT LOG NOISE (review P1). `CLAIM_BRANCH_TTL` is this keying's default AND ceiling, so
 # a ttl of FIX_LEASE (37200) is clamped to the SAME 14400 — the minted term would be identical and every
 # dispatch would print a clamp warning. Asking for it would therefore buy nothing and look like a fix.
@@ -405,8 +427,19 @@ else
   # ⛔ COMMENTS ARE STRIPPED FIRST: the block's own prose NAMES `claim_branch_record` (it explains why the
   # token must be written), so a plain grep stays green on a mutant that still calls it — the same
   # prose-vs-code confusion the repo's other design pins strip comments to avoid.
-  grep -v '^[[:space:]]*#' "$T/branchclaim-notoken.sh" | grep -qF 'claim_branch_record "'
-  ck "M) ...and the record CALL is genuinely gone from it (comments aside)" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+  # ⛔ NO PIPE: `grep -v` piped into a QUIET grep is the SIGPIPE false-negative idiom
+  # `scripts/check-no-sigpipe-grep.sh` exists to ban (#841/#864; it was RED on this file). Under
+  # `pipefail` a SIGPIPE-killed `grep -v` (141) makes the pipeline non-zero *while the call is still
+  # present* — and this assertion reads non-zero as "the call is gone", so it fails in the FALSE-PASS
+  # direction: a mutant that was NOT defused would be announced as defused, and arm M's whole claim ("so
+  # the P0 arm measures the write") rests on this line. Capture, then test in the shell — the guard's own
+  # prescribed remedy, and a `case` needs no pipe.
+  _nc="$(grep -v '^[[:space:]]*#' "$T/branchclaim-notoken.sh" || true)"
+  case "$_nc" in
+    *'claim_branch_record "'*) _nc_rc=1 ;;
+    *)                        _nc_rc=0 ;;
+  esac
+  ck "M) ...and the record CALL is genuinely gone from it (comments aside)" "$_nc_rc"
   run_block "$T/branchclaim-notoken.sh" 0 'acquired refs/claims/branch-fix-3696-claims-block-push'
   [ -s "$T/run/gitdir/branchclaim-branch-fix-3696-claims-block-push" ]
   ck "M) with the token write defused, arm 2's token assertion IS red — so the P0 arm measures the write" \
