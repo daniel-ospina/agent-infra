@@ -4527,7 +4527,18 @@ case "${1:-} ${2:-}" in
             garbage) printf 'not-an-issue\n' | tee -a "${GH_OUT:-/dev/null}" ;;
             *) printf 'https://github.com/acme/infra/issues/%s\n' "$n" | tee -a "${GH_OUT:-/dev/null}" ;;
         esac ;;
-    "issue comment") exit "${GH_COMMENT_RC:-0}" ;;
+    "issue comment")
+        # ⛔ A KEY REFRESH CAN FAIL *AFTER* THE COMMENT LANDED, and nothing used to reach that path
+        # (review F1): arm 4 deletes the `return 0` and no arm made `alarm_state_write` fail. The
+        # trigger is the same class `write_record` refuses on (`exit 23`) — an unusable STATE_DIR — so
+        # the double makes the directory unusable at exactly the moment the pass would re-key, i.e.
+        # AFTER the comment succeeded. A regular FILE at the directory's own path makes `mkdir -p`
+        # fail on every account, root included; a chmod would be a no-op for root and the arm would
+        # silently test nothing.
+        if [ -n "${GH_BREAK_STATE_DIR:-}" ]; then
+            rm -rf "$GH_BREAK_STATE_DIR" && printf 'x\n' >"$GH_BREAK_STATE_DIR"
+        fi
+        exit "${GH_COMMENT_RC:-0}" ;;
     "issue close")   exit "${GH_CLOSE_RC:-0}" ;;
     "issue reopen")  exit "${GH_REOPEN_RC:-0}" ;;
     # ⛔ `issue view` REPORTS THE STANDING ISSUE'S STATE, which is what the window's re-verify reads. A
@@ -4726,7 +4737,28 @@ assert_eq "$RC" "24" "T30 a non-github origin still reds (the consumer is not th
 assert_eq "$(rec30 alarm)" "skipped:no-github-origin" \
     "T30 …and the record says WHERE it went nowhere, instead of pretending it filed"
 assert_eq "$(wc -l <"$GH_LOG" | tr -d ' ')" "0" "T30 …and gh was not called for a repo it cannot file in"
-unset GH_LOG GH_COUNTER FARM_ARGV GH_OUT GH_CREATE_MODE GH_ISSUE_STATE GH_REOPEN_RC HARNESS_APPLY_ALARM_REPO
+# ── ARM 8: A KEY REFRESH THAT FAILS AFTER THE COMMENT LANDED MUST NOT FILE A SECOND ISSUE (review F1).
+# The trigger is the class `write_record` refuses on with `exit 23` (an unusable STATE_DIR), and the
+# pin-MOVED limb is where it bit: that inner `alarm_state_write` had NO `else`, so a failed refresh fell
+# through to `create` — a SECOND issue for one condition, and the FIRST one orphaned (the key then points
+# at the new number while `settle_farm_alarm` only ever closes `issue=`). Rule 1 — "a moved pin adds one
+# comment, never a second issue" — is what this arm falsifies, so the load-bearing assertion is the
+# CREATE COUNT, not the record: the pre-fix pass writes `alarm=<new number>` and looks healthy.
+rm -rf "$T/t30/state"; mkdir -p "$T/t30/state"; : >"$GH_LOG"
+OUT="$(run_pass30 "$T/t30" 2>&1)"                     # a standing alarm at the CURRENT head
+N_BEFORE="$(cat "$GH_COUNTER")"
+advance_origin t30 Y.txt yy >/dev/null                 # the pin MOVES while the farm is still stale
+OUT="$(GH_BREAK_STATE_DIR="$T/t30/state" run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_contains "$(cat "$GH_LOG")" "issue comment $N_BEFORE" \
+    "T30 the pin-moved tick really COMMENTED on the standing issue (the arm reached the inner key refresh)"
+assert_eq "$(grep -c 'issue create' "$GH_LOG" | tr -d ' ')" "1" \
+    "T30 a key refresh that FAILS after the comment landed files NO second issue (rule 1: one condition, one ticket)"
+assert_eq "$(cat "$GH_COUNTER")" "$N_BEFORE" \
+    "T30 …and the counter agrees — the standing issue is still the alarm, not an orphan beside a new one"
+assert_eq "$RC" "23" \
+    "T30 …and the unusable state dir is REFUSED as 23 (a pass with no record says so, it does not claim a verdict)"
+rm -f "$T/t30/state"; mkdir -p "$T/t30/state"
+unset GH_LOG GH_COUNTER FARM_ARGV GH_OUT GH_CREATE_MODE GH_ISSUE_STATE GH_REOPEN_RC GH_BREAK_STATE_DIR HARNESS_APPLY_ALARM_REPO
 
 echo
 echo "────────────────────────────────────────────────────────"

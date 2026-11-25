@@ -431,8 +431,11 @@ the red would be worse than no consumer.
 
 **Seams** (the unit sets none): `HARNESS_APPLY_ALARM` (`1|0`, default 1), `HARNESS_APPLY_ALARM_GH`
 (the `gh` binary), `HARNESS_APPLY_ALARM_REPO` (`owner/repo`, default resolved from the origin **and
-only when it is a github.com URL**), `HARNESS_APPLY_BOX` (default `uname -n`), and
-`HARNESS_APPLY_ALARM_REPEAT` (seconds, default 86400).
+only when it is a github.com URL**), `HARNESS_APPLY_BOX` (default `uname -n`),
+`HARNESS_APPLY_ALARM_REPEAT` (seconds, default 86400), and `HARNESS_APPLY_ALARM_TIMEOUT` (seconds the
+`gh` call may run, default 60; `0` **disarms** the bound deliberately, and a non-numeric value
+**refuses the pass** with `exit 2` — before any record is written, so a bad value shows as a stale
+record, not a red one).
 
 **A hand-closed issue is reopened, not ignored.** The suppression window would otherwise re-verify a grade
 whose alarm surface had been closed by hand — an inert guard one level up. So on a tick that *really
@@ -444,8 +447,13 @@ condition is still true; if it cannot be reopened the key is dropped and a fresh
 closes whatever is open at the id it knows. (b) `alarm_state_write` is atomic but the *decision* is not:
 two passes that both read an empty `issue` can both file (nothing serialises passes here — the same
 caveat the rows artifact carries). Bounded the same way, and the window's re-verify re-reads the state.
-(c) The `gh` call is bounded only where `timeout`/`gtimeout` exists (GNU coreutils, or Homebrew's); on a
-Mac without either it is unbounded and the record would be written after it returns.
+(c) The `gh` call is bounded only where `timeout`/`gtimeout` exists (GNU coreutils, or Homebrew's) —
+that bound is `HARNESS_APPLY_ALARM_TIMEOUT` (default 60 s, `0` disarms it); on a Mac without either
+the call is unbounded and the record would be written after it returns. (d) A **key refresh that fails
+after the comment landed** keeps the standing issue as the alarm and files nothing (`REC_ALARM` stays
+at that id, the log says the key is stale): the alternative — falling through to `create` — would file
+a second issue for one condition and orphan the first, since the key would then point at the new one.
+The cost is a repeated COMMENT on one ticket, never a second ticket.
 
 ## Exit vocabulary
 

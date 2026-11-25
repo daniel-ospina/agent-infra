@@ -155,6 +155,10 @@
 #   HARNESS_APPLY_BOX        the box identity the alarm is keyed on (default `uname -n`)
 #   HARNESS_APPLY_ALARM_REPEAT  seconds a suppression may last before the grade is re-verified
 #                            (default 86400 — a hand-closed issue must not hide a stale farm for ever)
+#   HARNESS_APPLY_ALARM_TIMEOUT  seconds the alarm's `gh` call may run before it is killed (default
+#                            60 — it runs BEFORE the record is written, and a hung `gh` must not lose
+#                            the tick). `0` DISARMS the bound deliberately; a non-numeric value
+#                            REFUSES the pass with exit 2, before any record is written.
 #
 # Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
 #
@@ -1078,6 +1082,20 @@ consume_farm_red() {
                 # ⛔ `retry=` IS NOT SET HERE EITHER: the pin moved, so the grade RAN on this tick.
                 REC_ALARM="$prev_issue"
                 log_line "alarm: $key — the standing issue $prev_issue now names this head (one comment, not a second issue)"
+                return 0
+            else
+                # ⛔ A FAILED KEY REFRESH IS NOT A FAILED ALARM (review F1). The COMMENT LANDED, so the
+                # standing issue already names this head — the alarm reached its reader and this tick
+                # did its job. Falling through to `create` would file a SECOND issue for the SAME
+                # condition (rule 1) AND orphan the first, because the key would then point at the new
+                # number while `settle_farm_alarm` only knows `issue=`/`box=` — so the standing ticket
+                # would never be closed. The same-head branch above answers this identical failure the
+                # same way (:1055-1057): keep the standing issue and say the key went stale. The only
+                # cost is that an unchanged next tick may comment again, which is a duplicate COMMENT
+                # on one ticket, never a second ticket. Trigger is the `write_record` refusal class
+                # (`exit 23`): an unwritable/full STATE_DIR.
+                REC_ALARM="$prev_issue"
+                log_line "alarm: $key — the standing issue $prev_issue now names this head, but the alarm key could not be refreshed in $ALARM_STATE — NOT filing a second issue (the standing one IS the alarm; the next unchanged tick may comment again)"
                 return 0
             fi
         fi
