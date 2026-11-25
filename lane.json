@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795570594,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-ai-drain-013621-2416253-1-1795570594-p2516726-49da8952",
+  "lease_until": 1795607194,
+  "pid": 2516726,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795570594,
+  "state": "RUNNING",
+  "tag": "ai-drain-013621-2416253-1",
+  "worktree": "/home/cmux/orchestrator-ai/wt-drainer-ai-drain-013621-2416253-1"
+}
