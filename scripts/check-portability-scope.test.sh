@@ -384,6 +384,16 @@ if (cmd === "step-run") {
   const [script, token] = rest;
   process.exit(steps.some((s) => cmds(s.run).some((l) => invokes(l, script) && (!token || l.includes(token)))) ? 0 : 1);
 }
+// step-run-text — emit the whole `run` text of the step whose LIVE (comment-stripped) command lines
+// contain <token>. The comment-stripping is the assertion as much as the locator: a filing line that
+// was commented out no longer selects a step, so the caller cannot extract-and-run a dead step.
+if (cmd === "step-run-text") {
+  const [token] = rest;
+  const s = steps.find((s) => cmds(s.run).some((l) => l.includes(token)));
+  if (!s) process.exit(1);
+  process.stdout.write(String(s.run));
+  process.exit(0);
+}
 if (cmd === "step-env") {
   const [script, key, value] = rest;
   process.exit(steps.some((s) => cmds(s.run).some((l) => invokes(l, script)) && String(s.env?.[key] ?? "") === value) ? 0 : 1);
@@ -391,7 +401,7 @@ if (cmd === "step-env") {
 if (cmd === "scheduled") process.exit(Object.prototype.hasOwnProperty.call(doc?.on ?? {}, "schedule") ? 0 : 1);
 process.exit(2);
 PROBE
-wf() {  # wf <step-run|step-env|scheduled> ... — 0 = asserted, 1 = false, 3 = could not answer
+wf() {  # wf <step-run|step-run-text|step-env|scheduled> ... — 0 = asserted, 1 = false, 3 = could not answer
   command -v node >/dev/null 2>&1 || { echo "node is not installed" >"$TMP/wf.err"; return 3; }
   node "$WF_PROBE" "$@" 2>"$TMP/wf.err"
 }
@@ -460,11 +470,117 @@ else
   bad "C3b: C3 stayed green with the freshness step's command removed — the arm is still a substring test"
 fi
 
-# C5 — a batch failure FILES AN ISSUE (a red nobody visits is not a report), and reuses ONE open one.
-if grep -q 'gh issue create' "$BATCH" && grep -q 'gh issue list' "$BATCH"; then
-  ok "C5: a batch failure opens ONE issue and reuses an open one (no issue-per-run flood)"
+# ── C5, C5b. THE BATCH LANE'S REPORT — RUN, NOT GREPPED ────────────────────────────────────────────
+# ⛔ A SUBSTRING IS NOT A REPORT (#4210 review P2, MEASURED). C5 was
+#     `grep -q 'gh issue create' "$BATCH" && grep -q 'gh issue list' "$BATCH"`
+# and commenting the filing line out left it GREEN — so the one thing the batch lane exists for
+# ("a red nobody reads is not a report") had no arm that could fail. The C-section header's own rule
+# ("a substring cannot tell a live step from prose") was applied to C1/C2/C3 and never to C5.
+#
+# So this section does not read the workflow at all: it EXTRACTS the shipped reporting step from the
+# PARSED document and RUNS it against a real detector run, with a `gh` shim that records what it
+# filed. What is asserted is the artifact a tracker list, a search and a notification actually see:
+# the `gh issue create --title` the step emitted. That is also the only way to test the title at all
+# (C7) — the parser's input is a detector stream, and the arm has to produce that stream, not guess it.
+C7DIR="$TMP/c7"
+RISE_TREE="$C7DIR/tree"
+mkdir -p "$RISE_TREE/scripts" "$C7DIR/shim"
+# TWO FILES, ONE RULE, ONE GRANDFATHERED. The rise is then decided by PATH alone, which is what makes
+# the POPULATION defect visible: a report reading the full finding list names the FIRST row
+# (`aa-grandfathered.sh`), while the rise is the SECOND (`zz-rise.sh`). With different rules a
+# population bug could hide behind a delimiter bug, and one fix would appear to cure the other.
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$RISE_TREE/scripts/aa-grandfathered.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$RISE_TREE/scripts/zz-rise.sh"
+c7git() { git -C "$RISE_TREE" "$@" >/dev/null 2>&1; }
+( cd "$RISE_TREE" && git init -q . )
+c7git add -A
+c7git -c user.email=t@example.invalid -c user.name=t commit -q -m base
+# the detector's own baseline for the fixture, then everything EXCEPT the second file is kept — so
+# `zz-rise.sh` is a rise by construction (baseline=0 live=1), not by hand-written fixture text.
+bash "$CHECK" --root "$RISE_TREE" --emit-baseline >"$C7DIR/base-all.tsv" 2>/dev/null
+grep -v 'zz-rise' "$C7DIR/base-all.tsv" >"$C7DIR/base.tsv"
+c7_grandfathered="$(grep -c 'aa-grandfathered' "$C7DIR/base.tsv" || true)"
+# THE INPUT, PRODUCED THE WAY CI PRODUCES IT: the same `--root` scan, stdout → findings, stderr →
+# verdict, rc → the record the reporting step fails closed on.
+C7SCAN="$C7DIR/scan-out"
+mkdir -p "$C7SCAN"
+c7rc=0
+bash "$CHECK" --root "$RISE_TREE" --baseline "$C7DIR/base.tsv" >"$C7SCAN/findings.txt" 2>"$C7SCAN/verdict.txt" || c7rc=$?
+printf '%s\n' "$c7rc" >"$C7SCAN/rc.txt"
+c7_findings_n="$(grep -c . "$C7SCAN/findings.txt" || true)"
+c7_rise_n="$(grep -c ': baseline=[0-9]' "$C7SCAN/verdict.txt" || true)"
+if [ "$c7rc" = 1 ] && [ "$c7_findings_n" = 2 ] && [ "$c7_rise_n" = 1 ] && [ "$c7_grandfathered" = 1 ]; then
+  ok "C5a: the fixture REPRODUCES the batch input by running the detector (rc=1, 2 live findings, 1 rising row, 1 grandfathered) — the report arms below have a real population"
 else
-  bad "C5: the batch lane does not file an issue (or files a new one every run)"
+  bad "C5a: the fixture does not reproduce a rise (rc=$c7rc findings=$c7_findings_n rise_rows=$c7_rise_n grandfathered=$c7_grandfathered; want rc=1 findings=2 rise_rows=1 grandfathered=1) — a report arm over this input would test nothing"
+fi
+
+cat >"$C7DIR/shim/gh" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "gh $*" >>"${GH_CALLS:-/dev/null}"
+case "$1 $2" in
+  "issue list") exit 0 ;;
+  "issue create") printf 'https://example.invalid/1\n' ;;
+  "label create") : ;;
+esac
+exit 0
+SHIM
+chmod +x "$C7DIR/shim/gh"
+
+run_report() {  # run_report <report.sh> <dir> [<scan-out src>] — runs the shipped step; echoes its rc
+  local script="$1" dir="$2" src="${3:-$C7SCAN}"
+  mkdir -p "$dir/scan-out"
+  cp "$src/findings.txt" "$src/verdict.txt" "$src/rc.txt" "$dir/scan-out/" 2>/dev/null
+  : >"$dir/gh-calls.txt"
+  : >"$dir/summary.md"
+  ( cd "$dir" \
+      && PATH="$C7DIR/shim:$PATH" GH_CALLS="$dir/gh-calls.txt" \
+         GITHUB_SHA=deadbeefcafe GITHUB_SERVER_URL=https://ci.example \
+         GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=7 GITHUB_WORKFLOW=portability-tree-scan.yml \
+         GITHUB_STEP_SUMMARY="$dir/summary.md" GH_TOKEN=shim \
+         bash "$script" ) >"$dir/out.log" 2>&1
+  echo "$?"
+}
+
+title_of() {  # title_of <dir> — the --title the step handed to `gh issue create`, verbatim
+  grep '^gh issue create ' "$1/gh-calls.txt" 2>/dev/null \
+    | sed -n 's/^gh issue create --title //; s/ --label .*$//p' | head -1
+}
+
+SHIP="$C7DIR/report.sh"
+c5_extracted=0
+if wf step-run-text "$BATCH" 'gh issue create' >"$SHIP" 2>"$TMP/wf.err" && grep -q . "$SHIP"; then
+  c5_extracted=1
+fi
+
+if [ "$c5_extracted" = 1 ]; then
+  ship_rc="$(run_report "$SHIP" "$C7DIR/ship")"
+  if grep -q '^gh issue create ' "$C7DIR/ship/gh-calls.txt" && grep -q '^gh issue list ' "$C7DIR/ship/gh-calls.txt"; then
+    ok "C5: the batch lane FILES an issue when the scan reds, and asks for an open one first (the shipped step, extracted from the parsed workflow and RUN against a real detector run — a commented-out filing line cannot pass)"
+  else
+    bad "C5: the shipped reporting step ran (rc=$ship_rc) and did not file: $(tail -2 "$C7DIR/ship/out.log" 2>/dev/null)"
+  fi
+else
+  bad "C5: the parsed workflow has no step whose LIVE (comment-stripped) command line files an issue — extracting it is the first half of the assertion: $(head -1 "$TMP/wf.err" 2>/dev/null)"
+fi
+
+# C5b — THE MUTANT. Replace the filing command with a NO-OP that still CARRIES the phrase, and the
+# RUN must stop filing. The no-op shape (not a comment) matters: commenting the line out leaves the
+# enclosing `if` with an EMPTY branch, so bash exits 2 on a SYNTAX error — the step would then file
+# nothing for a reason that has nothing to do with the arm, and C5b would pass on a parse failure. This
+# mutant stays VALID BASH that runs to the end (rc 1 asserted below), so the only difference is that the
+# report is dead while a raw grep still matches it — precisely how the old substring C5 stayed green.
+MUT="$C7DIR/report-noissue.sh"
+if [ "$c5_extracted" = 1 ]; then
+  sed 's|^\( *\)gh issue create |\1: no-op gh issue create |' "$SHIP" >"$MUT"
+  mut_rc="$(run_report "$MUT" "$C7DIR/mut")"
+  if grep -q 'gh issue create' "$MUT" && [ "$mut_rc" = 1 ] && ! grep -q '^gh issue create ' "$C7DIR/mut/gh-calls.txt"; then
+    ok "C5b: disabling the filing command (valid bash that keeps the TEXT, so a raw grep still matches) makes the step file NOTHING while still failing the run (rc=$mut_rc) — C5 is a run, not a substring"
+  else
+    bad "C5b: the report path was disabled and C5 could not tell — mutant rc=$mut_rc (want 1, i.e. it ran to the end rather than dying at a parse error), filed: $(grep -c 'issue create' "$C7DIR/mut/gh-calls.txt" 2>/dev/null) issue(s)"
+  fi
+else
+  bad "C5b: skipped the mutant because the shipped reporting step could not be extracted (see C5)"
 fi
 
 # C6 — the SUITE's own scope gate is the one predicate, and EACH F arm sits BEHIND it.
@@ -501,27 +617,75 @@ else
   bad "C6b: the scope decision did not follow PORTABILITY_TREE_SCAN (run='$run_out' skip='$skip_out')"
 fi
 
-# C7 — THE BATCH LANE'S ISSUE TITLE PARSES WHAT THE DETECTOR ACTUALLY EMITS (#4210 review P2).
-# `scan-out/findings.txt` is the detector's STDOUT, and `hit()` writes `path<TAB>line<TAB>rule<TAB>
-# replacement` (check-portability-traps.sh:1729). The title parser used `-F:` / `-F': '`, so a row whose
-# REPLACEMENT contains a colon — the shipped `date-d-gnu` row does — produced a title carrying tabs and
-# a row fragment, and a row without `": "` rendered `unknown` for a file and rule that are right there
-# in columns 1 and 3. This arm RUNS the two programs the workflow ships (extracted from the workflow
-# itself, so there is no second copy to drift) against a row in the emitted format, and then runs the
-# PRE-FIX programs on the same row to prove the arm can tell the two apart.
-title_line="$(grep -F 'first_file=' "$BATCH" | head -1)"
-rule_line="$(grep -F 'first_rule=' "$BATCH" | head -1)"
-sep="$(printf '%s' "$title_line" | cut -d"'" -f2)"
-file_prog="$(printf '%s' "$title_line" | cut -d"'" -f4)"
-rule_prog="$(printf '%s' "$rule_line" | cut -d"'" -f4)"
-printf 'scripts/foo.sh\t142\tdate-d-gnu\tBSD: `date -r <epoch>`; portable: box_epoch_to_iso\n' >"$TMP/findings-row.txt"
-got_file="$(awk -F"$sep" "$file_prog" "$TMP/findings-row.txt" 2>/dev/null)"
-got_rule="$(awk -F"$sep" "$rule_prog" "$TMP/findings-row.txt" 2>/dev/null)"
-bad_file="$(awk -F: 'NF>=2 { print $1; exit }' "$TMP/findings-row.txt" 2>/dev/null)"
-if [ "$got_file" = "scripts/foo.sh" ] && [ "$got_rule" = "date-d-gnu" ] && [ "$bad_file" != "scripts/foo.sh" ]; then
-  ok "C7: the batch issue title reads the detector's TAB row — file and rule are column-accurate, and a colon inside the REPLACEMENT cannot split the row"
+# C7 — THE BATCH LANE'S ISSUE TITLE NAMES THE RISE, READ FROM A REAL DETECTOR RUN.
+# ⛔ THE PREVIOUS C7 WAS VACUOUS, AND THAT IS THE WORST KIND OF ARM (#4210 review P2, MEASURED). It
+# extracted the title's two awk programs from the workflow and fed them a HAND-WRITTEN tab row:
+#     printf 'scripts/foo.sh\t142\tdate-d-gnu\tBSD: `date -r <epoch>`; ...'
+# The detector never emits that row — its PUBLISHER reformats `hit()`'s tab row at
+# check-portability-traps.sh:1845 into `path:line: rule — use replacement`. So C7 printed PASS over a
+# parser that returned empty on every real run, and the issue title shipped `unknown unknown` with a
+# count of the whole live finding list (144 measured) instead of the rise (1). Everything below is read
+# off the ACTUAL `gh issue create --title` from C5's run, which is the string a tracker would show.
+if [ "$c5_extracted" = 1 ]; then
+  c7_title="$(title_of "$C7DIR/ship")"
+  c7_ok=0
+  case "$c7_title" in
+    *"1 new trap(s)"*scripts/zz-rise.sh*cpu-count-single-mechanism*) c7_ok=1 ;;
+  esac
+  # a title that names the GRANDFATHERED row, or falls back to `unknown`, is the defect this arm exists
+  # for — regardless of anything else it gets right.
+  case "$c7_title" in
+    *unknown*|*aa-grandfathered*) c7_ok=0 ;;
+  esac
+  if [ -n "$c7_title" ] && [ "$c7_ok" = 1 ]; then
+    ok "C7: the batch issue title names the RISE — its file and rule and its count ('$c7_title'), from the detector's own output rather than the full live finding list"
+  else
+    bad "C7: the batch issue title does not name the rise (got '$c7_title'; want 'portability(tree): 1 new trap(s) — first: scripts/zz-rise.sh cpu-count-single-mechanism', never 'unknown' and never the grandfathered row)"
+  fi
 else
-  bad "C7: the batch title parser does not read the emitted format (file='$got_file' rule='$got_rule', pre-fix file='$bad_file'; want 'scripts/foo.sh' / 'date-d-gnu')"
+  bad "C7: skipped — the shipped reporting step could not be extracted (see C5), so the title was never produced"
+fi
+
+# C7b — NON-VACUITY: the PRE-FIX parsers, replayed on the SAME real run. If any of these ever starts
+# reading the rise correctly, the fixture has lost the power to tell the shipped parser from the broken
+# ones and C7 proves nothing — so that is a FAILURE of this arm, not a curiosity.
+if [ "$c5_extracted" = 1 ] && [ -s "$C7SCAN/findings.txt" ]; then
+  pf_tab="$(awk -F'\t' 'NF>=3 { print $1; exit }' "$C7SCAN/findings.txt")"
+  pf_n="$(grep -c . "$C7SCAN/findings.txt" || true)"
+  pf_colon="$(awk -F: 'NF>=2 { print $1; exit }' "$C7SCAN/findings.txt")"
+  if [ -z "$pf_tab" ] && [ "$pf_n" != "$c7_rise_n" ] && [ "$pf_colon" = "scripts/aa-grandfathered.sh" ]; then
+    ok "C7b: the PRE-FIX parsers MISREAD this same real run (tab parse='' → 'unknown'; count=$pf_n where the rise is $c7_rise_n; colon parse='$pf_colon', the GRANDFATHERED row) — C7 can tell the shipped parser from all three"
+  else
+    bad "C7b: the pre-fix parsers read the real run correctly (tab='$pf_tab' colon='$pf_colon' count=$pf_n rise=$c7_rise_n) — the fixture lost its discriminating power, so C7 proves nothing"
+  fi
+else
+  bad "C7b: skipped — no real detector output to replay the pre-fix parsers against (see C5a)"
+fi
+
+# C7c — A RISE THE REPORT CANNOT PARSE IS REPORTED AS SUCH, never as `0 new trap(s)`. rc=1 is the
+# detector's own statement that the rise is non-empty, so zero parsed rows means the ROW FORMAT moved.
+# Silently filing "0 new trap(s)" would be a false report about a real red — the one thing this title
+# must not do — so the step says so in the title AND in a warning annotation.
+if [ "$c5_extracted" = 1 ]; then
+  C7BROKEN="$C7DIR/unparsed"
+  mkdir -p "$C7BROKEN"
+  grep -v ': baseline=[0-9]' "$C7SCAN/verdict.txt" >"$C7BROKEN/verdict.txt"
+  cp "$C7SCAN/findings.txt" "$C7BROKEN/findings.txt"
+  printf '1\n' >"$C7BROKEN/rc.txt"
+  broken_rc="$(run_report "$SHIP" "$C7DIR/brokenrun" "$C7BROKEN")"
+  broken_title="$(title_of "$C7DIR/brokenrun")"
+  brk_ok=0
+  case "$broken_title" in
+    *"could not parse"*) brk_ok=1 ;;
+    *"0 new trap(s)"*) brk_ok=0 ;;
+  esac
+  if [ "$brk_ok" = 1 ] && [ "$broken_rc" = 1 ]; then
+    ok "C7c: a rise whose rows the report cannot parse says so in the title and still fails the run (rc=$broken_rc) — an unparseable rise is never filed as '0 new trap(s)'"
+  else
+    bad "C7c: an unparseable rise filed '$broken_title' (step rc=$broken_rc; want a title containing 'could not parse', never '0 new trap(s)')"
+  fi
+else
+  bad "C7c: skipped — the shipped reporting step could not be extracted (see C5)"
 fi
 
 printf '\nportability-scope.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$OS"

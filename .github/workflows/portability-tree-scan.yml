@@ -85,10 +85,14 @@ jobs:
           printf '%s\n' "$rc" > scan-out/rc.txt
           echo "── verdict ──"
           cat scan-out/verdict.txt
-          # ⛔ THIS LABEL MUST MATCH WHAT THE DETECTOR EMITS (review P2, measured): `hit()` prints
-          # `path<TAB>line<TAB>rule<TAB>replacement` (check-portability-traps.sh:1729). A colon form
-          # would make the title parser below read a replacement string's colons as field separators.
-          echo "── findings (machine-readable: path<TAB>line<TAB>rule<TAB>replacement) ──"
+          # ⛔ THIS LABEL MUST MATCH WHAT THE DETECTOR EMITS (#4210 review, MEASURED — it did not).
+          # `hit()` builds an INTERNAL tab-separated row (check-portability-traps.sh:1729), but the
+          # PUBLISHER reformats it on the way out: `:1845` prints
+          # `path:line: rule — use replacement`. The old label described `hit()` and told the next
+          # reader a TAB parse of this file would work; it does not, and that false belief is what put
+          # `unknown unknown` in the issue title. Findings are human-oriented (COLON form); the RISE —
+          # the only population a report should name — is the `NOT grandfathered` rows in the verdict.
+          echo "── findings (path:line: rule — use replacement; the RISE is the 'NOT grandfathered' rows in the verdict) ──"
           cat scan-out/findings.txt
           echo "SCAN rc=$rc"
           case "$rc" in
@@ -99,7 +103,7 @@ jobs:
 
       - name: The detector's own arms, in the mode the bounded lanes use
         # ⛔ THE SUITE IS RUN HERE WITH THE TREE ARM OFF ON PURPOSE. Step 1 IS that arm's assertion (the
-        # same command, the same baseline, with machine-readable output for the issue body), so running
+        # same command, the same baseline, its two streams captured for the report below), so running
         # F4 again from here would scan the tree twice and buy nothing. What this step DOES buy: the
         # arms the bounded lanes execute are provably runnable in the mode they execute them in, and
         # the F4/F5 SKIP lines are exercised on the lane they point at — so "the coverage moved" is
@@ -128,7 +132,9 @@ jobs:
           rc="$(cat scan-out/rc.txt)"
           sha="${GITHUB_SHA}"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          n="$(grep -c . scan-out/findings.txt || true)"
+          # `findings_n` is the FULL live finding list (grandfathered rows included) — an honest
+          # count of what was printed, and NOT the number of new traps. The rise is parsed below.
+          findings_n="$(grep -c . scan-out/findings.txt || true)"
 
           {
             echo "## Whole-tree portability scan (\`--root\`)"
@@ -138,7 +144,7 @@ jobs:
             echo "| head | \`${sha}\` |"
             echo "| run | ${run_url} |"
             echo "| exit | \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal) |"
-            echo "| findings | ${n} |"
+            echo "| findings | ${findings_n} |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -152,16 +158,46 @@ jobs:
           fi
 
           if [ "$rc" = "1" ]; then
-            echo "❌ ${n} NEW cross-platform trap(s) in the accumulated tree"
-            # ⛔ PARSE WHAT IS EMITTED, NOT WHAT SOUNDS RIGHT (#4210 review P2). `findings.txt` is the
-            # detector's stdout, and `hit()` writes TAB-separated `path\tline\trule\treplacement`
-            # (check-portability-traps.sh:1729) — a `-F:` split reads a whole row fragment up to the
-            # first colon inside a REPLACEMENT string, and renders `unknown` for a row with no `": "`.
-            # Only the replacement may contain a colon; the first three fields never do.
-            first_file="$(awk -F'\t' 'NF>=3 { print $1; exit }' scan-out/findings.txt)"
-            first_rule="$(awk -F'\t' 'NF>=3 { print $3; exit }' scan-out/findings.txt)"
-            title="portability(tree): ${n} new trap(s) — first: ${first_file:-unknown} ${first_rule:-unknown}"
+            echo "❌ a NEW cross-platform trap is in the accumulated tree"
+            # ⛔ THE RISE, FROM THE STREAM THAT CARRIES IT (#4210 review P1, MEASURED on a real run).
+            # TWO defects lived here, and the second survived the first fix:
+            #   1. THE DELIMITER — `scan-out/findings.txt` is the detector's STDOUT, and `hit()`'s TAB
+            #      row (:1729) is reformatted by the PUBLISHER at :1845 into
+            #      `path:line: rule — use replacement`. A `-F'\t'` parse matches nothing on that
+            #      stream, so the title's file and rule were always empty (`unknown unknown`).
+            #   2. THE POPULATION — even parsed correctly, `findings.txt` is the FULL live list, so the
+            #      "first" row is whichever GRANDFATHERED trap sorts first, and the count was that
+            #      whole list (144 rows measured) rather than the rise (1).
+            # The rise exists in exactly one place: the `NOT grandfathered` row set the detector prints
+            # on STDERR (:1979-1982), one row per rising (path, rule) pair:
+            #        <path>  <rule>: baseline=<b> live=<l>
+            # The row SHAPE is what is matched — not the header wording, which is prose and may be
+            # reworded. `scripts/check-portability-scope.test.sh` (C7) runs the REAL detector to build
+            # this input, so a drift in the shape reds the suite instead of silently filing
+            # `unknown unknown` again.
+            awk '/^[[:space:]]+[^[:space:]].*: baseline=[0-9]+ live=[0-9]+[[:space:]]*$/ {
+                   row = $0
+                   sub(/^[[:space:]]+/, "", row)
+                   sub(/: baseline=[0-9]+ live=[0-9]+[[:space:]]*$/, "", row)
+                   i = index(row, "  ")
+                   if (i > 1) printf "%s\t%s\n", substr(row, 1, i - 1), substr(row, i + 2)
+                 }' scan-out/verdict.txt > scan-out/rise.tsv
+            rise_n="$(grep -c . scan-out/rise.tsv || true)"
+            first_file="$(awk -F'\t' 'NF>=2 { print $1; exit }' scan-out/rise.tsv)"
+            first_rule="$(awk -F'\t' 'NF>=2 { print $2; exit }' scan-out/rise.tsv)"
+            # the summary above counts the full live list; this is the number the title means.
+            echo "- new traps (the rise): ${rise_n}" >> "$GITHUB_STEP_SUMMARY"
+            # ⛔ A RISE THIS STEP CANNOT PARSE IS REPORTED AS SUCH, never as `0 new trap(s)`. rc=1 is
+            # the detector's own statement that the rise is NON-EMPTY (:1977-1986), so zero parsed rows
+            # means the FORMAT moved — a false report, and the one failure this title must not hide.
+            if [ "$rise_n" -gt 0 ] && [ -n "$first_file" ] && [ -n "$first_rule" ]; then
+              title="portability(tree): ${rise_n} new trap(s) — first: ${first_file} ${first_rule}"
+            else
+              echo "::warning::the detector reported a rise (rc=1) but this step parsed ${rise_n} rising row(s) out of scan-out/verdict.txt — the issue title cannot name the trap"
+              title="portability(tree): a rise the report could not parse (rc=1) — see the run"
+            fi
           else
+            rise_n=0
             echo "❌ the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict, which is not a clean one"
             title="portability(tree): the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict"
           fi
@@ -176,7 +212,19 @@ jobs:
             echo "- head: \`${sha}\`"
             echo "- run: ${run_url}"
             echo "- exit: \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal)"
+            echo "- new traps (the rise): ${rise_n:-0}"
             echo ""
+            if [ -s scan-out/rise.tsv ]; then
+              echo "## The rise — \`new traps\` is THIS set, not the list below"
+              echo ""
+              echo "One row per (path, rule) pair whose live count rose above its baseline. The"
+              echo "\`## Findings\` list underneath is the FULL live list — most of it grandfathered."
+              echo ""
+              echo '```'
+              awk -F'\t' 'NF>=2 { print $1 "  " $2 }' scan-out/rise.tsv
+              echo '```'
+              echo ""
+            fi
             echo "## Findings"
             echo ""
             echo '```'
@@ -213,5 +261,5 @@ jobs:
           # ⛔ THE JOB STILL FAILS. Filing the issue is the REPORT; the red is the signal that this run
           # did not certify the tree. A run that filed and exited 0 would be the "detected but reported
           # as passing" shape this repo's admin-merge-detector exists to avoid.
-          echo "::error::${n} new cross-platform trap(s) in the accumulated tree — filed/updated an issue"
+          echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — filed/updated an issue"
           exit 1
