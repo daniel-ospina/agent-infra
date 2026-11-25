@@ -4514,21 +4514,38 @@ printf '%s\n' "$*" >>"${GH_LOG:-/dev/null}"
 case "${1:-} ${2:-}" in
     "issue create")
         n="$(cat "${GH_COUNTER:?}" 2>/dev/null || printf '0')"
-        n=$((n + 1)); printf '%s' "$n" >"$GH_COUNTER"; printf '%s\n' "$n" ;;
+        n=$((n + 1)); printf '%s' "$n" >"$GH_COUNTER"
+        # ⛔ THE REAL `gh` PRINTS THE ISSUE **URL**, NOT A NUMBER (measured: `gh issue create` has no
+        # `--json`, and four other consumers in this repo capture it as a URL). The first version of this
+        # stub printed a bare number, which made every arm below validate a contract the real tool never
+        # emits — and the real one then failed the pass's all-digits check, so nothing was ever recorded
+        # and every tick re-filed. A stub is a HYPOTHESIS about the tool: this one now states the
+        # measured shape, and `GH_CREATE_MODE=number` keeps the bare-number form covered because it is a
+        # documented seam.
+        case "${GH_CREATE_MODE:-url}" in
+            number) printf '%s\n' "$n" | tee -a "${GH_OUT:-/dev/null}" ;;
+            garbage) printf 'not-an-issue\n' | tee -a "${GH_OUT:-/dev/null}" ;;
+            *) printf 'https://github.com/acme/infra/issues/%s\n' "$n" | tee -a "${GH_OUT:-/dev/null}" ;;
+        esac ;;
     "issue comment") exit "${GH_COMMENT_RC:-0}" ;;
     "issue close")   exit "${GH_CLOSE_RC:-0}" ;;
+    "issue reopen")  exit "${GH_REOPEN_RC:-0}" ;;
+    # ⛔ `issue view` REPORTS THE STANDING ISSUE'S STATE, which is what the window's re-verify reads. A
+    # stub without it cannot express the hand-closed case at all — that is the arm that was missing.
+    "issue view")    printf '%s\n' "${GH_ISSUE_STATE:-OPEN}" ;;
     *) exit 1 ;;
 esac
 GH
 chmod +x "$T/gh-stub"
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t30/home/.pi/agent/scripts"; printf 'old bytes\n' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
-export GH_LOG="$T/t30/gh.log" GH_COUNTER="$T/t30/gh.n" FARM_ARGV="$T/t30/argv"
+export GH_LOG="$T/t30/gh.log" GH_COUNTER="$T/t30/gh.n" FARM_ARGV="$T/t30/argv" GH_OUT="$T/t30/gh.out"
 : >"$GH_LOG"; printf '0' >"$GH_COUNTER"
 # run_pass30 — the pass with the CONSUMER wired to the double. Never the real `gh`: that is what keeps
 # this arm hermetic on a box with no network and no auth, and it is the seam the shipped unit does not set.
 run_pass30() { local d="$1"; shift
-    HARNESS_APPLY_ALARM_GH="${HARNESS_APPLY_ALARM_GH:-$T/gh-stub}" HARNESS_APPLY_ALARM_REPO="acme/infra" \
+    HARNESS_APPLY_ALARM_GH="${HARNESS_APPLY_ALARM_GH:-$T/gh-stub}" \
+    HARNESS_APPLY_ALARM_REPO="${HARNESS_APPLY_ALARM_REPO-acme/infra}" \
     HARNESS_APPLY_BOX="cell-9" HARNESS_APPLY_ALARM="${ALARM_P:-1}" \
     run_pass "$d" "$@"
 }
@@ -4540,7 +4557,7 @@ assert_eq "$RC" "24" "T30 control: the stale farm still REDDENS with its own cod
 assert_eq "$(rec30 alarm)" "1" "T30 the red is CONSUMED — the record names the issue it was filed as"
 assert_contains "$(cat "$GH_LOG")" "issue create --repo acme/infra" "T30 and an ISSUE CREATE really went to the repo that owns the code"
 TITLE30="$(grep -m1 'issue create' "$GH_LOG" || true)"
-assert_contains "$TITLE30" "stale-farm: cell-9 runs" "T30 the issue NAMES THE BOX and the commit it runs (the two facts the alarm is keyed on)"
+assert_contains "$TITLE30" "harness-apply farm-drift (rc=24): cell-9 runs" "T30 the issue NAMES THE ACTION, the BOX and the commit it runs (the facts the alarm is keyed on)"
 assert_contains "$TITLE30" "while origin/main ships" "T30 …and the ref it should be running, so a reader needs no log"
 assert_contains "$TITLE30" "--body" "T30 the issue carries a body (a bare title is a ticket nobody can act on)"
 assert_contains "$(cat "$STATEP" 2>/dev/null || true)" "box=cell-9" \
@@ -4553,10 +4570,16 @@ case "$(rec30 deployed_age_s)" in ''|*[!0-9]*) bad "T30 the age of the deployed 
 # ── ARM 2: THE RETRY STOPS. Same pin, same ref, same farm, same checker ⇒ the grade cannot differ, and
 # re-running it every ten minutes IS the defect. The observable is the CHECKER not being executed: an
 # issue-count assertion alone would pass a pass that re-graded and re-filed nothing.
-ARGV_BEFORE="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+# ⛔ THE OBSERVABLE MUST EXIST BEFORE IT IS COMPARED. `$T/t30/argv` is created only BY the checker, so if
+# the fixture ever failed to run it, `wc -l <missing` yields "" on both sides and the comparison below
+# would pass while measuring nothing (the vacuous-assertion shape: a green row that names a property it
+# never observed).
+[ -s "$T/t30/argv" ] || bad "T30 the suppression observable ($T/t30/argv) was NEVER created — the checker did not run on the first tick"
+ARGV_BEFORE="$(grep -c . "$T/t30/argv" 2>/dev/null || true)"
+[ -n "$ARGV_BEFORE" ] || ARGV_BEFORE=0
 OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T30 the suppressed tick is STILL RED — a green tick over a stale farm is the false PASS this removes"
-assert_eq "$(wc -l <"$T/t30/argv" | tr -d ' ')" "$ARGV_BEFORE" "T30 …but the checker was NOT run again: a permanent failure is not retried"
+assert_eq "$(grep -c . "$T/t30/argv" 2>/dev/null || true)" "$ARGV_BEFORE" "T30 …but the checker was NOT run again: a permanent failure is not retried"
 assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …and no second issue was filed for the same (box, pinned head)"
 assert_eq "$(grep -c 'issue comment' "$GH_LOG" | tr -d ' ')" "0" "T30 …and no comment spam either — silence is the right amount of noise when nothing changed"
 assert_eq "$(rec30 retry)" "suppressed" "T30 the record SAYS the retry was suppressed, so the silence is a state and not an absence"
@@ -4566,34 +4589,39 @@ assert_contains "$OUT" "retry=suppressed" "T30 the log line says it too — the 
 # leave the box invisible for ever, which is #4237 reintroduced by its own fix. Past the window the
 # grade runs once more (and does NOT re-file the same box+pin).
 sleep 2
-ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+ARGV_MID="$(grep -c . "$T/t30/argv" 2>/dev/null || true)"
 OUT="$(HARNESS_APPLY_ALARM_REPEAT=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T30 past the repeat window the farm is still red"
-case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+# ⛔ EXACTLY ONE, not "any increase": a pass that re-graded five times would satisfy a `!=` and the row
+# claims one real re-verification.
+case "$(grep -c . "$T/t30/argv" 2>/dev/null || true)" in
+    "$((ARGV_MID + 1))") ok "T30 …and the window ELAPSING forces exactly ONE real re-verification (a bounded silence, not a blind spot)" ;;
     "$ARGV_MID") bad "T30 the repeat window NEVER elapsed — the suppression would be a permanent blind spot" ;;
-    *) ok "T30 …and the window ELAPSING forces one real re-verification (a bounded silence, not a blind spot)" ;;
+    *) bad "T30 the window elapsing re-graded more than once (got $(grep -c . "$T/t30/argv") lines, expected $((ARGV_MID + 1)))" ;;
 esac
 assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …which still does not duplicate the (box, pinned head) issue"
 # ── ARM 3: THE RE-ARM. One extra byte in the farm and the grade must run again — otherwise the
 # suppression is an inert guard that would hide the NEXT drift.
 printf 'new bytes\n' >>"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
-ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+ARGV_MID="$(grep -c . "$T/t30/argv" 2>/dev/null || true)"
 OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T30 a CHANGED farm is still red"
-case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+case "$(grep -c . "$T/t30/argv" 2>/dev/null || true)" in
+    "$((ARGV_MID + 1))") ok "T30 …and the farm changing RE-ARMS the grade (the falsifiable half of 'until the pin or the farm changes')" ;;
     "$ARGV_MID") bad "T30 a CHANGED farm did not re-arm the grade — the suppression would hide the next drift" ;;
-    *) ok "T30 …and the farm changing RE-ARMS the grade (the falsifiable half of 'until the pin or the farm changes')" ;;
+    *) bad "T30 a CHANGED farm re-graded more than once (got $(grep -c . "$T/t30/argv"), expected $((ARGV_MID + 1)))" ;;
 esac
 assert_eq "$(cat "$GH_COUNTER")" "1" "T30 …while the same (box, pinned head) is still ONE issue, not a second"
 # A changed CHECKER re-arms too: installing or repairing the instrument is an event the farm's bytes do
 # not reflect, and a key that ignored it would refuse to grade for ever (the inert-enforcer class).
 printf '\n# repaired\n' >>"$CLONE/scripts/check-farm-drift.sh"
-ARGV_MID="$(wc -l <"$T/t30/argv" | tr -d ' ')"
+ARGV_MID="$(grep -c . "$T/t30/argv" 2>/dev/null || true)"
 OUT="$(run_pass30 "$T/t30" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T30 a repaired CHECKER still reds the unchanged farm"
-case "$(wc -l <"$T/t30/argv" | tr -d ' ')" in
+case "$(grep -c . "$T/t30/argv" 2>/dev/null || true)" in
+    "$((ARGV_MID + 1))") ok "T30 …and repairing the CHECKER re-arms the grade too" ;;
     "$ARGV_MID") bad "T30 a CHANGED checker did not re-arm the grade — fixing the instrument would never be graded again" ;;
-    *) ok "T30 …and repairing the CHECKER re-arms the grade too" ;;
+    *) bad "T30 a changed CHECKER re-graded more than once (got $(grep -c . "$T/t30/argv"), expected $((ARGV_MID + 1)))" ;;
 esac
 # ── ARM 4: THE PIN MOVING. One comment on the standing issue, never a second issue: the condition is the
 # same condition, and filing per commit rebuilds the 144-issues-a-day alarm this replaces.
@@ -4646,8 +4674,59 @@ printf 'fixed again
 ' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
 OUT="$(FARM_CLEAN=1 GH_CLOSE_RC=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T30 a FAILING close does not change the pass verdict"
-assert_eq "$(rec30 alarm)" "3" "T30 …and the alarm stays recorded (and named) because it could not be closed — no silent orphan"
-unset GH_LOG GH_COUNTER FARM_ARGV
+assert_eq "$(rec30 alarm)" "unclosed:3" "T30 …and the alarm stays recorded (and named `unclosed:`) because it could not be closed — no silent orphan, and a GREEN record never reads as \`filed\`"
+# ── ARM 7: THE REAL `gh` CONTRACT, A CLOSED ISSUE, AND A NON-GITHUB ORIGIN ────────────────────
+# ⛔ THE ARM THAT WOULD HAVE CAUGHT THE P0. `gh issue create` prints the issue URL, and the first draft
+# required all-digits — so a real `gh` always took the failure arm, the state file was never written,
+# every tick re-filed, and the auto-close could never fire. ARM 1 above cannot see it, because it asserts
+# on the record only AFTER a stub that satisfies whatever contract the pass expects.
+case "$(cat "$T/t30/gh.out" 2>/dev/null || true)" in
+    *'https://github.com/acme/infra/issues/'*)
+        ok "T30 a URL-shaped create output (the shape REAL gh prints) yields a filed issue id" ;;
+    *)  bad "T30 no URL-shaped create output was produced — the real-gh contract is untested" ;;
+esac
+# …and a bare number is still accepted, because it is the documented seam shape:
+rm -f "$STATEP"
+OUT="$(GH_CREATE_MODE=number run_pass30 "$T/t30" 2>&1)"
+case "$(rec30 alarm)" in ''|*[!0-9]*) bad "T30 a bare-number create output (the seam shape) was not accepted (alarm=$(rec30 alarm))" ;;
+    *) ok "T30 a bare-number create output is accepted too (the seam shape)" ;; esac
+# …while genuine garbage is a FAILURE, recorded as one (never silently swallowed):
+rm -f "$STATEP"
+OUT="$(GH_CREATE_MODE=garbage run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 an unusable create output leaves the red standing"
+assert_eq "$(rec30 alarm)" "failed:gh-issue-create" "T30 …and is recorded as a FAILURE, not as a filed alarm"
+# ── THE HAND-CLOSED ISSUE. The suppression window's stated purpose is that a closed issue must not leave
+# a stale farm invisible; re-grading alone cannot achieve that, so a closed issue must be REOPENED.
+rm -f "$STATEP"
+OUT="$(run_pass30 "$T/t30" 2>&1)"                       # file a fresh issue
+ISSUE_N="$(rec30 alarm)"
+printf 'fixed for the reopen arm\n' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"   # re-arm the grade
+BEFORE_REOPEN="$(grep -c 'issue reopen' "$GH_LOG" | tr -d ' ')"
+OUT="$(GH_ISSUE_STATE=CLOSED run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 a hand-closed alarm over a still-stale farm is still red"
+case "$(grep -c 'issue reopen' "$GH_LOG" | tr -d ' ')" in
+    "$BEFORE_REOPEN") bad "T30 a CLOSED standing issue was NOT reopened — the window re-verifies a grade whose alarm surface is closed (an inert guard)" ;;
+    *) ok "T30 …and the CLOSED standing issue is REOPENED, so the red reaches someone again" ;;
+esac
+assert_eq "$(rec30 alarm)" "$ISSUE_N" "T30 …on the SAME issue, not a duplicate"
+# A reopen that ALSO fails must fall through to a fresh issue rather than leaving the red unreported.
+BEFORE_N="$(cat "$GH_COUNTER")"
+printf 'fixed for the unreopenable arm\n' >"$T/t30/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(GH_ISSUE_STATE=CLOSED GH_REOPEN_RC=1 run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 an unrestorable alarm is still red"
+case "$(cat "$GH_COUNTER")" in
+    "$BEFORE_N") bad "T30 a CLOSED issue that could not be reopened left the red UNFILED (no new issue)" ;;
+    *) ok "T30 …and a CLOSED issue that cannot be reopened gets a FRESH issue, not silence" ;;
+esac
+# ── A NON-GITHUB ORIGIN IS A NAMED SKIP. Every fixture's origin is a local path, so this is also the arm
+# that proves `alarm_slug`'s default path cannot shell out to `gh` on a box that has no GitHub remote.
+rm -f "$STATEP"; : >"$GH_LOG"
+OUT="$(HARNESS_APPLY_ALARM_REPO= run_pass30 "$T/t30" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T30 a non-github origin still reds (the consumer is not the gate)"
+assert_eq "$(rec30 alarm)" "skipped:no-github-origin" \
+    "T30 …and the record says WHERE it went nowhere, instead of pretending it filed"
+assert_eq "$(wc -l <"$GH_LOG" | tr -d ' ')" "0" "T30 …and gh was not called for a repo it cannot file in"
+unset GH_LOG GH_COUNTER FARM_ARGV GH_OUT GH_CREATE_MODE GH_ISSUE_STATE GH_REOPEN_RC HARNESS_APPLY_ALARM_REPO
 
 echo
 echo "────────────────────────────────────────────────────────"

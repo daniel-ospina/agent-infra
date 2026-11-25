@@ -852,6 +852,13 @@ def _harness_staleness_note(kv):
     if ag.isdigit():
         parts.append(f"running code {_age_words(ag)} old")
     if not parts:
+        # ⛔ PRESENT-BUT-UNMEASURABLE IS NOT "NOT RECORDED" (review P3). The pass writes
+        # `pin_behind=unknown` on every pre-flow refusal (a failed fetch, an unresolvable ref, an
+        # unpreservable tree), so a missing KEY and an unmeasurable VALUE are different facts and the
+        # instrument named them the same thing — telling an operator nothing was recorded when the
+        # record says the distance could not be computed.
+        if "pin_behind" in kv or "deployed_age_s" in kv:
+            return "staleness=<unmeasured: the pass could not compute it>"
         return "staleness=<not recorded by this pass>"
     return "; ".join(parts)
 
@@ -872,6 +879,8 @@ def _harness_alarm_note(kv):
         return "the farm alarm consumer is DISARMED here"
     if a.startswith("closed:"):
         return f"the previous farm alarm (#{a.split(':', 1)[1]}) closed on this pass"
+    if a.startswith("unclosed:"):
+        return f"the farm alarm (#{a.split(':', 1)[1]}) could NOT be closed and is still open"
     if a.startswith("skipped:"):
         return f"no farm alarm filed ({a})"
     return ""

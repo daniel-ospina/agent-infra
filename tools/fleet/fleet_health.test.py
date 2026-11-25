@@ -537,6 +537,16 @@ def leg_harness_apply(mod):
         detail, alarm = rec(rc=24, action="farm-drift", alarm="disarmed", detail="farm: DRIFT")
         check(alarm and "DISARMED" in detail,
               "HARNESS: a DISARMED consumer is named on the red it would have delivered")
+        # ⛔ PRESENT-BUT-UNMEASURABLE IS NOT "NOT RECORDED" (review P3): the pass writes
+        # `pin_behind=unknown` on every pre-flow refusal, so a missing KEY and an unmeasurable VALUE are
+        # different facts and the instrument must not name them the same thing.
+        detail, alarm = rec(rc=23, action="unresolvable-ref", drift="not-run",
+                            pin_behind="unknown", deployed_age_s="unknown")
+        check("staleness=<unmeasured" in detail,
+              "HARNESS: a record that RECORDED an unmeasurable staleness is not reported as 'not recorded'")
+        detail, alarm = rec(rc=0, alarm="unclosed:5")
+        check(not alarm and "could NOT be closed" in detail,
+              "HARNESS: a green pass whose alarm close FAILED says so, and never reads as `filed`")
         # An empty key is a pre-#4237 record: NAMED, never alarmed on — alarming would red every box once
         # for a field it is about to gain, which is how an instrument teaches operators to ignore it.
         detail, alarm = rec()

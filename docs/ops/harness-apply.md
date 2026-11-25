@@ -124,7 +124,7 @@ farm_n=0                     <- rows the farm grade reported: a COUNT when grade
 preserved=none
 pin_behind=0                 <- DISTANCE from the commit the box RUNS to the ref (a MEASUREMENT; no rule decides on it)
 deployed_age_s=0             <- AGE of that commit — "8 commits behind" and "running 6-day-old code" are different sentences
-alarm=none                   <- `none` · `disarmed` · `skipped:<why>` · `failed:<why>` · a bare ISSUE NUMBER (filed) · `closed:<n>` · `rekeyed:<n>`
+alarm=none                   <- `none` · `disarmed` · `skipped:<why>` · `failed:<why>` · a bare ISSUE NUMBER (filed) · `closed:<n>` · `unclosed:<n>` (the close FAILED)
 retry=suppressed             <- `suppressed` = this tick did NOT re-grade a permanent failure (see *Consuming the farm red*)
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -434,9 +434,18 @@ the red would be worse than no consumer.
 only when it is a github.com URL**), `HARNESS_APPLY_BOX` (default `uname -n`), and
 `HARNESS_APPLY_ALARM_REPEAT` (seconds, default 86400).
 
-**Declared residual:** the key lives on the box, so a box that loses its state directory can file **one**
-duplicate issue for a condition it had already alarmed. Bounded by the next clean grade, which closes
-whatever is open at the id it knows.
+**A hand-closed issue is reopened, not ignored.** The suppression window would otherwise re-verify a grade
+whose alarm surface had been closed by hand — an inert guard one level up. So on a tick that *really
+graded* the standing issue's state is read, and a `CLOSED` one is **reopened** with a comment saying the
+condition is still true; if it cannot be reopened the key is dropped and a fresh issue is filed.
+
+**Declared residuals.** (a) The key lives on the box, so a box that loses its state directory can file
+**one** duplicate issue for a condition it had already alarmed — bounded by the next clean grade, which
+closes whatever is open at the id it knows. (b) `alarm_state_write` is atomic but the *decision* is not:
+two passes that both read an empty `issue` can both file (nothing serialises passes here — the same
+caveat the rows artifact carries). Bounded the same way, and the window's re-verify re-reads the state.
+(c) The `gh` call is bounded only where `timeout`/`gtimeout` exists (GNU coreutils, or Homebrew's); on a
+Mac without either it is unbounded and the record would be written after it returns.
 
 ## Exit vocabulary
 

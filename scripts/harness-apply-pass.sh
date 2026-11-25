@@ -772,6 +772,19 @@ case "${HARNESS_APPLY_ALARM:-1}" in
     *) err "HARNESS_APPLY_ALARM must be 1|0 (got '${HARNESS_APPLY_ALARM:-}')"; exit 2 ;;
 esac
 ALARM_GH="${HARNESS_APPLY_ALARM_GH:-gh}"
+# ⛔ AND THE CONSUMER IS BOUNDED, because it runs BEFORE the record is written. On a cell `gh` is
+# `gh-limit/gh` → `gh-limit.py`, which SERIALISES on a box lock and sleeps through backoff BY DESIGN, so
+# an unbounded call can outlive the tick — and a tick that writes no record is indistinguishable from a
+# timer that stopped firing, which is the false-PASS shape this file exists to remove. 124 from the
+# bound is treated exactly like any other gh failure: `alarm=failed:<why>`. `timeout` is GNU; `gtimeout`
+# is Homebrew's; where NEITHER exists the call is unbounded and the resolved mechanism says so in the
+# record's own `alarm=`/log line, never silently.
+ALARM_GH_TIMEOUT="${HARNESS_APPLY_ALARM_TIMEOUT:-60}"
+case "$ALARM_GH_TIMEOUT" in ''|*[!0-9]*) err "HARNESS_APPLY_ALARM_TIMEOUT must be a whole number of seconds (got '$ALARM_GH_TIMEOUT')"; exit 2 ;; esac
+ALARM_BOUND=""
+if command -v timeout >/dev/null 2>&1; then ALARM_BOUND="$(command -v timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then ALARM_BOUND="$(command -v gtimeout)"
+fi
 ALARM_BOX="${HARNESS_APPLY_BOX:-$(uname -n 2>/dev/null || printf 'unknown-box')}"
 ALARM_REPO="${HARNESS_APPLY_ALARM_REPO:-}"
 # ⛔ AND THE SUPPRESSION IS BOUNDED IN TIME, DELIBERATELY. "The timer stops retrying" must not become
@@ -1012,19 +1025,45 @@ consume_farm_red() {
             # the suppression never engages after any re-arm (measured in this suite's own T30: the
             # arm that changes one file re-armed the grade, and without this refresh it re-armed it on
             # every tick for ever).
-            if alarm_state_write "box=$ALARM_BOX" "head=$REC_DEPLOYED" "ref_sha=$ref_sha" \
+            # ⛔ A HAND-CLOSED ISSUE IS NOT AN ALARM THAT STILL REACHES ANYONE (review P1). The
+            # suppression window exists so a closed issue cannot leave a stale farm invisible for ever —
+            # and re-grading alone never achieves that, because the SURFACE is the issue. So on a tick
+            # that REALLY GRADED (once per window or per changed input, never once per suppressed tick)
+            # the standing issue is read, and a closed one is REOPENED. If it cannot be reopened the key
+            # is dropped so a fresh issue is filed below — the only way "the red reaches a human"
+            # survives somebody closing it.
+            if [ "${FARM_GRADED_THIS_PASS:-0}" = "1" ]; then
+                case "$(alarm_issue_state "$prev_issue" "$slug")" in
+                    CLOSED)
+                        if _alarm_gh issue reopen "$prev_issue" --repo "$slug" \
+                            --comment "Reopening: the condition this alarm names is STILL TRUE — \`$ALARM_BOX\` still runs \`$REC_DEPLOYED\` while \`$REF\` ships \`$(short "$ref_sha")\`, and \`${FARM_DEST:-?}\` still does not match it (re-verified by a pass that really graded the farm)." >/dev/null 2>&1; then
+                            log_line "alarm: the standing issue #$prev_issue was CLOSED by hand and the farm is still stale — REOPENED it (a closed alarm reaches nobody)"
+                        else
+                            log_line "alarm: the standing issue #$prev_issue is CLOSED and could not be reopened — filing a fresh one rather than leaving the red unreported"
+                            prev_issue=""
+                        fi ;;
+                esac
+            fi
+            if [ -n "$prev_issue" ] && alarm_state_write "box=$ALARM_BOX" "head=$REC_DEPLOYED" "ref_sha=$ref_sha" \
                  "farm=$(farm_fingerprint "${FARM_DEST:-}")" "checker=$(checker_fingerprint "${FARM_CHECKER:-}")" \
                  "issue=$prev_issue" "filed_at=$(alarm_state_get filed_at)" \
                  "graded_at=$(alarm_graded_stamp)" \
+                 "rows_file=$(alarm_rows_pointer)" "farm_n=$(alarm_farm_n)" \
                  "remedy=$(printf '%s' "${REC_REMEDY:-none}" | tr '\n' ' ')"; then
                 REC_ALARM="$prev_issue"
                 log_line "alarm: $key is already filed as $prev_issue — NOT re-filed (one issue per box+pin, never one per tick)"
-            else
+            elif [ -n "$prev_issue" ]; then
                 REC_ALARM="$prev_issue"
                 log_line "alarm: $key is already filed as $prev_issue, but the alarm key could not be refreshed in $ALARM_STATE — the next unchanged tick may re-grade the same bytes"
             fi
-            return 0
+            # A dropped key (a closed issue that could not be reopened) falls through to a fresh file.
+            [ -n "$prev_issue" ] && return 0
         fi
+        # ⛔ AND THE PIN-MOVED BRANCH MUST NOT RUN ON A DROPPED KEY (review P2). With `prev_issue` empty
+        # a `gh issue comment ""` is answered by some clients as a no-op success, and the pass then
+        # recorded an EMPTY alarm and returned — the red was left unreported for a tick, which is the
+        # defect this whole change exists to remove. An empty key goes straight to a fresh file.
+        if [ -n "$prev_issue" ]; then
         # ⛔ THE PIN MOVED AND THE FARM IS STILL STALE: the alarm is still true, so it is NOT closed
         # and it is NOT duplicated — one comment records the new head, which is the fact a reader of
         # that issue needs. One comment per HEAD, never one per tick (the state is re-keyed below, so
@@ -1034,6 +1073,7 @@ consume_farm_red() {
                  "farm=$(farm_fingerprint "${FARM_DEST:-}")" "checker=$(checker_fingerprint "${FARM_CHECKER:-}")" \
                  "issue=$prev_issue" "filed_at=$(alarm_state_get filed_at)" \
                  "graded_at=$(alarm_graded_stamp)" \
+                 "rows_file=$(alarm_rows_pointer)" "farm_n=$(alarm_farm_n)" \
                  "remedy=$(printf '%s' "${REC_REMEDY:-none}" | tr '\n' ' ')"; then
                 # ⛔ `retry=` IS NOT SET HERE EITHER: the pin moved, so the grade RAN on this tick.
                 REC_ALARM="$prev_issue"
@@ -1043,16 +1083,31 @@ consume_farm_red() {
         fi
         # The comment failed (no auth, no network, the issue was deleted): fall through and try a
         # fresh file. A failed COMMENT must never leave the red with no alarm at all.
+        fi
     fi
     local issue
-    issue="$(_alarm_gh issue create --repo "$slug" --title "stale-farm: $ALARM_BOX runs $REC_DEPLOYED while $REF ships $(short "$ref_sha") (rc=24)" \
+    issue="$(_alarm_gh issue create --repo "$slug" --title "harness-apply $REC_ACTION (rc=24): $ALARM_BOX runs $REC_DEPLOYED while $REF ships $(short "$ref_sha")" \
         --body "$(farm_alarm_body "")" 2>/dev/null)"
+    # ⛔ `gh issue create` PRINTS THE ISSUE **URL**, NOT A NUMBER — MEASURED, and it is why this leg must
+    # parse rather than pattern-match. The first draft required all-digits, so a REAL `gh` always fell
+    # into the failure arm: the state file was never written, every tick re-filed, and the auto-close
+    # could never fire — the 144-issues-a-day alarm this whole change exists to remove, produced by its
+    # own consumer. The suite was green because its stub invented the numeric contract (a stub is a
+    # HYPOTHESIS about the tool; four other consumers in this repo — `hub-state-check.sh`,
+    # `provider-latency-tripwire.sh`, `fleet-cost-weekly.sh`, `lane_liveness.py` — all capture it as a
+    # URL). So: accept a bare number (a seam/stub may print one) and otherwise take the trailing integer
+    # of the URL. Anything else is a real failure and is recorded as one.
+    issue="$(printf '%s' "$issue" | tr -d '\r')"
+    case "$issue" in
+        ''|*[!0-9]*) issue="$(printf '%s' "$issue" | sed -n 's#.*/\([0-9][0-9]*\)$#\1#p' | head -1)" ;;
+    esac
     case "$issue" in
         ''|*[!0-9]*) REC_ALARM="failed:gh-issue-create"; log_line "alarm: could not file the stale-farm issue for $key (gh said: ${issue:-no output}) — the red still stands, but nobody outside this box has been told" ; return 0 ;;
     esac
     if alarm_state_write "box=$ALARM_BOX" "head=$REC_DEPLOYED" "ref_sha=$ref_sha" \
          "farm=$(farm_fingerprint "${FARM_DEST:-}")" "checker=$(checker_fingerprint "${FARM_CHECKER:-}")" \
          "issue=$issue" "filed_at=$(date +%s)" "graded_at=$(alarm_graded_stamp)" \
+         "rows_file=$(alarm_rows_pointer)" "farm_n=$(alarm_farm_n)" \
          "remedy=$(printf '%s' "${REC_REMEDY:-none}" | tr '\n' ' ')"; then
         REC_ALARM="$issue"
         log_line "alarm: filed $key as #$issue ($slug) — one issue for this box+pin, and the next tick with NO change will suppress rather than re-file"
@@ -1077,19 +1132,42 @@ settle_farm_alarm() {
     slug="$(alarm_slug)"
     [ -n "$slug" ] || return 0
     if _alarm_gh issue close "$prev_issue" --repo "$slug" \
-        --comment "Auto-closed: the farm on \`$ALARM_BOX\` now MATCHES \`$REC_REF\` (\`$FARM_DEST\` graded clean this pass, ref=$(short "${REF_SHA:-?}"), deployed=$REC_DEPLOYED). The condition this alarm names is no longer true." >/dev/null 2>&1; then
+        --comment "Auto-closed: the farm on \`$ALARM_BOX\` now MATCHES \`$REC_REF\` (\`${FARM_DEST:-?}\` graded clean this pass, ref=$(short "${REF_SHA:-?}"), deployed=$REC_DEPLOYED). The condition this alarm names is no longer true." >/dev/null 2>&1; then
         rm -f "$ALARM_STATE" 2>/dev/null || true
         REC_ALARM="closed:$prev_issue"
         log_line "alarm: the farm on $ALARM_BOX now matches $REC_REF — closed #$prev_issue (an alarm that cannot clear itself is an orphan)"
     else
-        REC_ALARM="$prev_issue"
-        log_line "alarm: the farm on $ALARM_BOX now matches $REC_REF, but closing #$prev_issue FAILED — the alarm is stale and still open"
+        # ⛔ NOT THE BARE NUMBER: on a GREEN pass a bare `alarm=3` reads as "filed", so `ok=1 rc=0 alarm=3`
+        # advertised a live farm alarm. The value names the state a human must still clear.
+        REC_ALARM="unclosed:$prev_issue"
+        log_line "alarm: the farm on $ALARM_BOX now matches $REC_REF, but closing #$prev_issue FAILED — the alarm is stale and still open (recorded unclosed:)"
     fi
     return 0
 }
 
-# The one `gh` entry point: a stub through the seam, and never a hard dependency of the verdict.
-_alarm_gh() { "$ALARM_GH" "$@" 2>/dev/null; }
+# The one `gh` entry point: a stub through the seam, a BOUND, and never a hard dependency of the verdict.
+_alarm_gh() {
+    if [ -n "$ALARM_BOUND" ] && [ "$ALARM_GH_TIMEOUT" -gt 0 ]; then
+        "$ALARM_BOUND" "$ALARM_GH_TIMEOUT" "$ALARM_GH" "$@" 2>/dev/null
+    else
+        "$ALARM_GH" "$@" 2>/dev/null
+    fi
+}
+
+# ⛔ IS THE STANDING ISSUE STILL OPEN? The suppression window exists so a HAND-CLOSED issue cannot leave
+# a stale farm invisible for ever — and re-grading alone never achieves that: the alarm's surface is the
+# issue, so a closed one has to be REOPENED (or replaced) or the "re-verify" re-verifies nothing. This is
+# the exact inert-enforcer shape #4237 is about, one level up. Read only on a tick that REALLY GRADED
+# (i.e. once per window or per changed input), never once per suppressed tick.
+alarm_issue_state() { # <issue> <slug> -> OPEN|CLOSED|unknown
+    local st
+    st="$(_alarm_gh issue view "$1" --repo "$2" --json state --jq .state 2>/dev/null | tr -d '[:space:]')"
+    case "$st" in
+        OPEN|open)     printf 'OPEN' ;;
+        CLOSED|closed) printf 'CLOSED' ;;
+        *)             printf 'unknown' ;;
+    esac
+}
 
 # ⛔ THE CHECKER IS PART OF THE GRADE'S INPUTS TOO, and leaving it out would make the suppression lie.
 # Measured shape of the hole: a box whose check-farm-drift.sh is MISSING reds as `farm-unknown` and the
@@ -1106,6 +1184,21 @@ alarm_graded_stamp() {
     else local g; g="$(alarm_state_get graded_at)"; printf '%s' "$g"; fi
 }
 
+# ⛔ THE FILED ISSUE TELLS ITS READER TO OPEN `farm_rows=`, SO A SUPPRESSED TICK MUST NOT BLANK IT.
+# A suppressed tick publishes no list (it did not grade), which left `farm_rows=not-graded` in the record
+# for up to a window — a dangling pointer on exactly the red the issue describes. The grade that STANDS
+# is the one the alarm was filed from, so its pointer is carried in the key and restored.
+alarm_rows_pointer() {
+    local v
+    v="$(alarm_state_get rows_file)"
+    case "$v" in ''|not-graded) printf '%s' "${REC_FARM_ROWS:-not-graded}" ;; *) printf '%s' "$v" ;; esac
+}
+alarm_farm_n() {
+    local v
+    v="$(alarm_state_get farm_n)"
+    case "$v" in ''|not-graded) printf '%s' "${REC_FARM_NROWS:-not-graded}" ;; *) printf '%s' "$v" ;; esac
+}
+
 checker_fingerprint() { # <path> -> fp, or none
     local f="${1:-}"
     if [ -z "$f" ] || { [ ! -f "$f" ] && [ ! -L "$f" ]; }; then printf 'none'; return 0; fi
@@ -1116,10 +1209,41 @@ checker_fingerprint() { # <path> -> fp, or none
 }
 
 farm_alarm_body() { # <extra sentence>
-    printf '`harness-apply` refuses this box with its own code for a STALE FARM (#4237), and nothing has\nconsumed that code until now.\n\n- box: `%s`\n- pinned head (the commit this box RUNS): `%s`\n- `%s` ships: `%s` (distance from the pinned head: %s commit(s))\n- age of the deployed commit: %s\n- farm graded: `%s` (%s drifting/new row(s) — full list in `farm_rows=` in the pass record)\n- mode: `%s`, behind=%s ahead=%s dirty=%s\n- action: `%s`\n- record: `%s`\n- remedy: %s\n%s\n\nThe guard is behaving exactly as designed — the FARM\n(`%s`, the directory this box EXECUTES) is not the code the ref ships, so every farmed script (the\nverdict parser, `record-review.sh`, `brief-gate.sh`, the claim helpers) is merged on main and INERT\nhere. This issue is auto-filed once per (box, pinned head); the pass will not re-file it while nothing\nchanges, and it closes itself on the first pass that grades the farm clean.\n' \
-        "$ALARM_BOX" "$REC_DEPLOYED" "$REC_REF" "$(short "${REF_SHA:-unresolved}")" "$REC_PIN_BEHIND" \
+    # ⛔ THE HEADLINE IS THE ACTION, NOT A GUESS (review P3). Seven of PREDICATE 4's red arms never
+    # reach the grade at all (no farm, a dangling link, no checker, a checker inside the farm it grades),
+    # and a body that opened with "the farm is not the code the ref ships" MISDIAGNOSED every one of
+    # them. `action=` chooses the sentence and the arm's own verdict phrase is forwarded verbatim.
+    local cause
+    case "$REC_ACTION" in
+        farm-drift)        cause="the FARM this box EXECUTES carries bytes the ref does not ship" ;;
+        farm-unverifiable) cause="the FARM could not be GRADED at all (a farm path or a checker that cannot be read) — cannot-verify is not a pass" ;;
+        *)                 cause="the farm grade came back UNKNOWN (the checker could not answer, or its answer contradicted itself) — cannot-verify is not a pass" ;;
+    esac
+    printf '`harness-apply` refuses this box with its own code (rc=24, `#4237`), and now consumes it itself:
+**%s**.
+
+- box: `%s`
+- pinned head (the commit this box RUNS): `%s`
+- `%s` ships: `%s` (distance from the pinned head: %s commit(s))
+- age of the deployed commit: %s
+- farm graded: `%s` (%s drifting/new row(s) — full list in `farm_rows=` in the pass record)
+- mode: `%s`, behind=%s ahead=%s dirty=%s
+- action: `%s`
+- diagnosis: %s
+- record: `%s`
+- remedy: %s
+%s
+
+The guard is behaving exactly as designed — the FARM
+(`%s`, the directory this box EXECUTES) is not what the ref ships, so every farmed script (the verdict
+parser, `record-review.sh`, `brief-gate.sh`, the claim helpers) is merged on main and INERT here. This
+issue is auto-filed once per (box, pinned head); the pass will not re-file it while nothing changes,
+and it closes itself on the first pass that grades the farm clean.
+' \
+        "$cause" "$ALARM_BOX" "$REC_DEPLOYED" "$REC_REF" "$(short "${REF_SHA:-unresolved}")" "$REC_PIN_BEHIND" \
         "$REC_DEPLOYED_AGE" "${FARM_DEST:-unset}" "$REC_FARM_NROWS" \
-        "$PASS_MODE" "$REC_BEHIND" "$REC_AHEAD" "$REC_DIRTY" "$REC_ACTION" "$RECORD" \
+        "$PASS_MODE" "$REC_BEHIND" "$REC_AHEAD" "$REC_DIRTY" "$REC_ACTION" \
+        "$(bounded "${REC_DETAIL:-no diagnosis recorded}")" "$RECORD" \
         "${REC_REMEDY:-none}" "${1:-}" "${FARM_DEST:-unset}"
 }
 
@@ -2391,6 +2515,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 REC_ALARM="$_a_issue"
                 REC_REMEDY="$(alarm_state_get remedy)"
                 [ -n "$REC_REMEDY" ] || REC_REMEDY="read farm_rows= (or the open issue #$_a_issue) and re-run check-farm-drift.sh by hand"
+                # ⛔ THE STANDING GRADE'S POINTER SURVIVES (review P2): this tick published no list.
+                REC_FARM_ROWS="$(alarm_state_get rows_file)"; [ -n "$REC_FARM_ROWS" ] || REC_FARM_ROWS=not-graded
+                REC_FARM_NROWS="$(alarm_state_get farm_n)"; [ -n "$REC_FARM_NROWS" ] || REC_FARM_NROWS=not-graded
                 log_line "farm: STALE — this is the SAME permanent red already filed as #$_a_issue (pin=$REC_DEPLOYED ref=$(short "${REF_SHA:-}") farm=$FARM_FP checker=$(checker_fingerprint "$FARM_CHECKER") are all unchanged), so this pass did NOT re-grade, did NOT re-file and did NOT re-publish the rows list; retry=suppressed"
                 finish 0 24 "farm: DRIFT (known — already alarmed as #$_a_issue) — $FARM_DEST is still NOT the code $REF ships and no input to the grade has changed (pin=$REC_DEPLOYED ref=$(short "${REF_SHA:-}")), so the retry is suppressed; fix the farm and this alarm closes itself"
             fi
