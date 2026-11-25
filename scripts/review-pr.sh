@@ -2477,28 +2477,28 @@ case "$VWORD" in
     if [ "$MK_ISSUES_BLOCK" = 1 ]; then
       marker_issues_verdict
     else
-    # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
-    # FAIL-OPEN class — fresh review of #2288). The count reader above already parsed the
-    # contradiction out of the accepted line, and this arm then THREW IT AWAY, so
-    # `**Verdict:** CLEAN — actually ISSUES 2: …` recorded `clean` with `ISSUE_N=2` in hand — and no
-    # P-token on the line meant the severity contradiction gate could not see it either. The
-    # first-word rule (the verdict WORD) is deliberate and unchanged; this is the other channel that
-    # was already measured and discarded. A reviewer that means clean reports no count, so the
-    # refusal only ever fires on a line that contradicts itself.
-    if [ -n "${ISSUE_N:-}" ] && [ "${ISSUE_N:-0}" -gt 0 ]; then
-      err "$PROG: the verdict line says CLEAN and also carries an ISSUES count of ${ISSUE_N} — a line cannot be both, so this is a verdict of convenience, not a clean review."
-      err "  accepted verdict line: $LAST"
-      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
-    fi
-    # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
-    # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
-    # (P0, fresh review at a8656b9; the full rationale lives on the function). That function now also
-    # reads EVERY verdict-shaped line in the accepted region, not only $LAST (P1/P2, fresh review of
-    # #2288: a counted CLEAN, or an `ISSUES 2`, one line above a bare `CLEAN`, recorded clean).
-    refuse_counted_clean
+      # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
+      # FAIL-OPEN class — fresh review of #2288). The count reader above already parsed the
+      # contradiction out of the accepted line, and this arm then THREW IT AWAY, so
+      # `**Verdict:** CLEAN — actually ISSUES 2: …` recorded `clean` with `ISSUE_N=2` in hand — and no
+      # P-token on the line meant the severity contradiction gate could not see it either. The
+      # first-word rule (the verdict WORD) is deliberate and unchanged; this is the other channel that
+      # was already measured and discarded. A reviewer that means clean reports no count, so the
+      # refusal only ever fires on a line that contradicts itself.
+      if [ -n "${ISSUE_N:-}" ] && [ "${ISSUE_N:-0}" -gt 0 ]; then
+        err "$PROG: the verdict line says CLEAN and also carries an ISSUES count of ${ISSUE_N} — a line cannot be both, so this is a verdict of convenience, not a clean review."
+        err "  accepted verdict line: $LAST"
+        err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+        die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
+      fi
+      # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
+      # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
+      # (P0, fresh review at a8656b9; the full rationale lives on the function). That function now also
+      # reads EVERY verdict-shaped line in the accepted region, not only $LAST (P1/P2, fresh review of
+      # #2288: a counted CLEAN, or an `ISSUES 2`, one line above a bare `CLEAN`, recorded clean).
+      refuse_counted_clean
 
-    VERDICT=clean   # a CLEAN line carries no count of its own
+      VERDICT=clean   # a CLEAN line carries no count of its own
     fi ;;
   issues)
     VERDICT=issues
