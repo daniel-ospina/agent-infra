@@ -191,6 +191,13 @@ export const UNLOCKED_WORKFLOWS = Object.freeze([
   // which narrows this reason but does not remove it: a harness PR that edits `ci.yml` still edits
   // `jobs.ci`.)
   ".github/workflows/harness-single-source.yml",
+  // agent-infra#4210 — the scheduled WHOLE-TREE portability scan. Unlocked on purpose, and the reason
+  // is that its liveness is asserted from somewhere BETTER than a byte lock: `ci.yml` and
+  // `ci-main.yml` (both locked) run `scripts/check-portability-tree-scan-alive.sh` on every run, so a
+  // version of this file that stops running -- schedule deleted, cron parked, workflow disabled -- REDS
+  // the bounded lanes within 72 h. A lock here would add the re-lock tax to a file that will be tuned
+  // (cadence, bounds) while asserting only "unchanged", not "still alive".
+  ".github/workflows/portability-tree-scan.yml",
 ]);
 export const UPDATE_COMMAND = "node scripts/check-workflow-lock.mjs --update-lock";
 
