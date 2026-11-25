@@ -4824,13 +4824,33 @@ reap. The decisions that are not obvious:
 - **Claimed by `orch-loop.sh` when it forms its dispatch batch**, not by `dispatch-merge.sh`: a
   refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
   `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
-  worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
-  every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
+  worktree, lane or chain spawned for work another box owns. **Released by `chain-merge.sh` on every
+  exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
   which is sized (`CLAIM_ISSUE_TTL`, default **48000 s** since agent-infra#4034 — 4 h from #2029 to that
   point) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
+  **⛔ EXCEPT AFTER A MERGE THAT DID NOT CLOSE THE ISSUE (agent-infra#4230).** "Merged" and "finished"
+  are different facts: GitHub auto-closes a linked issue only when the PR body carries a closing
+  keyword and the PR targets the default branch, so a `Refs #N` partial merges and leaves the issue
+  OPEN. Releasing there handed the still-open issue straight back to the pool — measured as three
+  issues each carrying TWO open PRs, with no claim in the registry for any of them (#14560 → #14572 +
+  #14596). So when the chain has evidence of a merge (`state/merged-<PR>.done`, confirmed against THIS
+  repo's PR) it asks the API for the **issue's state**: `closed` releases as before; `open` **keeps the
+  claim and RENEWS it** (`claim_issue_renew_record`, holder preserved, fenced on this box's own commit)
+  so the follow-up stays un-dispatchable and does not expire mid-flight; an unreadable or
+  uninterpretable answer **keeps and renews** too (fail-closed: the duplicate is likeliest exactly when
+  the API is rate-limited). Two weaker bars are also counted as merged, deliberately, and a reader must
+  be able to predict them: an **unreadable merge confirmation** (`gh` failed, so `_mrc=2` — the marker
+  may belong to another repo's PR of the same number) and a **marker the trap finds before the chain's
+  own flag** (a signal arriving between `merge-one.sh` writing `state/merged-<PR>.done` and the chain
+  assigning `CHAIN_MERGED`, which would otherwise release an open issue's claim on the one path nobody
+  watches) both take the keep-and-renew side: keeping a claim one lease too long is bounded and reaped
+  by `claim_prune`, while freeing an issue whose work already merged is the duplicate #4230 measures.
+  Only a **confirmation that this repo's PR is NOT merged** (`_mrc=1`) drops the marker, and then the
+  claim is released. A chain that merged NOTHING still releases on every path — an open issue a
+  peer could work must not be stranded on this box for a lease.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
   output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
