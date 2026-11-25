@@ -4598,6 +4598,19 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
+
+**The branch key is taken by the FIXER too, and it covers PR branches** (agent-infra#3696, P0).
+`refs/claims/branch-<slug>` was introduced by #3328 for *batch* branches and is now also taken by
+`fix-one.sh` before it runs, with `BRANCH_CLAIM_PATTERN` defaulting to `integration/* fix/* rescue/*`.
+The measured reason: on tortoise PR #11385 two lanes wrote ONE PR for ~6 h — 11 superseded heads, five
+clean reviews on five different heads, **0 landings** — because the per-head key (`<PR>-<head12>`) cannot
+express this. The losing writer *creates a new head*, so it mints a fresh key and wins its own CAS every
+time; only a key that outlives the head can refuse it. The coarse landing key `pr-<N>` is deliberately
+NOT reused: it is the LANDING key (taken only by `merge-one.sh`, and read as "someone is landing this
+PR" by `pr-sickness.sh`), so a fixer holding it would read as a live merger. An **unclaimed** branch is
+still never refused — widening the scope refuses only a stray push on top of a live owner — and a
+fixer that finds a peer holding the branch bails with the head-keyed `fixbail-<PR>-<head>` marker the
+controller refunds. Pinned by `branch-claim.test.sh` case 11 and `fix-one-branchclaim.test.sh`.
 (48000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
 outlive, 14400s -> 18000s by #2999, and 18000s -> 48000s by agent-infra#4034 when the lane backstop went
 7200s -> 36000s) are *defaults* for their keying; `CLAIM_TTL_MAX` (43200s, raised from 7200s by

@@ -183,12 +183,23 @@ release_from stray "$BR"; eq "peer release refused" "$?" "1"
   && ok "the claim ref survives the peer's release attempt" || bad "the peer's release deleted the claim"
 
 echo "== 6. scope: an ordinary branch is never gated"
+# ⛔ THE SUBJECT OF THIS CASE CHANGED WITH agent-infra#3696, AND THE OLD SUBJECT WAS A LATENT FALSE
+# PASS. It used `refs/heads/fix/whatever` as its "ordinary branch" — which the scope NOW covers, so the
+# case would have gone on passing while testing the opposite of what it says (an UNCLAIMED branch of an
+# IN-SCOPE name is allowed, case 1's polarity) and would have silently stopped being able to detect a
+# scope that had swallowed everything. The out-of-scope subject is now a prefix the guard does not
+# claim, and the in-scope half is pinned by case 11 rather than assumed here.
 commit_in stray "feature"
-if push_in stray "refs/heads/fix/whatever" "$T/p6.err"; then
-  ok "non-integration branch pushes freely"
+if push_in stray "refs/heads/chore/whatever" "$T/p6.err"; then
+  ok "a branch outside the declared scope pushes freely"
 else
   bad "scope too broad: $(cat "$T/p6.err")"
 fi
+( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 )
+case "$?" in
+  0) ok "hook-ref SKIPS an out-of-scope branch before any registry read" ;;
+  *) bad "hook-ref gated an out-of-scope branch (rc=$?) — the scope has swallowed everything" ;;
+esac
 
 echo "== 7. recovery: the holder releases, re-acquires and pushes again"
 ( cd "$T/owner" && git fetch -q origin "$REMOTE_BR:$REMOTE_BR" 2>/dev/null || git fetch -q origin )
@@ -494,6 +505,52 @@ NOW=$(date +%s)
 CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB_DEF"
 L4="$(lease_of refs/claims/branch-integration-lease-knob-default)"
 if [ -n "$L4" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the DEFAULT too — one knob, not two" 20000 "$L4"; else bad "no lease_until on the env-raised DEFAULT claim ref"; fi
+
+echo "== 11. a PR BRANCH is gated too — the #3696 loss, on the branch a fixer actually pushes"
+# ⛔ THE LOSS THIS CASE PINS, MEASURED (issue #3696, tortoise PR #11385, 2026-11-07): two lanes wrote
+# one PR for ~6 h — 11 superseded heads, 5 clean reviews on 5 different heads, **0 landings** — because
+# every push superseded the other lane's head-bound review attestation. #3328 built this exact
+# single-owner mechanism for BATCH branches and stopped the identical loss there; the PR branch a FIXER
+# pushes was simply outside the guard's `integration/*` scope, so the mechanism existed and did not
+# cover the branch the loss actually happened on.
+# ⛔ IT IS TWO ARMS, AND THE FIRST ONE IS THE ONE THAT MATTERS: widening a scope must never turn into
+# "the guard refuses lanes that never heard of it". An UNCLAIMED branch of an in-scope name still
+# pushes freely (case 1's polarity, restated at the new name), and only a STRAY push on top of a LIVE
+# claim is refused. Reverting the scope to `integration/*` reddens the second arm and nothing else.
+PRBR="fix/3696-claims-block-push"; PRBR_REF="refs/heads/$PRBR"
+RESBR="rescue/3696-claims"; RESBR_REF="refs/heads/$RESBR"
+# Seeded from the STRAY's head, deliberately: the arms below push from `stray`, so its commit must be
+# a FAST-FORWARD of the seeded tip. Seeding from `owner` made the first arm fail on a non-fast-forward
+# rejection — a fixture artefact that looks exactly like a guard refusal, and which would have made the
+# case pass or fail for a reason no reader could see.
+( cd "$T/stray" && git push -q origin "HEAD:$PRBR_REF" && git push -q origin "HEAD:$RESBR_REF" ) \
+  || bad "fixture: cannot seed the PR/rescue branches"
+commit_in stray "unclaimed PR-branch push"
+if push_in stray "$PRBR_REF" "$T/p11a.err"; then
+  ok "an UNCLAIMED PR branch pushes freely — widening the scope is not over-block"
+else
+  bad "an unclaimed PR branch was refused ($(cat "$T/p11a.err")) — its branch lease was released, so the only in-scope reason to refuse is scope, and a false block here is what gets a gate deleted"
+fi
+acquire_from owner "$PRBR"; eq "owner acquires the PR-BRANCH claim" "$?" "0"
+OWNER_PR_HEAD="$(cd "$T/origin.git" && git rev-parse "$PRBR")"
+commit_in stray "STRAY push onto an owned PR branch"
+if push_in stray "$PRBR_REF" "$T/p11b.err"; then
+  bad "the STRAY PR-branch push SUCCEEDED — a peer can still write on top of an owned head (#3696's whole failure)"
+else
+  ok "a stray push onto an OWNED PR branch is REFUSED"
+fi
+grep -q 'branch-claim: REFUSED' "$T/p11b.err" && ok "the PR-branch refusal names itself" \
+  || bad "refusal text: $(cat "$T/p11b.err")"
+grep -q 'held-by-live' "$T/p11b.err" && ok "...and says a live owner holds it (the peer can be told who)" \
+  || bad "no held-by-live reason in: $(cat "$T/p11b.err")"
+eq "the PR branch did NOT move (=> no head superseded, no attestation invalidated)" \
+   "$(cd "$T/origin.git" && git rev-parse "$PRBR")" "$OWNER_PR_HEAD"
+# rescue/* is the same class of writer (a rescue lane pushes a branch for a PR it does not own).
+( cd "$T/owner" && CLAIM_REPO="$T/owner" "$BC" acquire "$RESBR" >/dev/null 2>&1 ) \
+  || bad "fixture: cannot claim the rescue branch"
+( cd "$T/stray" && "$BC" hook-ref "$RESBR_REF" >/dev/null 2>&1 )
+eq "the scope covers rescue/* — a stray push on an OWNED rescue branch is refused" "$?" "1"
+
 
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"

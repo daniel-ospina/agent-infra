@@ -31,17 +31,25 @@
 # own lanes (every push goes through this checkout), and the claim ref is the server-visible record
 # that a peer can be told about even if it bypassed the hook.
 #
-# ⛔ SCOPE IS THE SMALLEST SURFACE THAT SOLVES IT. Only branches matching BRANCH_CLAIM_PATTERN (an
-# `integration/*` glob by default) are gated. Ordinary feature branches, `main`, tags and the claim
-# refs themselves are untouched — a broad gate would refuse the fleet's normal work and be removed
-# within a day, which is how a real gate becomes folklore.
+# ⛔ SCOPE IS THE SMALLEST SURFACE THAT SOLVES IT. Only branches matching BRANCH_CLAIM_PATTERN are
+# gated. `main`, tags and the claim refs themselves are untouched — a broad gate would refuse the
+# fleet's normal work and be removed within a day, which is how a real gate becomes folklore.
+#
+# ⛔ THE SCOPE IS NOT `integration/*` ALONE (agent-infra#3696, P0). #3328 closed this loss for BATCH
+# branches; #3696 measured the SAME loss on a PR BRANCH: two lanes wrote tortoise PR #11385 for ~6 h
+# and produced **11 superseded heads and zero landings**, because each writer's push invalidated the
+# other's head-bound review attestation. The scope below only decides which branches the GUARD looks
+# at — a branch nobody claimed still pushes freely (case 1: an unclaimed branch is never refused), so
+# covering the PR-branch prefixes costs nothing to a lane that does not claim, and refuses only a
+# STRAY push on top of a live owner. The prefixes are the ones the fixer/rescue loops actually push
+# to; a claim on any other branch is still honoured if taken, it just is not guarded by default.
 set -u
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=claims.sh
 . "$SELF_DIR/claims.sh" || { echo "branch-claim: cannot load claims.sh from $SELF_DIR" >&2; exit 2; }
 
-BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/*}"
+BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/* fix/* rescue/*}"
 
 die2() { printf 'branch-claim: %s\n' "$*" >&2; exit 2; }
 
