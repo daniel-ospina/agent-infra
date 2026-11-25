@@ -137,6 +137,7 @@
 #   bash scripts/check-portability-traps.sh --list-rules    # the rule table (id, trap, replacement)
 #   bash scripts/check-portability-traps.sh --emit-baseline # print a baseline for the current tree
 #   bash scripts/check-portability-traps.sh --root DIR --targets FILE   # scan a fixture tree
+#   bash scripts/check-portability-traps.sh --print-targets            # the scan set, one path per line
 #   bash scripts/check-portability-traps.sh --baseline FILE             # ratchet against another file
 #   bash scripts/check-portability-traps.sh --no-trigger-prefilter      # REFERENCE scan: no fast path
 #   bash scripts/check-portability-traps.sh --help, -h                 # this text
@@ -184,6 +185,11 @@ while [ $# -gt 0 ]; do
     --no-trigger-prefilter) USE_TRIGGER_PREFILTER=0; shift ;;
     --list-rules)    MODE="list-rules"; shift ;;
     --emit-baseline) MODE="emit"; USE_BASELINE=0; shift ;;
+    # ⛔ THE SCAN SET IS PUBLISHED, NOT RE-DERIVED (agent-infra#4210). The changed-files gate has to
+    # intersect a PR's diff with exactly the files this scan reads; a second `*.sh`+shebang rule in
+    # a caller is how a changed file becomes invisible to the gate (`targets()` is the one home for
+    # that derivation — see its comment).
+    --print-targets) MODE="print-targets"; USE_BASELINE=0; shift ;;
     --help|-h)       MODE="help"; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -1746,6 +1752,16 @@ scan() {
       awk -v pfast="$USE_TRIGGER_PREFILTER" "$SCAN_AWK" "$f" || exit 2
     done )
 }
+
+if [ "$MODE" = "print-targets" ]; then
+  # ⛔ AN EMPTY SCAN SET IS A REFUSAL, NEVER A CLEAN LIST: a caller that intersects a diff with an
+  # empty set concludes "nothing to scan" and goes green — the false-CLEAN shape this file refuses
+  # everywhere else, reached through its own published set.
+  targets_list="$(targets)" || exit 2
+  [ -n "$targets_list" ] || { echo "❌ the target set is EMPTY — refusing to publish an empty scan set" >&2; exit 2; }
+  printf '%s\n' "$targets_list"
+  exit 0
+fi
 
 findings="$(scan)" || exit 2
 

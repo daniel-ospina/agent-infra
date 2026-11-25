@@ -24,8 +24,20 @@
 # `scripts/run-bash-shards.sh` to prove the suite is discovered. The consequence a reader must know: a
 # lane that adds a real trap reds THIS shard, by design.
 #
+# ⛔ F4/F5 CARRY A SCOPE SWITCH SINCE #4210, AND IT IS NOT A COVERAGE TRADE (owner decision, 2026-11-25,
+# option A — the re-scope comment on agent-infra#4210). F4 is a `--root` scan: its runtime is a
+# function of REPOSITORY SIZE, not of the diff, so it grows on every merge and eventually outlived the
+# bounded lane's own step bound (measured: 2356 s of a 2400 s step, 98.2 %). A PR cannot change a
+# tree-wide result except through the files it touches — so the BOUNDED lane runs
+# `PORTABILITY_TREE_SCAN=0` (F4/F5 print an explicit SKIP naming the batch lane that owns them, never a
+# silent pass) and `.github/workflows/portability-tree-scan.yml` runs the same assertion against the
+# accumulated tree on a schedule, where a slow run buys information that has changed.
+# The DEFAULT here is 1: a developer, and any run that can afford it, still gets the full assertion.
+#
 #   bash scripts/check-portability-traps.test.sh
 #   bash scripts/check-portability-traps.test.sh --verbose
+#   PORTABILITY_TREE_SCAN=0 bash scripts/check-portability-traps.test.sh   # bounded lane (#4210)
+#   bash scripts/check-portability-traps.test.sh --scope-self-test        # print the F4/F5 SCOPE decision
 #
 # ⛔ IF THE LOCAL CHECKOUT GUARD REFUSES THIS SUITE (fails closed: "script-indirection — the discard's
 # effect could not be verified", #709), do NOT work around it by weakening the arms: run the SAME bytes
@@ -41,8 +53,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || { echo "❌ unresolvable
 CHECK="$HERE/check-portability-traps.sh"
 BASELINE="$HERE/portability-baseline.tsv"
 BOX="$HERE/lib/box.sh"
-VERBOSE=0
-[ "${1:-}" = "--verbose" ] && VERBOSE=1
+VERBOSE=0; SCOPE_SELF_TEST=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --verbose) VERBOSE=1 ;;
+    # ⛔ THE SCOPE DECISION IS PUBLISHED SO IT CAN BE ASSERTED WITHOUT NESTING A SUITE (#4210).
+    # The earlier suites in this tree record that a nested suite run is refused wholesale by the
+    # checkout guard (`script-indirection`), so an arm that re-ran this file to observe the switch
+    # would make the gate unrunnable; this mode prints the SAME decision the F section branches on.
+    --scope-self-test) SCOPE_SELF_TEST=1 ;;
+    *) echo "unknown argument: $_arg" >&2; exit 2 ;;
+  esac
+done
 
 [ -f "$CHECK" ] || { echo "❌ detector missing: $CHECK"; exit 1; }
 
@@ -58,6 +80,20 @@ unproven() { UNPROVEN=$((UNPROVEN+1)); printf 'UNPROVEN-ON(%s, %s)\n' "$(uname -
 # The platform EVERY arm below ran on. Stated once, printed in the summary, and never implied.
 OS="$(uname -s 2>/dev/null || echo unknown)"
 BASHV="${BASH_VERSION%%(*}"
+
+# ── THE SCOPE GATE (agent-infra#4210) ───────────────────────────────────────────────────────────
+# ONE predicate, read by ONE branch in the F section — a second copy of this decision is how the arm
+# keeps running in the bounded lane while the comment claims it moved.
+tree_scan_enabled() { [ "${PORTABILITY_TREE_SCAN:-1}" != "0" ]; }
+
+if [ "$SCOPE_SELF_TEST" = 1 ]; then
+  if tree_scan_enabled; then
+    printf 'SCOPE F4/F5=RUN (whole-tree scan enabled; PORTABILITY_TREE_SCAN=%s)\n' "${PORTABILITY_TREE_SCAN:-1}"
+  else
+    printf 'SCOPE F4/F5=SKIP (PORTABILITY_TREE_SCAN=0 — the batch lane owns the whole-tree scan)\n'
+  fi
+  exit 0
+fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ctrap-XXXXXX")" || { echo "❌ mktemp"; exit 1; }
 cleanup() { rm -rf "$TMP"; }
@@ -1721,19 +1757,33 @@ esac
 # over the tree is a test of a detector, not a gate — and the wiring is asserted rather than assumed,
 # because the brief calls out the exact failure a previous lane made (a reviewer filing "this test
 # never runs" by searching for a FILENAME instead of reading the derived list).
-real_out="$(bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" 2>&1)"; real_rc=$?
-if [ "$real_rc" != 0 ]; then printf '%s\n' "$real_out" | sed 's/^/    /' >&2; fi
-[ "$real_rc" = 0 ] && ok "F4: the repo's own tree is clean under the shipped baseline (what CI enforces)" \
-  || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
+#
+# ⛔ F4/F5 ARE THE SCOPE-SWITCHED ARMS (#4210 re-scope). The predicate is `tree_scan_enabled` and the
+# SKIP names the lane that owns the assertion — a `skip` that says WHERE the coverage went, because a
+# silent removal is the fail-open class this repo refuses.
+real_out=""
+if tree_scan_enabled; then
+  real_out="$(bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" 2>&1)"; real_rc=$?
+  if [ "$real_rc" != 0 ]; then printf '%s\n' "$real_out" | sed 's/^/    /' >&2; fi
+  [ "$real_rc" = 0 ] && ok "F4: the repo's own tree is clean under the shipped baseline (what CI enforces)" \
+    || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
+else
+  skip "F4: the whole-tree scan is owned by .github/workflows/portability-tree-scan.yml (--root over the accumulated tree, on a schedule) — #4210 moved it off the bounded lane because its cost tracks REPOSITORY SIZE, not the diff"
+  skip "F5: the verdict-line arm rides on F4's run and moves with it"
+fi
 
 # ⛔ NO PIPELINE INTO `grep -q` — THE SIGPIPE FALSE-NEGATIVE (#841/#861). Under `pipefail` a `grep -q`
 # that finds its match exits early, the writer takes SIGPIPE, and the PIPELINE reports failure — so a
 # PRESENT verdict line read as "not found". Here that would be a guard asserting a guard. A here-string
 # has no writer process to break, which is why this site and the three in C8/C11 use one.
-grep -q 'no NEW cross-platform traps' <<<"$real_out"
-ok_or_bad=$?
-[ "$ok_or_bad" = 0 ] && ok "F5: the verdict line is printed (silence is never a pass)" \
-  || bad "F5: the real-tree run printed no verdict line"
+# (Only meaningful when F4 ran: with the scan switched off there is no run whose verdict line could be
+# missing, and asserting on an empty string would report a red for a moved arm.)
+if tree_scan_enabled; then
+  grep -q 'no NEW cross-platform traps' <<<"$real_out"
+  ok_or_bad=$?
+  [ "$ok_or_bad" = 0 ] && ok "F5: the verdict line is printed (silence is never a pass)" \
+    || bad "F5: the real-tree run printed no verdict line"
+fi
 
 # ⛔ WIRING BY DERIVATION, NOT BY A SECOND LIST: both CI lanes execute scripts/run-bash-shards.sh,
 # and that runner DISCOVERS its suites by glob (`SUITE_GLOBS`) — nothing is registered by hand. So the

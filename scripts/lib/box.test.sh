@@ -61,6 +61,26 @@ case "$iso" in
   *) bad "epoch_to_iso: '$iso' is not ISO-8601 UTC" ;;
 esac
 
+# ── ISO -> epoch: the SAME `date` disagreement in the inverse direction (agent-infra#4210).
+# A staleness guard has to age a timestamp the Actions API published, so a forward-only shim would
+# push every caller back to `date -d`, the GNU-only spelling this file exists to remove.
+back="$(box_iso_to_epoch "$iso")" || back=""
+case "$back" in
+  ''|*[!0-9]*) bad "iso_to_epoch: '$back' (from '$iso') is not epoch seconds" ;;
+  *) if [ "$back" -le "$m1" ] && [ "$((m1 - back))" -le 1 ]; then ok "iso_to_epoch: round-trips $iso -> $back"
+     else bad "iso_to_epoch: round-trip $back does not match mtime $m1"; fi ;;
+esac
+# ⛔ THE REFUSAL DIRECTION: a non-ISO value must FAIL, not be parsed as "today" or "this year".
+# Measured shapes: GNU `date -d ""` answers MIDNIGHT TODAY (a 12-hour-fresh-looking age out of
+# nothing) and BSD `date -j -f` on a partial string fills in the current year.
+box_iso_to_epoch "" >/dev/null 2>&1 && bad "iso_to_epoch: an EMPTY string parsed (it must refuse)" \
+  || ok "iso_to_epoch: an empty string is refused, not parsed as today"
+box_iso_to_epoch "2026-11-25" >/dev/null 2>&1 && bad "iso_to_epoch: a DATE without a time parsed (a partial string is not an instant)" \
+  || ok "iso_to_epoch: a date without a time is refused"
+[ "$(box_iso_to_epoch '2026-11-25T04:10:30Z')" = "$(box_iso_to_epoch '2026-11-25T04:10:30+00:00')" ] \
+  && ok "iso_to_epoch: a +00:00 offset is normalised to the same instant as Z" \
+  || bad "iso_to_epoch: '+00:00' and 'Z' disagreed — an offset rendering would shift the age"
+
 # ── sed -i: it rewrites, and the GNU spelling's BSD hazard is live.
 printf 'alpha\n' > "$f"
 if box_sed_i 's/alpha/beta/' "$f" && [ "$(head -1 "$f")" = "beta" ]; then ok "sed_i: rewrote the file"; else bad "sed_i: did not rewrite"; fi

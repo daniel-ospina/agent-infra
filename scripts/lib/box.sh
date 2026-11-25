@@ -11,7 +11,9 @@
 #   • `sed -i`      — BSD requires a backup suffix ARG (`sed -i '' -e …`); GNU refuses one.
 #                     A GNU spelling on macOS silently treats the next argument as the suffix, so
 #                     `sed -i 's/a/b/' f` becomes an edit of nothing plus a stray file `f`'s suffix.
-#   • `date`        — BSD: `date -r <epoch>` takes epoch SECONDS; GNU: `date -d @<epoch>`.
+#   • `date`        — BSD: `date -r <epoch>` takes epoch SECONDS; GNU: `date -d @<epoch>`. The INVERSE
+#                     (ISO-8601 → epoch) disagrees the same way: BSD `date -j -f <fmt> <iso> +%s`,
+#                     GNU `date -d <iso> +%s` — `box_iso_to_epoch` is that direction.
 #   • CPU count     — macOS: `sysctl -n hw.ncpu`; Linux: `nproc` (or `getconf _NPROCESSORS_ONLN`).
 #                     `spawn-gate.sh` already derives `_NCPU` this way at SOURCE time; a script
 #                     sourced under the wrong PATH pinned `_NCPU=4` and MAX_LOAD=40 for every cell
@@ -111,6 +113,35 @@ box_epoch_to_iso() {
     if v="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then BOX_DATE_MECH="date-r"; fi
   fi
   [ -n "$v" ] || return 1
+  printf '%s\n' "$v"
+}
+
+# box_iso_to_epoch <ISO-8601 UTC> — epoch SECONDS. The INVERSE of `box_epoch_to_iso`, added for
+# #4210's staleness guard (a last-success timestamp published by the Actions API has to be aged).
+# Same platform disagreement in the other direction, so it is the SAME shim and not a caller's
+# private `date` call: BSD parses with `-j -f <fmt>`, GNU with `-d <string>`.
+box_iso_to_epoch() {
+  local s="${1:-}" v=""
+  # ⛔ THE SHAPE IS CHECKED BEFORE ANY `date` RUNS: a value that is not an ISO-8601 UTC instant must
+  # be a REFUSAL, because `date -d ""` prints midnight today and `date -j -f` on a partial string
+  # prints THIS year's value — both would turn an unreadable timestamp into a confident age.
+  case "$s" in ????-??-??T*Z) ;; *) return 1 ;; esac
+  # GitHub renders `…:SSZ`; a fractional part or a `+00:00` offset is normalised here so a caller
+  # never depends on that rendering staying put.
+  case "$s" in *+00:00) s="${s%+00:00}Z" ;; esac
+  case "$s" in *.*Z) s="${s%%.*}Z" ;; esac
+  case "$(box_os)" in
+    linux)
+      if v="$(date -u -d "$s" +%s 2>/dev/null)"; then BOX_DATE_MECH="date-d-parse"; fi  # portability-ok: OS-GUARDED — this arm runs only inside `case "$(box_os)" in linux)`; macOS takes the `date -j -f` arm below
+      ;;
+  esac
+  if [ -z "$v" ]; then
+    if v="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$s" +%s 2>/dev/null)"; then BOX_DATE_MECH="date-j-f"; fi
+  fi
+  if [ -z "$v" ]; then
+    if v="$(date -u -d "$s" +%s 2>/dev/null)"; then BOX_DATE_MECH="date-d-parse"; fi  # portability-ok: LAST-RESORT ARM of box_iso_to_epoch's probe chain — it runs only after the `date -j -f` arm above declined, and this function IS the shim the rule points at
+  fi
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$v"
 }
 
@@ -244,6 +275,17 @@ box_selftest() {
   else
     printf 'FAIL epoch_to_iso could not format %s on %s\n' "$m1" "$os"; fails=$((fails+1))
   fi
+  # The INVERSE direction, as a ROUND TRIP: the same instant must come back. A forward-only shim
+  # would let a caller's `date -d` parse hard-code one platform's dialect.
+  back="$(box_iso_to_epoch "$iso" 2>/dev/null)" || back=""
+  case "$back" in
+    ''|*[!0-9]*) printf 'FAIL iso_to_epoch=%s (from %s) via=%s\n' "$back" "$iso" "$BOX_DATE_MECH"; fails=$((fails+1)) ;;
+    *) if [ "$back" -le "$m1" ] && [ "$((m1 - back))" -le 1 ]; then
+         printf 'PASS iso_to_epoch round-trip=%s via=%s\n' "$back" "$BOX_DATE_MECH"
+       else
+         printf 'FAIL iso_to_epoch round-trip=%s != mtime %s via=%s\n' "$back" "$m1" "$BOX_DATE_MECH"; fails=$((fails+1))
+       fi ;;
+  esac
   if box_sed_i 's/alpha/beta/' "$tmp" && [ "$(head -1 "$tmp")" = "beta" ]; then
     printf 'PASS sed_i via=%s\n' "$BOX_SED_MECH"
   else
