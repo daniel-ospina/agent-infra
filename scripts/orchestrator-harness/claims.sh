@@ -2013,6 +2013,96 @@ claim_issue_release_record() {
   claim_issue_release "$repo" "$issue" "$own"
 }
 
+# claim_issue_renew_record <state-dir> <repo> <issue> [<expected-commit>] -> 0 renewed, 1 refused
+# ⛔ WHY A RENEWAL EXISTS AT ALL (agent-infra#4230). The release must not fire on a merge that did not
+# END the issue's work — but *skipping* the release is not the fix either: the term was minted when the
+# issue was DISPATCHED, so by the time a chain decides to keep it hours of that term are already spent,
+# and a claim that silently expires mid-follow-up hands the same issue to a second lane one lease later.
+# That is the same duplicate with a delay, so the keep path EXTENDS the term.
+# ⛔ THE HOLDER IDENTITY IS PRESERVED, NOT REPLACED (Kubernetes' `LeaseSpec` keeps `holderIdentity` and
+# distinguishes `acquireTime` from `renewTime` for exactly this reason): a renewal is the SAME holder
+# staying longer. Stamping the renewing process's identity instead would silently transfer the claim to
+# a different actor, and every peer's `claim_orphan_reason` verdict would then be about the wrong one.
+# ⛔ THE FENCE IS THE RELEASE'S FENCE, IN THE OTHER DIRECTION — `--force-with-lease=<ref>:<own>` moves
+# the ref only while it still points at THIS chain's generation, so a renewal can never take a claim a
+# peer acquired after us (that is a CAS, not a blind force — `_claim_acquire_at`'s reclaim arm).
+# ⛔ NO EXPECTATION + A RECORD IS STILL FENCED, unlike a release: the record's value IS this box's own
+# commit, so a renewal that read a NEWER generation's record is refused rather than applied to it.
+# ⛔ REFUSAL IS rc=1, NEVER rc=2 (the polarity agent-infra#3203 settled): rc=2 is the acquire's
+# "registry unavailable — proceed on the local lock" code, so no caller may read a refused renewal as
+# permission to do anything. There is no permission to grant — the claim simply keeps its old term.
+# ⛔ THE RECORD IS MOVED WITH THE REF. The tip becomes the NEW commit; leaving the old one in
+# `$O/state/issueclaim-<N>` would make every LATER release fence on a value that is no longer the tip,
+# so nothing could delete the claim and it would sit out its whole lease.
+claim_issue_renew_record() {
+  local dir="${1:-$HOME/orchestrator}" repo="${2:-}" issue="${3:-}" expect="${4:-}"
+  local f="$dir/state/issueclaim-$issue" own ref cur tmp lease holder now until new
+  if [ ! -f "$f" ]; then
+    CLAIM_RESULT="no recorded claim commit for #${issue:-?} — nothing to RENEW (that record is the only proof this box holds it)"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  own="$(cat "$f" 2>/dev/null || true)"
+  if [ -n "$expect" ] && [ "$own" != "$expect" ]; then
+    CLAIM_RESULT="the record for #$issue was overwritten by a NEWER generation (${own:-empty} != $expect) — NOT renewing; that claim is not this chain's"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  if [ -z "$own" ]; then
+    CLAIM_RESULT="the recorded claim commit for #$issue is EMPTY — it cannot identify the claim to renew"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  # The clock is validated BEFORE any arithmetic, exactly as `_claim_acquire_at` and `claim_prune` do:
+  # a `date` shim printing 0 mints an already-expired term (`until` = the ttl, epoch 1970), a leading
+  # zero aborts the arithmetic as OCTAL, and 13+ digits wrap through `$(( ))`.
+  now="$(date +%s 2>/dev/null)"
+  case "${now:-}" in
+    ''|0|0?*|*[!0123456789]*|?????????????*)
+      CLAIM_RESULT="could not renew: the LOCAL CLOCK is unreadable, so no lease deadline can be computed (refusing rather than minting an already-expired term)"
+      echo "$CLAIM_RESULT"; return 1 ;;
+  esac
+  ref="$(claim_issue_ref "$issue")"
+  # Read the tip before writing anything. The fenced push below would refuse anyway, but the refusal
+  # would then read as a lost race when the real cause is a claim this chain never held.
+  cur="$(_git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
+  if [ -z "$cur" ]; then
+    CLAIM_RESULT="cannot read $ref (network?) — NOT renewed; the claim keeps its current term"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  if [ "$cur" != "$own" ]; then
+    CLAIM_RESULT="refused — $ref is held by a NEWER generation ($cur != $own), so it is not this chain's to renew; it keeps its holder and its term"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  tmp="$CLAIM_TMP_NS/renew-$RANDOM$$"
+  if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+    _git update-ref -d "$tmp" 2>/dev/null
+    CLAIM_RESULT="cannot fetch $ref to read its holder — NOT renewed; the claim keeps its current term"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
+  holder="${lease%%$'\t'*}"
+  # An unparseable holder is replaced by THIS box, not by a guess: the ref tip IS our own commit (just
+  # proven), so the claim is ours and the identity loses nothing a peer was relying on.
+  case "${holder:-}" in ''|'?') holder="$(claim_owner)" ;; esac
+  until=$(( now + CLAIM_ISSUE_TTL ))
+  CLAIM_COMMIT_OUT=""; CLAIM_COMMIT_ERR=""
+  _claim_commit "$holder" "$until" >/dev/null
+  new="${CLAIM_COMMIT_OUT:-}"
+  if [ -z "$new" ]; then
+    CLAIM_RESULT="could not build the renewal commit — ${CLAIM_COMMIT_ERR:-unknown failure building a claim commit object}"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  if ! _git push -q --force-with-lease="$ref:$own" origin "$new:$ref" 2>/dev/null; then
+    CLAIM_RESULT="renewal refused — $ref no longer ours (fenced on $own; another box moved it)"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  CLAIM_COMMIT="$new"
+  # The record carries the NEW generation. A failed write is loud but not fatal: the REF is renewed,
+  # and only a later release's fence depends on the record.
+  claim_issue_record "$dir" "$issue" "$new" >/dev/null 2>&1 \
+    || printf '[claims] ⚠️ renewed %s but could not re-record its generation in %s — a later release will be fenced OFF that record and the claim will run to its full lease\n' "$ref" "$f" >&2
+  CLAIM_RESULT="renewed $ref (holder=${holder:-?} lease_until=$until; previous generation $own)"
+  echo "$CLAIM_RESULT"; return 0
+}
+
 # ── THE SNAPSHOT VERDICT (agent-infra#2466) ──────────────────────────────────────────────────
 # ONE reader for "does the durable registry say this key is free?", shared by every caller that
 # SELECTS work (`orch-loop.sh`'s `pr_owned` / `claim_live` / the sweep's printed decision). It adds

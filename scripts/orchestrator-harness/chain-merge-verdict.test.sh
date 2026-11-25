@@ -41,6 +41,16 @@ cat > "$T/bin/gh" <<'EOF'
 #   `pulls/<n>`  → "is THIS repo's PR merged?"      → ${MERGED_AT_STUB-} (set-but-empty = NOT merged)
 #   anything else→ "which open PR is on this branch?" → 5
 case " $* " in
+  # ⛔ THE ISSUE STATE IS ITS OWN QUESTION (#4230). `chain-merge.sh` now asks `repos/<o/r>/issues/<n>`
+  # whether the MERGED PR actually CLOSED the issue, because "merged" and "finished" are different
+  # facts on GitHub (a merge auto-closes only via a closing keyword on the default branch). Without
+  # this arm the catch-all below answered 5 for an issue state — i.e. "neither open nor closed" — and
+  # every new assertion would have graded the uninterpretable branch instead of the real one.
+  *"issues/"*)
+    # ISSUE_API_FAIL=1 = the READ failed (rate limit / DNS): exit non-zero, print nothing. An
+    # unreadable state is NOT "closed", and the chain must keep the claim on it (fail-closed).
+    [ "${ISSUE_API_FAIL:-0}" != 0 ] && exit 1
+    printf '%s\n' "${ISSUE_STATE_STUB-open}" ;;
   *"pulls/"*)
     printf 'READ\n' >> "${GH_PULLS_COUNT:-/dev/null}"
     # MERGED_API_FAIL=1 = the READ failed (rate limit / DNS): exit non-zero, print nothing. A failed
@@ -73,6 +83,7 @@ EOF
   # is an ASSERTION, not a hope. (Without a captured generation chain-merge deliberately refuses.)
   cat > "$T/o/claims.sh" <<EOF
 claim_issue_release_record() { printf 'RELEASED %s\n' "\$3" >> "$T/released"; return 0; }
+claim_issue_renew_record() { printf 'RENEWED %s\n' "\$3" >> "$T/released"; return 0; }
 EOF
   rm -f "$T/chain-ran" "$T/released"
   # rig() recreates $T/o, so the PATH-prepended shim dirs must be re-seeded with it.
@@ -85,6 +96,7 @@ PID=""
 drive() { # drive <phase-grace> <handoff-wait> — starts the chain, sets $PID (never echoes: a caller
            # running this in $( ) would own the child in a SUBSHELL and could not wait/kill it)
   PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" MERGED_API_FAIL="${MERGED_API_FAIL-0}" \
+    ISSUE_STATE_STUB="${ISSUE_STATE_STUB-open}" ISSUE_API_FAIL="${ISSUE_API_FAIL-0}" \
     LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" CHAIN_POLL="${CHAIN_POLL:-15}" \
     CHAIN_CONFIRM_RETRY="${CHAIN_CONFIRM_RETRY:-60}" GH_PULLS_COUNT="${GH_PULLS_COUNT:-}" \
     bash "$SCRIPT" "$T/repo" o/r 42 feat/42-tm >> "$T/o/logs/chain-42.log" 2>&1 &
@@ -205,6 +217,66 @@ for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
 wait "$PID" 2>/dev/null
 ck "the early MERGED exit still RELEASES the issue claim (the traps are installed before it)" \
    $(grep -q "RELEASED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+
+# ── 5b. A MERGE THAT DID NOT CLOSE THE ISSUE MUST NOT FREE ITS CLAIM (agent-infra#4230) ────────────
+# ⛔ THE MEASURED DEFECT THIS PINS (and the reason it can go RED): on GitHub "merged" and "finished"
+# are different facts — a merge auto-closes a linked issue only when the PR body carries a closing
+# keyword AND the PR targets the default branch. A partial `Refs #N` merges and leaves the issue OPEN,
+# and the chain's EXIT trap released `refs/claims/issue-<N>` on EVERY exit anyway. `refresh-candidates.sh`
+# then re-selected the open, now-unclaimed issue and a SECOND lane opened a second PR for the same work:
+# three issues, each carrying two open PRs (#14560 -> #14572 + #14596), and no claim left in the
+# registry for any of them. The assertion is the registry, not the log line.
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'MERGED abc\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+MERGED_AT_STUB='2026-10-19T00:00:00Z' ISSUE_STATE_STUB=open drive 90 30
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "an OPEN issue after a CONFIRMED merge KEEPS its claim — the trap does not free work that is not finished (#4230)" \
+   $([ "$RC" = 0 ] && ! ran && grep -q "still OPEN" "$T/o/logs/chain-42.log" \
+      && ! grep -q "RELEASED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+ck "…and the KEPT claim is RENEWED (a term minted at DISPATCH perishes mid-follow-up — the same duplicate, one lease later)" \
+   $(grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+
+# ── 5c. the SAME merge with the issue CLOSED releases, as before — the pair is what makes the
+#        condition discriminating rather than "never release again" ─────────────────────────────
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'MERGED abc\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+MERGED_AT_STUB='2026-10-19T00:00:00Z' ISSUE_STATE_STUB=closed drive 90 30
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "a CLOSED issue after a confirmed merge still RELEASES the claim (the condition has both arms)" \
+   $([ "$RC" = 0 ] && grep -q "RELEASED 42" "$T/released" 2>/dev/null \
+      && ! grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+
+# ── 5d. an UNREADABLE state is NOT "closed" (fail-closed), and it is likeliest exactly when the API
+#        is rate-limited — a retry storm of halted merges would otherwise free every open issue at once
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'MERGED abc\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+MERGED_AT_STUB='2026-10-19T00:00:00Z' ISSUE_API_FAIL=1 drive 90 30
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "a FAILED issue-state read is NOT 'closed': the claim is kept and renewed (fail-closed, #4230)" \
+   $([ "$RC" = 0 ] && grep -q "could not READ whether issue" "$T/o/logs/chain-42.log" \
+      && ! grep -q "RELEASED 42" "$T/released" 2>/dev/null \
+      && grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
+
+# ── 5e. THE OTHER HALF: a chain that merged NOTHING must STILL release (R8). Without this arm the
+#        change would "pass" by never releasing again — stranding every refused issue for a lease ────
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'BLOCKED_ATTEMPTS the rail refused twice\n' > "$T/o/state/lanemerge-5.verdict"
+ISSUE_STATE_STUB=open drive 90 30
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "a chain that merged NOTHING still RELEASES its claim (an open issue must stay dispatchable by a peer — R8)" \
+   $(ran && grep -q "RELEASED 42" "$T/released" 2>/dev/null \
+      && ! grep -q "RENEWED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
 
 echo
 # ── 13. the confirmation is asked ONCE PER RETRY WINDOW, and a later window may still ask ───────

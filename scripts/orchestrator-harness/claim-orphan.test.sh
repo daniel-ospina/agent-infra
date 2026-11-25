@@ -1658,6 +1658,75 @@ ck "O29 [PINNED] a suffixless 'pr-' is not a key and abstains (rc=$(field "$O29E
 # a residual rather than tightened here, because narrowing the pattern is a separate change to the arm
 # this PR is already widening — and an unmintable shape is not the defect class this PR closes.
 
+# ── O30: the RENEWAL (agent-infra#4230) ──────────────────────────────────────────────────────────
+# ⛔ WHY THE RENEWAL IS TESTED HERE AND NOT IN chain-merge's SUITE. `chain-merge.sh` decides WHETHER to
+# keep a claim after a merge that did not close its issue (#4230); the REGISTRY is what makes a keep
+# survive. And the keep must not be a mere SKIP: the term was minted when the issue was DISPATCHED, so
+# a kept-but-unrenewed claim expires mid-follow-up and the same issue is dispatched again — the same
+# duplicate, one lease later. So the properties below are the claim's own: the term EXTENDS, the HOLDER
+# is preserved, the fence still holds, and the RECORD moves with the ref (otherwise the later release
+# fences on a value that is no longer the tip and the claim can never be deleted).
+# The canonical shape this follows is a renewable lease, not a re-acquire: Kubernetes' `LeaseSpec`
+# keeps `holderIdentity` and distinguishes `acquireTime` from `renewTime`, so a renewal is the SAME
+# holder staying longer.
+ORIG30="$(mk_origin o30)"; O30="$T/o30"; mkdir -p "$O30/state"
+ensure_work_repo "$ORIG30"
+O30ENV="O=$O30"
+O30CS="CLAIM_STATE_DIR=$O30/state"
+own30="$(as_box "$ORIG30" selfbox 'claim_issue_acquire "" 77 90 >/dev/null || exit 1
+  claim_issue_record "$O" 77 "$CLAIM_COMMIT" || exit 1
+  printf "%s" "$CLAIM_COMMIT"' "$O30ENV" "$O30CS")"
+st_before="$(as_box "$ORIG30" selfbox 'claim_issue_status "" 77' "$O30ENV" "$O30CS")"
+until_before="$(printf '%s' "$st_before" | cut -f2)"
+[ -n "$own30" ] && [ -n "$until_before" ] || bad "O30: could not acquire the claim this section renews"
+r30="$(as_box "$ORIG30" selfbox 'claim_issue_renew_record "$O" "$CLAIM_REPO" 77 "$(cat "$O/state/issueclaim-77")"' "$O30ENV" "$O30CS")"; rc30=$?
+st_after="$(as_box "$ORIG30" selfbox 'claim_issue_status "" 77' "$O30ENV" "$O30CS")"
+until_after="$(printf '%s' "$st_after" | cut -f2)"
+owner_after="$(printf '%s' "$st_after" | cut -f1)"
+# ⛔ THE ACQUIRE ABOVE IS DELIBERATELY SHORT (90 s), because that is the shape the bug has: the term
+# was minted at DISPATCH, hours before the merge that decides to keep it. A renewal that only re-stamped
+# a term measured from the OLD one would leave the claim expiring mid-follow-up; the assertion below is
+# therefore on the SIZE of the extension (a fresh CLAIM_ISSUE_TTL), not on "the number went up by one".
+O30A=1
+[ "$rc30" -eq 0 ] && [ "$(( ${until_after:-0} - ${until_before:-0} ))" -gt 1000 ] && O30A=0
+ck "O30 (RED→GREEN) a renewal EXTENDS the lease to a FRESH term (before=$(printf '%s' "$until_before") after=$(printf '%s' "$until_after"), rc=$rc30) — the keep path cannot be a bare SKIP" $O30A
+O30B=0
+case "$owner_after" in selfbox:*) : ;; *) O30B=1 ;; esac
+ck "O30 (PINNED) the renewal PRESERVES the holder ($owner_after) — a renewal must not transfer the claim to the renewing process" $O30B
+new30="$(as_box "$ORIG30" selfbox 'cat "$O/state/issueclaim-77"' "$O30ENV" "$O30CS")"
+tip30="$("$REAL_GIT" -C "$T/repo" ls-remote origin refs/claims/issue-77 | awk '{print $1}')"
+O30C=1
+[ -n "$new30" ] && [ "$new30" = "$tip30" ] && [ "$new30" != "$own30" ] && O30C=0
+ck "O30 (PINNED) the RECORD moves onto the new generation (record=${new30:0:12} tip=${tip30:0:12} old=${own30:0:12}) — a release after a renewal must still fence" $O30C
+# …and that release is DRIVEN, not assumed: the chain's deferred release runs hours later, through
+# exactly this call, against whatever the record holds by then.
+out30="$(as_box "$ORIG30" selfbox 'claim_issue_release_record "$O" "$CLAIM_REPO" 77' "$O30ENV" "$O30CS")"; rc30r=$?
+left30="$("$REAL_GIT" -C "$T/repo" ls-remote origin 'refs/claims/issue-*' | wc -l | tr -d ' ')"
+O30D=1
+[ "$rc30r" -eq 0 ] && [ "$left30" = "0" ] && O30D=0
+ck "O30 (PINNED) a LATER release still succeeds after a renewal (rc=$rc30r refs-left=$left30; $out30)" $O30D
+# ⛔ THE FENCE, IN THE OTHER DIRECTION: a peer has taken the ref (a NEWER commit) while our record still
+# holds ours. A renewal is a WRITE, so it must refuse exactly where the release does — otherwise the
+# keep path becomes a way to STEAL a claim, which is worse than the release bug it fixes.
+peerc30="$(as_box "$ORIG30" peerbox '_claim_commit peerbox "$(( $(date +%s) + 600 ))"' "$O30ENV" "CLAIM_STATE_DIR=$T/cs-peer30")"
+[ -n "$peerc30" ] || bad "O30: could not mint the peer's claim for the fencing case"
+"$REAL_GIT" -C "$T/repo" push -q origin "$peerc30:refs/claims/issue-77"
+printf '%s\n' "${own30:-stale}" > "$O30/state/issueclaim-77"
+as_box "$ORIG30" selfbox 'claim_issue_renew_record "$O" "$CLAIM_REPO" 77 "${own30:-stale}"' "$O30ENV" "$O30CS" >/dev/null 2>&1; rc30f=$?
+tip30f="$("$REAL_GIT" -C "$T/repo" ls-remote origin refs/claims/issue-77 | awk '{print $1}')"
+O30E=1
+[ "$rc30f" -eq 1 ] && [ "$tip30f" = "$peerc30" ] && O30E=0
+ck "O30 (RED→GREEN) a renewal CANNOT move a claim a peer took (rc=$rc30f, tip still the peer's) — the keep path must not become a steal path" $O30E
+# ⛔ THE GENERATION GUARD, same as the release's: the record is keyed on the ISSUE, so the same box can
+# become the holder again while an older chain is still alive. An older chain must neither renew nor
+# consume that newer record.
+printf '%s\n' "${own30:-stale}" > "$O30/state/issueclaim-77"
+as_box "$ORIG30" selfbox 'claim_issue_renew_record "$O" "$CLAIM_REPO" 77 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"' "$O30ENV" "$O30CS" >/dev/null 2>&1; rc30g=$?
+rec30g="$(cat "$O30/state/issueclaim-77" 2>/dev/null)"
+O30F=1
+[ "$rc30g" -eq 1 ] && [ "$rec30g" = "${own30:-stale}" ] && O30F=0
+ck "O30 (PINNED) an OLDER chain cannot renew the NEWER generation's claim (rc=$rc30g, its record is left for ITS own release)" $O30F
+
 echo
 echo "─────────────────────────────────────────────────────────────"
 echo "  $PASS passed, $FAIL failed"
