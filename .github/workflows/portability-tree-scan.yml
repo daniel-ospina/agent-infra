@@ -85,7 +85,10 @@ jobs:
           printf '%s\n' "$rc" > scan-out/rc.txt
           echo "── verdict ──"
           cat scan-out/verdict.txt
-          echo "── findings (machine-readable: path:line: rule — replacement) ──"
+          # ⛔ THIS LABEL MUST MATCH WHAT THE DETECTOR EMITS (review P2, measured): `hit()` prints
+          # `path<TAB>line<TAB>rule<TAB>replacement` (check-portability-traps.sh:1729). A colon form
+          # would make the title parser below read a replacement string's colons as field separators.
+          echo "── findings (machine-readable: path<TAB>line<TAB>rule<TAB>replacement) ──"
           cat scan-out/findings.txt
           echo "SCAN rc=$rc"
           case "$rc" in
@@ -150,8 +153,13 @@ jobs:
 
           if [ "$rc" = "1" ]; then
             echo "❌ ${n} NEW cross-platform trap(s) in the accumulated tree"
-            first_file="$(awk -F: 'NF>=2 { print $1; exit }' scan-out/findings.txt)"
-            first_rule="$(awk -F': ' 'NF>=2 { split($2, w, " "); print w[1]; exit }' scan-out/findings.txt)"
+            # ⛔ PARSE WHAT IS EMITTED, NOT WHAT SOUNDS RIGHT (#4210 review P2). `findings.txt` is the
+            # detector's stdout, and `hit()` writes TAB-separated `path\tline\trule\treplacement`
+            # (check-portability-traps.sh:1729) — a `-F:` split reads a whole row fragment up to the
+            # first colon inside a REPLACEMENT string, and renders `unknown` for a row with no `": "`.
+            # Only the replacement may contain a colon; the first three fields never do.
+            first_file="$(awk -F'\t' 'NF>=3 { print $1; exit }' scan-out/findings.txt)"
+            first_rule="$(awk -F'\t' 'NF>=3 { print $3; exit }' scan-out/findings.txt)"
             title="portability(tree): ${n} new trap(s) — first: ${first_file:-unknown} ${first_rule:-unknown}"
           else
             echo "❌ the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict, which is not a clean one"

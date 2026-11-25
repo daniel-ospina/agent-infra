@@ -734,7 +734,10 @@ jobs:
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/check-portability-tree-scan-alive.sh
+        # `--base` is REQUIRED for the 404 branch: it is what tells a workflow that is LANDING from one
+        # that landed and never registered (#4210 review P2). `HEAD^` is present because this job
+        # checks out with `fetch-depth: 2`, and it is the same ref the diff gate above measures against.
+        run: bash scripts/check-portability-tree-scan-alive.sh --base HEAD^
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
         # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
         # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the

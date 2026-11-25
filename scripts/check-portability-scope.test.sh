@@ -20,12 +20,17 @@
 #   B. `check-portability-tree-scan-alive.sh` — the tree half CANNOT GO QUIET. A fresh success
 #      passes, a stale one fails, a workflow that has NEVER succeeded fails once its registration is
 #      older than the bound (the bootstrap window is the one narrow exception, and it is reported),
-#      and an unreadable API is a refusal. A scheduled job that stops is an absence, and an absence
-#      is not a pass.
-#   C. THE WIRING, DERIVED FROM THE FILES THAT RUN IT — both bounded lanes switch the whole-tree arm
+#      and an unreadable API is a refusal. A 404 is told apart from an outage by the TREE and the BASE
+#      together: absent from both the repository and the tree is an absence, and a file the BASE
+#      already carries but the API does not is an absence too — only a file this change ADDS gets the
+#      named bootstrap window, so it cannot be ridden forever.
+#   C. THE WIRING, READ FROM THE PARSED FILES THAT RUN IT — both bounded lanes switch the whole-tree arm
 #      off, the batch workflow switches it ON and runs `--root`, the batch workflow files ONE issue on
-#      a rise, and both bounded lanes ask the freshness question. A moved arm with no wiring is a
-#      removed arm, so each of these is asserted rather than assumed.
+#      a rise, and both bounded lanes ask the freshness question. These assert on the PARSED document
+#      (`scripts/workflow-yaml.mjs`): a step whose run COMMAND is the script, and a step's parsed env.
+#      Each is paired with the mutant that reverts it, and the mutant keeps the script's NAME in the
+#      text — because a substring check (“the name appears in the file”) is satisfied by a comment, which
+#      is the bypass the parsed assertions close. A moved arm with no wiring is a removed arm.
 #
 # HERMETIC: every fixture is a throwaway git repo or a PATH shim under $TMP. No network, no real
 # repository state, and — measured — the whole suite runs in about a second.
@@ -290,72 +295,169 @@ PATH="$TMP/gh-future:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b7.out" 2>&1; rc=$?
 [ "$rc" = 2 ] && ok "B7: a FUTURE timestamp REFUSES (a negative age would sail under every bound forever)" \
   || bad "B7: a future timestamp produced rc=$rc"
 
-# B8/B9 — A 404 IS NOT AN OUTAGE, AND THE DIFFERENCE IS THE LANDING PR. The workflow file exists in
-# THIS tree but not yet in the repository: treating that as "cannot read" would red every PR until the
-# first merge, and treating it as unconditional bootstrap would let a DELETED workflow stay green. The
-# tree is the disambiguator.
+# B8/B9 — A 404 IS NOT AN OUTAGE, AND THE TREE ALONE IS NOT THE DISAMBIGUATOR (#4210 review P2).
+# A file in THIS tree but not yet in the repository is a landing PR (reding it would red every PR until
+# the first merge), and a file in NEITHER is a real absence. But "the file is in the tree" is ALSO true
+# on `main`, so on its own it is an UNBOUNDED window: a workflow that landed and never registered would
+# read as fresh forever. The BASE answers the second half, so this fixture gives the guard a real base
+# to ask (the old arm leaned on the live repo's `origin/main`, which stops being a landing PR the
+# moment this change merges — a test that rots into the wrong answer).
 mkdir -p "$TMP/gh-404"
 printf '%s\n' '#!/usr/bin/env bash' 'echo "gh: Not Found (HTTP 404)" >&2' 'exit 1' >"$TMP/gh-404/gh"
 chmod +x "$TMP/gh-404/gh"
-PATH="$TMP/gh-404:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b8.out" 2>&1; rc=$?
+B8FIX="$TMP/alive-boot"
+mkdir -p "$B8FIX/scripts/lib" "$B8FIX/.github/workflows"
+cp "$ALIVE" "$B8FIX/scripts/check-portability-tree-scan-alive.sh"
+cp "$HERE/lib/box.sh" "$B8FIX/scripts/lib/box.sh"
+b8git() { git -C "$B8FIX" -c user.email=t@example.invalid -c user.name=t "$@" >/dev/null 2>&1; }
+b8git init -q
+printf 'base\n' >"$B8FIX/README.md"
+b8git add README.md
+b8git commit -q -m "base: no batch workflow yet"
+printf 'name: portability-tree-scan\non:\n  schedule:\n    - cron: "0 3 * * *"\n' >"$B8FIX/.github/workflows/portability-tree-scan.yml"
+b8git add .github/workflows/portability-tree-scan.yml
+b8git commit -q -m "land the batch workflow"
+B8ALIVE="$B8FIX/scripts/check-portability-tree-scan-alive.sh"
+
+PATH="$TMP/gh-404:$PATH" bash "$B8ALIVE" --repo o/r --base HEAD^ >"$TMP/b8.out" 2>&1; rc=$?
 if [ "$rc" = 0 ] && grep -q 'NOTE bootstrap' "$TMP/b8.out" && grep -q 'not yet registered' "$TMP/b8.out"; then
-  ok "B8: a workflow present in this tree but not yet registered passes WITH a named bootstrap note (the landing PR does not red on its own change)"
+  ok "B8: a workflow present in this tree but not yet registered passes WITH a named bootstrap note, and the note names the base that bounds it (the landing PR does not red on its own change)"
 else
   bad "B8: the landing-PR case produced rc=$rc: $(head -2 "$TMP/b8.out")"
 fi
-PATH="$TMP/gh-404:$PATH" bash "$ALIVE" --repo o/r --workflow definitely-absent-workflow.yml >"$TMP/b9.out" 2>&1; rc=$?
+
+# B8b — THE SAME 404, BUT THE BASE ALREADY CARRIES THE FILE: that is not a landing PR, it is a
+# workflow that landed and never registered, so the window must CLOSE (this is the assertion F3 was
+# missing — before the fix, this case was an unconditional exit 0 forever).
+PATH="$TMP/gh-404:$PATH" bash "$B8ALIVE" --repo o/r --base HEAD >"$TMP/b8b.out" 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q 'ALREADY ON' "$TMP/b8b.out" \
+  && ok "B8b: a 404 for a workflow the BASE already carries REFUSES (rc 2) — a workflow that never registered cannot ride the bootstrap window forever" \
+  || bad "B8b: a landed-but-unregistered workflow produced rc=$rc: $(head -2 "$TMP/b8b.out")"
+
+# B8c — THE BASE ITSELF DOES NOT RESOLVE: the question cannot be asked, and an unanswerable question is
+# a refusal, never a fresh-looking pass (a silent fallback would answer about a different ref).
+PATH="$TMP/gh-404:$PATH" bash "$B8ALIVE" --repo o/r --base definitely-not-a-ref >"$TMP/b8c.out" 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q 'Pass --base' "$TMP/b8c.out" \
+  && ok "B8c: an unresolvable --base REFUSES (rc 2) instead of falling back to a different ref" \
+  || bad "B8c: an unresolvable base produced rc=$rc: $(head -2 "$TMP/b8c.out")"
+
+PATH="$TMP/gh-404:$PATH" bash "$B8ALIVE" --repo o/r --workflow definitely-absent-workflow.yml >"$TMP/b9.out" 2>&1; rc=$?
 [ "$rc" = 2 ] && grep -q 'NOT present in this tree' "$TMP/b9.out" \
   && ok "B9: a workflow that is in NEITHER the repository NOR the tree REFUSES (a deleted workflow cannot ride the bootstrap window)" \
   || bad "B9: an absent workflow produced rc=$rc"
 
-# ── C1..C6. THE WIRING, READ FROM THE FILES THAT RUN IT ─────────────────────────────────────────
-# ⛔ THESE ARE DERIVED TEXT ASSERTIONS, AND THEY ARE THE POINT: a suite that stopped running, or a lane
-# that dropped the scope switch, cannot be caught by any arm of the suite itself.
+# ── C1..C7. THE WIRING, READ FROM THE PARSED FILES THAT RUN IT ─────────────────────────────────
+# ⛔ PARSED NODES, NOT TEXT (#4210 review P2 — MEASURED, not argued). These arms used to `grep -q` the
+# YAML SOURCE, and a substring cannot tell a live step from prose: deleting the diff half's `run:` line
+# left C2 GREEN on the comment that names it (ci.yml:2002), and commenting out the scope env left C1
+# green while the bounded lane went back to the 2356 s tree scan. So the arms now read the STRUCTURE
+# with `scripts/workflow-yaml.mjs` — the same parser the lane-parity guards use — and assert that a
+# step's `run` COMMAND is the script, and that a step's parsed `env.PORTABILITY_TREE_SCAN` is exactly
+# "0". Each arm is paired with the mutant that reverts it (Cn-b), and the mutant KEEPS the script's
+# name in the text on purpose: a text grep still matches while the step is dead, which is precisely the
+# assertion being replaced.
 CI_PRLANE="$REPO_ROOT/.github/workflows/ci.yml"
 CI_MAIN="$REPO_ROOT/.github/workflows/ci-main.yml"
 BATCH="$REPO_ROOT/.github/workflows/portability-tree-scan.yml"
 
-# C1 — both bounded lanes switch the whole-tree arm OFF on the shard step.
+WF_YAML_MODULE="$REPO_ROOT/scripts/workflow-yaml.mjs"
+export WF_YAML_MODULE
+WF_PROBE="$TMP/wfprobe.mjs"
+cat >"$WF_PROBE" <<'PROBE'
+import { readFileSync } from "node:fs";
+const { parseWorkflowYaml } = await import(process.env.WF_YAML_MODULE);
+const [cmd, file, ...rest] = process.argv.slice(2);
+let doc;
+try { doc = parseWorkflowYaml(readFileSync(file, "utf8")); }
+catch (e) { console.error("parse error: " + e.message); process.exit(3); }
+const steps = [];
+for (const job of Object.values(doc?.jobs ?? {})) if (Array.isArray(job?.steps)) steps.push(...job.steps);
+if (!steps.length) { console.error("no steps parsed"); process.exit(3); }
+const cmds = (run) => String(run ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+const invokes = (line, script) => {
+  const t = line.split(/\s+/);
+  if (t[0] !== "bash" && t[0] !== "sh") return false;
+  const p = t[1] ?? "";
+  return p === script || p.endsWith("/" + script);
+};
+if (cmd === "step-run") {
+  const [script, token] = rest;
+  process.exit(steps.some((s) => cmds(s.run).some((l) => invokes(l, script) && (!token || l.includes(token)))) ? 0 : 1);
+}
+if (cmd === "step-env") {
+  const [script, key, value] = rest;
+  process.exit(steps.some((s) => cmds(s.run).some((l) => invokes(l, script)) && String(s.env?.[key] ?? "") === value) ? 0 : 1);
+}
+if (cmd === "scheduled") process.exit(Object.prototype.hasOwnProperty.call(doc?.on ?? {}, "schedule") ? 0 : 1);
+process.exit(2);
+PROBE
+wf() {  # wf <step-run|step-env|scheduled> ... — 0 = asserted, 1 = false, 3 = could not answer
+  command -v node >/dev/null 2>&1 || { echo "node is not installed" >"$TMP/wf.err"; return 3; }
+  node "$WF_PROBE" "$@" 2>"$TMP/wf.err"
+}
+
+# C1 — both bounded lanes switch the whole-tree arm OFF on the shard step, IN THE PARSED ENV.
 for f in "$CI_PRLANE" "$CI_MAIN"; do
   b="$(basename "$f")"
-  if grep -q 'PORTABILITY_TREE_SCAN: "0"' "$f"; then
-    ok "C1: $b runs the shard step with PORTABILITY_TREE_SCAN=0 (the whole-tree arm is off the bounded lane)"
+  if wf step-env "$f" run-bash-shards.sh PORTABILITY_TREE_SCAN 0; then
+    ok "C1: $b runs the shard step with PORTABILITY_TREE_SCAN=0 (parsed step env — the whole-tree arm is off the bounded lane)"
   else
-    bad "C1: $b does NOT switch the whole-tree arm off — the bounded lane still pays the tree scan"
+    bad "C1: $b does not switch the whole-tree arm off on the shard step (rc=$?; parsed env, so a commented-out key does not count): $(head -1 "$TMP/wf.err")"
   fi
 done
 
 # C2 — both bounded lanes RUN the diff half (the assertion has to still bite).
 for f in "$CI_PRLANE" "$CI_MAIN"; do
   b="$(basename "$f")"
-  if grep -q 'check-portability-traps-changed.sh' "$f"; then
-    ok "C2: $b runs check-portability-traps-changed.sh (the required lane scans the DIFF)"
+  if wf step-run "$f" check-portability-traps-changed.sh; then
+    ok "C2: $b runs check-portability-traps-changed.sh (parsed run command — the required lane scans the DIFF)"
   else
-    bad "C2: $b never runs the diff half — the scope split removed the assertion from this lane"
+    bad "C2: $b never runs the diff half as a step command (rc=$?; a mention in a comment is not a step): $(head -1 "$TMP/wf.err")"
   fi
 done
 
-# C3 — both bounded lanes ask the freshness question (the moved half cannot go quiet).
+# C3 — both bounded lanes ask the freshness question (the moved half cannot go quiet), AND pass the
+# `--base` its 404 branch needs to tell a landing workflow from one that never registered (#4210 P2).
 for f in "$CI_PRLANE" "$CI_MAIN"; do
   b="$(basename "$f")"
-  if grep -q 'check-portability-tree-scan-alive.sh' "$f"; then
-    ok "C3: $b asks whether the whole-tree scan is alive (staleness is a failure in the bounded lane)"
+  if wf step-run "$f" check-portability-tree-scan-alive.sh --base; then
+    ok "C3: $b asks whether the whole-tree scan is alive, with the --base that bounds its 404 bootstrap window"
   else
-    bad "C3: $b does not ask the freshness question — a dead batch job would be an absence nobody reads"
+    bad "C3: $b does not run the freshness question with --base (rc=$?; a dead batch job would ride an unbounded 404 window): $(head -1 "$TMP/wf.err")"
   fi
 done
 
-# C4 — the batch workflow exists, is scheduled, and runs the TREE scope with the arm ENABLED.
-# ⛔ THE TREE SCOPE IS ASSERTED BY THE DETECTOR'S OWN `--root`, NOT BY A SECOND COPY OF F4: the batch
-# job runs that command and parses its findings for the issue body, then runs the suite with the tree
-# arm OFF (the arm's content is step 1). So the wiring assertion is "scheduled AND --root AND the arms
-# run in the bounded-lane mode" — a batch job that ran only the arms would scan no tree at all.
-if [ -f "$BATCH" ] && grep -q '^  schedule:' "$BATCH" && grep -q -- '--root' "$BATCH" \
-   && grep -q 'PORTABILITY_TREE_SCAN: "0"' "$BATCH" \
-   && grep -q 'check-portability-traps.test.sh' "$BATCH"; then
-  ok "C4: portability-tree-scan.yml is SCHEDULED, runs the tree scope with --root, and runs the arms in the bounded-lane mode"
+# C4 — the batch workflow exists, is scheduled, and runs the TREE scope with the arm DISABLED for the
+# arms step. Read from the parsed document, so an unscheduled-but-mentioned workflow cannot pass.
+if [ -f "$BATCH" ] && wf scheduled "$BATCH" \
+   && wf step-run "$BATCH" check-portability-traps.sh --root \
+   && wf step-env "$BATCH" check-portability-traps.test.sh PORTABILITY_TREE_SCAN 0 \
+   && wf step-run "$BATCH" check-portability-traps.test.sh; then
+  ok "C4: portability-tree-scan.yml is SCHEDULED, runs the tree scope with --root, and runs the arms in the bounded-lane mode (parsed)"
 else
-  bad "C4: the batch lane is missing, unscheduled, scans no tree, or never runs the arms"
+  bad "C4: the batch lane is missing, unscheduled, scans no tree, or never runs the arms (parsed; rc=$?): $(head -1 "$TMP/wf.err")"
+fi
+
+# C1b/C2b/C3b — THE MUTANTS. Each is the edit the review MEASURED staying green under the text arms.
+# The arm passes only when the parsed assertion REDS while the raw-text grep still matches: that is
+# what makes it a test of the wiring rather than of the prose.
+sed 's|^\( *\)PORTABILITY_TREE_SCAN: "0"$|\1# MUTANT: PORTABILITY_TREE_SCAN: "0"|' "$CI_PRLANE" >"$TMP/mut-c1.yml"
+sed 's|^\( *\)run: bash scripts/check-portability-traps-changed.sh$|\1run: ": no-op bash scripts/check-portability-traps-changed.sh"|' "$CI_PRLANE" >"$TMP/mut-c2.yml"
+sed 's|^\( *\)run: bash scripts/check-portability-tree-scan-alive.sh --base origin/main$|\1run: ": no-op bash scripts/check-portability-tree-scan-alive.sh --base origin/main"|' "$CI_PRLANE" >"$TMP/mut-c3.yml"
+if grep -q 'PORTABILITY_TREE_SCAN: "0"' "$TMP/mut-c1.yml" && ! wf step-env "$TMP/mut-c1.yml" run-bash-shards.sh PORTABILITY_TREE_SCAN 0; then
+  ok "C1b: commenting out the scope env (the text survives) still REDS C1 — the arm reads the parsed env, not the string"
+else
+  bad "C1b: C1 stayed green with the scope env commented out — the arm is still a substring test"
+fi
+if grep -q 'check-portability-traps-changed.sh' "$TMP/mut-c2.yml" && ! wf step-run "$TMP/mut-c2.yml" check-portability-traps-changed.sh; then
+  ok "C2b: replacing the diff step's command with a no-op that still NAMES the script REDS C2 — a mention is not a step"
+else
+  bad "C2b: C2 stayed green with the diff step's command removed — the arm is still a substring test"
+fi
+if grep -q 'check-portability-tree-scan-alive.sh' "$TMP/mut-c3.yml" && ! wf step-run "$TMP/mut-c3.yml" check-portability-tree-scan-alive.sh; then
+  ok "C3b: replacing the freshness step's command with a no-op that still NAMES the script REDS C3"
+else
+  bad "C3b: C3 stayed green with the freshness step's command removed — the arm is still a substring test"
 fi
 
 # C5 — a batch failure FILES AN ISSUE (a red nobody visits is not a report), and reuses ONE open one.
@@ -397,6 +499,29 @@ if grep -q 'F4/F5=RUN' <<<"$run_out" && grep -q 'F4/F5=SKIP' <<<"$skip_out"; the
   ok "C6b: the scope decision is INVERTIBLE and printed for both values (RUN when enabled, SKIP when not)"
 else
   bad "C6b: the scope decision did not follow PORTABILITY_TREE_SCAN (run='$run_out' skip='$skip_out')"
+fi
+
+# C7 — THE BATCH LANE'S ISSUE TITLE PARSES WHAT THE DETECTOR ACTUALLY EMITS (#4210 review P2).
+# `scan-out/findings.txt` is the detector's STDOUT, and `hit()` writes `path<TAB>line<TAB>rule<TAB>
+# replacement` (check-portability-traps.sh:1729). The title parser used `-F:` / `-F': '`, so a row whose
+# REPLACEMENT contains a colon — the shipped `date-d-gnu` row does — produced a title carrying tabs and
+# a row fragment, and a row without `": "` rendered `unknown` for a file and rule that are right there
+# in columns 1 and 3. This arm RUNS the two programs the workflow ships (extracted from the workflow
+# itself, so there is no second copy to drift) against a row in the emitted format, and then runs the
+# PRE-FIX programs on the same row to prove the arm can tell the two apart.
+title_line="$(grep -F 'first_file=' "$BATCH" | head -1)"
+rule_line="$(grep -F 'first_rule=' "$BATCH" | head -1)"
+sep="$(printf '%s' "$title_line" | cut -d"'" -f2)"
+file_prog="$(printf '%s' "$title_line" | cut -d"'" -f4)"
+rule_prog="$(printf '%s' "$rule_line" | cut -d"'" -f4)"
+printf 'scripts/foo.sh\t142\tdate-d-gnu\tBSD: `date -r <epoch>`; portable: box_epoch_to_iso\n' >"$TMP/findings-row.txt"
+got_file="$(awk -F"$sep" "$file_prog" "$TMP/findings-row.txt" 2>/dev/null)"
+got_rule="$(awk -F"$sep" "$rule_prog" "$TMP/findings-row.txt" 2>/dev/null)"
+bad_file="$(awk -F: 'NF>=2 { print $1; exit }' "$TMP/findings-row.txt" 2>/dev/null)"
+if [ "$got_file" = "scripts/foo.sh" ] && [ "$got_rule" = "date-d-gnu" ] && [ "$bad_file" != "scripts/foo.sh" ]; then
+  ok "C7: the batch issue title reads the detector's TAB row — file and rule are column-accurate, and a colon inside the REPLACEMENT cannot split the row"
+else
+  bad "C7: the batch title parser does not read the emitted format (file='$got_file' rule='$got_rule', pre-fix file='$bad_file'; want 'scripts/foo.sh' / 'date-d-gnu')"
 fi
 
 printf '\nportability-scope.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$OS"
