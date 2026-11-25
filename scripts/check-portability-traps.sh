@@ -1737,8 +1737,7 @@ function hit(rule, is_hit, replacement,   f, l, i) {
 # that is legal — stated here because it looks like a bug and is not.
 
 scan() {
-  local list
-  list="$(targets)" || exit 2
+  local list="$TARGET_LIST"
   [ -n "$list" ] || { echo "❌ the target set is EMPTY — refusing to report a CLEAN over zero files" >&2; exit 2; }
   ( cd "$ROOT" || exit 2
     # A file that vanished between listing and reading is a refusal, not a skip: silently scanning a
@@ -1753,13 +1752,19 @@ scan() {
     done )
 }
 
+# ⛔ THE TARGET SET IS DERIVED ONCE, AND THE SAME SET IS THE SCOPE OF THE COMPARISON (agent-infra#4210).
+# Deriving it twice let the scan and the ratchet disagree; more importantly, a SCOPED run (`--targets`)
+# must not report the baseline rows of files it never read as "SHRUNK" — every unscanned row would fall
+# to 0 by construction, printing a wall of "CONFIRM each was FIXED" for rows that were merely never
+# opened, which trains a reader to ignore the one notice that detects a real scan loss.
+TARGET_LIST="$(targets)" || exit 2
+[ -n "$TARGET_LIST" ] || { echo "❌ the target set is EMPTY — refusing to report a CLEAN over zero files" >&2; exit 2; }
+
 if [ "$MODE" = "print-targets" ]; then
   # ⛔ AN EMPTY SCAN SET IS A REFUSAL, NEVER A CLEAN LIST: a caller that intersects a diff with an
   # empty set concludes "nothing to scan" and goes green — the false-CLEAN shape this file refuses
   # everywhere else, reached through its own published set.
-  targets_list="$(targets)" || exit 2
-  [ -n "$targets_list" ] || { echo "❌ the target set is EMPTY — refusing to publish an empty scan set" >&2; exit 2; }
-  printf '%s\n' "$targets_list"
+  printf '%s\n' "$TARGET_LIST"
   exit 0
 fi
 
@@ -1877,8 +1882,14 @@ fi
 # row — i.e. the gate REDS on every grandfathered finding on the one host whose traps it exists for,
 # and the `just` column silently became empty (a justification-less baseline). `split(line, F, "\t")`
 # inside awk is portable, so the whole join is done there instead.
-join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" '
+join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" -v scope_flat="${TARGET_LIST//$'\n'/$'\034'}" '
       BEGIN {
+        # ⛔ THE SCAN SCOPE IS TRANSPORTED FLATTENED, never with literal newlines in a `-v` value:
+        # one-true-awk refuses those (see the rule-table transport note). Rows whose FILE this run
+        # never opened are OUT OF SCOPE, not SHRUNK — a scoped run is not evidence about an unscanned
+        # file, and reporting it as a fall is the notice that would stop detecting a real scan loss.
+        nscan = split(scope_flat, S, "\034")
+        for (i = 1; i <= nscan; i++) scanned[S[i]] = 1
         ln = 0
         while ((getline line < basefile) > 0) {
           ln++
@@ -1919,12 +1930,16 @@ join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" '
           }
         }
         for (k in base) {
-          if (!(k in live) || live[k] + 0 < base[k] + 0) {
-            split(k, parts, SUBSEP)
+          split(k, parts, SUBSEP)
+          # ⛔ `inscope` GUARDS BOTH DIAGNOSTICS: a missing justification in an unscanned file is not
+          # this run finding either — the full-tree lane still checks the whole baseline.
+          # (No apostrophes in this awk body: it is inside a SINGLE-QUOTED shell string, and one
+          # apostrophe terminates the program exactly as it did in the heredoc that cost #2828/#2930.)
+          inscope = (parts[1] in scanned)
+          if (inscope && (!(k in live) || live[k] + 0 < base[k] + 0)) {
             printf "SHRUNK\t%s\t%s\t%d\t%d\n", parts[1], parts[2], base[k], (k in live ? live[k] : 0)
           }
-          if (justs[k] ~ /^[ \t]*$/ || justs[k] == "") {
-            split(k, parts, SUBSEP)
+          if (inscope && (justs[k] ~ /^[ \t]*$/ || justs[k] == "")) {
             printf "NOJUST\t%s\t%s\t0\t0\n", parts[1], parts[2]
           }
         }
@@ -1965,5 +1980,12 @@ if [ "$new_total" != "0" ]; then
 fi
 
 grand="$(printf '%s\n' "$counts" | awk -F'\t' 'NF>=3 { s += $3 } END { print s + 0 }')"
-echo "✅ no NEW cross-platform traps (${grand} grandfathered across $(printf '%s' "$counts" | awk -F'\t' 'NF>=3' | wc -l | tr -d ' ') file/rule pairs)" >&2
+# ⛔ A SCOPED RUN SAYS IT IS SCOPED, in the verdict line a CI log keeps. "0 new traps" from a scan of
+# four changed files and from a scan of the whole tree are different claims, and a log that cannot
+# tell them apart makes the cheap lane look like the expensive one.
+if [ -n "$TARGETS" ]; then
+  echo "✅ no NEW cross-platform traps (${grand} grandfathered across $(printf '%s' "$counts" | awk -F'\t' 'NF>=3' | wc -l | tr -d ' ') file/rule pairs; SCOPED to the target list — the tree-wide verdict is the batch lane's, #4210)" >&2
+else
+  echo "✅ no NEW cross-platform traps (${grand} grandfathered across $(printf '%s' "$counts" | awk -F'\t' 'NF>=3' | wc -l | tr -d ' ') file/rule pairs)" >&2
+fi
 exit 0

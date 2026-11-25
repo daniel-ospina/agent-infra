@@ -1527,6 +1527,39 @@ run_check "$E" --baseline "$TMP/base-nojust.tsv"
   || bad "E4: a justification-less baseline entry was accepted"
 
 
+# ── E20..E22: A SCOPED SCAN IS NOT EVIDENCE ABOUT A FILE IT NEVER OPENED (#4210) ─────────────
+# ⛔ THE DEFECT THESE PIN, AND IT IS A MISREADING GENERATOR. `--targets` restricts the scan to named
+# files, but the ratchet compared against the WHOLE baseline — so every row belonging to an unscanned
+# file fell to 0 and printed as `SHRANK … CONFIRM each was FIXED and not merely UNSCANNED`. On the
+# changed-files lane that is EVERY unscanned row, on EVERY run (measured: 85 rows on the first run of
+# `check-portability-traps-changed.sh`), i.e. a notice whose whole purpose is to detect a real scan
+# loss arriving buried in rows that were merely never read — which teaches a reader to skip it.
+# E20 scoped: only the SCANNED file may be reported. E21 control: with the file in scope the notice IS
+# reported, so E20 cannot pass by suppressing the notice altogether. E22: the verdict SAYS it is
+# scoped, because "0 new traps" over four changed files and over the whole tree are different claims.
+mkdir -p "$TMP/tree/scope"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/scope/in.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/scope/out.sh"
+printf 'scope/in.sh\tcpu-count-single-mechanism\t3\t#4210 arm: both files hold ONE live trap, the baseline claims THREE\n' >"$TMP/base-scope.tsv"
+printf 'scope/out.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this row is OUT of scope for the scoped run below\n' >>"$TMP/base-scope.tsv"
+printf 'scope/in.sh\n' >"$TMP/scope-in-only"
+printf 'scope/in.sh\nscope/out.sh\n' >"$TMP/scope-both"
+run_check "$TMP/scope-in-only" --baseline "$TMP/base-scope.tsv"
+if [ "$?" = 0 ] && grep -q 'scope/in.sh' "$ERR" && ! grep -q 'scope/out.sh' "$ERR"; then
+  ok "E20: a SCOPED scan reports the scanned file fall and says NOTHING about an unscanned file (the notice keeps its meaning)"
+else
+  bad "E20: a scoped scan reported an unscanned baseline row as SHRANK (or reported nothing at all) — every scoped run would arrive buried in rows it never read"
+fi
+run_check "$TMP/scope-both" --baseline "$TMP/base-scope.tsv"
+if [ "$?" = 0 ] && grep -q 'scope/in.sh' "$ERR" && grep -q 'scope/out.sh' "$ERR"; then
+  ok "E21: the SAME two rows ARE both reported when both files are scanned — the scope filter is not a blanket suppression"
+else
+  bad "E21: with both files in scope a fall was NOT reported — the scope filter suppresses real notices"
+fi
+grep -q 'SCOPED to the target list' "$ERR" \
+  && ok "E22: a scoped verdict SAYS it is scoped — 'no new traps' over a diff and over the tree are different claims" \
+  || bad "E22: the scoped verdict is indistinguishable from a whole-tree one"
+
 # ── E8..E10: `--emit-baseline` IS A DOCUMENTED REGENERATION PATH, SO IT IS A GATE SURFACE ────────
 # ⛔ THE DEFECT THESE PIN (review cycle-18 P1). The rule table reached awk as `-v rules="$RULES"` with
 # LITERAL NEWLINES in it; one-true-awk — macOS, the host this class exists for — refuses that, the
