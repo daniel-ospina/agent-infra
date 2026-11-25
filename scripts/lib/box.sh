@@ -122,14 +122,25 @@ box_epoch_to_iso() {
 # private `date` call: BSD parses with `-j -f <fmt>`, GNU with `-d <string>`.
 box_iso_to_epoch() {
   local s="${1:-}" v=""
+  # GitHub renders `…:SSZ`; a fractional part or a `+00:00` offset is normalised here so a caller
+  # never depends on that rendering staying put.
+  # ⛔ ORDER IS LOAD-BEARING: normalisation runs BEFORE the shape gate below, because the gate's
+  # pattern requires a trailing `Z`, so a `…+00:00` timestamp can never reach the normalisation that
+  # turns it into one — the arm becomes unreachable and the ONLY thing left doing the work is the
+  # refusal, which reads as `box_iso_to_epoch` not understanding a value it documents support for
+  # (measured: `…T04:10:30+00:00` returned rc 1 while `…T04:10:30Z` returned the epoch). Normalising
+  # first preserves the gate's guarantee, because neither case below runs `date` or validates
+  # anything; it only rewrites the SUFFIX, and a non-ISO value still fails the gate afterwards.
+  case "$s" in *+00:00) s="${s%+00:00}Z" ;; esac
+  case "$s" in *.*Z) s="${s%%.*}Z" ;; esac
   # ⛔ THE SHAPE IS CHECKED BEFORE ANY `date` RUNS: a value that is not an ISO-8601 UTC instant must
   # be a REFUSAL, because `date -d ""` prints midnight today and `date -j -f` on a partial string
   # prints THIS year's value — both would turn an unreadable timestamp into a confident age.
+  # STATED LIMIT: only a ZERO offset is normalised. A non-zero offset (`…-05:00`) is REFUSED rather
+  # than shifted — a silent shift is a mis-aged timestamp that no caller can detect, so the
+  # fail-closed direction is the refusal, and `box.test.sh` pins it as a limit rather than leaving it
+  # an accident of the pattern above.
   case "$s" in ????-??-??T*Z) ;; *) return 1 ;; esac
-  # GitHub renders `…:SSZ`; a fractional part or a `+00:00` offset is normalised here so a caller
-  # never depends on that rendering staying put.
-  case "$s" in *+00:00) s="${s%+00:00}Z" ;; esac
-  case "$s" in *.*Z) s="${s%%.*}Z" ;; esac
   case "$(box_os)" in
     linux)
       if v="$(date -u -d "$s" +%s 2>/dev/null)"; then BOX_DATE_MECH="date-d-parse"; fi  # portability-ok: OS-GUARDED — this arm runs only inside `case "$(box_os)" in linux)`; macOS takes the `date -j -f` arm below

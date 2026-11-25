@@ -80,6 +80,13 @@ box_iso_to_epoch "2026-11-25" >/dev/null 2>&1 && bad "iso_to_epoch: a DATE witho
 [ "$(box_iso_to_epoch '2026-11-25T04:10:30Z')" = "$(box_iso_to_epoch '2026-11-25T04:10:30+00:00')" ] \
   && ok "iso_to_epoch: a +00:00 offset is normalised to the same instant as Z" \
   || bad "iso_to_epoch: '+00:00' and 'Z' disagreed — an offset rendering would shift the age"
+# ⛔ THE STATED LIMIT, PINNED: only a ZERO offset is normalised. A non-zero offset is REFUSED, not
+# silently shifted — a shift is a mis-aged timestamp no caller can detect, so the fail-closed
+# direction is the refusal. Without this arm the limit is an accident of the pattern above: a later
+# widening of the normalisation would start accepting `-05:00` and nothing would say so.
+box_iso_to_epoch '2026-11-25T04:10:30-05:00' >/dev/null 2>&1 \
+  && bad "iso_to_epoch: a NON-ZERO offset parsed (it must refuse — a silent shift mis-ages an age)" \
+  || ok "iso_to_epoch: a non-zero offset is refused, not silently shifted"
 
 # ── sed -i: it rewrites, and the GNU spelling's BSD hazard is live.
 printf 'alpha\n' > "$f"
