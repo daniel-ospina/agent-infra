@@ -113,7 +113,11 @@ run_block() {
     fi
     # The token seams, stubbed so arm 2 can see whether the block WROTE one and where. Arm E exercises
     # the real ones; these two must therefore mirror the real signatures, not an invented one.
-    claim_branch_token_path() { printf '%s/branchclaim-%s' "${2:-/nodir}" "$1"; }
+    # ⛔ MIRRORS THE REAL SHAPE, NOT A CONVENIENT ONE (cycle-2 review F5): `claim_branch_token_path`
+    # prints `<gitdir>/branchclaim-<claim_branch_key>` — ONE path segment, `<gitdir>/branchclaim-branch-fix-e2e`
+    # (arm E prints exactly that). The first stub printed `<dir>/branchclaim-fix/3696-...`, a DIRECTORY
+    # plus a file that the library can never produce, so arm 2 pinned a shape that survived a format change.
+    claim_branch_token_path() { printf '%s/branchclaim-branch-%s' "${2:-/nodir}" "$(printf '%s' "$1" | sed -e 's#[^A-Za-z0-9._-]#-#g' -e 's#--*#-#g')"; }
     claim_branch_record() {
       mkdir -p "$(dirname -- "${1:?}")" 2>/dev/null || return 1
       printf '%s\n%s\n' "${2-}" "${3-}" > "$1" || return 1
@@ -159,12 +163,21 @@ grep -qx 'deadbeefcafebabe' "$T/run/branchown"
 ck "2) BRANCH_OWN carries the claim commit ($(cat "$T/run/branchown")) — the EXIT trap can release it" $?
 # ⛔ THE P0 ARM (see arm E for the measured end-to-end form): without this file the guard refuses the
 # fixer's OWN push as held-by-live, because it decides by POSSESSION.
-[ -s "$T/run/wt/branchclaim-fix/3696-claims-block-push" ] || [ -s "$T/run/gitdir/branchclaim-fix/3696-claims-block-push" ] || true
-[ -s "$T/run/gitdir/branchclaim-fix/3696-claims-block-push" ]
-ck "2) the FENCING TOKEN is written into the worktree's git dir ($(cat "$T/run/token"))" "$?"
-grep -qx 'deadbeefcafebabe' "$T/run/gitdir/branchclaim-fix/3696-claims-block-push" 2>/dev/null || \
-  sed -n 2p "$T/run/gitdir/branchclaim-fix/3696-claims-block-push" 2>/dev/null | grep -qx 'deadbeefcafebabe'
-ck "2) and it names the claim commit (line 2 is the fence)" $?
+# ⛔ THE STATUS IS CAPTURED BEFORE THE MESSAGE IS BUILT (cycle-2 review F1, MEASURED FALSE PASS). The
+# first version passed a bare `$?` as `ck`'s second argument while its MESSAGE ran `$(cat …)`, so `ck`
+# received cat's status (always 0, the record always exists) and the arm printed a green ✅ with an EMPTY
+# `()` while the token had never been written: deleting the whole token-write block left this arm green
+# and only 7 others red. A test whose headline clause cannot fail is the same class as the gate this PR
+# is fixing. Capture first, print second.
+_TOK="$T/run/gitdir/branchclaim-branch-fix-3696-claims-block-push"
+[ -s "$_TOK" ]; _tok_rc=$?
+if [ "$_tok_rc" -eq 0 ]; then
+  ok "2) the FENCING TOKEN is written into the worktree's git dir ($_TOK)"
+else
+  bad "2) NO fencing token at $_TOK — the guard would refuse this lane's own push as held-by-live"
+fi
+sed -n 2p "$_TOK" 2>/dev/null | grep -qx 'deadbeefcafebabe'; _tok2_rc=$?
+ck "2) and it names the claim commit (line 2 is the fence)" "$_tok2_rc"
 grep -qF 'fencing token written for worktree' "$T/run/o/logs/fix-3696.log"
 ck "2) the log records that the token was written" $?
 grep -qF 'single-owner branch claim: acquired' "$T/run/o/logs/fix-3696.log"
@@ -289,6 +302,36 @@ ck "E) CONTROL: a stray lane with no token IS refused on that branch" "$([ $? -n
 grep -q 'held-by-live' "$E/stray.err" 2>/dev/null
 ck "E) ...with reason=held-by-live, naming the holder" $?
 
+# E2. THE TOKEN GOES TO THE **WORKTREE'S** GIT DIR, NOT THE REPO'S — a pin, because the mistake is silent
+# ⛔ REVIEW CYCLE 2 MEASURED THIS UNPINNED: patching `-C "$WT"` to `-C "$REPO"` — exactly what the block's
+# own comment forbids — left all 43 arms green. Arm E could not see it (that fixture is a single checkout,
+# where REPO==WT and the two git dirs are the same), and arm 2's `git()` stub prints one constant
+# regardless of its arguments. A linked worktree is the posture that ships (`fix-one.sh` materialises one)
+# and the one where the two differ: `<repo>/.git` vs `<repo>/.git/worktrees/<name>`.
+E2ROOT="$T/e2e2"; E2WT="$E2ROOT/wt"
+mkdir -p "$E2ROOT"
+( cd "$E/lane" && git worktree add -q "$E2WT" -b fix/e2e2 2>/dev/null ) \
+  || bad "E2) fixture: cannot create the linked worktree"
+(
+  set -u
+  O="$E2ROOT/o"; L="$E2ROOT/o/logs/fix-2"; PR=2
+  REPO="$E/lane"; BR=fix/e2e2; HEAD="$(git -C "$E2WT" rev-parse HEAD)"; WT="$E2WT"
+  BRANCH_OWN=""; BRANCH_TOKEN=""
+  mkdir -p "$O/state" "$O/logs"; : > "$L"
+  CLAIM_REPO="$E/lane"
+  . "$HERE/claims.sh" || exit 3
+  . "$T/branchclaim.sh" || exit 4
+  printf '%s\n' "${BRANCH_TOKEN-}" > "$E2ROOT/token"
+) >/dev/null 2>&1
+E2_GITDIR="$(git -C "$E2WT" rev-parse --absolute-git-dir 2>/dev/null)"
+[ -n "$E2_GITDIR" ] && [ "$E2_GITDIR" != "$(git -C "$E/lane" rev-parse --absolute-git-dir)" ]
+ck "E2) the fixture really has TWO git dirs (wt=$E2_GITDIR)" $?
+[ -s "$E2_GITDIR/branchclaim-branch-fix-e2e2" ]
+ck "E2) the token landed in the WORKTREE's git dir" "$?"
+[ -e "$E/lane/.git/branchclaim-branch-fix-e2e2" ]
+ck "E2) and NOT in the shared repo git dir (which every lane on this box can read)" \
+   "$([ $? -ne 0 ] && echo 0 || echo 1)"
+
 # M. the MUTANT — arm 1 measures the block, not the fixture
 sed 's|: > "\$O/state/fixbail-\$PR-\$HEAD"|:|' "$T/branchclaim.sh" > "$T/branchclaim-mutant.sh"
 if cmp -s "$T/branchclaim.sh" "$T/branchclaim-mutant.sh"; then
@@ -300,13 +343,25 @@ else
      "$([ $? -ne 0 ] && echo 0 || echo 1)"
 fi
 # the token mutant: the P0 arm must be about the write, not about the fixture
-sed 's|BRANCH_TOKEN="\$(claim_branch_record|BRANCH_TOKEN="\$(true #|' "$T/branchclaim.sh" > "$T/branchclaim-notoken.sh"
+# ⛔ THE MUTANT MUST STILL BE A VALID PROGRAM (cycle-2 review F2, VERIFIED). The first defused the call by
+# opening a `#` comment INSIDE the `$( )`, which swallows the closing paren — `bash -n` refuses the file
+# and `run_block` sources it with its output discarded, so the arm proved only that a file which does not
+# parse writes no token. This one replaces the ASSIGNMENT, so the block is still the block minus the write;
+# the parse is asserted FIRST, and it must be mutated at all.
+sed 's|BRANCH_TOKEN="\$(claim_branch_record|BRANCH_TOKEN="\$(\:|' "$T/branchclaim.sh" > "$T/branchclaim-notoken.sh"
 if cmp -s "$T/branchclaim.sh" "$T/branchclaim-notoken.sh"; then
   bad "M) the token mutant is IDENTICAL to the block — the record call was not found to defuse"
 else
+  bash -n "$T/branchclaim-notoken.sh"
+  ck "M) the token mutant is still a VALID program (a syntax-error mutant proves nothing)" $?
+  # ⛔ COMMENTS ARE STRIPPED FIRST: the block's own prose NAMES `claim_branch_record` (it explains why the
+  # token must be written), so a plain grep stays green on a mutant that still calls it — the same
+  # prose-vs-code confusion the repo's other design pins strip comments to avoid.
+  grep -v '^[[:space:]]*#' "$T/branchclaim-notoken.sh" | grep -qF 'claim_branch_record "'
+  ck "M) ...and the record CALL is genuinely gone from it (comments aside)" "$([ $? -ne 0 ] && echo 0 || echo 1)"
   run_block "$T/branchclaim-notoken.sh" 0 'acquired refs/claims/branch-fix-3696-claims-block-push'
-  [ -s "$T/run/gitdir/branchclaim-fix/3696-claims-block-push" ]
-  ck "M) with the token write defused, arm 2's token assertion would be RED — so it measures the write" \
+  [ -s "$T/run/gitdir/branchclaim-branch-fix-3696-claims-block-push" ]
+  ck "M) with the token write defused, arm 2's token assertion IS red — so the P0 arm measures the write" \
      "$([ $? -ne 0 ] && echo 0 || echo 1)"
 fi
 

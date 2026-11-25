@@ -821,11 +821,14 @@ release_branch_claim() { # same 20s bound as release_fix_claim, for the same rea
   w=$!
   wait "$p" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
-  # ⛔ THE TOKEN GOES WHEN THE CLAIM GOES (branch-claim.sh's `cmd_release` does the same): a token left
-  # behind names a claim commit that is no longer the ref's tip, and the fence would then read our own
-  # stale file as a POSsession proof for a claim we no longer hold — the exact `--force-with-lease`
-  # staleness the token exists to prevent.
-  [ -n "${BRANCH_TOKEN:-}" ] && claim_branch_forget "$BRANCH_TOKEN"
+  # ⛔ FORGET THE TOKEN ONLY WHEN THE RELEASE ACTUALLY LANDED (cycle-2 review P2, verified against
+  # `branch-claim.sh`'s `cmd_release`, which forgets only on success). `_claim_release_at` returns 1
+  # WITHOUT deleting the ref when the fenced push fails or the 20 s watchdog TERMs it — the expected
+  # failure this file's own `release_fix_claim` bound documents. On that path the claim is STILL OURS
+  # and the token is the only possession proof, so forgetting it would destroy recovery path (1) in the
+  # lifetime note above (a same-box lane releases with the token) and strand the claim for the full
+  # branch lease with no cooperating remedy left but deleting the ref by hand.
+  [ "$rc" -eq 0 ] && [ -n "${BRANCH_TOKEN:-}" ] && claim_branch_forget "$BRANCH_TOKEN"
   return "$rc"
 }
 trap 'release_prlock; release_fix_claim; release_branch_claim' EXIT
@@ -1189,7 +1192,8 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 - Make the fix at the stated location, and add/adjust tests so they genuinely FAIL on the pre-fix code (prove non-vacuity where you can).
 - Register any new test file in \`config/ci-surfaces.yml\` (correct surface) — verify with \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python tools/ci_selection.py --integrity\`.
 - Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite. Your worktree has its own \`.venv\` — use THAT one. ⛔ Never search the filesystem for an interpreter: no \`find\`/\`rg\`/\`du\` outside this worktree (a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result). If \`.venv\` is genuinely missing here, run \`uv sync --extra embeddings --extra parity\` once.
-- Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git push origin $BR\`.
+- Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git -C "$WT" push origin $BR\`.
+- ⛔ PUSH FROM THE WORKTREE (\`git -C "$WT"\`), NOT FROM THE HARNESS CHECKOUT. The single-owner branch guard proves ownership by a per-CHECKOUT fencing token, written into the git dir of the checkout this lane will push from; a linked worktree has its own git dir, so a push issued from anywhere else is refused as \`held-by-live\` — by this lane's OWN claim (agent-infra#3696 cycle-2 review, measured). The token is deliberately NOT copied into the shared checkout's git dir, because that would let every lane on this box push this branch, which is the hazard \`branch-claim.sh\`'s header records.
 - Do NOT merge. Do NOT amend already-pushed commits — add a new commit.
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
