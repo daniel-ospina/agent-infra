@@ -12,8 +12,11 @@
 #
 #   A. `check-portability-traps-changed.sh` — the diff half. A trap added in a changed file REDS; a
 #      change with no trap passes; a change touching nothing in the scan set says so BY NAME; an
-#      unanswerable diff REFUSES (rc 2) instead of reading as "nothing changed"; the scan set comes
-#      from the detector's own derivation, not from a second `*.sh` guess.
+#      unanswerable diff REFUSES (rc 2) instead of reading as "nothing changed" — and EVERY refusal
+#      site is driven by its own arm (unresolvable base, failed `git diff`, unpublishable scan set,
+#      empty published set, and the detector's own refusal at the scan), because a site with no arm is
+#      a guard whose deletion nothing reds; the scan set comes from the detector's own derivation, not
+#      from a second `*.sh` guess.
 #   B. `check-portability-tree-scan-alive.sh` — the tree half CANNOT GO QUIET. A fresh success
 #      passes, a stale one fails, a workflow that has NEVER succeeded fails once its registration is
 #      older than the bound (the bootstrap window is the one narrow exception, and it is reported),
@@ -164,6 +167,66 @@ cp "$SCOPE" "$TMP/broken/check-portability-traps-changed.sh"
 bash "$TMP/broken/check-portability-traps-changed.sh" --root "$FIX" --base HEAD~1 >"$TMP/a6.out" 2>&1; rc=$?
 [ "$rc" = 2 ] && ok "A6: a detector REFUSAL (rc 2) propagates as a refusal, never as a pass" \
   || bad "A6: a refusing detector produced rc=$rc — a gate that cannot run must not read as green"
+
+# A6a..A6c — THE WRAPPER'S OTHER TWO REFUSAL SITES, EACH DRIVEN BY ITS OWN STUB (review P2, measured).
+# ⛔ WHY THESE EXIST: the F2 fix above replaced A6's original stub (which refused EVERY invocation)
+# rather than duplicating it, so the site that stub happened to reach — the `--print-targets` guard —
+# lost its only invocation, and the EMPTY-set guard and the failed-`git diff` guard never had one. The
+# three guards mask each other pairwise today, so a single deleted handler still refuses via its
+# neighbour: exactly the shape that makes a deletion of two of them silently read as CLEAN, which is
+# the one direction this file exists to refuse. Each arm below drives ONE site and asserts the
+# refusal BY NAME, so a handler that stops naming its reason cannot pass on some other site's rc.
+
+# A6a — THE DETECTOR CANNOT PUBLISH ITS SCAN SET (an empty set would read as 'nothing to scan').
+mkdir -p "$TMP/nopublish"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo "shim: cannot answer --print-targets" >&2' \
+  'exit 3' >"$TMP/nopublish/check-portability-traps.sh"
+chmod +x "$TMP/nopublish/check-portability-traps.sh"
+cp "$SCOPE" "$TMP/nopublish/check-portability-traps-changed.sh"
+bash "$TMP/nopublish/check-portability-traps-changed.sh" --root "$FIX" --base HEAD~1 >"$TMP/a6a.out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q 'could not publish its scan set' "$TMP/a6a.out"; then
+  ok "A6a: a detector that cannot publish its scan set REFUSES BY NAME (rc 2) — not an empty set read as 'nothing to scan'"
+else
+  bad "A6a: an unpublishable scan set produced rc=$rc without naming the refusal: $(head -2 "$TMP/a6a.out")"
+fi
+
+# A6b — THE DETECTOR PUBLISHES AN EMPTY SET: a successfully answered question with no answer in it.
+mkdir -p "$TMP/emptyset"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  "  *' --print-targets '*) exit 0 ;;" \
+  'esac' \
+  'exit 0' >"$TMP/emptyset/check-portability-traps.sh"
+chmod +x "$TMP/emptyset/check-portability-traps.sh"
+cp "$SCOPE" "$TMP/emptyset/check-portability-traps-changed.sh"
+bash "$TMP/emptyset/check-portability-traps-changed.sh" --root "$FIX" --base HEAD~1 >"$TMP/a6b.out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q 'EMPTY scan set' "$TMP/a6b.out"; then
+  ok "A6b: a PUBLISHED BUT EMPTY scan set REFUSES BY NAME (rc 2) — an answered-but-empty set is a refusal, not a clean run"
+else
+  bad "A6b: an empty published set produced rc=$rc without naming the refusal: $(head -2 "$TMP/a6b.out")"
+fi
+
+# A6c — THE BASE RESOLVES, BUT THE DIFF ITSELF FAILS (a corrupt object store, an unmounted volume, a
+# repo readable for `rev-parse` and not for `diff`). 'I could not compute the changed set' must never
+# become 'nothing changed'. A PATH shim answers the base resolution from the real git and fails only
+# at `diff`, so the arm reaches `:88-91` and not the base guard one line above it.
+mkdir -p "$TMP/gitfail"
+real_git="$(command -v git)"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'for a in "$@"; do' \
+  '  if [ "$a" = "diff" ]; then echo "shim: cannot read the object store" >&2; exit 128; fi' \
+  'done' \
+  "exec \"$real_git\" \"\$@\"" >"$TMP/gitfail/git"
+chmod +x "$TMP/gitfail/git"
+PATH="$TMP/gitfail:$PATH" bash "$SCOPE" --root "$FIX" --base HEAD~1 >"$TMP/a6c.out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q 'cannot compute the changed set' "$TMP/a6c.out"; then
+  ok "A6c: a FAILED 'git diff' behind a RESOLVABLE base REFUSES BY NAME (rc 2) — uncomputable is not empty"
+else
+  bad "A6c: a failed diff produced rc=$rc without naming the refusal: $(head -2 "$TMP/a6c.out")"
+fi
 
 # ── B1..B7. THE TREE HALF CANNOT GO QUIET ───────────────────────────────────────────────────────
 # A PATH shim stands in for `gh`: each arm states which reads it answers, and the guard must reach a
