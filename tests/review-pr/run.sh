@@ -4516,8 +4516,6 @@ grep -qF '\[ADVERSARIAL-BOUND\]' "$ROOT/scripts/record-review.sh" 2>/dev/null; c
 grep -qF 'residuals=[[:space:]]*' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…and 'residuals=' is still the field its arm (iii) demands (the recorder still extracts `residuals=[[:space:]]*…`), so the mirror's refusal condition still matches"
 # ══ end §BT ══
 
-# ══ end §BT ══
-
 # ── §BU THE MARKER SUPPLIES AN **ISSUES** VERDICT — AND NEVER A CLEAN ONE (agent-infra#4233) ─────
 # ⛔ WHY THIS SECTION EXISTS. `review-pr.sh` answered `no verdict from the reviewer — re-run` for a run
 # whose reviewer had emitted a COMPLETE, machine-readable verdict — `REVIEW_VERDICT: ISSUES` /
