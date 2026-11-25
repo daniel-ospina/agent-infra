@@ -1315,14 +1315,20 @@ if [ -n "${CROSS_OWN:-}" ]; then
 fi
 # ⛔ THE BRANCH CLAIM IS **NOT** RELEASED HERE, UNLIKE THE HEAD CLAIM ABOVE — DELIBERATELY
 # (agent-infra#3696). The head claim must be dropped because the chain re-claims the head it is about
-# to act on; the branch claim has no such successor, so the right lifetime for it is the WHOLE
-# fix→merge chain, released by the EXIT trap. Two reasons, both measured:
-#   * `merge-one.sh` pushes this same branch when the PR is dirty (a rebase onto main, AGENTS.md).
-#     Dropping the claim before the chain would leave a window in which a peer lane takes
-#     `branch-<slug>` and the merge's own push is then refused as "held by a peer" — a false block we
-#     would have manufactured ourselves, on the path that lands the work.
-#   * While this lane still owns the branch, a peer fixer's `claim_branch_acquire` is REFUSED, which is
-#     precisely the window #3696 measured (lane B pushing on top of an attested head mid-merge).
+# to act on; the branch claim has no successor key, so its right lifetime is the whole lane — fixer AND
+# merge chain — and the EXIT trap is what ends it.
+# ⛔ WHAT THAT IS **NOT** JUSTIFIED BY (a claim this comment used to make, verified FALSE before push):
+# `merge-one.sh` does NOT push this branch. It pushes only CLAIM refs (its `git push` calls are the
+# claim CAS and its release, `--force-with-lease` on `refs/claims/…`), and it resolves a CONFLICTING
+# head by parking it for a fixer, not by rebasing and pushing (`merge-one.sh:1336-1353`). The actor
+# that pushes a dirty PR is the AGENT in a fixer lane, not the merge chain.
+# The real reasons to hold it past the handoff:
+#   * This lane is still the writer for $BR until it exits, and #3696's measured window is exactly a
+#     peer pushing WHILE the harness reviews/lands this head (lane B pushed 2 minutes after lane A's
+#     attestation was recorded). Releasing at the handoff would re-open that window for the whole
+#     audit + rail, and holding it costs nothing because nothing in the chain pushes this branch.
+#   * The fixer's own later `git push` (a conflict-resolution turn) still passes the guard: the
+#     token fence compares the CHECKOUT's claim commit, which is ours, so `held-by-you` allows it.
 # The cost of holding it: if this process dies before its EXIT trap fires, the claim strands for the
 # branch lease (CLAIM_BRANCH_TTL, 4 h) and peer pushes to this branch are refused until then — a
 # FAIL-CLOSED direction, and the refusal names the holder and the remedy (`branch-claim.sh release`).
