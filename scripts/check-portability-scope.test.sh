@@ -569,8 +569,11 @@ printf '%s\n' "gh $*" >>"${GH_CALLS:-/dev/null}"
 case "${GH_FAIL:-}" in
   "$1 $2") echo "shim: gh $1 $2 FAILED (GH_FAIL=$GH_FAIL)" >&2; exit 1 ;;
 esac
+# GH_EXISTING answers the list with ONE open issue, so the UPDATE branch (comment on the existing
+# issue) can be driven as well as the CREATE branch — a failed write is only "unchecked" where no arm
+# reaches it, and the review named `gh issue comment` alongside `issue create` (#4210 review P2).
 case "$1 $2" in
-  "issue list") exit 0 ;;
+  "issue list") [ -n "${GH_EXISTING:-}" ] && printf '%s\n' "$GH_EXISTING"; exit 0 ;;
   "issue create") printf 'https://example.invalid/1\n' ;;
   "label create") : ;;
 esac
@@ -586,7 +589,7 @@ run_report() {  # run_report <report.sh> <dir> [<scan-out src>] — runs the shi
   : >"$dir/summary.md"
   ( cd "$dir" \
       && PATH="$C7DIR/shim:$PATH" GH_CALLS="$dir/gh-calls.txt" GH_FAIL="${GH_FAIL:-}" \
-         DISPATCH_REASON="${DISPATCH_REASON:-}" \
+         GH_EXISTING="${GH_EXISTING:-}" DISPATCH_REASON="${DISPATCH_REASON:-}" \
          GITHUB_SHA=deadbeefcafe GITHUB_SERVER_URL=https://ci.example \
          GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=7 GITHUB_WORKFLOW=portability-tree-scan.yml \
          GITHUB_STEP_SUMMARY="$dir/summary.md" GH_TOKEN=shim \
@@ -812,6 +815,38 @@ if [ "$c5_extracted" = 1 ]; then
   else
     bad "C10: a failed create produced rc=$createfail_rc and the step still described the report as filed: $(tail -2 "$C7DIR/createfail/out.log")"
   fi
+  # C10b — THE UPDATE PATH IS ARMED TOO. The review named `gh issue comment` as well as `gh issue
+  # create`, and C10 drives only the create branch: with an OPEN issue present, a FAILED comment was
+  # still unproven — the step could claim "UPDATED the open issue" for a report it never published,
+  # which is the same false record C10 exists for in the create branch. `GH_EXISTING` makes the shim
+  # answer the list with a number, so this run takes the update branch and the comment fails.
+  commentfail_rc="$(GH_EXISTING=42 GH_FAIL='issue comment' run_report "$SHIP" "$C7DIR/commentfail")"
+  if [ "$commentfail_rc" = 1 ] \
+     && grep -q '^gh issue comment 42 ' "$C7DIR/commentfail/gh-calls.txt" \
+     && grep -q 'the report was NOT filed' "$C7DIR/commentfail/out.log" \
+     && ! grep -q 'UPDATED the open issue' "$C7DIR/commentfail/out.log" \
+     && ! grep -q 'filed/updated an issue' "$C7DIR/commentfail/out.log"; then
+    ok "C10b: a FAILED 'gh issue comment' on the one open issue is reported as NOT filed (rc=$commentfail_rc) — the update path cannot assert a report it did not publish"
+  else
+    bad "C10b: a failed comment (rc=$commentfail_rc; comment called: $(grep -c '^gh issue comment ' "$C7DIR/commentfail/gh-calls.txt" 2>/dev/null)) was described as a published report: $(tail -2 "$C7DIR/commentfail/out.log")"
+  fi
+
+  # C10b-m — NON-VACUITY, IN THE MUTANT DIRECTION: the SAME failing comment, with the comment's exit
+  # code IGNORED, must be reported as an UPDATE. Without this the arm could pass on a step that never
+  # claimed an update for any reason at all, and the deletion this arm exists for would go unseen.
+  MUTC="$C7DIR/report-ignorecomment.sh"
+  sed 's|^\( *\)if gh issue comment "\$existing" --body-file issue-body.md; then|\1if true; then|' "$SHIP" >"$MUTC"
+  if cmp -s "$SHIP" "$MUTC"; then
+    bad "C10b-m: the mutant is BYTE-IDENTICAL to the shipped step — the sed no longer reaches the comment call, so C10b proves nothing (fix the pattern; do not trust a green here)"
+  else
+    mutc_rc="$(GH_EXISTING=42 GH_FAIL='issue comment' run_report "$MUTC" "$C7DIR/commentfailmut")"
+    if [ "$mutc_rc" = 1 ] && grep -q 'UPDATED the open issue' "$C7DIR/commentfailmut/out.log"; then
+      ok "C10b-m: ignoring the comment's exit code makes the step report an update that FAILED (rc=$mutc_rc) — C10b reds on that mutant, so it is the arm that sees the deletion"
+    else
+      bad "C10b-m: the mutant that ignores the comment's exit code was still reported as not filed (rc=$mutc_rc) — C10b would not see the deletion: $(tail -2 "$C7DIR/commentfailmut/out.log")"
+    fi
+  fi
+
   # C11 — THE DISPATCH REASON IS RECORDED, BECAUSE THE INPUT PROMISES IT IS (#4210 review P3, MEASURED).
   # `on.workflow_dispatch.inputs.reason` said "recorded in the run summary" and NO STEP READ IT, so the
   # description was a claim about nothing. This drives it through the shipped step and reads the summary.
