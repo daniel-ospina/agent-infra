@@ -2225,31 +2225,50 @@ case "$_rsc_body" in
 esac
 # …and BOTH printed remedies must name a verb that works. The park texts are strings, so this is the
 # only pin available; it is worth having because the text is what an operator pastes.
-# ⛔ THE SCAN IS RESTRICTED TO THE PARK LINES, AND THAT IS A FIX THIS ARM NEEDED (fresh review of #3441,
-# P2 — MEASURED VACUOUS). Scanning the WHOLE file for `rm -rf … reviewround-` and taking `head -1`
-# matched, in merge-one.sh, the WRITE-FAILURE message above the remedy (added by the same commit) rather
-# than the `REVIEW-CEILING` park text in the ceiling arm — so reverting merge-one.sh's park remedy to
-# `rm -f` left this suite GREEN (measured 217/0). That is baseline row 4 of
-# `docs/ops/review-non-vacuity-baseline.md` in one file over: a phrase that another site prints
-# unconditionally. The grep is now anchored on the `park`/`park_ctrl` call sites, so only a remedy that
-# is actually printed to an operator can satisfy it; the mutant reverts EACH file in turn and both red.
+# ⛔ ⛔ THE ORCH-LOOP HALF IS DRIVEN, NOT GREPPED (fresh review of #4242, P2 — MEASURED). The pin used
+# to grep the `park`/`park_ctrl` CALL LINES for the remedy, which was correct only while the reason was
+# an inline literal. `review_ceiling_reason` now COMPOSES it (`_remedy=…` then `_tail=…${_remedy}`) and
+# the caller parks `"$_rcl"`, so the row found nothing and redded a shipped behaviour that was still
+# correct — a FALSE RED on a CI-discovered suite (280/1 with the operator remedy intact), which also
+# invites the wrong repair (broaden the grep until it matches anything again, restoring exactly the
+# vacuity the row's own comment records). A pin on HOW a string is assembled is a pin on refactoring;
+# the property is that the RENDERED reason an operator pastes carries the working verb, so the shipped
+# function is extracted and RUN. merge-one.sh keeps the park-line grep: its reason IS a literal there.
+_c4u_remedy_for() { # <file> → the REVIEW-CEILING remedy text an operator pastes
+  case "$1" in
+    *orch-loop.sh)
+      { awk '/^review_round_read\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$1"
+        awk '/^review_round_remaining\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$1"
+        awk '/^review_ceiling_line\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$1"
+        awk '/^review_ceiling_reason\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$1"
+      } > "$TMP/c4u-orch.sh"
+      [ -s "$TMP/c4u-orch.sh" ] || { printf ''; return 0; }
+      ( O="$TMP/c4u-o"; mkdir -p "$O/state"; . "$TMP/c4u-orch.sh"; review_ceiling_reason 77 aaaa1111 999999999 10 2>/dev/null )
+      ;;
+    *) grep -E 'park(_ctrl)? ' "$1" | grep -o 'rm -rf[^"]*reviewround-[^"]*' | head -1 ;;
+  esac
+}
 for _f in "$MERGED_ONE_SH" "$ORCH"; do
-  _park_txt="$(grep -E 'park(_ctrl)? ' "$_f" | grep -o 'rm -rf[^\"]*reviewround-[^\"]*' | head -1)"
-  [ -n "$_park_txt" ] && ok "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)" \
-    || bad "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy (the text an operator PASTES) does not print a working rm -rf for the book — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert"
+  _park_txt="$(_c4u_remedy_for "$_f")"
+  if printf '%s' "$_park_txt" | grep -q 'rm -rf' && printf '%s' "$_park_txt" | grep -q 'reviewround-'; then
+    ok "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)"
+  else
+    bad "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy (the text an operator PASTES) does not print a working rm -rf for the book — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert (rendered: [$(printf '%s' "$_park_txt" | tr '\n' ' ' | cut -c1-120)])"
+  fi
 done
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
-# vacuity above was exactly one file satisfying the other's row. The rewrite is applied ONLY to the park
-# lines (awk, not a whole-file sed), so the write-failure message that caused the hole is untouched and
-# the mutant reproduces the real regression rather than a blanket text change.
+# vacuity above was exactly one file satisfying the other's row. The rewrite is applied ONLY to the
+# REMEDY-BEARING lines (awk, not a whole-file sed): a `park`/`park_ctrl` call, or an assignment to one
+# of the reason-composing locals (`_remedy`/`_rcl`/`_tail`/`_why`/`_reason`) — so the write-failure
+# message that caused the original hole is untouched and the mutant reproduces the real regression.
 for _pair in "$MERGED_ONE_SH:merge-one" "$ORCH:orch-loop"; do
   _mfu="${_pair%%:*}"; _lbl="${_pair#*:}"
-  awk '/park(_ctrl)? /{gsub(/rm -rf/,"rm -f")} {print}' "$_mfu" > "$TMP/parktxt.$_lbl.sh"
-  _got="$(grep -E 'park(_ctrl)? ' "$TMP/parktxt.$_lbl.sh" | grep -o 'rm -rf[^\"]*reviewround-[^\"]*' | head -1)"
+  awk '/park(_ctrl)? / || /^[ \t]*_(remedy|rcl|tail|why|reason)=/{gsub(/rm -rf/,"rm -f")} {print}' "$_mfu" > "$TMP/parktxt.$_lbl.sh"
+  _got="$(_c4u_remedy_for "$TMP/parktxt.$_lbl.sh" | grep -o 'rm -rf' | head -1)"
   if [ -z "$_got" ]; then
     ok "MUTANT-U: reverting $_lbl's park remedy to rm -f makes (c4u)'s row for it report ❌ — the per-file remedy pin is live"
   else
-    bad "MUTANT-U could not strip $_lbl's park remedy (the park-line rewrite changed nothing), so (c4u)'s row for that file proves nothing"
+    bad "MUTANT-U could not strip $_lbl's park remedy (the remedy-line rewrite changed nothing), so (c4u)'s row for that file proves nothing"
   fi
 done
 
