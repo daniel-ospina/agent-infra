@@ -2326,7 +2326,17 @@ _c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends wi
       *) return 1 ;;
     esac
     case "$_op" in */"$2") return 0 ;; esac
-    case "$_rest" in " "*) _rest="${_rest# }" ;; *) return 1 ;; esac
+    # ⛔ THE RUN BETWEEN OPERANDS IS ONE SEPARATOR TOO (fresh review of #4249, P3 — MEASURED). The same
+    # property the strip above states in general terms applies HERE: bash treats any run of blanks as one
+    # separator, so `rm -rf '<parked>'  '<book>'` (two spaces) really does remove the book. Consuming
+    # exactly ONE space made that shape a NEW false RED that `main` did not have (main=GREEN, head=RED,
+    # paste measured to remove the book), and the failure text then told the operator the remedy "does not
+    # remove the book" over a paste that does — inviting the broaden-the-matcher repair this block warns
+    # against. Consume the whole run, exactly as the leading strip does.
+    case "$_rest" in
+      " "*) while [ "${_rest# }" != "$_rest" ]; do _rest="${_rest# }"; done ;;
+      *) return 1 ;;
+    esac
   done
 }
 _c4u_row() { # <label> <text> <book-token>
@@ -2374,6 +2384,21 @@ _c4u_shape 'trailing prose contraction is not part of the paste' GREEN "rm -rf '
 # ⛔ AND THE WHITESPACE-RUN FIX IS PINNED HERE (the two-space false RED above): revert the `while` strip in
 # `_c4u_ok` and this GREEN row reds, so the fix cannot be silently dropped back into the false RED.
 _c4u_shape 'a space RUN after the verb is one separator'  GREEN "rm -rf  '/x/state/reviewround-77'"
+# ⛔ AND A RUN BETWEEN OPERANDS IS THE SAME SEPARATOR (fresh review of #4249, P3 — MEASURED): the strip
+# above consumes only the leading run, so consuming exactly ONE space between operands left this shape a
+# NEW false RED that `main` did not have — `main`=GREEN, head=RED — over a paste that really removes the
+# book. Reverting the between-operand `while` back to a single `${_rest# }` reds this row.
+_c4u_shape 'a space RUN between operands is one separator' GREEN "rm -rf '/x/state/parked-77'  '/x/state/reviewround-77'"
+# ⛔ THE EMPTY-BOOK GUARD IS PINNED HERE, and only here (fresh review of #4249, P3 — MEASURED). `_c4u_shape`
+# hardcodes the book, so it cannot express this; the token is passed directly. The guard is a real defence,
+# not decoration: with an empty token the operand pattern `*/"$2"` degenerates to `*/`, which matches ANY
+# operand ending in `/`, so the text below reads GREEN without `[ -n "${2:-}" ] || return 1` and RED with
+# it. Deleting that line left every other row green — this is the row that notices.
+if _c4u_ok "rm -rf '/x/state/sub/'" ''; then
+  bad "(c4u) the remedy predicate accepts an EMPTY book token — its operand pattern degenerates to a bare '/', so any trailing-slash operand reads as the book (the `-n` guard is gone)"
+else
+  ok "(c4u) the remedy predicate REFUSES an empty book token (without the guard its operand pattern would match any trailing-slash operand)"
+fi
 _c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON
