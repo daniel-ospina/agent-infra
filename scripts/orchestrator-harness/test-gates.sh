@@ -3484,6 +3484,40 @@ ISSUES 2')"
   else
     echo "  ❌ lane-merge.sh's verdict-line helpers could not be extracted — the lane path's severity rule is UNPROVEN, never green"; FAIL=$((FAIL+1))
   fi
+  # (f) ⛔ THE SECOND VERDICT-LESS PARK PATH IS ADVISORY-AWARE TOO (round 7 of that review, P2 —
+  # MEASURED). `review_abandoned_record` is what the EXIT trap calls when a reviewer run died without a
+  # verdict, and the advisory design DELIBERATELY preserves `reviewdisp-<PR>` — which makes an advisory
+  # head exactly the head that sits at MAX_REVIEW_TRIES, so a crash lands this reason on it. It used to
+  # say "nothing was reviewed here" and name a reviewer budget for a head holding a usable P3-only
+  # verdict, and its lift command left `reviewdisp` at the cap, so "accept the nits" re-parked on the
+  # next cycle. Driven from the SHIPPED function (with the shipped budget helpers), not by grep.
+  awk '/^review_abandoned_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE" > "$TMP/abandoned.sh"
+  if grep -q '^review_abandoned_record() {' "$TMP/abandoned.sh" && bash -n "$TMP/abandoned.sh" 2>/dev/null; then
+    RA="$TMP/rao"; rm -rf "$RA"; mkdir -p "$RA/state"; : > "$RA/merge.log"
+    printf 'aaa7 3\n' > "$RA/state/reviewdisp-2132"; printf 'P3-ONLY\n' > "$RA/state/advisory-2132-aaa7"
+    ( O="$RA"; L="$RA/merge.log"; PR=2132; HEAD=aaa7; MAX_REVIEW_TRIES=3; LAST=""; REV_STARTED=1; REV_RECORDED=0
+      park() { printf '%s\n' "$*" > "$RA/parkreason"; }
+      . "$TMP/reviewstate.sh"; . "$TMP/abandoned.sh"; review_abandoned_record ) >/dev/null 2>&1 || true
+    # ⚠ THE REASON IS BUILT WITH DOUBLE QUOTES, so `$PR`/`$O` are ALREADY EXPANDED in it: assert on the
+    # CONCRETE path the operator is told to remove (`reviewdisp-2132`), never on the literal `$PR`.
+    if [ -f "$RA/parkreason" ] && grep -q 'ALREADY CARRIES A P3-ONLY' "$RA/parkreason" && grep -q 'reviewdisp-2132' "$RA/parkreason"; then
+      echo "  ✅ a crashed reviewer at an ADVISORY head parks with the advisory named and a lift command that clears the bound"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the abandoned-run park at an advisory head does not name it / its lift command cannot un-park (reason=[$( [ -f "$RA/parkreason" ] && tr '\n' ' ' < "$RA/parkreason" | cut -c1-200 || echo none)])"; FAIL=$((FAIL+1))
+    fi
+    # CONTROL: with NO advisory, the original sentence and the budget remedy are still what is written.
+    rm -f "$RA/parkreason" "$RA/state/advisory-2132-aaa7"
+    ( O="$RA"; L="$RA/merge.log"; PR=2132; HEAD=aaa7; MAX_REVIEW_TRIES=3; LAST=""; REV_STARTED=1; REV_RECORDED=0
+      park() { printf '%s\n' "$*" > "$RA/parkreason"; }
+      . "$TMP/reviewstate.sh"; . "$TMP/abandoned.sh"; review_abandoned_record ) >/dev/null 2>&1 || true
+    if [ -f "$RA/parkreason" ] && grep -q 'nothing was reviewed here' "$RA/parkreason" && ! grep -q 'ADVISORY' "$RA/parkreason"; then
+      echo "  ✅ …while a head with NO advisory keeps the original reason (the branch is the marker, not a rewrite)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the non-advisory abandoned-run reason changed (reason=[$( [ -f "$RA/parkreason" ] && tr '\n' ' ' < "$RA/parkreason" | cut -c1-200 || echo none)])"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ review_abandoned_record could not be extracted — the second verdict-less park path is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
   # (g) ⛔ THE REVIEW-CAP PARK REASON IS ADVISORY-AWARE (fresh review of #4241, P3). With the per-head
   # budget deliberately preserved, a P3-only head reaches REVIEW-CAP as its deterministic terminal, and
   # the standard reason then asserts the reviewer "never produced a usable verdict" — false (it did)

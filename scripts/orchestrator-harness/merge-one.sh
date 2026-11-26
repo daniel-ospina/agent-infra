@@ -2425,7 +2425,19 @@ review_abandoned_record() {
   fi
   if [ "$n" -ge "$MAX_REVIEW_TRIES" ]; then
     echo "[merge $PR] NEEDS-REVIEW: $why — review attempts at head=$HEAD are EXHAUSTED ${n}/${MAX_REVIEW_TRIES}, PARKED" >> "$L.log"
-    park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
+    # ⛔ ADVISORY-AWARE (fresh review of #4241, P2). This is the SECOND park path that reaches an
+    # advisory head, and it is not a hypothetical one: the advisory design deliberately PRESERVES
+    # `reviewdisp-<PR>` (a cosmetic verdict does not move the head, so the per-head bound is the only
+    # thing bounding re-reviews), which makes an advisory head exactly the head that sits at
+    # MAX_REVIEW_TRIES — and a reviewer that then dies abnormally lands HERE, on the reason that says
+    # "nothing was reviewed here" and names a reviewer budget for a review that produced a usable
+    # P3-only verdict. "Accept the nits" also needs the bound cleared, or the un-park command below
+    # re-parks on the very next cycle (the NO-VERDICT arm's own lift command removes reviewdisp).
+    if [ -f "$O/state/advisory-$PR-$HEAD" ]; then
+      park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run). ⛔ BUT THIS HEAD ALREADY CARRIES A P3-ONLY (COSMETIC) VERDICT: $O/state/advisory-$PR-$HEAD was written by a run that DID produce one, so no signed marker is missing and the reviewer's budget is not the remedy — no fixer is authorised either way (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push changes the head key and re-arms the budget), or accept the nits and lift the bound: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
+    else
+      park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
+    fi
     rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
     return 0
   fi
@@ -2609,7 +2621,7 @@ review_state_record() {
         # reviewed at this head" and the reviewer-budget remedy are both false — a usable P3-only
         # verdict WAS produced, and the remedy is a human decision on the nits, not a bigger budget.
         if [ "$_prior_advisory" = "1" ]; then
-          _nv_reason="the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. ⛔ BUT THIS HEAD ALREADY CARRIES A P3-ONLY (COSMETIC) VERDICT: $O/state/advisory-$PR-$HEAD was written by a run that DID produce one, so the reviewer is not the problem and its budget is not the remedy. No fixer is authorised (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms the per-head budget), or accept the nits. Then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
+          _nv_reason="the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. ⛔ BUT THIS HEAD ALREADY CARRIES A P3-ONLY (COSMETIC) VERDICT: $O/state/advisory-$PR-$HEAD was written by a run that DID produce one, so the reviewer is not the problem and its budget is not the remedy. No fixer is authorised (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push changes the head key and re-arms the budget), or accept the nits and lift the bound — ${_spent} stays at the cap otherwise and the head re-parks on the next cycle: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
         else
           _nv_reason="the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
         fi
