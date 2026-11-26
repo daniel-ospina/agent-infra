@@ -3609,11 +3609,23 @@ ISSUES 2')"
     # reds `bash-suites`; on the owner's macOS box BSD sed consumes the SCRIPT as the backup extension,
     # edits nothing, and `2>/dev/null || true` swallows the error. The rewrite is therefore ONE `awk`
     # over the comment-stripped capture the pin reads, so the mutant cannot diverge from what it mutates.
-    awk '{ if (index($0, "_rcl=\"$(review_ceiling_reason") > 0) { gsub(/review_ceiling_reason/, "review_ceiling_line"); sub(/ "\$\{MAX_REVIEW:-10\}"$/, "") } } {print}' "$_ceil_code" > "$TMP/ceilwire.mut.sh"
+    # ⛔ NO `sub()` STRIPPING THE 4TH ARG (fix of this PR's own earlier mutant — MEASURED: 0 MATCHES).
+    # It read `sub(/ "\$\{MAX_REVIEW:-10\}"$/, "")`, which requires END-OF-LINE right after the closing
+    # quote — while the shipped line ends `"${MAX_REVIEW:-10}")"`. So it matched NOTHING, and had it
+    # ever fired it would have produced a THREE-arg call that never existed. The `gsub` alone IS the
+    # pre-change shape, exactly as #4242 (e96e769bc:648) replaced it. An inert transform inside the very
+    # mutant that proves non-vacuity is the same false confidence this PR exists to close one level up,
+    # so the rewrite's OUTPUT is asserted below rather than believed.
+    awk '{ if (index($0, "_rcl=\"$(review_ceiling_reason") > 0) { gsub(/review_ceiling_reason/, "review_ceiling_line") } } {print}' "$_ceil_code" > "$TMP/ceilwire.mut.sh"
     if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
       echo "  ❌ MUTANT: the ceiling-wiring pin survives reverting the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
     else
       echo "  ✅ MUTANT: reverting the ceiling arm's call to review_ceiling_line makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
+    fi
+    if grep -qF '_rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
+      echo "  ✅ MUTANT: the rewrite yields EXACTLY the pre-change call shape (4 args, as #4242 left it), not a truncated call"; PASS=$((PASS+1))
+    else
+      echo "  ❌ MUTANT: the revert did not produce the pre-change 4-arg call shape — a transform that silently no-ops (or drops an argument) proves nothing about the pin"; FAIL=$((FAIL+1))
     fi
     awk '{ if (index($0, "if park_ctrl") > 0 && index($0, "$_rcl") > 0) gsub(/\$_rcl/, "$(review_ceiling_line \"$PR\" \"\${HEAD_N:-}\" \"$_rrn\" \"\${MAX_REVIEW:-10}\")") } {print}' "$_ceil_code" > "$TMP/ceilwire.parkmut.sh"
     if grep -qF 'if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then' "$TMP/ceilwire.parkmut.sh"; then
