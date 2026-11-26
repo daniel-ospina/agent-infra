@@ -3580,6 +3580,38 @@ ISSUES 2')"
       echo "  ❌ the ADVISORY reason contradicts its own stale_findings reading: [$(printf '%s' "$_r_stale" | cut -c1-260)]"; FAIL=$((FAIL+1))
     fi
     rm -f "$CO/state/advisory-2132-c0c0c0c0" "$CO/state/needsfix-2132-aaaa1111"
+    # ⛔ AND THE REASON IS WIRED TO THE ARM THAT PARKS (fresh review of #4242, P2 — MEASURED). Every row
+    # above drives the FUNCTION, and the (c4u) row in pr-dispatch renders it too — so reverting the call
+    # site to the pre-change expression makes `review_ceiling_reason` DEAD CODE (only a comment names it)
+    # while all four suites stay green, and no operator can ever see the advisory-aware diagnosis. This
+    # PR added a call-site pin for the severity argument and a presence pin for the REVIEW-CAP marker;
+    # the ceiling arm had no equivalent. Pin the exact call, then prove the pin live by reverting it.
+    # ⛔ The pin matches only an ACTIVE assignment — line-anchored `_rcl=` with no leading `#` — and it
+    # proves itself live by RE-RUNNING the same predicate over a copy with that line removed, plus a
+    # negative control: a grep for the call TEXT alone is satisfied by a comment quoting it (that was
+    # this pin's first draft, measured), and a `sed`/`awk` mirror of the predicate can silently no-op.
+    _ceil_wired() { grep -qE '^[[:space:]]*_rcl=.*review_ceiling_reason' "$1"; }
+    if _ceil_wired "$ORCH"; then
+      echo "  ✅ orch-loop.sh's REVIEW-CEILING arm PARKS the reason review_ceiling_reason builds (the advisory-aware one is wired, not dead code)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the REVIEW-CEILING arm no longer calls review_ceiling_reason — the advisory-aware diagnosis is DEAD CODE: the function is driven by these rows and rendered by (c4u), so the suite stays green while no operator ever sees it"; FAIL=$((FAIL+1))
+    fi
+    # MUTANT: delete ONLY the ceiling arm's active `_rcl=` assignment, then require the SAME predicate to
+    # red — otherwise the presence pin is matching something other than the shipped call (VACUOUS).
+    grep -vE '^[[:space:]]*_rcl=.*review_ceiling_reason' "$ORCH" > "$TMP/ceilwire.mut.sh"
+    if _ceil_wired "$TMP/ceilwire.mut.sh"; then
+      echo "  ❌ MUTANT: the ceiling-wiring pin survives removing the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ MUTANT: removing the ceiling arm's call makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
+    fi
+    # NEGATIVE CONTROL: a COMMENT quoting the same call must NOT satisfy the pin (measured: the
+    # text-grep draft above passed on a commented-out arm, so the arm could be dead while green).
+    printf '%s\n' '# _rcl="$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' > "$TMP/ceilwire.comment.sh"
+    if _ceil_wired "$TMP/ceilwire.comment.sh"; then
+      echo "  ❌ the ceiling-wiring pin is satisfied by a COMMENT quoting the call — it does not prove the arm is wired"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ the ceiling-wiring pin refuses a COMMENT-quoted call (it cannot be satisfied by prose)"; PASS=$((PASS+1))
+    fi
   else
     echo "  ❌ could not extract review_ceiling_reason from orch-loop.sh — the ceiling's advisory discriminator is UNPROVEN, never green"; FAIL=$((FAIL+1))
   fi
