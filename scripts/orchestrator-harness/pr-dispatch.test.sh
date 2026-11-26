@@ -2253,13 +2253,24 @@ _c4u_remedy_for() { # <file> <merge|render> [advisory-head] → the REVIEW-CEILI
     *) grep -E 'park(_ctrl)? ' "$1" | grep -o 'rm -rf[^"]*reviewround-[^"]*' | head -1 ;;
   esac
 }
-# ⛔ THE VERB MUST BE APPLIED TO THE BOOK, NOT MERELY PRESENT (fresh review of #4242, P2 — MEASURED).
-# Two independent greps ('rm -rf' AND 'reviewround-') went GREEN on a remedy that removes the park
-# markers and only MENTIONS `state/reviewround-$1` — a paste that leaves the corrupt book in place and
-# re-parks for ever. The anchor is back (`rm -rf` … `reviewround-` with no `)` between).
+# ⛔ THE VERB MUST BE APPLIED TO THE BOOK — ADJACENCY IS NOT APPLICATION (fresh review of #4242, two
+# P2s — MEASURED). Two independent greps ('rm -rf' AND 'reviewround-') went GREEN on a remedy that removes
+# the park markers and only MENTIONS `state/reviewround-$1`. The first anchor (`rm -rf[^)]*reviewround-`)
+# fixed THAT case but still tested ADJACENCY, so three shapes measured GREEN on a remedy that leaves a
+# DIRECTORY at the book after the operator pastes it:
+#   split      `rm -rf '…parked-77' '…parkreason-77'; rm -f '…/state/reviewround-77'`  (verb on the markers)
+#   mention    `rm -rf '…parked-77'; the book is '…/state/reviewround-77'`              (no verb on the book)
+#   decoy      `rm -rf '/tmp/reviewround-scratch'; rm -f '…/state/reviewround-77'`      (verb on a namesake)
+# The property is "ONE command both uses rm -rf and names the book", so the parenthetical prose is
+# stripped (it contains `rm -rf` too — that is why a substring test cannot see the verb) and the test
+# runs per ';'-separated command. Measured: A real render GREEN, F merge-one literal GREEN, G merged
+# absolute path GREEN, B/C/D/E RED (E = wholesale rm -f).
 # ⛔ AND BOTH BRANCHES ARE RENDERED (P3): the advisory head's `_tail` is where `${_remedy}` was dropped
 # in a measured mutant, and a call that seeds no advisory record only ever renders the else-branch.
-_c4u_ok() { printf '%s' "$1" | grep -qE 'rm -rf[^)]*reviewround-' ; }
+_c4u_ok() {
+  printf '%s' "$1" | sed 's/([^()]*)//g' \
+    | awk -F';' '{for(i=1;i<=NF;i++) if ($i ~ /rm -rf/ && $i ~ /state\/reviewround-/) f=1} END{exit !f}'
+}
 _c4u_row() { # <label> <text>
   if _c4u_ok "$2"; then ok "(c4u) $1's REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)"
   else bad "(c4u) $1's REVIEW-CEILING remedy (the text an operator PASTES) does not print a working rm -rf for the book — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert (rendered: [$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-140)])"; fi
