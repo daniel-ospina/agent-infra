@@ -2277,19 +2277,25 @@ _c4u_remedy_for() { # <file> <merge|render> [advisory-head] → the REVIEW-CEILI
 # ⛔ AND BOTH BRANCHES ARE RENDERED (P3): the advisory head's `_tail` is where `${_remedy}` was dropped
 # in a measured mutant, and a call that seeds no advisory record only ever renders the else-branch.
 _c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends with the book
-  local _rest _op _sq _dq
+  local _rest _op _sq _dq _bare
   [ -n "${2:-}" ] || return 1
   _sq="'" _dq='"'   # the quote characters as PATTERN VARIABLES: a backslash escape inside "${v#pat}"
                           # does not strip (measured — it read GREEN as RED on a reordered operand list)
+  # ⛔ A PASTE WITH AN UNTERMINATED QUOTE EXECUTES **NOTHING** (measured). The shell refuses the line
+  # ("unexpected EOF while looking for matching `''"), so the book SURVIVES however well-formed the
+  # operand we matched is — `rm -rf '<book>' '<parked` printed GREEN on the operand walk alone and
+  # removes neither. So both quote characters must BALANCE over the text before any operand is believed.
+  # Fail-closed by design: a lone apostrophe in the prose reds the row (visible friction) instead of
+  # letting an unexecutable paste pass as a repair.
+  for _bare in "$_sq" "$_dq"; do
+    _rest="${1//"$_bare"/}"
+    [ $(( (${#1} - ${#_rest}) % 2 )) -eq 0 ] || return 1
+  done
   case "${1:-}" in *"rm -rf "*) _rest="${1#*rm -rf }" ;; *) return 1 ;; esac
   while :; do
     case "$_rest" in
-      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"
-                 [ "${#_op}" -lt "${#_rest}" ] || return 1   # no closing quote = not an operand, and
-                 _rest="${_rest#*"$_sq"}" ;;                # paste of an unterminated quote removes NOTHING
-      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"
-                 [ "${#_op}" -lt "${#_rest}" ] || return 1
-                 _rest="${_rest#*"$_dq"}" ;;
+      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"; _rest="${_rest#*"$_sq"}" ;;
+      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"; _rest="${_rest#*"$_dq"}" ;;
       *) return 1 ;;
     esac
     case "$_op" in */"$2") return 0 ;; esac
@@ -2303,6 +2309,26 @@ _c4u_row() { # <label> <text> <book-token>
 _c4u_row "$(basename "$MERGED_ONE_SH")" "$(_c4u_remedy_for "$MERGED_ONE_SH" merge)" 'reviewround-$PR'
 _c4u_row "$(basename "$ORCH")" "$(_c4u_remedy_for "$ORCH" render)" 'reviewround-77'
 _c4u_row "$(basename "$ORCH") (ADVISORY head)" "$(_c4u_remedy_for "$ORCH" render aaaa1111)" 'reviewround-77'
+# ⛔ THE PREDICATE ITSELF IS PINNED WITH SHAPES (fresh review of #4242, P3 — MEASURED). The three rows above
+# only prove the SHIPPED renders pass; on their own they do not distinguish the book-binding rule from a
+# weaker matcher — and this predicate regressed through four fresh reviews, each time with all four suites
+# green (deleting both termination guards measured byte-identical suite logs, 282/0). These rows drive the
+# predicate directly, in BOTH polarities, on the shapes those reviews produced, so removing any part of the
+# rule reds a row instead of silently widening it.
+_c4u_shape() { # <label> <want GREEN|RED> <text>
+  local _got
+  if _c4u_ok "$3" 'reviewround-77'; then _got=GREEN; else _got=RED; fi
+  if [ "$_got" = "$2" ]; then ok "(c4u) the remedy predicate says $2 for the shape '$1'"
+  else bad "(c4u) the remedy predicate says $_got for the shape '$1', expected $2 — the book-binding rule has drifted (text: [$3])"; fi
+}
+_c4u_shape 'book is an operand of rm -rf'          GREEN "rm -rf '/x/state/reviewround-77' '/x/state/parked-77' (rm -rf, not rm -f)"
+_c4u_shape 'double-quoted, terminated'             GREEN 'rm -rf "/x/state/reviewround-77"'
+_c4u_shape 'split verb (book removed by rm -f)'    RED   "rm -rf '/x/state/parked-77'; rm -f '/x/state/reviewround-77'"
+_c4u_shape 'wrong PR (reviewround-7 vs -77)'       RED   "rm -rf '/x/state/reviewround-7'"
+_c4u_shape 'operand is a PREFIX of the book (.bak)' RED   "rm -rf '/x/state/reviewround-77.bak'"
+_c4u_shape 'text ends at an UNTERMINATED quote'    RED   "rm -rf '/x/state/reviewround-77"
+_c4u_shape 'unterminated quote AFTER the book'     RED   "rm -rf '/x/state/reviewround-77' '/x/state/parked-77"
+_c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON
 # THE EXTRACTED FRAGMENT, NOT ON SELECTED SOURCE LINES (fresh review of #4242, two P2s + P3 — MEASURED):
