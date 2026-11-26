@@ -2201,7 +2201,7 @@ review_ceiling_line() { # <pr> <head> <n> <max>
 # it is in the REVIEW-CAP reason above — and the remedy differs, because here a fix and a push IS the
 # legitimate route (the human acts on the nits), while a reviewer-budget remedy only re-arms cycles.
 review_ceiling_reason() { # <pr> <head> <n> <max>
-  local _rcl _common _tail _remedy
+  local _rcl _common _tail _remedy _sf _why0
   _rcl="$(review_ceiling_line "$1" "${2:-}" "$3" "$4")"
   _common=" — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict."
   # ⛔ THE REMEDY IS BUILT FROM THIS FUNCTION'S OWN ARGUMENTS, NOT FROM THE GLOBALS (fresh review of
@@ -2213,7 +2213,21 @@ review_ceiling_reason() { # <pr> <head> <n> <max>
   # silent-erasure class 81ca77e51 fixed in the prompt heredocs, one string over.
   _remedy=" ⛔ \`rounds=999999999\` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$1' '$O/state/parkreason-$1' '$O/state/parkorigin-$1' '$O/state/reviewround-$1' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"
   if [ -f "$O/state/advisory-$1-${2:-}" ]; then
-    _tail=" ⛔ ADVISORY: this head's verdict is P3-ONLY (cosmetic), which is why stale_findings reads 0 — an advisory record is NOT a needsfix-* marker, so it is invisible to that count by construction. A usable verdict WAS produced and its comment WAS posted, so the reviewer's budget is NOT the cause: no fixer may be dispatched (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms this per-PR budget), or accept the nits.${_remedy}"
+    # ⛔ THE "stale_findings reads 0" CLAUSE IS CONDITIONAL, NOT DECORATION (fresh review of #4241,
+    # P3 — MEASURED). It was asserted UNCONDITIONALLY in the advisory tail, while the SAME sentence
+    # carries `$(review_round_remaining)` — so a PR whose EARLIER head left a `needsfix-*` marker and
+    # whose live head carries an advisory record printed `stale_findings=1 heads=aaaa1111` and, twelve
+    # words later, "which is why stale_findings reads 0". A reason that contradicts itself in one
+    # sentence is worse than a vague one: it teaches the operator the field is noise. Both branches
+    # say the same TRUE thing about the count (an advisory is not a `needsfix-*` marker, so THIS head
+    # never enters it); only the 0 case may call the reading 0.
+    _sf="$(review_round_remaining "$1")"; _sf="${_sf#stale_findings=}"; _sf="${_sf%% *}"
+    if [ "${_sf:-0}" = "0" ]; then
+      _why0="which is why stale_findings reads 0 — an advisory record is NOT a needsfix-* marker, so it is invisible to that count by construction"
+    else
+      _why0="and the stale_findings markers listed above belong to EARLIER heads — an advisory record is NOT a needsfix-* marker, so this head never enters that count, and those markers are not a verdict about this head"
+    fi
+    _tail=" ⛔ ADVISORY: this head's verdict is P3-ONLY (cosmetic), ${_why0}. A usable verdict WAS produced and its comment WAS posted, so the reviewer's budget is NOT the cause: no fixer may be dispatched (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms this per-PR budget), or accept the nits.${_remedy}"
   else
     _tail=" stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 this head carries no findings marker AND no advisory record, so the reviewer produced no usable verdict at the live head. A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head).${_remedy}"
   fi

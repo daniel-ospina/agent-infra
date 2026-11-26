@@ -3256,6 +3256,31 @@ ISSUES 2')"
     echo "  ❌ a P3-only finding set wrote the FIXER marker (needsfix=$( [ -f "$RS/state/needsfix-2132-a3a3a3a3" ] && echo yes || echo no), advisory=$( [ -f "$RS/state/advisory-2132-a3a3a3a3" ] && echo yes || echo no)) — a cosmetic nit would authorise a push over a certified branch"; FAIL=$((FAIL+1))
   fi
   eqv "…and the controller classifies that P3-only head NEEDS-REVIEW (no fixer)" "NEEDS-REVIEW" "$(_rgs 2132 a3a3a3a3)"
+  # (a2) ⛔ AN ADVISORY MUST NOT SUPERSEDE A SAME-HEAD FINDINGS VERDICT, AND THAT IS THE ONE CASE THE
+  # ROWS ABOVE DO NOT SEED (fresh review of #4241, P2). The `ISSUES` arm prunes `needsfix-<PR>-*`
+  # UNCONDITIONALLY and the advisory arm runs AFTER the prune, so a second review at an UNCHANGED head
+  # that disagreed DOWNWARDS deleted the marker a different reviewer had written for that SAME head —
+  # the sole fixer authorisation — and replaced it with an advisory record claiming "P3-ONLY findings
+  # at head=H", false at a head carrying a P1. Two reviewers disagreeing on rank is the NORMAL case
+  # (`MAX_REVIEW_TRIES` exists for it) and only the LOWER opinion survived. Same rule the NO-VERDICT
+  # arm already applies one arm down: a weaker artifact does not supersede a findings verdict here.
+  _clean; _rs_sev ISSUES BLOCKING e1e1e1e1
+  _rs_sev ISSUES ADVISORY e1e1e1e1
+  if [ -f "$RS/state/needsfix-2132-e1e1e1e1" ] && [ ! -f "$RS/state/advisory-2132-e1e1e1e1" ]; then
+    echo "  ✅ an ADVISORY at a head that ALREADY carries findings keeps NEEDS-FIX (the weaker verdict never demotes the authorisation)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an ADVISORY verdict DELETED the same-head findings marker (needsfix=$( [ -f "$RS/state/needsfix-2132-e1e1e1e1" ] && echo yes || echo no), advisory=$( [ -f "$RS/state/advisory-2132-e1e1e1e1" ] && echo yes || echo no)) — a cosmetic second opinion erased a real finding's fixer"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller still classifies that head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 e1e1e1e1)"
+  # CONTROL: the restoration is scoped to the SAME head — an advisory at head B must not preserve a
+  # findings marker left at head A (nothing was recorded about B).
+  _clean; _rs_sev ISSUES BLOCKING e2e2e2e2
+  _rs_sev ISSUES ADVISORY e3e3e3e3
+  if [ -f "$RS/state/advisory-2132-e3e3e3e3" ] && [ ! -f "$RS/state/needsfix-2132-e3e3e3e3" ]; then
+    echo "  ✅ …while an advisory at a NEW head is a plain advisory (the restore is head-keyed, never PR-wide)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the findings restore leaked ACROSS heads (needsfix-e3e3e3e3=$( [ -f "$RS/state/needsfix-2132-e3e3e3e3" ] && echo yes || echo no)) — an old head's findings marker now authorises a push at a head nobody reported on"; FAIL=$((FAIL+1))
+  fi
   # (b) P2: unchanged — the fixer is still authorised, so the split did not weaken the gate.
   _clean; _rs_sev ISSUES BLOCKING b2b2b2b2
   if [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && [ ! -f "$RS/state/advisory-2132-b2b2b2b2" ]; then
@@ -3375,6 +3400,31 @@ ISSUES 2')"
     else
       echo "  ❌ parity broken on 'ISSUES 2,P3,P1' — producer=[$(_fs 'ISSUES 2,P3,P1')] lane_advisory=$( _lva "$TMP/lva-gluedmix.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
     fi
+    # ⛔ AND AN ALNUM-GLUED RANK IS NOT A RANK ON **EITHER** SIDE (fresh review of #4241, P3 —
+    # MEASURED). The producer's blocking test had lost its left boundary while the lane's kept it, so
+    # `ISSUES 2 P3 xP1` / `… 2P1` / `… 9P2` read BLOCKING there and ADVISORY here: 98 of 1848
+    # wider-token shapes, 0 in the reverse direction. Safe-sided, but it is the same asymmetry the
+    # count-glued rows above exist to close, one token over — and `P1s` already settles that a rank
+    # with an alnum on its flank is prose. Both sides now scan with the SAME shape, so these rows
+    # red if either loses its boundary.
+    _alnum_i=0
+    for _al in 'ISSUES 2 P3 xP1' 'ISSUES 2 P3 2P1' 'ISSUES 2 P3 9P2' 'ISSUES 2 P3 aP2'; do
+      _alnum_i=$(( _alnum_i + 1 ))
+      _lvafile "$TMP/lva-alnum-$_alnum_i.log" "$_al"
+      if [ "$(_fs "$_al")" = "ADVISORY" ] && _lva "$TMP/lva-alnum-$_alnum_i.log"; then
+        echo "  ✅ parity: '$_al' is ADVISORY for BOTH paths (an alnum-glued token is not a rank)"; PASS=$((PASS+1))
+      else
+        echo "  ❌ parity broken on '$_al' — producer=[$(_fs "$_al")] lane_advisory=$( _lva "$TMP/lva-alnum-$_alnum_i.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+      fi
+    done
+    # …and the CONTROL for that boundary: a rank behind PUNCTUATION still blocks on both sides, so the
+    # rows above cannot be satisfied by simply deleting the blocking test.
+    _lvafile "$TMP/lva-punct.log" 'ISSUES 2 (P1) P3'
+    if [ "$(_fs 'ISSUES 2 (P1) P3')" = "BLOCKING" ] && ! _lva "$TMP/lva-punct.log"; then
+      echo "  ✅ parity: 'ISSUES 2 (P1) P3' is BLOCKING for BOTH paths (a punctuation-bounded rank is a rank)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 2 (P1) P3' — producer=[$(_fs 'ISSUES 2 (P1) P3')] lane_advisory=$( _lva "$TMP/lva-punct.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
     # ⛔ `ISSUES 0` IS "FOUND NONE", NOT A FIX LIST (parity P2 — the #2132 class on the lane path):
     # the producer reads NO-VERDICT and re-reviews; a bare `[0-9]+` match told the lane FIX_REQUIRED.
     if [ "$(_vc 'ISSUES 0')" = "NO-VERDICT" ] && ! _lvap "$TMP/lva-zero.log"; then
@@ -3397,7 +3447,12 @@ ISSUES 2')"
   # the standard reason then asserts the reviewer "never produced a usable verdict" — false (it did)
   # — and prints a reviewer-budget remedy that only re-arms the same cycles. A presence pin, so the
   # discriminator cannot be deleted while the rest of the suite stays green.
-  if grep -qF 'state/advisory-$PR-${HEAD_N:-}' "$ORCH"; then
+  # ⛔ THE PIN NAMES THE **TEST**, NOT A STRING THE REMEDY ALSO CARRIES (fresh review of #4241, P3 —
+  # MEASURED). It used to grep for `state/advisory-$PR-${HEAD_N:-}`, which also appears in the SAME
+  # arm's `_cap_why` rm-recipe — so replacing the discriminator with `if false; then` left the pin
+  # GREEN while a P3-only head parked claiming "the reviewer never produced a usable verdict".
+  # `[ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]` is the file TEST itself and appears nowhere else.
+  if grep -qF '[ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]' "$ORCH"; then
     echo "  ✅ orch-loop.sh's REVIEW-CAP reason reads the advisory marker (no false 'no usable verdict' at a P3-only head)"; PASS=$((PASS+1))
   else
     echo "  ❌ the REVIEW-CAP park reason does not read the advisory marker — a P3-only head parks with a false diagnosis"; FAIL=$((FAIL+1))
@@ -3435,6 +3490,20 @@ ISSUES 2')"
       echo "  ❌ the ceiling reason read an advisory record from ANOTHER head"; FAIL=$((FAIL+1))
     fi
     rm -f "$CO/state/advisory-2132-c1c1c1c1"
+    # (g3) ⛔ THE ADVISORY TAIL MUST NOT CONTRADICT THE SAME SENTENCE'S OWN COUNT (fresh review of
+    # #4241, P3 — MEASURED). It asserted "which is why stale_findings reads 0" UNCONDITIONALLY while
+    # `_rcl` carries `$(review_round_remaining)` — so a PR whose EARLIER head left a `needsfix-*`
+    # marker and whose live head carries an advisory record printed `stale_findings=1 heads=aaaa1111`
+    # and, twelve words later, "which is why stale_findings reads 0". A reason that refutes itself
+    # teaches the operator the field is noise. Driven, not pinned: the 0-case row above cannot see it.
+    : > "$CO/state/advisory-2132-c0c0c0c0"; : > "$CO/state/needsfix-2132-aaaa1111"
+    _r_stale="$(_creason 2132 c0c0c0c0 10 10)"
+    if grep -qF 'stale_findings=1' <<<"$_r_stale" && ! grep -qF 'stale_findings reads 0' <<<"$_r_stale" && grep -qi 'EARLIER heads' <<<"$_r_stale"; then
+      echo "  ✅ …and an advisory head that ALSO carries an earlier head's findings does NOT claim stale_findings reads 0 (the count cannot contradict itself)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the ADVISORY reason contradicts its own stale_findings reading: [$(printf '%s' "$_r_stale" | cut -c1-260)]"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$CO/state/advisory-2132-c0c0c0c0" "$CO/state/needsfix-2132-aaaa1111"
   else
     echo "  ❌ could not extract review_ceiling_reason from orch-loop.sh — the ceiling's advisory discriminator is UNPROVEN, never green"; FAIL=$((FAIL+1))
   fi

@@ -2333,7 +2333,15 @@ finding_severity() {
     # substring test also matched a NEGATED mention (`P3 (no P1s)`), which left a P3-only review
     # blocking — the #4241 harm intact. A rank followed by a non-alnum or end-of-token keeps the
     # punctuation-joined forms (`P3,P0`, `P3/P1`) blocking while `P1s` / `P10` demote nothing.
-    if [[ "$tok" =~ [Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
+    # ⛔ AND IT CARRIES THE SAME LEFT BOUNDARY AS THE `P3` TEST (fresh review of #4241, P3 —
+    # MEASURED). Without it an ALNUM-GLUED token (`xP1`, `2P1`, `9P2`) matched here while
+    # `lane-merge.sh::log_verdict_is_advisory` — whose rule is `(^|[^alnum])P<digit>([^alnum]|$)` —
+    # did not, so `ISSUES 2 P3 xP1` was BLOCKING for the producer and ADVISORY for the lane: 98 of
+    # 1848 wider-token shapes, 0 the other way. The direction was the safe one (a fixer
+    # over-authorised on a contrived token, never withheld), but `P1s` already establishes that an
+    # alnum-glued rank is NOT a rank, and one shape on both sides is what makes the parity rows
+    # mean something. `(P0)`, `**P1**`, `P3,P0`, `P3/P1` all still match: a boundary is not an anchor.
+    if [[ "$tok" =~ (^|[^[:alnum:]])[Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
     # ⛔ THE `P3` TEST HAS THE SAME SHAPE AS THE BLOCKING TEST ABOVE (fresh review of #4241, P3 —
     # MEASURED). Anchoring it at the token START was the ONE asymmetry left in this function: a token
     # where `P3` sits behind a non-space separator (`ISSUES 2,P3`, `ISSUES: 2-P3`, `ISSUES 2/P3`,
@@ -2426,7 +2434,9 @@ review_abandoned_record() {
   return 0
 }
 
-# review_state_record <class> — write the state marker the CONTROLLER acts on, at $HEAD.
+# review_state_record <class> [<severity>] — write the state marker the CONTROLLER acts on, at
+# $HEAD. `<severity>` is `finding_severity()`'s answer for the same verdict line and defaults to
+# BLOCKING; only the literal `ADVISORY` demotes (agent-infra#4241).
 # ⛔ NO-VERDICT IS BOUNDED AND KEYED ON THE HEAD. A reviewer that never returns a verdict must not
 # buy an unbounded succession of PAID reviews (the #1717 class, one input over): MAX_REVIEW_TRIES
 # (default 3) parks the head with a reason that names the truth — nothing was reviewed, so no signed
@@ -2466,6 +2476,19 @@ review_state_record() {
       # for "a review at an unchanged head" (MAX_REVIEW_TRIES) was INERT on exactly this path. The
       # blocking arm still resets both at its tail, where it is correct: its fixer PUSHES, and a push
       # re-arms the budget by changing the key.
+      # ⛔ AN ADVISORY MUST NOT SUPERSEDE A SAME-HEAD FINDINGS VERDICT (fresh review of #4241, P2 —
+      # the forbidden direction). The prune below is UNCONDITIONAL and the advisory arm runs AFTER it,
+      # so a second review at an UNCHANGED head that disagreed DOWNWARDS deleted the
+      # `needsfix-<PR>-<HEAD>` marker another reviewer had already written for that very head — the
+      # sole thing that authorises a fixer (`orch-loop.sh::review_gate_state`) — and replaced it with
+      # an `advisory-*` record asserting "P3-ONLY findings at head=H", which is FALSE at that head.
+      # Two fresh-context reviewers disagreeing on rank for one diff is the NORMAL case
+      # (`MAX_REVIEW_TRIES` exists for it), and only the LOWER opinion survived; the P1 was never
+      # repaired. This is the same event the NO-VERDICT arm already ruled on one arm down — a weaker
+      # artifact does not supersede a findings verdict at the same head — so the marker is read
+      # BEFORE the prune and restored by the advisory arm, never demoted.
+      local _prior_needsfix=0
+      [ -f "$O/state/needsfix-$PR-$HEAD" ] && _prior_needsfix=1
       rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* "$O/state/advisory-$PR-"* 2>/dev/null || true
       # ⛔ A P3-ONLY FINDING SET IS AN ADVISORY, NOT A FIXER AUTHORISATION (agent-infra#4241). The
       # marker above is the SOLE thing that authorises a fixer (`orch-loop.sh::review_gate_state`),
@@ -2479,6 +2502,18 @@ review_state_record() {
       # them up — acting on a P3 is a human decision, named as one at the park. This branch
       # deliberately writes NOTHING a fixer reads.
       if [ "$sev" = "ADVISORY" ]; then
+        # ⛔ A FINDINGS MARKER AT THIS SAME HEAD WINS (fresh review of #4241, P2). Restore it and
+        # write NO advisory record: the advisory's own text ("P3-ONLY findings at head=H") would be a
+        # false statement about a head a reviewer already reported a P1/P2 on, and its effect — no
+        # fixer — is exactly the harm #4241 exists to prevent, in reverse.
+        if [ "$_prior_needsfix" = "1" ]; then
+          if touch "$O/state/needsfix-$PR-$HEAD" 2>/dev/null; then
+            echo "[merge $PR] ADVISORY at head=$HEAD does NOT supersede the FINDINGS already recorded at this head — keeping NEEDS-FIX (a fixer is still the remedy); no advisory record written, no re-review budget consumed" >> "$L.log"
+          else
+            echo "[merge $PR] a FINDINGS marker existed at head=$HEAD and the advisory refused to demote it, but it COULD NOT BE RESTORED — the controller decides by a FILE TEST, so this head falls to the re-record arm (another REVIEW), never to a fixer" >> "$L.log"
+          fi
+          return 0
+        fi
         if printf '%s\n' "P3-ONLY findings at head=$HEAD (cosmetic) — advisory, NO fixer is authorised" > "$O/state/advisory-$PR-$HEAD" 2>/dev/null; then
           echo "[merge $PR] ADVISORY: the reviewer's findings at head=$HEAD are P3-ONLY (cosmetic) — recorded as advisory; NO fixer is authorised and no push is caused" >> "$L.log"
         else
