@@ -2584,7 +2584,20 @@ review_state_record() {
       # ⛔ AND THE OTHER HEADS' FINDINGS MARKERS GO WITH IT (review round 9): the same-head marker was
       # already excluded by the early return above, so only INERT old-head ones remain — leaving them is
       # the growth the sibling markers no longer have, and it makes "replaced at a new head" false.
+      # ⛔ THE SAME-HEAD ADVISORY IS *NOT* EXCLUDED BY THAT EARLY RETURN (review round 6, P2 — MEASURED).
+      # The early return guards `needsfix-<PR>-<HEAD>` only, so at a head whose verdict was P3-ONLY a
+      # later verdict-less run deleted `advisory-<PR>-<HEAD>` — the record of a review that DID happen —
+      # and then parked with "the reviewer produced NO usable verdict … Nothing was reviewed at this
+      # head", which is false, and with the reviewer-budget remedy, which is the wrong remedy (the
+      # remedy is to act on the nits or accept them). Read the marker before the prune and restore it
+      # after, exactly as the blocking arm does for its own same-head marker.
+      local _prior_advisory=0
+      [ -f "$O/state/advisory-$PR-$HEAD" ] && _prior_advisory=1
       rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/advisory-$PR-"* 2>/dev/null || true
+      if [ "$_prior_advisory" = "1" ]; then
+        printf '%s\n' "P3-ONLY findings at head=$HEAD (cosmetic) — advisory, NO fixer is authorised" > "$O/state/advisory-$PR-$HEAD" 2>/dev/null \
+          || echo "[merge $PR] a P3-only verdict existed at head=$HEAD and the advisory could not be re-written — the head falls to the re-record arm (another REVIEW), never to a fixer" >> "$L.log"
+      fi
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
         # ⛔ AND IT NAMES THE SHARED BOOK (agent-infra#2971): the count is the controller's dispatch
@@ -2592,7 +2605,15 @@ review_state_record() {
         # ANY arm — never this file's private tally sitting beside an untouched controller budget.
         # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
         # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
-        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
+        # ⛔ ADVISORY-AWARE (review round 6, P2): with a same-head advisory still standing, "Nothing was
+        # reviewed at this head" and the reviewer-budget remedy are both false — a usable P3-only
+        # verdict WAS produced, and the remedy is a human decision on the nits, not a bigger budget.
+        if [ "$_prior_advisory" = "1" ]; then
+          _nv_reason="the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. ⛔ BUT THIS HEAD ALREADY CARRIES A P3-ONLY (COSMETIC) VERDICT: $O/state/advisory-$PR-$HEAD was written by a run that DID produce one, so the reviewer is not the problem and its budget is not the remedy. No fixer is authorised (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms the per-head budget), or accept the nits. Then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
+        else
+          _nv_reason="the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR'"
+        fi
+        park "$_nv_reason"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
         return 0
       fi

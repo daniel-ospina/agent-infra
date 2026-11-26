@@ -3293,6 +3293,28 @@ ISSUES 2')"
   else
     echo "  ❌ the findings restore leaked ACROSS heads (needsfix-e3e3e3e3=$( [ -f "$RS/state/needsfix-2132-e3e3e3e3" ] && echo yes || echo no)) — an old head's findings marker now authorises a push at a head nobody reported on"; FAIL=$((FAIL+1))
   fi
+  # ⛔ A VERDICT-LESS RUN AT THE SAME HEAD MUST NOT ERASE THE ADVISORY (round 6 of that review, P2 —
+  # MEASURED). The NO-VERDICT arm's own early return guards `needsfix-<PR>-<HEAD>` only, so at a
+  # P3-only head it pruned `advisory-<PR>-*` UNCONDITIONALLY — deleting the record of a review that
+  # DID happen — and then parked with "the reviewer produced NO usable verdict … Nothing was reviewed
+  # at this head" plus the reviewer-budget remedy. Both are false when a P3-only verdict exists: the
+  # remedy is a human deciding on the nits. The marker is read before the prune and restored after.
+  _clean; _rs_sev ISSUES ADVISORY a7a7a7a7
+  _rs_sev NO-VERDICT ADVISORY a7a7a7a7
+  if [ -f "$RS/state/advisory-2132-a7a7a7a7" ]; then
+    echo "  ✅ a verdict-less run at a P3-only head KEEPS the advisory (the review that DID happen is not erased)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a verdict-less run DELETED the same-head advisory — the P3 findings are gone and the park now claims nothing was reviewed at a head that was"; FAIL=$((FAIL+1))
+  fi
+  # …and the park reason it leaves when the budget IS spent must say so, not blame the reviewer. Driven
+  # at the cap (3rd attempt) so the `park` branch is the one taken.
+  _clean; _rs_sev ISSUES ADVISORY a8a8a8a8
+  _rs_sev NO-VERDICT ADVISORY a8a8a8a8 1 >/dev/null 2>&1 || true
+  if [ -f "$RS/parkreason" ] && grep -q 'ALREADY CARRIES A P3-ONLY' "$RS/parkreason"; then
+    echo "  ✅ …and the park reason names the advisory instead of claiming nothing was reviewed"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the park reason at an advisory head does not name the advisory (reason=[$( [ -f "$RS/parkreason" ] && tr '\n' ' ' < "$RS/parkreason" | cut -c1-160 || echo none)]) — the operator is told the reviewer failed and given a budget remedy for a review that produced a usable verdict"; FAIL=$((FAIL+1))
+  fi
   # (b) P2: unchanged — the fixer is still authorised, so the split did not weaken the gate.
   _clean; _rs_sev ISSUES BLOCKING b2b2b2b2
   if [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && [ ! -f "$RS/state/advisory-2132-b2b2b2b2" ]; then
