@@ -1834,7 +1834,7 @@ if tree_scan_enabled; then
     || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
 else
   skip "F4: the whole-tree scan is owned by .github/workflows/portability-tree-scan.yml (--root over the accumulated tree, on a schedule) — #4210 moved it off the bounded lane because its cost tracks REPOSITORY SIZE, not the diff"
-  skip "F5: the verdict-line arm rides on F4's run and moves with it"
+  skip "F5: the verdict-line arm rides on F4's run and moves with it — the batch workflow's REPORT step now asserts it on its own scan-out/verdict.txt (a clean rc=0 without the clean verdict line FAILS the run there), and scripts/check-portability-scope.test.sh C8 runs that shipped step to prove the assertion is live"
 fi
 
 # ⛔ NO PIPELINE INTO `grep -q` — THE SIGPIPE FALSE-NEGATIVE (#841/#861). Under `pipefail` a `grep -q`

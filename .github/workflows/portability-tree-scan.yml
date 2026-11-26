@@ -123,6 +123,10 @@ jobs:
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
+          # ⛔ THE DISPATCH REASON IS RECORDED, BECAUSE THIS INPUT PROMISES IT IS (`on.workflow_dispatch.
+          # inputs.reason`, review P3 — MEASURED: no step read it, so the description was a claim about
+          # nothing). Empty on a scheduled run, so the summary row is written only when it is set.
+          DISPATCH_REASON: ${{ inputs.reason }}
         run: |
           set -uo pipefail
           if [ ! -f scan-out/rc.txt ]; then
@@ -143,12 +147,29 @@ jobs:
             echo "|---|---|"
             echo "| head | \`${sha}\` |"
             echo "| run | ${run_url} |"
-            echo "| exit | \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal) |"
+            echo "| exit | \`${rc}\` |"
             echo "| findings | ${findings_n} |"
+            # The meaning of the exit code is NOT a constant: rc=1 has two meanings (a rise, and a
+            # justification-less baseline row that never reached the comparison), so it is written by
+            # the branch that actually measured which one happened.
+            [ -n "${DISPATCH_REASON:-}" ] && echo "| reason | ${DISPATCH_REASON} |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$rc" = "0" ]; then
+            # ⛔ F5 LIVES HERE NOW — IT WAS MOVED, NOT DROPPED (#4210 review P2, MEASURED). The suite's
+            # F5 (`check-portability-traps.test.sh`: "a clean run PRINTS its verdict line; silence is
+            # never a pass") rides on F4's `--root` run, and this job runs that suite with
+            # `PORTABILITY_TREE_SCAN: 0` — so F4 and F5 both SKIP here, and both bounded lanes run the
+            # same suite with the arm off (ci.yml:1928, ci-main.yml:663). Nothing else grepped the
+            # verdict: this job's clean verdict rested on `rc=0` ALONE, so a detector that exited 0 while
+            # printing no verdict was reported CLEAN — exactly the false-PASS class F5 existed to catch.
+            # The assertion is the same one, on the same stream (the detector's clean line is STDERR →
+            # scan-out/verdict.txt), at the only place that now concludes "clean".
+            if ! grep -q 'no NEW cross-platform traps' scan-out/verdict.txt; then
+              echo "::error::the detector exited 0 but printed NO clean verdict line into scan-out/verdict.txt — silence is never a pass, so this run is reported FAILED (F5)"
+              exit 1
+            fi
             # The run itself IS the published last-success timestamp the bounded lanes read
             # (scripts/check-portability-tree-scan-alive.sh): no state is written anywhere else, so the
             # record cannot outlive the run that was supposed to produce it.
@@ -157,7 +178,21 @@ jobs:
             exit 0
           fi
 
-          if [ "$rc" = "1" ]; then
+          if [ "$rc" = "1" ] && grep -q 'carry NO justification' scan-out/verdict.txt; then
+            # ⛔ rc=1 HAS TWO MEANINGS, AND ONLY ONE OF THEM IS A RISE (review P3, MEASURED).
+            # `check-portability-traps.sh:1974-1978` exits 1 for a justification-less baseline row and
+            # does so BEFORE the NEW path at :1980 — it prints no `baseline=` row at all. Reading that
+            # as "a rise the report could not parse" blamed the ROW FORMAT for a real, different failure.
+            # The detector's own message is the discriminator, and the title now states the actual cause.
+            rise_n=0
+            rc_note="1 a justification-less baseline row (the comparison never ran)"
+            incident="could not compare the baseline — a baseline row carries NO justification, so NO rise was reported"
+            title="portability(tree): baseline row(s) with no justification (rc=1) — the comparison never ran"
+            echo "❌ the detector REFUSED to compare: a baseline row carries no justification"
+            echo "- new traps (the rise): 0 — the comparison never ran, so this is not a rise" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$rc" = "1" ]; then
+            rc_note="1 a NEW trap"
+            incident="reported a rise"
             echo "❌ a NEW cross-platform trap is in the accumulated tree"
             # ⛔ THE RISE, FROM THE STREAM THAT CARRIES IT (#4210 review P1, MEASURED on a real run).
             # TWO defects lived here, and the second survived the first fix:
@@ -198,12 +233,18 @@ jobs:
             fi
           else
             rise_n=0
+            rc_note="${rc} a refusal — the tree has no verdict"
+            incident="REFUSED to produce a verdict (rc=${rc}) — no rise was reported"
             echo "❌ the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict, which is not a clean one"
             title="portability(tree): the whole-tree scan REFUSED (rc=${rc}) — the tree has no verdict"
           fi
 
           {
-            echo "The scheduled whole-tree portability scan **${GITHUB_WORKFLOW}** reported a rise."
+            # ⛔ THE OPENING SENTENCE NAMES THE INCIDENT THAT ACTUALLY HAPPENED (review P3). It used to
+            # say "reported a rise" unconditionally, including for rc=2 (the detector REFUSED) and for
+            # the justification-less-baseline case — where no rise was ever reported. A reader of the
+            # tracker got a false description of the incident.
+            echo "The scheduled whole-tree portability scan **${GITHUB_WORKFLOW}** ${incident}."
             echo ""
             echo "This is the batch half of #4210: it owns the tree-wide assertion that was moved off the"
             echo "required lane because its cost tracks repository size, not the diff. It is opened **once**"
@@ -211,7 +252,7 @@ jobs:
             echo ""
             echo "- head: \`${sha}\`"
             echo "- run: ${run_url}"
-            echo "- exit: \`${rc}\` (0 clean, 1 a NEW trap, 2 refusal)"
+            echo "- exit: \`${rc}\` (${rc_note})"
             echo "- new traps (the rise): ${rise_n:-0}"
             echo ""
             if [ -s scan-out/rise.tsv ]; then
@@ -251,15 +292,45 @@ jobs:
 
           label="portability-tree-scan"
           gh label create "$label" --color BFD4F2 --description "Whole-tree portability scan findings (#4210)" >/dev/null 2>&1 || true
-          existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
-          if [ -n "$existing" ]; then
+
+          # ⛔ EVERY READ HERE REFUSES ON FAILURE — INCLUDING THIS ONE (#4210 review P2, MEASURED).
+          # `set -uo pipefail` has no `-e`, so an unchecked `existing="$(gh issue list …)"` turned a
+          # FAILED list into an EMPTY one, which took the `else` and filed a brand-new PEER issue — the
+          # exact thing this body's own text ("opened **once** per incident — later runs comment on this
+          # issue instead of opening a new one") and the fleet's hard rule forbid. Every other read in
+          # this change refuses on failure by design (`check-portability-tree-scan-alive.sh:140-169` exits
+          # 2 on an unreadable API; `check-portability-traps.sh:1761` exits 2 on an unpublishable scan
+          # set). A failed read is not "no open issue".
+          if ! existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"; then
+            echo "::error::could not read the open ${label} issue list (gh issue list FAILED) — refusing to file a PEER issue on an unreadable list; the refusal is named and this run fails closed"
+            report_state="unreadable"
+          elif [ -n "$existing" ]; then
             echo "ℹ️ updating the ONE open issue (#${existing}) instead of filing a peer"
-            gh issue comment "$existing" --body-file issue-body.md
+            if gh issue comment "$existing" --body-file issue-body.md; then
+              report_state="updated #${existing}"
+            else
+              echo "::error::gh issue comment on #${existing} FAILED — the report was NOT published"
+              report_state="failed"
+            fi
           else
-            gh issue create --title "$title" --label "$label" --body-file issue-body.md
+            if gh issue create --title "$title" --label "$label" --body-file issue-body.md; then
+              report_state="filed"
+            else
+              echo "::error::gh issue create FAILED — the report was NOT published"
+              report_state="failed"
+            fi
           fi
           # ⛔ THE JOB STILL FAILS. Filing the issue is the REPORT; the red is the signal that this run
           # did not certify the tree. A run that filed and exited 0 would be the "detected but reported
           # as passing" shape this repo's admin-merge-detector exists to avoid.
-          echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — filed/updated an issue"
+          # ⛔ AND THE FINAL LINE STATES WHAT ACTUALLY HAPPENED (#4210 review P2, MEASURED): it used to
+          # assert "filed/updated an issue" unconditionally, so the step's own record of whether the
+          # tracker got the report was uninformative — and the report is the single deliverable this
+          # batch lane exists for ("a red nobody reads is not a report").
+          case "$report_state" in
+            filed)      echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — FILED an issue" ;;
+            updated*)   echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — UPDATED the open issue (${report_state})" ;;
+            unreadable) echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — the report was NOT filed (the open-issue list could not be read)" ;;
+            *)          echo "::error::${rise_n} new cross-platform trap(s) in the accumulated tree — the report was NOT filed (the gh write FAILED)" ;;
+          esac
           exit 1

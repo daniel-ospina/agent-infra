@@ -31,6 +31,10 @@
 #      Each is paired with the mutant that reverts it, and the mutant keeps the script's NAME in the
 #      text — because a substring check (“the name appears in the file”) is satisfied by a comment, which
 #      is the bypass the parsed assertions close. A moved arm with no wiring is a removed arm.
+#      C5..C10 go one step further and RUN the shipped reporting step against a real detector run: the
+#      issue it files, the title it gives it, and what it does when the verdict line is missing, when
+#      the open-issue READ fails (it must never file a peer) and when the WRITE fails (it must never
+#      claim a report it did not publish).
 #
 # HERMETIC: every fixture is a throwaway git repo or a PATH shim under $TMP. No network, no real
 # repository state, and — measured — the whole suite runs in about a second.
@@ -173,10 +177,11 @@ bash "$TMP/broken/check-portability-traps-changed.sh" --root "$FIX" --base HEAD~
 [ "$rc" = 2 ] && ok "A6: a detector REFUSAL (rc 2) propagates as a refusal, never as a pass" \
   || bad "A6: a refusing detector produced rc=$rc — a gate that cannot run must not read as green"
 
-# A6a..A6c — THE WRAPPER'S OTHER TWO REFUSAL SITES, EACH DRIVEN BY ITS OWN STUB (review P2, measured).
-# ⛔ WHY THESE EXIST: the F2 fix above replaced A6's original stub (which refused EVERY invocation)
-# rather than duplicating it, so the site that stub happened to reach — the `--print-targets` guard —
-# lost its only invocation, and the EMPTY-set guard and the failed-`git diff` guard never had one. The
+# A6a..A6d — THE WRAPPER'S OTHER REFUSAL SITES, EACH DRIVEN BY ITS OWN STUB (review P2, measured).
+# ⛔ WHY THESE EXIST: AN EARLIER REVIEW CYCLE ON THIS PR (that cycle's `F2`, not an arm of the F-section —
+# the F arms live in `check-portability-traps.test.sh` and are unrelated to these) replaced A6's original
+# stub (which refused EVERY invocation) rather than duplicating it, so the site that stub happened to
+# reach — the `--print-targets` guard —# lost its only invocation, and the EMPTY-set guard and the failed-`git diff` guard never had one. The
 # three guards mask each other pairwise today, so a single deleted handler still refuses via its
 # neighbour: exactly the shape that makes a deletion of two of them silently read as CLEAN, which is
 # the one direction this file exists to refuse. Each arm below drives ONE site and asserts the
@@ -233,7 +238,37 @@ else
   bad "A6c: a failed diff produced rc=$rc without naming the refusal: $(head -2 "$TMP/a6c.out")"
 fi
 
-# ── B1..B7. THE TREE HALF CANNOT GO QUIET ───────────────────────────────────────────────────────
+# A6d — THE DETECTOR'S OWN EMPTY-SET REFUSAL (`check-portability-traps.sh:1756-1762`), NOT THE
+# WRAPPER'S (review P3, MEASURED). A6a/A6b drive sites in `check-portability-traps-changed.sh` with a
+# STUB detector; the publisher's own guard — "an EMPTY scan set is a refusal, never a clean list" on the
+# `--print-targets` path — had no arm at all, so deleting it left every arm green. Per mutation rule 3
+# that reads as covered while unproven. This arm runs the REAL detector over a real git repo whose scan
+# set is genuinely empty (a tracked README is not shell), so the guard is what produces the rc.
+A6D_TREE="$TMP/emptyscan"
+mkdir -p "$A6D_TREE"
+a6dgit() { git -C "$A6D_TREE" -c user.email=t@example.invalid -c user.name=t "$@" >/dev/null 2>&1; }
+a6dgit init -q
+printf 'not shell\n' >"$A6D_TREE/README.md"
+a6dgit add README.md
+a6dgit commit -q -m "no shell files at all"
+bash "$CHECK" --print-targets --root "$A6D_TREE" >"$TMP/a6d.out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q 'target set is EMPTY' "$TMP/a6d.out"; then
+  ok "A6d: the DETECTOR's own empty scan set REFUSES BY NAME (rc 2) on --print-targets — an empty published set is never a clean list"
+else
+  bad "A6d: an empty scan set produced rc=$rc without naming the refusal (want rc 2 + 'target set is EMPTY'): $(head -2 "$TMP/a6d.out")"
+fi
+# A6d-b — THE MUTANT: the same run with the guard line DELETED must stop refusing. Without this the
+# arm could be passing on some other guard, which is exactly how a deletion reads as covered.
+mkdir -p "$TMP/a6dmut"
+sed '/the target set is EMPTY/d' "$CHECK" >"$TMP/a6dmut/check-portability-traps.sh"
+mut_out="$(bash "$TMP/a6dmut/check-portability-traps.sh" --print-targets --root "$A6D_TREE" 2>&1)"; mut_rc=$?
+if [ "$mut_rc" = 0 ] && [ -z "$mut_out" ]; then
+  ok "A6d-b: deleting that one guard turns the empty set into a SILENT SUCCESS (rc=0, no output) — A6d reds on the deletion, not on a neighbour"
+else
+  bad "A6d-b: the guard-deleted mutant still produced rc=$mut_rc / '$(printf '%s' "$mut_out" | head -1)' — A6d is not the arm that sees this deletion"
+fi
+
+# ── B1..B7b. THE TREE HALF CANNOT GO QUIET ──────────────────────────────────────────────────────
 # A PATH shim stands in for `gh`: each arm states which reads it answers, and the guard must reach a
 # verdict from THOSE answers only.
 mkgh() {  # mkgh <dir> <runs-json> <workflow-json> <exit-code-for-both>
@@ -295,6 +330,16 @@ PATH="$TMP/gh-future:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b7.out" 2>&1; rc=$?
 [ "$rc" = 2 ] && ok "B7: a FUTURE timestamp REFUSES (a negative age would sail under every bound forever)" \
   || bad "B7: a future timestamp produced rc=$rc"
 
+# B7b — THE SAME REFUSAL IN THE NEVER-SUCCEEDED BRANCH (review P3, MEASURED). B7 covers the
+# last-success timestamp; this covers the workflow's `created_at`, which used to CLAMP a negative age to
+# 0 — i.e. a registration timestamped in the future GRANTED the bootstrap window, while the branch 30
+# lines above refused the identical input. #4210 acceptance 4 says a future timestamp is a refusal.
+mkgh "$TMP/gh-future-created" '{"workflow_runs":[]}' "{\"created_at\":\"$(iso_of $((now + 7200)))\"}"
+PATH="$TMP/gh-future-created:$PATH" bash "$ALIVE" --repo o/r >"$TMP/b7b.out" 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q 'in the FUTURE' "$TMP/b7b.out" \
+  && ok "B7b: a FUTURE registration date REFUSES (rc 2) instead of being clamped into a bootstrap window" \
+  || bad "B7b: a future created_at produced rc=$rc (want 2): $(head -2 "$TMP/b7b.out")"
+
 # B8/B9 — A 404 IS NOT AN OUTAGE, AND THE TREE ALONE IS NOT THE DISAMBIGUATOR (#4210 review P2).
 # A file in THIS tree but not yet in the repository is a landing PR (reding it would red every PR until
 # the first merge), and a file in NEITHER is a real absence. But "the file is in the tree" is ALSO true
@@ -346,7 +391,7 @@ PATH="$TMP/gh-404:$PATH" bash "$B8ALIVE" --repo o/r --workflow definitely-absent
   && ok "B9: a workflow that is in NEITHER the repository NOR the tree REFUSES (a deleted workflow cannot ride the bootstrap window)" \
   || bad "B9: an absent workflow produced rc=$rc"
 
-# ── C1..C7. THE WIRING, READ FROM THE PARSED FILES THAT RUN IT ─────────────────────────────────
+# ── C1..C10. THE WIRING, READ FROM THE PARSED FILES THAT RUN IT ────────────────────────────────
 # ⛔ PARSED NODES, NOT TEXT (#4210 review P2 — MEASURED, not argued). These arms used to `grep -q` the
 # YAML SOURCE, and a substring cannot tell a live step from prose: deleting the diff half's `run:` line
 # left C2 GREEN on the comment that names it (ci.yml:2002), and commenting out the scope env left C1
@@ -518,6 +563,12 @@ fi
 cat >"$C7DIR/shim/gh" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "gh $*" >>"${GH_CALLS:-/dev/null}"
+# GH_FAIL names the subcommand that FAILS, so the report arms can drive a failed READ and a failed
+# WRITE separately (#4210 review P2). Without it the shim always succeeded, and no arm could see that
+# the step treated a failed `issue list` as "no open issue" and filed a PEER.
+case "${GH_FAIL:-}" in
+  "$1 $2") echo "shim: gh $1 $2 FAILED (GH_FAIL=$GH_FAIL)" >&2; exit 1 ;;
+esac
 case "$1 $2" in
   "issue list") exit 0 ;;
   "issue create") printf 'https://example.invalid/1\n' ;;
@@ -534,7 +585,8 @@ run_report() {  # run_report <report.sh> <dir> [<scan-out src>] — runs the shi
   : >"$dir/gh-calls.txt"
   : >"$dir/summary.md"
   ( cd "$dir" \
-      && PATH="$C7DIR/shim:$PATH" GH_CALLS="$dir/gh-calls.txt" \
+      && PATH="$C7DIR/shim:$PATH" GH_CALLS="$dir/gh-calls.txt" GH_FAIL="${GH_FAIL:-}" \
+         DISPATCH_REASON="${DISPATCH_REASON:-}" \
          GITHUB_SHA=deadbeefcafe GITHUB_SERVER_URL=https://ci.example \
          GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=7 GITHUB_WORKFLOW=portability-tree-scan.yml \
          GITHUB_STEP_SUMMARY="$dir/summary.md" GH_TOKEN=shim \
@@ -570,11 +622,19 @@ fi
 # nothing for a reason that has nothing to do with the arm, and C5b would pass on a parse failure. This
 # mutant stays VALID BASH that runs to the end (rc 1 asserted below), so the only difference is that the
 # report is dead while a raw grep still matches it — precisely how the old substring C5 stayed green.
+# ⛔ THE SED MUST REACH THE SHIPPED SHAPE, AND SAY SO WHEN IT DOES NOT (#4210 review, MEASURED). The
+# filing call now sits inside `if gh issue create …; then` (the write's exit code is checked so the
+# final line can report what actually happened), so the old anchored pattern STOPPED MATCHING — the
+# mutant became a byte-identical copy, the step filed as usual, and C5b failed while blaming the arm.
+# The `if `/`if ! ` prefix is therefore part of the pattern, and `cmp` proves the substitution landed.
 MUT="$C7DIR/report-noissue.sh"
 if [ "$c5_extracted" = 1 ]; then
-  sed 's|^\( *\)gh issue create |\1: no-op gh issue create |' "$SHIP" >"$MUT"
+  sed -e 's|^\( *\)if gh issue create |\1if : no-op gh issue create |' \
+      -e 's|^\( *\)gh issue create |\1: no-op gh issue create |' "$SHIP" >"$MUT"
   mut_rc="$(run_report "$MUT" "$C7DIR/mut")"
-  if grep -q 'gh issue create' "$MUT" && [ "$mut_rc" = 1 ] && ! grep -q '^gh issue create ' "$C7DIR/mut/gh-calls.txt"; then
+  if cmp -s "$SHIP" "$MUT"; then
+    bad "C5b: the mutant is BYTE-IDENTICAL to the shipped step — the sed pattern no longer matches the filing call, so this arm tested nothing (fix the pattern; do not trust a green here)"
+  elif grep -q 'gh issue create' "$MUT" && [ "$mut_rc" = 1 ] && ! grep -q '^gh issue create ' "$C7DIR/mut/gh-calls.txt"; then
     ok "C5b: disabling the filing command (valid bash that keeps the TEXT, so a raw grep still matches) makes the step file NOTHING while still failing the run (rc=$mut_rc) — C5 is a run, not a substring"
   else
     bad "C5b: the report path was disabled and C5 could not tell — mutant rc=$mut_rc (want 1, i.e. it ran to the end rather than dying at a parse error), filed: $(grep -c 'issue create' "$C7DIR/mut/gh-calls.txt" 2>/dev/null) issue(s)"
@@ -686,6 +746,126 @@ if [ "$c5_extracted" = 1 ]; then
   fi
 else
   bad "C7c: skipped — the shipped reporting step could not be extracted (see C5)"
+fi
+
+# C8/C8b — THE CLEAN VERDICT LINE IS ASSERTED WHERE "CLEAN" IS CONCLUDED (#4210 review P2, MEASURED).
+# The suite's F5 ("a clean run PRINTS its verdict line; silence is never a pass") rides on F4's `--root`
+# run. This job runs that suite with `PORTABILITY_TREE_SCAN: 0`, so F4 and F5 both SKIP here, and both
+# bounded lanes run the same suite with the arm off — the assertion was REMOVED rather than MOVED, and
+# the job's clean verdict rested on `rc=0` alone. A detector that exits 0 while printing no verdict was
+# therefore reported CLEAN. The fix puts the same assertion in the shipped reporting step; these arms
+# RUN that step, because a `grep` in the YAML is not the step.
+if [ "$c5_extracted" = 1 ]; then
+  # C8 — rc=0 WITH NO VERDICT LINE: the step must FAIL CLOSED, and must not claim a clean tree.
+  CSILENT="$C7DIR/silent"
+  mkdir -p "$CSILENT"
+  printf '0\n' >"$CSILENT/rc.txt"
+  printf 'the detector printed nothing at all\n' >"$CSILENT/findings.txt"
+  printf 'nothing at all\n' >"$CSILENT/verdict.txt"
+  silent_rc="$(run_report "$SHIP" "$C7DIR/silentrun" "$CSILENT")"
+  if [ "$silent_rc" = 1 ] && grep -q 'NO clean verdict line' "$C7DIR/silentrun/out.log" \
+     && ! grep -q 'tree clean at' "$C7DIR/silentrun/out.log"; then
+    ok "C8: an rc=0 run that printed NO clean verdict line FAILS the reporting step (rc=$silent_rc) — silence is never a pass, and the assertion moved with the arm"
+  else
+    bad "C8: a silent rc=0 run produced rc=$silent_rc (want 1) — a detector that exits 0 without a verdict is reported CLEAN: $(tail -2 "$C7DIR/silentrun/out.log") "
+  fi
+
+  # C8b — THE CONTROL, AND THE NON-VACUITY GUARD IN THE OTHER DIRECTION: a REAL clean detector run
+  # (the same fixture, with the full baseline so nothing rises) must still pass rc=0 and file NOTHING.
+  # Without this, an assertion written to always fail — or one matching the wrong string — would pass C8.
+  CCLEAN="$C7DIR/clean"
+  mkdir -p "$CCLEAN"
+  c8b_detector_rc=0
+  bash "$CHECK" --root "$RISE_TREE" --baseline "$C7DIR/base-all.tsv" >"$CCLEAN/findings.txt" 2>"$CCLEAN/verdict.txt" || c8b_detector_rc=$?
+  printf '%s\n' "$c8b_detector_rc" >"$CCLEAN/rc.txt"
+  clean_rc="$(run_report "$SHIP" "$C7DIR/cleanrun" "$CCLEAN")"
+  if [ "$c8b_detector_rc" = 0 ] && [ "$clean_rc" = 0 ] \
+     && grep -q 'tree clean at' "$C7DIR/cleanrun/out.log" \
+     && ! grep -q '^gh issue create ' "$C7DIR/cleanrun/gh-calls.txt"; then
+    ok "C8b: a REAL clean detector run still passes the step (rc=0), announces the clean tree and files NOTHING — the new assertion is not a blanket red"
+  else
+    bad "C8b: a real clean run behaved wrongly (detector rc=$c8b_detector_rc step rc=$clean_rc; want 0/0, clean line and no issue): $(tail -2 "$C7DIR/cleanrun/out.log")"
+  fi
+
+  # C9 — A FAILED `gh issue list` MUST NOT BECOME A PEER ISSUE (#4210 review P2, MEASURED). Under
+  # `set -uo pipefail` (no `-e`) the unchecked read yielded an EMPTY `existing`, which took the `else`
+  # and filed a brand-new PEER — the one thing this issue body and the fleet's hard rule forbid. Every
+  # other read in this change refuses on failure; this arm makes this one do the same.
+  listfail_rc="$(GH_FAIL='issue list' run_report "$SHIP" "$C7DIR/listfail")"
+  if [ "$listfail_rc" = 1 ] \
+     && ! grep -q '^gh issue create ' "$C7DIR/listfail/gh-calls.txt" \
+     && grep -q 'refusing to file a PEER' "$C7DIR/listfail/out.log"; then
+    ok "C9: a FAILED open-issue list files NOTHING and names the refusal (rc=$listfail_rc) — a failed read is not 'no open issue'"
+  else
+    bad "C9: a failed 'gh issue list' produced rc=$listfail_rc and filed $(grep -c '^gh issue create ' "$C7DIR/listfail/gh-calls.txt" 2>/dev/null) peer issue(s) — want rc 1, zero creates, refusal named: $(tail -2 "$C7DIR/listfail/out.log")"
+  fi
+
+  # C10 — A FAILED WRITE MUST NOT BE REPORTED AS A FILED REPORT (#4210 review P2). The final line used
+  # to assert "filed/updated an issue" unconditionally, so the step's own record of whether the tracker
+  # got the report carried no information — and the report is this batch lane's single deliverable.
+  createfail_rc="$(GH_FAIL='issue create' run_report "$SHIP" "$C7DIR/createfail")"
+  if [ "$createfail_rc" = 1 ] \
+     && grep -q '^gh issue create ' "$C7DIR/createfail/gh-calls.txt" \
+     && grep -q 'the report was NOT filed' "$C7DIR/createfail/out.log" \
+     && ! grep -q 'FILED an issue' "$C7DIR/createfail/out.log"; then
+    ok "C10: a FAILED 'gh issue create' is reported as NOT filed (rc=$createfail_rc) — the step no longer asserts a report that may not exist"
+  else
+    bad "C10: a failed create produced rc=$createfail_rc and the step still described the report as filed: $(tail -2 "$C7DIR/createfail/out.log")"
+  fi
+  # C11 — THE DISPATCH REASON IS RECORDED, BECAUSE THE INPUT PROMISES IT IS (#4210 review P3, MEASURED).
+  # `on.workflow_dispatch.inputs.reason` said "recorded in the run summary" and NO STEP READ IT, so the
+  # description was a claim about nothing. This drives it through the shipped step and reads the summary.
+  dispatch_rc="$(DISPATCH_REASON='investigating the rise from run 7' run_report "$SHIP" "$C7DIR/reasonrun")"
+  if grep -q '| reason | investigating the rise from run 7 |' "$C7DIR/reasonrun/summary.md" 2>/dev/null; then
+    ok "C11: a workflow_dispatch reason is WRITTEN INTO THE RUN SUMMARY by the shipped step (rc=$dispatch_rc) — the input's own description is now true"
+  else
+    bad "C11: the dispatch reason was not recorded in the run summary — the input's description is still a claim about nothing: $(head -3 "$C7DIR/reasonrun/summary.md" 2>/dev/null)"
+  fi
+
+  # C12 — rc=1 IS NOT ALWAYS A RISE (#4210 review P3, MEASURED). `check-portability-traps.sh:1974-1978`
+  # exits 1 for a JUSTIFICATION-LESS BASELINE ROW and does so BEFORE the NEW path (:1980) — no
+  # `baseline=` row is printed at all. That was titled "a rise the report could not parse", i.e. the ROW
+  # FORMAT was blamed for a different, real failure. The input here is produced by the REAL detector
+  # from a baseline whose column 4 is blank, so the discriminator is tested against the detector's own
+  # message rather than a hand-copied string.
+  CNOJUST="$C7DIR/nojust"
+  mkdir -p "$CNOJUST"
+  awk -F'\t' 'BEGIN{OFS="\t"} /^#/ {print; next} NF>=4 {$4=""; print; next} {print}' "$C7DIR/base.tsv" >"$C7DIR/base-nojust.tsv"
+  c12_rc=0
+  bash "$CHECK" --root "$RISE_TREE" --baseline "$C7DIR/base-nojust.tsv" >"$CNOJUST/findings.txt" 2>"$CNOJUST/verdict.txt" || c12_rc=$?
+  printf '%s\n' "$c12_rc" >"$CNOJUST/rc.txt"
+  nojust_rc="$(run_report "$SHIP" "$C7DIR/nojustrun" "$CNOJUST")"
+  nojust_title="$(title_of "$C7DIR/nojustrun")"
+  if [ "$c12_rc" = 1 ] && grep -q 'carry NO justification' "$CNOJUST/verdict.txt" \
+     && ! grep -q 'baseline=[0-9]' "$CNOJUST/verdict.txt" \
+     && case "$nojust_title" in *justification*) true ;; *) false ;; esac \
+     && case "$nojust_title" in *"could not parse"*) false ;; *) true ;; esac \
+     && [ "$nojust_rc" = 1 ] \
+     && ! grep -q 'reported a rise' "$C7DIR/nojustrun/issue-body.md"; then
+    ok "C12: a justification-less baseline row (rc=1, NO rise rows) is reported as ITS OWN cause, not as an unparseable rise ('$nojust_title')"
+  else
+    bad "C12: the justification-less case was mis-diagnosed (detector rc=$c12_rc title='$nojust_title' step rc=$nojust_rc; want a title naming the justification, never 'could not parse', and a body that does not claim a rise)"
+  fi
+
+  # C12b — rc>2 IS A REFUSAL, AND THE ISSUE BODY MUST NOT OPEN BY CLAIMING A RISE (#4210 review P3). A
+  # reader of the tracker got a false description of the incident, because the body's first sentence was
+  # unconditional prose rather than the incident the run actually measured.
+  CREF="$C7DIR/refused"
+  mkdir -p "$CREF"
+  printf '2\n' >"$CREF/rc.txt"
+  printf 'the scan could not read its target set\n' >"$CREF/findings.txt"
+  printf '❌ the target set is EMPTY — refusing to report a CLEAN over zero files\n' >"$CREF/verdict.txt"
+  ref_rc="$(run_report "$SHIP" "$C7DIR/refrun" "$CREF")"
+  ref_title="$(title_of "$C7DIR/refrun")"
+  if [ "$ref_rc" = 1 ] && case "$ref_title" in *REFUSED*) true ;; *) false ;; esac \
+     && ! grep -q 'reported a rise' "$C7DIR/refrun/issue-body.md" \
+     && grep -q 'REFUSED' "$C7DIR/refrun/issue-body.md"; then
+    ok "C12b: a REFUSED run (rc=2) files a body that says it was refused and does NOT claim a rise (title='$ref_title')"
+  else
+    bad "C12b: the rc=2 incident was described as a rise (title='$ref_title' step rc=$ref_rc) — the tracker got a false description"
+  fi
+else
+  bad "C8/C8b/C9/C10/C11/C12: skipped — the shipped reporting step could not be extracted (see C5)"
 fi
 
 printf '\nportability-scope.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$OS"

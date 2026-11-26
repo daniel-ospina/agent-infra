@@ -189,7 +189,15 @@ case "$created_epoch" in
   ''|*[!0-9]*) echo "❌ REFUSING: $WORKFLOW has no successful run and its registration date ('$created_iso') is unreadable — cannot tell 'just landed' from 'never ran'" >&2; exit 2 ;;
 esac
 age=$((now - created_epoch))
-[ "$age" -lt 0 ] && age=0
+# ⛔ A FUTURE REGISTRATION DATE IS REFUSED, NOT CLAMPED (review P3, MEASURED). This branch used to clamp
+# a negative age to 0, which reads as "registered just now" — i.e. it GRANTED the bootstrap window on a
+# payload anomaly, while the last-success branch two blocks above refuses the same input (and B7 asserts
+# that). #4210 acceptance 4 says a future timestamp is a refusal; clamping made the two branches disagree
+# about the same clock, and no arm (B3/B4/B7) could see it.
+if [ "$age" -lt 0 ]; then
+  echo "❌ REFUSING: $WORKFLOW has no successful run and its registration date ('$created_iso') is in the FUTURE relative to this clock — refusing to open a bootstrap window from a negative age" >&2
+  exit 2
+fi
 if [ "$age" -le "$max_secs" ]; then
   echo "NOTE bootstrap: $WORKFLOW has no successful run yet; it was registered ${created_iso} ($((age / 3600))h ago), inside the ${MAX_HOURS}h bootstrap window. The first scheduled run must appear before that window closes."
   exit 0
