@@ -1916,8 +1916,11 @@ refund_bailed_fixer() {
 # PR is parked with no owner. Absent BOTH markers reads NEEDS-REVIEW — the fail-closed direction,
 # because "nothing says findings exist" must never be spent as if it did.
 # ⛔ AND ONLY THE BLOCKING MARKER IS AN AUTHORISATION (agent-infra#4241). `state/advisory-<pr>-<head>`
-# is written by the same producer for a P3-ONLY (cosmetic) finding set: it is a RECORD for a later
-# sweep, NOT an authorisation. Reading it as findings sends a fixer to push over a certified branch
+# is written by the same producer for a P3-ONLY (cosmetic) finding set: it is a RECORD of that verdict,
+# NOT an authorisation — and ⛔ NOTHING SWEEPS IT. Do not claim a "later sweep" picks it up: its only
+# consumers are existence tests and the prunes, and `report.sh` queues `needsreview-*` only, so a
+# P3-only head never appears in the stale-evidence queue. Acting on the nits is a HUMAN decision, named
+# as one at the park. Reading it as findings sends a fixer to push over a certified branch
 # and invalidate the signed record that was already fine — a cosmetic nit destroying a certified
 # implementation, which is the destruction #4241 measures (3 consecutive cosmetic fix commits on
 # tortoise #14623; #14645 went `ai-review-gate=pass` -> red BECAUSE a fixer pushed to a green PR).
@@ -2133,9 +2136,16 @@ review_round_clear() { rm -rf "$O/state/reviewround-$1" 2>/dev/null || true; }
 # (`review_gate_state` returns NEEDS-FIX otherwise, and every NEEDS-FIX case is handled above it), so
 # everything countable here is a findings record left by a PREVIOUS head. Calling it `findings=` made
 # the line claim a currency it cannot observe; the honest question it answers is "what did earlier
-# heads leave unresolved", and where it says 0 the reviewer simply produced no usable verdict at the
-# live head. A `needsfix-<PR>-<head>` marker IS the findings record the fixer arm consumes, so
-# counting its heads is the honest measure of what is still open.
+# heads leave unresolved".
+# ⛔ AND 0 DOES **NOT** MEAN "THE REVIEWER PRODUCED NO USABLE VERDICT" (fresh review of #4241, P3 —
+# the sentence that stood here was false on both counts). An ADVISORY head (P3-only, cosmetic) DOES
+# reach this arm: `review_gate_state` reads it NEEDS-REVIEW because an advisory authorises nothing,
+# and an `advisory-*` record is not a `needsfix-*` marker, so it is invisible to this count BY
+# CONSTRUCTION. At such a head the reviewer produced a usable verdict and posted its comment. The park
+# reason at the ceiling therefore reads the advisory marker at the head itself
+# (`review_ceiling_reason`) instead of inferring a cause from this number.
+# A `needsfix-<PR>-<head>` marker IS the findings record the fixer arm consumes, so counting its heads
+# is the honest measure of what is still open.
 review_round_remaining() { # <pr>
   local n=0 heads="" f
   for f in "$O"/state/needsfix-"$1"-*; do
@@ -2177,6 +2187,37 @@ review_ceiling_report_only() { # [<max>]
 review_ceiling_line() { # <pr> <head> <n> <max>
   printf 'REVIEW-CEILING %s rounds=%s/%s head=%s %s' \
     "$1" "$3" "$4" "${2:-?}" "$(review_round_remaining "$1")"
+}
+# review_ceiling_reason <pr> <head> <n> <max> — the park REASON for the review-round ceiling, with
+# the ADVISORY discriminator applied at the head being parked.
+# ⛔ THE INVARIANT IT REPLACES WAS FALSE ON BOTH COUNTS (fresh review of #4241, P3 — MEASURED). The
+# reason claimed `stale_findings=0` means "the reviewer produced no usable verdict at the live head (a
+# live head WITH findings takes the fixer path and never reaches this line)". An advisory head IS
+# reachable here: it reads NEEDS-REVIEW (an advisory authorises nothing), its per-head budget is
+# deliberately PRESERVED, and the ceiling is keyed PER PR — so head A can spend most of the rounds and
+# a later P3-only head H parks here with `stale_findings=0` beside a verdict that DID exist and a
+# comment that WAS posted. `review_round_remaining` counts `needsfix-*` only, so an advisory record is
+# invisible to it by construction. The advisory marker at THIS head is the discriminator, exactly as
+# it is in the REVIEW-CAP reason above — and the remedy differs, because here a fix and a push IS the
+# legitimate route (the human acts on the nits), while a reviewer-budget remedy only re-arms cycles.
+review_ceiling_reason() { # <pr> <head> <n> <max>
+  local _rcl _common _tail _remedy
+  _rcl="$(review_ceiling_line "$1" "${2:-}" "$3" "$4")"
+  _common=" — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict."
+  # ⛔ THE REMEDY IS BUILT FROM THIS FUNCTION'S OWN ARGUMENTS, NOT FROM THE GLOBALS (fresh review of
+  # #4241, P3 — MEASURED). Interpolated into the sentence above it read `$O`/`$PR` from the caller's
+  # scope under `set -u`, so the helper was unusable outside the controller loop (`PR: unbound
+  # variable`) and silently printed an empty path wherever the global was unset. And the backticks
+  # around the rounds value MUST be escaped inside a double-quoted string: unescaped they are a
+  # COMMAND SUBSTITUTION, so the operator-facing reason said `⛔  is not a spent budget` — the same
+  # silent-erasure class 81ca77e51 fixed in the prompt heredocs, one string over.
+  _remedy=" ⛔ \`rounds=999999999\` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$1' '$O/state/parkreason-$1' '$O/state/parkorigin-$1' '$O/state/reviewround-$1' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"
+  if [ -f "$O/state/advisory-$1-${2:-}" ]; then
+    _tail=" ⛔ ADVISORY: this head's verdict is P3-ONLY (cosmetic), which is why stale_findings reads 0 — an advisory record is NOT a needsfix-* marker, so it is invisible to that count by construction. A usable verdict WAS produced and its comment WAS posted, so the reviewer's budget is NOT the cause: no fixer may be dispatched (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms this per-PR budget), or accept the nits.${_remedy}"
+  else
+    _tail=" stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 this head carries no findings marker AND no advisory record, so the reviewer produced no usable verdict at the live head. A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head).${_remedy}"
+  fi
+  printf '%s%s%s' "$_rcl" "$_common" "$_tail"
 }
 # [reviewround:end]
 
@@ -7848,10 +7889,14 @@ while true; do
               # pays for the review it exists to refuse is not a guard. The rounds already spent stand
               # — this line reports them, it does not retract them.
               _rrn="$(review_round_read "$PR")"
-              _rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
+              # ⛔ THE REASON IS BUILT BY `review_ceiling_reason`, WHICH READS THE ADVISORY MARKER AT
+              # THIS HEAD (fresh review of #4241, P3). Inlined here, the reason asserted the reviewer
+              # "produced no usable verdict at the live head" — false at a P3-only head, which is
+              # reachable on this arm by construction (see that function's note).
+              _rcl="$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
               # ⛔ THREE PLACES, so the diagnosis survives log-quiet (#943): the log, the ledger row
               # below, and the park reason file. A single `echo` is what #3331 measured being lost.
-              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then
                 echo "#$_rcl — review-round budget EXHAUSTED, PARKED (the next review is refused; a runaway guard, never a pass)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "parked: $_rcl — review budget exhausted, needs a human (bounded, never a silent stop)"
               else

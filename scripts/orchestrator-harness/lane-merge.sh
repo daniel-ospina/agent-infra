@@ -1296,17 +1296,6 @@ fi
   return 0
 }
 
-# chain_verdict_from_log — classify a FINISHED merge chain, from the artifacts that ACTUALLY exist.
-#
-# ⛔ IT MUST NOT READ THE CHAIN LOG FOR THE VERDICT (reviewer finding A1, verified against the
-# shipped writers). The chain log (`lane-merge-<PR>.log`, or `chain-<N>.log`) carries only the
-# chain's own progress lines and `merge-one rc=…`. The reviewer's outcome and the rail's verdict are
-# written by merge-one.sh to ITS log — `$O/logs/merge-<PR>.log` — as `ISSUES <n>` /
-# `NOT CLEAN or reviewer failed` / `MERGED via the rail` / `PARKED`, and the durable head-keyed
-# markers are `state/needsfix-<PR>-<head>`, `state/parked-<PR>` and `state/parkreason-<PR>`.
-# A classifier that greps only the chain log can never return FIX_REQUIRED, so every "the reviewer
-# found issues" outcome would reach the lane as a terminal BLOCK — the one path that turns a paid
-# review into work. The MARKERS are checked first: machine-written, and not mistakable for prose.
 # verdict_line_has_issues <line> — does this line name an issue COUNT >= 1, by merge-one.sh's rule?
 # ⛔ ONE DEFINITION OF A FINDINGS VERDICT (agent-infra#4241, parity P2). `merge-one.sh::verdict_class()`
 # decides whether the reviewer's last line reports findings: it TOLERATES a separator before the count
@@ -1368,6 +1357,17 @@ log_verdict_is_advisory() {
   return 1
 }
 
+# chain_verdict_from_log — classify a FINISHED merge chain, from the artifacts that ACTUALLY exist.
+#
+# ⛔ IT MUST NOT READ THE CHAIN LOG FOR THE VERDICT (reviewer finding A1, verified against the
+# shipped writers). The chain log (`lane-merge-<PR>.log`, or `chain-<N>.log`) carries only the
+# chain's own progress lines and `merge-one rc=…`. The reviewer's outcome and the rail's verdict are
+# written by merge-one.sh to ITS log — `$O/logs/merge-<PR>.log` — as `ISSUES <n>` /
+# `NOT CLEAN or reviewer failed` / `MERGED via the rail` / `PARKED`, and the durable head-keyed
+# markers are `state/needsfix-<PR>-<head>`, `state/parked-<PR>` and `state/parkreason-<PR>`.
+# A classifier that greps only the chain log can never return FIX_REQUIRED, so every "the reviewer
+# found issues" outcome would reach the lane as a terminal BLOCK — the one path that turns a paid
+# review into work. The MARKERS are checked first: machine-written, and not mistakable for prose.
 chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
   local clog="$1" mlog="$O/logs/merge-$PR.log" f seen_needsfix=0 at="${2:-${HEAD:-}}"
   # ⛔ `parked-<PR>` IS THE HEAD ITSELF (merge-one.sh:342), so EXISTENCE IS NOT A PARK AT THIS HEAD
