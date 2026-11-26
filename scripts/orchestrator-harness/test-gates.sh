@@ -3580,6 +3580,26 @@ ISSUES 2')"
       echo "  ❌ the ADVISORY reason contradicts its own stale_findings reading: [$(printf '%s' "$_r_stale" | cut -c1-260)]"; FAIL=$((FAIL+1))
     fi
     rm -f "$CO/state/advisory-2132-c0c0c0c0" "$CO/state/needsfix-2132-aaaa1111"
+    # ⛔ AND THE REASON IS WIRED TO THE ARM THAT PARKS (fresh review of #4242, P2 — MEASURED). Every row
+    # above drives the FUNCTION, and the (c4u) row in pr-dispatch renders it too — so reverting the call
+    # site to the pre-change expression makes `review_ceiling_reason` DEAD CODE (only a comment names it)
+    # while all four suites stay green, and no operator can ever see the advisory-aware diagnosis. This
+    # PR added a call-site pin for the severity argument and a presence pin for the REVIEW-CAP marker;
+    # the ceiling arm had no equivalent. Pin the exact call, then prove the pin live by reverting it.
+    if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$ORCH"; then
+      echo "  ✅ orch-loop.sh's REVIEW-CEILING arm PARKS the reason review_ceiling_reason builds (the advisory-aware one is wired, not dead code)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the REVIEW-CEILING arm no longer calls review_ceiling_reason — the advisory-aware diagnosis is DEAD CODE: the function is driven by these rows and rendered by (c4u), so the suite stays green while no operator ever sees it"; FAIL=$((FAIL+1))
+    fi
+    # MUTANT: revert ONLY that call site (to the pre-change `review_ceiling_line` shape) and require the
+    # pin above to red — otherwise the presence pin could be satisfied by a comment.
+    awk '{ if (index($0, "_rcl=\"$(review_ceiling_reason") > 0) gsub(/review_ceiling_reason/, "review_ceiling_line") } {print}' "$ORCH" > "$TMP/ceilwire.mut.sh"
+    sed -i 's/${MAX_REVIEW:-10})")"$//' "$TMP/ceilwire.mut.sh" 2>/dev/null || true
+    if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
+      echo "  ❌ MUTANT: the ceiling-wiring pin survives reverting the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ MUTANT: reverting the ceiling arm's call to review_ceiling_line makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
+    fi
   else
     echo "  ❌ could not extract review_ceiling_reason from orch-loop.sh — the ceiling's advisory discriminator is UNPROVEN, never green"; FAIL=$((FAIL+1))
   fi

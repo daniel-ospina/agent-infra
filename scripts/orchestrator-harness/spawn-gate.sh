@@ -3666,7 +3666,10 @@ cell_preflight_path() {
 # keys on 75 alone will mis-read a disk refusal, and a caller that keys on the exit status alone will
 # mis-read a `pi` that exited 75 for its own reason. That is why the early contract here named only the load gate, and
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
-# merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings (and, since
+# merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings — ⛔ EXCEPT a verdict
+# whose findings are P3-ONLY, which records `advisory-<PR>-<head>` and authorises NO fixer and NO push
+# (agent-infra#4241: the finding is real, the remedy is a human's decision, because a cosmetic push
+# moves the head and invalidates the signed CLEAN record) — (and, since
 # agent-infra#2132, a `needsreview-<PR>-<head>` one for a run that produced NO USABLE VERDICT — which
 # is wider than "unparseable": a bare or zero-count `ISSUES` line and an empty final message both
 # land there. What the marker means is "no evidence exists at this head", never "the reviewer found
