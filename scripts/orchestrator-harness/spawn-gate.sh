@@ -3669,7 +3669,9 @@ cell_preflight_path() {
 # merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings — ⛔ EXCEPT a verdict
 # whose findings are P3-ONLY, which records `advisory-<PR>-<head>` and authorises NO fixer and NO push
 # (agent-infra#4241: the finding is real, the remedy is a human's decision, because a cosmetic push
-# moves the head and invalidates the signed CLEAN record) — (and, since
+# moves the head and invalidates the SIGNED RECORD for that head — the reviewer's verdict, which for a
+# findings set is a `not-clean` record, never a CLEAN one; and a same-head `needsfix` marker that a
+# DIFFERENT reviewer already wrote still wins, so the advisory never demotes a real finding) — (and, since
 # agent-infra#2132, a `needsreview-<PR>-<head>` one for a run that produced NO USABLE VERDICT — which
 # is wider than "unparseable": a bare or zero-count `ISSUES` line and an empty final message both
 # land there. What the marker means is "no evidence exists at this head", never "the reviewer found
