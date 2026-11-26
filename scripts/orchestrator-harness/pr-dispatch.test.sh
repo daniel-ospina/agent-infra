@@ -2349,6 +2349,9 @@ _c4u_shape 'operand is a PREFIX of the book (.bak)' RED   "rm -rf '/x/state/revi
 _c4u_shape 'text ends at an UNTERMINATED quote'    RED   "rm -rf '/x/state/reviewround-77"
 _c4u_shape 'unterminated quote AFTER the book'     RED   "rm -rf '/x/state/reviewround-77' '/x/state/parked-77"
 _c4u_shape 'verb prefix ate the opening quote'     RED   "' rm -rf '/x/state/reviewround-77"
+_c4u_shape 'verb prefix ate the opening quote (dq)' RED  '" rm -rf "/x/state/reviewround-77'   # the mirror: the two
+#   quote arms each need their OWN row — deleting only the double-quote guard was measured SILENT (suite log
+#   byte-identical at 291/0), while the paste it accepts exits 127 and leaves the book DIRECTORY in place.
 _c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON
