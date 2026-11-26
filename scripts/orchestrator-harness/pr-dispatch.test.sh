@@ -2284,8 +2284,12 @@ _c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends wi
   case "${1:-}" in *"rm -rf "*) _rest="${1#*rm -rf }" ;; *) return 1 ;; esac
   while :; do
     case "$_rest" in
-      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"; _rest="${_rest#*"$_sq"}" ;;
-      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"; _rest="${_rest#*"$_dq"}" ;;
+      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1   # no closing quote = not an operand, and
+                 _rest="${_rest#*"$_sq"}" ;;                # paste of an unterminated quote removes NOTHING
+      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1
+                 _rest="${_rest#*"$_dq"}" ;;
       *) return 1 ;;
     esac
     case "$_op" in */"$2") return 0 ;; esac
