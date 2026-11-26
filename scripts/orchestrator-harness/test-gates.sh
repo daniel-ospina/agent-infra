@@ -3606,13 +3606,18 @@ ISSUES 2')"
     else
       echo "  ❌ the REVIEW-CEILING arm no longer calls review_ceiling_reason — the advisory-aware diagnosis is DEAD CODE: the function is driven by these rows and rendered by (c4u), so the suite stays green while no operator ever sees it"; FAIL=$((FAIL+1))
     fi
-    # MUTANT: delete ONLY the ceiling arm's active `_rcl=` assignment, then require the SAME predicate to
-    # red — otherwise the presence pin is matching something other than the shipped call (VACUOUS).
-    grep -vE '^[[:space:]]*_rcl=.*review_ceiling_reason' "$ORCH" > "$TMP/ceilwire.mut.sh"
-    if _ceil_wired "$TMP/ceilwire.mut.sh"; then
-      echo "  ❌ MUTANT: the ceiling-wiring pin survives removing the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
+    # MUTANT: REVERT the ceiling arm's call (`review_ceiling_reason` -> `review_ceiling_line`, the
+    # pre-change shape) and require the SAME predicate to red. ⛔ The revert must be an INDEPENDENT
+    # transform, never `grep -vE <pattern>` with the predicate's own pattern: `grep -vE P | grep -qE P`
+    # is unsatisfiable for every input, so that row printed "the pin is live" over a file whose call had
+    # ALREADY been removed (measured, round 2) — the exact silent-✅ class this PR exists to kill. The
+    # `changed` count also proves the transform applied: a no-op sed would leave the pin TRUE (VACUOUS).
+    sed -E '/^[[:space:]]*_rcl=.*review_ceiling_reason/s/review_ceiling_reason/review_ceiling_line/' "$ORCH" > "$TMP/ceilwire.mut.sh"
+    _ceil_changed="$(diff "$ORCH" "$TMP/ceilwire.mut.sh" 2>/dev/null | grep -c '^<' || true)"
+    if [ "${_ceil_changed:-0}" -eq 1 ] && ! _ceil_wired "$TMP/ceilwire.mut.sh"; then
+      echo "  ✅ MUTANT: reverting the ceiling arm's call to review_ceiling_line (one line changed) makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
     else
-      echo "  ✅ MUTANT: removing the ceiling arm's call makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
+      echo "  ❌ MUTANT: the ceiling-wiring pin does not react to the call being reverted (lines changed=${_ceil_changed:-0} — 0 means the transform no-opped, >1 means it touched more than the call); the pin is VACUOUS"; FAIL=$((FAIL+1))
     fi
     # MUTANT (CONSUMER leg): park a LITERAL instead of `$_rcl`. The presence-only draft stayed GREEN on this
     # (measured, fresh review of #4249 P3) — the reason was computed and discarded. The mutant's OWN
