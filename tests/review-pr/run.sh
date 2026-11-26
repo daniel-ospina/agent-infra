@@ -106,6 +106,16 @@
 #      exit 6, and so is a marker placed BEFORE the verdict — the presence of the block is not proof
 #      that a reviewer concluded anything (P2 finding, measured at the first review of this change)
 #
+#   §BU (#4233) THE MARKER SUPPLIES AN **ISSUES** VERDICT — NEVER A CLEAN ONE. A reviewer that
+#      concluded with `REVIEW_VERDICT: ISSUES` / `FINDINGS_BLOCKING: 3` and NO prose verdict line was
+#      answered `no verdict — re-run` and its three named findings were discarded; a prose `CLEAN` over
+#      the SAME block was answered `a self-contradicting CLEAN verdict`. One input shape, two names, and
+#      neither printed what the parser had read. The marker now SUPPLIES the refusal direction (count
+#      READABLE and > 0, count line at or after the verdict field) and still may never supply CLEAN
+#      (`ISSUES` over a zero stays exit 6 — the #2670 grant-direction pin), with a MUTATION control
+#      proving the arm is what reads it and a fence/quotation arm proving repetition is not a verdict.
+#      The unparseable arm now prints every field it matched and refuses to prescribe a blind re-run.
+#
 #   §BK (#3987) the CLEAN ARTIFACT carries the MUTATION ATTRIBUTION block `record-review.sh`
 #      demands: the reviewer's own section is extracted and published in the evidence comment, the
 #      POSTED artifact is judged by the recorder's OWN predicate (`brief-gate.sh --mutation-missing`),
@@ -4505,6 +4515,102 @@ SEAM_OC_PAT="$(eval "$SEAM_OCL"; printf '%s' "${_RECORDER_OC_DECL_RE:-}")"
 grep -qF '\[ADVERSARIAL-BOUND\]' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…the adversarial-bound token the mirror refuses is still one the recorder triggers on"
 grep -qF 'residuals=[[:space:]]*' "$ROOT/scripts/record-review.sh" 2>/dev/null; ck $? "…and 'residuals=' is still the field its arm (iii) demands (the recorder still extracts `residuals=[[:space:]]*…`), so the mirror's refusal condition still matches"
 # ══ end §BT ══
+
+# ── §BU THE MARKER SUPPLIES AN **ISSUES** VERDICT — AND NEVER A CLEAN ONE (agent-infra#4233) ─────
+# ⛔ WHY THIS SECTION EXISTS. `review-pr.sh` answered `no verdict from the reviewer — re-run` for a run
+# whose reviewer had emitted a COMPLETE, machine-readable verdict — `REVIEW_VERDICT: ISSUES` /
+# `FINDINGS_BLOCKING: 3` — with rc=0, 599 s, a finished reviewer and three named [P2] findings. All of
+# them were discarded. `VWORD` is derived only from the last PROSE verdict-shaped line, so a reviewer
+# that concluded with exactly the block this file's prompt demands, and no separate `CLEAN` /
+# `ISSUES <n>` line, had no verdict at all — and the operator was told to re-run into the same discard.
+# The SAME block had been called `a self-contradicting CLEAN verdict` one round earlier (a prose CLEAN
+# over it), i.e. one input shape, two names, and neither named the lines it had matched.
+# ⛔ THE #2670 DECISION IS NOT WEAKENED, AND (4) BELOW IS ITS PIN: the marker may QUALIFY a verdict, and
+# now may SUPPLY the REFUSAL direction (`ISSUES`), which records nothing — never `CLEAN`. A restated
+# contract block still mints nothing (§AQ(5b)), and `ISSUES` over a zero still supplies nothing.
+echo; echo "§BU the marker supplies an ISSUES verdict (agent-infra#4233) — and never a clean one"
+
+# (1) THE ISSUE'S OWN ACCEPTANCE CASE: marker-only, ISSUES over 3 => ISSUES, findings printed, no record.
+reset; FIXTURE_NO_MARKER=1
+printf '[P2] .github/workflows/portability-tree-scan.yml:161-163 — the title parser reads the wrong field\n[P2] .github/workflows/portability-tree-scan.yml:131 — n is grep -c\n[P2] scripts/check-portability-scope.test.sh:511-522 — C7 does not test the pipeline it claims to\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 3\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "marker-only 'REVIEW_VERDICT: ISSUES' + 'FINDINGS_BLOCKING: 3' is an ISSUES verdict, not 'no verdict' (rc=$(rc_of), agent-infra#4233)"
+no_record; ck $? "  ...nothing recorded — the marker may only ever supply the REFUSAL direction"
+err_not_has "NO VERDICT"; ck $? "  ...and the paid review is not discarded as a reviewer failure"
+err_has "STRUCTURED verdict marker reports 3 blocking finding(s)"; ck $? "  ...the refusal names the COUNT the marker carried"
+err_has "marker line: REVIEW_VERDICT: ISSUES"; ck $? "  ...and the marker line, so the reader is not left with an oracle"
+out_has "the title parser reads the wrong field"; ck $? "  ...and the three findings are PRINTED (they were lost before: no fixer ever saw them)"
+
+# (2) MUTATION CONTROL: the arm is what makes (1) pass. Force the flag off and the SAME transcript is
+# the old exit 6 — so (1) cannot be satisfied by some other widening landing underneath it.
+BU="$TMP/mutant-no-marker-issues.sh"
+sed 's/^  MK_ISSUES_BLOCK=1$/  MK_ISSUES_BLOCK=0/' "$SRC" > "$BU"
+if cmp -s "$SRC" "$BU"; then
+  fail "the marker-supplies-ISSUES mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MARKER=1
+  printf '[P2] a.sh:1 - x\n[P2] b.sh:2 - y\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 2\n' > "$TMP/reviewer-out"
+  run "$BU" 2284
+  [ "$(rc_of)" = "6" ]; ck $? "the MUTANT without the arm answers 6 again (rc=$(rc_of)) - so the arm is what reads the marker, not an earlier gate"
+  no_record; ck $? "  ...and records nothing either way"
+fi
+
+# (3) THE BLOCK MUST BE A BLOCK, NOT TWO SCATTERED LINES: a count line BEFORE the verdict field cannot
+# be assembled into a conclusion, and the refusal says exactly what it read (issue #4233, part 2).
+reset; FIXTURE_NO_MARKER=1
+printf 'FINDINGS_BLOCKING: 3\nsome prose in between\nREVIEW_VERDICT: ISSUES\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a count line ABOVE the verdict field does not supply a verdict (rc=$(rc_of)) — the prompt puts the block after it"
+no_record; ck $? "  ...nothing recorded"
+err_has "WHAT THIS PARSER READ"; ck $? "  ...and the refusal prints WHAT IT READ instead of asserting an absence"
+err_has "FINDINGS_BLOCKING line     : FINDINGS_BLOCKING: 3"; ck $? "  ...including the count line it matched"
+err_has "blind re-run reproduces"; ck $? "  ...and does not send the operator into the same 10-minute discard"
+
+# (4) ⛔ THE ANTI-FAIL-OPEN PIN — THE ONE DIRECTION THE MARKER MAY NEVER SUPPLY. `ISSUES` over a ZERO is
+# the same statement as `ISSUES 0`, which is CLEAN; letting the marker supply THAT would be the measured
+# #2670 fail-open (a restatement minting a signed clean record). It must still be exit 6, no record.
+reset; FIXTURE_NO_MARKER=1
+printf 'my notes\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "'REVIEW_VERDICT: ISSUES' over FINDINGS_BLOCKING: 0 supplies NO verdict (rc=$(rc_of), want 6) - the marker cannot grant clean"
+no_record; ck $? "  ...nothing recorded"
+err_has "marker verdict / count read: issues / 0"; ck $? "  ...and the refusal names the fields it decoded, so 'nothing' and 'zero' are distinguishable"
+
+# (4b) A QUOTED marker supplies nothing either — the marker is read from the same fence-filtered region as
+# the prose verdict, so repeating somebody else's ISSUES block cannot become a conclusion.
+reset; FIXTURE_NO_MARKER=1
+printf 'An earlier head already carried this:\n```\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 3\n```\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a FENCED ISSUES marker is a quotation, never a verdict (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+
+# (5) ONE INPUT SHAPE, ONE OUTCOME: a prose CLEAN over the same block reaches the SAME diagnosis through
+# the SAME function, instead of a second name for the same conclusion.
+reset; FIXTURE_NO_MARKER=1
+printf '[P2] a.sh:1 - x\nCLEAN\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 3\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a prose CLEAN over a marker reporting 3 blockers is an ISSUES review (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+err_has "STRUCTURED verdict marker reports 3 blocking finding(s)"; ck $? "  ...reported by the SAME diagnosis the no-prose-line arm uses (one shape, one name)"
+
+# (5b) ANTI-WALL: the conversion must NOT swallow the CLEAN-side contradiction arm. A marker that says
+# `CLEAN` over a NON-ZERO count is not the ISSUES direction and stays its own refusal (§AQ(2)).
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 7\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "'REVIEW_VERDICT: CLEAN' over FINDINGS_BLOCKING: 7 is still refused as a contradiction (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+err_has "marker reports 7 blocking finding(s) while the verdict is CLEAN"; ck $? "  ...by its OWN arm, not by the ISSUES conversion"
+
+# (6) ANTI-WALL, THE OTHER WAY: the ordinary clean path still records, through the marker, unchanged.
+reset; FIXTURE_NO_MARKER=1
+printf 'Nothing blocks.\nCLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a marker saying CLEAN over a zero still RECORDS (rc=$(rc_of))"
+grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "  ...verdict=clean, bound to the reviewed head"
+rm -f "$BU"; reset
+# ══ end §BU ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

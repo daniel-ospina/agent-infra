@@ -6777,6 +6777,16 @@ if [ -s "$MERGE" ]; then
     m3="$( O="$vdir" PR=43 HEAD="" L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES' _ "$TMP/verdict.sh" )"
     [ -z "$(ls -A "$vdir/state" 2>/dev/null)" ] && rc=0 || rc=1
     ck "review_state_record: an empty head writes no marker (a marker must name a head)" $rc
+    # ⛔ #4241: a P3-ONLY finding set is an ADVISORY — the fixer marker is what authorises the push
+    # that invalidates an already-certified record, so a cosmetic nit must never write it.
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/advisory-* "$vdir"/state/reviewcount-* "$vdir"/state/reviewdisp-* 2>/dev/null
+    m4="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES ADVISORY' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/advisory-42-abc123" ] && [ ! -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: an ADVISORY (P3-only) writes the advisory record, NEVER the fixer marker" $rc
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/advisory-* "$vdir"/state/reviewcount-* "$vdir"/state/reviewdisp-* 2>/dev/null
+    m5="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES something-else' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/needsfix-42-abc123" ] && [ ! -f "$vdir/state/advisory-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: an UNRECOGNISED severity is BLOCKING (fail closed, never a silent downgrade)" $rc
   else
     ck "merge-one.sh carries verdict_class/review_state_record (#2132)" 1
   fi

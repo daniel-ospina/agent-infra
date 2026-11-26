@@ -847,6 +847,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "#2573 — how long a `cloud-cell-<pid>.<rand>` temp dir must have been untouched before the hygiene role may reclaim it, once its embedded pid is provably gone. The pid is the primary proof; this floor is the SECOND gate that covers pid RECYCLING (the name's pid can be dead now and have belonged to something else by the time the dir was written). A zero floor makes the recycling hole unbounded, which is why the loader refuses it by name rather than silently accepting a vacuous bound.",
   },
   {
+    name: "RETRY_STAGED_MAX_AGE_MS",
+    owners: ["extensions/reflect-hook.ts"],
+    value: "= 6 * 60 * 60 * 1000;",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "agent-infra#4108 (introduced in #4147, REGISTERED here from #4237) — how old a STAGED capture-retry body must be before the sweep may unlink it, once its worker is provably gone. The same two-gate shape as HYGIENE_TMP_MIN_AGE_S: the PRIMARY proof is the worker's absence (a live worker deletes its own body on every one of its exits — LANDED, TERMINAL, EXHAUSTED, ABORTED — so a body this old belongs to a worker killed mid-wait), and the age floor is the SECOND gate that covers the reboot/SIGKILL/OOM case, where nothing deletes anything and a full transcript would otherwise sit in `~/.tortoise/capture-retry/` for ever. 6 h is 60× the 360 s worst case a live worker can hold a body (RETRY_MAX_ATTEMPTS-1 = 3 waits, each clamped to RETRY_MAX_WAIT_MS = 120 s), so no live retry can ever be swept. ⚠️ DISCLOSED, not claimed: this row pins the LITERAL (the forward scan asserts `= 6 * 60 * 60 * 1000;` in the owner) and NOT the sweep's behaviour — `sweepStaleStaged` is module-private and no suite calls it, which is how the bound shipped unregistered and unnoticed until the reverse scan caught it. A behaviour pin (young body KEPT, past-floor body UNLINKED, unreadable stat never throwing) is owed and is not claimed here.",
+  },
+  {
     name: "LANE_IDLE_MIN",
     owners: ["scripts/orchestrator-harness/lane-reap.sh"],
     value: "${LANE_REAP_IDLE_MIN:-120}",
@@ -1725,6 +1733,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "durable task-run RECORD retention age (7 days) in shared/task-runs.ts — a disk-retention backstop for the run-record/log tree, not a session or child liveness bound (the byte cap binds first in practice); paired with the live-pid / settle-grace guard so it never evicts an in-flight lane",
     owner: "#1662",
+  },
+  {
+    symbol: "REC_DEPLOYED_AGE",
+    rationale:
+      "a MEASURED age in seconds — the wall age of the commit this box actually RUNS (`now - commit_ct`), stamped into the pass record as `deployed_age_s` and printed by `fleet-health.py` as \"running code 6d old\" — never a bound (agent-infra#4237). The staleness DECISION is made by `harness-apply-pass.sh`'s own grade (the farm's content fingerprint and the `origin/main..ref` relation); this number is what a READER judges that grade against, which is why nothing compares against it. The `_AGE` suffix rule matches its initializer and its `unknown` pre-assignment, and registering it as a term would put a measurement in a vocabulary of bounds — the same rationale as CR_AGE (#2246), CIQ_AGE (#2426) and LANE_ARM_SNAPSHOT_AGE (#1567). ⛔ The failure this exemption guards against is the reason #4237 existed at all: a stale-farm red carried NO age anywhere, so a six-day-old farm read as healthy, and the fix is to MEASURE the age and publish it, never to register it as a bound",
+    owner: "#4237",
   },
 ];
 

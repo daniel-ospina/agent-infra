@@ -1544,6 +1544,53 @@ if [ "$(marker_field_word 'REVIEW_VERDICT: CLEAN')" != clean ] \
    || [ -z "$(printf '%s\n' 'FINDINGS_BLOCKING: 0' | grep -aE "$VD_MK_COUNT")" ]; then
   die "$E_SCAN" "the structured-verdict marker reader failed its own canary ('REVIEW_VERDICT: CLEAN' / 'FINDINGS_BLOCKING: 0') — it compiled but is not working, so it cannot be shown to have run and no verdict is recorded (transcript: $TRANSCRIPT)"
 fi
+# ⛔ THE MARKER MAY **SUPPLY** AN `ISSUES` VERDICT — NEVER A `CLEAN` ONE (issue #4233).
+# MEASURED. A reviewer that concluded with exactly the block this file's own prompt demands —
+#     REVIEW_VERDICT: ISSUES
+#     FINDINGS_BLOCKING: 3
+# and no separate prose `CLEAN` / `ISSUES <n>` line, was answered `no verdict from the reviewer —
+# re-run`: rc=0, 599 s, a finished reviewer, three named `[P2]` findings, all of them DISCARDED as if
+# the reviewer had never concluded. The SAME input shape was called `a self-contradicting CLEAN
+# verdict` one round earlier — two names for one block, and neither message named the lines it could
+# not read. That is the defect (issue #4233, category A: `no verdict` reads as "not yet reviewed" and
+# invites a re-run until the wrapper happens to emit `clean`, which turns a discarded refusal into an
+# attested PASS).
+# ⛔ AND IT IS NOT THE FAIL-OPEN THE #2670 REVIEW MEASURED AWAY. That review measured the marker
+# SUPPLYING A **CLEAN** verdict: a transcript that merely RESTATED the prompt's contract block
+# (`REVIEW_VERDICT: CLEAN` / `FINDINGS_BLOCKING: 0`) minted a signed clean record with no conclusion
+# in it. The rule it established — the marker qualifies a verdict, it does not grant one — is about
+# the GRANT direction and is preserved EXACTLY here: this arm can only ever produce `ISSUES`, which
+# records NOTHING and prints the findings. The two directions are not symmetric in consequence (a
+# false ISSUES costs a diagnosis; a false CLEAN is the signed attestation this whole file exists to
+# prevent), which is the asymmetry this file states everywhere else: a second reader "can only ever
+# REFUSE, never GRANT".
+# THE BLOCK MUST BE A BLOCK: the count has to sit on a line at or after the verdict field (the
+# prompt's "two lines after"), so two unrelated marker-shaped lines scattered through the transcript
+# cannot be assembled into a conclusion. And the count must be READABLE and NON-ZERO — a marker
+# asserting `CLEAN`, or `ISSUES` over a zero (the same statement as `ISSUES 0`, i.e. clean, §AQ(4b)),
+# supplies nothing and the run refuses exactly as it did before.
+M2_LINENO="$(grep -av $'^\001' "$SURVIVORS_FILE" 2>/dev/null \
+            | grep -anE "$VD_MK_COUNT" | tail -1 | cut -d: -f1)"
+MK_ISSUES_BLOCK=0
+if [ "${MK_VERDICT:-}" = issues ] && [ -n "${MK_COUNT:-}" ] \
+   && [ "${MK_COUNT:-0}" -gt 0 ] 2>/dev/null \
+   && [ -n "${M_LINENO:-}" ] && [ -n "${M2_LINENO:-}" ] \
+   && [ "${M2_LINENO}" -ge "${M_LINENO}" ] 2>/dev/null; then
+  MK_ISSUES_BLOCK=1
+fi
+# ⛔ ONE PLACE WHERE A MARKER BECOMES AN ISSUES VERDICT (issue #4233). Both entry points — a
+# transcript with NO prose verdict line at all, and a prose `CLEAN` the reviewer's own primary
+# channel contradicts — reach the same conclusion through the same sentences, so the same input
+# shape can no longer be reported as two different things depending on which field a reader latched
+# onto. It deliberately does NOT post anything by itself: it sets the verdict, and the ONE issues
+# path below decides what is published (which is no record, ever).
+marker_issues_verdict() {
+  err "$PROG: the reviewer's STRUCTURED verdict marker reports $MK_COUNT blocking finding(s) — this is an ISSUES review, not a missing verdict and not a clean one."
+  err "  marker line: $MK_VERDICT_LINE"
+  err "  count line:  $MK_COUNT_LINE"
+  err "  The marker is the PRIMARY channel (issue #2670), so the count is a field and not a reading of the reviewer's English. The ISSUES verdict stands, its findings are printed below, and NO record is written."
+  VERDICT=issues; ISSUE_N="$MK_COUNT"
+}
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
 # A finding line LEADS with its severity; mid-line mentions are prose, not findings. See the
@@ -2421,28 +2468,38 @@ VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' '
 # definition of "a verdict line" and it is still the reviewer's own.
 case "$VWORD" in
   clean)
-    # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
-    # FAIL-OPEN class — fresh review of #2288). The count reader above already parsed the
-    # contradiction out of the accepted line, and this arm then THREW IT AWAY, so
-    # `**Verdict:** CLEAN — actually ISSUES 2: …` recorded `clean` with `ISSUE_N=2` in hand — and no
-    # P-token on the line meant the severity contradiction gate could not see it either. The
-    # first-word rule (the verdict WORD) is deliberate and unchanged; this is the other channel that
-    # was already measured and discarded. A reviewer that means clean reports no count, so the
-    # refusal only ever fires on a line that contradicts itself.
-    if [ -n "${ISSUE_N:-}" ] && [ "${ISSUE_N:-0}" -gt 0 ]; then
-      err "$PROG: the verdict line says CLEAN and also carries an ISSUES count of ${ISSUE_N} — a line cannot be both, so this is a verdict of convenience, not a clean review."
-      err "  accepted verdict line: $LAST"
-      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
-    fi
-    # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
-    # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
-    # (P0, fresh review at a8656b9; the full rationale lives on the function). That function now also
-    # reads EVERY verdict-shaped line in the accepted region, not only $LAST (P1/P2, fresh review of
-    # #2288: a counted CLEAN, or an `ISSUES 2`, one line above a bare `CLEAN`, recorded clean).
-    refuse_counted_clean
+    # ⛔ THE REVIEWER'S OWN PRIMARY CHANNEL CONTRADICTS ITS PROSE (issue #4233). `CLEAN` in prose
+    # over a marker reading `REVIEW_VERDICT: ISSUES` / `FINDINGS_BLOCKING: 3` is ONE input shape, and
+    # it used to be refused as `a self-contradicting CLEAN verdict` while the SAME block with no
+    # prose line was refused as `no verdict` — two names for one conclusion, neither naming the
+    # lines it read. The marker's ISSUES direction is the fail-closed one (nothing is recorded
+    # either way), so it wins, through the same message the no-prose-line arm uses.
+    if [ "$MK_ISSUES_BLOCK" = 1 ]; then
+      marker_issues_verdict
+    else
+      # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
+      # FAIL-OPEN class — fresh review of #2288). The count reader above already parsed the
+      # contradiction out of the accepted line, and this arm then THREW IT AWAY, so
+      # `**Verdict:** CLEAN — actually ISSUES 2: …` recorded `clean` with `ISSUE_N=2` in hand — and no
+      # P-token on the line meant the severity contradiction gate could not see it either. The
+      # first-word rule (the verdict WORD) is deliberate and unchanged; this is the other channel that
+      # was already measured and discarded. A reviewer that means clean reports no count, so the
+      # refusal only ever fires on a line that contradicts itself.
+      if [ -n "${ISSUE_N:-}" ] && [ "${ISSUE_N:-0}" -gt 0 ]; then
+        err "$PROG: the verdict line says CLEAN and also carries an ISSUES count of ${ISSUE_N} — a line cannot be both, so this is a verdict of convenience, not a clean review."
+        err "  accepted verdict line: $LAST"
+        err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+        die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
+      fi
+      # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
+      # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
+      # (P0, fresh review at a8656b9; the full rationale lives on the function). That function now also
+      # reads EVERY verdict-shaped line in the accepted region, not only $LAST (P1/P2, fresh review of
+      # #2288: a counted CLEAN, or an `ISSUES 2`, one line above a bare `CLEAN`, recorded clean).
+      refuse_counted_clean
 
-    VERDICT=clean ;;   # a CLEAN line carries no count of its own
+      VERDICT=clean   # a CLEAN line carries no count of its own
+    fi ;;
   issues)
     VERDICT=issues
     # ⛔ THE MARKER CAN CONTRADICT THE PROSE IN THIS DIRECTION TOO — and the ISSUES verdict still
@@ -2473,12 +2530,31 @@ case "$VWORD" in
       [ "${ISSUE_N:-0}" -gt 0 ] || ISSUE_N=1
     fi ;;
   *)
-    err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line AND no structured verdict marker in its transcript (rc=$AGENT_RC)."
+    # ⛔ THE MARKER SUPPLIES AN ISSUES VERDICT WHEN THERE IS NO PROSE LINE AT ALL (issue #4233 — the
+    # measured case: `REVIEW_VERDICT: ISSUES` / `FINDINGS_BLOCKING: 3` and nothing else shaped).
+    # Without this the paid review above is discarded and the operator is told to re-run into the
+    # same discard, which is the false-PASS generator the issue was filed over.
+    if [ "$MK_ISSUES_BLOCK" = 1 ]; then
+      marker_issues_verdict
+    else
+    # ⛔ A READER THAT FAILS SILENTLY IS THE WHOLE BUG; A READER THAT FAILS LOUDLY WITH ITS INPUT IS A
+    # DIAGNOSIS (issue #4233, part 2 of the required fix). Everything this parser matched is printed,
+    # so an operator can see WHICH field was unreadable instead of being handed an oracle's `no
+    # verdict`. And the remedy is not a blind re-run: a re-run of the same reviewer reproduces the
+    # same discard, which is ten minutes and one identical transcript.
+    err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line AND no usable structured verdict marker in its transcript (rc=$AGENT_RC)."
+    err "  WHAT THIS PARSER READ, so the refusal names its input instead of asserting an absence:"
+    err "    prose verdict line accepted : ${LAST:-<none — no verdict-shaped line at all>}"
+    err "    REVIEW_VERDICT line        : ${MK_VERDICT_LINE:-<none>}"
+    err "    FINDINGS_BLOCKING line     : ${MK_COUNT_LINE:-<none>}"
+    err "    marker verdict / count read: ${MK_VERDICT:-<unreadable>} / ${MK_COUNT:-<unreadable>}"
+    err "  A marker reading ISSUES over a NON-ZERO count is a verdict (it records nothing and its findings are printed); anything else is not a conclusion this parser can read."
     err "  This is a reviewer failure (crash, wall-clock cap, provider refusal, or a final message that broke the format). Nothing was posted and NO record was written."
-    err "  The contract requires, after the verdict line: 'REVIEW_VERDICT: CLEAN' and 'FINDINGS_BLOCKING: 0'."
+    err "  The contract requires, after the verdict line: 'REVIEW_VERDICT: CLEAN' (or ISSUES) and 'FINDINGS_BLOCKING: <n>'."
     err "  Last 20 transcript lines:"
     tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
-    die "$E_NOVERDICT" "no verdict from the reviewer — re-run (transcript: $TRANSCRIPT)" ;;
+    die "$E_NOVERDICT" "no verdict from the reviewer — the transcript above is the input; a blind re-run reproduces this discard (transcript: $TRANSCRIPT)"
+    fi ;;
 esac
 
 # ⛔ `ISSUES 0` IS CLEAN; `ISSUES n` FOR n > 0 IS NOT, AND NOTHING CONVERTS IT (P2, sixth

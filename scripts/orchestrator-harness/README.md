@@ -398,6 +398,8 @@ a killed worker cannot take the controller down with it.
                         2. CLEAN   → record-review.sh (HMAC-signed marker into the PR body)
                                      → wait for ai-review-gate SUCCESS → gh pr merge --squash
                             ISSUES  → touch state/needsfix-<PR>-<head>   ← hands off to the fixer path
+                            ISSUES..P3 → touch state/advisory-<PR>-<head> ← a COSMETIC (P3-only)
+                                     finding set: a RECORD, never a fixer authorisation (agent-infra#4241)
                           no verdict → touch state/needsreview-<PR>-<head>  ← re-runs the REVIEW; never
                                      a fixer, and bounded by MAX_REVIEW_TRIES (agent-infra#2132)
                         rail mode (the repo does NOT require the gate — e.g. agent-infra):
@@ -457,6 +459,7 @@ a killed worker cannot take the controller down with it.
 | `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge/**fix** a given PR. Taken by `merge-one.sh`, by the doctor's `merge` role, and — since the pusher hole was closed (#2574) — by `fix-one.sh`, the one worker whose product is a NEW HEAD: without it a lander could re-resolve a head that a fixer then moved under it, and the rail refuses with the just-minted attestation stale. A LIVE holder makes the fixer DEFER with a refundable bail marker and no attempt consumed. A claim whose pid `kill -0` proves GONE is TAKEN OVER — measured, and by `mv` aside + verify, never `rm && write`: the record is renamed aside, what was detached is checked against the dead pid that was measured, and a record that turns out to be a peer's LIVE claim is put back with `ln` (create-if-absent) **if the path is still free** — if a third party has re-claimed it in between, the displaced claim cannot be reinstated, which is logged as a WARNING and reported as its own deferral (never as "nothing was deleted"). `fix-one.sh` also CREATES the record with its pid already in it (a pre-written file `ln`-ed into place), because a noclobber create that writes the pid afterwards leaves the file briefly EMPTY and the other three readers treat "no owner" as a reason to `rm` it. An EMPTY or unparseable record is **not** stale ON ITS CONTENT ALONE (that same window), so content alone never reaps it. ⛔ AN EMPTY RECORD THAT HAS OUTLIVED ANY POSSIBLE CREATE WINDOW IS A MEASUREMENT, NOT AN INFERENCE (agent-infra#3096): `fix-one.sh`'s `prlock_no_owner_abandoned` and `pr-owner-liveness.sh`'s `pl_verdict` both reclaim one whose `find -mmin` age exceeds `PRLOCK_NO_OWNER_GRACE_MIN` (default 2 m — microseconds vs the 21 h measured on the cells), by detach-and-verify, never `rm && write`. Before that reconcile the two verdicts DISAGREED for one state — `pl_verdict` answered OWNED for a 21-hour-old 0-byte record while `pr_owned` counted the PR un-owned — so the controller spawned nothing for a PR nothing owned and the issue path stayed shut. The `OVERRIDES`-style departure from the earlier literal rule is marked in `pr-owner-liveness.sh`'s header with its evidence; the rule it protects (never reap on emptiness ALONE) is unchanged. A lock state no re-dispatch can clear (a path that is not a regular file, or an unwritable `$O/state`) is REFUSED and the attempt is CONSUMED, so `MAX_FIX_TRIES` parks the PR instead of a refunded spin. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
 | `state/needsfix-<PR>-<head>` | "a reviewer reported real issues at this exact head" — the only state that authorises a fixer ON THE REVIEW-GATE ARM (the CI-red and CONFLICTING arms dispatch on a red required check / an unmergeable head with no marker at all, by design). Deleted when a fixer is spawned, and cleared by a CLEAN verdict whose signed marker VERIFIED at that head; a verdict-less run never deletes it (nothing was pushed, so it supersedes nothing) |
+| `state/advisory-<PR>-<head>` | "the reviewer's findings at this exact head were P3-ONLY (cosmetic)" — a RECORD, and it AUTHORISES NOTHING: no fixer, no push. ⛔ IT DOES NOT END THE REVIEW EITHER: the head still reads NEEDS-REVIEW, so the review arm may spend a BOUNDED re-review at it (`MAX_REVIEW_TRIES`), and the marker is deliberately NOT allowed to reset `reviewdisp-<PR>` — the head does not move on a cosmetic verdict, so that budget is the only thing bounding the loop. At the cap the head PARKS with a reason that reads this marker and says the findings were P3-only, instead of claiming the reviewer never produced a verdict. Written by `merge-one.sh::review_state_record` when `finding_severity()` reads a P3-only rank off the reporter's verdict line (`ISSUES <n> P3`), so a prose nit can no longer authorise the push that invalidates an already-certified review record (agent-infra#4241). ⛔ AN ABSENT RANK IS BLOCKING, NOT ADVISORY: a legacy `ISSUES <n>` line, an empty severity and any value the helper never emits all keep the `needsfix` write — the demotion is an allow-list, because a format drift must never become a silent downgrade of the gate. Pruned with its siblings at a new verdict and cleared by `review_state_clear` when a verified CLEAN supersedes it at that head |
 | `state/needsreview-<PR>-<head>` | "a reviewer run at this head produced NO usable verdict" — the remedy is another REVIEW, never a fixer (agent-infra#2132). Written by `merge-one.sh` ONLY (the controller cannot see whether evidence exists). One marker per PR; swept when a GATE-authority PR goes GREEN, when the PR is MERGED/CLOSED, when the signed marker verifies, and by `prune_orphan_markers` once per cycle for PRs that left the open listing (never for a marker newer than the listing). On a rail repo GREEN does not imply evidence, so the sweep does not run there |
 | `state/reviewcount-<PR>` | **RETIRED** (agent-infra#2971): its `"<head> <n>"` budget is now the `state/reviewdisp-<PR>` record below — ONE budget shared by the two arms instead of two books neither could see. A leftover file is inert and is deleted wherever the old one was |
 | `state/reviewdisp-<PR>` | `"<head> <n>"`: review ATTEMPTS at this `(PR, head)`, spent by BOTH arms (agent-infra#2971) — the **CONTROLLER** on a dispatch, and `merge-one.sh` when a reviewer run produced no usable verdict on a path nothing counted above it (`REV_PAID=1` in the spawn command tells it the controller already paid, so one attempt is never counted twice). The controller dispatched for that (PR, head), written only after a spawn succeeded. The head is the key, so a push re-arms it; an unchanged head is never re-reviewed **once CLEAN evidence exists at it** (`REVIEW-AT-HEAD`), and otherwise spends at most `MAX_REVIEW_TRIES` re-records before `REVIEW-CAP` — the budget is per head, not per PR (agent-infra#2653). Before the spawn the arm asks `review_disp_decide`, and an **unreadable head is not a key** (a review spent on an unnamed head cannot be keyed, compared or recorded — the arm refuses and names the head): **`REVIEW-AT-HEAD`** — the enforcer's store already holds a CLEAN record at exactly this head (BOTH store names are read: the repo-qualified file and the legacy `<pr>.json`, the same pair `merge-one.sh::record_at_head` checks) — so no second review is bought for an unchanged head; **`REVIEW-CAP n/max`** parks a head that spent `MAX_REVIEW_TRIES` re-records with no verdict. None is ever a silent skip. `MAX_REVIEW_TRIES=0` is **REPORT-ONLY** (no dispatch, nothing parked — the `MAX_RED_FIX_TRIES=0` idiom), and an UNWRITABLE record is named rather than swallowed (`reviewdisp` ⇒ park, `reviewathead` ⇒ `REVIEW-AT-HEAD-UNBOUNDED`; an unwritable `parked-<PR>` ⇒ `PARK DID NOT LAND`, never `PARKED`): a swallowed write makes the bound itself best-effort, which is exactly how a cap becomes unbounded. Pruned on MERGED/CLOSED and by `prune_orphan_markers` |
@@ -4610,6 +4613,22 @@ so the separation is structural now rather than a numeric ordering) (the loss #3
 case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
 for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
 never wrong.)*
+
+**The branch key is taken by the FIXER too, and it covers PR branches** (agent-infra#3696, P0).
+`refs/claims/branch-<slug>` was introduced by #3328 for *batch* branches and is now also taken by
+`fix-one.sh` before it runs, with `BRANCH_CLAIM_PATTERN` defaulting to `integration/* fix/* rescue/*`.
+The measured reason: on tortoise PR #11385 two lanes wrote ONE PR for ~6 h — 11 superseded heads, five
+clean reviews on five different heads, **0 landings** — because the per-head key (`<PR>-<head12>`) cannot
+express this. The losing writer *creates a new head*, so it mints a fresh key and wins its own CAS every
+time; only a key that outlives the head can refuse it. The coarse landing key `pr-<N>` is deliberately
+NOT reused: it is the LANDING key (taken only by `merge-one.sh`, and read as "someone is landing this
+PR" by `pr-sickness.sh`), so a fixer holding it would read as a live merger. An **unclaimed** branch is
+still never refused — widening the scope refuses only a stray push on top of a live owner — and a
+fixer that finds a peer holding the branch bails with the head-keyed `fixbail-<PR>-<head>` marker the
+controller refunds. The fixer WRITES THE FENCING TOKEN into its worktree's git dir: the guard decides by
+possession, so an acquire without the token is refused by its own claim. Pinned by
+`branch-claim.test.sh` case 11 (plus its glob-scope arm) and `fix-one-branchclaim.test.sh` (including an
+end-to-end arm that pushes through the installed hook).
 Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
@@ -4824,13 +4843,33 @@ reap. The decisions that are not obvious:
 - **Claimed by `orch-loop.sh` when it forms its dispatch batch**, not by `dispatch-merge.sh`: a
   refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
   `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
-  worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
-  every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
+  worktree, lane or chain spawned for work another box owns. **Released by `chain-merge.sh` on every
+  exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
   which is sized (`CLAIM_ISSUE_TTL`, default **48000 s** since agent-infra#4034 — 4 h from #2029 to that
   point) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
+  **⛔ EXCEPT AFTER A MERGE THAT DID NOT CLOSE THE ISSUE (agent-infra#4230).** "Merged" and "finished"
+  are different facts: GitHub auto-closes a linked issue only when the PR body carries a closing
+  keyword and the PR targets the default branch, so a `Refs #N` partial merges and leaves the issue
+  OPEN. Releasing there handed the still-open issue straight back to the pool — measured as three
+  issues each carrying TWO open PRs, with no claim in the registry for any of them (#14560 → #14572 +
+  #14596). So when the chain has evidence of a merge (`state/merged-<PR>.done`, confirmed against THIS
+  repo's PR) it asks the API for the **issue's state**: `closed` releases as before; `open` **keeps the
+  claim and RENEWS it** (`claim_issue_renew_record`, holder preserved, fenced on this box's own commit)
+  so the follow-up stays un-dispatchable and does not expire mid-flight; an unreadable or
+  uninterpretable answer **keeps and renews** too (fail-closed: the duplicate is likeliest exactly when
+  the API is rate-limited). Two weaker bars are also counted as merged, deliberately, and a reader must
+  be able to predict them: an **unreadable merge confirmation** (`gh` failed, so `_mrc=2` — the marker
+  may belong to another repo's PR of the same number) and a **marker the trap finds before the chain's
+  own flag** (a signal arriving between `merge-one.sh` writing `state/merged-<PR>.done` and the chain
+  assigning `CHAIN_MERGED`, which would otherwise release an open issue's claim on the one path nobody
+  watches) both take the keep-and-renew side: keeping a claim one lease too long is bounded and reaped
+  by `claim_prune`, while freeing an issue whose work already merged is the duplicate #4230 measures.
+  Only a **confirmation that this repo's PR is NOT merged** (`_mrc=1`) drops the marker, and then the
+  claim is released. A chain that merged NOTHING still releases on every path — an open issue a
+  peer could work must not be stranded on this box for a lease.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
   output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —

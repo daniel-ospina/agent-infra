@@ -232,13 +232,18 @@ PY
 echo
 
 echo "── cross-box claims (what other machines can see) ─────────"
-claims=0
+claims=0; brclaims=0
 if [ -d "$REPO" ] && command -v git >/dev/null 2>&1; then
   live=$(git -C "$REPO" ls-remote origin 'refs/claims/*' 2>/dev/null)
   claims=$(printf '%s\n' "$live" | grep -c 'refs/claims/' )
+  # ⛔ A BRANCH CLAIM IS ITS OWN ROW (agent-infra#3696). `fix-one.sh` now mints `refs/claims/branch-*`
+  # for the PR branch it owns, so counting those into the per-head/PR total inflated it and left the
+  # one caption below saying "a reviewer in flight" about rows that are a FIXER holding a branch.
+  brclaims=$(printf '%s\n' "$live" | grep -c 'refs/claims/branch-')
   printf '%s\n' "$live" | awk 'NF{print "  "$2}' | head -12
 fi
-echo "  → live: ${claims:-0}  (a claim with a live lease = a reviewer in flight on some box)"
+echo "  → live: ${claims:-0}  (all claim keys) — of which branch-owner: ${brclaims:-0}"
+echo "     a branch-owner claim is a fixer/batch lane holding a BRANCH (agent-infra#3696); the rest are per-head/PR keys (a review or a landing in flight)"
 echo
 
 echo "── queue health ────────────────────────────────────────────"

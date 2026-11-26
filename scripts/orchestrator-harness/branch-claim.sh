@@ -31,17 +31,31 @@
 # own lanes (every push goes through this checkout), and the claim ref is the server-visible record
 # that a peer can be told about even if it bypassed the hook.
 #
-# ⛔ SCOPE IS THE SMALLEST SURFACE THAT SOLVES IT. Only branches matching BRANCH_CLAIM_PATTERN (an
-# `integration/*` glob by default) are gated. Ordinary feature branches, `main`, tags and the claim
-# refs themselves are untouched — a broad gate would refuse the fleet's normal work and be removed
-# within a day, which is how a real gate becomes folklore.
+# ⛔ SCOPE IS THE SMALLEST SURFACE THAT SOLVES IT. Only branches matching BRANCH_CLAIM_PATTERN are
+# gated. `main`, tags and the claim refs themselves are untouched — a broad gate would refuse the
+# fleet's normal work and be removed within a day, which is how a real gate becomes folklore.
+#
+# ⛔ THE SCOPE IS NOT `integration/*` ALONE (agent-infra#3696, P0). #3328 closed this loss for BATCH
+# branches; #3696 measured the SAME loss on a PR BRANCH: two lanes wrote tortoise PR #11385 for ~6 h
+# and produced **11 superseded heads and zero landings**, because each writer's push invalidated the
+# other's head-bound review attestation. The scope below only decides which branches the GUARD looks
+# at — a branch nobody claimed still pushes freely (case 1: an unclaimed branch is never refused), so
+# covering the PR-branch prefixes costs nothing to a lane that does not claim, and refuses only a
+# STRAY push on top of a live owner.
+# ⛔ THE SCOPE IS NOT THE WHOLE OF THE FIXER'S TERRITORY, AND THIS COMMENT USED TO CLAIM IT WAS
+# (review P2, verified against `orch-loop.sh`'s own target filter). The fixer/merge loops also work on
+# `design/…`, `scope/…` and `…-tm` / `…-cap` heads. `fix-one.sh` acquires the claim for whatever branch
+# it was handed — the ACQUIRE is pattern-independent — so for those a claim exists that the GUARD does
+# not read. That direction is harmless (the claim still refuses a peer's `acquire`, and an unguarded
+# push is simply the status quo before this change); it is stated here rather than hidden, and the
+# prefixes are the ones whose stray push was measured, not a claim that they are all of them.
 set -u
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=claims.sh
 . "$SELF_DIR/claims.sh" || { echo "branch-claim: cannot load claims.sh from $SELF_DIR" >&2; exit 2; }
 
-BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/*}"
+BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/* fix/* rescue/*}"
 
 die2() { printf 'branch-claim: %s\n' "$*" >&2; exit 2; }
 
@@ -78,12 +92,22 @@ claim_repo_init_local() {
 }
 
 # branch_matches_pattern <branch> — the SCOPE decision, in one place.
+# ⛔ PATHNAME EXPANSION IS DISABLED FOR THE SPLIT (review P2, MEASURED). `for pat in $VAR` runs
+# `$VAR` through word-splitting **and then pathname expansion**, so a checkout that happens to contain a
+# top-level `integration/` or `fix/` DIRECTORY rewrote the pattern list into that directory's entries
+# (measured: `PAT=[integration/sub]` instead of `integration/*`) — after which the branch matched
+# nothing and the gate refused nothing. It fails OPEN, it fails silently, and it fails exactly for the
+# branch class the gate exists to refuse. `set -f` is the one-token fix; it is scoped to this function
+# so nothing else in the script inherits it.
 branch_matches_pattern() {
-  local br="${1:-}" pat
+  local br="${1:-}" pat _had_f=0
+  case "$-" in *f*) _had_f=1 ;; esac
+  set -f
   for pat in $BRANCH_CLAIM_PATTERN; do
     # shellcheck disable=SC2254  # the glob is the point
-    case "$br" in $pat) return 0 ;; esac
+    case "$br" in $pat) [ "$_had_f" -eq 0 ] && set +f; return 0 ;; esac
   done
+  [ "$_had_f" -eq 0 ] && set +f
   return 1
 }
 
