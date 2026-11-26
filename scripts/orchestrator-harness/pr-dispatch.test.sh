@@ -2283,19 +2283,39 @@ _c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends wi
                           # does not strip (measured — it read GREEN as RED on a reordered operand list)
   # ⛔ A PASTE WITH AN UNTERMINATED QUOTE EXECUTES **NOTHING** (measured). The shell refuses the line
   # ("unexpected EOF while looking for matching `''"), so the book SURVIVES however well-formed the
-  # operand we matched is — `rm -rf '<book>' '<parked` printed GREEN on the operand walk alone and
-  # removes neither. So both quote characters must BALANCE over the text before any operand is believed.
-  # Fail-closed by design: a lone apostrophe in the prose reds the row (visible friction) instead of
-  # letting an unexecutable paste pass as a repair.
+  # operand we matched is — `rm -rf '<book>' '<parked` printed GREEN on the operand walk alone, and running
+  # it gives `unexpected EOF` with the book still on disk. Two separate checks are needed, because neither
+  # covers the other (both measured):
+  #   (1) parity over the COMMAND portion — catches an unterminated quote ANYWHERE in it, including after a
+  #       well-formed operand that the walk would have accepted and RETURNED on;
+  #   (2) a closer for the operand being examined — catches a text whose GLOBAL parity is even but whose
+  #       unterminated quote was eaten by the verb-prefix strip (` rm -rf '<book>`, quotes=2, no closer).
+  # ⚠️ (1) reads only the text BEFORE the trailing parenthetical prose: the prose is not part of the paste,
+  # and counting it made a single added contraction (`isn't`) red a row whose remedy was unchanged — a false
+  # diagnosis inviting the wrong repair (broaden the matcher).
+  # ⚠️ STILL FAIL-CLOSED, NOT EXHAUSTIVE (#4246): a `'` INSIDE a double-quoted word is literal to the shell
+  # but counted by parity, so an exotic pre-verb shape can still pass both checks. The unbounded form is
+  # behavioural: plant the book as a directory, run the paste, assert it is gone.
+  local _cmd="${1:-}"
+  case "$_cmd" in *" ("*) _cmd="${_cmd% (*}" ;; esac   # the TRAILING parenthetical, i.e. the LAST " (" —
+                                                          # the first one can be inside the prose itself
+                                                          # (advisory renders carry `P3-ONLY (cosmetic)`),
+                                                          # and cutting there left `head's` behind: odd
+                                                          # parity, and a paste that DOES remove the book
+                                                          # redded (measured)
   for _bare in "$_sq" "$_dq"; do
-    _rest="${1//"$_bare"/}"
-    [ $(( (${#1} - ${#_rest}) % 2 )) -eq 0 ] || return 1
+    _rest="${_cmd//"$_bare"/}"
+    [ $(( (${#_cmd} - ${#_rest}) % 2 )) -eq 0 ] || return 1
   done
   case "${1:-}" in *"rm -rf "*) _rest="${1#*rm -rf }" ;; *) return 1 ;; esac
   while :; do
     case "$_rest" in
-      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"; _rest="${_rest#*"$_sq"}" ;;
-      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"; _rest="${_rest#*"$_dq"}" ;;
+      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1
+                 _rest="${_rest#*"$_sq"}" ;;
+      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1
+                 _rest="${_rest#*"$_dq"}" ;;
       *) return 1 ;;
     esac
     case "$_op" in */"$2") return 0 ;; esac
@@ -2321,13 +2341,14 @@ _c4u_shape() { # <label> <want GREEN|RED> <text>
   if [ "$_got" = "$2" ]; then ok "(c4u) the remedy predicate says $2 for the shape '$1'"
   else bad "(c4u) the remedy predicate says $_got for the shape '$1', expected $2 — the book-binding rule has drifted (text: [$3])"; fi
 }
-_c4u_shape 'book is an operand of rm -rf'          GREEN "rm -rf '/x/state/reviewround-77' '/x/state/parked-77' (rm -rf, not rm -f)"
+_c4u_shape 'book is an operand of rm -rf'          GREEN "rm -rf '/x/state/reviewround-77' '/x/state/parked-77'"
 _c4u_shape 'double-quoted, terminated'             GREEN 'rm -rf "/x/state/reviewround-77"'
 _c4u_shape 'split verb (book removed by rm -f)'    RED   "rm -rf '/x/state/parked-77'; rm -f '/x/state/reviewround-77'"
 _c4u_shape 'wrong PR (reviewround-7 vs -77)'       RED   "rm -rf '/x/state/reviewround-7'"
 _c4u_shape 'operand is a PREFIX of the book (.bak)' RED   "rm -rf '/x/state/reviewround-77.bak'"
 _c4u_shape 'text ends at an UNTERMINATED quote'    RED   "rm -rf '/x/state/reviewround-77"
 _c4u_shape 'unterminated quote AFTER the book'     RED   "rm -rf '/x/state/reviewround-77' '/x/state/parked-77"
+_c4u_shape 'verb prefix ate the opening quote'     RED   "' rm -rf '/x/state/reviewround-77"
 _c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON
