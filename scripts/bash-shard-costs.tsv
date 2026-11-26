@@ -152,6 +152,7 @@
 0	scripts/orchestrator-harness/claim-action-proof.test.sh
 89	scripts/orchestrator-harness/cloud-cell-doctor.test.sh
 0	scripts/orchestrator-harness/fix-one-brief.test.sh
+0	scripts/orchestrator-harness/fix-one-branchclaim.test.sh
 6	scripts/orchestrator-harness/gh-cred.test.sh
 0	scripts/orchestrator-harness/install-exec-bit.test.sh
 0	scripts/orchestrator-harness/lane-env.test.sh

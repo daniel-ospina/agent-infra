@@ -17,7 +17,8 @@
 #   4 FENCING              a token that is no longer the claim ref's tip cannot push (the property
 #                          is inherited from claims.sh, not re-derived here).
 #   5 FENCED RELEASE       a peer cannot release the holder's claim.
-#   6 SCOPE                an ordinary feature branch is never gated.
+#   6 SCOPE                an ordinary feature branch is never gated — and its subject is CLAIMED first,
+#                          so the arm can fail (cycle-3 review F2: unclaimed, rc was 0 either way).
 #   7 RECOVERY             after the holder releases, it can re-acquire AND push — the gate is not
 #                          a dead end.
 #   8 MUTANT               with the hook removed the same stray push SUCCEEDS and the head MOVES,
@@ -183,12 +184,34 @@ release_from stray "$BR"; eq "peer release refused" "$?" "1"
   && ok "the claim ref survives the peer's release attempt" || bad "the peer's release deleted the claim"
 
 echo "== 6. scope: an ordinary branch is never gated"
+# ⛔ THE SUBJECT OF THIS CASE CHANGED WITH agent-infra#3696, AND THE OLD SUBJECT WAS A LATENT FALSE
+# PASS. It used `refs/heads/fix/whatever` as its "ordinary branch" — which the scope NOW covers, so the
+# case would have gone on passing while testing the opposite of what it says (an UNCLAIMED branch of an
+# IN-SCOPE name is allowed, case 1's polarity) and would have silently stopped being able to detect a
+# scope that had swallowed everything. The out-of-scope subject is now a prefix the guard does not
+# claim, and the in-scope half is pinned by case 11 rather than assumed here.
 commit_in stray "feature"
-if push_in stray "refs/heads/fix/whatever" "$T/p6.err"; then
-  ok "non-integration branch pushes freely"
+if push_in stray "refs/heads/chore/whatever" "$T/p6.err"; then
+  ok "a branch outside the declared scope pushes freely"
 else
   bad "scope too broad: $(cat "$T/p6.err")"
 fi
+# ⛔ THE SUBJECT IS CLAIMED BEFORE THIS ARM READS IT (cycle-3 review F2, MEASURED INERT). Against an
+# UNCLAIMED subject the arm could not fail for the reason its own `bad` sentence names: `hook-ref` skips
+# an out-of-scope branch (rc 0) and ALSO allows an in-scope UNCLAIMED one (case 1's polarity), so a scope
+# that had swallowed everything was indistinguishable from a correct one — MEASURED: with the default
+# widened to `*` this case stayed 100% green. Claiming it first makes the two outcomes differ: a claimed
+# IN-SCOPE branch IS refused (cases 11/12), so rc 0 below can only mean the scope SKIPPED it. The
+# `guard` line is the control proving that refusal was armed.
+acquire_from owner "chore/whatever"
+eq "fixture: the out-of-scope subject is CLAIMED before the scope reads it" "$?" "0"
+guard_from stray "chore/whatever"
+eq "the guard DOES refuse that branch — so rc 0 below is the scope's doing, not an unarmed claim" "$?" "1"
+( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 ); _rc6=$?
+case "$_rc6" in
+  0) ok "hook-ref SKIPS a CLAIMED out-of-scope branch before any registry read" ;;
+  *) bad "hook-ref gated an out-of-scope branch (rc=$_rc6) — the scope has swallowed everything" ;;
+esac
 
 echo "== 7. recovery: the holder releases, re-acquires and pushes again"
 ( cd "$T/owner" && git fetch -q origin "$REMOTE_BR:$REMOTE_BR" 2>/dev/null || git fetch -q origin )
@@ -494,6 +517,121 @@ NOW=$(date +%s)
 CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB_DEF"
 L4="$(lease_of refs/claims/branch-integration-lease-knob-default)"
 if [ -n "$L4" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the DEFAULT too — one knob, not two" 20000 "$L4"; else bad "no lease_until on the env-raised DEFAULT claim ref"; fi
+
+echo "== 11. a PR BRANCH is gated too — the #3696 loss, on the branch a fixer actually pushes"
+# ⛔ THE LOSS THIS CASE PINS, MEASURED (issue #3696, tortoise PR #11385, 2026-11-07): two lanes wrote
+# one PR for ~6 h — 11 superseded heads, 5 clean reviews on 5 different heads, **0 landings** — because
+# every push superseded the other lane's head-bound review attestation. #3328 built this exact
+# single-owner mechanism for BATCH branches and stopped the identical loss there; the PR branch a FIXER
+# pushes was simply outside the guard's `integration/*` scope, so the mechanism existed and did not
+# cover the branch the loss actually happened on.
+# ⛔ IT IS TWO ARMS, AND THE FIRST ONE IS THE ONE THAT MATTERS: widening a scope must never turn into
+# "the guard refuses lanes that never heard of it". An UNCLAIMED branch of an in-scope name still
+# pushes freely (case 1's polarity, restated at the new name), and only a STRAY push on top of a LIVE
+# claim is refused. Reverting the scope to `integration/*` reddens the second arm and nothing else.
+PRBR="fix/3696-claims-block-push"; PRBR_REF="refs/heads/$PRBR"
+RESBR="rescue/3696-claims"; RESBR_REF="refs/heads/$RESBR"
+# Seeded from the STRAY's head, deliberately: the arms below push from `stray`, so its commit must be
+# a FAST-FORWARD of the seeded tip. Seeding from `owner` made the first arm fail on a non-fast-forward
+# rejection — a fixture artefact that looks exactly like a guard refusal, and which would have made the
+# case pass or fail for a reason no reader could see.
+( cd "$T/stray" && git push -q origin "HEAD:$PRBR_REF" && git push -q origin "HEAD:$RESBR_REF" ) \
+  || bad "fixture: cannot seed the PR/rescue branches"
+commit_in stray "unclaimed PR-branch push"
+if push_in stray "$PRBR_REF" "$T/p11a.err"; then
+  ok "an UNCLAIMED PR branch pushes freely — widening the scope is not over-block"
+else
+  bad "an unclaimed PR branch was refused ($(cat "$T/p11a.err")) — its branch lease was released, so the only in-scope reason to refuse is scope, and a false block here is what gets a gate deleted"
+fi
+acquire_from owner "$PRBR"; eq "owner acquires the PR-BRANCH claim" "$?" "0"
+OWNER_PR_HEAD="$(cd "$T/origin.git" && git rev-parse "$PRBR")"
+commit_in stray "STRAY push onto an owned PR branch"
+if push_in stray "$PRBR_REF" "$T/p11b.err"; then
+  bad "the STRAY PR-branch push SUCCEEDED — a peer can still write on top of an owned head (#3696's whole failure)"
+else
+  ok "a stray push onto an OWNED PR branch is REFUSED"
+fi
+grep -q 'branch-claim: REFUSED' "$T/p11b.err" && ok "the PR-branch refusal names itself" \
+  || bad "refusal text: $(cat "$T/p11b.err")"
+grep -q 'held-by-live' "$T/p11b.err" && ok "...and says a live owner holds it (the peer can be told who)" \
+  || bad "no held-by-live reason in: $(cat "$T/p11b.err")"
+eq "the PR branch did NOT move (=> no head superseded, no attestation invalidated)" \
+   "$(cd "$T/origin.git" && git rev-parse "$PRBR")" "$OWNER_PR_HEAD"
+# rescue/* is the same class of writer (a rescue lane pushes a branch for a PR it does not own).
+( cd "$T/owner" && CLAIM_REPO="$T/owner" "$BC" acquire "$RESBR" >/dev/null 2>&1 ) \
+  || bad "fixture: cannot claim the rescue branch"
+( cd "$T/stray" && "$BC" hook-ref "$RESBR_REF" >/dev/null 2>&1 )
+eq "the scope covers rescue/* — a stray push on an OWNED rescue branch is refused" "$?" "1"
+
+
+echo "== 12. the scope list is NOT pathname-expanded (review P2, MEASURED fail-open)"
+# ⛔ `for pat in $BRANCH_CLAIM_PATTERN` runs the list through word-splitting AND pathname expansion, so a
+# checkout containing a top-level `integration/` (or `fix/`) DIRECTORY rewrote the patterns into that
+# directory's entries — measured `PAT=[integration/sub]` instead of `integration/*` — after which no
+# branch matched and the gate refused nothing. It fails OPEN, silently, for exactly the branch class the
+# gate exists to refuse. `set -f` in `branch_matches_pattern` is the fix; this arm is its detector, and
+# it must be run from a checkout that HAS such a directory (the hook always runs from the repo root, so
+# this is the real posture, not a contrived one).
+GLOBBR="integration/globscope-3696"; GLOBREF="refs/heads/$GLOBBR"
+( cd "$T/stray" && git push -q origin "HEAD:$GLOBREF" && mkdir -p integration && : > integration/sub ) \
+  || bad "fixture: cannot seed the glob-scope branch/directory"
+acquire_from owner "$GLOBBR"; eq "owner acquires the glob-scope branch" "$?" "0"
+( cd "$T/stray" && "$BC" hook-ref "$GLOBREF" >/dev/null 2>&1 )
+eq "a checkout with an \`integration/\` DIR still gates that branch (the list is not glob-expanded)" "$?" "1"
+
+echo "== 13. branch_matches_pattern RESTORES the caller's \`-f\` (review F3: the restore had no mutant)"
+# ⛔ THE SCOPE FIX IS `set -f` INSIDE `branch_matches_pattern`, AND ITS PRIMARY TOOTH IS CASE 12 ABOVE.
+# The RESTORE half — the `_had_f` capture and the `[ "$_had_f" -eq 0 ] && set +f` on both exits — was
+# pinned by NOTHING: a mutant that never restores `-f`, or one that unconditionally clears it over a
+# caller who had it, reddened no arm in either suite (agent-infra#3442 rule 1: a new guard with no
+# mutant reads to the next reader as covered). It is inert in the SHIPPED process (\`cmd_hook_ref\` does
+# no globbing afterwards and the script exits), which is exactly why it needed a pin rather than an
+# argument: an unconditional \`set +f\` would re-enable pathname expansion in a caller's shell — this
+# gate's own fail-open class.
+BM="$T/bmp.sh"
+sed -n '/^branch_matches_pattern() {/,/^}/p' "$BC" > "$BM"
+[ -s "$BM" ] && ok "13) branch_matches_pattern is extractable for a same-shell \`\$-\` observation" \
+  || bad "13) cannot extract branch_matches_pattern from $BC"
+# run_bmp <fn-file> <caller-had--f:0|1> <branch> → "<rc>:<-f-after>" measured in ONE shell, because the
+# property is about the caller's options and a subshell boundary would hide the leak it exists to catch.
+run_bmp() {
+  local fn="$1" hadf="$2" br="$3"
+  ( set +f
+    [ "$hadf" = 1 ] && set -f
+    BRANCH_CLAIM_PATTERN='integration/* fix/*'
+    . "$fn"
+    branch_matches_pattern "$br"; _rc=$?
+    case "$-" in *f*) _f=1 ;; *) _f=0 ;; esac
+    printf '%s:%s\n' "$_rc" "$_f"
+  )
+}
+eq "13) a caller WITHOUT -f gets it back OFF after a MATCH (the function does not leak -f)" \
+   "$(run_bmp "$BM" 0 integration/x)" "0:0"
+eq "...and after a NON-match, so BOTH exits restore" \
+   "$(run_bmp "$BM" 0 chore/x)" "1:0"
+eq "...and -f the CALLER already had is PRESERVED, not cleared over it" \
+   "$(run_bmp "$BM" 1 integration/x)" "0:1"
+eq "...on the non-match exit too" \
+   "$(run_bmp "$BM" 1 chore/x)" "1:1"
+# the mutant: delete BOTH restores. The function then leaks `set -f` into its caller, and row 1 reddens.
+sed 's|\[ "$_had_f" -eq 0 \] && set +f|:|' "$BM" > "$T/bmp-norestore.sh"
+if cmp -s "$BM" "$T/bmp-norestore.sh"; then
+  bad "13) the mutant is IDENTICAL — the restore was not found to delete, so the rows above cannot be attributed to it"
+else
+  bash -n "$T/bmp-norestore.sh" && ok "13) the mutant is still a VALID program" || bad "13) the mutant does not parse"
+  eq "13) with the restores deleted the caller's -f LEAKS — so the rows above measure the restore" \
+     "$(run_bmp "$T/bmp-norestore.sh" 0 integration/x)" "0:1"
+  # the other direction: never CAPTURE, so it always clears. A caller that had -f loses it.
+  sed 's|_had_f=1 ;;|_had_f=0 ;;|' "$BM" > "$T/bmp-alwaysclear.sh"
+  if cmp -s "$BM" "$T/bmp-alwaysclear.sh"; then
+    bad "13) the always-clear mutant is IDENTICAL — the capture was not found to defuse"
+  else
+    bash -n "$T/bmp-alwaysclear.sh" && ok "13) the always-clear mutant is still a VALID program" \
+      || bad "13) the always-clear mutant does not parse"
+    eq "13) a function that never CAPTURES clears a caller's -f — so the capture is measured too" \
+       "$(run_bmp "$T/bmp-alwaysclear.sh" 1 integration/x)" "0:0"
+  fi
+fi
 
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"

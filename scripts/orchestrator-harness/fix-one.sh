@@ -794,7 +794,48 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
   kill "$w" 2>/dev/null
   return "$rc"
 }
-trap 'release_prlock; release_fix_claim' EXIT
+# ── SINGLE-OWNER BRANCH CLAIM (agent-infra#3696) ───────────────────────────────────────
+# ⛔ WHY THE PER-HEAD KEY ABOVE IS NOT ENOUGH, AND WHAT THIS ADDS. `claim_acquire` is keyed by
+# `<PR>-<head12>`: it stops two lanes fixing the SAME head, and it is CORRECT — but the writer that
+# caused #3696 does not collide on it, because **its push CREATES a new head**, so it takes a fresh
+# key and wins its own CAS every time. Measured (tortoise PR #11385, 2026-11-07): lane A held
+# `refs/claims/11385-a51050d7b` and lane B pushed `93b85f33d` on top of it, then 10 more heads over
+# ~6 h — every push invalidated the other lane's head-bound review attestation, so five fresh reviews
+# returned clean on five different heads and the PR never landed.
+# The question the incident needed answered is COARSER than "this head": *does another lane own this
+# BRANCH right now?* That is `refs/claims/branch-<slug>` — the key, CAS, fencing token, guard and
+# reaper that #3328 already built and reviewed for batch branches, deliberately reused rather than
+# a second registry. See branch-claim.sh's header for the loss it was built for; it is the same shape.
+# ⛔ IT IS NOT THE LANDING KEY `pr-<N>` ON PURPOSE (claims.sh:963-970 RECORDS that `pr-<N>` is taken
+# ONLY by the landing path, and ps_held in pr-sickness.sh reads it as "someone is LANDING this PR").
+# ⛔ THE CITATION IS THE RECORD, NOT A PARAPHRASE OF IT (cycle-3 review F3b, verified against the tree):
+# this used to read `claims.sh:1855-1858`, which is the PR-SICKNESS QUEUE comment — it says the decision
+# lives elsewhere, it is not the decision. A conclusion resting on a pointer to a different paragraph is
+# how the next lane re-derives and concludes the opposite, the failure mode agent-infra#2258 records.
+# Taking `pr-<N>` here would reverse that recorded decision and make a live FIXER read as a live
+# MERGER; the branch key answers the writer question without touching the landing one.
+BRANCH_OWN=""
+BRANCH_TOKEN=""
+release_branch_claim() { # same 20s bound as release_fix_claim, for the same reason (EXIT path)
+  local p w rc
+  [ -n "${BRANCH_OWN:-}" ] || { [ -n "${BRANCH_TOKEN:-}" ] && claim_branch_forget "$BRANCH_TOKEN"; return 1; }
+  claim_branch_release "$REPO" "$BR" "$BRANCH_OWN" >/dev/null 2>&1 &
+  p=$!
+  ( sleep 20; kill -TERM "$p" 2>/dev/null; sleep 5; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  # ⛔ FORGET THE TOKEN ONLY WHEN THE RELEASE ACTUALLY LANDED (cycle-2 review P2, verified against
+  # `branch-claim.sh`'s `cmd_release`, which forgets only on success). `_claim_release_at` returns 1
+  # WITHOUT deleting the ref when the fenced push fails or the 20 s watchdog TERMs it — the expected
+  # failure this file's own `release_fix_claim` bound documents. On that path the claim is STILL OURS
+  # and the token is the only possession proof, so forgetting it would destroy recovery path (1) in the
+  # lifetime note above (a same-box lane releases with the token) and strand the claim for the full
+  # branch lease with no cooperating remedy left but deleting the ref by hand.
+  [ "$rc" -eq 0 ] && [ -n "${BRANCH_TOKEN:-}" ] && claim_branch_forget "$BRANCH_TOKEN"
+  return "$rc"
+}
+trap 'release_prlock; release_fix_claim; release_branch_claim' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 # ⛔ `_FIX_MOD_DIR` (the work root) is resolved at the TOP of this file, before the gh shims — see
@@ -822,6 +863,92 @@ if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site — `CLAIM_TTL_MAX` is
   # sized ABOVE this lease (claims.sh), and a lease reaching the ceiling is reported, never silent.
   FIX_LEASE=$(( FIX_BOUND + 1200 ))
+  # ── THE BRANCH CLAIM IS TAKEN FIRST, AND ITS REFUSAL IS THE FIX FOR #3696 ────────────────
+  # Coarse-to-fine, the same order merge-one.sh takes its keys in: a lane that does not own the
+  # BRANCH has no business reading it, let alone pushing a new head onto it. Taking it here — before
+  # the fixer runs, therefore LONG before the push — is what makes a second worker see "a peer owns
+  # this branch" at the moment it decides to work rather than after it has already superseded a head.
+  # ⛔ A REFUSAL IS A PRE-WORK REFUSAL, so it refunds the attempt exactly as the head-claim refusal
+  # below does: the controller books `fixcount` at SPAWN, so a lane that did nothing must not burn one
+  # of MAX_FIX_TRIES (the 2026-10-14 P2 that marker exists for).
+  # ⛔ AN OLD DEPLOYED claims.sh HAS NO `claim_branch_acquire`, AND THAT IS A NAMED STATE, NOT A
+  # SILENT PASS — the same polarity merge-one.sh uses for `claim_pr_acquire`. Fail-open on the
+  # branch key alone (the per-head CAS below still runs), and say so in the log.
+  # [fixgate-branchclaim:begin]
+  if command -v claim_branch_acquire >/dev/null 2>&1; then
+    claim_branch_acquire "$REPO" "$BR" >/dev/null
+    BR_RC=$?
+    case "$BR_RC" in
+      0) BRANCH_OWN="$CLAIM_COMMIT"
+         echo "[fix $PR] single-owner branch claim: $CLAIM_RESULT" >> "$L.log"
+         # ⛔ THE LIBRARY ACQUIRE DOES **NOT** WRITE THE FENCING TOKEN, AND WITHOUT IT THIS LANE'S OWN
+         # PUSH IS REFUSED (P0, measured on a fixture before this line existed). `claim_branch_guard`
+         # answers "may I push?" by POSSESSION — does this checkout's token file name the commit that
+         # is currently the claim ref's tip? — and `claim_branch_record` is called by exactly ONE writer
+         # in the tree, `branch-claim.sh`'s `cmd_acquire`, which this path does not go through. So a
+         # fixer that acquired correctly was refused `reason=held-by-live` **by its own claim**, with a
+         # message telling it to ask itself to release. The token must name the git dir of the WORKTREE
+         # THE PUSH WILL COME FROM: it is per-checkout by design (claims.sh:1049-1059), and a linked
+         # worktree has its own git dir (measured here: `<repo>/.git/worktrees/<name>`), so a token
+         # written for $REPO would be invisible to the hook running in $WT.
+         if [ -n "${WT:-}" ]; then
+           _wt_gitdir="$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null)"
+           if [ -n "$_wt_gitdir" ] && BRANCH_TOKEN="$(claim_branch_record "$(claim_branch_token_path "$BR" "$_wt_gitdir")" "$BR" "$BRANCH_OWN" 2>/dev/null)"; then
+             echo "[fix $PR] branch claim fencing token written for worktree $WT" >> "$L.log"
+           else
+             BRANCH_TOKEN=""
+             echo "[fix $PR] WARNING: acquired the branch claim but could NOT write its fencing token into $WT ('${_wt_gitdir:-no git dir}') — the push guard will REFUSE this lane's own push as held-by-live until the token exists. Fix the worktree's git dir; the claim is still released on exit" >> "$L.log"
+           fi
+           unset _wt_gitdir 2>/dev/null || true
+         else
+           echo "[fix $PR] WARNING: no worktree path is set, so the branch claim has NO fencing token — this lane's push would be refused as held-by-live" >> "$L.log"
+         fi ;;
+      1) case "${CLAIM_RESULT:-}" in
+           *unreadable-clock*)
+             # ⛔ rc=1 IS NOT ALWAYS A PEER (review P3, verified at claims.sh:1584-1592): an unreadable
+             # local clock is minted as rc 1 on purpose so callers refuse on it. Reporting that as
+             # "another lane owns this branch" blames a peer that does not exist and buries the real
+             # repair — the wrong-cause class this file already documents.
+             echo "[fix $PR] single-owner branch claim REFUSED: $CLAIM_RESULT — this box's CLOCK is unreadable, NOT a peer: the ownership window cannot be judged, so nothing was started. Recording a bail marker and exiting" >> "$L.log" ;;
+           *)
+             echo "[fix $PR] single-owner branch claim REFUSED: $CLAIM_RESULT — another lane already owns branch $BR; NOT starting a fixer and NOT pushing a new head on top of its work (agent-infra#3696). Recording a bail marker and exiting" >> "$L.log" ;;
+         esac
+         : > "$O/state/fixbail-$PR-$HEAD"
+         exit 0 ;;
+      *)
+         # ⛔ rc=2 IS NOT PROOF THAT NOTHING WAS TAKEN (P2, review at c5243820f; verified against
+         # `claims.sh:1634-1643`, `:1717-1726` and `:1742-1754`). `_claim_acquire_at` returns 2 **with
+         # `CLAIM_COMMIT` set** on three paths where the CAS may have LANDED: the create push reported
+         # success and the read-back differed; the reclaim push landed with a differing read-back; and
+         # "the push exited non-zero, but it may have LANDED and only the immediate re-read failed".
+         # That third site states this exact cost in its own words — returning 2 without the commit
+         # left the caller "PROCEED[ING] fail-open while genuinely owning the ref, so every other box
+         # refused that head until the lease expired".
+         # ⛔ SO THE BRANCH ARM DOES WHAT THE HEAD-CLAIM ARM 19 LINES BELOW ALREADY DOES (`:937-941`):
+         # adopt the surfaced commit and attempt the FENCED release. That release is a no-op when the
+         # ref is a PEER's (the fence is on OUR commit), so it can never delete another lane's claim.
+         # Without it the claim is unreleasable by anything: `release_branch_claim` returns early on an
+         # empty `BRANCH_OWN` (`:821`) so the EXIT trap is a no-op, no fencing token is written on this
+         # path (it is written only in the rc=0 arm), and branch keys have NO independent reaper
+         # (`claims.sh:200-203`: `claim-reaper.sh` ABSTAINS on them) — so a "fail-open" arm would hold
+         # the branch for `CLAIM_BRANCH_TTL` (4 h) and refuse every peer fixer and every peer push,
+         # while telling the operator the opposite of the state.
+         if [ -n "${CLAIM_COMMIT:-}" ]; then
+           BRANCH_OWN="$CLAIM_COMMIT"
+           if release_branch_claim; then
+             BRANCH_OWN=""
+             echo "[fix $PR] single-owner branch claim: released the orphaned claim commit ${CLAIM_COMMIT:0:12} fenced (rc=$BR_RC: $CLAIM_RESULT) — this box no longer excludes $BR" >> "$L.log"
+           else
+             echo "[fix $PR] single-owner branch claim: the CAS may have LANDED and the FENCED release of ${CLAIM_COMMIT:0:12} did NOT (rc=$BR_RC: $CLAIM_RESULT) — this box may still hold $BR; the EXIT trap retries it, and no fencing token exists on this path so a same-box lane cannot release it either: 'branch-claim.sh status $BR' if peers stay refused" >> "$L.log"
+           fi
+         else
+           echo "[fix $PR] single-owner branch claim UNAVAILABLE (rc=$BR_RC: $CLAIM_RESULT) — proceeding WITHOUT branch exclusion (fail-open on purpose, same polarity as the head claim below; ask the holder to release it: branch-claim.sh release $BR, or with no cooperation possible: git push origin :refs/claims/branch-$(claim_branch_slug "$BR") after confirming no worker is live)" >> "$L.log"
+         fi ;;
+    esac
+  else
+    echo "[fix $PR] single-owner branch claim UNAVAILABLE: claims.sh defines no claim_branch_acquire (it predates agent-infra#3328) — proceeding WITHOUT branch exclusion, so a peer lane writing $BR is NOT excluded. Re-provision claims.sh (install.sh seeds it)" >> "$L.log"
+  fi
+  # [fixgate-branchclaim:end]
   claim_acquire "$REPO" "$PR" "$HEAD" "$FIX_LEASE" >/dev/null
   CROSS_RC=$?
   case "$CROSS_RC" in
@@ -1097,7 +1224,8 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 - Make the fix at the stated location, and add/adjust tests so they genuinely FAIL on the pre-fix code (prove non-vacuity where you can).
 - Register any new test file in \`config/ci-surfaces.yml\` (correct surface) — verify with \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python tools/ci_selection.py --integrity\`.
 - Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite. Your worktree has its own \`.venv\` — use THAT one. ⛔ Never search the filesystem for an interpreter: no \`find\`/\`rg\`/\`du\` outside this worktree (a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result). If \`.venv\` is genuinely missing here, run \`uv sync --extra embeddings --extra parity\` once.
-- Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git push origin $BR\`.
+- Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git -C "$WT" push origin $BR\`.
+- ⛔ PUSH FROM THE WORKTREE (\`git -C "$WT"\`), NOT FROM THE HARNESS CHECKOUT. The single-owner branch guard proves ownership by a per-CHECKOUT fencing token, written into the git dir of the checkout this lane will push from; a linked worktree has its own git dir, so a push issued from anywhere else is refused as \`held-by-live\` — by this lane's OWN claim (agent-infra#3696 cycle-2 review, measured). The token is deliberately NOT copied into the shared checkout's git dir, because that would let every lane on this box push this branch, which is the hazard \`branch-claim.sh\`'s header records.
 - Do NOT merge. Do NOT amend already-pushed commits — add a new commit.
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
@@ -1258,6 +1386,35 @@ if [ -n "${CROSS_OWN:-}" ]; then
     echo "[fix $PR] cross-box fixer claim: could not release ${CROSS_OWN:0:12} — the EXIT trap will retry" >> "$L.log"
   fi
 fi
+# ⛔ THE BRANCH CLAIM IS **NOT** RELEASED HERE, UNLIKE THE HEAD CLAIM ABOVE — DELIBERATELY
+# (agent-infra#3696). The head claim must be dropped because the chain re-claims the head it is about
+# to act on; the branch claim has no successor key, so its right lifetime is the whole lane — fixer AND
+# merge chain — and the EXIT trap is what ends it.
+# ⛔ WHAT THAT IS **NOT** JUSTIFIED BY (a claim this comment used to make, verified FALSE before push):
+# `merge-one.sh` does NOT push this branch. It pushes only CLAIM refs (its `git push` calls are the
+# claim CAS and its release, `--force-with-lease` on `refs/claims/…`), and it resolves a CONFLICTING
+# head by parking it for a fixer, not by rebasing and pushing (`merge-one.sh:1336-1353`). The actor
+# that pushes a dirty PR is the AGENT in a fixer lane, not the merge chain.
+# The real reasons to hold it past the handoff:
+#   * This lane is still the writer for $BR until it exits, and #3696's measured window is exactly a
+#     peer pushing WHILE the harness reviews/lands this head (lane B pushed 2 minutes after lane A's
+#     attestation was recorded). Releasing at the handoff would re-open that window for the whole
+#     audit + rail, and holding it costs nothing because nothing in the chain pushes this branch.
+#   * The fixer's own later `git push` (a conflict-resolution turn) still passes the guard: the
+#     token fence compares the CHECKOUT's claim commit, which is ours, so `held-by-you` allows it.
+# The cost of holding it: if this process dies before its EXIT trap fires, the claim strands for the
+# branch lease (CLAIM_BRANCH_TTL, 4 h) and peer pushes to this branch are refused until then — a
+# FAIL-CLOSED direction. Recovery, in order: (1) any same-box lane that holds the token can
+# `branch-claim.sh release <br>`; (2) with no cooperating holder, `git push origin
+# :refs/claims/branch-<slug>` after confirming no worker is live; (3) `claim_prune` reaps it at expiry.
+# ⛔ AND THE TERM IS SHORTER THAN THIS LANE'S OWN BOUND (review P1, stated rather than implied): the
+# branch key's default AND ceiling is `CLAIM_BRANCH_TTL` (14400 s) while this lane may run to
+# `LANE_BACKSTOP_S` (36000 s). A lane living past 4 h therefore loses exclusive ownership: a peer's
+# re-acquire CAS succeeds on the expired claim and this box's next push is refused. That is #3328's own
+# recorded residual for batch branches (`claims.sh:196-212`, which deliberately does NOT raise the
+# default), inherited here rather than duplicated — not a new hazard, and the per-head CAS still stops
+# a peer fixing THIS head. Raising `CLAIM_BRANCH_TTL` is the knob, and it is the operator's call, because
+# it raises the default AND the ceiling for every batch that does not need 10 h.
 # re-run the full chain at the new head
 # ⛔ RELEASE THE PR-OWNER LOCK FIRST, AND BEFORE THE CHAIN — not only at exit. `merge-one.sh` takes
 # this SAME lock as its first act and, finding a live pid, exits 0 with "already owns this PR" — so
