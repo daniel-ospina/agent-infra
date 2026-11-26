@@ -1296,6 +1296,67 @@ fi
   return 0
 }
 
+# verdict_line_has_issues <line> — does this line name an issue COUNT >= 1, by merge-one.sh's rule?
+# ⛔ ONE DEFINITION OF A FINDINGS VERDICT (agent-infra#4241, parity P2). `merge-one.sh::verdict_class()`
+# decides whether the reviewer's last line reports findings: it TOLERATES a separator before the count
+# (`ISSUES: 3`, `ISSUES - 3`) and REFUSES a count of 0 (`ISSUES 0` says the reviewer found NONE). This
+# file used to anchor on the literal `^ISSUES <digits>`, so `ISSUES: 2 P3` was a re-review for the
+# producer and a FIXER AUTHORISATION here — the lane path still authorised the very push #4241 is
+# about — and `ISSUES 0` read as a fix list here while the producer read NO-VERDICT. Same line, one
+# rule. `test-gates.sh` extracts the producer's `verdict_class` and these helpers and drives them over
+# ONE matrix, so the two paths cannot drift apart again.
+verdict_line_has_issues() {
+  local n="${1:-}"
+  case "$n" in ISSUES*) n="${n#ISSUES}" ;; *) return 1 ;; esac
+  n="${n#"${n%%[0-9]*}"}"      # drop a leading non-digit run (blanks, `:`, `-`) — verdict_class's rule
+  n="${n%%[!0-9]*}"            # keep the leading digit run
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#n}" -le 9 ] || return 1
+  [ "$n" -ge 1 ]
+}
+
+# last_issues_verdict_line <log> — the reviewer's NEWEST findings verdict line; prints NOTHING when
+# that line carries no usable count. ⛔ THE LAST LINE, NOT ANY LINE (agent-infra#4241, parity P2): the
+# producer classifies the LAST verdict line, so a tail carrying `ISSUES 2` and then `ISSUES 0` is
+# NO-VERDICT to it — a "any line in the tail matches" read answered YES and would dispatch a fixer at
+# a head the producer had just called unreviewed.
+last_issues_verdict_line() {
+  local l last=""
+  while IFS= read -r l; do last="$l"; done < <(tail -n 300 "$1" 2>/dev/null | grep -E '^ISSUES')
+  [ -n "$last" ] || return 1
+  verdict_line_has_issues "$last" || return 1
+  printf '%s\n' "$last"
+}
+
+# log_verdict_is_advisory <merge-log> — are the reviewer's findings at this head P3-ONLY?
+# 0 = yes (cosmetic advisory), 1 = no (blocking, or no usable verdict line at all).
+# ⛔ THE SAME RULE AS `merge-one.sh::finding_severity()`, WHICH IS THE PRODUCER'S (agent-infra#4241):
+# `ISSUES 2 P3` is a cosmetic finding set recorded as an ADVISORY — no fixer, no push — while any
+# OTHER rank on the line, a rank-less line, and a non-rank token (`P30`) are BLOCKING. Parsed as a
+# TOKEN (`(^|[^alnum])P<digit>([^alnum]|$)`), never as a bare substring: `P30` is not a rank, and a
+# substring scan would make this classifier disagree with the producer about one verdict line — the
+# lane would attest "P3-only" over a head whose durable marker says blocking, and the controller
+# would dispatch a fixer for the same head.
+log_verdict_is_advisory() {
+  local _vls=""
+  _vls="$(last_issues_verdict_line "$1" 2>/dev/null)" || return 1
+  [ -n "$_vls" ] || return 1
+  # ⛔ MATCHED WITH `=~`, NOT `grep -o`, AND THE BOUNDARY IS NOT CONSUMED (fresh-context review of
+  # #4241, P2 — MEASURED). A `grep -Eo '(^|[^alnum])P[123]([^alnum]|$)'` capture ate the comma in
+  # `ISSUES 2 P3,P1`, so the `P1` that followed it had no preceding character left to match and the
+  # helper answered ADVISORY — the same fail-open, one layer down. `=~` asks a yes/no question about
+  # the whole line, once per rank class, so no match can swallow another's boundary; and it cannot
+  # SIGPIPE-invert a producer (#841/#864), because there is no pipe in it.
+  # ⛔ ANY SINGLE-DIGIT RANK THAT IS NOT `P3` IS BLOCKING (fresh review of #4241, P1). Matching only
+  # `P1`/`P2` ignored a rank outside that pair, so `ISSUES 2 P0 P3` read ADVISORY and a P0
+  # (security/data-loss) finding got NO fixer — the #4241 harm one severity class up. `P0` outranks
+  # P1 and `P4`-`P9` are ranks this gate never emits, so both fail CLOSED; `P30` is not a rank and
+  # falls through to the blocking default.
+  if [[ "$_vls" =~ (^|[^[:alnum:]])[Pp][0-24-9]([^[:alnum:]]|$) ]]; then return 1; fi
+  if [[ "$_vls" =~ (^|[^[:alnum:]])[Pp]3([^[:alnum:]]|$) ]]; then return 0; fi
+  return 1
+}
+
 # chain_verdict_from_log — classify a FINISHED merge chain, from the artifacts that ACTUALLY exist.
 #
 # ⛔ IT MUST NOT READ THE CHAIN LOG FOR THE VERDICT (reviewer finding A1, verified against the
@@ -1334,19 +1395,37 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
   #   the log names the reviewer FAILING → the marker is NOT a fix list (the no-verdict case)
   #   the log names neither (rotated)    → the DURABLE marker decides, as it always did
   _has_issues=0; _saw_failure=0
+  # ⛔ A RANKED, P3-ONLY VERDICT IS NOT A FIX LIST (agent-infra#4241). `ISSUES 2 P3` is a cosmetic
+  # finding set that merge-one.sh records as an ADVISORY — no fixer is authorised, and no push may be
+  # caused. This classifier is the LANE's own fixer authorisation, so it must apply the same rule or
+  # the two paths disagree about the same verdict line. `log_verdict_is_advisory` is the ONE reader
+  # of that rule here (extracted and driven by `test-gates.sh`, so it cannot drift from the producer).
   if [ -s "$mlog" ]; then
     # ⛔ ANCHORED (reviewer finding, P2): the log is merge-one's stdout AND the reviewer's own prose,
     # so `grep 'ISSUES [0-9]+'` matched a reviewer that merely WROTE "ISSUES 2" somewhere. Only a line
-    # that STARTS with the verdict counts — the same anchor merge-one uses when it reads it back.
-    tail -n 300 "$mlog" 2>/dev/null | grep -qE '^ISSUES [0-9]+' && _has_issues=1
+    # that STARTS with the verdict counts — the same anchor merge-one uses when it reads it back, and
+    # the same COUNT/separator rule through `last_issues_verdict_line` (parity, agent-infra#4241).
+    last_issues_verdict_line "$mlog" >/dev/null 2>&1 && _has_issues=1
     tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed' && _saw_failure=1
   fi
+  # The advisory check runs AFTER the counts so `_saw_failure` keeps its meaning, and it can only ever
+  # REMOVE a fixer authorisation, never add one. ⛔ AS AN `if`, NOT `fn && assign`: the helper's
+  # "not advisory" answer is a NON-ZERO status, so the `&&` form would be a bare failing command
+  # (benign under this file's `set -u`, and an `exit` the day anyone adds `set -e`).
+  if log_verdict_is_advisory "$mlog"; then _has_issues=0; fi
   _marker_is_fixlist() { [ "$_has_issues" = 1 ] || { [ "$_saw_failure" = 0 ]; }; }
   if [ -n "$at" ]; then
     if [ -e "$O/state/needsfix-$PR-$at" ]; then
       _marker_is_fixlist && { echo "FIX_REQUIRED"; return; }
       echo "REVIEW_NO_VERDICT"; return
     fi
+    # ⛔ THE ADVISORY MARKER IS THE PRODUCER'S OWN STATEMENT THAT THE FINDINGS WERE P3-ONLY
+    # (agent-infra#4241): a RECORD, never a fix list. Told the fixer, it would push over a certified
+    # branch and invalidate the signed review — the destruction the issue measures. It is NOT
+    # `REVIEW_NO_VERDICT` either: the reviewer DID produce a verdict and DID post its comment, so the
+    # lane is not sent round a paid re-review loop it cannot win (prose drift re-creates a P3 on the
+    # next tree, #4088). It hands off with a reason that names the truth.
+    if [ -e "$O/state/advisory-$PR-$at" ]; then echo "ADVISORY_ONLY"; return; fi
   else
     for f in "$O/state/needsfix-$PR"-*; do [ -e "$f" ] && seen_needsfix=1; done
     if [ "$seen_needsfix" = 1 ]; then
@@ -1361,7 +1440,11 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     # run that posted NO comment at all — a fix round spent, rc=10, and nothing on the PR to read. The
     # header of this file measures that class at 43 of 124 runs, so it is not a corner case. Only an
     # ACTUAL issue count is a fix list; a failed/unrunnable reviewer gets its own token.
-    if tail -n 300 "$mlog" 2>/dev/null | grep -qE '^ISSUES [0-9]+'; then echo "FIX_REQUIRED"; return; fi
+    if last_issues_verdict_line "$mlog" >/dev/null 2>&1; then
+      # ⛔ NOT FOR A P3-ONLY VERDICT (agent-infra#4241) — same rule as the marker arm above.
+      if log_verdict_is_advisory "$mlog"; then echo "ADVISORY_ONLY"; return; fi
+      echo "FIX_REQUIRED"; return
+    fi
     # ⛔ THE VOCABULARY IS THE WRITER'S, NOT AN APPROXIMATION OF IT (landing-review, two findings). Both
     # patterns below are taken from `merge-one.sh`'s own echo lines, because the strings they used to
     # carry were DEAD TEXT:
@@ -1918,6 +2001,13 @@ if [ "$WATCH" -eq 1 ]; then
           # log names a merge, the API says this PR is not merged. That is not "merged" and it is not
           # "the reviewer found issues" — it is the one thing a lane must NAME and hand off.
           emit_blocked BLOCKED "the merge log claims MERGED but repos/$OR/pulls/$PR reports no merged_at — the log may belong to another repo's PR #$PR (log: $(chain_log))" ;;
+        ADVISORY_ONLY)
+          # ⛔ #4241: the reviewer posted a comment whose findings are P3-only (cosmetic). That is NOT
+          # a fix list and it is not “no verdict” — sending a fixer here is what destroyed certified
+          # implementations (a cosmetic push moves the head and invalidates the signed record). The
+          # lane cannot mint a clean record for itself, so the one missing step is a review that
+          # records this diff clean; name it and hand off.
+          emit_attestation "the reviewer's findings at head ${HD:-} are P3-ONLY (cosmetic) — recorded as an ADVISORY, so no fixer is authorised and no push is caused; the advisory does not satisfy the review gate, so a review that records this diff clean is still owed (agent-infra#4241)" ;;
         FIX_REQUIRED)
           # The reviewer's findings ARE the fix list; the PR comment carries them in full.
           emit_fix FIX_REQUIRED "the fresh-context reviewer recorded ISSUES at head ${HD:-} — read the review comment on PR #$PR and fix every finding" ;;

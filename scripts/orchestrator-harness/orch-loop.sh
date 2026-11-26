@@ -1905,16 +1905,27 @@ refund_bailed_fixer() {
 }
 
 # review_gate_state <pr> <head-sha> — WHY the repo's review gate is red, as the CONTROLLER must act:
-#   NEEDS-FIX     a reviewer reported findings at this head  -> a FIXER is authorised
-#   NEEDS-REVIEW  no findings exist at this head (evidence stale, or no verdict was produced)
-#                 -> re-run the REVIEW; a fixer is NEVER authorised
+#   NEEDS-FIX     a reviewer reported BLOCKING findings (P1/P2) at this head -> a FIXER is authorised
+#   NEEDS-REVIEW  no blocking findings exist at this head (evidence stale, no verdict was produced, or
+#                 the findings were P3-ONLY advisory) -> re-run the REVIEW; a fixer is NEVER authorised
 # ⛔ ONE VOCABULARY WITH THE PRODUCER (agent-infra#2132). merge-one.sh's review_state_record() writes
-# exactly these two markers and nothing else may authorise a fixer, so the log line and the dispatch
+# exactly these markers and nothing else may authorise a fixer, so the log line and the dispatch
 # decision cannot diverge. Before this the controller logged a bare `FAILED:ai-review-gate`, which is
 # indistinguishable from a genuine rejection: a fixer dispatched on stale evidence pushes, the push
 # invalidates the signed review by design, and one MAX_FIX_TRIES attempt is burnt per cycle until the
 # PR is parked with no owner. Absent BOTH markers reads NEEDS-REVIEW — the fail-closed direction,
 # because "nothing says findings exist" must never be spent as if it did.
+# ⛔ AND ONLY THE BLOCKING MARKER IS AN AUTHORISATION (agent-infra#4241). `state/advisory-<pr>-<head>`
+# is written by the same producer for a P3-ONLY (cosmetic) finding set: it is a RECORD of that verdict,
+# NOT an authorisation — and ⛔ NOTHING SWEEPS IT. Do not claim a "later sweep" picks it up: its only
+# consumers are existence tests and the prunes, and `report.sh` queues `needsreview-*` only, so a
+# P3-only head never appears in the stale-evidence queue. Acting on the nits is a HUMAN decision, named
+# as one at the park. Reading it as findings sends a fixer to push over a certified branch
+# and invalidate the signed record that was already fine — a cosmetic nit destroying a certified
+# implementation, which is the destruction #4241 measures (3 consecutive cosmetic fix commits on
+# tortoise #14623; #14645 went `ai-review-gate=pass` -> red BECAUSE a fixer pushed to a green PR).
+# The advisory marker is named HERE, in the reader, so a future "any findings marker" glob cannot
+# quietly re-admit it: this file test is the whole contract.
 review_gate_state() {
   if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
 }
@@ -2125,9 +2136,16 @@ review_round_clear() { rm -rf "$O/state/reviewround-$1" 2>/dev/null || true; }
 # (`review_gate_state` returns NEEDS-FIX otherwise, and every NEEDS-FIX case is handled above it), so
 # everything countable here is a findings record left by a PREVIOUS head. Calling it `findings=` made
 # the line claim a currency it cannot observe; the honest question it answers is "what did earlier
-# heads leave unresolved", and where it says 0 the reviewer simply produced no usable verdict at the
-# live head. A `needsfix-<PR>-<head>` marker IS the findings record the fixer arm consumes, so
-# counting its heads is the honest measure of what is still open.
+# heads leave unresolved".
+# ⛔ AND 0 DOES **NOT** MEAN "THE REVIEWER PRODUCED NO USABLE VERDICT" (fresh review of #4241, P3 —
+# the sentence that stood here was false on both counts). An ADVISORY head (P3-only, cosmetic) DOES
+# reach this arm: `review_gate_state` reads it NEEDS-REVIEW because an advisory authorises nothing,
+# and an `advisory-*` record is not a `needsfix-*` marker, so it is invisible to this count BY
+# CONSTRUCTION. At such a head the reviewer produced a usable verdict and posted its comment. The park
+# reason at the ceiling therefore reads the advisory marker at the head itself
+# (`review_ceiling_reason`) instead of inferring a cause from this number.
+# A `needsfix-<PR>-<head>` marker IS the findings record the fixer arm consumes, so counting its heads
+# is the honest measure of what is still open.
 review_round_remaining() { # <pr>
   local n=0 heads="" f
   for f in "$O"/state/needsfix-"$1"-*; do
@@ -2170,6 +2188,59 @@ review_ceiling_line() { # <pr> <head> <n> <max>
   printf 'REVIEW-CEILING %s rounds=%s/%s head=%s %s' \
     "$1" "$3" "$4" "${2:-?}" "$(review_round_remaining "$1")"
 }
+# review_ceiling_reason <pr> <head> <n> <max> — the park REASON for the review-round ceiling, with
+# the ADVISORY discriminator applied at the head being parked.
+# ⛔ THE INVARIANT IT REPLACES WAS FALSE ON BOTH COUNTS (fresh review of #4241, P3 — MEASURED). The
+# reason claimed `stale_findings=0` means "the reviewer produced no usable verdict at the live head (a
+# live head WITH findings takes the fixer path and never reaches this line)". An advisory head IS
+# reachable here: it reads NEEDS-REVIEW (an advisory authorises nothing), its per-head budget is
+# deliberately PRESERVED, and the ceiling is keyed PER PR — so head A can spend most of the rounds and
+# a later P3-only head H parks here with `stale_findings=0` beside a verdict that DID exist and a
+# comment that WAS posted. `review_round_remaining` counts `needsfix-*` only, so an advisory record is
+# invisible to it by construction. The advisory marker at THIS head is the discriminator, exactly as
+# it is in the REVIEW-CAP reason above — and the remedy differs, because here a fix and a push IS the
+# legitimate route (the human acts on the nits), while a reviewer-budget remedy only re-arms cycles.
+review_ceiling_reason() { # <pr> <head> <n> <max>
+  local _rcl _common _tail _remedy _sf _why0
+  _rcl="$(review_ceiling_line "$1" "${2:-}" "$3" "$4")"
+  _common=" — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict."
+  # ⛔ THE REMEDY IS BUILT FROM THIS FUNCTION'S OWN ARGUMENTS, NOT FROM THE GLOBALS (fresh review of
+  # #4241, P3 — MEASURED). Interpolated into the sentence above it read `$O`/`$PR` from the caller's
+  # scope under `set -u`, so the helper was unusable outside the controller loop (`PR: unbound
+  # variable`) and silently printed an empty path wherever the global was unset. And the backticks
+  # around the rounds value MUST be escaped inside a double-quoted string: unescaped they are a
+  # COMMAND SUBSTITUTION, so the operator-facing reason said `⛔  is not a spent budget` — the same
+  # silent-erasure class 81ca77e51 fixed in the prompt heredocs, one string over.
+  _remedy=" ⛔ \`rounds=999999999\` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$1' '$O/state/parkreason-$1' '$O/state/parkorigin-$1' '$O/state/reviewround-$1' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"
+  if [ -f "$O/state/advisory-$1-${2:-}" ]; then
+    # ⛔ THE "stale_findings reads 0" CLAUSE IS CONDITIONAL, NOT DECORATION (fresh review of #4241,
+    # P3 — MEASURED). It was asserted UNCONDITIONALLY in the advisory tail, while the SAME sentence
+    # carries `$(review_round_remaining)` — so a PR whose EARLIER head left a `needsfix-*` marker and
+    # whose live head carries an advisory record printed `stale_findings=1 heads=aaaa1111` and, twelve
+    # words later, "which is why stale_findings reads 0". A reason that contradicts itself in one
+    # sentence is worse than a vague one: it teaches the operator the field is noise. Both branches
+    # say the same TRUE thing about the count (an advisory is not a `needsfix-*` marker, so THIS head
+    # never enters it); only the 0 case may call the reading 0.
+    # ⛔ FROM THE COUNT `_rcl` ALREADY PRINTED, NEVER A SECOND READ (fresh review of #4241, P3 —
+    # MEASURED). A second `review_round_remaining` call is a second measurement: when the count moves
+    # between the two (a concurrent marker delete, which this very arm can cause), `_rcl` prints
+    # `stale_findings=1` and this branch, reading 0, appended "which is why stale_findings reads 0" —
+    # the self-refuting sentence restored by the fix it was written to remove. One read, one number.
+    case "$_rcl" in
+      *stale_findings=*) _sf="${_rcl##*stale_findings=}"; _sf="${_sf%% *}" ;;
+      *) _sf="0" ;;
+    esac
+    if [ "${_sf:-0}" = "0" ]; then
+      _why0="which is why stale_findings reads 0 — an advisory record is NOT a needsfix-* marker, so it is invisible to that count by construction"
+    else
+      _why0="and the stale_findings markers listed above belong to EARLIER heads — an advisory record is NOT a needsfix-* marker, so this head never enters that count, and those markers are not a verdict about this head"
+    fi
+    _tail=" ⛔ ADVISORY: this head's verdict is P3-ONLY (cosmetic), ${_why0}. A usable verdict WAS produced and its comment WAS posted, so the reviewer's budget is NOT the cause: no fixer may be dispatched (an advisory authorises nothing, and a cosmetic push moves the head and invalidates the signed record). A human decides: act on the cosmetic findings and push (a push re-arms this per-PR budget), or accept the nits.${_remedy}"
+  else
+    _tail=" stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 this head carries no findings marker AND no advisory record, so the reviewer produced no usable verdict at the live head. A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head).${_remedy}"
+  fi
+  printf '%s%s%s' "$_rcl" "$_common" "$_tail"
+}
 # [reviewround:end]
 
 # prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*` /
@@ -2203,7 +2274,7 @@ prune_orphan_markers() {
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/spendcount-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/advisory-* "$O"/state/fixspend-* "$O"/state/spendcount-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -2214,7 +2285,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend|spendcount)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|advisory|fixspend|spendcount)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
@@ -6719,7 +6790,7 @@ while true; do
       # `parked-<PR>`/`parkreason-<PR>` pair it accompanies: the sweep's contract for that pair is
       # unchanged by this round, and widening it is a separate change with its own readers.
       rm -f "$O/state/parkorigin-$PR" 2>/dev/null || true
-      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/advisory-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
       # of the hand-rolled `rm -f` lines that also clear it (`merge-one.sh`'s CLEAN path).
@@ -7796,7 +7867,19 @@ while true; do
               # ⛔ A PARK THAT DID NOT LAND MUST NOT BE REPORTED AS ONE (review round 4 of #2653, P2):
               # the park IS the terminator here, so an unwritable `parked-<PR>` means the PR re-enters
               # this arm every cycle while the log says PARKED — an inert bound with a green face.
-              if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"; then
+              # ⛔ THE REASON MUST NAME THE STATE THAT ACTUALLY HOLDS (fresh review of #4241, P3). A
+              # P3-ONLY head reads NEEDS-REVIEW for ever (an advisory authorises nothing) and its
+              # per-head budget is deliberately PRESERVED, so this park is the DETERMINISTIC terminal
+              # for it — and the standard reason would then assert three false things: that the
+              # reviewer "never produced a usable verdict" (it did), that "a fixer has no findings to
+              # act on" (there are findings), and a reviewer-budget remedy that only re-arms the same
+              # cycles. The advisory marker is the discriminator, read at THIS head.
+              if [ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]; then
+                _cap_why="REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — ADVISORY: the reviewer's findings at this head are P3-ONLY (cosmetic), recorded as an advisory that AUTHORISES NOTHING, so no fixer may be dispatched and the gate can only clear on a review that records this diff clean. The reviewer's budget is NOT the cause here (it produced a verdict and posted its comment). A push re-arms the budget; otherwise this needs a human decision on the cosmetic findings: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR' '$O/state/advisory-$PR-${HEAD_N:-}'"
+              else
+                _cap_why="REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
+              fi
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_cap_why"; then
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, PARKED (an unfixable head must not loop; a push re-arms it)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at this head — needs a human (bounded, never a silent stop)"
               else
@@ -7828,10 +7911,14 @@ while true; do
               # pays for the review it exists to refuse is not a guard. The rounds already spent stand
               # — this line reports them, it does not retract them.
               _rrn="$(review_round_read "$PR")"
-              _rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
+              # ⛔ THE REASON IS BUILT BY `review_ceiling_reason`, WHICH READS THE ADVISORY MARKER AT
+              # THIS HEAD (fresh review of #4241, P3). Inlined here, the reason asserted the reviewer
+              # "produced no usable verdict at the live head" — false at a P3-only head, which is
+              # reachable on this arm by construction (see that function's note).
+              _rcl="$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
               # ⛔ THREE PLACES, so the diagnosis survives log-quiet (#943): the log, the ledger row
               # below, and the park reason file. A single `echo` is what #3331 measured being lost.
-              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then
                 echo "#$_rcl — review-round budget EXHAUSTED, PARKED (the next review is refused; a runaway guard, never a pass)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "parked: $_rcl — review budget exhausted, needs a human (bounded, never a silent stop)"
               else

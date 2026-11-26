@@ -3038,6 +3038,10 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   grep -m1 '^is_limit() {' "$MERGE"
   grep -m1 '^is_num() {' "$MERGE"
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SEVERITY DERIVATION IS PART OF THE PRODUCER (agent-infra#4241): `review_state_record`'s
+  # advisory arm is decided by what this function prints, so it is extracted (never re-typed) exactly
+  # like the class helper above — a copy here would keep passing after the shipped pair drifted.
+  awk '/^finding_severity\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
@@ -3055,6 +3059,7 @@ ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 _rs_sz="$(wc -c < "$TMP/reviewstate.sh" | tr -d ' ')"; _rgs_sz="$(wc -c < "$TMP/fn_review_gate_state.sh" | tr -d ' ')"
 if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
+   && grep -q '^finding_severity() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
    && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
@@ -3071,6 +3076,16 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
       park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
       . "$TMP/reviewstate.sh"; review_state_record "$1" )
   }
+  # _rs_sev <class> <severity> <head> [max] — the same producer WITH the severity argument the
+  # shipped `*)` arm passes (agent-infra#4241). Kept beside `_rs` so the no-severity call shape stays
+  # driven: the second argument is optional and its ABSENCE must keep the legacy blocking behaviour.
+  _rs_sev() {
+    ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$3"; MAX_REVIEW_TRIES="${4:-3}"
+      park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
+      . "$TMP/reviewstate.sh"; review_state_record "$1" "$2" )
+  }
+  # _fs <verdict-line> — the shipped severity derivation, driven on the line the reviewer writes.
+  _fs() { ( . "$TMP/reviewstate.sh"; finding_severity "$1" ); }
   # _rgs <pr> <head> — drive the CONSUMER's classifier against the same state dir.
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
@@ -3078,7 +3093,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
 # — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
 # leftover record here would make a later "one timeout" drive read as a cap that had been hit.
-_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/advisory-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -3189,6 +3204,385 @@ ISSUES 2')"
   # (3) INERT-BY-ABSENCE: with no marker at all the controller must NOT authorise a fixer. "Nothing
   # says findings exist" is not "findings exist", and the fail-closed direction is the re-review.
   eqv "no marker at all reads NEEDS-REVIEW (fail-closed, never a fixer)" "NEEDS-REVIEW" "$(_rgs 2132 cccc3333)"
+
+  # ── (3b) THE SEVERITY SPLIT (agent-infra#4241) ────────────────────────────────────────────────
+  # ⛔ A COSMETIC (P3) FINDING MUST NOT AUTHORISE A PUSH. The marker this arm writes is the SOLE
+  # fixer authorisation, so writing it for a P3 authorises a push — and the push moves the head and
+  # invalidates the signed review record that was already fine. Measured: 3 consecutive cosmetic fix
+  # commits on tortoise #14623, and #14645 went ai-review-gate=pass -> red BECAUSE a fixer pushed to a
+  # green PR. The split is driven from the shipped production line (`finding_severity`) into the
+  # shipped writer and back out through the shipped reader, so no half can drift.
+  eqv "a P3-only verdict line derives ADVISORY" "ADVISORY" "$(_fs 'ISSUES 2 P3')"
+  eqv "…the separator variant too (ISSUES: 2 P3)" "ADVISORY" "$(_fs 'ISSUES: 2 P3')"
+  eqv "…and a wrapped rank (**P3**)" "ADVISORY" "$(_fs 'ISSUES 2 **P3**')"
+  eqv "a P2 verdict line derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P2')"
+  eqv "a P1 verdict line derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 1 P1')"
+  # ⛔ FAIL CLOSED ON THE LEGACY SHAPE (the issue's third requirement): a count with NO rank, and a
+  # rank the helper never emits, must behave EXACTLY as before. An absent rank read as "cosmetic"
+  # would turn a format drift into a silent downgrade of the whole gate.
+  eqv "a severity-less legacy line (ISSUES 3) derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 3')"
+  eqv "a line mixing P3 with P1 derives BLOCKING (the highest rank wins)" "BLOCKING" "$(_fs 'ISSUES 2 P3 P1')"
+  # ⛔ A PUNCTUATION-JOINED ENUMERATION IS THE MEASURED FAIL-OPEN (fresh-context review of #4241, P2):
+  # the first version judged only a token's first two characters, so `P3,P1` / `P3/P1` / `P3-P2`
+  # derived ADVISORY and a real P1 got NO fixer. One row per join shape.
+  eqv "a comma-joined P3,P1 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3,P1')"
+  eqv "a slash-joined P3/P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3/P2')"
+  eqv "a dash-joined P3-P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3-P2')"
+  # ⛔ A RANK IS TOKEN-SHAPED AT ITS END TOO (second cycle of that review, P2). `P1s)` is prose, not a
+  # rank, and reading it as one left a P3-only review BLOCKING — the #4241 harm intact, one token
+  # over. The one residual is recorded in the rows below, not left to chance: a rank-shaped token
+  # inside prose (`no P1/P2`) still reads as blocking — the FAIL-CLOSED direction, deliberately (a
+  # false blocking costs a fixer round; a false `P3` would ship an unfixed defect), and the reviewer
+  # prompt now forbids prose on that line for exactly this reason.
+  eqv "a negated mention 'no P1s' does not block (P1s is not a rank token)" "ADVISORY" "$(_fs 'ISSUES 2 P3 (no P1s)')"
+  # ⛔ A PLURAL RANK IS PROSE TOO, SO IT DEMOTES — AND THAT IS PINNED HERE, NOT LEFT TO ACCIDENT (third
+  # review cycle of #4241, P3 — MEASURED). `ISSUES 3 P1s, P3` derives ADVISORY: the plural token is not
+  # a rank (the same alnum-flank rule as `P1s)` above), so only the real `P3` is read and a set that
+  # MEANT "several P1s plus a cosmetic" gets no fixer. Recorded as a DECLARED RESIDUAL, deliberately
+  # NOT fixed: telling a plural rank from a NEGATED mention (`(no P1s)`, the row above) needs a
+  # preceding-token negator scan, and that rule has to exist in BOTH readers (`finding_severity` here
+  # and `lane-merge.sh::log_verdict_is_advisory`) — two token loops, when every parity failure in the
+  # last four rounds came from a one-shape asymmetry between exactly those two. The DIRECTION is the
+  # safe one: a withheld fixer parks the head with a review round still to spend, while a mis-read `P3`
+  # authorises the very push #4241 removes. The reviewer prompt forbids prose on this line, so the
+  # shape should never be emitted; the row exists so the behaviour cannot change unnoticed.
+  eqv "RESIDUAL: 'ISSUES 3 P1s, P3' reads ADVISORY (a plural rank is prose — the safe direction)" "ADVISORY" "$(_fs 'ISSUES 3 P1s, P3')"
+  eqv "RESIDUAL: 'no P1/P2' still reads BLOCKING (fail-closed, prose forbidden on that line)" "BLOCKING" "$(_fs 'ISSUES 2 P3 (no P1/P2 findings)')"
+  eqv "a trailing-colon rank is still a rank" "ADVISORY" "$(_fs 'ISSUES 2 P3:')"
+  eqv "a P30-style token is not a rank (fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P30')"
+  # ⛔ ONLY `P3` MAY EVER BE COSMETIC (fresh review of #4241, P1 — MEASURED FAIL-OPEN). Judging only the
+  # `P1`/`P2` pair IGNORED every other rank, so `ISSUES 2 P0 P3` derived ADVISORY and a P0
+  # (security/data-loss) finding set got NO fixer: the #4241 harm exactly one severity class up, which
+  # is the direction that must never fail. One row per out-of-vocabulary rank class.
+  eqv "a P0 rank is BLOCKING (an unlisted rank must never demote)" "BLOCKING" "$(_fs 'ISSUES 2 P0 P3')"
+  eqv "…and a lone P0" "BLOCKING" "$(_fs 'ISSUES 1 P0')"
+  eqv "…and a wrapped P0 ((P0))" "BLOCKING" "$(_fs 'ISSUES 2 P3 (P0)')"
+  eqv "a P4 rank is BLOCKING too (outside the vocabulary, fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P4 P3')"
+  eqv "…and a punctuation-joined P3,P0" "BLOCKING" "$(_fs 'ISSUES 2 P3,P0')"
+  eqv "a non-ISSUES line derives BLOCKING (never advisory by default)" "BLOCKING" "$(_fs 'CLEAN https://x/y')"
+  # (a) P3-ONLY: an advisory marker, NO fixer marker, and the controller does NOT authorise a fixer.
+  _clean; _rs_sev ISSUES ADVISORY a3a3a3a3
+  if [ -f "$RS/state/advisory-2132-a3a3a3a3" ] && [ ! -f "$RS/state/needsfix-2132-a3a3a3a3" ]; then
+    echo "  ✅ a P3-ONLY finding set writes an ADVISORY record and NOT the fixer marker"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a P3-only finding set wrote the FIXER marker (needsfix=$( [ -f "$RS/state/needsfix-2132-a3a3a3a3" ] && echo yes || echo no), advisory=$( [ -f "$RS/state/advisory-2132-a3a3a3a3" ] && echo yes || echo no)) — a cosmetic nit would authorise a push over a certified branch"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that P3-only head NEEDS-REVIEW (no fixer)" "NEEDS-REVIEW" "$(_rgs 2132 a3a3a3a3)"
+  # (a2) ⛔ AN ADVISORY MUST NOT SUPERSEDE A SAME-HEAD FINDINGS VERDICT, AND THAT IS THE ONE CASE THE
+  # ROWS ABOVE DO NOT SEED (fresh review of #4241, P2). The `ISSUES` arm prunes `needsfix-<PR>-*`
+  # UNCONDITIONALLY and the advisory arm runs AFTER the prune, so a second review at an UNCHANGED head
+  # that disagreed DOWNWARDS deleted the marker a different reviewer had written for that SAME head —
+  # the sole fixer authorisation — and replaced it with an advisory record claiming "P3-ONLY findings
+  # at head=H", false at a head carrying a P1. Two reviewers disagreeing on rank is the NORMAL case
+  # (`MAX_REVIEW_TRIES` exists for it) and only the LOWER opinion survived. Same rule the NO-VERDICT
+  # arm already applies one arm down: a weaker artifact does not supersede a findings verdict here.
+  _clean; _rs_sev ISSUES BLOCKING e1e1e1e1
+  _rs_sev ISSUES ADVISORY e1e1e1e1
+  if [ -f "$RS/state/needsfix-2132-e1e1e1e1" ] && [ ! -f "$RS/state/advisory-2132-e1e1e1e1" ]; then
+    echo "  ✅ an ADVISORY at a head that ALREADY carries findings keeps NEEDS-FIX (the weaker verdict never demotes the authorisation)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an ADVISORY verdict DELETED the same-head findings marker (needsfix=$( [ -f "$RS/state/needsfix-2132-e1e1e1e1" ] && echo yes || echo no), advisory=$( [ -f "$RS/state/advisory-2132-e1e1e1e1" ] && echo yes || echo no)) — a cosmetic second opinion erased a real finding's fixer"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller still classifies that head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 e1e1e1e1)"
+  # CONTROL: the restoration is scoped to the SAME head — an advisory at head B must not preserve a
+  # findings marker left at head A (nothing was recorded about B).
+  _clean; _rs_sev ISSUES BLOCKING e2e2e2e2
+  _rs_sev ISSUES ADVISORY e3e3e3e3
+  if [ -f "$RS/state/advisory-2132-e3e3e3e3" ] && [ ! -f "$RS/state/needsfix-2132-e3e3e3e3" ]; then
+    echo "  ✅ …while an advisory at a NEW head is a plain advisory (the restore is head-keyed, never PR-wide)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the findings restore leaked ACROSS heads (needsfix-e3e3e3e3=$( [ -f "$RS/state/needsfix-2132-e3e3e3e3" ] && echo yes || echo no)) — an old head's findings marker now authorises a push at a head nobody reported on"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ A VERDICT-LESS RUN AT THE SAME HEAD MUST NOT ERASE THE ADVISORY (round 6 of that review, P2 —
+  # MEASURED). The NO-VERDICT arm's own early return guards `needsfix-<PR>-<HEAD>` only, so at a
+  # P3-only head it pruned `advisory-<PR>-*` UNCONDITIONALLY — deleting the record of a review that
+  # DID happen — and then parked with "the reviewer produced NO usable verdict … Nothing was reviewed
+  # at this head" plus the reviewer-budget remedy. Both are false when a P3-only verdict exists: the
+  # remedy is a human deciding on the nits. The marker is read before the prune and restored after.
+  _clean; _rs_sev ISSUES ADVISORY a7a7a7a7
+  _rs_sev NO-VERDICT ADVISORY a7a7a7a7
+  if [ -f "$RS/state/advisory-2132-a7a7a7a7" ]; then
+    echo "  ✅ a verdict-less run at a P3-only head KEEPS the advisory (the review that DID happen is not erased)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a verdict-less run DELETED the same-head advisory — the P3 findings are gone and the park now claims nothing was reviewed at a head that was"; FAIL=$((FAIL+1))
+  fi
+  # …and the park reason it leaves when the budget IS spent must say so, not blame the reviewer. Driven
+  # at the cap (3rd attempt) so the `park` branch is the one taken.
+  _clean; _rs_sev ISSUES ADVISORY a8a8a8a8
+  _rs_sev NO-VERDICT ADVISORY a8a8a8a8 1 >/dev/null 2>&1 || true
+  if [ -f "$RS/parkreason" ] && grep -q 'ALREADY CARRIES A P3-ONLY' "$RS/parkreason"; then
+    echo "  ✅ …and the park reason names the advisory instead of claiming nothing was reviewed"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the park reason at an advisory head does not name the advisory (reason=[$( [ -f "$RS/parkreason" ] && tr '\n' ' ' < "$RS/parkreason" | cut -c1-160 || echo none)]) — the operator is told the reviewer failed and given a budget remedy for a review that produced a usable verdict"; FAIL=$((FAIL+1))
+  fi
+  # (b) P2: unchanged — the fixer is still authorised, so the split did not weaken the gate.
+  _clean; _rs_sev ISSUES BLOCKING b2b2b2b2
+  if [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && [ ! -f "$RS/state/advisory-2132-b2b2b2b2" ]; then
+    echo "  ✅ a BLOCKING (P1/P2) finding set still writes the fixer marker (the gate is not weakened)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a BLOCKING finding set did not write the fixer marker (needsfix=$( [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && echo yes || echo no)) — the #4241 split weakened the gate"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that blocking head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 b2b2b2b2)"
+  # (c) FAIL CLOSED: an unknown/absent severity argument must not demote the marker.
+  _clean; _rs_sev ISSUES "" c9c9c9c9
+  if [ -f "$RS/state/needsfix-2132-c9c9c9c9" ] && [ ! -f "$RS/state/advisory-2132-c9c9c9c9" ]; then
+    echo "  ✅ an EMPTY severity is BLOCKING (an allow-list, never whatever the caller passed)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an empty severity demoted the marker to advisory — a fail-open severity read"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs_sev ISSUES "p3-ish" c8c8c8c8
+  if [ -f "$RS/state/needsfix-2132-c8c8c8c8" ]; then
+    echo "  ✅ an unrecognised severity is BLOCKING too (fail closed on a value the helper never emits)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an unrecognised severity did not write the fixer marker"; FAIL=$((FAIL+1))
+  fi
+  # (d) A verified CLEAN supersedes the advisory at the same head (one state per PR, always NOW).
+  _clean; _rs_sev ISSUES ADVISORY d7d7d7d7; _rc d7d7d7d7
+  [ ! -f "$RS/state/advisory-2132-d7d7d7d7" ] \
+    && { echo "  ✅ a verified CLEAN clears the advisory record at that head"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the advisory record survived a verified CLEAN (a state that contradicts the signed record)"; FAIL=$((FAIL+1)); }
+  # (e) ⛔ AN ADVISORY MUST NOT ZERO THE PER-HEAD REVIEW BUDGET (fresh-context review of #4241, P2). The
+  # head does NOT move on a cosmetic verdict, so `reviewdisp-<PR>` — the ONE bound on re-reviews at an
+  # unchanged head (MAX_REVIEW_TRIES) — is the only thing that stops the same P3 being re-reviewed
+  # until the coarser per-PR ceiling runs out. Zeroing it here made `review_disp_decide` answer
+  # `ALLOW 0` for ever at that head. The blocking arm still resets it: its fixer PUSHES, and a push
+  # re-arms the budget by changing the key.
+  _clean; printf 'aaaa1111 2\n' > "$RS/state/reviewdisp-2132"
+  _rs_sev ISSUES ADVISORY aaaa1111
+  if [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)" = "aaaa1111 2" ]; then
+    echo "  ✅ a P3-only verdict LEAVES the per-head review budget standing (the re-review loop stays bounded)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a P3-only verdict zeroed reviewdisp-<PR> (was [aaaa1111 2], now [$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)]) — MAX_REVIEW_TRIES is inert at that head"; FAIL=$((FAIL+1))
+  fi
+  _clean; printf 'bbbb1111 1\n' > "$RS/state/reviewdisp-2132"
+  _rs_sev ISSUES BLOCKING bbbb1111
+  if [ ! -f "$RS/state/reviewdisp-2132" ]; then
+    echo "  ✅ …while a BLOCKING verdict still resets it (its fixer pushes, and a push re-arms the budget)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a blocking verdict no longer resets the re-review budget ([$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)] survived)"; FAIL=$((FAIL+1))
+  fi
+  # (f) THE LANE'S OWN FIXER AUTHORISATION APPLIES THE SAME RULE (agent-infra#4241). `lane-merge.sh`
+  # classifies the SAME verdict line to decide FIX_REQUIRED, so a P3-only line must not read as a fix
+  # list there either — otherwise the lane path still authorises the push this issue is about. Driven
+  # from the shipped functions (extracted, never re-typed) and parsed as a TOKEN, so `P30` — which the
+  # producer calls blocking — cannot disagree with it.
+  # ⛔ THE VERDICT-LINE SELECTOR IS PART OF THE RULE NOW (parity P2): the producer tolerates
+  # `ISSUES: 3` and refuses `ISSUES 0`, while the lane anchored on `^ISSUES <digits>` — one line, two
+  # answers. All three lane helpers are extracted TOGETHER (the advisory reader calls the other two) and
+  # driven over the same rows below, so the two paths cannot drift by construction.
+  LANE="${LANE:-$(dirname "$ORCH")/lane-merge.sh}"
+  awk '/^(verdict_line_has_issues|last_issues_verdict_line|log_verdict_is_advisory)\(\) \{/{f=1} f{print} f&&/^\}/{f=0}' "$LANE" > "$TMP/fn_lva.sh" 2>/dev/null
+  if [ -s "$TMP/fn_lva.sh" ] \
+     && grep -q '^verdict_line_has_issues() {' "$TMP/fn_lva.sh" \
+     && grep -q '^last_issues_verdict_line() {' "$TMP/fn_lva.sh" \
+     && grep -q '^log_verdict_is_advisory() {' "$TMP/fn_lva.sh" && bash -n "$TMP/fn_lva.sh" 2>/dev/null; then
+    _lva() { ( . "$TMP/fn_lva.sh"; log_verdict_is_advisory "$1" ); }
+    _lvap() { ( . "$TMP/fn_lva.sh"; last_issues_verdict_line "$1" >/dev/null ); }
+    _lvafile() { printf '%s\n' "$2" > "$1"; }
+    _lvafile "$TMP/lva-p3.log" 'ISSUES 2 P3'
+    _lvafile "$TMP/lva-p30.log" 'ISSUES 2 P30'
+    _lvafile "$TMP/lva-join.log" 'ISSUES 2 P3,P1'
+    _lvafile "$TMP/lva-legacy.log" 'ISSUES 3'
+    _lvafile "$TMP/lva-colon.log" 'ISSUES: 2 P3'
+    _lvafile "$TMP/lva-p0.log" 'ISSUES 2 P0 P3'
+    _lvafile "$TMP/lva-zero.log" 'ISSUES 0'
+    _lvafile "$TMP/lva-two.log" "$(printf 'ISSUES 2\nISSUES 0')"
+    _lva "$TMP/lva-p3.log" && { echo "  ✅ lane-merge.sh: a P3-only verdict is advisory (no fixer round)"; PASS=$((PASS+1)); } || { echo "  ❌ lane-merge.sh still reads a P3-only verdict as a fix list"; FAIL=$((FAIL+1)); }
+    _lva "$TMP/lva-p30.log" && { echo "  ❌ lane-merge.sh reads \`P30\` as a rank — it disagrees with finding_severity()"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: \`P30\` is not a rank (agrees with the producer, fail closed)"; PASS=$((PASS+1)); }
+    _lva "$TMP/lva-join.log" && { echo "  ❌ lane-merge.sh reads a punctuation-joined P3,P1 as advisory (a P1 would get no fixer)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a punctuation-joined P3,P1 is BLOCKING"; PASS=$((PASS+1)); }
+    _lva "$TMP/lva-legacy.log" && { echo "  ❌ lane-merge.sh reads a RANK-LESS legacy line as advisory (silent downgrade)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a rank-less legacy line stays BLOCKING"; PASS=$((PASS+1)); }
+    # ⛔ PARITY IS DRIVEN, NOT CLAIMED (parity P2, MEASURED). Before this fix: `ISSUES: 2 P3` was
+    # ADVISORY for the producer and BLOCKING for the lane (the lane path still authorised the cosmetic
+    # push #4241 is about), `ISSUES 2 P0 P3` was ADVISORY for BOTH (a P0 got no fixer), and `ISSUES 0`
+    # was NO-VERDICT for the producer and FIX_REQUIRED for the lane (a fixer on a clean head). Each row
+    # below drives the producer AND the lane over the same line.
+    # ⛔ AND EACH ROW IS AN `if`, NOT AN `A && ❌ || B && ✅ || ❌` CHAIN (fresh review of #4241, P3 —
+    # MEASURED). With equal-precedence left-associative `&&`/`||` that shape parses as
+    # `((A&&B)||C)&&D||E`, so on the branch where the lane DID read the line as advisory the row printed
+    # the ❌ AND the ✅ "parity for BOTH paths" line and incremented PASS alongside FAIL — a false ✅ in
+    # the block whose whole subject is that parity is measured, asserting a parity it never evaluated.
+    if [ "$(_fs 'ISSUES: 2 P3')" = "ADVISORY" ] && _lva "$TMP/lva-colon.log"; then
+      echo "  ✅ parity: 'ISSUES: 2 P3' is ADVISORY for BOTH the producer and the lane"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES: 2 P3' — producer=[$(_fs 'ISSUES: 2 P3')] lane_advisory=$( _lva "$TMP/lva-colon.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    if [ "$(_fs 'ISSUES 2 P0 P3')" = "BLOCKING" ] && ! _lva "$TMP/lva-p0.log"; then
+      echo "  ✅ parity: 'ISSUES 2 P0 P3' is BLOCKING for BOTH paths (fail closed on an unlisted rank)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 2 P0 P3' — producer=[$(_fs 'ISSUES 2 P0 P3')] lane_advisory=$( _lva "$TMP/lva-p0.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    # ⛔ THE COUNT-GLUED FORMS WERE THE HOLE IN THIS MATRIX (fresh review of #4241, P3 — MEASURED).
+    # The producer required a rank to START its whitespace token while the lane scanned the line with a
+    # boundary, so `ISSUES 2,P3` was BLOCKING for the producer (a cosmetic push) and ADVISORY for the
+    # lane: 28 of 240 separator×rank shapes disagreed at that head, 0 after the producer's P3 test took
+    # the blocking test's boundary shape. These rows ARE the matrix for that shape; they red before the
+    # fix and are why "one rule, cannot drift apart" is now a property rather than a claim.
+    _glued_i=0
+    for _gl in 'ISSUES 2,P3' 'ISSUES: 2-P3' 'ISSUES 2_P3' 'ISSUES 2/P3' 'ISSUES (2)P3' 'ISSUES 2 -P3' 'ISSUES 2 (P3' 'ISSUES 2)P3'; do
+      _glued_i=$(( _glued_i + 1 ))
+      _lvafile "$TMP/lva-glued-$_glued_i.log" "$_gl"
+      if [ "$(_fs "$_gl")" = "ADVISORY" ] && _lva "$TMP/lva-glued-$_glued_i.log"; then
+        echo "  ✅ parity: '$_gl' is ADVISORY for BOTH paths (a count-glued cosmetic rank is still cosmetic)"; PASS=$((PASS+1))
+      else
+        echo "  ❌ parity broken on '$_gl' — producer=[$(_fs "$_gl")] lane_advisory=$( _lva "$TMP/lva-glued-$_glued_i.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+      fi
+    done
+    # …and glued to ANOTHER rank it blocks on BOTH sides: the demotion is P3-ONLY, never a rank class.
+    _lvafile "$TMP/lva-gluedmix.log" 'ISSUES 2,P3,P1'
+    if [ "$(_fs 'ISSUES 2,P3,P1')" = "BLOCKING" ] && ! _lva "$TMP/lva-gluedmix.log"; then
+      echo "  ✅ parity: 'ISSUES 2,P3,P1' is BLOCKING for BOTH paths (a glued P1 still blocks)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 2,P3,P1' — producer=[$(_fs 'ISSUES 2,P3,P1')] lane_advisory=$( _lva "$TMP/lva-gluedmix.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    # ⛔ AND AN ALNUM-GLUED RANK IS NOT A RANK ON **EITHER** SIDE (fresh review of #4241, P3 —
+    # MEASURED). The producer's blocking test had lost its left boundary while the lane's kept it, so
+    # `ISSUES 2 P3 xP1` / `… 2P1` / `… 9P2` read BLOCKING there and ADVISORY here: 98 of 1848
+    # wider-token shapes, 0 in the reverse direction. Safe-sided, but it is the same asymmetry the
+    # count-glued rows above exist to close, one token over — and `P1s` already settles that a rank
+    # with an alnum on its flank is prose. Both sides now scan with the SAME shape, so these rows
+    # red if either loses its boundary.
+    _alnum_i=0
+    for _al in 'ISSUES 2 P3 xP1' 'ISSUES 2 P3 2P1' 'ISSUES 2 P3 9P2' 'ISSUES 2 P3 aP2'; do
+      _alnum_i=$(( _alnum_i + 1 ))
+      _lvafile "$TMP/lva-alnum-$_alnum_i.log" "$_al"
+      if [ "$(_fs "$_al")" = "ADVISORY" ] && _lva "$TMP/lva-alnum-$_alnum_i.log"; then
+        echo "  ✅ parity: '$_al' is ADVISORY for BOTH paths (an alnum-glued token is not a rank)"; PASS=$((PASS+1))
+      else
+        echo "  ❌ parity broken on '$_al' — producer=[$(_fs "$_al")] lane_advisory=$( _lva "$TMP/lva-alnum-$_alnum_i.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+      fi
+    done
+    # …and the PLURAL-rank residual above is measured on BOTH sides, so it cannot become a lane-only
+    # difference (a plural rank is prose by the same alnum-flank rule, so only the `P3` is read).
+    _lvafile "$TMP/lva-plural.log" 'ISSUES 3 P1s, P3'
+    if [ "$(_fs 'ISSUES 3 P1s, P3')" = "ADVISORY" ] && _lva "$TMP/lva-plural.log"; then
+      echo "  ✅ parity: 'ISSUES 3 P1s, P3' is ADVISORY for BOTH paths (declared residual: a plural rank is prose, the safe direction)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 3 P1s, P3' — producer=[$(_fs 'ISSUES 3 P1s, P3')] lane_advisory=$( _lva "$TMP/lva-plural.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    # …and the CONTROL for that boundary: a rank behind PUNCTUATION still blocks on both sides, so the
+    # rows above cannot be satisfied by simply deleting the blocking test.
+    _lvafile "$TMP/lva-punct.log" 'ISSUES 2 (P1) P3'
+    if [ "$(_fs 'ISSUES 2 (P1) P3')" = "BLOCKING" ] && ! _lva "$TMP/lva-punct.log"; then
+      echo "  ✅ parity: 'ISSUES 2 (P1) P3' is BLOCKING for BOTH paths (a punctuation-bounded rank is a rank)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 2 (P1) P3' — producer=[$(_fs 'ISSUES 2 (P1) P3')] lane_advisory=$( _lva "$TMP/lva-punct.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    # ⛔ `ISSUES 0` IS "FOUND NONE", NOT A FIX LIST (parity P2 — the #2132 class on the lane path):
+    # the producer reads NO-VERDICT and re-reviews; a bare `[0-9]+` match told the lane FIX_REQUIRED.
+    if [ "$(_vc 'ISSUES 0')" = "NO-VERDICT" ] && ! _lvap "$TMP/lva-zero.log"; then
+      echo "  ✅ parity: 'ISSUES 0' is NO-VERDICT for both paths (a count of zero is not a fix list)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 0' — producer=[$(_vc 'ISSUES 0')] lane_findings=$( _lvap "$TMP/lva-zero.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
+    # ⛔ AND THE LAST VERDICT LINE WINS, as it does for the producer: `ISSUES 2` followed by `ISSUES 0`
+    # is NO-VERDICT there, so the lane must not read the older line as a live fix list.
+    if _lvap "$TMP/lva-two.log"; then
+      echo "  ❌ lane-merge.sh read an OLDER 'ISSUES 2' line after a newer 'ISSUES 0'"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ the lane reads the reviewer's LAST verdict line, like the producer"; PASS=$((PASS+1))
+    fi
+  else
+    echo "  ❌ lane-merge.sh's verdict-line helpers could not be extracted — the lane path's severity rule is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
+  # (f) ⛔ THE SECOND VERDICT-LESS PARK PATH IS ADVISORY-AWARE TOO (round 7 of that review, P2 —
+  # MEASURED). `review_abandoned_record` is what the EXIT trap calls when a reviewer run died without a
+  # verdict, and the advisory design DELIBERATELY preserves `reviewdisp-<PR>` — which makes an advisory
+  # head exactly the head that sits at MAX_REVIEW_TRIES, so a crash lands this reason on it. It used to
+  # say "nothing was reviewed here" and name a reviewer budget for a head holding a usable P3-only
+  # verdict, and its lift command left `reviewdisp` at the cap, so "accept the nits" re-parked on the
+  # next cycle. Driven from the SHIPPED function (with the shipped budget helpers), not by grep.
+  awk '/^review_abandoned_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE" > "$TMP/abandoned.sh"
+  if grep -q '^review_abandoned_record() {' "$TMP/abandoned.sh" && bash -n "$TMP/abandoned.sh" 2>/dev/null; then
+    RA="$TMP/rao"; rm -rf "$RA"; mkdir -p "$RA/state"; : > "$RA/merge.log"
+    printf 'aaa7 3\n' > "$RA/state/reviewdisp-2132"; printf 'P3-ONLY\n' > "$RA/state/advisory-2132-aaa7"
+    ( O="$RA"; L="$RA/merge.log"; PR=2132; HEAD=aaa7; MAX_REVIEW_TRIES=3; LAST=""; REV_STARTED=1; REV_RECORDED=0
+      park() { printf '%s\n' "$*" > "$RA/parkreason"; }
+      . "$TMP/reviewstate.sh"; . "$TMP/abandoned.sh"; review_abandoned_record ) >/dev/null 2>&1 || true
+    # ⚠ THE REASON IS BUILT WITH DOUBLE QUOTES, so `$PR`/`$O` are ALREADY EXPANDED in it: assert on the
+    # CONCRETE path the operator is told to remove (`reviewdisp-2132`), never on the literal `$PR`.
+    if [ -f "$RA/parkreason" ] && grep -q 'ALREADY CARRIES A P3-ONLY' "$RA/parkreason" && grep -q 'reviewdisp-2132' "$RA/parkreason"; then
+      echo "  ✅ a crashed reviewer at an ADVISORY head parks with the advisory named and a lift command that clears the bound"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the abandoned-run park at an advisory head does not name it / its lift command cannot un-park (reason=[$( [ -f "$RA/parkreason" ] && tr '\n' ' ' < "$RA/parkreason" | cut -c1-200 || echo none)])"; FAIL=$((FAIL+1))
+    fi
+    # CONTROL: with NO advisory, the original sentence and the budget remedy are still what is written.
+    rm -f "$RA/parkreason" "$RA/state/advisory-2132-aaa7"
+    ( O="$RA"; L="$RA/merge.log"; PR=2132; HEAD=aaa7; MAX_REVIEW_TRIES=3; LAST=""; REV_STARTED=1; REV_RECORDED=0
+      park() { printf '%s\n' "$*" > "$RA/parkreason"; }
+      . "$TMP/reviewstate.sh"; . "$TMP/abandoned.sh"; review_abandoned_record ) >/dev/null 2>&1 || true
+    if [ -f "$RA/parkreason" ] && grep -q 'nothing was reviewed here' "$RA/parkreason" && ! grep -q 'ADVISORY' "$RA/parkreason"; then
+      echo "  ✅ …while a head with NO advisory keeps the original reason (the branch is the marker, not a rewrite)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the non-advisory abandoned-run reason changed (reason=[$( [ -f "$RA/parkreason" ] && tr '\n' ' ' < "$RA/parkreason" | cut -c1-200 || echo none)])"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ review_abandoned_record could not be extracted — the second verdict-less park path is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
+  # (g) ⛔ THE REVIEW-CAP PARK REASON IS ADVISORY-AWARE (fresh review of #4241, P3). With the per-head
+  # budget deliberately preserved, a P3-only head reaches REVIEW-CAP as its deterministic terminal, and
+  # the standard reason then asserts the reviewer "never produced a usable verdict" — false (it did)
+  # — and prints a reviewer-budget remedy that only re-arms the same cycles. A presence pin, so the
+  # discriminator cannot be deleted while the rest of the suite stays green.
+  # ⛔ THE PIN NAMES THE **TEST**, NOT A STRING THE REMEDY ALSO CARRIES (fresh review of #4241, P3 —
+  # MEASURED). It used to grep for `state/advisory-$PR-${HEAD_N:-}`, which also appears in the SAME
+  # arm's `_cap_why` rm-recipe — so replacing the discriminator with `if false; then` left the pin
+  # GREEN while a P3-only head parked claiming "the reviewer never produced a usable verdict".
+  # `[ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]` is the file TEST itself and appears nowhere else.
+  if grep -qF '[ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]' "$ORCH"; then
+    echo "  ✅ orch-loop.sh's REVIEW-CAP reason reads the advisory marker (no false 'no usable verdict' at a P3-only head)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the REVIEW-CAP park reason does not read the advisory marker — a P3-only head parks with a false diagnosis"; FAIL=$((FAIL+1))
+  fi
+  # (g2) ⛔ AND THE REVIEW-**CEILING** REASON IS ADVISORY-AWARE, DRIVEN (fresh review of #4241, P3).
+  # An advisory head is REACHABLE on that arm: it reads NEEDS-REVIEW, its per-head budget is preserved,
+  # and the ceiling is keyed per PR — so head A spends most of the rounds and a later P3-only head H
+  # parks there with `stale_findings=0` beside a verdict that DID exist. `review_round_remaining` counts
+  # `needsfix-*` only, so the advisory record is invisible to it; the marker at the head is the only
+  # discriminator. Driven, not pinned: a presence pin cannot tell a live discriminator from one neutered
+  # to `if false`.
+  { ex review_round_remaining; ex review_ceiling_line; ex review_ceiling_reason; } > "$TMP/fn_ceiling.sh"
+  if grep -q '^review_ceiling_reason() {' "$TMP/fn_ceiling.sh" && grep -q '^review_ceiling_line() {' "$TMP/fn_ceiling.sh" && bash -n "$TMP/fn_ceiling.sh" 2>/dev/null; then
+    CO="$TMP/ceilO"; mkdir -p "$CO/state"
+    _creason() { ( O="$CO"; . "$TMP/fn_ceiling.sh"; review_ceiling_reason "$@" ); }
+    : > "$CO/state/advisory-2132-c0c0c0c0"
+    _r_adv="$(_creason 2132 c0c0c0c0 10 10)"
+    if grep -qi 'ADVISORY' <<<"$_r_adv" && ! grep -qi 'no usable verdict' <<<"$_r_adv" && grep -qF 'stale_findings=0' <<<"$_r_adv"; then
+      echo "  ✅ an ADVISORY head parked at the REVIEW CEILING gets the truth (no 'no usable verdict', the marker named) — the human remedy, not a reviewer-budget one"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the REVIEW-CEILING reason still gives a P3-only head the no-usable-verdict diagnosis: [$(printf '%s' "$_r_adv" | cut -c1-220)]"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$CO/state/advisory-2132-c0c0c0c0"
+    _r_plain="$(_creason 2132 c0c0c0c0 10 10)"
+    if grep -qi 'no usable verdict' <<<"$_r_plain" && ! grep -qF "this head's verdict is P3-ONLY" <<<"$_r_plain"; then
+      echo "  ✅ …while a head with NO advisory record keeps the no-verdict diagnosis (the discriminator is the marker, not the wording)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the no-advisory branch lost its diagnosis (the discriminator fires without its marker): [$(printf '%s' "$_r_plain" | cut -c1-220)]"; FAIL=$((FAIL+1))
+    fi
+    : > "$CO/state/advisory-2132-c1c1c1c1"
+    _r_other="$(_creason 2132 d0d0d0d0 10 10)"
+    if grep -qi 'no usable verdict' <<<"$_r_other"; then
+      echo "  ✅ …and it is HEAD-KEYED: an advisory record at another head does not change this head's diagnosis"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the ceiling reason read an advisory record from ANOTHER head"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$CO/state/advisory-2132-c1c1c1c1"
+    # (g3) ⛔ THE ADVISORY TAIL MUST NOT CONTRADICT THE SAME SENTENCE'S OWN COUNT (fresh review of
+    # #4241, P3 — MEASURED). It asserted "which is why stale_findings reads 0" UNCONDITIONALLY while
+    # `_rcl` carries `$(review_round_remaining)` — so a PR whose EARLIER head left a `needsfix-*`
+    # marker and whose live head carries an advisory record printed `stale_findings=1 heads=aaaa1111`
+    # and, twelve words later, "which is why stale_findings reads 0". A reason that refutes itself
+    # teaches the operator the field is noise. Driven, not pinned: the 0-case row above cannot see it.
+    : > "$CO/state/advisory-2132-c0c0c0c0"; : > "$CO/state/needsfix-2132-aaaa1111"
+    _r_stale="$(_creason 2132 c0c0c0c0 10 10)"
+    if grep -qF 'stale_findings=1' <<<"$_r_stale" && ! grep -qF 'stale_findings reads 0' <<<"$_r_stale" && grep -qF 'P3-ONLY' <<<"$_r_stale"; then
+      echo "  ✅ …and an advisory head that ALSO carries an earlier head's findings does NOT claim stale_findings reads 0 (the count cannot contradict itself)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the ADVISORY reason contradicts its own stale_findings reading: [$(printf '%s' "$_r_stale" | cut -c1-260)]"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$CO/state/advisory-2132-c0c0c0c0" "$CO/state/needsfix-2132-aaaa1111"
+  else
+    echo "  ❌ could not extract review_ceiling_reason from orch-loop.sh — the ceiling's advisory discriminator is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
   # (4) BOUNDED: a reviewer that never returns a verdict must not buy an unbounded run of PAID
   # reviews (the #1717 class, one input over). The count is per HEAD, so a push re-arms it.
   _clean; _rs NO-VERDICT dddd4444; _rs NO-VERDICT dddd4444
@@ -3293,6 +3687,18 @@ ISSUES 2')"
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
   else
     echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ AND THE SEVERITY RIDES THAT CALL (agent-infra#4241; fresh-context review, P3). The rows above
+  # drive the producer, the writer and the reader as three separate pieces — so the call site could be
+  # reverted to the pre-change ONE-argument form and every one of them would stay GREEN while the
+  # whole split is INERT. That is the same false-PASS shape the comment above measures for the marker
+  # write, one line over. Asserted PRESENT (so its removal reddens), on the arm body with comments
+  # stripped, so a commented-out call cannot satisfy it.
+  if [ "$_arms_ok" = 1 ] && _star_body="$(grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh")" \
+     && grep -qF 'review_state_record "$(verdict_class "$LAST")" "$(finding_severity "$LAST")"' <<<"$_star_body"; then
+    echo "  ✅ …and the arm PASSES \$(finding_severity …) to the writer (a one-argument call would make the split inert)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the verdict arm does not pass \$(finding_severity …) to review_state_record — the #4241 severity split would be inert"; FAIL=$((FAIL+1))
   fi
   # (7) ⛔ THE CLEAR ARM (#2132 Required item 4): a COMPLETED review at the new head clears the
   # state. Without this assertion the clear sites could be deleted outright and the suite stayed
@@ -3748,13 +4154,14 @@ GHFAIL2
     # `continue` → the file is never removed, and one stale file per abandoned PR accumulates silently
     # for ever — the exact leak the reviewcount pin was added for. So every family is seeded here.
     rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"
-    : > "$PO/state/reviewdisp-6999"; : > "$PO/state/reviewathead-6999"; sleep 1; : > "$PO/state/last-open-prs"
+    : > "$PO/state/reviewdisp-6999"; : > "$PO/state/reviewathead-6999"; : > "$PO/state/advisory-6999-a99"; sleep 1; : > "$PO/state/last-open-prs"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
     if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ] \
-       && [ ! -e "$PO/state/reviewdisp-6999" ] && [ ! -e "$PO/state/reviewathead-6999" ]; then
-      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount AND the review budgets (reviewdisp/reviewathead) are pruned"; PASS=$((PASS+1))
+       && [ ! -e "$PO/state/reviewdisp-6999" ] && [ ! -e "$PO/state/reviewathead-6999" ] \
+       && [ ! -e "$PO/state/advisory-6999-a99" ]; then
+      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount AND the review budgets (reviewdisp/reviewathead) AND the advisory record are pruned"; PASS=$((PASS+1))
     else
-      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted) reviewdisp=$( [ -e "$PO/state/reviewdisp-6999" ] && echo kept || echo deleted) reviewathead=$( [ -e "$PO/state/reviewathead-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
+      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted) reviewdisp=$( [ -e "$PO/state/reviewdisp-6999" ] && echo kept || echo deleted) reviewathead=$( [ -e "$PO/state/reviewathead-6999" ] && echo kept || echo deleted) advisory=$( [ -e "$PO/state/advisory-6999-a99" ] && echo KEPT-leak || echo deleted)) — the glob and the sed alternation are two halves of one predicate, so a family seeded in ONE half only leaks for ever"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.
@@ -3781,6 +4188,13 @@ GHFAIL2
   # (13) …and the SPEND sweep still exists on the GREEN arm (review round 5, residual 2): losing it
   # silently restores the monotonic state/ growth round 5 fixed, and nothing else would notice.
   wpin "the GREEN arm still sweeps the local spend record" "$TMP/green_arm.sh" 'rm -f "$O/state/fixspend-$PR-"*'
+  # ⛔ AND THE TERMINAL (MERGED|CLOSED) SWEEP CARRIES THE ADVISORY FAMILY TOO (fresh review of #4241,
+  # P3 — NOTHING covered `orch-loop.sh`'s MERGED|CLOSED arm at all). A presence pin, and NAMED as one:
+  # the arm sits inside the controller's per-PR cycle and no fixture here drives that cycle. It still
+  # catches deletion of the half — the leak class the orphan-prune row above now drives behaviourally
+  # for the prune half. The PR-wide form is unique to that arm (the REVIEW-CAP remedy names the
+  # head-keyed form), so the pin cannot be satisfied by prose elsewhere.
+  wpin "a MERGED/CLOSED PR's advisory record is swept with the rest of its evidence state" "$ORCH" '"$O/state/advisory-$PR-"*'
 
   wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
 else
