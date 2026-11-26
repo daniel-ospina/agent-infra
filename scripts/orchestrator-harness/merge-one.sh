@@ -1935,10 +1935,10 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
     ISSUES <n> <P1|P2|P3>
 ⛔ EXACTLY THOSE TWO FIELDS AND NOTHING AFTER THE RANK (agent-infra#4241). No prose, no parenthetical,
 no list of the ranks: the rank is judged from this line alone, by a machine, and any rank-shaped token
-on it OTHER THAN `P3` reads as BLOCKING (the safe direction — a false blocking costs a fixer round, a
-false `P3` would ship an unfixed defect). That is why `ISSUES 2 P3 (no P1/P2 findings)` is read as
+on it OTHER THAN \`P3\` reads as BLOCKING (the safe direction — a false blocking costs a fixer round, a
+false \`P3\` would ship an unfixed defect). That is why \`ISSUES 2 P3 (no P1/P2 findings)\` is read as
 blocking: the parser cannot tell a negated mention from a rank, so do not write one. The only token
-that can ever read as cosmetic is `P3` itself — `P0`, `P1`, `P2`, and any other `P<digit>` you might
+that can ever read as cosmetic is \`P3\` itself — \`P0\`, \`P1\`, \`P2\`, and any other \`P<digit>\` you might
 invent all block, so there is no spelling of "cosmetic" worth guessing at.
 ⛔ THE RANK ON THAT LINE IS WHAT DECIDES WHETHER YOUR FINDINGS AUTHORISE A PUSH (agent-infra#4241).
 It is the HIGHEST severity among the findings you are reporting, using the same P1/P2/P3 ranks your
