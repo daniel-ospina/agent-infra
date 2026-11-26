@@ -3235,6 +3235,18 @@ ISSUES 2')"
   # false blocking costs a fixer round; a false `P3` would ship an unfixed defect), and the reviewer
   # prompt now forbids prose on that line for exactly this reason.
   eqv "a negated mention 'no P1s' does not block (P1s is not a rank token)" "ADVISORY" "$(_fs 'ISSUES 2 P3 (no P1s)')"
+  # ⛔ A PLURAL RANK IS PROSE TOO, SO IT DEMOTES — AND THAT IS PINNED HERE, NOT LEFT TO ACCIDENT (third
+  # review cycle of #4241, P3 — MEASURED). `ISSUES 3 P1s, P3` derives ADVISORY: the plural token is not
+  # a rank (the same alnum-flank rule as `P1s)` above), so only the real `P3` is read and a set that
+  # MEANT "several P1s plus a cosmetic" gets no fixer. Recorded as a DECLARED RESIDUAL, deliberately
+  # NOT fixed: telling a plural rank from a NEGATED mention (`(no P1s)`, the row above) needs a
+  # preceding-token negator scan, and that rule has to exist in BOTH readers (`finding_severity` here
+  # and `lane-merge.sh::log_verdict_is_advisory`) — two token loops, when every parity failure in the
+  # last four rounds came from a one-shape asymmetry between exactly those two. The DIRECTION is the
+  # safe one: a withheld fixer parks the head with a review round still to spend, while a mis-read `P3`
+  # authorises the very push #4241 removes. The reviewer prompt forbids prose on this line, so the
+  # shape should never be emitted; the row exists so the behaviour cannot change unnoticed.
+  eqv "RESIDUAL: 'ISSUES 3 P1s, P3' reads ADVISORY (a plural rank is prose — the safe direction)" "ADVISORY" "$(_fs 'ISSUES 3 P1s, P3')"
   eqv "RESIDUAL: 'no P1/P2' still reads BLOCKING (fail-closed, prose forbidden on that line)" "BLOCKING" "$(_fs 'ISSUES 2 P3 (no P1/P2 findings)')"
   eqv "a trailing-colon rank is still a rank" "ADVISORY" "$(_fs 'ISSUES 2 P3:')"
   eqv "a P30-style token is not a rank (fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P30')"
@@ -3417,6 +3429,14 @@ ISSUES 2')"
         echo "  ❌ parity broken on '$_al' — producer=[$(_fs "$_al")] lane_advisory=$( _lva "$TMP/lva-alnum-$_alnum_i.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
       fi
     done
+    # …and the PLURAL-rank residual above is measured on BOTH sides, so it cannot become a lane-only
+    # difference (a plural rank is prose by the same alnum-flank rule, so only the `P3` is read).
+    _lvafile "$TMP/lva-plural.log" 'ISSUES 3 P1s, P3'
+    if [ "$(_fs 'ISSUES 3 P1s, P3')" = "ADVISORY" ] && _lva "$TMP/lva-plural.log"; then
+      echo "  ✅ parity: 'ISSUES 3 P1s, P3' is ADVISORY for BOTH paths (declared residual: a plural rank is prose, the safe direction)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ parity broken on 'ISSUES 3 P1s, P3' — producer=[$(_fs 'ISSUES 3 P1s, P3')] lane_advisory=$( _lva "$TMP/lva-plural.log" && echo yes || echo no)"; FAIL=$((FAIL+1))
+    fi
     # …and the CONTROL for that boundary: a rank behind PUNCTUATION still blocks on both sides, so the
     # rows above cannot be satisfied by simply deleting the blocking test.
     _lvafile "$TMP/lva-punct.log" 'ISSUES 2 (P1) P3'
@@ -3498,7 +3518,7 @@ ISSUES 2')"
     # teaches the operator the field is noise. Driven, not pinned: the 0-case row above cannot see it.
     : > "$CO/state/advisory-2132-c0c0c0c0"; : > "$CO/state/needsfix-2132-aaaa1111"
     _r_stale="$(_creason 2132 c0c0c0c0 10 10)"
-    if grep -qF 'stale_findings=1' <<<"$_r_stale" && ! grep -qF 'stale_findings reads 0' <<<"$_r_stale" && grep -qi 'EARLIER heads' <<<"$_r_stale"; then
+    if grep -qF 'stale_findings=1' <<<"$_r_stale" && ! grep -qF 'stale_findings reads 0' <<<"$_r_stale" && grep -qF 'P3-ONLY' <<<"$_r_stale"; then
       echo "  ✅ …and an advisory head that ALSO carries an earlier head's findings does NOT claim stale_findings reads 0 (the count cannot contradict itself)"; PASS=$((PASS+1))
     else
       echo "  ❌ the ADVISORY reason contradicts its own stale_findings reading: [$(printf '%s' "$_r_stale" | cut -c1-260)]"; FAIL=$((FAIL+1))

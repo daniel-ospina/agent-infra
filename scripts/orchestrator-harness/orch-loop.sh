@@ -2221,7 +2221,15 @@ review_ceiling_reason() { # <pr> <head> <n> <max>
     # sentence is worse than a vague one: it teaches the operator the field is noise. Both branches
     # say the same TRUE thing about the count (an advisory is not a `needsfix-*` marker, so THIS head
     # never enters it); only the 0 case may call the reading 0.
-    _sf="$(review_round_remaining "$1")"; _sf="${_sf#stale_findings=}"; _sf="${_sf%% *}"
+    # ⛔ FROM THE COUNT `_rcl` ALREADY PRINTED, NEVER A SECOND READ (fresh review of #4241, P3 —
+    # MEASURED). A second `review_round_remaining` call is a second measurement: when the count moves
+    # between the two (a concurrent marker delete, which this very arm can cause), `_rcl` prints
+    # `stale_findings=1` and this branch, reading 0, appended "which is why stale_findings reads 0" —
+    # the self-refuting sentence restored by the fix it was written to remove. One read, one number.
+    case "$_rcl" in
+      *stale_findings=*) _sf="${_rcl##*stale_findings=}"; _sf="${_sf%% *}" ;;
+      *) _sf="0" ;;
+    esac
     if [ "${_sf:-0}" = "0" ]; then
       _why0="which is why stale_findings reads 0 — an advisory record is NOT a needsfix-* marker, so it is invisible to that count by construction"
     else
