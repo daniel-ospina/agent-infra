@@ -1905,16 +1905,24 @@ refund_bailed_fixer() {
 }
 
 # review_gate_state <pr> <head-sha> — WHY the repo's review gate is red, as the CONTROLLER must act:
-#   NEEDS-FIX     a reviewer reported findings at this head  -> a FIXER is authorised
-#   NEEDS-REVIEW  no findings exist at this head (evidence stale, or no verdict was produced)
-#                 -> re-run the REVIEW; a fixer is NEVER authorised
+#   NEEDS-FIX     a reviewer reported BLOCKING findings (P1/P2) at this head -> a FIXER is authorised
+#   NEEDS-REVIEW  no blocking findings exist at this head (evidence stale, no verdict was produced, or
+#                 the findings were P3-ONLY advisory) -> re-run the REVIEW; a fixer is NEVER authorised
 # ⛔ ONE VOCABULARY WITH THE PRODUCER (agent-infra#2132). merge-one.sh's review_state_record() writes
-# exactly these two markers and nothing else may authorise a fixer, so the log line and the dispatch
+# exactly these markers and nothing else may authorise a fixer, so the log line and the dispatch
 # decision cannot diverge. Before this the controller logged a bare `FAILED:ai-review-gate`, which is
 # indistinguishable from a genuine rejection: a fixer dispatched on stale evidence pushes, the push
 # invalidates the signed review by design, and one MAX_FIX_TRIES attempt is burnt per cycle until the
 # PR is parked with no owner. Absent BOTH markers reads NEEDS-REVIEW — the fail-closed direction,
 # because "nothing says findings exist" must never be spent as if it did.
+# ⛔ AND ONLY THE BLOCKING MARKER IS AN AUTHORISATION (agent-infra#4241). `state/advisory-<pr>-<head>`
+# is written by the same producer for a P3-ONLY (cosmetic) finding set: it is a RECORD for a later
+# sweep, NOT an authorisation. Reading it as findings sends a fixer to push over a certified branch
+# and invalidate the signed record that was already fine — a cosmetic nit destroying a certified
+# implementation, which is the destruction #4241 measures (3 consecutive cosmetic fix commits on
+# tortoise #14623; #14645 went `ai-review-gate=pass` -> red BECAUSE a fixer pushed to a green PR).
+# The advisory marker is named HERE, in the reader, so a future "any findings marker" glob cannot
+# quietly re-admit it: this file test is the whole contract.
 review_gate_state() {
   if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
 }
@@ -2203,7 +2211,7 @@ prune_orphan_markers() {
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/spendcount-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/advisory-* "$O"/state/fixspend-* "$O"/state/spendcount-* "$O"/state/reviewcount-* "$O"/state/conflictcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -2214,7 +2222,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend|spendcount)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|advisory|fixspend|spendcount)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|conflictcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
@@ -6719,7 +6727,7 @@ while true; do
       # `parked-<PR>`/`parkreason-<PR>` pair it accompanies: the sweep's contract for that pair is
       # unchanged by this round, and widening it is a separate change with its own readers.
       rm -f "$O/state/parkorigin-$PR" 2>/dev/null || true
-      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/advisory-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/spendcount-$PR-"* "$O/state/reviewcount-$PR" "$O/state/conflictcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
       # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
       # of the hand-rolled `rm -f` lines that also clear it (`merge-one.sh`'s CLEAN path).

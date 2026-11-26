@@ -3038,6 +3038,10 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   grep -m1 '^is_limit() {' "$MERGE"
   grep -m1 '^is_num() {' "$MERGE"
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SEVERITY DERIVATION IS PART OF THE PRODUCER (agent-infra#4241): `review_state_record`'s
+  # advisory arm is decided by what this function prints, so it is extracted (never re-typed) exactly
+  # like the class helper above — a copy here would keep passing after the shipped pair drifted.
+  awk '/^finding_severity\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
@@ -3055,6 +3059,7 @@ ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 _rs_sz="$(wc -c < "$TMP/reviewstate.sh" | tr -d ' ')"; _rgs_sz="$(wc -c < "$TMP/fn_review_gate_state.sh" | tr -d ' ')"
 if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
+   && grep -q '^finding_severity() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
    && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
@@ -3071,6 +3076,16 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
       park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
       . "$TMP/reviewstate.sh"; review_state_record "$1" )
   }
+  # _rs_sev <class> <severity> <head> [max] — the same producer WITH the severity argument the
+  # shipped `*)` arm passes (agent-infra#4241). Kept beside `_rs` so the no-severity call shape stays
+  # driven: the second argument is optional and its ABSENCE must keep the legacy blocking behaviour.
+  _rs_sev() {
+    ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$3"; MAX_REVIEW_TRIES="${4:-3}"
+      park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
+      . "$TMP/reviewstate.sh"; review_state_record "$1" "$2" )
+  }
+  # _fs <verdict-line> — the shipped severity derivation, driven on the line the reviewer writes.
+  _fs() { ( . "$TMP/reviewstate.sh"; finding_severity "$1" ); }
   # _rgs <pr> <head> — drive the CONSUMER's classifier against the same state dir.
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
@@ -3078,7 +3093,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
 # — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
 # leftover record here would make a later "one timeout" drive read as a cap that had been hit.
-_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/advisory-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -3189,6 +3204,107 @@ ISSUES 2')"
   # (3) INERT-BY-ABSENCE: with no marker at all the controller must NOT authorise a fixer. "Nothing
   # says findings exist" is not "findings exist", and the fail-closed direction is the re-review.
   eqv "no marker at all reads NEEDS-REVIEW (fail-closed, never a fixer)" "NEEDS-REVIEW" "$(_rgs 2132 cccc3333)"
+
+  # ── (3b) THE SEVERITY SPLIT (agent-infra#4241) ────────────────────────────────────────────────
+  # ⛔ A COSMETIC (P3) FINDING MUST NOT AUTHORISE A PUSH. The marker this arm writes is the SOLE
+  # fixer authorisation, so writing it for a P3 authorises a push — and the push moves the head and
+  # invalidates the signed review record that was already fine. Measured: 3 consecutive cosmetic fix
+  # commits on tortoise #14623, and #14645 went ai-review-gate=pass -> red BECAUSE a fixer pushed to a
+  # green PR. The split is driven from the shipped production line (`finding_severity`) into the
+  # shipped writer and back out through the shipped reader, so no half can drift.
+  eqv "a P3-only verdict line derives ADVISORY" "ADVISORY" "$(_fs 'ISSUES 2 P3')"
+  eqv "…the separator variant too (ISSUES: 2 P3)" "ADVISORY" "$(_fs 'ISSUES: 2 P3')"
+  eqv "…and a wrapped rank (**P3**)" "ADVISORY" "$(_fs 'ISSUES 2 **P3**')"
+  eqv "a P2 verdict line derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P2')"
+  eqv "a P1 verdict line derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 1 P1')"
+  # ⛔ FAIL CLOSED ON THE LEGACY SHAPE (the issue's third requirement): a count with NO rank, and a
+  # rank the helper never emits, must behave EXACTLY as before. An absent rank read as "cosmetic"
+  # would turn a format drift into a silent downgrade of the whole gate.
+  eqv "a severity-less legacy line (ISSUES 3) derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 3')"
+  eqv "a line mixing P3 with P1 derives BLOCKING (the highest rank wins)" "BLOCKING" "$(_fs 'ISSUES 2 P3 P1')"
+  # ⛔ A PUNCTUATION-JOINED ENUMERATION IS THE MEASURED FAIL-OPEN (fresh-context review of #4241, P2):
+  # the first version judged only a token's first two characters, so `P3,P1` / `P3/P1` / `P3-P2`
+  # derived ADVISORY and a real P1 got NO fixer. One row per join shape.
+  eqv "a comma-joined P3,P1 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3,P1')"
+  eqv "a slash-joined P3/P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3/P2')"
+  eqv "a dash-joined P3-P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3-P2')"
+  eqv "a P30-style token is not a rank (fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P30')"
+  eqv "a non-ISSUES line derives BLOCKING (never advisory by default)" "BLOCKING" "$(_fs 'CLEAN https://x/y')"
+  # (a) P3-ONLY: an advisory marker, NO fixer marker, and the controller does NOT authorise a fixer.
+  _clean; _rs_sev ISSUES ADVISORY a3a3a3a3
+  if [ -f "$RS/state/advisory-2132-a3a3a3a3" ] && [ ! -f "$RS/state/needsfix-2132-a3a3a3a3" ]; then
+    echo "  ✅ a P3-ONLY finding set writes an ADVISORY record and NOT the fixer marker"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a P3-only finding set wrote the FIXER marker (needsfix=$( [ -f "$RS/state/needsfix-2132-a3a3a3a3" ] && echo yes || echo no), advisory=$( [ -f "$RS/state/advisory-2132-a3a3a3a3" ] && echo yes || echo no)) — a cosmetic nit would authorise a push over a certified branch"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that P3-only head NEEDS-REVIEW (no fixer)" "NEEDS-REVIEW" "$(_rgs 2132 a3a3a3a3)"
+  # (b) P2: unchanged — the fixer is still authorised, so the split did not weaken the gate.
+  _clean; _rs_sev ISSUES BLOCKING b2b2b2b2
+  if [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && [ ! -f "$RS/state/advisory-2132-b2b2b2b2" ]; then
+    echo "  ✅ a BLOCKING (P1/P2) finding set still writes the fixer marker (the gate is not weakened)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a BLOCKING finding set did not write the fixer marker (needsfix=$( [ -f "$RS/state/needsfix-2132-b2b2b2b2" ] && echo yes || echo no)) — the #4241 split weakened the gate"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that blocking head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 b2b2b2b2)"
+  # (c) FAIL CLOSED: an unknown/absent severity argument must not demote the marker.
+  _clean; _rs_sev ISSUES "" c9c9c9c9
+  if [ -f "$RS/state/needsfix-2132-c9c9c9c9" ] && [ ! -f "$RS/state/advisory-2132-c9c9c9c9" ]; then
+    echo "  ✅ an EMPTY severity is BLOCKING (an allow-list, never whatever the caller passed)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an empty severity demoted the marker to advisory — a fail-open severity read"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs_sev ISSUES "p3-ish" c8c8c8c8
+  if [ -f "$RS/state/needsfix-2132-c8c8c8c8" ]; then
+    echo "  ✅ an unrecognised severity is BLOCKING too (fail closed on a value the helper never emits)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an unrecognised severity did not write the fixer marker"; FAIL=$((FAIL+1))
+  fi
+  # (d) A verified CLEAN supersedes the advisory at the same head (one state per PR, always NOW).
+  _clean; _rs_sev ISSUES ADVISORY d7d7d7d7; _rc d7d7d7d7
+  [ ! -f "$RS/state/advisory-2132-d7d7d7d7" ] \
+    && { echo "  ✅ a verified CLEAN clears the advisory record at that head"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the advisory record survived a verified CLEAN (a state that contradicts the signed record)"; FAIL=$((FAIL+1)); }
+  # (e) ⛔ AN ADVISORY MUST NOT ZERO THE PER-HEAD REVIEW BUDGET (fresh-context review of #4241, P2). The
+  # head does NOT move on a cosmetic verdict, so `reviewdisp-<PR>` — the ONE bound on re-reviews at an
+  # unchanged head (MAX_REVIEW_TRIES) — is the only thing that stops the same P3 being re-reviewed
+  # until the coarser per-PR ceiling runs out. Zeroing it here made `review_disp_decide` answer
+  # `ALLOW 0` for ever at that head. The blocking arm still resets it: its fixer PUSHES, and a push
+  # re-arms the budget by changing the key.
+  _clean; printf 'aaaa1111 2\n' > "$RS/state/reviewdisp-2132"
+  _rs_sev ISSUES ADVISORY aaaa1111
+  if [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)" = "aaaa1111 2" ]; then
+    echo "  ✅ a P3-only verdict LEAVES the per-head review budget standing (the re-review loop stays bounded)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a P3-only verdict zeroed reviewdisp-<PR> (was [aaaa1111 2], now [$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)]) — MAX_REVIEW_TRIES is inert at that head"; FAIL=$((FAIL+1))
+  fi
+  _clean; printf 'bbbb1111 1\n' > "$RS/state/reviewdisp-2132"
+  _rs_sev ISSUES BLOCKING bbbb1111
+  if [ ! -f "$RS/state/reviewdisp-2132" ]; then
+    echo "  ✅ …while a BLOCKING verdict still resets it (its fixer pushes, and a push re-arms the budget)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a blocking verdict no longer resets the re-review budget ([$(cat "$RS/state/reviewdisp-2132" 2>/dev/null)] survived)"; FAIL=$((FAIL+1))
+  fi
+  # (f) THE LANE'S OWN FIXER AUTHORISATION APPLIES THE SAME RULE (agent-infra#4241). `lane-merge.sh`
+  # classifies the SAME verdict line to decide FIX_REQUIRED, so a P3-only line must not read as a fix
+  # list there either — otherwise the lane path still authorises the push this issue is about. Driven
+  # from the shipped function (extracted, never re-typed) and parsed as a TOKEN, so `P30` — which the
+  # producer calls blocking — cannot disagree with it.
+  LANE="${LANE:-$(dirname "$ORCH")/lane-merge.sh}"
+  awk '/^log_verdict_is_advisory\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$LANE" > "$TMP/fn_lva.sh" 2>/dev/null
+  if [ -s "$TMP/fn_lva.sh" ] && grep -q '^log_verdict_is_advisory() {' "$TMP/fn_lva.sh" && bash -n "$TMP/fn_lva.sh" 2>/dev/null; then
+    _lva() { ( . "$TMP/fn_lva.sh"; log_verdict_is_advisory "$1" ); }
+    _lvafile() { printf '%s\n' "$2" > "$1"; }
+    _lvafile "$TMP/lva-p3.log" 'ISSUES 2 P3'
+    _lvafile "$TMP/lva-p30.log" 'ISSUES 2 P30'
+    _lvafile "$TMP/lva-join.log" 'ISSUES 2 P3,P1'
+    _lvafile "$TMP/lva-legacy.log" 'ISSUES 3'
+    _lva "$TMP/lva-p3.log" && { echo "  ✅ lane-merge.sh: a P3-only verdict is advisory (no fixer round)"; PASS=$((PASS+1)); } || { echo "  ❌ lane-merge.sh still reads a P3-only verdict as a fix list"; FAIL=$((FAIL+1)); }
+    _lva "$TMP/lva-p30.log" && { echo "  ❌ lane-merge.sh reads \`P30\` as a rank — it disagrees with finding_severity()"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: \`P30\` is not a rank (agrees with the producer, fail closed)"; PASS=$((PASS+1)); }
+    _lva "$TMP/lva-join.log" && { echo "  ❌ lane-merge.sh reads a punctuation-joined P3,P1 as advisory (a P1 would get no fixer)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a punctuation-joined P3,P1 is BLOCKING"; PASS=$((PASS+1)); }
+    _lva "$TMP/lva-legacy.log" && { echo "  ❌ lane-merge.sh reads a RANK-LESS legacy line as advisory (silent downgrade)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a rank-less legacy line stays BLOCKING"; PASS=$((PASS+1)); }
+  else
+    echo "  ❌ lane-merge.sh's log_verdict_is_advisory() could not be extracted — the lane path's severity rule is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
   # (4) BOUNDED: a reviewer that never returns a verdict must not buy an unbounded run of PAID
   # reviews (the #1717 class, one input over). The count is per HEAD, so a push re-arms it.
   _clean; _rs NO-VERDICT dddd4444; _rs NO-VERDICT dddd4444
@@ -3293,6 +3409,18 @@ ISSUES 2')"
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
   else
     echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ AND THE SEVERITY RIDES THAT CALL (agent-infra#4241; fresh-context review, P3). The rows above
+  # drive the producer, the writer and the reader as three separate pieces — so the call site could be
+  # reverted to the pre-change ONE-argument form and every one of them would stay GREEN while the
+  # whole split is INERT. That is the same false-PASS shape the comment above measures for the marker
+  # write, one line over. Asserted PRESENT (so its removal reddens), on the arm body with comments
+  # stripped, so a commented-out call cannot satisfy it.
+  if [ "$_arms_ok" = 1 ] && _star_body="$(grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh")" \
+     && grep -qF 'review_state_record "$(verdict_class "$LAST")" "$(finding_severity "$LAST")"' <<<"$_star_body"; then
+    echo "  ✅ …and the arm PASSES \$(finding_severity …) to the writer (a one-argument call would make the split inert)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the verdict arm does not pass \$(finding_severity …) to review_state_record — the #4241 severity split would be inert"; FAIL=$((FAIL+1))
   fi
   # (7) ⛔ THE CLEAR ARM (#2132 Required item 4): a COMPLETED review at the new head clears the
   # state. Without this assertion the clear sites could be deleted outright and the suite stayed
