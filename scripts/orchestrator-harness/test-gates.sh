@@ -3586,17 +3586,20 @@ ISSUES 2')"
     # while all four suites stay green, and no operator can ever see the advisory-aware diagnosis. This
     # PR added a call-site pin for the severity argument and a presence pin for the REVIEW-CAP marker;
     # the ceiling arm had no equivalent. Pin the exact call, then prove the pin live by reverting it.
-    # ⛔ ON A COMMENT-STRIPPED CAPTURE (fresh review of #4247, P2 — MEASURED). The first version grepped
-    # `"$ORCH"` unstripped, so a COMMENT quoting the invocation satisfied it — and the mutant rewrote
-    # every line containing `_rcl="$(review_ceiling_reason`, comments included, so it mutated the
-    # comment too and printed "the pin is live" over a reverted call site. It certified exactly the
-    # vacuity it exists to catch (measured: real call reverted + comment quoting it → 2 passed). This
-    # suite already fixed that class ten lines away (the `(f)` row's `grep -v '^[[:space:]]*#'`); the
-    # same capture is taken here, once, and BOTH the pin and the mutant read it.
+    # ⛔ THE PIN IS LINE-ANCHORED, NOT MERELY COMMENT-STRIPPED (fresh reviews of #4247, two P2s —
+    # MEASURED). v1 grepped `"$ORCH"` unstripped, so a comment quoting the invocation satisfied it. v2
+    # stripped line-LEADING comments only — and this file has hundreds of lines whose `#` FOLLOWS code,
+    # so ONE INLINE comment (`code … # was: _rcl="$(review_ceiling_reason "$PR" "${HEAD_N:-}"
+    # "$_rrn" "${MAX_REVIEW:-10}")"`) moved the block from 2 passed to 3 passed over a REVERTED arm,
+    # because the mutant's trigger was inside that comment too, so it rewrote the prose rather than the
+    # (already reverted) code: it certified the vacuity it exists to catch, one strip-rule away. An ERE
+    # anchored at the START of the line cannot be satisfied by a trailing comment, and the mutants keep
+    # their own anchor, so prose cannot absorb a mutation.
     _ceil_code="$TMP/ceilwire.code.sh"
     grep -v '^[[:space:]]*#' "$ORCH" > "$_ceil_code"
-    if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$_ceil_code" \
-       && grep -qF 'if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then' "$_ceil_code"; then
+    _ceil_build='^[[:space:]]*_rcl="\$\(review_ceiling_reason "\$PR" "\$\{HEAD_N:-\}" "\$_rrn" "\$\{MAX_REVIEW:-10\}"\)"'
+    _ceil_park='^[[:space:]]*if park_ctrl "\$PR" "\$\{HEAD_N:-\}" "\$_rcl"; then'
+    if grep -qE "$_ceil_build" "$_ceil_code" && grep -qE "$_ceil_park" "$_ceil_code"; then
       echo "  ✅ orch-loop.sh's REVIEW-CEILING arm PARKS the reason review_ceiling_reason builds (the advisory-aware one is wired into the park, not dead code)"; PASS=$((PASS+1))
     else
       echo "  ❌ the REVIEW-CEILING arm no longer both BUILDS the reason with review_ceiling_reason and PARKS it — the advisory-aware diagnosis is DEAD CODE (a reason computed and discarded is the same harm): the function is driven by these rows and rendered by (c4u), so the suite stays green while no operator ever sees it"; FAIL=$((FAIL+1))
@@ -3616,8 +3619,24 @@ ISSUES 2')"
     # pre-change shape, exactly as #4242 (e96e769bc:648) replaced it. An inert transform inside the very
     # mutant that proves non-vacuity is the same false confidence this PR exists to close one level up,
     # so the rewrite's OUTPUT is asserted below rather than believed.
-    awk '{ if (index($0, "_rcl=\"$(review_ceiling_reason") > 0) { gsub(/review_ceiling_reason/, "review_ceiling_line") } } {print}' "$_ceil_code" > "$TMP/ceilwire.mut.sh"
-    if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
+    # ⛔ NO `awk -v` FOR THE PATTERNS, AND NO `\$` INSIDE AN AWK STRING (fresh review of #4247, two P2s/
+    # P3s — MEASURED). `awk -v` runs ESCAPE PROCESSING on the assignment, so a pattern carrying
+    # `\$ \( \{ \}` arrived stripped: `$` became an END-OF-LINE anchor mid-pattern and `(` a group,
+    # i.e. UNSATISFIABLE — the pin stayed green (grep does not eat backslashes) while BOTH mutants
+    # matched nothing. And `\$` inside an awk STRING constant is undefined (gawk/nawk drop it, mawk keeps
+    # it), so the park mutant's replacement was byte-different per implementation. Both rewrites are bash
+    # line loops over the SAME line-anchored patterns the pin uses, so a mutant cannot be absorbed by
+    # prose the pin ignores, and `_m1`/`_m2` report whether anything was changed: a row must never print
+    # "the pin is live" over a mutation that never happened.
+    _m1=0
+    while IFS= read -r _l; do
+      if [[ "$_l" =~ $_ceil_build ]]; then
+        printf '%s\n' "${_l/review_ceiling_reason/review_ceiling_line}"; _m1=1
+      else printf '%s\n' "$_l"; fi
+    done < "$_ceil_code" > "$TMP/ceilwire.mut.sh"
+    if [ "$_m1" -ne 1 ] || [ ! -s "$TMP/ceilwire.mut.sh" ]; then
+      echo "  ❌ MUTANT: the build-call revert matched NOTHING — the mutation never happened, so this row would certify a pin it never tested"; FAIL=$((FAIL+1))
+    elif grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
       echo "  ❌ MUTANT: the ceiling-wiring pin survives reverting the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
     else
       echo "  ✅ MUTANT: reverting the ceiling arm's call to review_ceiling_line makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
@@ -3627,8 +3646,15 @@ ISSUES 2')"
     else
       echo "  ❌ MUTANT: the revert did not produce the pre-change 4-arg call shape — a transform that silently no-ops (or drops an argument) proves nothing about the pin"; FAIL=$((FAIL+1))
     fi
-    awk '{ if (index($0, "if park_ctrl") > 0 && index($0, "$_rcl") > 0) gsub(/\$_rcl/, "$(review_ceiling_line \"$PR\" \"\${HEAD_N:-}\" \"$_rrn\" \"\${MAX_REVIEW:-10}\")") } {print}' "$_ceil_code" > "$TMP/ceilwire.parkmut.sh"
-    if grep -qF 'if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then' "$TMP/ceilwire.parkmut.sh"; then
+    _m2=0
+    while IFS= read -r _l; do
+      if [[ "$_l" =~ $_ceil_park ]]; then
+        printf '%sif park_ctrl "$PR" "${HEAD_N:-}" "$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"; then\n' "${_l%%if park_ctrl*}"; _m2=1
+      else printf '%s\n' "$_l"; fi
+    done < "$_ceil_code" > "$TMP/ceilwire.parkmut.sh"
+    if [ "$_m2" -ne 1 ] || [ ! -s "$TMP/ceilwire.parkmut.sh" ]; then
+      echo "  ❌ MUTANT: the park-site revert matched NOTHING — the mutation never happened, so this row would certify a pin it never tested"; FAIL=$((FAIL+1))
+    elif grep -qF 'if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"; then' "$TMP/ceilwire.parkmut.sh"; then
       echo "  ❌ MUTANT: the reason can be computed and DISCARDED (the park pin survives) — the row claims the arm PARKS it, so it must red"; FAIL=$((FAIL+1))
     else
       echo "  ✅ MUTANT: parking a freshly-computed line instead of \$_rcl makes the row red (the reason must REACH the park, not merely be built)"; PASS=$((PASS+1))
