@@ -2308,6 +2308,13 @@ _c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends wi
     [ $(( (${#_cmd} - ${#_rest}) % 2 )) -eq 0 ] || return 1
   done
   case "${1:-}" in *"rm -rf "*) _rest="${1#*rm -rf }" ;; *) return 1 ;; esac
+  # ⛔ A WHITESPACE RUN IS ONE SEPARATOR, NOT A MALFORMED PASTE (fresh review of #4249, P3 — MEASURED).
+  # The verb-prefix strip hands the walk a single leading space; with exactly one space stripped the walk
+  # saw a leading space as its first token and returned 1, so `rm -rf  '<book>'` (two spaces) redded even
+  # though the paste really does remove the book — a NEW false RED that `main` did not have, and whose
+  # failure text asserted the remedy "does not remove the book", inviting the broaden-the-matcher repair
+  # this block warns against. Consume the whole run: bash itself treats any run of blanks as one separator.
+  while [ "${_rest# }" != "$_rest" ]; do _rest="${_rest# }"; done
   while :; do
     case "$_rest" in
       "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"
@@ -2352,6 +2359,21 @@ _c4u_shape 'verb prefix ate the opening quote'     RED   "' rm -rf '/x/state/rev
 _c4u_shape 'verb prefix ate the opening quote (dq)' RED  '" rm -rf "/x/state/reviewround-77'   # the mirror: the two
 #   quote arms each need their OWN row — deleting only the double-quote guard was measured SILENT (suite log
 #   byte-identical at 291/0), while the paste it accepts exits 127 and leaves the book DIRECTORY in place.
+# ⛔ EACH PARITY ARM NEEDS ITS OWN ROW TOO — THE TWO ARE NOT MIRRORS (fresh review of #4249, P2 — MEASURED).
+# The row above pins the double-quote operand CLOSER (`[ "${#_op}" -lt "${#_rest}" ]`), NOT parity: deleting
+# ONLY that closer reds the row above and nothing else, while deleting ONLY the `"$_dq"` entry from the
+# parity loop left ALL 13 then-existing rows green. The gap was live, not theoretical — `rm -rf '<book>' "junk` reads GREEN
+# under that mutant, and running it prints `unexpected EOF while looking for matching` and removes NOTHING
+# (the shell refuses the whole line), which is the exact false-GREEN this PR exists to close, one quote
+# flavour over. So the parity arms are pinned by ODD-PARITY shapes whose operand walk SUCCEEDS and RETURNS:
+_c4u_shape 'unterminated DOUBLE quote after a well-formed operand' RED "rm -rf '/x/state/reviewround-77' \"junk"
+# ⛔ THE TRAILING-PARENTHETICAL STRIP IS PINNED HERE, and only here (fresh review of #4249, P3 — MEASURED):
+# without the strip this row is odd-parity in `'` and reds, so deleting line `_cmd="${_cmd% (*}" is caught.
+# The contraction lives in the PROSE, which is not part of the paste; counting it was a false diagnosis.
+_c4u_shape 'trailing prose contraction is not part of the paste' GREEN "rm -rf '/x/state/reviewround-77' (isn't this fine)"
+# ⛔ AND THE WHITESPACE-RUN FIX IS PINNED HERE (the two-space false RED above): revert the `while` strip in
+# `_c4u_ok` and this GREEN row reds, so the fix cannot be silently dropped back into the false RED.
+_c4u_shape 'a space RUN after the verb is one separator'  GREEN "rm -rf  '/x/state/reviewround-77'"
 _c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON

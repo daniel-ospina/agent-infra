@@ -3590,9 +3590,19 @@ ISSUES 2')"
     # proves itself live by RE-RUNNING the same predicate over a copy with that line removed, plus a
     # negative control: a grep for the call TEXT alone is satisfied by a comment quoting it (that was
     # this pin's first draft, measured), and a `sed`/`awk` mirror of the predicate can silently no-op.
-    _ceil_wired() { grep -qE '^[[:space:]]*_rcl=.*review_ceiling_reason' "$1"; }
+    # ⛔ THE PIN CHECKS THE *CONSUMPTION*, NOT JUST THE ASSIGNMENT (fresh review of #4249, P3 — MEASURED).
+    # The row's label claims the arm "PARKS the reason review_ceiling_reason builds", but a presence-only
+    # grep for the assignment stayed GREEN when the consumer was rewritten to park a LITERAL —
+    # `park_ctrl "$PR" "${HEAD_N:-}" "a literal reason"` measured every row green. That is exactly the
+    # dead-code outcome this pin exists to prevent: the function is computed and then thrown away, and no
+    # operator ever sees it. So require BOTH legs, each line-anchored and immune to a `#`-commented line:
+    # the ACTIVE assignment, AND the ACTIVE `park_ctrl` call that passes `"$_rcl"`.
+    _ceil_wired() {
+      grep -qE '^[[:space:]]*_rcl=.*review_ceiling_reason' "$1" &&
+        grep -qE '^[[:space:]]*(if[[:space:]]+)?park_ctrl[^#]*"[$]_rcl"' "$1"
+    }
     if _ceil_wired "$ORCH"; then
-      echo "  ✅ orch-loop.sh's REVIEW-CEILING arm PARKS the reason review_ceiling_reason builds (the advisory-aware one is wired, not dead code)"; PASS=$((PASS+1))
+      echo "  ✅ orch-loop.sh's REVIEW-CEILING arm PARKS the reason review_ceiling_reason builds (it is assigned AND consumed by park_ctrl — the advisory-aware one is wired, not dead code)"; PASS=$((PASS+1))
     else
       echo "  ❌ the REVIEW-CEILING arm no longer calls review_ceiling_reason — the advisory-aware diagnosis is DEAD CODE: the function is driven by these rows and rendered by (c4u), so the suite stays green while no operator ever sees it"; FAIL=$((FAIL+1))
     fi
@@ -3603,6 +3613,17 @@ ISSUES 2')"
       echo "  ❌ MUTANT: the ceiling-wiring pin survives removing the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
     else
       echo "  ✅ MUTANT: removing the ceiling arm's call makes the wiring pin red (the pin is live)"; PASS=$((PASS+1))
+    fi
+    # MUTANT (CONSUMER leg): park a LITERAL instead of `$_rcl`. The presence-only draft stayed GREEN on this
+    # (measured, fresh review of #4249 P3) — the reason was computed and discarded. The mutant's OWN
+    # construction is asserted first: a `sed` that silently no-ops would pass the row vacuously.
+    sed 's|park_ctrl "$PR" "${HEAD_N:-}" "$_rcl"|park_ctrl "$PR" "${HEAD_N:-}" "a literal reason"|' "$ORCH" > "$TMP/ceilwire.mut2.sh"
+    if cmp -s "$ORCH" "$TMP/ceilwire.mut2.sh"; then
+      echo "  ❌ MUTANT (consumer leg): the mutation did not apply — park_ctrl's \$_rcl argument was not found, so the CONSUMPTION is UNPROVEN"; FAIL=$((FAIL+1))
+    elif _ceil_wired "$TMP/ceilwire.mut2.sh"; then
+      echo "  ❌ MUTANT (consumer leg): the wiring pin survives parking a LITERAL reason — it matches the ASSIGNMENT but not the CONSUMPTION, so review_ceiling_reason can be dead code while the suite is green"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ MUTANT (consumer leg): parking a LITERAL instead of \$_rcl makes the wiring pin red (the pin proves the reason is CONSUMED, not merely built)"; PASS=$((PASS+1))
     fi
     # NEGATIVE CONTROL: a COMMENT quoting the same call must NOT satisfy the pin (measured: the
     # text-grep draft above passed on a commented-out arm, so the arm could be dead while green).
