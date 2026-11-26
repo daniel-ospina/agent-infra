@@ -3228,7 +3228,25 @@ ISSUES 2')"
   eqv "a comma-joined P3,P1 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3,P1')"
   eqv "a slash-joined P3/P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3/P2')"
   eqv "a dash-joined P3-P2 derives BLOCKING" "BLOCKING" "$(_fs 'ISSUES 2 P3-P2')"
+  # ⛔ A RANK IS TOKEN-SHAPED AT ITS END TOO (second cycle of that review, P2). `P1s)` is prose, not a
+  # rank, and reading it as one left a P3-only review BLOCKING — the #4241 harm intact, one token
+  # over. The one residual is recorded in the rows below, not left to chance: a rank-shaped token
+  # inside prose (`no P1/P2`) still reads as blocking — the FAIL-CLOSED direction, deliberately (a
+  # false blocking costs a fixer round; a false `P3` would ship an unfixed defect), and the reviewer
+  # prompt now forbids prose on that line for exactly this reason.
+  eqv "a negated mention 'no P1s' does not block (P1s is not a rank token)" "ADVISORY" "$(_fs 'ISSUES 2 P3 (no P1s)')"
+  eqv "RESIDUAL: 'no P1/P2' still reads BLOCKING (fail-closed, prose forbidden on that line)" "BLOCKING" "$(_fs 'ISSUES 2 P3 (no P1/P2 findings)')"
+  eqv "a trailing-colon rank is still a rank" "ADVISORY" "$(_fs 'ISSUES 2 P3:')"
   eqv "a P30-style token is not a rank (fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P30')"
+  # ⛔ ONLY `P3` MAY EVER BE COSMETIC (fresh review of #4241, P1 — MEASURED FAIL-OPEN). Judging only the
+  # `P1`/`P2` pair IGNORED every other rank, so `ISSUES 2 P0 P3` derived ADVISORY and a P0
+  # (security/data-loss) finding set got NO fixer: the #4241 harm exactly one severity class up, which
+  # is the direction that must never fail. One row per out-of-vocabulary rank class.
+  eqv "a P0 rank is BLOCKING (an unlisted rank must never demote)" "BLOCKING" "$(_fs 'ISSUES 2 P0 P3')"
+  eqv "…and a lone P0" "BLOCKING" "$(_fs 'ISSUES 1 P0')"
+  eqv "…and a wrapped P0 ((P0))" "BLOCKING" "$(_fs 'ISSUES 2 P3 (P0)')"
+  eqv "a P4 rank is BLOCKING too (outside the vocabulary, fail closed)" "BLOCKING" "$(_fs 'ISSUES 2 P4 P3')"
+  eqv "…and a punctuation-joined P3,P0" "BLOCKING" "$(_fs 'ISSUES 2 P3,P0')"
   eqv "a non-ISSUES line derives BLOCKING (never advisory by default)" "BLOCKING" "$(_fs 'CLEAN https://x/y')"
   # (a) P3-ONLY: an advisory marker, NO fixer marker, and the controller does NOT authorise a fixer.
   _clean; _rs_sev ISSUES ADVISORY a3a3a3a3
@@ -3287,23 +3305,65 @@ ISSUES 2')"
   # (f) THE LANE'S OWN FIXER AUTHORISATION APPLIES THE SAME RULE (agent-infra#4241). `lane-merge.sh`
   # classifies the SAME verdict line to decide FIX_REQUIRED, so a P3-only line must not read as a fix
   # list there either — otherwise the lane path still authorises the push this issue is about. Driven
-  # from the shipped function (extracted, never re-typed) and parsed as a TOKEN, so `P30` — which the
+  # from the shipped functions (extracted, never re-typed) and parsed as a TOKEN, so `P30` — which the
   # producer calls blocking — cannot disagree with it.
+  # ⛔ THE VERDICT-LINE SELECTOR IS PART OF THE RULE NOW (parity P2): the producer tolerates
+  # `ISSUES: 3` and refuses `ISSUES 0`, while the lane anchored on `^ISSUES <digits>` — one line, two
+  # answers. All three lane helpers are extracted TOGETHER (the advisory reader calls the other two) and
+  # driven over the same rows below, so the two paths cannot drift by construction.
   LANE="${LANE:-$(dirname "$ORCH")/lane-merge.sh}"
-  awk '/^log_verdict_is_advisory\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$LANE" > "$TMP/fn_lva.sh" 2>/dev/null
-  if [ -s "$TMP/fn_lva.sh" ] && grep -q '^log_verdict_is_advisory() {' "$TMP/fn_lva.sh" && bash -n "$TMP/fn_lva.sh" 2>/dev/null; then
+  awk '/^(verdict_line_has_issues|last_issues_verdict_line|log_verdict_is_advisory)\(\) \{/{f=1} f{print} f&&/^\}/{f=0}' "$LANE" > "$TMP/fn_lva.sh" 2>/dev/null
+  if [ -s "$TMP/fn_lva.sh" ] \
+     && grep -q '^verdict_line_has_issues() {' "$TMP/fn_lva.sh" \
+     && grep -q '^last_issues_verdict_line() {' "$TMP/fn_lva.sh" \
+     && grep -q '^log_verdict_is_advisory() {' "$TMP/fn_lva.sh" && bash -n "$TMP/fn_lva.sh" 2>/dev/null; then
     _lva() { ( . "$TMP/fn_lva.sh"; log_verdict_is_advisory "$1" ); }
+    _lvap() { ( . "$TMP/fn_lva.sh"; last_issues_verdict_line "$1" >/dev/null ); }
     _lvafile() { printf '%s\n' "$2" > "$1"; }
     _lvafile "$TMP/lva-p3.log" 'ISSUES 2 P3'
     _lvafile "$TMP/lva-p30.log" 'ISSUES 2 P30'
     _lvafile "$TMP/lva-join.log" 'ISSUES 2 P3,P1'
     _lvafile "$TMP/lva-legacy.log" 'ISSUES 3'
+    _lvafile "$TMP/lva-colon.log" 'ISSUES: 2 P3'
+    _lvafile "$TMP/lva-p0.log" 'ISSUES 2 P0 P3'
+    _lvafile "$TMP/lva-zero.log" 'ISSUES 0'
+    _lvafile "$TMP/lva-two.log" "$(printf 'ISSUES 2\nISSUES 0')"
     _lva "$TMP/lva-p3.log" && { echo "  ✅ lane-merge.sh: a P3-only verdict is advisory (no fixer round)"; PASS=$((PASS+1)); } || { echo "  ❌ lane-merge.sh still reads a P3-only verdict as a fix list"; FAIL=$((FAIL+1)); }
     _lva "$TMP/lva-p30.log" && { echo "  ❌ lane-merge.sh reads \`P30\` as a rank — it disagrees with finding_severity()"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: \`P30\` is not a rank (agrees with the producer, fail closed)"; PASS=$((PASS+1)); }
     _lva "$TMP/lva-join.log" && { echo "  ❌ lane-merge.sh reads a punctuation-joined P3,P1 as advisory (a P1 would get no fixer)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a punctuation-joined P3,P1 is BLOCKING"; PASS=$((PASS+1)); }
     _lva "$TMP/lva-legacy.log" && { echo "  ❌ lane-merge.sh reads a RANK-LESS legacy line as advisory (silent downgrade)"; FAIL=$((FAIL+1)); } || { echo "  ✅ lane-merge.sh: a rank-less legacy line stays BLOCKING"; PASS=$((PASS+1)); }
+    # ⛔ PARITY IS DRIVEN, NOT CLAIMED (parity P2, MEASURED). Before this fix: `ISSUES: 2 P3` was
+    # ADVISORY for the producer and BLOCKING for the lane (the lane path still authorised the cosmetic
+    # push #4241 is about), `ISSUES 2 P0 P3` was ADVISORY for BOTH (a P0 got no fixer), and `ISSUES 0`
+    # was NO-VERDICT for the producer and FIX_REQUIRED for the lane (a fixer on a clean head). Each row
+    # below drives the producer AND the lane over the same line.
+    _lva "$TMP/lva-colon.log" && [ "$(_fs 'ISSUES: 2 P3')" = "ADVISORY" ] \
+      && { echo "  ✅ parity: 'ISSUES: 2 P3' is ADVISORY for BOTH the producer and the lane"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ parity broken on 'ISSUES: 2 P3' — producer=[$(_fs 'ISSUES: 2 P3')] lane_advisory=$( _lva "$TMP/lva-colon.log" && echo yes || echo no)"; FAIL=$((FAIL+1)); }
+    _lva "$TMP/lva-p0.log" && { echo "  ❌ lane-merge.sh reads 'ISSUES 2 P0 P3' as advisory — a P0 would get no fixer"; FAIL=$((FAIL+1)); } || [ "$(_fs 'ISSUES 2 P0 P3')" = "BLOCKING" ] \
+      && { echo "  ✅ parity: 'ISSUES 2 P0 P3' is BLOCKING for BOTH paths (fail closed on an unlisted rank)"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ parity broken on 'ISSUES 2 P0 P3' — producer=[$(_fs 'ISSUES 2 P0 P3')]"; FAIL=$((FAIL+1)); }
+    # ⛔ `ISSUES 0` IS "FOUND NONE", NOT A FIX LIST (parity P2 — the #2132 class on the lane path):
+    # the producer reads NO-VERDICT and re-reviews; a bare `[0-9]+` match told the lane FIX_REQUIRED.
+    _lvap "$TMP/lva-zero.log" && { echo "  ❌ lane-merge.sh reads 'ISSUES 0' as a findings verdict (a fixer on a clean head)"; FAIL=$((FAIL+1)); } || [ "$(_vc 'ISSUES 0')" = "NO-VERDICT" ] \
+      && { echo "  ✅ parity: 'ISSUES 0' is NO-VERDICT for both paths (a count of zero is not a fix list)"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ parity broken on 'ISSUES 0' — producer=[$(_vc 'ISSUES 0')]"; FAIL=$((FAIL+1)); }
+    # ⛔ AND THE LAST VERDICT LINE WINS, as it does for the producer: `ISSUES 2` followed by `ISSUES 0`
+    # is NO-VERDICT there, so the lane must not read the older line as a live fix list.
+    _lvap "$TMP/lva-two.log" && { echo "  ❌ lane-merge.sh read an OLDER 'ISSUES 2' line after a newer 'ISSUES 0'"; FAIL=$((FAIL+1)); } \
+      || { echo "  ✅ the lane reads the reviewer's LAST verdict line, like the producer"; PASS=$((PASS+1)); }
   else
-    echo "  ❌ lane-merge.sh's log_verdict_is_advisory() could not be extracted — the lane path's severity rule is UNPROVEN, never green"; FAIL=$((FAIL+1))
+    echo "  ❌ lane-merge.sh's verdict-line helpers could not be extracted — the lane path's severity rule is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  fi
+  # (g) ⛔ THE REVIEW-CAP PARK REASON IS ADVISORY-AWARE (fresh review of #4241, P3). With the per-head
+  # budget deliberately preserved, a P3-only head reaches REVIEW-CAP as its deterministic terminal, and
+  # the standard reason then asserts the reviewer "never produced a usable verdict" — false (it did)
+  # — and prints a reviewer-budget remedy that only re-arms the same cycles. A presence pin, so the
+  # discriminator cannot be deleted while the rest of the suite stays green.
+  if grep -qF 'state/advisory-$PR-${HEAD_N:-}' "$ORCH"; then
+    echo "  ✅ orch-loop.sh's REVIEW-CAP reason reads the advisory marker (no false 'no usable verdict' at a P3-only head)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the REVIEW-CAP park reason does not read the advisory marker — a P3-only head parks with a false diagnosis"; FAIL=$((FAIL+1))
   fi
   # (4) BOUNDED: a reviewer that never returns a verdict must not buy an unbounded run of PAID
   # reviews (the #1717 class, one input over). The count is per HEAD, so a push re-arms it.

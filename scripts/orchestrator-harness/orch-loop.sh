@@ -7804,7 +7804,19 @@ while true; do
               # ⛔ A PARK THAT DID NOT LAND MUST NOT BE REPORTED AS ONE (review round 4 of #2653, P2):
               # the park IS the terminator here, so an unwritable `parked-<PR>` means the PR re-enters
               # this arm every cycle while the log says PARKED — an inert bound with a green face.
-              if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"; then
+              # ⛔ THE REASON MUST NAME THE STATE THAT ACTUALLY HOLDS (fresh review of #4241, P3). A
+              # P3-ONLY head reads NEEDS-REVIEW for ever (an advisory authorises nothing) and its
+              # per-head budget is deliberately PRESERVED, so this park is the DETERMINISTIC terminal
+              # for it — and the standard reason would then assert three false things: that the
+              # reviewer "never produced a usable verdict" (it did), that "a fixer has no findings to
+              # act on" (there are findings), and a reviewer-budget remedy that only re-arms the same
+              # cycles. The advisory marker is the discriminator, read at THIS head.
+              if [ -f "$O/state/advisory-$PR-${HEAD_N:-}" ]; then
+                _cap_why="REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — ADVISORY: the reviewer's findings at this head are P3-ONLY (cosmetic), recorded as an advisory that AUTHORISES NOTHING, so no fixer may be dispatched and the gate can only clear on a review that records this diff clean. The reviewer's budget is NOT the cause here (it produced a verdict and posted its comment). A push re-arms the budget; otherwise this needs a human decision on the cosmetic findings: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR' '$O/state/advisory-$PR-${HEAD_N:-}'"
+              else
+                _cap_why="REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/parkorigin-$PR' '$O/state/reviewdisp-$PR'"
+              fi
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_cap_why"; then
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, PARKED (an unfixable head must not loop; a push re-arms it)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at this head — needs a human (bounded, never a silent stop)"
               else

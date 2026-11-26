@@ -1933,6 +1933,13 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
     CLEAN <the comment URL that gh pr comment printed>
   or, if you found real issues:
     ISSUES <n> <P1|P2|P3>
+⛔ EXACTLY THOSE TWO FIELDS AND NOTHING AFTER THE RANK (agent-infra#4241). No prose, no parenthetical,
+no list of the ranks: the rank is judged from this line alone, by a machine, and any rank-shaped token
+on it OTHER THAN `P3` reads as BLOCKING (the safe direction — a false blocking costs a fixer round, a
+false `P3` would ship an unfixed defect). That is why `ISSUES 2 P3 (no P1/P2 findings)` is read as
+blocking: the parser cannot tell a negated mention from a rank, so do not write one. The only token
+that can ever read as cosmetic is `P3` itself — `P0`, `P1`, `P2`, and any other `P<digit>` you might
+invent all block, so there is no spelling of "cosmetic" worth guessing at.
 ⛔ THE RANK ON THAT LINE IS WHAT DECIDES WHETHER YOUR FINDINGS AUTHORISE A PUSH (agent-infra#4241).
 It is the HIGHEST severity among the findings you are reporting, using the same P1/P2/P3 ranks your
 comment already assigns: \`P1\`/\`P2\` mean blocking (a fixer is dispatched and will push, which is
@@ -2304,7 +2311,7 @@ verdict_class() {
 # ⛔ PARSED WITH PARAMETER EXPANSION, NOT WORD SPLITTING (the round-4 rule above): `set -- $line`
 # globs against the repo's cwd, and this value decides whether a push is authorised.
 finding_severity() {
-  local rest="${1:-}" tok t2 _p3=0
+  local rest="${1:-}" tok _p3=0
   case "$rest" in ISSUES*) rest="${rest#ISSUES}" ;; *) printf 'BLOCKING'; return 0 ;; esac
   while [ -n "$rest" ]; do
     rest="${rest#"${rest%%[![:space:]]*}"}"          # strip the leading blanks (no `tr`, no splitting)
@@ -2317,20 +2324,30 @@ finding_severity() {
     # got NO fixer. A reviewer listing ranks on one line in file order is a plausible emission, and
     # this is the direction that must never fail: the fixer is withheld, the head reads NEEDS-REVIEW,
     # and the PR loops (or parks) with a blocking defect unfixed.
-    case "$tok" in
-      *[Pp]1*|*[Pp]2*) printf 'BLOCKING'; return 0 ;;
-    esac
+    # ⛔ ANY SINGLE-DIGIT RANK THAT IS NOT `P3` IS BLOCKING (fresh review of #4241, P1). Testing only
+    # `P1`/`P2` IGNORED a rank outside that pair: `ISSUES 2 P0 P3` derived ADVISORY, so a P0
+    # (security/data-loss) finding got NO fixer — the #4241 harm exactly one severity class up. `P0`
+    # outranks P1, and `P4`-`P9` are ranks this gate never emits, so both fail CLOSED; `P30` is not a
+    # rank at all (a digit follows the two-character prefix) and stays blocking via the default.
+    # ⛔ AND IT MUST BE TOKEN-SHAPED, NOT A BARE SUBSTRING (second cycle of that review, P2): a
+    # substring test also matched a NEGATED mention (`P3 (no P1s)`), which left a P3-only review
+    # blocking — the #4241 harm intact. A rank followed by a non-alnum or end-of-token keeps the
+    # punctuation-joined forms (`P3,P0`, `P3/P1`) blocking while `P1s` / `P10` demote nothing.
+    if [[ "$tok" =~ [Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
     # Tolerate the wrappers a reviewer actually emits around its rank (`**P3**`, `(P3)`, `P3:`,
     # `- P3`) by dropping leading punctuation, then judge the first two characters. `P30`-style
     # tokens are NOT a rank: a digit follows, so the token is ignored (fail closed).
     while :; do
       case "$tok" in [Pp]*) break ;; *[[:punct:]]) tok="${tok#?}" ;; *) break ;; esac
     done
-    t2="${tok:0:2}"; [ "${tok:2:1}" = '' ] || case "${tok:2:1}" in [0-9]) t2="" ;; esac
-    case "$t2" in
-      P1|p1|P2|p2) printf 'BLOCKING'; return 0 ;;
-      P3|p3)       _p3=1 ;;
-    esac
+    # ⛔ A RANK IS TOKEN-SHAPED AT ITS START AND AT ITS END (second cycle of that review, P2): `^P1`
+    # followed by a non-alnum/end is a rank; `P1s`, `P10` and `P1x` are NOT (they are prose or an
+    # unrelated identifier), so they can neither block nor demote. The prefix-only test this replaces
+    # read `P1s)` as `P1` and left a P3-only review blocking — the #4241 harm intact, one token over.
+    # The digit class is "any single digit except 3" for the same reason the joined-form test above
+    # uses it: only `P3` may ever be cosmetic, everything else fails closed.
+    if [[ "$tok" =~ ^[Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
+    if [[ "$tok" =~ ^[Pp]3([^[:alnum:]]|$) ]]; then _p3=1; fi
   done
   if [ "$_p3" = 1 ]; then printf 'ADVISORY'; else printf 'BLOCKING'; fi
 }
@@ -2455,8 +2472,11 @@ review_state_record() {
       # invalidates the signed review record by design. Measured on tortoise 2026-11-25: three
       # consecutive fix commits on #14623, each one cosmetic, each one throwing away a certified
       # ~5,000-line review; #14645 went `ai-review-gate=pass` → red BECAUSE a fixer pushed to a green
-      # PR. The finding is not lost: it is recorded here, where a later sweep can pick it up, and
-      # this branch deliberately writes NOTHING a fixer reads.
+      # PR. The finding is not lost: it is recorded in `state/advisory-<PR>-<head>`, which is what the
+      # controller reads before it parks the head (and what tells a human why). ⛔ NOTHING SWEEPS IT:
+      # the marker has no consumer that acts on the findings, so do not claim a "later sweep" picks
+      # them up — acting on a P3 is a human decision, named as one at the park. This branch
+      # deliberately writes NOTHING a fixer reads.
       if [ "$sev" = "ADVISORY" ]; then
         if printf '%s\n' "P3-ONLY findings at head=$HEAD (cosmetic) — advisory, NO fixer is authorised" > "$O/state/advisory-$PR-$HEAD" 2>/dev/null; then
           echo "[merge $PR] ADVISORY: the reviewer's findings at head=$HEAD are P3-ONLY (cosmetic) — recorded as advisory; NO fixer is authorised and no push is caused" >> "$L.log"
@@ -2465,9 +2485,13 @@ review_state_record() {
           # NEEDS-REVIEW, so a failed advisory write leaves the PR in the SAFE state (no fixer).
           echo "[merge $PR] ADVISORY at head=$HEAD but the advisory MARKER WAS NOT WRITTEN — the controller reads this head as NEEDS-REVIEW by ABSENCE (fail-closed), so no fixer is authorised either way" >> "$L.log"
         fi
-        # A usable verdict either way: it restarts the verdict-less counter exactly as the blocking
-        # arm below does (the two books are pruned by the rm above), so a P3-only verdict is never
-        # counted as a reviewer that produced nothing.
+        # A usable verdict either way: a P3-only verdict is never counted as a reviewer that produced
+        # nothing. ⛔ WHAT THIS ARM RESETS, EXACTLY (fresh review of #4241, P3 — the comment here
+        # claimed the blocking arm's `reviewdisp` reset, which this arm deliberately does NOT do): the
+        # markers are pruned by the `rm` above, and the per-head REVIEW BUDGET is LEFT STANDING. That
+        # is the whole point — the head does not move on a cosmetic verdict, so `reviewdisp-<PR>` is
+        # the only thing bounding re-reviews at it (MAX_REVIEW_TRIES). The blocking arm resets it
+        # because its fixer PUSHES and the new head re-arms the count by changing the key.
         return 0
       fi
       # ⛔ AND A FAILED MARKER WRITE IS REPORTED AS WHAT IT IS (kept from main's #8602 port): the
