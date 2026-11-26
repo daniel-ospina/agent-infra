@@ -3593,8 +3593,16 @@ ISSUES 2')"
     fi
     # MUTANT: revert ONLY that call site (to the pre-change `review_ceiling_line` shape) and require the
     # pin above to red — otherwise the presence pin could be satisfied by a comment.
+    # ⛔ NO `sed -i` HERE (fresh review of #4247, P2 — MEASURED). A bare `sed -i` is GNU-only, so
+    # `scripts/check-portability-traps.sh` refuses this suite (`sed-in-place-gnu: baseline=0 live=1`) and
+    # reds `bash-suites`; on the owner's macOS box BSD sed consumes the SCRIPT as the backup extension,
+    # edits nothing, and `2>/dev/null || true` swallows the error — so the "revert to the pre-change
+    # shape" this comment promises would silently not happen. The arg-strip is therefore a
+    # stdin->stdout `sed` (portable: no `-i`, no backup suffix) whose rc failure stops the step instead
+    # of being discarded.
     awk '{ if (index($0, "_rcl=\"$(review_ceiling_reason") > 0) gsub(/review_ceiling_reason/, "review_ceiling_line") } {print}' "$ORCH" > "$TMP/ceilwire.mut.sh"
-    sed -i 's/${MAX_REVIEW:-10})")"$//' "$TMP/ceilwire.mut.sh" 2>/dev/null || true
+    sed 's/ "${MAX_REVIEW:-10}")"$/)/' "$TMP/ceilwire.mut.sh" > "$TMP/ceilwire.mut2.sh" \
+      && mv "$TMP/ceilwire.mut2.sh" "$TMP/ceilwire.mut.sh"
     if grep -qF '"$(review_ceiling_reason "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"' "$TMP/ceilwire.mut.sh"; then
       echo "  ❌ MUTANT: the ceiling-wiring pin survives reverting the call site — it is matching something other than the shipped call (VACUOUS)"; FAIL=$((FAIL+1))
     else
