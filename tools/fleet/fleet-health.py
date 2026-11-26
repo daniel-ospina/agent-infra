@@ -818,6 +818,74 @@ def _harness_apply_is_scheduled():
     return False
 
 
+def _age_words(seconds):
+    """A duration a human can act on at a glance. Seconds are useless on a dashboard: "behind by 8" and
+    "running code 6 days old" are the same fact told two ways, and only the second made #4237 obvious."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _harness_staleness_note(kv):
+    """#4237 — STALENESS AS A NUMBER, WITH ITS AGE.
+
+    The record always carried `behind=`, and NOTHING computed the two readings that make it actionable:
+    the pinned-vs-ref DISTANCE and the AGE of the commit the box runs. MEASURED on a cell: `head=` and
+    `deployed=` pinned at a commit six days old while `origin/main` had moved, `ok=0 rc=24` on every
+    tick, and no instrument anywhere said "the cells are N commits behind, executing six-day-old code".
+    An EMPTY key is a record written before these fields existed, and that is NAMED rather than alarmed
+    (the next cadence writes it).
+    """
+    parts = []
+    pb = str(kv.get("pin_behind", ""))
+    if pb.isdigit():
+        parts.append(f"{pb} commit(s) behind the ref")
+    ag = str(kv.get("deployed_age_s", ""))
+    if ag.isdigit():
+        parts.append(f"running code {_age_words(ag)} old")
+    if not parts:
+        # ⛔ PRESENT-BUT-UNMEASURABLE IS NOT "NOT RECORDED" (review P3). The pass writes
+        # `pin_behind=unknown` on every pre-flow refusal (a failed fetch, an unresolvable ref, an
+        # unpreservable tree), so a missing KEY and an unmeasurable VALUE are different facts and the
+        # instrument named them the same thing — telling an operator nothing was recorded when the
+        # record says the distance could not be computed.
+        if "pin_behind" in kv or "deployed_age_s" in kv:
+            return "staleness=<unmeasured: the pass could not compute it>"
+        return "staleness=<not recorded by this pass>"
+    return "; ".join(parts)
+
+
+def _harness_alarm_note(kv):
+    """Did the RED actually reach anyone? (#4237 — the consumption is a FIELD.)
+
+    `alarm=` is what `harness-apply-pass.sh` writes when it files or settles its own farm red. A bare
+    number means "filed as issue #N"; `failed:<why>` means the consumer could not deliver, which is a
+    fact the fleet instrument must surface — the whole defect was a red that reached nobody.
+    """
+    a = str(kv.get("alarm", ""))
+    if a.isdigit():
+        return f"filed as issue #{a}"
+    if a.startswith("failed:"):
+        return f"the farm alarm was NOT delivered ({a})"
+    if a == "disarmed":
+        return "the farm alarm consumer is DISARMED here"
+    if a.startswith("closed:"):
+        return f"the previous farm alarm (#{a.split(':', 1)[1]}) closed on this pass"
+    if a.startswith("unclosed:"):
+        return f"the farm alarm (#{a.split(':', 1)[1]}) could NOT be closed and is still open"
+    if a.startswith("skipped:"):
+        return f"no farm alarm filed ({a})"
+    return ""
+
+
 def harness_apply_record():
     """Return (detail, alarm) from the harness-apply pass record.
 
@@ -910,15 +978,23 @@ def harness_apply_record():
     # An EMPTY key is a record written before this field existed. NAMED, not alarmed: the next cadence
     # writes it, and alarming on the upgrade would red every box once for a field it is about to gain.
     drift_note = f"drift={drift}" if drift else "drift=<not recorded by this pass>"
+    stale_note = _harness_staleness_note(kv)
+    alarm_note = _harness_alarm_note(kv)
+    alarm_note = f" ({alarm_note})" if alarm_note else ""
     if rc in ("0", "10", "11") and behind_n == 0:
         return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
-                f"action={kv.get('action', '?')} {drift_note}", False)
+                f"{stale_note}; action={kv.get('action', '?')} {drift_note}{alarm_note}", False)
     if behind_n is not None and behind_n > 0:
-        return (f"BEHIND origin/{ref}: {behind_n} commit(s) — deployed={deployed} (rc={rc}, "
-                f"action={kv.get('action', '?')}, {drift_note}) — the box is not being moved", True)
+        return (f"BEHIND origin/{ref}: {behind_n} commit(s) — deployed={deployed} ({stale_note}; rc={rc}, "
+                f"action={kv.get('action', '?')}, {drift_note}{alarm_note}) — the box is not being moved", True)
+    # ⛔ A RED WHOSE ALARM COULD NOT BE DELIVERED IS ITS OWN FINDING (#4237). The measured cost of this
+    # failing silently was six days of a stale farm with two PRs left unverdictable, so the reason leads.
+    if str(kv.get("alarm", "")).startswith("failed:"):
+        return (f"RED and UNDELIVERED: record rc={rc} action={kv.get('action', '?')} — {_harness_alarm_note(kv)}. "
+                f"deployed={deployed} ref={ref} behind={behind} ({stale_note}); detail={kv.get('detail', '?')}", True)
     return (f"record rc={rc} deployed={deployed} head={head} ref={ref} behind={behind} "
-            f"action={kv.get('action', '?')} detail={kv.get('detail', '?')} age={age}s — a human must look "
-            f"(an ahead box may hold work that exists nowhere else)", True)
+            f"action={kv.get('action', '?')} detail={kv.get('detail', '?')} age={age}s ({stale_note}){alarm_note} "
+            f"— a human must look (an ahead box may hold work that exists nowhere else)", True)
 
 
 def harness_apply_section():
