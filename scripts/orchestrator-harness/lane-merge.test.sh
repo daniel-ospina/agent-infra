@@ -763,6 +763,61 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/ho
 ck "a ROTATED log (no reviewer outcome at all) still trusts the durable marker → FIX_REQUIRED" \
    $([ "$RC" = 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-58.verdict" 2>/dev/null)" = FIX_REQUIRED ] && echo 0 || echo 1)
 
+# ── 11c-duodevices. THE ADVISORY RULE AT THE LEVEL IT SHIPS (fresh review of #4241, P2) ─────────
+# ⛔ `test-gates.sh` drives the EXTRACTED HELPER `log_verdict_is_advisory`; NOTHING drove the function
+# `lane-merge.sh` actually CALLS, and the string `ADVISORY_ONLY` appeared in no test file. MEASURED at
+# 81ca77e51: deleting EITHER `log_verdict_is_advisory` guard inside `chain_verdict_from_log`, or its
+# head-keyed advisory MARKER arm, left all three suites green — the same false-PASS class this PR
+# closed for the producer's call site, proven for only one of the two paths. Each row names the guard
+# it pins, and each was MEASURED to redden on exactly its own mutation:
+#   A ← the marker arm (`state/advisory-<PR>-<head>` → ADVISORY_ONLY)      [delete it → UNKNOWN]
+#   B ← the trailing log arm (`ISSUES 2 P3` in the log → ADVISORY_ONLY)   [delete it → FIX_REQUIRED]
+#   D ← the pre-check that folds a P3-only verdict out of the findings count BEFORE the marker arm
+#                                                                        [delete it → FIX_REQUIRED]
+#   C ← the CONTROL: a BLOCKING verdict is still a fix list (the split withholds only P3)
+#   E ← head-scoping: an advisory marker at ANOTHER head is not this head's verdict
+CVL_FN="$T/fn_cvl.sh"
+awk '/^(verdict_line_has_issues|last_issues_verdict_line|log_verdict_is_advisory|chain_verdict_from_log)\(\) \{/{f=1} f{print} f&&/^\}/{f=0}' "$SCRIPT" > "$CVL_FN" 2>/dev/null
+if [ -s "$CVL_FN" ] && grep -q '^chain_verdict_from_log() {' "$CVL_FN" && bash -n "$CVL_FN" 2>/dev/null; then
+  CV="$T/cvo"; mkdir -p "$CV/state" "$CV/logs"; : > "$CV/logs/chain.log"
+  _cv() { ( O="$CV"; PR=97; HEAD="$1"; . "$CVL_FN"; chain_verdict_from_log "$CV/logs/chain.log" "$1" ); }
+  _cv_reset() { rm -rf "$CV/state"; mkdir -p "$CV/state"; : > "$CV/logs/merge-97.log"; }
+  _cv_reset; : > "$CV/state/advisory-97-bbbb2222"
+  ck "…the head-keyed advisory MARKER alone → ADVISORY_ONLY (no fixer, no round)" \
+     $([ "$(_cv bbbb2222)" = ADVISORY_ONLY ] && echo 0 || echo 1)
+  _cv_reset; printf 'ISSUES 2 P3\n' > "$CV/logs/merge-97.log"
+  ck "…a P3-ONLY verdict in the merge LOG → ADVISORY_ONLY (the trailing log arm applies the same rule)" \
+     $([ "$(_cv cccc3333)" = ADVISORY_ONLY ] && echo 0 || echo 1)
+  _cv_reset; printf 'ISSUES 2,P3\n' > "$CV/logs/merge-97.log"
+  ck "…and a COUNT-GLUED P3-only verdict is advisory too (parity with finding_severity's boundary rule)" \
+     $([ "$(_cv cccc3333)" = ADVISORY_ONLY ] && echo 0 || echo 1)
+  _cv_reset; printf 'ISSUES 2 P3\n[merge 97] reviewer NOT CLEAN or reviewer failed\n' > "$CV/logs/merge-97.log"
+  : > "$CV/state/needsfix-97-dddd4444"
+  ck "…a P3-only verdict beside a 'reviewer failed' line AND a needsfix marker → REVIEW_NO_VERDICT, never a fix list" \
+     $([ "$(_cv dddd4444)" = REVIEW_NO_VERDICT ] && echo 0 || echo 1)
+  _cv_reset; printf 'ISSUES 2 P2\n[merge 97] reviewer NOT CLEAN or reviewer failed\n' > "$CV/logs/merge-97.log"
+  : > "$CV/state/needsfix-97-eeee5555"
+  ck "…CONTROL: a BLOCKING verdict beside the same failure line IS a fix list (the split withholds only P3)" \
+     $([ "$(_cv eeee5555)" = FIX_REQUIRED ] && echo 0 || echo 1)
+  _cv_reset; : > "$CV/state/advisory-97-ffff6666"
+  ck "…an advisory marker at ANOTHER head is not this head's verdict (the key is the head)" \
+     $(if [ "$(_cv aaaa7777)" = ADVISORY_ONLY ]; then echo 1; else echo 0; fi)
+  # ⛔ AND END TO END, where the lane ACTS on it: the ADVISORY_ONLY disposition must hand off (exit 12,
+  # NO fix round spent, no push) and must NOT tell the lane to read a review comment and fix findings.
+  new_o "$T/junk-q17.tsv"
+  printf 'open||newhead1|clean\n' > "$T/pr-open17.tsv"
+  printf '%s deadbeef %s\n' 999995 "$OT/logs/lm-98.log" > "$OT/state/lanemerge-98.chain"
+  printf 'ISSUES 2 P3\n' > "$OT/logs/merge-98.log"
+  : > "$OT/state/advisory-98-newhead1"
+  ADV_LOG="$T/gh-advisory.log"; : > "$ADV_LOG"
+  OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ADV_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+        bash "$SCRIPT" 98 --watch --repo o/r --pr-tsv "$T/pr-open17.tsv" 2>&1)"; RC=$?
+  ck "a P3-ONLY head at the shipped disposition → BLOCKED_ATTESTATION (exit 12), NO fix round, no 'fix every finding' hand-off" \
+     $([ "$RC" = 12 ] && [ ! -s "$OT/state/lanemerge-98.round" ] && ! grep -q 'fix every finding' "$ADV_LOG" && echo 0 || echo 1)
+else
+  ck "lane-merge.sh's chain classifier (chain_verdict_from_log) could not be extracted — the lane's advisory rule is UNPROVEN, never green" 1
+fi
+
 # ── 11c-quaterdecies. …and --watch with NOTHING to supervise says so instead of handing off ────
 # ⛔ MEASURED (reviewer finding, P2): a fresh $O has no chain record and no claim lock, and this chunk
 # posted "no signed review record exists … and the chain did not merge" with rc=12 — a hand-off about a

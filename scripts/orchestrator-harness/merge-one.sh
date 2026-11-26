@@ -2334,20 +2334,16 @@ finding_severity() {
     # blocking — the #4241 harm intact. A rank followed by a non-alnum or end-of-token keeps the
     # punctuation-joined forms (`P3,P0`, `P3/P1`) blocking while `P1s` / `P10` demote nothing.
     if [[ "$tok" =~ [Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
-    # Tolerate the wrappers a reviewer actually emits around its rank (`**P3**`, `(P3)`, `P3:`,
-    # `- P3`) by dropping leading punctuation, then judge the first two characters. `P30`-style
-    # tokens are NOT a rank: a digit follows, so the token is ignored (fail closed).
-    while :; do
-      case "$tok" in [Pp]*) break ;; *[[:punct:]]) tok="${tok#?}" ;; *) break ;; esac
-    done
-    # ⛔ A RANK IS TOKEN-SHAPED AT ITS START AND AT ITS END (second cycle of that review, P2): `^P1`
-    # followed by a non-alnum/end is a rank; `P1s`, `P10` and `P1x` are NOT (they are prose or an
-    # unrelated identifier), so they can neither block nor demote. The prefix-only test this replaces
-    # read `P1s)` as `P1` and left a P3-only review blocking — the #4241 harm intact, one token over.
-    # The digit class is "any single digit except 3" for the same reason the joined-form test above
-    # uses it: only `P3` may ever be cosmetic, everything else fails closed.
-    if [[ "$tok" =~ ^[Pp][0-24-9]([^[:alnum:]]|$) ]]; then printf 'BLOCKING'; return 0; fi
-    if [[ "$tok" =~ ^[Pp]3([^[:alnum:]]|$) ]]; then _p3=1; fi
+    # ⛔ THE `P3` TEST HAS THE SAME SHAPE AS THE BLOCKING TEST ABOVE (fresh review of #4241, P3 —
+    # MEASURED). Anchoring it at the token START was the ONE asymmetry left in this function: a token
+    # where `P3` sits behind a non-space separator (`ISSUES 2,P3`, `ISSUES: 2-P3`, `ISSUES 2/P3`,
+    # `ISSUES 2 (P3`) was never recognised as a rank at all, so it fell to the fail-closed default
+    # BLOCKING and a cosmetic-only review still authorised a PUSH — the #4241 harm, one verdict-line
+    # shape wide. `lane-merge.sh::log_verdict_is_advisory` scans with a boundary, so the two readers
+    # disagreed on 28 of 240 separator×rank shapes; 0 after this line. Reading it by ONE rule now, the
+    # boundary on BOTH sides keeps `P30` (a digit follows) and `P1s` (an alnum follows) outside the
+    # rank class while `**P3**`, `(P3)`, `P3:`, `P3.` and `-P3` all match.
+    if [[ "$tok" =~ (^|[^[:alnum:]])[Pp]3([^[:alnum:]]|$) ]]; then _p3=1; fi
   done
   if [ "$_p3" = 1 ]; then printf 'ADVISORY'; else printf 'BLOCKING'; fi
 }
@@ -2444,7 +2440,12 @@ review_state_record() {
   # marker; every other value — empty, a typo, a rank the helper never emits — is BLOCKING. A gate
   # that fails open on an unknown severity is the same defect as one that fails open on an unknown
   # check conclusion.
-  [ "$sev" = "ADVISORY" ] || sev="BLOCKING"
+  # ⛔ THE ALLOW-LIST IS THE `if` AT THE ADVISORY ARM, NOT A NORMALISING LINE BESIDE IT (fresh review
+  # of #4241, P3 — MEASURED). This used to carry `[ "$sev" = "ADVISORY" ] || sev="BLOCKING"`, a line
+  # that could be DELETED with no change to any of the three assertions that named it: the arm tests
+  # `[ "$sev" = "ADVISORY" ]`, so every other value already fell to the blocking path. The inert
+  # normaliser is gone rather than left as a decoy for the next reader — `sev` is compared in exactly
+  # one place and never printed.
   # ⛔ ONE MARKER PER PR, NOT PER (PR, HEAD) (review round 1, P2). An older head's stale-evidence
   # marker is not a fact about THIS head, and nothing swept it: the controller writes one on every red
   # cycle, so with the per-head name alone the `needsreview-*` population only ever GREW — a counter
