@@ -2253,23 +2253,29 @@ _c4u_remedy_for() { # <file> <merge|render> [advisory-head] → the REVIEW-CEILI
     *) grep -E 'park(_ctrl)? ' "$1" | grep -o 'rm -rf[^"]*reviewround-[^"]*' | head -1 ;;
   esac
 }
-# ⛔ THE VERB MUST BE APPLIED TO THE BOOK — ADJACENCY IS NOT APPLICATION (fresh review of #4242, two
+# ⛔ THE VERB MUST BE APPLIED TO THE BOOK — ADJACENCY IS NOT APPLICATION (fresh reviews of #4242, three
 # P2s — MEASURED). Two independent greps ('rm -rf' AND 'reviewround-') went GREEN on a remedy that removes
-# the park markers and only MENTIONS `state/reviewround-$1`. The first anchor (`rm -rf[^)]*reviewround-`)
-# fixed THAT case but still tested ADJACENCY, so three shapes measured GREEN on a remedy that leaves a
+# the park markers and only MENTIONS `state/reviewround-$1`. Each repair since then has failed the same
+# way — by testing ORDER rather than OPERAND — and each was measured GREEN on a remedy that leaves a
 # DIRECTORY at the book after the operator pastes it:
-#   split      `rm -rf '…parked-77' '…parkreason-77'; rm -f '…/state/reviewround-77'`  (verb on the markers)
-#   mention    `rm -rf '…parked-77'; the book is '…/state/reviewround-77'`              (no verb on the book)
-#   decoy      `rm -rf '/tmp/reviewround-scratch'; rm -f '…/state/reviewround-77'`      (verb on a namesake)
-# The property is "ONE command both uses rm -rf and names the book", so the parenthetical prose is
-# stripped (it contains `rm -rf` too — that is why a substring test cannot see the verb) and the test
-# runs per ';'-separated command. Measured: A real render GREEN, F merge-one literal GREEN, G merged
-# absolute path GREEN, B/C/D/E RED (E = wholesale rm -f).
+#   anchor 1  `rm -rf[^)]*reviewround-`            GREEN on: `rm -rf '…parked-77'; rm -f '…/state/reviewround-77'`
+#   anchor 2  strip parens + same ';' field        GREEN on: `rm -f '…parked-77' '…/state/reviewround-77' rm -rf, not rm -f`
+#                                                     (the prose is not parenthesised, so it survives the strip)
+# THE PROPERTY IS THE OPERAND: an `rm -rf` whose OWN argument list names the book. So the predicate
+# matches the verb, then the run of quoted operands after it, and requires the book among THEM. Both quote
+# flavours are accepted (a re-quote is a refactor, not a defect); the parenthetical prose needs no
+# stripping because prose is never an operand. Measured over 14 shapes: real render / args reordered /
+# merge-one literal / merged absolute path / double-quoted / mixed quoting / `$O` unexpanded GREEN;
+# split / mention / decoy / wholesale rm -f / prose-after-the-book / junk between verb and operand / empty RED.
+# ⚠️ BOUNDED (filed): a TEXT pin is not a proof — prose that itself quotes a complete `rm -rf '…reviewround-77'`
+# would still satisfy it. The unbounded form is BEHAVIOURAL (plant the book as a directory in $TMP, run the
+# pasted command, assert it is gone), which also survives a remedy whose verb is spelled differently.
+# ⛔ THE PIPE IS PART OF THE BUG CLASS: `printf … | grep -q` is the #841/#864 SIGPIPE idiom and reds
+# `sigpipe-grep`; a here-string carries the text without an earlier writer to kill.
 # ⛔ AND BOTH BRANCHES ARE RENDERED (P3): the advisory head's `_tail` is where `${_remedy}` was dropped
 # in a measured mutant, and a call that seeds no advisory record only ever renders the else-branch.
-_c4u_ok() {
-  printf '%s' "$1" | sed 's/([^()]*)//g' \
-    | awk -F';' '{for(i=1;i<=NF;i++) if ($i ~ /rm -rf/ && $i ~ /state\/reviewround-/) f=1} END{exit !f}'
+_c4u_ok() { # the book must be an OPERAND of an rm -rf, not merely named on the line
+  grep -qE "rm -rf([[:space:]]+('[^']*'|\"[^\"]*\"))*[[:space:]]+('[^']*state/reviewround-[^']*'|\"[^\"]*state/reviewround-[^\"]*\")" <<<"$1"
 }
 _c4u_row() { # <label> <text>
   if _c4u_ok "$2"; then ok "(c4u) $1's REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)"
