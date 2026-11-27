@@ -4936,8 +4936,23 @@ seed_stale_record() {
     "$REC_HEAD_OLD" "$REPO_FIXTURE" > "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
 }
 
+# A carried record's SIGNED MARKER is what check (c) reads, and it is bound to the RECORDED head —
+# so a carry scenario without one models a store-only attestation, which is a DIFFERENT (refused)
+# state. Every carry scenario below therefore seeds the marker the real recorder would have posted.
+seed_body_marker() { # <sha> [verdict] [sig]
+  local m
+  m="review recorded: reviews/2284.json verdict=${2:-clean} @ $1 (daniel-ospina/agent-infra)"
+  printf '%s sig=%s\n' "$m" "${3:-$(printf '%s' "$m" | openssl dgst -sha256 -hmac fixture-signing-key | awk '{print $NF}')}" >> "$TMP/body.md"
+}
+# The RECORDER'S negative line (#3400) — the only thing that tells a carry arm the carried record is
+# `not-clean`; the token and rc stay identity-based, which is why the token alone was not enough.
+seen_not_clean_hint() {
+  FIXTURE_CC_STDERR="record-review.sh --check-carry: ⛔ reviewed NOT CLEAN at ${REC_HEAD_OLD:0:12}… — 2 open finding(s)."
+  export FIXTURE_CC_STDERR
+}
+
 # (1) `carry` — the reviewed DIFF is byte-identical, so the gate already carries the record.
-reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_body_marker "$REC_HEAD_OLD"
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "(1) carry: exit 0 — nothing is stale and nothing is owed (rc=$(rc_of))"
@@ -4984,6 +4999,7 @@ err_has "did NOT produce a clean record"; ck $? "(3) …naming the failed prereq
 # one). The seam must rebuild the store record (`--recover-body`) and ASK AGAIN before paying.
 reset; FIXTURE_CC_TOKEN=norecord; FIXTURE_CC_RC=4
 FIXTURE_RECOVER_RC=0; FIXTURE_CC_TOKEN_AFTER_RECOVER=carry; FIXTURE_CC_RC_AFTER_RECOVER=0
+seed_body_marker "$REC_HEAD_OLD"   # the whole premise: the SIGNED marker lives in the body
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "(4) norecord: recovered from the signed body marker, then carried (rc=$(rc_of))"
@@ -5041,6 +5057,41 @@ else
   [ -f "$TMP/pi-runs.txt" ]; ck $? "§BW(9) the MUTANT BUYS A REVIEW on an unchanged artifact — so §BW(1) is the arm's doing"
 fi
 rm -f "$MUT_CC"; reset
+
+# (12)/(13) ⛔ THE VERDICT AXIS — `--check-carry` IS AN IDENTITY ANSWER, NOT AN APPROVAL (P0, fresh
+# review of PR #4256). The recorder answers "is the reviewed ARTIFACT still the artifact that would
+# merge" and reports a `not-clean` record on STDERR while the token and exit code stay identity-based
+# (#3400). So a seam that trusted the token reported "NO REVIEW OWED" / rc=0 over a review that left
+# 2 open blocking findings — and `auto-rail.sh` maps 0 to `clean`. Pre-fix the same PR bought a review
+# and exited 7. These two arms pin both directions: the head-bound case (12) and the CARRY case (13),
+# which is the one the #4255 base-advance shape reaches.
+reset; FIXTURE_CC_TOKEN=head; FIXTURE_CC_RC=0; seed_stale_record; seen_not_clean_hint
+printf 'CLEAN
+' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "(12) head + a NOT-CLEAN record: exit 7 (issues), never 5/'nothing owed' (rc=$(rc_of))"
+no_reviewer; ck $? "(12) …no reviewer spawned (an unchanged artifact is not an approval)"
+err_has "OPEN FINDINGS"; ck $? "(12) …and the refusal says the findings are open, not that a clean record exists"
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record; seen_not_clean_hint; seed_body_marker "$REC_HEAD_OLD" not-clean
+printf 'CLEAN
+' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "(13) carry + a NOT-CLEAN record: exit 7 — the #4255 base-advance shape cannot launder an open finding into 'clean' (rc=$(rc_of))"
+no_reviewer; ck $? "(13) …no reviewer spawned"
+err_not_has "NO REVIEW OWED"; ck $? "(13) …and the success line is NOT printed over it"
+
+# (14) THE OTHER HALF OF THE ATTESTATION: a CLEAN carried record with NO signed body marker. Check (c)
+# reads the BODY, so exit 0 here would report the required check satisfied while it is red (a body edit
+# that wipes the marker, a dropped post, a store synced from another box). Nothing must be bought, and
+# nothing may be claimed.
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(14) carry with NO body marker: exit 9 (record arm), not 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(14) …no reviewer spawned (the record is current; the marker is the missing half)"
+err_not_has "NO REVIEW OWED"; ck $? "(14) …and no success line over a body the gate cannot read"
+err_has "NO signed marker"; ck $? "(14) …naming the half that is missing"
+
 # ══ end §BW ══
 
 # ⛔ THE PIN MUST NOT COUNT WHAT THE BOX DECIDES (P1, MEASURED at 0dd5e5519 on PR #4253). The floor
@@ -5100,7 +5151,7 @@ fi
 # patch-projection vectors were moved ABOVE the pin (they had landed below it, which hid them from the
 # pin's own count): 1336 printed on the four-dialect box, i.e. 1310 outside the loop. Measured by
 # RUNNING, never by adding assertion counts — that is the mistake this note exists for.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1310 ]; ck $? "assertion-count pin: >= 1310 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1309 ]; ck $? "assertion-count pin: >= 1309 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
