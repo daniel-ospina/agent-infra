@@ -3878,8 +3878,12 @@ mkdir -p "$TMP/cellhome/.pi/agent/scripts"
 printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 # #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+# #4105 adds the SECOND declared sibling (`code-identity.py`): `record-review.sh` resolves both from
+# its own `lib/`, and cmd_check fails the cell BY NAME when either is absent — so a fixture carrying
+# only one is refused on the other and every arm downstream of it reports the wrong reason.
 mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/code-identity.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
 # #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
 # not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
@@ -4034,9 +4038,12 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.s
 chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
 printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
 chmod +x "$TMP/tm/record-review.sh"
-# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+# #1717/#4105: cmd_check refuses a cell whose recorder lacks EITHER declared sibling
+# (lib/diff-normalize.py, lib/code-identity.py) — a recorder missing the second still runs, it just
+# silently stops carrying code-identical head moves, which is the expensive failure.
 mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/code-identity.py"
 # …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
 # for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
 # and turns a current harness into an unverifiable one.
@@ -4196,9 +4203,10 @@ mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
 mkdir -p "$KC/home/.pi/agent/scripts"
 printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
-# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+# #1717/#4105: the recorder's declared siblings must sit beside it, or cmd_check refuses the cell.
 mkdir -p "$KC/home/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/code-identity.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then

@@ -15198,6 +15198,259 @@ printf '#!/bin/bash\ncat <<%sEOF%s\n# changed\nEOF\n' "'" "'" > "$T/ci-h2.sh"
 CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-h1.sh" "$T/ci-h2.sh" || CI_RC=$?
 [ "$CI_RC" = "1" ] && ok "21.7 a '#' line inside a heredoc BODY is data, not a comment (rc 1)" || bad "21.7 heredoc body '# 'line was stripped — rc=$CI_RC (want 1)"
 
+# ⛔ THE VECTORS BELOW COME FROM THE REVIEW OF THIS CHANGE, and every `want` in them is what the
+# PRE-FIX helper returned as the OTHER value — each one was MEASURED against the shipped code before
+# the fix (the pre-fix rc is named in the assertion text so a later reader can re-measure it).
+#
+# 21.8 — A COMMENT SPLICED BY A LINE CONTINUATION IS NOT A COMMENT WE CAN DROP. POSIX.1-2017 XCU
+# §2.2.1 removes the backslash+newline pair BEFORE the input is split into tokens, so comment
+# recognition happens AFTER the splice: the `# c` line below is part of the previous command's tokens.
+# Pre-fix this pair compared IDENTICAL (rc 0) while the two files print `foo` + `bar: command not
+# found` (rc 127) and `foo bar` — a FALSE IDENTICAL inside the merge gate's trust boundary, i.e. a
+# clean verdict reviewed over one program carried onto a different one (review finding 2).
+printf 'echo foo \\\n# c\nbar\n' > "$T/ci-k1.sh"
+printf 'echo foo \\\nbar\n' > "$T/ci-k2.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-k1.sh" "$T/ci-k2.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "2" ] && ok "21.8 a comment spliced onto the previous line by a continuation is REFUSED (rc 2), never carried as identical" || bad "21.8 continuation-spliced comment rc=$CI_RC (want 2 — pre-fix 0 carried a program nobody reviewed)"
+# …AND THE OTHER DIRECTION. A whole-line comment that itself ends in a backslash swallows the NEXT
+# physical line as comment text, so fixing only the first shape would leave this one open.
+printf 'echo start\n# c \\\nbar\n' > "$T/ci-k3.sh"
+printf 'echo start\nbar\n' > "$T/ci-k4.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-k3.sh" "$T/ci-k4.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "2" ] && ok "21.8b a comment line that CONTINUES onto the next line is REFUSED (rc 2)" || bad "21.8b comment-continues rc=$CI_RC (want 2)"
+# CONTROL: an ordinary continuation with NO comment near it must still be COMPARED (rc 1 for a changed
+# line), not refused — otherwise 21.8/21.8b would be satisfied by "refuse every continuation", a
+# different and needlessly capability-losing rule that would silently shrink the arm to .py-only.
+printf 'echo hi \\\n  --flag\n' > "$T/ci-k5.sh"
+printf 'echo hi \\\n  --other\n' > "$T/ci-k6.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-k5.sh" "$T/ci-k6.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.8c a continuation with no comment in it is still COMPARED (rc 1), not blanket-refused" || bad "21.8c plain continuation rc=$CI_RC (want 1)"
+
+# 21.9 — A SHEBANG IS EXECUTABLE CONTENT. `ast` discards it as a comment, so pre-fix a head move whose
+# only delta was `#!/usr/bin/env python3` → `#!/usr/bin/env -S python3 -OO` compared IDENTICAL (rc 0),
+# while `-OO` changes what the interpreter does at import time (docstrings AND assertions stripped).
+# The shell normaliser already exempts `#!` from stripping for exactly this reason; the Python side
+# now applies the same predicate, so the two language paths agree (review P2).
+printf '#!/usr/bin/env python3\ndef f():\n    """doc"""\n    return 1\n' > "$T/ci-s1.py"
+printf '#!/usr/bin/env -S python3 -OO\ndef f():\n    """doc"""\n    return 1\n' > "$T/ci-s2.py"
+CI_RC=0; python3 "$CI_CI" "pkg/mod.py" "$T/ci-s1.py" "$T/ci-s2.py" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.9 a .py SHEBANG-ONLY delta is DIFFERENT (rc 1), never carried as docstring-only" || bad "21.9 shebang-only delta rc=$CI_RC (want 1 — pre-fix 0)"
+# CONTROL: the SAME shebang with a docstring rewrite must still carry — the shebang comparison cannot
+# be allowed to turn the feature off for every script that has one.
+printf '#!/usr/bin/env python3\ndef f():\n    """first"""\n    return 1\n' > "$T/ci-s3.py"
+CI_RC=0; python3 "$CI_CI" "pkg/mod.py" "$T/ci-s1.py" "$T/ci-s3.py" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "0" ] && ok "21.9b …while an IDENTICAL shebang with a docstring-only delta still carries (rc 0)" || bad "21.9b same-shebang docstring rc=$CI_RC (want 0)"
+
+# 21.10 — `<<` INSIDE AN ARITHMETIC EXPANSION IS A SHIFT, NOT A HEREDOC. Pre-fix `n=$(( 1 << 4 ))`
+# refused as `unparseable heredoc operator` (rc 2), so ANY script containing a left shift could never
+# carry (review P3). Fail-closed, so it cost re-reviews rather than soundness — but it cost them on
+# every docstring touch of such a script, which is the cost #4105 exists to remove.
+printf '#!/bin/bash\nn=$(( 1 << 4 ))\necho $n\n' > "$T/ci-a1.sh"
+cp "$T/ci-a1.sh" "$T/ci-a2.sh"
+printf '#!/bin/bash\nn=$(( 1 << 5 ))\necho $n\n' > "$T/ci-a3.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-a1.sh" "$T/ci-a2.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "0" ] && ok "21.10 an arithmetic left shift no longer refuses (rc 0 for two identical scripts)" || bad "21.10 arithmetic shift rc=$CI_RC (want 0 — pre-fix 2)"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-a1.sh" "$T/ci-a3.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.10b a CHANGED shift is still DIFFERENT (rc 1)" || bad "21.10b changed shift rc=$CI_RC (want 1)"
+# ANTI-REGRESSION for the `<<` skip: a REAL heredoc that follows an arithmetic expansion must still
+# open its body, so its `#` line stays DATA. Without this, "ignore `<<` inside arithmetic" could be made
+# to ignore a heredoc too and 21.7's heredoc vector would not notice (no arithmetic on its line).
+printf '#!/bin/bash\nn=$((1<<2))\ncat <<%sEOF%s\n# kept\nEOF\n' "'" "'" > "$T/ci-a4.sh"
+printf '#!/bin/bash\nn=$((1<<2))\ncat <<%sEOF%s\n# changed\nEOF\n' "'" "'" > "$T/ci-a5.sh"
+CI_RC=0; python3 "$CI_CI" "run.sh" "$T/ci-a4.sh" "$T/ci-a5.sh" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "1" ] && ok "21.10c a heredoc AFTER an arithmetic expansion still keeps its body verbatim (rc 1)" || bad "21.10c heredoc after arithmetic rc=$CI_RC (want 1)"
+
+# 21.11 — THE HELPER MUST NOT WARN. `ast.Str` was resolved on every docstring check; it is deprecated
+# since 3.12, and the recorder deliberately no longer swallows this helper's stderr (#4105 finding 2 of
+# the first review), so a deprecation warning would land in a lane's diagnosis looking like a refusal
+# reason. Run with `-W error::DeprecationWarning` so it is a FAILURE here, not a cosmetic line — the
+# filter is what makes this vector non-vacuous on a box whose default filter hides it.
+CI_RC=0; python3 -W error::DeprecationWarning "$CI_CI" "pkg/mod.py" "$T/ci-a.py" "$T/ci-b.py" 2>/dev/null || CI_RC=$?
+[ "$CI_RC" = "0" ] && ok "21.11 no DeprecationWarning on a docstring-only pair (ast.Str is never resolved)" || bad "21.11 helper rc=$CI_RC under -W error::DeprecationWarning (want 0 — pre-fix resolves ast.Str)"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# 21.12-21.14 — TWO GUARDS IN THE RECORDER'S ARM, AND THE PRIOR-RECORD GUARD, ALL WITH NO VECTOR
+# (review of #4105: "the mode-change and >100 paths refusals … are reachable but unpinned", and
+# "the new prior-record guard has no vector at all"). Each drives the REAL recorder against the REAL
+# fixture above, so the guard's own code is what answers.
+ci_record_bare() { # <record-script> <pr> <reviewed-sha> <head-sha> → $RECORD_RC $RECORD_ERR (NO --evidence)
+    local rec="$1" pr="$2" reviewed="$3" head="$4"
+    local rcfile="$T/rc-ci" errfile="$T/err-ci"
+    rm -f "$rcfile" "$errfile"; : > "$LOG"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_HEAD_SHA="$head" STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export RECORD_REVIEW_LOCAL_REPO="$CI_REPO" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1
+        rc=0
+        bash "$rec" "$pr" "$reviewed" clean daniel-ospina/agent-infra 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    )
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+ci_seed_prior() { # <pr> <head-sha> <verdict> <evidence> — a superseded record for the carry to inherit
+    local f; f="$(Q2 "$1")"; mkdir -p "$(dirname "$f")"
+    printf '{"pr":%s,"head_sha":"%s","verdict":"%s","evidence":"%s","repo":"daniel-ospina/agent-infra"}\n' \
+        "$1" "$2" "$3" "$4" > "$f"
+}
+# 21.12 — A MODE CHANGE IS EXECUTABLE-LINE MATERIAL. `git diff --raw` reports the SAME blob ids for a
+# `chmod +x`, so a copy comparing only blob CONTENT would call it prose and carry the verdict; the arm
+# refuses on `omode != nmode`. Deleting that line reddens nothing before this vector existed.
+chmod +x "$CI_REPO/run.sh"
+git -C "$CI_REPO" add -A
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -m "mode change"
+CI_C7="$(git -C "$CI_REPO" rev-parse HEAD)"
+if [ "$(git -C "$CI_REPO" rev-parse "$CI_C6:run.sh")" = "$(git -C "$CI_REPO" rev-parse "$CI_C7:run.sh")" ] \
+   && git -C "$CI_REPO" diff --summary "$CI_C6" "$CI_C7" | grep -q 'mode change 100644 => 100755'; then
+    ok "21.12 fixture: C6→C7 is a MODE-ONLY change on one path (same blob id, so only the mode guard can see it)"
+else
+    bad "21.12 fixture: C6→C7 is not a mode-only delta — the vector would be measuring something else"
+fi
+rm -f "$(Q2 425508)"
+ci_record "$RECORD" 425508 "$CI_C6" "$CI_C7"
+[ "$RECORD_RC" = "3" ] && ok "21.12 a MODE-ONLY delta REFUSES (exit 3) — chmod is executable-line material, not prose" || bad "21.12 mode-only delta (rc=$RECORD_RC, want 3)"
+[ ! -f "$(Q2 425508)" ] && ok "21.12 no record written over a mode change" || bad "21.12 a record was written over a mode change"
+# MUTATION PIN: drop the mode guard from a copy and the SAME fixture records — so the line is the
+# reason, not some other refusal in the chain.
+CI_MUT2="$T/mut-4105-mode"
+mkdir -p "$CI_MUT2/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT2/lib/diff-normalize.py"
+cp "$SCRIPT_DIR/lib/code-identity.py" "$CI_MUT2/lib/code-identity.py"
+python3 - "$RECORD" "$CI_MUT2/record-review.sh" <<'CIEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = ('        [ "$omode" = "$nmode" ] || { command rm -rf "$tmp"; return 1; }\n')
+assert old in text, "mode-guard anchor not found"
+open(dst, "w").write(text.replace(old, "", 1))
+CIEOF
+if bash -n "$CI_MUT2/record-review.sh" 2>/dev/null && ! cmp -s "$CI_MUT2/record-review.sh" "$RECORD"; then
+    ok "21.12 mutation: the mode-guard-free copy parses and differs from the recorder"
+else
+    bad "21.12 mutation: the mode-guard-free copy is unusable (identical to the recorder or unparseable)"
+fi
+rm -f "$(Q2 425508)"
+ci_record "$CI_MUT2/record-review.sh" 425508 "$CI_C6" "$CI_C7"
+[ "$RECORD_RC" = "0" ] && ok "21.12 MUTATION PIN: without the mode guard the same chmod delta is CARRIED (rc 0) — the guard is load-bearing" || bad "21.12 mutation NOT caught (rc=$RECORD_RC) — 21.12 passes without the mode guard"
+
+# 21.13 — THE PATH CEILING. 101 comment-only files are below the per-file truth but above
+# `CODE_IDENTITY_MAX_FILES=100`; the arm refuses rather than carrying an unbounded head move. Nothing
+# asserted it before, so the ceiling could be deleted (or raised) with the suite green.
+mkdir -p "$CI_REPO/many"
+for i in $(seq 1 101); do printf '#!/bin/bash\n# v1 file %s\necho %s\n' "$i" "$i" > "$CI_REPO/many/f$i.sh"; done
+git -C "$CI_REPO" add -A
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -m "many files"
+CI_C8="$(git -C "$CI_REPO" rev-parse HEAD)"
+for i in $(seq 1 101); do printf '#!/bin/bash\n# v2 reworded %s\necho %s\n' "$i" "$i" > "$CI_REPO/many/f$i.sh"; done
+git -C "$CI_REPO" add -A
+git -C "$CI_REPO" -c commit.gpgsign=false commit -q -m "many comment rewrites"
+CI_C9="$(git -C "$CI_REPO" rev-parse HEAD)"
+CI_NPATHS="$(git -C "$CI_REPO" diff --name-only "$CI_C8" "$CI_C9" | grep -c . || true)"
+[ "$CI_NPATHS" = "101" ] && ok "21.13 fixture: C8→C9 touches 101 paths, each comment-only (one over the ceiling)" || bad "21.13 fixture: C8→C9 touches $CI_NPATHS paths, want 101"
+rm -f "$(Q2 425509)"
+ci_record "$RECORD" 425509 "$CI_C8" "$CI_C9"
+[ "$RECORD_RC" = "3" ] && ok "21.13 an over-ceiling head move REFUSES (exit 3)" || bad "21.13 over-ceiling delta (rc=$RECORD_RC, want 3)"
+[ ! -f "$(Q2 425509)" ] && ok "21.13 no record written over an over-ceiling delta" || bad "21.13 a record was written over an over-ceiling delta"
+# MUTATION PIN: raising the ceiling makes the SAME fixture carry — so the ceiling, not some other
+# guard, is what refused. (This is the one direction that proves the constant is read at all.)
+CI_MUT3="$T/mut-4105-ceiling"
+mkdir -p "$CI_MUT3/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT3/lib/diff-normalize.py"
+cp "$SCRIPT_DIR/lib/code-identity.py" "$CI_MUT3/lib/code-identity.py"
+sed 's/^CODE_IDENTITY_MAX_FILES=100$/CODE_IDENTITY_MAX_FILES=200/' "$RECORD" > "$CI_MUT3/record-review.sh"
+if ! cmp -s "$CI_MUT3/record-review.sh" "$RECORD" && bash -n "$CI_MUT3/record-review.sh" 2>/dev/null; then
+    ok "21.13 mutation: the raised-ceiling copy parses and differs from the recorder"
+else
+    bad "21.13 mutation: the raised-ceiling copy is unusable — re-anchor it rather than dropping the pin"
+fi
+rm -f "$(Q2 425509)"
+ci_record "$CI_MUT3/record-review.sh" 425509 "$CI_C8" "$CI_C9"
+[ "$RECORD_RC" = "0" ] && ok "21.13 MUTATION PIN: with the ceiling raised the same 101-path delta is CARRIED (rc 0) — the ceiling is load-bearing" || bad "21.13 mutation NOT caught (rc=$RECORD_RC) — 21.13 passes without the ceiling"
+
+# 21.14 — THE PRIOR-RECORD GUARD (#4105 review, finding 3). The `code` arm INHERITS the superseded
+# record's `evidence`, so the record it inherits from must name the REVIEWED head and the SAME verdict;
+# otherwise a record minted at an unrelated head — or a `clean-micro` behind a `clean` carry — hands
+# over evidence that covers a tree nobody reviewed. It is reached ONLY without `--evidence` (a verified
+# `--evidence` takes the other path, which is why every earlier vector — all of them `--evidence`
+# carriers — left this branch dead in the suite).
+#   (a) WRONG HEAD ⇒ the evidence is NOT inherited, and a `clean` carry with no artifact is REFUSED
+#       by the existing carry-provenance guard (exit 3) rather than minted on a borrowed ref.
+ci_seed_prior 425510 "$CI_C3" clean "comment:777"
+ci_record_bare "$RECORD" 425510 "$CI_C1" "$CI_C2"
+[ "$RECORD_RC" = "3" ] && ok "21.14 a prior record at a DIFFERENT head does not authorise the carry (exit 3)" || bad "21.14 wrong-head prior (rc=$RECORD_RC, want 3)"
+assert_contains "$RECORD_ERR" "⚠️ #4105: the record being superseded" "21.14 …and the recorder NAMES the mismatch instead of inheriting silently"
+assert_contains "$RECORD_ERR" "NOT the reviewed head" "21.14 …saying the prior record is not the reviewed head"
+assert_contains "$RECORD_ERR" "carry-provenance" "21.14 …and the refusal is the existing carry-provenance guard (no artifact was manufactured)"
+assert_contains "$(cat "$(Q2 425510)" 2>/dev/null || true)" '"head_sha":"'"$CI_C3"'"' "21.14 the superseded record is left at its own head (nothing was re-bound)"
+assert_not_contains "$RECORD_ERR" "evidence=comment:777" "21.14 the FOREIGN evidence was NOT inherited"
+#   (b) POSITIVE CONTROL — the guard is not a blanket refusal: a prior record AT the reviewed head with
+#       the same verdict IS inherited, which is the behaviour the arm exists for.
+ci_seed_prior 425511 "$CI_C1" clean "comment:778"
+ci_record_bare "$RECORD" 425511 "$CI_C1" "$CI_C2"
+CI_R3="$(cat "$(Q2 425511)" 2>/dev/null || true)"
+[ "$RECORD_RC" = "0" ] && ok "21.14b a prior record AT the reviewed head DOES authorise the carry (rc 0)" || bad "21.14b matching prior (rc=$RECORD_RC, want 0, err=$RECORD_ERR)"
+assert_contains "$CI_R3" '"evidence":"comment:778"' "21.14b …and the inherited artifact is recorded, not dropped"
+assert_not_contains "$RECORD_ERR" "⚠️ #4105: the record being superseded" "21.14b …with no mismatch warning"
+# MUTATION PIN: restore the pre-fix unconditional inherit and the WRONG-HEAD fixture records (rc 0) with
+# the foreign `comment:777` — which is the exact unsoundness the guard removes.
+CI_MUT4="$T/mut-4105-prior"
+mkdir -p "$CI_MUT4/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT4/lib/diff-normalize.py"
+cp "$SCRIPT_DIR/lib/code-identity.py" "$CI_MUT4/lib/code-identity.py"
+python3 - "$RECORD" "$CI_MUT4/record-review.sh" <<'CIEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = ('    if [ "$CODE_CARRY_PRIOR_HEAD" != "$ORIG_SHA" ] || [ "$CODE_CARRY_PRIOR_VERDICT" != "$VERDICT" ]; then')
+new = ('    # MUTATION (#4105): the pre-fix shape — inherit unconditionally.\n'
+       '    if false; then')
+assert old in text, "prior-record guard anchor not found"
+open(dst, "w").write(text.replace(old, new, 1))
+CIEOF
+if bash -n "$CI_MUT4/record-review.sh" 2>/dev/null && ! cmp -s "$CI_MUT4/record-review.sh" "$RECORD"; then
+    ok "21.14 mutation: the unconditional-inherit copy parses and differs from the recorder"
+else
+    bad "21.14 mutation: the unconditional-inherit copy is unusable — re-anchor the pin"
+fi
+ci_seed_prior 425510 "$CI_C3" clean "comment:777"
+ci_record_bare "$CI_MUT4/record-review.sh" 425510 "$CI_C1" "$CI_C2"
+[ "$RECORD_RC" = "0" ] && ok "21.14 MUTATION PIN: inheriting unconditionally CARRIES the wrong-head record's evidence (rc 0) — the guard is load-bearing" || bad "21.14 mutation NOT caught (rc=$RECORD_RC) — 21.14 passes without the guard"
+assert_contains "$(cat "$(Q2 425510)" 2>/dev/null || true)" '"evidence":"comment:777"' "21.14 MUTATION PIN: …and that is exactly how the foreign artifact got carried"
+
+# 21.15 — AN EMPTY HELPER IS NOT A MISSING ONE, AND IT IS THE WORSE CASE. `python3 empty.py a b` exits
+# 0 with no output, and the arm reads a ZERO status as "the two files normalise to the SAME code" — so
+# a truncated or half-copied sibling would carry EVERY head move, a real code change included. The
+# farm guards `[ -s ]` on `lib/diff-normalize.py` for the same reason (an empty normalizer hashes the
+# empty string into a constant digest: a false accept), and the gate must not be weaker than the farm
+# that feeds it — so the arm now requires `-s`. Found while fixing the delivery finding: absence was
+# refused, emptiness was not.
+CI_MUT5="$T/mut-4105-empty"
+mkdir -p "$CI_MUT5/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT5/lib/diff-normalize.py"
+cp "$RECORD" "$CI_MUT5/record-review.sh"
+: > "$CI_MUT5/lib/code-identity.py"          # ZERO bytes: present, runnable, and always "identical"
+rm -f "$(Q2 425512)"
+ci_record "$CI_MUT5/record-review.sh" 425512 "$CI_C1" "$CI_C2"
+[ "$RECORD_RC" = "3" ] && ok "21.15 a ZERO-BYTE code-identity.py does NOT carry (exit 3)" || bad "21.15 empty helper carried a docstring delta (rc=$RECORD_RC, want 3 — an empty .py exits 0, which this arm reads as identical)"
+[ ! -f "$(Q2 425512)" ] && ok "21.15 no record written when the helper is empty" || bad "21.15 a record was written with an empty helper"
+# MUTATION PIN: with the pre-fix `-f` guard the SAME empty helper carries the SAME delta (rc 0) — so the
+# `-s` is what refuses, not the missing-helper branch or the arm failing for another reason.
+CI_MUT6="$T/mut-4105-empty-f"
+mkdir -p "$CI_MUT6/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$CI_MUT6/lib/diff-normalize.py"
+: > "$CI_MUT6/lib/code-identity.py"
+sed 's/^  \[ -s "\$CODE_IDENTITY_PY" \] || return 1$/  [ -f "$CODE_IDENTITY_PY" ] || return 1/' \
+    "$RECORD" > "$CI_MUT6/record-review.sh"
+if ! cmp -s "$CI_MUT6/record-review.sh" "$RECORD" && bash -n "$CI_MUT6/record-review.sh" 2>/dev/null; then
+    ok "21.15 mutation: the -f copy parses and differs from the recorder"
+else
+    bad "21.15 mutation: the -f copy is unusable — re-anchor it rather than dropping the pin"
+fi
+rm -f "$(Q2 425512)"
+ci_record "$CI_MUT6/record-review.sh" 425512 "$CI_C1" "$CI_C2"
+[ "$RECORD_RC" = "0" ] && ok "21.15 MUTATION PIN: with the pre-fix \`-f\` guard the SAME empty helper CARRIES the delta (rc 0) — the emptiness check is load-bearing" || bad "21.15 mutation NOT caught (rc=$RECORD_RC) — 21.15 passes without the -s guard"
+rm -f "$(Q2 425512)"
+
 
 cd "$ORIG_PWD" 2>/dev/null || cd "$T" || true
 echo ""

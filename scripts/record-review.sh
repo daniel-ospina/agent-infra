@@ -6213,7 +6213,13 @@ code_identity_carry() { # <reviewed-sha> <current-head> -> 0 = code identical, 1
   [ "${#reviewed}" -eq 40 ] && [ "${#current}" -eq 40 ] || return 1
   command -v git >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  [ -f "$CODE_IDENTITY_PY" ] || return 1
+  # ⛔ `-s`, NOT `-f` (review of #4105, consequence A of the farm finding). A ZERO-BYTE helper is not a
+  # missing one: `python3 empty.py a b` exits 0 with no output, and this arm reads a zero status as
+  # "the two files normalise to the SAME code" — so a truncated or half-copied sibling would carry
+  # EVERY head move, including ones that changed code. The farm already guards `[ -s ]` on
+  # `lib/diff-normalize.py` for the same reason (an empty normalizer hashes the empty string into a
+  # constant digest, a false accept); the gate must not be weaker than the farm that feeds it.
+  [ -s "$CODE_IDENTITY_PY" ] || return 1
   # THE CHECKOUT MUST BE THIS PR'S REPO. Without this, an unrelated clone holding
   # two commits with the same abbreviated-looking shas could answer for a repo it
   # is not — the same identity guard the #1398 local-diff fallback applies.

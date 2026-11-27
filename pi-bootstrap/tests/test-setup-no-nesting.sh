@@ -197,6 +197,18 @@ check_record_review_farmed() {
   else
     fail "$label: farmed lib/diff-normalize.py differs from scripts/lib/diff-normalize.py (stale copy!)"
   fi
+  # agent-infra#4105 — the SAME sibling contract for the code-identity helper, and it is not optional
+  # decoration: absent, `code_identity_carry` returns 1 at its `[ -f "$CODE_IDENTITY_PY" ]` guard on
+  # every head move, so the farmed recorder (the copy the merge rail actually runs) behaves exactly as
+  # it did before #4105 while the repo copy the §21 vectors drive stays green.
+  local ci="$DEST/scripts/lib/code-identity.py"
+  [ -f "$ci" ] \
+    || { fail "$label: lib/code-identity.py not farmed into scripts/lib/ — record-review.sh resolves it as its own sibling, so the #4105 code-identity carry arm would be INERT on this box"; return; }
+  if diff -q "$ROOT/scripts/lib/code-identity.py" "$ci" >/dev/null 2>&1; then
+    echo "ok: $label farmed lib/code-identity.py == repo copy (#4105)"
+  else
+    fail "$label: farmed lib/code-identity.py differs from scripts/lib/code-identity.py (stale copy!)"
+  fi
 }
 
 # #1719 — the runner-label gate is the FALLBACK when GitHub-hosted CI is unhealthy: the launchd
@@ -705,13 +717,24 @@ script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_cl
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
 script:watch-truncation.sh script:wip-sweep.sh
 lib:beat-pair.sh lib:bounded.sh lib:cell-home.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py
-lib:diff-normalize.py lib:live-paths.sh lib:pid-identity.sh lib:transcript-patterns.sh
+lib:code-identity.py lib:diff-normalize.py lib:live-paths.sh lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:nonblocking-dispatch.sh foreign:orch-loop.sh
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh other:orchestrator-harness/repo-slug.sh
 "
 
+# RE-CUT 2026-11-27 (computed by `--cut` from the CODE, never hand-typed): ONE PIN LINE added
+# (`lib:code-identity.py`), nothing removed. `scripts/record-review.sh` resolves
+# `$(dirname "${BASH_SOURCE[0]}")/lib/code-identity.py` for its #4105 code-identity carry arm, and F2's
+# extractor sees that sibling — correctly, because it IS a producer a farmed consumer execs. It was
+# DELIVERED BY NOTHING (`lib_srcs` in `pi-bootstrap/setup.sh` did not list it), which is the same
+# `producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING` failure (agent-infra#1552/#1899)
+# that `repo-slug.sh` and `brief-gate.sh` produced above — and the one that matters most here, because
+# the farmed `record-review.sh` IS the merge gate: without the sibling its owner-move arm returns 1 on
+# every head move and behaves exactly as it did before #4105, while the repo copy the §21 vectors drive
+# stays green. It is now in `setup.sh`'s `lib_srcs`, whose destination is the sibling `scripts/lib/`
+# the recorder resolves.
 # RE-CUT 2026-11-20 (computed from the CODE, never hand-typed): ONE PIN LINE added
 # (`foreign:nonblocking-dispatch.sh`), nothing removed — the 69 entries on `origin/main` plus this one.
 # It is a producer a farmed consumer EXECS whose derived site is a MEASURED example of a DEPLOYED path:
