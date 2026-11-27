@@ -1707,6 +1707,35 @@ _r4b="$_rdir/r4b.out"; run_review "$rev_4" 42 acme/widget "$_r4b"
 [ "$(review_state "$_r4b")" = refused ] \
   || bad "rc=4 (pi unavailable, before any review is paid for) must read as 'refused' (got '$(review_state "$_r4b")')"
 rm -f "$rev_4"
+# ⛔ 12, 13 AND 14 ARE REFUSALS TOO (P2, fresh review of agent-infra#4256 at `a3ee7be7dfda`). `review-pr.sh`
+# grew 12/13 with the carry-before-review seam and documents each as "no review was bought and
+# nothing was recorded": 12 is a failed READ of the live diff/head (or of the PR body when confirming a
+# carry's marker), 13 is a RED CHECK SURFACE, and 14 — added by the P3 finding of the fresh review of PR
+# #4257 at `b454f9f1c2a8` — is the `carry-patch` MARKER refusal (the re-record landed in the store but the
+# marker check (c) reads back was absent or unsigned). NONE was in the refused arm, so each fell to `*` →
+# `retry` — the class that SPENDS the paid budget — and a head whose check surface was transiently red or
+# unreadable was refused in seconds three times, reached REVIEW_MAX_ATTEMPTS, and was held EXHAUSTED for
+# REVIEW_ATTEMPT_WINDOW_S (21600 s = 6 h), including AFTER the checks went green. 14 is the same defect
+# one layer in: it used to BE 9, and 9 is also where a recorder that ran and failed AFTER a paid review
+# arrives, which is why the producer had to give it a code of its own before this arm could read it. This
+# is the same defect the round-2 note fixed for 4/75, in the same direction — and the loop over the three
+# codes is the guard that a NEW refusal code cannot be added without landing here.
+# ⛔ THE BUDGET-IGNORING PROBE IS NOT REPEATED HERE (P3, fresh review of PR #4257 at `c2e80bac1db7`).
+# This loop used to also assert `review_action refused <past window> $REVIEW_MAX_ATTEMPTS` → 1, once per
+# `_rc`. That probe cannot be sensitive to `_rc`: it passes `refused` as a LITERAL, `review_action` is not
+# touched by this change, and the call was character-for-character the one already asserted ~13 lines
+# below (`_frc=$?`), so NO mutation of the 4|75|12|13|14 arm could redden it — dead weight that READ as
+# coverage of an rc-dependent path that does not exist. Its `$?` was also expanded AFTER `[ $? -eq 1 ]`
+# had run, so its failure message reported the test's own status instead of `review_action`'s. The
+# budget-ignoring property is asserted ONCE, below, with the file's own `_frc=$?` idiom; the assertion
+# this loop OWES is the `review_state` one above, which does redden when 12/13 fall back to `retry`.
+for _rc in 12 13 14; do
+  _rvf=$(mktemp); printf '#!/bin/bash\nexit %s\n' "$_rc" > "$_rvf"; chmod +x "$_rvf"
+  _rxf="$_rdir/rf-refused-$_rc.out"; run_review "$_rvf" 42 acme/widget "$_rxf"
+  [ "$(review_state "$_rxf")" = refused ] \
+    || bad "rc=$_rc (a failed READ / a RED check surface: nothing was bought) must read as 'refused' (got '$(review_state "$_rxf")') — folded into 'retry' it spends the PAID attempt budget, and three refusals mark a head nobody ever read as EXHAUSTED for the whole window"
+  rm -f "$_rvf"
+done
 review_action refused 0 "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 0 ] \
   || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
 review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) 0; [ $? -eq 1 ] \

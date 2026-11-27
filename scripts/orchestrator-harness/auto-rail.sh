@@ -972,7 +972,11 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
 #     7  the reviewer FOUND ISSUES — not recorded, findings posted as the comment
 #     8  the head moved during the review        9  the record/artifact arm failed
 #     4  no `pi`                                 75 a spawn-point load refusal
-#     → 0/5 clean, 7 issues, 4/75 REFUSED (nothing was consumed: see `refused` in review_action),
+#    12  a carry-before-review answer that was NOT a review (`unreadable`/`surface-unknown`: the
+#        recorder could not READ the diff/head), or a carry re-record whose BODY marker could not be
+#        read — nothing was bought either way      13 the head's CHECK SURFACE is RED (`red-surface`)
+#    14  a carry re-record whose marker came back absent/UNSIGNED — nothing was bought
+#     → 0/5 clean, 7 issues, 4/12/13/14/75 REFUSED (nothing was consumed: see `refused` in review_action),
 #       everything else retry (the review may have been paid for, so the attempt budget applies).
 # ⛔ A STALE RECORD IS TREATED AS "NO ATTESTATION FOR THE HEAD THAT WOULD MERGE", WHICH IS A DELIBERATE
 # COST, STATED RATHER THAN HIDDEN. `record-review.sh --check-carry` would sometimes answer that the
@@ -1004,7 +1008,24 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
     # refusals would otherwise mark a head nobody ever read as EXHAUSTED, permanently, and the comment
     # published for it would claim the review had been paid for. Their own state retries on TIME alone.
     # rc=3 is deliberately NOT here: `review-pr.sh` exits 3 on several paths AFTER the reviewer ran.
-    4|75) printf 'refused\n';;
+    # ⛔ 12 AND 13 ARE REFUSALS TOO (P2, fresh review of PR #4256 at `a3ee7be7dfda`). `review-pr.sh`
+    # documents both as "no review was bought and nothing was recorded": 12 is a failed READ of the live
+    # diff/head (or of the PR body when confirming a carry's marker), 13 is a RED CHECK SURFACE (a
+    # broken build is not a review finding). They landed in `*)` → `retry`, the class that SPENDS the
+    # paid budget — so a head whose check surface was transiently red or unreadable was refused in
+    # seconds three times, reached REVIEW_MAX_ATTEMPTS, and was held EXHAUSTED for
+    # REVIEW_ATTEMPT_WINDOW_S (21600 s = 6 h) including AFTER the checks went green. Same defect the
+    # round-2 note above fixed for 4/75, in the same direction: a review that was never bought must not
+    # be charged as one.
+    # ⛔ AND 14 IS THE SAME CASE ONE LAYER IN (P3, fresh review of PR #4257 at `b454f9f1c2a8`). 14 is the
+    # `carry-patch` MARKER refusal — the re-record landed in the record store but the marker check (c)
+    # reads back was absent or unsigned. `review-pr.sh` prints "NOTHING was reviewed and nothing more
+    # should be bought" on both of its arms, and it emitted them on 9 until this fix: 9 is also where a
+    # recorder that RAN AND FAILED after a paid review arrives, so the refusal was charged the budget it
+    # says it did not spend. The producer now separates them (its header states the split), and this arm
+    # MUST stay in step with it — a new "nothing was bought" code that is not listed here inherits
+    # `retry` and re-creates the defect silently.
+    4|75|12|13|14) printf 'refused\n';;
     *)   printf 'retry\n';;
   esac
 }
@@ -1173,6 +1194,11 @@ review_ledger_unreadable() {  # $1 = attempt ledger; rc 0 = exists but its conte
 # and both are needed: this one keeps a free dispatch out of the budget at all, and the window covers the
 # classes auto-rail cannot see (rc=3/9 have pre-review paths too, so their state is `retry` and they DO
 # consume — there is no state that could tell those apart from a paid failure).
+# ⛔ THAT SENTENCE IS AN ARGUMENT FOR CODES, AND `review-pr.sh` NOW SUPPLIES ONE (P3, fresh review of PR
+# #4257 at `b454f9f1c2a8`): the `carry-patch` marker refusals bought nothing and used to share rc=9 with a
+# recorder that failed AFTER a paid review, so no arm could classify them correctly. They are rc=14 now and
+# the `refused` arm reads it — because a code IS a state the loop can see, which is the only way a
+# pre-review refusal in a code that is otherwise post-review stops spending budget it never used.
 # ⛔ IT DROPS ONE LINE — AND ONLY WHEN THAT LINE IS PROVABLY THE REFUSAL'S OWN. An earlier version
 # truncated the WHOLE ledger, which forgave paid attempts too (two paid failures + one refusal reset the
 # budget and bought three more paid reviews); the one-line form closed that. The caller cannot see the
