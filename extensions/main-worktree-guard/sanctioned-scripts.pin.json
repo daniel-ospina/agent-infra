@@ -19,7 +19,7 @@
     "scripts/ci-workflow-pr-evaluable.sh": "9db2703be4442e2cd11ccb983d5312cb62934e9cbfd51d20e7fd6fb5c0430bb3",
     "scripts/ci_exemption.py": "b0fdd26b97dc4d2c820869c670e5e48b4eae7a185199da353abfca772bb0cc68",
     "scripts/gh-shim/gh": "e1505380fd89eed4340ea393898ef5bf7b94d4bf1eba34bd3e323b3684d775e9",
-    "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
+    "scripts/lib/diff-normalize.py": "3174fd1155b2ec2a31656457da1e3a5657da6949476768030c540887c630261c",
     "scripts/record-review.sh": "949d6371a3254f8f034ae19ad56a0767bb020f6df2947c431bc3d39f232f6ee7",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
