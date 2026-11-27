@@ -7691,13 +7691,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4994 :6832 :9298 :9472, plus a comment mention at :4863; `14.1c-CITE` below
+#     CITE-CHECK: :4994 :6840 :9306 :9480, plus a comment mention at :4863; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4972) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
 #     predicate line beside it (CITE-CHECK: :4994) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9298). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9306). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7723,7 +7723,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:9298` / `:9472` — CITE-CHECK: :9298 :9472 — re-derived by the
+#     this head the predicates are `:9306` / `:9480` — CITE-CHECK: :9306 :9480 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8632,7 +8632,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6832 :9298 :9472 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6840 :9306 :9480 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -15150,7 +15150,12 @@ python3 - "$RECORD" "$CI_MUT/record-review.sh" <<'CIEOF'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = ('        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null 2>&1; then')
+# ⛔ THE ANCHOR FOLLOWS THE ARM: the shipped line drops `2>&1` on purpose (the
+# helper's reason must reach stderr — 21.5b pins that), so a reversal mutation that
+# still quoted the silent spelling stopped matching and ABORTED this harness before
+# its summary. A mutation anchor is a claim about the CURRENT text: when the arm
+# changes, the anchor is re-derived with it, never left pointing at the old line.
+old = ('        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null; then')
 new = ('        # MUTATION (#4105): the pre-fix comparison — raw blob bytes, no stripping.\n'
        '        if ! command cmp -s "$tmp/a" "$tmp/b"; then')
 assert old in text, "mutation anchor not found"
