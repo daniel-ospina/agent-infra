@@ -5055,6 +5055,25 @@ run "$SRC" 2284
 no_reviewer; ck $? "(10) …no reviewer spawned for an unsigned re-record either"
 err_has "UNSIGNED"; ck $? "(10) …and the refusal names the missing signature rather than a missing marker"
 
+# (10b) ⛔ A FAILED BODY READ AFTER THE RE-RECORD IS ITS OWN REFUSAL (P3, fresh review of PR #4257 at
+# `c2e80bac1db7`). The carry arm's `gh pr view --json body` read has TWO failure modes and they need
+# OPPOSITE remedies: rc=0 with no marker bound to this head (the re-record's best-effort post did not
+# land — re-run the recorder) versus a NON-ZERO read (the API did not answer — the marker may be there
+# and correct, so re-running the recorder is a no-op and a PAID review must not be bought). Without a
+# scenario the fourth outcome was unasserted: replacing that arm with `*) : ;;` left this suite green,
+# and the seam then fell through to a full review of a head that already carries a valid, diff-identical
+# record — the exact money #4255 exists to stop spending.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_READ_FAIL=body
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "12" ]; ck $? "(10b) a FAILED body read after the re-record => exit 12, a RETRY refusal (rc=$(rc_of))"
+err_has "could not be READ"; ck $? "(10b) …naming the READ failure, not a missing marker (the two have opposite remedies)"
+out_not_has "NO REVIEW OWED"; ck $? "(10b) …and never claiming the carry on a marker it could not read back"
+no_reviewer; ck $? "(10b) …and no reviewer paid for a read failure"
+grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "(10b) …with the store re-record still landed — so the arm is the READ's doing, not a failed re-record"
+
 # (11) MUTATION CONTROL for (10): weaken the marker gate to "the store landed" and the marker-less
 # scenario exits 0 — so §BW(10) is the gate's doing, not the fixture's.
 MUT_MARK="$TMP/mutant-nomarkergate.sh"
