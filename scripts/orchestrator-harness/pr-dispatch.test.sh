@@ -2253,37 +2253,153 @@ _c4u_remedy_for() { # <file> <merge|render> [advisory-head] → the REVIEW-CEILI
     *) grep -E 'park(_ctrl)? ' "$1" | grep -o 'rm -rf[^"]*reviewround-[^"]*' | head -1 ;;
   esac
 }
-# ⛔ THE VERB MUST BE APPLIED TO THE BOOK — ADJACENCY IS NOT APPLICATION (fresh reviews of #4242, three
-# P2s — MEASURED). Two independent greps ('rm -rf' AND 'reviewround-') went GREEN on a remedy that removes
-# the park markers and only MENTIONS `state/reviewround-$1`. Each repair since then has failed the same
-# way — by testing ORDER rather than OPERAND — and each was measured GREEN on a remedy that leaves a
-# DIRECTORY at the book after the operator pastes it:
-#   anchor 1  `rm -rf[^)]*reviewround-`            GREEN on: `rm -rf '…parked-77'; rm -f '…/state/reviewround-77'`
-#   anchor 2  strip parens + same ';' field        GREEN on: `rm -f '…parked-77' '…/state/reviewround-77' rm -rf, not rm -f`
-#                                                     (the prose is not parenthesised, so it survives the strip)
-# THE PROPERTY IS THE OPERAND: an `rm -rf` whose OWN argument list names the book. So the predicate
-# matches the verb, then the run of quoted operands after it, and requires the book among THEM. Both quote
-# flavours are accepted (a re-quote is a refactor, not a defect); the parenthetical prose needs no
-# stripping because prose is never an operand. Measured over 14 shapes: real render / args reordered /
-# merge-one literal / merged absolute path / double-quoted / mixed quoting / `$O` unexpanded GREEN;
-# split / mention / decoy / wholesale rm -f / prose-after-the-book / junk between verb and operand / empty RED.
-# ⚠️ BOUNDED (filed): a TEXT pin is not a proof — prose that itself quotes a complete `rm -rf '…reviewround-77'`
-# would still satisfy it. The unbounded form is BEHAVIOURAL (plant the book as a directory in $TMP, run the
-# pasted command, assert it is gone), which also survives a remedy whose verb is spelled differently.
+# ⛔ THE BOOK MUST BE AN OPERAND OF THE rm -rf — BY NAME (three fresh reviews of #4242 — MEASURED).
+# Every generation of this predicate before the current one tested the SHAPE of the line instead of the
+# operand, and each was measured GREEN on a remedy that leaves a DIRECTORY at `state/reviewround-<PR>`,
+# i.e. the operator pastes the printed repair and the PR re-parks for ever:
+#   gen 1  `rm -rf[^)]*reviewround-`         `rm -rf '…parked-77'; rm -f '…/state/reviewround-77'`
+#   gen 2  strip parens, both substrings in one ';' field
+#                                            `rm -f '…parked-77' '…/state/reviewround-77' rm -rf, not rm -f`
+#   gen 3  book is an operand, any reviewround-…
+#                                            `rm -rf '…/state/reviewround-7'; rm -f '…/state/reviewround-77'`
+#                                            `rm -rf '…/state/reviewround-77.bak'`   (prefix of the book)
+# The property is "the paste REMOVES THE BOOK", so the predicate now walks the operand list after the verb
+# and requires ONE QUOTED OPERAND THAT ENDS WITH THE BOOK'S OWN NAME — passed in by the caller, because a
+# matcher cannot know which `reviewround-*` path is this PR's book. `*/"$2"` makes `reviewround-77.bak`,
+# `reviewround-7`, `reviewround-77 is left behind` and a stranded `reviewround-` (an empty $PR) all RED.
+# ⚠️ BOUNDED, DISCLOSED (#4246): a TEXT pin is still not a proof — prose that itself quotes a complete
+# `rm -rf '…/state/reviewround-77'` satisfies it, and an UNQUOTED operand reds (production renders quoted
+# paths, so that is friction, not a live false green). The unbounded form is BEHAVIOURAL: plant the book as
+# a directory in $TMP, run the pasted command, assert it is gone — #4246 carries the design.
 # ⛔ THE PIPE IS PART OF THE BUG CLASS: `printf … | grep -q` is the #841/#864 SIGPIPE idiom and reds
-# `sigpipe-grep`; a here-string carries the text without an earlier writer to kill.
+# `sigpipe-grep` (it did, on this very line, at 8ae533aa). The text arrives by here-string — no earlier
+# writer left to kill. This is also why the walk below is bash string work and not a `sed`/`awk` pipeline.
 # ⛔ AND BOTH BRANCHES ARE RENDERED (P3): the advisory head's `_tail` is where `${_remedy}` was dropped
 # in a measured mutant, and a call that seeds no advisory record only ever renders the else-branch.
-_c4u_ok() { # the book must be an OPERAND of an rm -rf, not merely named on the line
-  grep -qE "rm -rf([[:space:]]+('[^']*'|\"[^\"]*\"))*[[:space:]]+('[^']*state/reviewround-[^']*'|\"[^\"]*state/reviewround-[^\"]*\")" <<<"$1"
+_c4u_ok() { # <text> <book-token> — an rm -rf whose OWN quoted operand ends with the book
+  local _rest _op _sq _dq _bare
+  [ -n "${2:-}" ] || return 1
+  _sq="'" _dq='"'   # the quote characters as PATTERN VARIABLES: a backslash escape inside "${v#pat}"
+                          # does not strip (measured — it read GREEN as RED on a reordered operand list)
+  # ⛔ A PASTE WITH AN UNTERMINATED QUOTE EXECUTES **NOTHING** (measured). The shell refuses the line
+  # ("unexpected EOF while looking for matching `''"), so the book SURVIVES however well-formed the
+  # operand we matched is — `rm -rf '<book>' '<parked` printed GREEN on the operand walk alone, and running
+  # it gives `unexpected EOF` with the book still on disk. Two separate checks are needed, because neither
+  # covers the other (both measured):
+  #   (1) parity over the COMMAND portion — catches an unterminated quote ANYWHERE in it, including after a
+  #       well-formed operand that the walk would have accepted and RETURNED on;
+  #   (2) a closer for the operand being examined — catches a text whose GLOBAL parity is even but whose
+  #       unterminated quote was eaten by the verb-prefix strip (` rm -rf '<book>`, quotes=2, no closer).
+  # ⚠️ (1) reads only the text BEFORE the trailing parenthetical prose: the prose is not part of the paste,
+  # and counting it made a single added contraction (`isn't`) red a row whose remedy was unchanged — a false
+  # diagnosis inviting the wrong repair (broaden the matcher).
+  # ⚠️ STILL FAIL-CLOSED, NOT EXHAUSTIVE (#4246): a `'` INSIDE a double-quoted word is literal to the shell
+  # but counted by parity, so an exotic pre-verb shape can still pass both checks. The unbounded form is
+  # behavioural: plant the book as a directory, run the paste, assert it is gone.
+  local _cmd="${1:-}"
+  case "$_cmd" in *" ("*) _cmd="${_cmd% (*}" ;; esac   # the TRAILING parenthetical, i.e. the LAST " (" —
+                                                          # the first one can be inside the prose itself
+                                                          # (advisory renders carry `P3-ONLY (cosmetic)`),
+                                                          # and cutting there left `head's` behind: odd
+                                                          # parity, and a paste that DOES remove the book
+                                                          # redded (measured)
+  for _bare in "$_sq" "$_dq"; do
+    _rest="${_cmd//"$_bare"/}"
+    [ $(( (${#_cmd} - ${#_rest}) % 2 )) -eq 0 ] || return 1
+  done
+  case "${1:-}" in *"rm -rf "*) _rest="${1#*rm -rf }" ;; *) return 1 ;; esac
+  # ⛔ A WHITESPACE RUN IS ONE SEPARATOR, NOT A MALFORMED PASTE (fresh review of #4249, P3 — MEASURED).
+  # The verb-prefix strip hands the walk a single leading space; with exactly one space stripped the walk
+  # saw a leading space as its first token and returned 1, so `rm -rf  '<book>'` (two spaces) redded even
+  # though the paste really does remove the book — a NEW false RED that `main` did not have, and whose
+  # failure text asserted the remedy "does not remove the book", inviting the broaden-the-matcher repair
+  # this block warns against. Consume the whole run: bash itself treats any run of blanks as one separator.
+  while [ "${_rest# }" != "$_rest" ]; do _rest="${_rest# }"; done
+  while :; do
+    case "$_rest" in
+      "$_sq"*) _rest="${_rest#"$_sq"}"; _op="${_rest%%"$_sq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1
+                 _rest="${_rest#*"$_sq"}" ;;
+      "$_dq"*) _rest="${_rest#"$_dq"}"; _op="${_rest%%"$_dq"*}"
+                 [ "${#_op}" -lt "${#_rest}" ] || return 1
+                 _rest="${_rest#*"$_dq"}" ;;
+      *) return 1 ;;
+    esac
+    case "$_op" in */"$2") return 0 ;; esac
+    # ⛔ THE RUN BETWEEN OPERANDS IS ONE SEPARATOR TOO (fresh review of #4249, P3 — MEASURED). The same
+    # property the strip above states in general terms applies HERE: bash treats any run of blanks as one
+    # separator, so `rm -rf '<parked>'  '<book>'` (two spaces) really does remove the book. Consuming
+    # exactly ONE space made that shape a NEW false RED that `main` did not have (main=GREEN, head=RED,
+    # paste measured to remove the book), and the failure text then told the operator the remedy "does not
+    # remove the book" over a paste that does — inviting the broaden-the-matcher repair this block warns
+    # against. Consume the whole run, exactly as the leading strip does.
+    case "$_rest" in
+      " "*) while [ "${_rest# }" != "$_rest" ]; do _rest="${_rest# }"; done ;;
+      *) return 1 ;;
+    esac
+  done
 }
-_c4u_row() { # <label> <text>
-  if _c4u_ok "$2"; then ok "(c4u) $1's REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)"
-  else bad "(c4u) $1's REVIEW-CEILING remedy (the text an operator PASTES) does not print a working rm -rf for the book — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert (rendered: [$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-140)])"; fi
+_c4u_row() { # <label> <text> <book-token>
+  if _c4u_ok "$2" "$3"; then ok "(c4u) $1's REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)"
+  else bad "(c4u) $1's REVIEW-CEILING remedy (the text an operator PASTES) does not remove the book ($3) with rm -rf — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert (rendered: [$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-140)])"; fi
 }
-_c4u_row "$(basename "$MERGED_ONE_SH")" "$(_c4u_remedy_for "$MERGED_ONE_SH" merge)"
-_c4u_row "$(basename "$ORCH")" "$(_c4u_remedy_for "$ORCH" render)"
-_c4u_row "$(basename "$ORCH") (ADVISORY head)" "$(_c4u_remedy_for "$ORCH" render aaaa1111)"
+_c4u_row "$(basename "$MERGED_ONE_SH")" "$(_c4u_remedy_for "$MERGED_ONE_SH" merge)" 'reviewround-$PR'
+_c4u_row "$(basename "$ORCH")" "$(_c4u_remedy_for "$ORCH" render)" 'reviewround-77'
+_c4u_row "$(basename "$ORCH") (ADVISORY head)" "$(_c4u_remedy_for "$ORCH" render aaaa1111)" 'reviewround-77'
+# ⛔ THE PREDICATE ITSELF IS PINNED WITH SHAPES (fresh review of #4242, P3 — MEASURED). The three rows above
+# only prove the SHIPPED renders pass; on their own they do not distinguish the book-binding rule from a
+# weaker matcher — and this predicate regressed through four fresh reviews, each time with all four suites
+# green (deleting both termination guards measured byte-identical suite logs, 282/0). These rows drive the
+# predicate directly, in BOTH polarities, on the shapes those reviews produced, so removing any part of the
+# rule reds a row instead of silently widening it.
+_c4u_shape() { # <label> <want GREEN|RED> <text>
+  local _got
+  if _c4u_ok "$3" 'reviewround-77'; then _got=GREEN; else _got=RED; fi
+  if [ "$_got" = "$2" ]; then ok "(c4u) the remedy predicate says $2 for the shape '$1'"
+  else bad "(c4u) the remedy predicate says $_got for the shape '$1', expected $2 — the book-binding rule has drifted (text: [$3])"; fi
+}
+_c4u_shape 'book is an operand of rm -rf'          GREEN "rm -rf '/x/state/reviewround-77' '/x/state/parked-77'"
+_c4u_shape 'double-quoted, terminated'             GREEN 'rm -rf "/x/state/reviewround-77"'
+_c4u_shape 'split verb (book removed by rm -f)'    RED   "rm -rf '/x/state/parked-77'; rm -f '/x/state/reviewround-77'"
+_c4u_shape 'wrong PR (reviewround-7 vs -77)'       RED   "rm -rf '/x/state/reviewround-7'"
+_c4u_shape 'operand is a PREFIX of the book (.bak)' RED   "rm -rf '/x/state/reviewround-77.bak'"
+_c4u_shape 'text ends at an UNTERMINATED quote'    RED   "rm -rf '/x/state/reviewround-77"
+_c4u_shape 'unterminated quote AFTER the book'     RED   "rm -rf '/x/state/reviewround-77' '/x/state/parked-77"
+_c4u_shape 'verb prefix ate the opening quote'     RED   "' rm -rf '/x/state/reviewround-77"
+_c4u_shape 'verb prefix ate the opening quote (dq)' RED  '" rm -rf "/x/state/reviewround-77'   # the mirror: the two
+#   quote arms each need their OWN row — deleting only the double-quote guard was measured SILENT (suite log
+#   byte-identical at 291/0), while the paste it accepts exits 127 and leaves the book DIRECTORY in place.
+# ⛔ EACH PARITY ARM NEEDS ITS OWN ROW TOO — THE TWO ARE NOT MIRRORS (fresh review of #4249, P2 — MEASURED).
+# The row above pins the double-quote operand CLOSER (`[ "${#_op}" -lt "${#_rest}" ]`), NOT parity: deleting
+# ONLY that closer reds the row above and nothing else, while deleting ONLY the `"$_dq"` entry from the
+# parity loop left ALL 13 then-existing rows green. The gap was live, not theoretical — `rm -rf '<book>' "junk` reads GREEN
+# under that mutant, and running it prints `unexpected EOF while looking for matching` and removes NOTHING
+# (the shell refuses the whole line), which is the exact false-GREEN this PR exists to close, one quote
+# flavour over. So the parity arms are pinned by ODD-PARITY shapes whose operand walk SUCCEEDS and RETURNS:
+_c4u_shape 'unterminated DOUBLE quote after a well-formed operand' RED "rm -rf '/x/state/reviewround-77' \"junk"
+# ⛔ THE TRAILING-PARENTHETICAL STRIP IS PINNED HERE, and only here (fresh review of #4249, P3 — MEASURED):
+# without the strip this row is odd-parity in `'` and reds, so deleting line `_cmd="${_cmd% (*}" is caught.
+# The contraction lives in the PROSE, which is not part of the paste; counting it was a false diagnosis.
+_c4u_shape 'trailing prose contraction is not part of the paste' GREEN "rm -rf '/x/state/reviewround-77' (isn't this fine)"
+# ⛔ AND THE WHITESPACE-RUN FIX IS PINNED HERE (the two-space false RED above): revert the `while` strip in
+# `_c4u_ok` and this GREEN row reds, so the fix cannot be silently dropped back into the false RED.
+_c4u_shape 'a space RUN after the verb is one separator'  GREEN "rm -rf  '/x/state/reviewround-77'"
+# ⛔ AND A RUN BETWEEN OPERANDS IS THE SAME SEPARATOR (fresh review of #4249, P3 — MEASURED): the strip
+# above consumes only the leading run, so consuming exactly ONE space between operands left this shape a
+# NEW false RED that `main` did not have — `main`=GREEN, head=RED — over a paste that really removes the
+# book. Reverting the between-operand `while` back to a single `${_rest# }` reds this row.
+_c4u_shape 'a space RUN between operands is one separator' GREEN "rm -rf '/x/state/parked-77'  '/x/state/reviewround-77'"
+# ⛔ THE EMPTY-BOOK GUARD IS PINNED HERE, and only here (fresh review of #4249, P3 — MEASURED). `_c4u_shape`
+# hardcodes the book, so it cannot express this; the token is passed directly. The guard is a real defence,
+# not decoration: with an empty token the operand pattern `*/"$2"` degenerates to `*/`, which matches ANY
+# operand ending in `/`, so the text below reads GREEN without `[ -n "${2:-}" ] || return 1` and RED with
+# it. Deleting that line left every other row green — this is the row that notices.
+if _c4u_ok "rm -rf '/x/state/sub/'" ''; then
+  bad "(c4u) the remedy predicate accepts an EMPTY book token — its operand pattern degenerates to a bare '/', so any trailing-slash operand reads as the book (the `-n` guard is gone)"
+else
+  ok "(c4u) the remedy predicate REFUSES an empty book token (without the guard its operand pattern would match any trailing-slash operand)"
+fi
+_c4u_shape 'empty text'                            RED   ""
 # MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
 # vacuity above was exactly one file satisfying the other's row. ⛔ THE MUTATION IS NAME-AGNOSTIC AND ON
 # THE EXTRACTED FRAGMENT, NOT ON SELECTED SOURCE LINES (fresh review of #4242, two P2s + P3 — MEASURED):
@@ -2311,10 +2427,12 @@ for _pair in "$MERGED_ONE_SH:merge-one:merge" "$ORCH:orch-loop:render"; do
   else
     if [ "$_mode" = render ]; then
       _mt="$( O="$TMP/c4u-mo.$_lbl"; rm -rf "$O"; mkdir -p "$O/state"; . "$TMP/mut-u.$_lbl.mut.sh"; review_ceiling_reason 77 aaaa1111 999999999 10 2>/dev/null )"
+      _mtbook='reviewround-77'
     else
       _mt="$(grep -E 'park(_ctrl)? ' "$TMP/mut-u.$_lbl.mut.sh" | grep -o 'rm -rf[^"]*reviewround-[^"]*' | head -1)"
+      _mtbook='reviewround-$PR'
     fi
-    if _c4u_ok "$_mt"; then
+    if _c4u_ok "$_mt" "$_mtbook"; then
       bad "MUTANT-U did not strip $_lbl's park remedy — (c4u)'s row for that file still finds a working verb in the mutant, so the per-file pin is VACUOUS"
     else
       ok "MUTANT-U: reverting $_lbl's park remedy to rm -f makes (c4u)'s row for it report ❌ — the per-file remedy pin is live"
