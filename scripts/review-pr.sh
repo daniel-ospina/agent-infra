@@ -2354,6 +2354,79 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
+function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl, _t) {
+  # ⛔ AN INLINE QUOTATION IN A MUTATION-TABLE ROW IS NOT THE REVIEWER OWN COUNT — UNLESS THE
+  # QUOTATION ITSELF SAYS THE FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). On such a
+  # row, a quoted span that carries NO liveness cue is replaced by one space before the three arms run,
+  # so a phrase the reviewer is QUOTING cannot be counted as a finding it is REPORTING.
+  #   The measured line (preserved verbatim in the operator log, /tmp/aiv99-4251.log, from transcript
+  #   /tmp/review-pr-4251.Qo3hv5/reviewer.log — since swept, which is why the line is embedded in the
+  #   suite as a fixture):
+  #     | `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration
+  #       error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | … |
+  #   The article arm read `an unmapped declaration error` out of that QUOTED TEST ASSERTION as a
+  #   count of one live finding, and `review-pr.sh` answered `a self-contradicting CLEAN verdict
+  #   (clean + a reported count) is never recorded` about a review that had contradicted nothing.
+  # ⛔ WHY THIS IS GATED ON THE LIVENESS CUE RATHER THAN ON THE QUOTES ALONE. CommonMark 0.31.2 §6
+  # lists the inline constructs — code spans, emphasis, links, images, autolinks, raw HTML, breaks,
+  # textual content — and there is NO inline quotation construct: a double-quoted string is Textual
+  # content (§6.9), i.e. plain text. So a double quote pair is a HEURISTIC for "the reviewer is
+  # quoting", never a spec rule, and it must be the NARROWEST heuristic that fixes the measured case.
+  # A quotation that itself says the findings `remain`/are `still`/`open`/`unresolved` is a report of a
+  # LIVE blocker whoever wrote it, and is left intact — so the fail-open direction (a reviewer
+  # smuggling its own blocker into quotes) stays refused by its own words.
+  # ⛔ AND THE BLANKING IS CONFINED TO A TABLE ROW — THAT IS THE GATE (P1, fresh review at
+  # `f3875382b204` — MEASURED fail-OPEN at that head). Blanking on the QUOTATION ALONE meant
+  #   `I found "3 blocking defects" in the parser.`  ->  NO fragment (it RECORDED),
+  # while its unquoted twin still refused, so a review that had stated three blocking defects minted a
+  # SIGNED clean record — the one thing this seam exists to make impossible (the second, unblanked pass
+  # covers only VERDICT-SHAPED lines, so nothing rescued it). The only case this blanking was ever
+  # needed for (#4251, above) is a MUTATION-ATTRIBUTION TABLE ROW quoting the test assertion it names,
+  # and a table row IS a citation by construction while prose is the reviewer SPEAKING. So the citation
+  # context is the table row and nothing else; every ordinary line is read exactly as the pre-#4253
+  # seam read it, which is the fail-closed direction.
+  # ⛔ THE TEST IS THE LINE, NOT THE QUOTES: a markdown table row is a line whose first non-space
+  # character is a cell separator. A `\001`-marked (4-column-indented) table row is NOT blanked — it
+  # fails closed, deliberately, because indented content is the class the map already treats as a
+  # quotation and this arm only ever needed to narrow.
+  # ⚠️ DECLARED RESIDUAL, NOW TABLE-ROW ONLY: a live blocker quoted in a table row whose own cell
+  # carries no liveness word — `| x | "3 blocking defects" | y |` — is read as describing work. §BV pins
+  # BOTH directions of that limit: an ordinary-line quotation REFUSES (§BV(7)), a table-row quotation
+  # with a cue in its span or clause REFUSES (§BV(4)/(4b)), and the cue-less measured row RECORDS (§BV(1)).
+  _t = s
+  sub(/^[[:space:]]+/, "", _t)
+  if (substr(_t, 1, 1) != "|") return s
+  out = ""
+  rest = s
+  while (match(rest, /"[^"]*"/)) {
+    span = substr(rest, RSTART, RLENGTH)
+    # ⛔ THE CUE IS READ FROM THE CLAUSE THAT CARRIES THE QUOTATION, NOT FROM THE SPAN ALONE (P2, fresh
+    # review at `0dd5e5519` — MEASURED at `896b4a96`, the head this replaces):
+    #   `The suite reports "2 blocking defects" still open.`  ->  NO fragment at QUOTE_OK=1
+    #   the same line                                          ->  `"2 blocking defects` at QUOTE_OK=0
+    # so a reviewer that QUOTED a count and then said — outside the quotes — that it is still open had
+    # its report BLANKED, and the second, unblanked pass cannot rescue it (that pass re-scans only
+    # verdict-shaped lines). A signed clean was minted over a report of a live count, which is the one
+    # direction this seam exists to refuse, while the cue saying the finding is live sat in plain sight
+    # on the predicate. Windows `pre`/`post` are the clause OF THE SPAN — back to the last sentence
+    # terminator or table-cell separator, and forward to the next one — because THAT is where English
+    # puts the predicate (`"2 blocking defects" still open`). ⛔ Bounded that narrowly, the §BV(4c)
+    # DECLARED residual (`The parser has "3 blocking defects in it".`, no cue anywhere near it) still
+    # records, and the measured #4251 mutation-table row still records: its cell separators close the
+    # window before any other column of the table can contribute a word.
+    # ⛔ RSTART/RLENGTH ARE SAVED FIRST: `sub()` below overwrites both, and the emission at the bottom of
+    # this loop slices `rest` with them.
+    _rs = RSTART; _rl = RLENGTH
+    pre = substr(rest, 1, _rs - 1); sub(/^.*[.!?|]/, "", pre)
+    post = substr(rest, _rs + _rl); sub(/[.;:!?|].*$/, "", post)
+    win = span " " pre " " post
+    # ⛔ THIS VOCABULARY MUST STAY THE `_cue` VOCABULARY BELOW — §BV fails the suite if the two drift.
+    live = (win ~ /(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/)
+    out = out substr(rest, 1, _rs - 1) (live ? span : " ")
+    rest = substr(rest, _rs + _rl)
+  }
+  return out rest
+}
 function repair_led(cl,   n, w, i, low) {
   # ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — MEASURED
   # REGRESSION this branch introduced: `repair_re` holds ordinary NOUNS (`fix`, `close`, `remove`), so
@@ -2441,6 +2514,12 @@ BEGIN {
   # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
   # in a refusal message.
   line = tolower($0)
+  # ⛔ ONE BLANKING RULE FOR EVERY LINE (P1, fresh review at `f3875382b204`): the gate lives INSIDE
+  # `unquote` (table row only), so there is no per-pass blanking regime left to disagree about — and
+  # the former `QUOTE_OK` carve-out is provably unnecessary, because a table row can never be
+  # verdict-shaped: every VD_* pattern is anchored at `^[[:space:]]*` on a CLEAN/ISSUES/`Verdict:`
+  # token, and the first non-space character of a table row is `|`.
+  line = unquote(line)
   for (arm = 1; arm <= 3; arm++) {
     re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
     off = 0; rest = line
@@ -2617,6 +2696,13 @@ refuse_counted_clean() {
         || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
       COUNT_SCAN_CANARY_OK=1
     fi
+    # ⛔ ONE BLANKING RULE, AND THE VERDICT-SHAPED CHANNEL IS UNTOUCHED BY IT (issue #4233, REOPENED —
+    # the #4251 shape; P1, fresh review at `f3875382b204`). The blanking now applies to MUTATION-TABLE
+    # ROWS ONLY (see `unquote`), so the survivors pass and this second pass over $VERDICT_LINES_FILE
+    # scan identically and a verdict line can never be blanked (`CLEAN — "3 blocking defects in the
+    # parser".` still refuses). The second pass is therefore not a second blanking regime: it exists for
+    # the EARLIER-VERDICT-SHAPED-ISSUES arm at the top of this loop, and re-reading the counts on the
+    # verdict subset is idempotent (`_hit` breaks out of both loops at the first fragment).
     _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
       || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
@@ -2624,11 +2710,67 @@ refuse_counted_clean() {
   done < "$_src"
   done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
-    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
-    err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
+    # ⛔ THE REFUSAL MUST NAME THE LINES IT RECONCILED — AND MUST NOT CLAIM A SHAPE IT NEVER SAW
+    # (issue #4233, REOPENED — the #4251 shape). The old wording asserted `a verdict-shaped line ALSO
+    # reports a non-zero count` about EVERY counted-clean refusal. Measured on PR #4251 the count sat
+    # on a mutation-table row carrying no verdict word at all, so the sentence described an input the
+    # reader had not read — the reopen's exact objection: `a guard that says self-contradicting when
+    # what it means is I could not tell which field is authoritative`. Both lanes now print the SAME
+    # two lines (the verdict it compared and the line it matched), so a reader can see which field is
+    # which; only the sentence explaining them differs, because only one case is a single line that
+    # really cannot be both.
+    # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864): under `pipefail` the quiet grep exits at
+    # its first match, the writer takes SIGPIPE and the pipeline reports 141 — which would silently
+    # report a verdict-shaped line as unshaped and take the wrong arm.
+    CLEAN_COUNT_SHAPED=0
+    if grep -aqE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_SHAPED=1
+    fi
+    # ⛔ A THIRD SHAPE, AND WHY IT IS NOT THE MILD SENTENCE (MEASURED at `896b4a96` on this change):
+    # with only the SHAPED/not split, §L (`[P1] scripts/x.sh:42 — a real blocking bug` + `CLEAN`) lost
+    # `self-contradicting` too, because its count sits on a DIFFERENT line. But that line DECLARES a
+    # blocking finding at P<n>: the reader can tell exactly which field is authoritative, and the two
+    # fields disagree — which is a contradiction, not an unreconcilable read. `SEV_RE` is the existing
+    # severity classifier (line-anchored P0-P3 token), reused rather than re-spelled, so a finding LINE
+    # is what it already means everywhere else in this script.
+    CLEAN_COUNT_FINDING=0
+    if [ "$CLEAN_COUNT_SHAPED" = "0" ] && grep -aqE "$SEV_RE" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_FINDING=1
+    fi
+    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and this transcript reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a review cannot be both, so this is a verdict of convenience, not a clean review."
+    err "  verdict line it compared : ${LAST:-<none>}"
+    err "  line the count matched   : ${CLEAN_COUNT_LINE:-$LAST}"
+    err "  phrase it read           : \"$CLEAN_COUNT_WORDS\""
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      err "  The count sits ON the verdict-shaped line above, so that ONE line contradicts itself."
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      err "  The count sits on a DIFFERENT line, and that line DECLARES a blocking finding — so the verdict and the line above contradict each other, and the reader can see both fields."
+    else
+      err "  The count sits on a DIFFERENT line, which carries no verdict word — the reader could not tell which field was authoritative, and says so instead of blaming a contradiction it cannot point at."
+    fi
     err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
     err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-    die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
+    if [ -r "${TRANSCRIPT:-}" ]; then
+      err "  last lines of that transcript:"
+      tail -n 5 "$TRANSCRIPT" 2>/dev/null | while IFS= read -r _tl; do err "    $_tl"; done
+    fi
+    # ⛔ THE LAST LINE MUST NOT CONTRADICT THE SENTENCE TWO LINES ABOVE IT (P2, fresh review at
+    # `0dd5e5519`). This `die` was UNCONDITIONAL: BOTH arms ended with `a self-contradicting CLEAN
+    # verdict (clean + a reported count)`, including the DIFFERENT-line arm whose own `err` line says
+    # the reader `could not tell which field was authoritative` — so the most visible line of exactly
+    # the case the reopen is about still called the reviewer self-contradicting and still asserted a
+    # count ON a clean. That is the reopen's own objection verbatim: `a guard that says
+    # self-contradicting when what it means is I could not tell which field is authoritative`.
+    # §BV(3)'s `err_has "self-contradicting"` could not see it either, because this shared `die`
+    # satisfied it in BOTH arms. The exit code and the direction (nothing posted, nothing recorded) are
+    # unchanged; only the CLAIM is now the one the arm can support.
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count on the SAME line) is never recorded — re-run the review"
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a blocking finding on a DIFFERENT line) is never recorded — re-run the review"
+    else
+      die "$E_ISSUES" "an unreconciled CLEAN verdict (a clean verdict and a count on DIFFERENT lines, with no way to tell which field is authoritative) is never recorded — re-run the review"
+    fi
   fi
 }
 
