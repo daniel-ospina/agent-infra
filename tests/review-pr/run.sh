@@ -5063,9 +5063,44 @@ rm -f "$MUT_CC"; reset
 # re-measure by RUNNING the suite and reading its printed total:
 #     pin_value = total − 6 × <the dialect count the run itself reported> − 2
 # Never copy a total printed on another box into this file, and never copy a pin value from a comment.
-# MEASURED at this head (the #4255 merge, §BW included): 1316 printed on a three-dialect Linux box
-# (awk→mawk, mawk, nawk; no gawk), i.e. 1296 outside the env-dependent loop; the four-dialect twin
-# prints 1322 and wants the SAME 1296.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1296 ]; ck $? "assertion-count pin: >= 1296 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# ── the PATCH projection's own vector pin (cross-repo contract, #1377/#4255) ──
+# ⛔ THIS HOLE WAS MEASURED, NOT IMAGINED. Nothing in THIS repo pinned the bytes
+# `diff-normalize.py --patch-only` emits — the only pinned literals live in the
+# CONSUMER (tortoise's `ai-review-gate.test.sh`), so a change here reddened the
+# consumer's CI and left this repo green while the producer's contract silently
+# moved. These three vectors are the same ones that consumer pins, so the two
+# sides now redden together.
+NORM="$ROOT/scripts/lib/diff-normalize.py"
+if [ -f "$NORM" ]; then
+  _pv="$TMP/patch-vector.diff"
+  printf 'diff --git a/f.md b/f.md\nindex 1b2a1c5..532af15 100644\n--- a/f.md\n+++ b/f.md\n@@ -8,5 +8,6 @@ l7\n l8\n l9\n l10\n+PR-LINE\n l11\n l12\n' > "$_pv"
+  _got="$(python3 "$NORM" --patch-only < "$_pv" | openssl dgst -sha256 | awk '{print $NF}')"
+  [ "$_got" = "b243470836a141b2808db9ce56a772217fc51aed6d919e01e74bb1f6f62bede8" ]; ck $? "the patch projection's digest matches the literal the CONSUMER pins ($_got) — one contract, two repos"
+  # The hunk FRAME is position-bearing: identical +/- bytes under a different
+  # enclosing scope must NOT project identically (a force-push that only MOVES the
+  # reviewed lines is not a carry). This is the vector the fresh review of #4255
+  # found the projection was blind to.
+  printf 'diff --git a/g.py b/g.py\nindex 1111111..2222222 100644\n--- a/g.py\n+++ b/g.py\n@@ -3,3 +3,4 @@ def alpha():\n     a1\n     a2\n+GATE_BYPASS\n     a3\n' > "$_pv"
+  _a="$(python3 "$NORM" --patch-only < "$_pv" | openssl dgst -sha256 | awk '{print $NF}')"
+  printf 'diff --git a/g.py b/g.py\nindex 3333333..4444444 100644\n--- a/g.py\n+++ b/g.py\n@@ -40,3 +40,4 @@ def zulu():\n     a1\n     a2\n+GATE_BYPASS\n     a3\n' > "$_pv"
+  _z="$(python3 "$NORM" --patch-only < "$_pv" | openssl dgst -sha256 | awk '{print $NF}')"
+  [ "$_a" != "$_z" ]; ck $? "the projection DISTINGUISHES a relocation into another scope (def alpha() vs def zulu())"
+  # ...and it is still blind to what a base advance is allowed to move: the same
+  # hunk at different line numbers with different blob ids and extra CONTEXT.
+  printf 'diff --git a/g.py b/g.py\nindex 9999999..8888888 100644\n--- a/g.py\n+++ b/g.py\n@@ -90,5 +90,6 @@ def alpha():\n     a0\n     a1\n     a2\n+GATE_BYPASS\n     a3\n' > "$_pv"
+  _m="$(python3 "$NORM" --patch-only < "$_pv" | openssl dgst -sha256 | awk '{print $NF}')"
+  [ "$_a" = "$_m" ]; ck $? "  ...and still IGNORES a base move's line numbers, blob ids and extra context — the carry #4255 exists for"
+else
+  ck 1 "diff-normalize.py is missing at $NORM"
+fi
+
+# MEASURED at this head (the #4255 merge, §BW + the §BW(10)/(11) store-vs-body arm): 1327 printed on
+# a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk), i.e. 1307 outside the env-dependent loop;
+# the four-dialect twin prints 1333 and wants the SAME 1307. RE-MEASURED after this branch's three
+# patch-projection vectors were moved ABOVE the pin (they had landed below it, which hid them from the
+# pin's own count): 1336 printed on the four-dialect box, i.e. 1310 outside the loop. Measured by
+# RUNNING, never by adding assertion counts — that is the mistake this note exists for.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1310 ]; ck $? "assertion-count pin: >= 1310 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
