@@ -3170,7 +3170,11 @@ reset
 # Re-set to 891 when §BU added the marker-supplies-ISSUES arm (#4233 round 1). §BV then added the
 # quotation/attribution arm (#4233 reopened, the #4251 shape) — 23 assertions — and §BV's second round
 # (the clause-scoped liveness window, the split terminal sentences, the exact-vocabulary row) added 6
-# more, with 1 in §L pinning the sentence of its own arm: 30 in total across those two rounds.
+# more, with 1 in §L pinning the sentence of its own arm: 30 in total across those two rounds. The third
+# round added the P1 fail-open rows and re-pointed the mutation controls (+8): §BV(7) is the prose
+# quotation that must now REFUSE (the measured fail-open), §BV(4c) flips the old declared residual to a
+# refusal, §BV(7b) refuses a prose line that merely CONTAINS a pipe, and §BV(8)/(9) are the two mutants
+# that show the anchored row test — not the blanking, and not a cheaper any-pipe predicate — is the fix.
 # ⛔ THESE ARE NO LONGER ABSOLUTE TOTALS (P3, fresh review at `0dd5e5519` — the `was 1252/0; §BV adds
 # 21 → 1275` sentence did not close, because the PREVIOUS pin's own `ck` was already counted in the
 # 1252). The pin reads `PASS - _AT_ENV_ASSERTIONS`, i.e. assertions OUTSIDE §AT's dialect loop, so its
@@ -4666,6 +4670,11 @@ rm -f "$BU"; reset
 # invents a finding from a quotation. Whether that transcript's true verdict was CLEAN or ISSUES is
 # settled DOWNSTREAM, not here: if it really carried [P1]/[P2] lines the severity scanner refuses it
 # whatever this arm does — so this fix cannot convert a refusal into a passed review.
+# ⛔ AND THE BLANKING IS CONFINED TO WHAT THE MEASURED CASE ACTUALLY IS: A MUTATION-TABLE ROW (P1, fresh
+# review at `f3875382b204`). Blanking every quotation turned a STATED count on ordinary prose into no
+# finding — a signed clean over a stated blocker, which §BV(7) now pins as a REFUSAL and §BV(8) shows
+# going green again only when every line is blanked. The residual left is table-row-only, and §BV pins
+# its recording side ((1)) and its refusal side ((4), (4b)) so it cannot move silently in either direction.
 # ⛔ AND THE SECOND HALF OF THE ISSUE: the reader must not BLAME the reviewer for its own unparseable
 # input. `self-contradicting` now requires a verdict-shaped offending line (a line really cannot be
 # both); a count on an ORDINARY line is reported as unreconciled, with both lines printed.
@@ -4687,10 +4696,14 @@ run "$SRC" 2284
 [ -f "$TMP/record-argv.txt" ]; ck $? "  ...a record was written, so a paid review is not discarded over a quotation"
 err_not_has "self-contradicting"; ck $? "  ...and nothing in the run asserts the reviewer contradicted itself"
 
-# (2) MUTATION CONTROL: the blanking is what makes (1) pass. Force BOTH passes unblanked and the SAME
-# transcript is the pre-fix refusal again, naming the pre-fix fragment byte for byte.
+# (2) MUTATION CONTROL: the blanking is what makes (1) pass. Remove it entirely and the SAME transcript
+# is the pre-fix refusal again, naming the pre-fix fragment byte for byte.
 BV="$TMP/mutant-no-unquote.sh"
-sed 's/^    _quote_ok=1$/    _quote_ok=0/' "$SRC" > "$BV"
+# ⛔ THE MUTANT THAT REVERTS THE FIX IS NOW "NO BLANKING AT ALL" (P1, fresh review at
+# `f3875382b204`): the old control flipped `_quote_ok`, which no longer exists — ONE blanking rule
+# governs every line — so the mutation neutralises the call itself. It must apply exactly once, and
+# `cmp -s` below fails the suite loudly if a later edit moves the call out from under this control.
+sed 's/^  line = unquote(line)$/  line = line/' "$SRC" > "$BV"
 if cmp -s "$SRC" "$BV"; then
   fail "the unquote mutation did not apply - this control proves NOTHING"
 else
@@ -4710,9 +4723,10 @@ BVMEASURED
   no_record; ck $? "  ...nothing recorded either way"
 fi
 
-# (3) ⛔ THE CARVE-OUT THAT KEEPS THIS FROM BEING A FAIL-OPEN: a VERDICT-SHAPED line is scanned a
-# SECOND time unblanked (from $VERDICT_LINES_FILE), because a line cannot be both clean and counted.
-# Without that second pass, blanking quotations would un-refuse `CLEAN — "3 blocking defects …"`.
+# (3) ⛔ THE VERDICT-SHAPED CHANNEL IS UNTOUCHED BY THE BLANKING: the gate inside `unquote` admits a
+# MUTATION-TABLE ROW and nothing else, and a verdict line can never be a table row (every VD_* pattern
+# is anchored at `^[[:space:]]*` on a CLEAN/ISSUES/`Verdict:` token, while a table row begins `|`). So
+# `CLEAN — "3 blocking defects …"` is read exactly as the pre-#4253 seam read it, on every pass.
 reset; printf '**Verdict:** CLEAN — "3 blocking defects in the parser".\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a verdict-shaped line QUOTING a count is still refused (rc=$(rc_of), want 7) - blanking cannot un-refuse the verdict channel"
@@ -4720,10 +4734,11 @@ no_record; ck $? "  ...nothing recorded"
 err_has "self-contradicting"; ck $? "  ...and THIS one really is self-contradicting, so it keeps that name"
 err_has "The count sits ON the verdict-shaped line above"; ck $? "  ...and the message says the count is ON that one line, which is what makes it contradictory"
 
-# (4) ⛔ AND A QUOTATION THAT ITSELF SAYS THE FINDING IS LIVE IS NOT BLANKED. A reviewer that smuggles
-# its blocker into quotes still gets refused by the quotation's own words — the blanking is gated on
-# the liveness cue precisely so this direction cannot open.
-reset; printf 'The mutation row says "2 blocking defects remain in the parser".\nCLEAN\n' > "$TMP/reviewer-out"
+# (4) ⛔ AND A QUOTATION THAT ITSELF SAYS THE FINDING IS LIVE IS NOT BLANKED — INSIDE the blanking path,
+# which is why the fixture is a TABLE ROW (the only line class the blanking touches now; the same line as
+# prose would be unblanked and would refuse for a reason this row could not attribute). A reviewer that
+# smuggles its blocker into quotes still gets refused by the quotation's own words.
+reset; printf '| assertion "2 blocking defects remain in the parser" | x |\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a quoted phrase saying the defects REMAIN is still a finding (rc=$(rc_of), want 7)"
 no_record; ck $? "  ...nothing recorded"
@@ -4734,27 +4749,30 @@ no_record; ck $? "  ...nothing recorded"
 #
 #   The suite reports "2 blocking defects" still open.
 #
-# produced NO fragment at `QUOTE_OK=1` while it printed `"2 blocking defects` at `QUOTE_OK=0` — i.e.
-# the survivors pass RECORDED A SIGNED CLEAN over a review that had reported a live count with its own
-# cue sitting on the predicate outside the quotes. That is the one direction this seam exists to
-# refuse, and the wave-2 unblanked verdict pass does not rescue it (that pass covers only
-# VD_CLEAN|VD_CLEAN_URL|VD_ISSUES|VD_LABEL lines, and this is an ordinary line). The window is the
-# quotation AND the clause that carries it, bounded by a sentence terminator or a table-cell separator.
-# ⚠️ NON-VACUITY: this row is RED at `896b4a96` (the head that carries the defect) and GREEN after the
-# window fix — it discriminates against the regression, not against the pre-#4253 seam, which refused
-# this line too (nothing was blanked there).
-reset; printf 'The suite reports "2 blocking defects" still open.\nCLEAN\n' > "$TMP/reviewer-out"
+# produced NO fragment — i.e. the pass RECORDED A SIGNED CLEAN over a review that had reported a live
+# count with its own cue sitting on the predicate outside the quotes. The window is the quotation AND
+# the clause that carries it, bounded by a sentence terminator or a table-cell separator.
+# ⛔ THE FIXTURE IS A TABLE ROW SO THE WINDOW IS STILL THE ONLY THING DECIDING IT (P1, fresh review at
+# `f3875382b204`): as prose the line is no longer blanked at all, so it would refuse for a reason this
+# row cannot attribute. As a row, the span-to-cell window is what keeps the count alive.
+# ⚠️ NON-VACUITY: RED at `896b4a96` (the head that carries the defect) and GREEN after the window fix;
+# it also goes RED under `win = span` (blanking on the span's own words), which is what pins the window.
+reset; printf '| the suite reports "2 blocking defects" still open |\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a quoted count whose LIVENESS CUE is outside the quotation still refuses (rc=$(rc_of), want 7)"
 no_record; ck $? "  ...nothing recorded, so no signed clean is minted over it"
 err_has '2 blocking defects'; ck $? "  ...and the count it refused over is printed, not swallowed by the blanking"
 
-# (4c) ⛔ AND THE WINDOW IS A CLAUSE, NOT THE LINE — the DECLARED residual must stay quiet, or the fix
-# for (4b) would swallow the heuristic that #4233's own measured case depends on.
+# (4c) ⛔ THE PREVIOUS ROUND'S DECLARED RESIDUAL IS NOW CLOSED (P1, fresh review at `f3875382b204`).
+# `The parser has "3 blocking defects in it".` is an ORDINARY LINE, so the blanking does not apply to it
+# at all and its own stated count refuses. Up to `f3875382b` this row asserted `rc=0`, i.e. the suite
+# ENFORCED the fail-open — a later fix would have had to change a test to close it. The residual that
+# remains is table-row-only, and §BV(1) pins its recording side while (4)/(4b) pin the refusal side.
 reset; printf 'The parser has "3 blocking defects in it".\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "the DECLARED residual (no cue near the quotation) still RECORDS (rc=$(rc_of), want 0) - the window did not widen to the whole line"
-[ -f "$TMP/record-argv.txt" ]; ck $? "  ...a record was written, so the narrowing is still a narrowing"
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count on an ORDINARY line is a reported finding again (rc=$(rc_of), want 7) - the declared fail-open is CLOSED"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over it"
+err_has '3 blocking defects'; ck $? "  ...and the count it refused over is printed"
 
 # (5) ⛔ THE DIAGNOSIS: the refusal must NAME BOTH LINES it reconciled and must not claim a shape it
 # never saw. `a verdict-shaped line ALSO reports a non-zero count` was asserted over EVERY
@@ -4780,7 +4798,7 @@ err_not_has "self-contradicting"; ck $? "  ...and the terminal refusal does NOT 
 
 # (6) THE TWO LIVENESS VOCABULARIES CANNOT DRIFT. `unquote` decides what survives blanking, and the
 # `_cue` test decides what survives the articles arm; if one gains a word the other lacks, a quotation
-# is blanked on one pass and live on another — the drift MEMORY.md records for VD_ISSUES, one grammar
+# is live to one reader and dead to the other — the drift MEMORY.md records for VD_ISSUES, one grammar
 # over. Both are derived from the SUT, so an edit to either alone is red.
 _BV_UNQ_LINE="$(grep -n 'live = (win ~' "$SRC" | head -1 | cut -d: -f1)"
 [ -n "$_BV_UNQ_LINE" ]; ck $? "the quotation reader's liveness line was located (line ${_BV_UNQ_LINE:-<none>})"
@@ -4794,19 +4812,90 @@ _BV_CUE_VOC="$(awk 'index($0,"_cue !~ /^[^.;:,!?()]*("){ p="_cue !~ /^[^.;:,!?()
 # from BOTH readers kept it green (measured: `remainXleft` → 0; the shortened set → 0). The vocabulary
 # decides which quotations survive blanking, so a silent shrink re-grades reviews unseen.
 [ "$_BV_UNQ_VOC" = 'remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left' ]; ck $? "  ...and it is EXACTLY the expected cue set, so no word can be dropped from both readers at once (got '${_BV_UNQ_VOC}')"
-rm -f "$BV"; reset
+
+# (7) ⛔ THE MEASURED FAIL-OPEN, PINNED (P1, fresh review at `f3875382b204`). This is the line the review
+# ran against the head: blanking EVERY quotation turned a STATED non-zero count of blocking findings
+# into no finding, so a transcript that refused before #4253 recorded a signed clean. The fix confines
+# the blanking to a table row; this line is prose, so its count is read exactly as the pre-#4253 seam
+# read it. ⚠️ NON-VACUITY: RED at `f3875382b204`, where the pre-fix classifier blanked every quotation
+# (measured there: the span was replaced before the three arms, so this line reported nothing while its
+# unquoted twin still refused) and GREEN here; §BV(8) is the mutant that re-opens it.
+reset; printf 'I found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a QUOTED count on an ordinary prose line is still a finding (rc=$(rc_of), want 7) - the P1 fail-open"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over a stated blocker"
+err_has '3 blocking defects'; ck $? "  ...and the count is printed, not blanked away"
+
+# (7b) ⛔ THE GATE IS A ROW, NOT "THE LINE CONTAINS A PIPE" (P1, fresh review at `f3875382b204` — the
+# review offered `index(line,"|")>0` as the cheap gate; that predicate also matches PROSE that merely
+# contains a shell pipeline). `I found "3 blocking defects"` must refuse wherever it is written, so the
+# stricter test is pinned here and (9) shows what the cheaper one would have cost.
+reset; printf 'The suite runs `grep x | wc -l` and found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count in prose that happens to contain a PIPE is still a finding (rc=$(rc_of), want 7)"
+
+# (8) ⛔ MUTATION CONTROL FOR THE GATE ITSELF, IN THE FAIL-OPEN DIRECTION: delete the table-row test and
+# every line is blanked again — the exact pre-fix behaviour. (7) goes RED and (1) stays GREEN, which is
+# what shows the ROW TEST, not the removal of the blanking, is what closes the fail-open.
+BV2="$TMP/mutant-blank-all.sh"
+sed 's/^  if (substr(_t, 1, 1) != "|") return s$/  if (0) return s/' "$SRC" > "$BV2"
+if cmp -s "$SRC" "$BV2"; then
+  fail "the table-row-gate mutation did not apply - this control proves NOTHING"
+else
+  reset; printf 'I found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$BV2" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT that blanks EVERY line records the same prose count (rc=$(rc_of), want 0) - so the table-row gate is what refuses it"
+  reset; FIXTURE_NO_MUTATION=1
+  cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+  run "$BV2" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  ...and the measured #4251 TABLE ROW still records under it, so the fix narrowed the blanking and did not remove it"
+fi
+
+# (9) ⛔ MUTATION CONTROL FOR THE STRICTER PREDICATE: widen the gate to "the line contains a pipe" (the
+# cheap form the review proposed) and (7b)'s prose line is blanked → it records a signed clean over a
+# stated blocker. That is why the gate is anchored to the START of the line.
+BV3="$TMP/mutant-any-pipe.sh"
+sed 's/^  if (substr(_t, 1, 1) != "|") return s$/  if (index(_t, "|") == 0) return s/' "$SRC" > "$BV3"
+if cmp -s "$SRC" "$BV3"; then
+  fail "the any-pipe-gate mutation did not apply - this control proves NOTHING"
+else
+  reset; printf 'The suite runs `grep x | wc -l` and found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$BV3" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT with the cheap any-pipe gate RECORDS that prose count (rc=$(rc_of), want 0) - so anchoring the gate to the line start is load-bearing"
+fi
+rm -f "$BV" "$BV2" "$BV3"; reset
 # ══ end §BV ══
 
 # ⛔ THE PIN MUST NOT COUNT WHAT THE BOX DECIDES (P1, MEASURED at 0dd5e5519 on PR #4253). The floor
 # used to be an absolute total, and §AT drives six assertions per awk implementation the box happens to
-# have — so the same suite, at the same head, measured 1275 passes on a four-dialect box (the box the
-# 1274 was calibrated on, reproduced here by putting a `gawk` on PATH) and 1268 passes on this
-# three-dialect Linux box (awk→mawk, mawk, nawk; no gawk). GitHub's ubuntu runner is the three-dialect
-# case too (awk→gawk, gawk, mawk; no nawk), so 1274 was a red NO CHANGE COULD CLEAR on CI and here —
-# which is the opposite of a tripwire: a permanently-red assertion trains readers to ignore the pin and
-# hides the section loss it exists for. The pin therefore holds the STABLE surface (what §AT's dialect
-# loop drove is subtracted, and that loop's own size is pinned exactly above), so 1250 means the same
-# thing on every box, and a lost section still moves it.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1257 ]; ck $? "assertion-count pin: >= 1257 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# have — so the same suite, at the same head, printed a DIFFERENT total on a four-dialect box than on a
+# three-dialect one. GitHub's ubuntu runner is a three-dialect box (awk→gawk, gawk, mawk; no nawk), so
+# an absolute floor was a red NO CHANGE COULD CLEAR on CI — the opposite of a tripwire: a
+# permanently-red assertion trains readers to ignore the pin and hides the section loss it exists for.
+# The pin therefore holds the STABLE surface (what §AT's dialect loop drove is subtracted, and that
+# loop's own size is pinned exactly above, at `6 × installed dialects`), so it means the same thing on
+# every box, and a lost section still moves it.
+# ⛔ THE ARITHMETIC, BECAUSE THE PREVIOUS VERSION OF THIS COMMENT DID NOT CLOSE IT (P3, fresh review at
+# `f3875382b204`: it quoted "1275 on a four-dialect box / 1268 on this three-dialect box" against a pin
+# of 1257 — and 1257 + 6×4 + 2 is 1283, not 1275, so at least one quoted total was not a same-head
+# measurement). What a green run prints is EXACTLY
+#
+#     total = pin_value + (6 × installed awk dialects) + 2
+#
+# (six per dialect from §AT's loop, one for the §AT delta assertion, one for this pin's own `ck`). So
+# re-measure by RUNNING the suite and reading its printed total:
+#     pin_value = total − 6 × <the dialect count the run itself reported> − 2
+# Never copy a total printed on another box into this file, and never copy a pin value from a comment.
+# MEASURED at this head: 1285 printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk),
+# i.e. 1265 outside the env-dependent loop; the four-dialect twin prints 1291 and wants the SAME 1265.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1265 ]; ck $? "assertion-count pin: >= 1265 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

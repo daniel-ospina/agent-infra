@@ -2178,11 +2178,11 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
-function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl) {
-  # ⛔ AN INLINE QUOTATION IS NOT THE REVIEWER OWN COUNT — UNLESS THE QUOTATION ITSELF SAYS THE
-  # FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). Every quoted span that carries NO
-  # liveness cue is replaced by one space before the three arms run, so a phrase the reviewer is
-  # QUOTING cannot be counted as a finding it is REPORTING.
+function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl, _t) {
+  # ⛔ AN INLINE QUOTATION IN A MUTATION-TABLE ROW IS NOT THE REVIEWER OWN COUNT — UNLESS THE
+  # QUOTATION ITSELF SAYS THE FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). On such a
+  # row, a quoted span that carries NO liveness cue is replaced by one space before the three arms run,
+  # so a phrase the reviewer is QUOTING cannot be counted as a finding it is REPORTING.
   #   The measured line (preserved verbatim in the operator log, /tmp/aiv99-4251.log, from transcript
   #   /tmp/review-pr-4251.Qo3hv5/reviewer.log — since swept, which is why the line is embedded in the
   #   suite as a fixture):
@@ -2199,12 +2199,27 @@ function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl) {
   # A quotation that itself says the findings `remain`/are `still`/`open`/`unresolved` is a report of a
   # LIVE blocker whoever wrote it, and is left intact — so the fail-open direction (a reviewer
   # smuggling its own blocker into quotes) stays refused by its own words.
-  # ⚠️ DECLARED RESIDUAL (fail-open, pinned-adjacent and deliberately not chased): a reviewer that
-  # reports its own live blocker inside quotes on a line with NO liveness word and NO verdict word —
-  # `The parser has "3 blocking defects in it".` — is read as describing work. That is the same
-  # direction the map already accepts for a fenced, HTML or 4-column-indented quotation, and the
-  # verdict-shaped channel is untouched (see the QUOTE_OK call site), which is where a real blocker
-  # is written.
+  # ⛔ AND THE BLANKING IS CONFINED TO A TABLE ROW — THAT IS THE GATE (P1, fresh review at
+  # `f3875382b204` — MEASURED fail-OPEN at that head). Blanking on the QUOTATION ALONE meant
+  #   `I found "3 blocking defects" in the parser.`  ->  NO fragment (it RECORDED),
+  # while its unquoted twin still refused, so a review that had stated three blocking defects minted a
+  # SIGNED clean record — the one thing this seam exists to make impossible (the second, unblanked pass
+  # covers only VERDICT-SHAPED lines, so nothing rescued it). The only case this blanking was ever
+  # needed for (#4251, above) is a MUTATION-ATTRIBUTION TABLE ROW quoting the test assertion it names,
+  # and a table row IS a citation by construction while prose is the reviewer SPEAKING. So the citation
+  # context is the table row and nothing else; every ordinary line is read exactly as the pre-#4253
+  # seam read it, which is the fail-closed direction.
+  # ⛔ THE TEST IS THE LINE, NOT THE QUOTES: a markdown table row is a line whose first non-space
+  # character is a cell separator. A `\001`-marked (4-column-indented) table row is NOT blanked — it
+  # fails closed, deliberately, because indented content is the class the map already treats as a
+  # quotation and this arm only ever needed to narrow.
+  # ⚠️ DECLARED RESIDUAL, NOW TABLE-ROW ONLY: a live blocker quoted in a table row whose own cell
+  # carries no liveness word — `| x | "3 blocking defects" | y |` — is read as describing work. §BV pins
+  # BOTH directions of that limit: an ordinary-line quotation REFUSES (§BV(7)), a table-row quotation
+  # with a cue in its span or clause REFUSES (§BV(4)/(4b)), and the cue-less measured row RECORDS (§BV(1)).
+  _t = s
+  sub(/^[[:space:]]+/, "", _t)
+  if (substr(_t, 1, 1) != "|") return s
   out = ""
   rest = s
   while (match(rest, /"[^"]*"/)) {
@@ -2323,7 +2338,12 @@ BEGIN {
   # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
   # in a refusal message.
   line = tolower($0)
-  if (QUOTE_OK) line = unquote(line)
+  # ⛔ ONE BLANKING RULE FOR EVERY LINE (P1, fresh review at `f3875382b204`): the gate lives INSIDE
+  # `unquote` (table row only), so there is no per-pass blanking regime left to disagree about — and
+  # the former `QUOTE_OK` carve-out is provably unnecessary, because a table row can never be
+  # verdict-shaped: every VD_* pattern is anchored at `^[[:space:]]*` on a CLEAN/ISSUES/`Verdict:`
+  # token, and the first non-space character of a table row is `|`.
+  line = unquote(line)
   for (arm = 1; arm <= 3; arm++) {
     re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
     off = 0; rest = line
@@ -2392,7 +2412,7 @@ BEGIN {
 '
 
 refuse_counted_clean() {
-  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src _quote_ok
+  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -2500,16 +2520,14 @@ refuse_counted_clean() {
         || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
       COUNT_SCAN_CANARY_OK=1
     fi
-    # ⛔ WHO BLANKED THE QUOTATIONS, AND WHY BLANKING HERE CANNOT WEAKEN THE VERDICT-SHAPED CHANNEL
-    # (issue #4233, REOPENED — the #4251 shape). Quotations are blanked ONLY on the survivors pass.
-    # Every verdict-shaped line is scanned a SECOND time, unblanked, from $VERDICT_LINES_FILE below —
-    # and that is exactly the channel the design already calls self-contradictory by construction
-    # (`a count always refuses` there, see the arm's own rule). So `CLEAN — "3 blocking defects in the
-    # parser".` still refuses, while a quotation on an ordinary line does not become a finding. The
-    # two passes are not redundant: they carry DIFFERENT blanking, and §BV pins both directions.
-    _quote_ok=1
-    if [ "$_src" = "$VERDICT_LINES_FILE" ]; then _quote_ok=0; fi
-    _hit="$(printf '%s' "$_scan" | awk -v QUOTE_OK="$_quote_ok" "$COUNT_SCAN_AWK")" \
+    # ⛔ ONE BLANKING RULE, AND THE VERDICT-SHAPED CHANNEL IS UNTOUCHED BY IT (issue #4233, REOPENED —
+    # the #4251 shape; P1, fresh review at `f3875382b204`). The blanking now applies to MUTATION-TABLE
+    # ROWS ONLY (see `unquote`), so the survivors pass and this second pass over $VERDICT_LINES_FILE
+    # scan identically and a verdict line can never be blanked (`CLEAN — "3 blocking defects in the
+    # parser".` still refuses). The second pass is therefore not a second blanking regime: it exists for
+    # the EARLIER-VERDICT-SHAPED-ISSUES arm at the top of this loop, and re-reading the counts on the
+    # verdict subset is idempotent (`_hit` breaks out of both loops at the first fragment).
+    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
       || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
     CLEAN_COUNT_WORDS="$(printf '%s' "$_hit" | head -1)"; CLEAN_COUNT_LINE="$_vl"; break
