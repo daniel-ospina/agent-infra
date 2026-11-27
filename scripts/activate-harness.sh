@@ -832,7 +832,18 @@ probe_recorded() { # <name> <record-path> <beacon> <max_age_s> <reason>
 installer_for() { # <base> -> "<installer path>\t<args>"
     case "$1" in
         eldato-harness-apply)     printf '%s|--install' "$ROOT/scripts/install-harness-apply-timer.sh" ;;
-        eldato-disk-reaper)       printf '%s|--install' "$ROOT/scripts/install-disk-reaper-timer.sh" ;;
+        # ⛔ BOTH DISK-REAPER UNITS COME FROM ONE INSTALLER, AND SAYING SO IS THE WHOLE FIX (#4250).
+        # #4169 shipped `eldato-disk-reaper-cache.{service,timer}` (the 10-minute size-triggered cache
+        # pass) and left this map alone. The derivation below turned that template into a row, the
+        # lookup missed, and the grid answered `DECLARATION ERROR … must UNKNOWN` — exit 2 on a
+        # HEALTHY box, measured as 12 red arms in `activate-harness.test.sh` and as a red
+        # `script-validate` shard on main. The file warned about exactly this class in the comment at
+        # the DECLARATION ERROR emit ("this is literally how conflict-rebase shipped unscheduled"),
+        # so the fix is the mapping, not a downgrade of the row: the capability is real, it is
+        # installed by `install-disk-reaper-timer.sh --install` (one pass renders, installs, enables
+        # and read-back-verifies BOTH units), and it must be graded.
+        eldato-disk-reaper|eldato-disk-reaper-cache)
+                                  printf '%s|--install' "$ROOT/scripts/install-disk-reaper-timer.sh" ;;
         eldato-runner-autoscale)  printf '%s|--install' "$ROOT/scripts/install-runner-autoscale-timer.sh" ;;
         eldato-conflict-rebase)   printf '%s|--install' "$ROOT/scripts/install-conflict-rebase-timer.sh" ;;
         eldato-controller-watchdog|eldato-objective-reminder)
@@ -852,6 +863,15 @@ row_meta() { # <base> -> "<class>|<max_age_s>"
     case "$1" in
         eldato-harness-apply)     printf 'must|1200' ;;    # 10 min + RandomizedDelaySec=60 + slack
         eldato-disk-reaper)       printf 'must|5400' ;;    # hourly + pass runtime
+        # 10 min (`OnCalendar=*:0/10`) + AccuracySec=60 + RandomizedDelaySec=30 = 690 s of scheduler
+        # slack, so this bound leaves 2400 - 690 = 1710 s for a pass's own runtime — a pass that
+        # legitimately runs long is not its own red. ⛔ NOT a `TimeoutStartSec` bound: the unit is
+        # `Type=oneshot` (`eldato-disk-reaper-cache.service`), for which systemd DISABLES the start
+        # timeout by default, and the unit sets none — the real limits are the per-pass cap
+        # (`DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB`), the bounded-execution helper's per-probe wall clock,
+        # and the lock (a concurrent pass defers, exit 6). It also does nothing at all while the box is
+        # above the free-space trigger.
+        eldato-disk-reaper-cache) printf 'must|2400' ;;
         eldato-ai-drainer)        printf 'must|2400' ;;    # 20 min
         eldato-controller-watchdog) printf 'must|1200' ;;  # 5 min
         eldato-objective-reminder)  printf 'must|1800' ;;  # 10 min
@@ -1178,8 +1198,17 @@ do_install() {
                 eldato-harness-apply)
                     act_say "arming $base via scripts/install-harness-apply-timer.sh"
                     bash "$ROOT/scripts/install-harness-apply-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
+                # ⛔ THE SAME INSTALLER ARMS BOTH DISK-REAPER ROWS (#4250): #4169 shipped the
+                # 10-minute cache unit inside `install-disk-reaper-timer.sh`, so a `must` row for it
+                # that fell through to the arm below warned "MUST row with no runnable installer" and
+                # set `failed=1` — `--install` reported the box unarmed while the installer would have
+                # armed the unit. Two base names, one script: it renders/installs/enables/read-back-
+                # verifies both units and is idempotent, so the second call reports `unchanged`.
                 eldato-disk-reaper)
                     act_say "arming $base via scripts/install-disk-reaper-timer.sh"
+                    bash "$ROOT/scripts/install-disk-reaper-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
+                eldato-disk-reaper-cache)
+                    act_say "arming $base via scripts/install-disk-reaper-timer.sh (same installer as eldato-disk-reaper)"
                     bash "$ROOT/scripts/install-disk-reaper-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 eldato-conflict-rebase)
                     act_say "arming $base via scripts/install-conflict-rebase-timer.sh"
