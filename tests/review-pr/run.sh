@@ -207,7 +207,10 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
        FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE \
        FIXTURE_NO_MARKER FIXTURE_MARKER_VERDICT FIXTURE_MARKER_COUNT \
-       FIXTURE_NO_MUTATION FIXTURE_MUTATION_EXEMPT
+       FIXTURE_NO_MUTATION FIXTURE_MUTATION_EXEMPT \
+       FIXTURE_CC_TOKEN FIXTURE_CC_RC FIXTURE_CC_RECORDED FIXTURE_CC_LIVE FIXTURE_CC_STDERR \
+       FIXTURE_RECOVER_RC FIXTURE_RECOVER_BODY_OUT \
+       FIXTURE_CC_TOKEN_AFTER_RECOVER FIXTURE_CC_RC_AFTER_RECOVER
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -476,6 +479,35 @@ EOF
 # ── the fake recorder: proves WHAT review-pr.sh asked record-review.sh to bind ─
 cat > "$TMP/bin/fake-record" <<'EOF'
 #!/usr/bin/env bash
+# ⛔ THE READ-ONLY VERBS COME FIRST (agent-infra#4255). `review-pr.sh` now asks this recorder's
+# OWN carry predicate (`--check-carry`, and `--recover-body` when the store has no record) BEFORE
+# it pays for a review. A fixture that let those verbs fall through to the MINT path below would
+# treat `--check-carry` as the PR number and write a record file named after the flag — poisoning
+# the store the seam reads and turning every "nothing recorded" assertion into a lie. They are also
+# deliberately NOT appended to record-argv.txt: `no_record()` and the `head -1` argv assertions use
+# that file to mean "the recorder was asked to MINT", which a read-only question is not.
+# Defaults reproduce the PRE-#4255 behaviour exactly (`fresh` / rc 1 → fall through to a review), so
+# every pre-existing scenario keeps meaning what it meant; the new arms are opt-in knobs.
+case "${1:-}" in
+  --check-carry)
+    # A ONE-SHOT ANSWER: once `--recover-body` has run, the store DOES hold a record, so the next
+    # question must be answerable differently. That is the #2872 sequence `review-pr.sh` now walks
+    # (norecord → rebuild from the signed body marker → ask again), and without this knob the arm
+    # that walks it could not be driven at all.
+    if [ -f "$TMP/recover-pr.txt" ] && [ -n "${FIXTURE_CC_TOKEN_AFTER_RECOVER:-}" ]; then
+      _tok="$FIXTURE_CC_TOKEN_AFTER_RECOVER"; _rc="${FIXTURE_CC_RC_AFTER_RECOVER:-0}"
+    else
+      _tok="${FIXTURE_CC_TOKEN:-fresh}"; _rc="${FIXTURE_CC_RC:-1}"
+    fi
+    printf '%s\t%s\t%s\n' "$_tok" "${FIXTURE_CC_RECORDED:-0}" "${FIXTURE_CC_LIVE:-0}"
+    [ -n "${FIXTURE_CC_STDERR:-}" ] && printf '%s\n' "$FIXTURE_CC_STDERR" >&2
+    printf '%s\n' "${2:-}" >> "$TMP/check-carry-pr.txt"
+    exit "$_rc" ;;
+  --recover-body)
+    printf '%s\n' "${2:-}" >> "$TMP/recover-pr.txt"
+    [ -n "${FIXTURE_RECOVER_BODY_OUT:-}" ] && printf '%s\n' "$FIXTURE_RECOVER_BODY_OUT"
+    exit "${FIXTURE_RECOVER_RC:-1}" ;;
+esac
 printf '%s\n' "$*" >> "$TMP/record-argv.txt"
 pr="$1"; sha="$2"; verdict="$3"; repo="$4"; shift 4 || true
 ev=""; pin=""
@@ -600,6 +632,13 @@ reset() {
   # defaults", which is what every scenario except §A5 wants.
   FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
   FIXTURE_COMMENT_RC=0
+  # §BW (agent-infra#4255) — the carry-before-review knobs. EMPTY means "the recorder's read-only
+  # verbs answer what the pre-#4255 recorder's absence would" (token `fresh` / rc 1), i.e. the seam
+  # falls through to a review exactly as it did before the change.
+  FIXTURE_CC_TOKEN=""; FIXTURE_CC_RC=""; FIXTURE_CC_RECORDED=""; FIXTURE_CC_LIVE=""
+  FIXTURE_CC_STDERR=""; FIXTURE_RECOVER_RC=""; FIXTURE_RECOVER_BODY_OUT=""
+  FIXTURE_CC_TOKEN_AFTER_RECOVER=""; FIXTURE_CC_RC_AFTER_RECOVER=""
+  rm -f "$TMP/check-carry-pr.txt" "$TMP/recover-pr.txt"
   unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
 }
 
@@ -3181,6 +3220,11 @@ reset
 # value is (that stable surface) - 1 and does NOT move with the box's awk-dialect count — the loop's
 # own size is pinned exactly above, in `6 × installed dialects`. Re-measure by running the suite and
 # subtracting; never copy the printed total here.
+# §BW then added the carry-before-review arm (#4255 — the recorder's `--check-carry` seam, its
+# `--recover-body` retry, the two RETRY/RED exits and its mutation control): 31 assertions, taking the
+# stable surface from 1265 to 1296. §BW landed by MERGE, so it was renumbered from the §BV the branch
+# had chosen while `main` was still on §BU — `main` took §BV for #4233-reopened first, and a duplicate
+# section name would make every `§BV(n)` cross-reference in this file ambiguous.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -4874,6 +4918,131 @@ fi
 rm -f "$BV" "$BV2" "$BV3"; reset
 # ══ end §BV ══
 
+# ── §BW A STALE HEAD IS NOT A STALE REVIEW (agent-infra#4255) ────────────────
+# THE HARM. `review-pr.sh`'s only pre-review guard used to be "is a clean record bound to this exact
+# sha?". A PR whose head moved for the one reason that never changes what was reviewed — the base
+# advanced and the branch was refreshed onto it — answered NO and bought a 20-40 minute review.
+# These scenarios drive the seam to the RECORDER's own predicate (`--check-carry`) instead, and
+# assert the OBSERVABLES that matter: was a reviewer paid for, was a record minted, at which head.
+echo; echo "§BW the recorder's carry predicate is asked BEFORE a review is bought"
+REC_HEAD_OLD="2222222222222222222222222222222222222222"
+# The PRECONDITION of every carry answer is a record that exists and names an EARLIER head, so the
+# carry-patch scenarios seed the store with exactly that (a fresh `reset` empties it). Verdict `clean`
+# and a real `evidence` field: `--check-carry` treats a `carried` record with no provenance as
+# NO RECORD (#10177), so a sloppier fixture would not model the shape being carried.
+seed_stale_record() {
+  mkdir -p "$TMP/home/.pi/agent/reviews"
+  printf '{"pr":2284,"head_sha":"%s","mint":"fresh","evidence":"comment:1234","verdict":"clean","repo":"%s","reviewed_at":"2026-11-01T00:00:00Z"}\n' \
+    "$REC_HEAD_OLD" "$REPO_FIXTURE" > "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
+}
+
+# (1) `carry` — the reviewed DIFF is byte-identical, so the gate already carries the record.
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(1) carry: exit 0 — nothing is stale and nothing is owed (rc=$(rc_of))"
+no_reviewer; ck $? "(1) carry: NO reviewer was spawned"
+no_record; ck $? "(1) carry: no record was re-minted (the gate carries the existing one as-is)"
+out_has "NO REVIEW OWED"; ck $? "(1) carry: the answer says so, naming the recorder's own predicate"
+[ "$(cat "$TMP/check-carry-pr.txt" 2>/dev/null)" = "2284" ]; ck $? "(1) carry: it asked about THIS PR"
+
+# (2) `carry-patch` (#1377) — the rendered diff moved, every reviewed line identical: RE-RECORD at the
+# CURRENT head and buy no review. The positional sha must be the RECORDED one (a same-head call is a
+# fresh mint that refuses a blank --evidence); the fixture re-binds to the live head exactly as the
+# real recorder's carry arm does, which is what makes the "recorded at the LIVE head" assertion real.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(2) carry-patch: exit 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(2) carry-patch: NO reviewer was spawned — this is the 20-40 min the issue is about"
+case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+  "2284 $REC_HEAD_OLD "*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "(2) carry-patch: re-recorded with the RECORDED head positionally, never the live one (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+  *"--expect-head"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "(2) …and WITHOUT --expect-head, which the recorder refuses precisely when the head moved"
+grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "(2) …and the record now COVERS the live head (what the gate reads)"
+out_has "NO REVIEW OWED"; ck $? "(2) …and says the re-binding is mechanical, not a new verdict"
+
+# (3) THE FAIL-SAFE DIRECTION: if the carry cannot be SHOWN (the recorder did not land a clean record
+# at the live head), the seam must fall through to a real review. A short-circuit that trusted its own
+# token would leave the PR unreviewed AND unrecorded — a wall, not a saving.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6; FIXTURE_RECORD_RC=1; seed_stale_record
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ -f "$TMP/pi-runs.txt" ]; ck $? "(3) an UNPROVEN carry falls through and the reviewer IS spawned (no silent wall)"
+err_has "did NOT produce a clean record"; ck $? "(3) …naming the failed prerequisite instead of claiming a carry"
+
+# (4) THE MEASURED PRODUCTION CASE: on this box the store has NO record for the PR, though the BODY
+# carries a correctly-signed marker (#14746/#14774 answered `norecord` while their bodies carried
+# one). The seam must rebuild the store record (`--recover-body`) and ASK AGAIN before paying.
+reset; FIXTURE_CC_TOKEN=norecord; FIXTURE_CC_RC=4
+FIXTURE_RECOVER_RC=0; FIXTURE_CC_TOKEN_AFTER_RECOVER=carry; FIXTURE_CC_RC_AFTER_RECOVER=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(4) norecord: recovered from the signed body marker, then carried (rc=$(rc_of))"
+[ -f "$TMP/recover-pr.txt" ]; ck $? "(4) …--recover-body WAS asked (a store-less box is not evidence of changed content)"
+[ "$(wc -l < "$TMP/check-carry-pr.txt" 2>/dev/null | tr -d ' ')" = "2" ]; ck $? "(4) …and the question was asked a SECOND time after the recovery"
+no_reviewer; ck $? "(4) …and no reviewer was spawned"
+
+# (5)/(6) NOT A REVIEW, AND NOT A REFUSAL OF THE CODE: a failed READ is a RETRY, and a RED BUILD is
+# not a review finding. Both must leave the money unspent and name the right remedy.
+reset; FIXTURE_CC_TOKEN=unreadable; FIXTURE_CC_RC=3
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "12" ]; ck $? "(5) unreadable: exit 12 (RETRY), not a review (rc=$(rc_of))"
+no_reviewer; ck $? "(5) …no reviewer spawned"
+no_record; ck $? "(5) …nothing recorded"
+err_has "failed READ"; ck $? "(5) …and the remedy says the read failed, never that the diff changed"
+reset; FIXTURE_CC_TOKEN=red-surface; FIXTURE_CC_RC=7
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "13" ]; ck $? "(6) red-surface: exit 13, not a review (rc=$(rc_of))"
+no_reviewer; ck $? "(6) …no reviewer spawned for a broken build"
+no_record; ck $? "(6) …nothing recorded"
+
+# (7) `head` — a clean-family record (e.g. `clean-low`) already bound to this head: refused as the
+# unchanged-head case, NOT carried and NOT re-reviewed.
+reset; FIXTURE_CC_TOKEN=head; FIXTURE_CC_RC=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "5" ]; ck $? "(7) head: exit 5 — nothing to review, nothing to re-record (rc=$(rc_of))"
+no_reviewer; ck $? "(7) …no reviewer spawned"
+
+# (8) NON-VACUITY, THE OTHER DIRECTION: a genuinely CHANGED artifact still buys a review. Without this
+# the whole section could be satisfied by a seam that never reviews anything.
+reset; FIXTURE_CC_TOKEN=fresh; FIXTURE_CC_RC=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(8) fresh: the ordinary review still runs and records (rc=$(rc_of))"
+[ -f "$TMP/pi-runs.txt" ]; ck $? "(8) …the reviewer WAS spawned (a changed diff is still reviewed)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "(8) …and the record is minted"
+
+# (9) MUTATION: disable the carry arm and the §BW(1) scenario pays for a review — so §BW(1) is the
+# arm's doing and not the fixture's.
+MUT_CC="$TMP/mutant-nocarry.sh"
+# ⛔ THE REPLACEMENT MUST CONTAIN NO `|`: a `case` arm is a GLOB, so `|` is alternation, and the
+# first draft renamed only the SECOND alternative — `carry|red-base-owned-DISABLED` still MATCHED
+# `carry`, the mutant behaved like the real script, and the control silently proved nothing.
+sed 's/^  carry|red-base-owned)$/  __never_a_token__)/' "$SRC" > "$MUT_CC"; chmod +x "$MUT_CC"
+if cmp -s "$SRC" "$MUT_CC"; then
+  fail "§BW(9) the mutation did not apply — the anchored carry arm changed shape, so this control proves NOTHING"
+else
+  pass "§BW(9) mutation applied (the carry arm made unmatchable)"
+  reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_CC" 2284
+  [ -f "$TMP/pi-runs.txt" ]; ck $? "§BW(9) the MUTANT BUYS A REVIEW on an unchanged artifact — so §BW(1) is the arm's doing"
+fi
+rm -f "$MUT_CC"; reset
+# ══ end §BW ══
+
 # ⛔ THE PIN MUST NOT COUNT WHAT THE BOX DECIDES (P1, MEASURED at 0dd5e5519 on PR #4253). The floor
 # used to be an absolute total, and §AT drives six assertions per awk implementation the box happens to
 # have — so the same suite, at the same head, printed a DIFFERENT total on a four-dialect box than on a
@@ -4894,8 +5063,9 @@ rm -f "$BV" "$BV2" "$BV3"; reset
 # re-measure by RUNNING the suite and reading its printed total:
 #     pin_value = total − 6 × <the dialect count the run itself reported> − 2
 # Never copy a total printed on another box into this file, and never copy a pin value from a comment.
-# MEASURED at this head: 1285 printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk),
-# i.e. 1265 outside the env-dependent loop; the four-dialect twin prints 1291 and wants the SAME 1265.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1265 ]; ck $? "assertion-count pin: >= 1265 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# MEASURED at this head (the #4255 merge, §BW included): 1316 printed on a three-dialect Linux box
+# (awk→mawk, mawk, nawk; no gawk), i.e. 1296 outside the env-dependent loop; the four-dialect twin
+# prints 1322 and wants the SAME 1296.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1296 ]; ck $? "assertion-count pin: >= 1296 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
