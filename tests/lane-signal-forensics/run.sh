@@ -62,6 +62,38 @@ assertion_count() { # assertion_count <label> -> "N passed, M failed" from the s
   sed -n 's/^tests: \([0-9]*\) passed, \([0-9]*\) failed$/\1|\2/p' "$FIX/$1.out" | tail -1
 }
 
+# ⛔ A RUN THAT PRINTED NO SUMMARY IS NOT A VERDICT (agent-infra#4250, measured on CI).
+# On job 140169171893 mutant A answered `rc=0` with NO `tests:` line while its output carried the
+# arm-1 failure. The old code graded that as "mutant A did NOT redden the suite — arm 1's assertions
+# are vacuous" and then, on the very next check, reported the arm-1 failure as PRESENT: two verdicts
+# that contradict each other, both derived from ONE missing line. Its real cause is that the run was
+# cut off before the suite's own summary (the suite imports the mutant extension into its OWN process,
+# so a fixture signal can take the runner down mid-run) — an INSTRUMENT failure, not a statement
+# about the mutant. So: a summary-less run is re-run ONCE, and if it is still summary-less the arm is
+# reported as UNKNOWN/(truncated) and NEVER as "the mutation did not take". A genuinely vacuous
+# mutant is unaffected — it prints a full summary with rc=0, twice.
+#
+# Sets RC and COUNT in THIS shell (not via a subshell) so `bad`/`ok` keep counting the failures.
+run_suite_verified() { # <label> -> 0 when a summary exists (RC, COUNT set); 1 when the run was truncated
+  local label="$1" attempt
+  for attempt in 1 2; do
+    RC="$(run_suite "${label}-${attempt}")"
+    COUNT="$(assertion_count "${label}-${attempt}")"
+    if [ -n "$COUNT" ]; then
+      cp "$FIX/${label}-${attempt}.out" "$FIX/$label.out"
+      return 0
+    fi
+    if [ "$attempt" = 1 ]; then
+      echo "   ⟳ $label printed NO summary line (rc=$RC) — the run was TRUNCATED, not a verdict; re-running it once"
+      sed -n '1,12p' "$FIX/${label}-${attempt}.out" | sed 's/^/      │ /'
+    fi
+  done
+  # The caller's diagnostics read `$FIX/<label>.out` even on this path, so publish the LAST attempt's
+  # output there rather than leaving a stale file from an earlier label (or none at all).
+  cp "$FIX/${label}-2.out" "$FIX/$label.out" 2>/dev/null || :
+  return 1
+}
+
 # mutate <old> <new> — applies ONE exact replacement to the copied extension and
 # refuses if the anchor is not present exactly once (a mutant that cannot locate
 # its target would silently test nothing).
@@ -98,17 +130,22 @@ SRC_HASH_BEFORE="$(shasum -a 256 "$SRC_EXT" | awk '{print $1}')"
 SRC_DIFF_BEFORE="$(git -C "$ROOT" diff -- "$SRC_EXT")"
 
 # ── baseline ────────────────────────────────────────────────────────────────
-RC="$(run_suite baseline)"
-COUNT="$(assertion_count baseline)"
-echo "   baseline: rc=$RC  tests: ${COUNT/|/ passed, } failed"
-if [ "$RC" = "0" ]; then
-  ok "baseline is GREEN (the arms pass on the unmutated source)"
+if run_suite_verified baseline; then
+  echo "   baseline: rc=$RC  tests: ${COUNT/|/ passed, } failed"
+  if [ "$RC" = "0" ]; then
+    ok "baseline is GREEN (the arms pass on the unmutated source)"
+  else
+    bad "baseline is RED — a mutant result below would be meaningless"
+    sed -n '1,40p' "$FIX/baseline.out"
+  fi
+  BASE_PASS="${COUNT%%|*}"
+  case "$BASE_PASS" in ''|*[!0-9]*) bad "baseline printed no parsable assertion count (got '$COUNT')"; BASE_PASS=0 ;; esac
 else
-  bad "baseline is RED — a mutant result below would be meaningless"
+  echo "   baseline: rc=$RC  tests:  (no summary — TRUNCATED)"
+  bad "baseline printed NO summary line in 2 attempts (rc=$RC) — the run is TRUNCATED, so the baseline is UNKNOWN, not green"
   sed -n '1,40p' "$FIX/baseline.out"
+  BASE_PASS=0
 fi
-BASE_PASS="${COUNT%%|*}"
-case "$BASE_PASS" in ''|*[!0-9]*) bad "baseline printed no parsable assertion count (got '$COUNT')"; BASE_PASS=0 ;; esac
 
 # ── mutant A: the trap is removed ───────────────────────────────────────────
 # `process.on(signal, handler)` IS arm 1: without it the victim dies by Node's
@@ -117,29 +154,36 @@ case "$BASE_PASS" in ''|*[!0-9]*) bad "baseline printed no parsable assertion co
 echo
 echo "── mutant A: signal trap removed"
 if mutate 'process.on(signal, handler);' 'void handler; /* MUTANT-A: trap removed */'; then
-  RC="$(run_suite mutantA)"
-  COUNT="$(assertion_count mutantA)"
-  echo "   mutantA:  rc=$RC  tests: ${COUNT/|/ passed, } failed"
-  if [ "$RC" != "0" ]; then
-    ok "mutant A reddens the suite (exit $RC)"
+  if ! run_suite_verified mutantA; then
+    # ⛔ TRUNCATED IS ITS OWN VERDICT (#4250). Reporting this as "did NOT redden the suite — arm 1's
+    # assertions are vacuous" claimed something about the MUTANT from a run that never finished — and
+    # then reported the arm-1 failure as present one line later. Say what was measured.
+    echo "   mutantA:  rc=$RC  tests:  (no summary — TRUNCATED)"
+    bad "mutant A printed NO summary line in 2 attempts (rc=$RC) — the run was TRUNCATED, so the result is UNKNOWN: NOT a green mutant, and NOT evidence that arm 1's assertions are vacuous"
+    sed -n '1,20p' "$FIX/mutantA.out"
   else
-    bad "mutant A did NOT redden the suite — arm 1's assertions are vacuous"
-  fi
-  if grep -q 'arm 1: the signal log has exactly one record' "$FIX/mutantA.out"; then
-    ok "mutant A's failing assertion is the arm-1 one: 'arm 1: the signal log has exactly one record'"
-  else
-    bad "mutant A did not fail on the arm-1 assertion (it must fail THERE, not elsewhere)"
-    grep -E '^\s+(❌|✅)' "$FIX/mutantA.out" | head -20
-  fi
-  # Non-vacuity: the mutant must have removed exactly one arm — the mutant run's
-  # passing count is strictly lower than the baseline's, and at least one test
-  # still passed (so the suite ran rather than crashing on load).
-  MUT_PASS="${COUNT%%|*}"
-  case "$MUT_PASS" in ''|*[!0-9]*) MUT_PASS=0 ;; esac
-  if [ "$MUT_PASS" -gt 0 ] && [ "$MUT_PASS" -lt "$BASE_PASS" ]; then
-    ok "mutant A removed $((BASE_PASS - MUT_PASS)) passing assertion group(s) and the suite still ran"
-  else
-    bad "mutant A's pass count ($MUT_PASS) is not strictly between 0 and the baseline ($BASE_PASS) — the suite crashed or nothing changed"
+    echo "   mutantA:  rc=$RC  tests: ${COUNT/|/ passed, } failed"
+    if [ "$RC" != "0" ]; then
+      ok "mutant A reddens the suite (exit $RC)"
+    else
+      bad "mutant A did NOT redden the suite — arm 1's assertions are vacuous"
+    fi
+    if grep -q 'arm 1: the signal log has exactly one record' "$FIX/mutantA.out"; then
+      ok "mutant A's failing assertion is the arm-1 one: 'arm 1: the signal log has exactly one record'"
+    else
+      bad "mutant A did not fail on the arm-1 assertion (it must fail THERE, not elsewhere)"
+      grep -E '^\s+(❌|✅)' "$FIX/mutantA.out" | head -20
+    fi
+    # Non-vacuity: the mutant must have removed exactly one arm — the mutant run's
+    # passing count is strictly lower than the baseline's, and at least one test
+    # still passed (so the suite ran rather than crashing on load).
+    MUT_PASS="${COUNT%%|*}"
+    case "$MUT_PASS" in ''|*[!0-9]*) MUT_PASS=0 ;; esac
+    if [ "$MUT_PASS" -gt 0 ] && [ "$MUT_PASS" -lt "$BASE_PASS" ]; then
+      ok "mutant A removed $((BASE_PASS - MUT_PASS)) passing assertion group(s) and the suite still ran"
+    else
+      bad "mutant A's pass count ($MUT_PASS) is not strictly between 0 and the baseline ($BASE_PASS) — the suite crashed or nothing changed"
+    fi
   fi
 else
   bad "mutant A could not be applied (anchor not unique) — the mutation was not exercised"
@@ -153,9 +197,12 @@ echo
 echo "── mutant B: checkpoint arm disabled"
 cp "$SRC_EXT" "$FIX/ext/task-signal-forensics.ts"
 if mutate 'checkpoint = doCheckpoint ? snapshot() :' 'checkpoint = false ? snapshot() :'; then
-  RC="$(run_suite mutantB)"
-  COUNT="$(assertion_count mutantB)"
-  echo "   mutantB:  rc=$RC  tests: ${COUNT/|/ passed, } failed"
+  if ! run_suite_verified mutantB; then
+    echo "   mutantB:  rc=$RC  tests:  (no summary — TRUNCATED)"
+    bad "mutant B printed NO summary line in 2 attempts (rc=$RC) — the run was TRUNCATED, so the result is UNKNOWN: NOT a green mutant"
+    sed -n '1,20p' "$FIX/mutantB.out"
+  else
+    echo "   mutantB:  rc=$RC  tests: ${COUNT/|/ passed, } failed"
   if [ "$RC" != "0" ]; then
     ok "mutant B reddens the suite (exit $RC)"
   else
@@ -171,6 +218,7 @@ if mutate 'checkpoint = doCheckpoint ? snapshot() :' 'checkpoint = false ? snaps
     bad "mutant B also broke arm 1 — the arms are not independent, so neither mutant isolates a mechanism"
   else
     ok "mutant B left arm 1 green (the two arms are independently load-bearing)"
+  fi
   fi
 else
   bad "mutant B could not be applied (anchor not unique) — the mutation was not exercised"
@@ -188,6 +236,94 @@ if [ "$(git -C "$ROOT" diff -- "$SRC_EXT")" = "$SRC_DIFF_BEFORE" ]; then
   ok "the tracked extension's diff is unchanged by the run (a dirty pre-commit tree included)"
 else
   bad "the tracked extension source was MODIFIED BY THIS RUN — the mutants escaped the copy"
+fi
+
+# ── the TRUNCATED guard is TESTED, not merely measured (#4250, review F4) ──
+# `run_suite_verified` above is this driver's own confidence limit: a run that prints no
+# `tests:` summary is re-run ONCE and then graded UNKNOWN/(truncated) — never "the mutation did
+# not take". NOTHING here could fail if that guard were reverted to the old single-`run_suite`
+# form, and the suite would go green again on the exact CI shape that produced two contradictory
+# verdicts (job 140169171893). So this arm re-runs THIS driver with a `TSX_RUNNER` stub that
+# reproduces that shape — an arm failure PRINTED, the process cut off before any summary, exit 0 —
+# and asserts the composed verdict from the OUTSIDE — FIVE things, every one of them now
+# attributable (it reds under the revert of the code it is written about): (1) every one of the
+# three labels is graded "no summary line in 2 attempts" AND the run is refused (exit != 0) — the
+# finding this arm used to miss, because `rc != 0` alone is already true of the PRE-fix driver,
+# (2) TRUNCATED is stated, (3) a summary-less baseline is not read as GREEN, (4) a summary-less
+# mutant is not read as "the assertions are vacuous", (5) the retry is taken exactly once per label.
+# The stub needs no tsx, so this arm costs a few file copies.
+if [ "${LSF_TRUNCATION_GUARD:-}" = "child" ]; then
+  # The child's three labels ARE the stub's runs; re-entering this arm would fork forever.
+  echo
+  echo "── truncation-guard arm skipped: this run IS the truncated child"
+else
+  echo
+  echo "── guard: a summary-less run is TRUNCATED, not a green mutant (#4250)"
+  TRUNC_STUB="$FIX/truncating-runner.sh"
+  cat >"$TRUNC_STUB" <<'STUB'
+#!/usr/bin/env bash
+# CI's measured shape (job 140169171893): arms print, arm 1's failure is PRINTED, and the process
+# is cut off before the suite's own `tests: N passed, M failed` summary. Exit 0 is what made the
+# old code read this as "the mutant did not redden the suite".
+printf '  ✅ arm 1: the lane records its parent\n'
+printf '  ❌ arm 1: the signal log has exactly one record\n'
+exit 0
+STUB
+  chmod +x "$TRUNC_STUB"
+  GUARD_OUT="$FIX/truncation-guard.out"
+  LSF_TRUNCATION_GUARD=child TSX_RUNNER="$TRUNC_STUB" \
+      bash "$ROOT/tests/lane-signal-forensics/run.sh" >"$GUARD_OUT" 2>&1
+  GUARD_RC=$?
+  # ⛔ THE EXIT STATUS ALONE COULD NOT FAIL THIS ARM (#4251 review, finding 1). The PRE-fix driver
+  # already exited non-zero on this shape: with no summary it calls `bad` from the parse guard
+  # (`:142`, "baseline printed no parsable assertion count") and from BOTH "did NOT redden the
+  # suite" arms — so `rc != 0` was already the pre-fix verdict, and an rc-only arm is green on
+  # exactly the code this guard replaces. It is green under any UNRELATED child failure too (a
+  # missing `node`, a broken `mutate`, an unwritable `$FIX`): it attributes nothing.
+  # So bind it to what ONLY the fixed driver emits — the per-label TRUNCATED verdict, in its own
+  # words, once per label — and keep the refusal as the other half of the same assertion. The retry
+  # notice (`⟳ … printed NO summary line (rc=N)`) does not contain "in 2 attempts", so this counts
+  # final verdicts only; reverting `run_suite_verified` to the old single-`run_suite` form prints
+  # none of them and reds here.
+  TRUNC_VERDICTS="$(grep -c 'printed NO summary line in 2 attempts' "$GUARD_OUT" 2>/dev/null || true)"
+  if [ "$GUARD_RC" -ne 0 ] && [ "$TRUNC_VERDICTS" = "3" ]; then
+    ok "all three labels are graded 'NO summary line in 2 attempts' — TRUNCATED, not a verdict (exit $GUARD_RC)"
+  else
+    if [ "$GUARD_RC" -eq 0 ]; then
+      bad "the driver reported PASS on a summary-less run (exit 0) — a truncated run is UNPROVEN, never green"
+    else
+      bad "expected the truncated verdict on all three labels (3), observed '$TRUNC_VERDICTS' (exit $GUARD_RC) — a summary-less run was graded as something other than TRUNCATED"
+    fi
+    sed -n '1,40p' "$GUARD_OUT"
+  fi
+  if grep -q 'TRUNCATED' "$GUARD_OUT"; then
+    ok "the summary-less run is graded TRUNCATED/UNKNOWN, in its own words"
+  else
+    bad "the summary-less run was never called TRUNCATED — the guard is gone"
+    grep -E '^\s+(✅|❌)' "$GUARD_OUT" | head -20
+  fi
+  # The pre-fix verdict IS this string: "baseline is GREEN" was printed from a run that never
+  # emitted a summary — the false PASS the guard exists to refuse.
+  if grep -q 'baseline is GREEN' "$GUARD_OUT"; then
+    bad "a summary-less BASELINE was reported GREEN — a pass verdict from a run that never finished"
+  else
+    ok "a summary-less baseline is NOT reported green"
+  fi
+  # …and this one is the CONTRADICTION: "did NOT redden the suite" is a claim about the MUTANT,
+  # derived from a run that never finished, printed beside the arm-1 failure it denies.
+  if grep -q 'did NOT redden the suite' "$GUARD_OUT"; then
+    bad "a summary-less MUTANT was called 'did NOT redden the suite' — a claim about a mutant from an unfinished run"
+  else
+    ok "a summary-less mutant is never called 'did NOT redden' (no claim about an unfinished run)"
+  fi
+  # The retry notice is the `⟳` line run_suite_verified prints ONLY when it re-runs (its wording,
+  # "re-running it once", is not shared with the `bad` verdict lines, which name the attempt count).
+  TRUNC_RETRIES="$(grep -c 're-running it once' "$GUARD_OUT" 2>/dev/null || true)"
+  if [ "$TRUNC_RETRIES" = "3" ]; then
+    ok "each of the three labels was re-run exactly ONCE before its verdict (3 retry notices)"
+  else
+    bad "expected exactly one retry per label (3 notices), observed '$TRUNC_RETRIES'"
+  fi
 fi
 
 echo

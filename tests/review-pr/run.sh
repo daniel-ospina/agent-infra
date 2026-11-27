@@ -207,7 +207,10 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
        FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE \
        FIXTURE_NO_MARKER FIXTURE_MARKER_VERDICT FIXTURE_MARKER_COUNT \
-       FIXTURE_NO_MUTATION FIXTURE_MUTATION_EXEMPT
+       FIXTURE_NO_MUTATION FIXTURE_MUTATION_EXEMPT \
+       FIXTURE_CC_TOKEN FIXTURE_CC_RC FIXTURE_CC_RECORDED FIXTURE_CC_LIVE FIXTURE_CC_STDERR \
+       FIXTURE_RECOVER_RC FIXTURE_RECOVER_BODY_OUT \
+       FIXTURE_CC_TOKEN_AFTER_RECOVER FIXTURE_CC_RC_AFTER_RECOVER
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -476,6 +479,35 @@ EOF
 # ── the fake recorder: proves WHAT review-pr.sh asked record-review.sh to bind ─
 cat > "$TMP/bin/fake-record" <<'EOF'
 #!/usr/bin/env bash
+# ⛔ THE READ-ONLY VERBS COME FIRST (agent-infra#4255). `review-pr.sh` now asks this recorder's
+# OWN carry predicate (`--check-carry`, and `--recover-body` when the store has no record) BEFORE
+# it pays for a review. A fixture that let those verbs fall through to the MINT path below would
+# treat `--check-carry` as the PR number and write a record file named after the flag — poisoning
+# the store the seam reads and turning every "nothing recorded" assertion into a lie. They are also
+# deliberately NOT appended to record-argv.txt: `no_record()` and the `head -1` argv assertions use
+# that file to mean "the recorder was asked to MINT", which a read-only question is not.
+# Defaults reproduce the PRE-#4255 behaviour exactly (`fresh` / rc 1 → fall through to a review), so
+# every pre-existing scenario keeps meaning what it meant; the new arms are opt-in knobs.
+case "${1:-}" in
+  --check-carry)
+    # A ONE-SHOT ANSWER: once `--recover-body` has run, the store DOES hold a record, so the next
+    # question must be answerable differently. That is the #2872 sequence `review-pr.sh` now walks
+    # (norecord → rebuild from the signed body marker → ask again), and without this knob the arm
+    # that walks it could not be driven at all.
+    if [ -f "$TMP/recover-pr.txt" ] && [ -n "${FIXTURE_CC_TOKEN_AFTER_RECOVER:-}" ]; then
+      _tok="$FIXTURE_CC_TOKEN_AFTER_RECOVER"; _rc="${FIXTURE_CC_RC_AFTER_RECOVER:-0}"
+    else
+      _tok="${FIXTURE_CC_TOKEN:-fresh}"; _rc="${FIXTURE_CC_RC:-1}"
+    fi
+    printf '%s\t%s\t%s\n' "$_tok" "${FIXTURE_CC_RECORDED:-0}" "${FIXTURE_CC_LIVE:-0}"
+    [ -n "${FIXTURE_CC_STDERR:-}" ] && printf '%s\n' "$FIXTURE_CC_STDERR" >&2
+    printf '%s\n' "${2:-}" >> "$TMP/check-carry-pr.txt"
+    exit "$_rc" ;;
+  --recover-body)
+    printf '%s\n' "${2:-}" >> "$TMP/recover-pr.txt"
+    [ -n "${FIXTURE_RECOVER_BODY_OUT:-}" ] && printf '%s\n' "$FIXTURE_RECOVER_BODY_OUT"
+    exit "${FIXTURE_RECOVER_RC:-1}" ;;
+esac
 printf '%s\n' "$*" >> "$TMP/record-argv.txt"
 pr="$1"; sha="$2"; verdict="$3"; repo="$4"; shift 4 || true
 ev=""; pin=""
@@ -600,6 +632,13 @@ reset() {
   # defaults", which is what every scenario except §A5 wants.
   FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
   FIXTURE_COMMENT_RC=0
+  # §BW (agent-infra#4255) — the carry-before-review knobs. EMPTY means "the recorder's read-only
+  # verbs answer what the pre-#4255 recorder's absence would" (token `fresh` / rc 1), i.e. the seam
+  # falls through to a review exactly as it did before the change.
+  FIXTURE_CC_TOKEN=""; FIXTURE_CC_RC=""; FIXTURE_CC_RECORDED=""; FIXTURE_CC_LIVE=""
+  FIXTURE_CC_STDERR=""; FIXTURE_RECOVER_RC=""; FIXTURE_RECOVER_BODY_OUT=""
+  FIXTURE_CC_TOKEN_AFTER_RECOVER=""; FIXTURE_CC_RC_AFTER_RECOVER=""
+  rm -f "$TMP/check-carry-pr.txt" "$TMP/recover-pr.txt"
   unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
 }
 
@@ -1150,6 +1189,7 @@ run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "exit 7 when the verdict says CLEAN but a [P1] line is present (rc=$(rc_of))"
 no_comment; ck $? "NO comment posted — the refusal runs BEFORE the artifact exists (a fail-closed check placed after the side effect fails open)"
 err_has "self-contradicting"; ck $? "…naming the contradiction"
+err_has "a blocking finding on a DIFFERENT line"; ck $? "…and naming WHICH contradiction: a blocking finding on a different line, not an unreconcilable read (§BV(5)'s arm keeps the mild sentence)"
 err_has "[P1] scripts/x.sh:42"; ck $? "…and printing the finding it refused to record over"
 no_record; ck $? "NO record written"
 no_record && [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…and no record file exists"
@@ -2365,10 +2405,24 @@ SCANNER="$(sed -n "/^BLOCK_SPAN_AWK='/,/^'\$/p" "$SRC" | sed '1d;$d')"
 [ -n "$SCANNER" ]; ck $? "the scanner program was extracted from the SUT"
 printf '%s\n' "$SCANNER" > "$TMP/scanner.awk"
 AWKS_TRIED=""
+# ⛔ §AT IS THE ONE ENV-DEPENDENT SECTION, SO IT DECLARES ITS OWN SIZE (P1, MEASURED at 0dd5e5519 on
+# PR #4253). The loop below drives SIX assertions per awk implementation THIS box happens to have, and
+# the implementations differ by machine: this Linux box has three (awk→mawk, mawk, nawk) and no gawk;
+# GitHub's ubuntu runner has three the other way round (awk→gawk, gawk, mawk, no nawk); the box the
+# tail pin was calibrated on had four. Six assertions are therefore NOT a measure of what ran, and the
+# tail pin must never carry them in an absolute floor — they are SUBTRACTED there instead. The count
+# is taken here and asserted EXACTLY after the loop, so a dialect's arm dropping out is red ON ITS OWN
+# LINE.
+# The TAP rule for this case (testanything.org/tap-specification; node-tap "Planned assertion counts")
+# is that an implementation a platform does not have is DECLARED, never silently omitted, because an
+# omitted one silently moves every count that includes it. Declaring the number here — rather than
+# emitting a fake ✅ for a dialect nobody ran — is how this suite applies it without minting a false
+# PASS.
+_at_loop_base="$PASS"; _at_dialects=0
 for _a in awk gawk mawk nawk; do
   command -v "$_a" >/dev/null 2>&1 || continue
   "$_a" -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
-  AWKS_TRIED="$AWKS_TRIED $_a"
+  AWKS_TRIED="$AWKS_TRIED $_a"; _at_dialects=$((_at_dialects + 1))
   [ "$sp" = "0" ]; ck $? "…and COMPILES under $_a (rc=$sp)"
   # ⛔ COMPILING IS NOT WORKING (P0, seventh fresh review of #2288 — MEASURED: a `{0,3}` bridge compiles
   # everywhere but mawk does not SUPPORT interval expressions, so the count classifier matched NOTHING
@@ -2383,6 +2437,16 @@ for _a in awk gawk mawk nawk; do
     if [ "$_want" = "refuse" ]; then [ -n "$_got" ]; ck $? "…and the count classifier WORKS under $_a ($_line)"; else [ -z "$_got" ]; ck $? "…and stays quiet under $_a ($_line)"; fi
   done
 done
+# ⛔ THE DIALECT LOOP'S SIZE, PINNED EXACTLY (P1, MEASURED: the tail floor alone could not see this).
+# Six assertions per installed dialect is the contract; a dialect whose classifier arm lost its five
+# `_case` probes, or whose compile arm was deleted, would otherwise just make the total smaller — the
+# exact same symptom as a lost section, at a scale the tail floor cannot separate from "this box has
+# one fewer awk". `_at_loop_delta` is PASSES inside the loop, so a genuinely FAILING dialect arm also
+# shows here (it is already red on its own line) — never silently absorbed into a smaller total.
+_at_loop_delta=$((PASS - _at_loop_base))
+[ "$_at_loop_delta" -eq $((6 * _at_dialects)) ]; ck $? "§AT drove 6 assertions for each of the $_at_dialects installed dialect(s) ($_at_loop_delta assertions) — a dialect arm that drops out is named here instead of only shrinking the tail count"
+# What the tail pin subtracts: the dialect loop plus this assertion itself.
+_AT_ENV_ASSERTIONS=$((_at_loop_delta + 1))
 # ⛔ ONE DIALECT IS NOT "THE DIALECTS" (P2, third fresh review of #2288): the defect this arm exists
 # for was gawk refusing a program mawk accepted, so compiling under whichever `awk` PATH happens to
 # resolve to proves that box's dialect and nothing else. Every discoverable implementation is compiled
@@ -3142,6 +3206,25 @@ reset
 # silently.
 # Re-set to 762 when §BJ added the clause-scoped exemption, the word-numeral mirror, the indented-line
 # arm, the functional awk probe and the signed-marker arm (seventh fresh review). It was 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
+# Re-set to 891 when §BU added the marker-supplies-ISSUES arm (#4233 round 1). §BV then added the
+# quotation/attribution arm (#4233 reopened, the #4251 shape) — 23 assertions — and §BV's second round
+# (the clause-scoped liveness window, the split terminal sentences, the exact-vocabulary row) added 6
+# more, with 1 in §L pinning the sentence of its own arm: 30 in total across those two rounds. The third
+# round added the P1 fail-open rows and re-pointed the mutation controls (+8): §BV(7) is the prose
+# quotation that must now REFUSE (the measured fail-open), §BV(4c) flips the old declared residual to a
+# refusal, §BV(7b) refuses a prose line that merely CONTAINS a pipe, and §BV(8)/(9) are the two mutants
+# that show the anchored row test — not the blanking, and not a cheaper any-pipe predicate — is the fix.
+# ⛔ THESE ARE NO LONGER ABSOLUTE TOTALS (P3, fresh review at `0dd5e5519` — the `was 1252/0; §BV adds
+# 21 → 1275` sentence did not close, because the PREVIOUS pin's own `ck` was already counted in the
+# 1252). The pin reads `PASS - _AT_ENV_ASSERTIONS`, i.e. assertions OUTSIDE §AT's dialect loop, so its
+# value is (that stable surface) - 1 and does NOT move with the box's awk-dialect count — the loop's
+# own size is pinned exactly above, in `6 × installed dialects`. Re-measure by running the suite and
+# subtracting; never copy the printed total here.
+# §BW then added the carry-before-review arm (#4255 — the recorder's `--check-carry` seam, its
+# `--recover-body` retry, the two RETRY/RED exits and its mutation control): 31 assertions, taking the
+# stable surface from 1265 to 1296. §BW landed by MERGE, so it was renumbered from the §BV the branch
+# had chosen while `main` was still on §BU — `main` took §BV for #4233-reopened first, and a duplicate
+# section name would make every `§BV(n)` cross-reference in this file ambiguous.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -4612,6 +4695,377 @@ ck $? "  ...verdict=clean, bound to the reviewed head"
 rm -f "$BU"; reset
 # ══ end §BU ══
 
-[ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
+# ── §BV A QUOTED ASSERTION IS NOT A FINDING THE REVIEWER REPORTED (agent-infra#4233, reopened) ────
+# ⛔ WHY THIS SECTION EXISTS. #4234 fixed ONE verdict shape (the marker-only `REVIEW_VERDICT: ISSUES`
+# block, §BU). #4251 then hit a SECOND shape on the SAME deployed parser, and `review-pr.sh` answered
+# `a self-contradicting CLEAN verdict (clean + a reported count) is never recorded`. The measured
+# input (preserved verbatim in /tmp/aiv99-4251.log; the transcript it names,
+# /tmp/review-pr-4251.Qo3hv5/reviewer.log, has since been swept — which is exactly why the line lives
+# in this suite as a fixture now):
+#
+#   | `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error"
+#     | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | … |
+#
+#   …and the fragment the classifier printed for it, byte for byte: ` an unmapped declaration error`.
+#   That is a mutation-table row — a REQUIRED section of the reviewer's own artifact — quoting the TEST
+#   ASSERTION it names. The article arm read the quoted noun phrase as a count of one live finding.
+# ⛔ WHAT IS AND IS NOT CLAIMED HERE. The original #4251 transcript is gone, so this section does NOT
+# claim to have re-fed it; it feeds the MEASURED LINE, verbatim, and asserts the classifier no longer
+# invents a finding from a quotation. Whether that transcript's true verdict was CLEAN or ISSUES is
+# settled DOWNSTREAM, not here: if it really carried [P1]/[P2] lines the severity scanner refuses it
+# whatever this arm does — so this fix cannot convert a refusal into a passed review.
+# ⛔ AND THE BLANKING IS CONFINED TO WHAT THE MEASURED CASE ACTUALLY IS: A MUTATION-TABLE ROW (P1, fresh
+# review at `f3875382b204`). Blanking every quotation turned a STATED count on ordinary prose into no
+# finding — a signed clean over a stated blocker, which §BV(7) now pins as a REFUSAL and §BV(8) shows
+# going green again only when every line is blanked. The residual left is table-row-only, and §BV pins
+# its recording side ((1)) and its refusal side ((4), (4b)) so it cannot move silently in either direction.
+# ⛔ AND THE SECOND HALF OF THE ISSUE: the reader must not BLAME the reviewer for its own unparseable
+# input. `self-contradicting` now requires a verdict-shaped offending line (a line really cannot be
+# both); a count on an ORDINARY line is reported as unreconciled, with both lines printed.
+echo; echo "§BV a quoted assertion is not a reported finding (agent-infra#4233, reopened — the #4251 shape)"
+
+# (1) THE ISSUE'S ACCEPTANCE CASE: the measured #4251 row, in the mutable section, still records CLEAN.
+reset; FIXTURE_NO_MUTATION=1
+cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "the measured #4251 mutation row no longer invents a finding: the review RECORDS (rc=$(rc_of), want 0)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  ...a record was written, so a paid review is not discarded over a quotation"
+err_not_has "self-contradicting"; ck $? "  ...and nothing in the run asserts the reviewer contradicted itself"
+
+# (2) MUTATION CONTROL: the blanking is what makes (1) pass. Remove it entirely and the SAME transcript
+# is the pre-fix refusal again, naming the pre-fix fragment byte for byte.
+BV="$TMP/mutant-no-unquote.sh"
+# ⛔ THE MUTANT THAT REVERTS THE FIX IS NOW "NO BLANKING AT ALL" (P1, fresh review at
+# `f3875382b204`): the old control flipped `_quote_ok`, which no longer exists — ONE blanking rule
+# governs every line — so the mutation neutralises the call itself. It must apply exactly once, and
+# `cmp -s` below fails the suite loudly if a later edit moves the call out from under this control.
+sed 's/^  line = unquote(line)$/  line = line/' "$SRC" > "$BV"
+if cmp -s "$SRC" "$BV"; then
+  fail "the unquote mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+  run "$BV" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "the MUTANT without the blanking refuses the same row again (rc=$(rc_of), want 7) - so the blanking is load-bearing"
+  err_has "an unmapped declaration error"; ck $? "  ...naming the SAME fragment the pre-fix seam printed (the fixture reproduces the reported defect, not a lookalike)"
+  no_record; ck $? "  ...nothing recorded either way"
+fi
+
+# (3) ⛔ THE VERDICT-SHAPED CHANNEL IS UNTOUCHED BY THE BLANKING: the gate inside `unquote` admits a
+# MUTATION-TABLE ROW and nothing else, and a verdict line can never be a table row (every VD_* pattern
+# is anchored at `^[[:space:]]*` on a CLEAN/ISSUES/`Verdict:` token, while a table row begins `|`). So
+# `CLEAN — "3 blocking defects …"` is read exactly as the pre-#4253 seam read it, on every pass.
+reset; printf '**Verdict:** CLEAN — "3 blocking defects in the parser".\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a verdict-shaped line QUOTING a count is still refused (rc=$(rc_of), want 7) - blanking cannot un-refuse the verdict channel"
+no_record; ck $? "  ...nothing recorded"
+err_has "self-contradicting"; ck $? "  ...and THIS one really is self-contradicting, so it keeps that name"
+err_has "The count sits ON the verdict-shaped line above"; ck $? "  ...and the message says the count is ON that one line, which is what makes it contradictory"
+
+# (4) ⛔ AND A QUOTATION THAT ITSELF SAYS THE FINDING IS LIVE IS NOT BLANKED — INSIDE the blanking path,
+# which is why the fixture is a TABLE ROW (the only line class the blanking touches now; the same line as
+# prose would be unblanked and would refuse for a reason this row could not attribute). A reviewer that
+# smuggles its blocker into quotes still gets refused by the quotation's own words.
+reset; printf '| assertion "2 blocking defects remain in the parser" | x |\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted phrase saying the defects REMAIN is still a finding (rc=$(rc_of), want 7)"
+no_record; ck $? "  ...nothing recorded"
+
+# (4b) ⛔ THE CUE THAT GOVERNS A QUOTATION OFTEN SITS OUTSIDE IT (P2, fresh review at `0dd5e5519` —
+# MEASURED at the pre-fix blanking, on the head this row was added for): `unquote()` tested the
+# LIVENESS CUE inside the span only, so
+#
+#   The suite reports "2 blocking defects" still open.
+#
+# produced NO fragment — i.e. the pass RECORDED A SIGNED CLEAN over a review that had reported a live
+# count with its own cue sitting on the predicate outside the quotes. The window is the quotation AND
+# the clause that carries it, bounded by a sentence terminator or a table-cell separator.
+# ⛔ THE FIXTURE IS A TABLE ROW SO THE WINDOW IS STILL THE ONLY THING DECIDING IT (P1, fresh review at
+# `f3875382b204`): as prose the line is no longer blanked at all, so it would refuse for a reason this
+# row cannot attribute. As a row, the span-to-cell window is what keeps the count alive.
+# ⚠️ NON-VACUITY: RED at `896b4a96` (the head that carries the defect) and GREEN after the window fix;
+# it also goes RED under `win = span` (blanking on the span's own words), which is what pins the window.
+reset; printf '| the suite reports "2 blocking defects" still open |\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count whose LIVENESS CUE is outside the quotation still refuses (rc=$(rc_of), want 7)"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over it"
+err_has '2 blocking defects'; ck $? "  ...and the count it refused over is printed, not swallowed by the blanking"
+
+# (4c) ⛔ THE PREVIOUS ROUND'S DECLARED RESIDUAL IS NOW CLOSED (P1, fresh review at `f3875382b204`).
+# `The parser has "3 blocking defects in it".` is an ORDINARY LINE, so the blanking does not apply to it
+# at all and its own stated count refuses. Up to `f3875382b` this row asserted `rc=0`, i.e. the suite
+# ENFORCED the fail-open — a later fix would have had to change a test to close it. The residual that
+# remains is table-row-only, and §BV(1) pins its recording side while (4)/(4b) pin the refusal side.
+reset; printf 'The parser has "3 blocking defects in it".\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count on an ORDINARY line is a reported finding again (rc=$(rc_of), want 7) - the declared fail-open is CLOSED"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over it"
+err_has '3 blocking defects'; ck $? "  ...and the count it refused over is printed"
+
+# (5) ⛔ THE DIAGNOSIS: the refusal must NAME BOTH LINES it reconciled and must not claim a shape it
+# never saw. `a verdict-shaped line ALSO reports a non-zero count` was asserted over EVERY
+# counted-clean refusal, including the measured #4251 one where the count sat on a mutation-table row
+# with no verdict word at all. This is the reopened issue's demand — `the parser could not reconcile a
+# count with a verdict, which is the parser's problem to name, not the reviewer's fault to blame for`.
+reset; printf 'Summary: I found two blocking defects:\n- one in the parser\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a live count on an ordinary line still refuses (rc=$(rc_of), want 7) - the direction is unchanged"
+err_not_has "a verdict-shaped line ALSO reports"; ck $? "  ...and it no longer claims the count sat on a verdict-shaped line (that line carried no verdict word)"
+err_has "The count sits on a DIFFERENT line"; ck $? "  ...it says the two are on different lines — the reconciliation it could not perform"
+err_has "could not tell which field was authoritative"; ck $? "  ...naming its OWN limit instead of blaming the reviewer"
+err_has 'verdict line it compared : CLEAN'; ck $? "  ...and printing the verdict line it compared against"
+err_has 'line the count matched   : Summary: I found two blocking defects:'; ck $? "  ...and the exact line it matched, so both halves of the reconciliation are visible"
+err_has 'phrase it read           : " two blocking defects"'; ck $? "  ...and the exact phrase (leading separator included, as the pre-fix log printed it)"
+# ⛔ AND THE LAST LINE OF THE REFUSAL MUST NOT CONTRADICT THE SENTENCE TWO LINES ABOVE IT (P2, fresh
+# review at `0dd5e5519`): `die` was UNCONDITIONAL and said `a self-contradicting CLEAN verdict` on
+# BOTH arms, including this one, whose own `err` line says the reader `could not tell which field was
+# authoritative` — so the most visible line of the case the reopen is about still blamed the reviewer
+# for a contradiction it had just said it could not point at. §BV(3) cannot see this: its
+# `err_has "self-contradicting"` is satisfied by the same shared `die`, so it passes in EITHER arm.
+err_not_has "self-contradicting"; ck $? "  ...and the terminal refusal does NOT call this arm self-contradicting (it is unreconciled, not contradictory)"
+
+# (6) THE TWO LIVENESS VOCABULARIES CANNOT DRIFT. `unquote` decides what survives blanking, and the
+# `_cue` test decides what survives the articles arm; if one gains a word the other lacks, a quotation
+# is live to one reader and dead to the other — the drift MEMORY.md records for VD_ISSUES, one grammar
+# over. Both are derived from the SUT, so an edit to either alone is red.
+_BV_UNQ_LINE="$(grep -n 'live = (win ~' "$SRC" | head -1 | cut -d: -f1)"
+[ -n "$_BV_UNQ_LINE" ]; ck $? "the quotation reader's liveness line was located (line ${_BV_UNQ_LINE:-<none>})"
+_BV_UNQ_VOC="$(awk 'index($0,"live = (win ~ /("){ p="live = (win ~ /("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
+_BV_CUE_VOC="$(awk 'index($0,"_cue !~ /^[^.;:,!?()]*("){ p="_cue !~ /^[^.;:,!?()]*("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
+[ -n "$_BV_UNQ_VOC" ] && [ -n "$_BV_CUE_VOC" ]; ck $? "both liveness vocabularies were extracted live from the script (quotation='${_BV_UNQ_VOC:-<none>}')"
+[ "$_BV_UNQ_VOC" = "$_BV_CUE_VOC" ]; ck $? "  ...and they are IDENTICAL, so no word can be live to one reader and dead to the other (cue='${_BV_CUE_VOC:-<none>}')"
+# ⛔ THE EXACT SET, NOT ITS TWO ENDS (P3, fresh review at `0dd5e5519`): the previous row was
+# `case "$_BV_UNQ_VOC" in remain\|*\|left)`, whose `\|` are LITERAL — it only required the string to
+# BEGIN `remain|` and END `|left`, so deleting `still|open|unresolved|unfixed|outstanding|reopened`
+# from BOTH readers kept it green (measured: `remainXleft` → 0; the shortened set → 0). The vocabulary
+# decides which quotations survive blanking, so a silent shrink re-grades reviews unseen.
+[ "$_BV_UNQ_VOC" = 'remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left' ]; ck $? "  ...and it is EXACTLY the expected cue set, so no word can be dropped from both readers at once (got '${_BV_UNQ_VOC}')"
+
+# (7) ⛔ THE MEASURED FAIL-OPEN, PINNED (P1, fresh review at `f3875382b204`). This is the line the review
+# ran against the head: blanking EVERY quotation turned a STATED non-zero count of blocking findings
+# into no finding, so a transcript that refused before #4253 recorded a signed clean. The fix confines
+# the blanking to a table row; this line is prose, so its count is read exactly as the pre-#4253 seam
+# read it. ⚠️ NON-VACUITY: RED at `f3875382b204`, where the pre-fix classifier blanked every quotation
+# (measured there: the span was replaced before the three arms, so this line reported nothing while its
+# unquoted twin still refused) and GREEN here; §BV(8) is the mutant that re-opens it.
+reset; printf 'I found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a QUOTED count on an ordinary prose line is still a finding (rc=$(rc_of), want 7) - the P1 fail-open"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over a stated blocker"
+err_has '3 blocking defects'; ck $? "  ...and the count is printed, not blanked away"
+
+# (7b) ⛔ THE GATE IS A ROW, NOT "THE LINE CONTAINS A PIPE" (P1, fresh review at `f3875382b204` — the
+# review offered `index(line,"|")>0` as the cheap gate; that predicate also matches PROSE that merely
+# contains a shell pipeline). `I found "3 blocking defects"` must refuse wherever it is written, so the
+# stricter test is pinned here and (9) shows what the cheaper one would have cost.
+reset; printf 'The suite runs `grep x | wc -l` and found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count in prose that happens to contain a PIPE is still a finding (rc=$(rc_of), want 7)"
+
+# (8) ⛔ MUTATION CONTROL FOR THE GATE ITSELF, IN THE FAIL-OPEN DIRECTION: delete the table-row test and
+# every line is blanked again — the exact pre-fix behaviour. (7) goes RED and (1) stays GREEN, which is
+# what shows the ROW TEST, not the removal of the blanking, is what closes the fail-open.
+BV2="$TMP/mutant-blank-all.sh"
+sed 's/^  if (substr(_t, 1, 1) != "|") return s$/  if (0) return s/' "$SRC" > "$BV2"
+if cmp -s "$SRC" "$BV2"; then
+  fail "the table-row-gate mutation did not apply - this control proves NOTHING"
+else
+  reset; printf 'I found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$BV2" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT that blanks EVERY line records the same prose count (rc=$(rc_of), want 0) - so the table-row gate is what refuses it"
+  reset; FIXTURE_NO_MUTATION=1
+  cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+  run "$BV2" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  ...and the measured #4251 TABLE ROW still records under it, so the fix narrowed the blanking and did not remove it"
+fi
+
+# (9) ⛔ MUTATION CONTROL FOR THE STRICTER PREDICATE: widen the gate to "the line contains a pipe" (the
+# cheap form the review proposed) and (7b)'s prose line is blanked → it records a signed clean over a
+# stated blocker. That is why the gate is anchored to the START of the line.
+BV3="$TMP/mutant-any-pipe.sh"
+sed 's/^  if (substr(_t, 1, 1) != "|") return s$/  if (index(_t, "|") == 0) return s/' "$SRC" > "$BV3"
+if cmp -s "$SRC" "$BV3"; then
+  fail "the any-pipe-gate mutation did not apply - this control proves NOTHING"
+else
+  reset; printf 'The suite runs `grep x | wc -l` and found "3 blocking defects" in the parser.\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$BV3" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT with the cheap any-pipe gate RECORDS that prose count (rc=$(rc_of), want 0) - so anchoring the gate to the line start is load-bearing"
+fi
+rm -f "$BV" "$BV2" "$BV3"; reset
+# ══ end §BV ══
+
+# ── §BW A STALE HEAD IS NOT A STALE REVIEW (agent-infra#4255) ────────────────
+# THE HARM. `review-pr.sh`'s only pre-review guard used to be "is a clean record bound to this exact
+# sha?". A PR whose head moved for the one reason that never changes what was reviewed — the base
+# advanced and the branch was refreshed onto it — answered NO and bought a 20-40 minute review.
+# These scenarios drive the seam to the RECORDER's own predicate (`--check-carry`) instead, and
+# assert the OBSERVABLES that matter: was a reviewer paid for, was a record minted, at which head.
+echo; echo "§BW the recorder's carry predicate is asked BEFORE a review is bought"
+REC_HEAD_OLD="2222222222222222222222222222222222222222"
+# The PRECONDITION of every carry answer is a record that exists and names an EARLIER head, so the
+# carry-patch scenarios seed the store with exactly that (a fresh `reset` empties it). Verdict `clean`
+# and a real `evidence` field: `--check-carry` treats a `carried` record with no provenance as
+# NO RECORD (#10177), so a sloppier fixture would not model the shape being carried.
+seed_stale_record() {
+  mkdir -p "$TMP/home/.pi/agent/reviews"
+  printf '{"pr":2284,"head_sha":"%s","mint":"fresh","evidence":"comment:1234","verdict":"clean","repo":"%s","reviewed_at":"2026-11-01T00:00:00Z"}\n' \
+    "$REC_HEAD_OLD" "$REPO_FIXTURE" > "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
+}
+
+# (1) `carry` — the reviewed DIFF is byte-identical, so the gate already carries the record.
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(1) carry: exit 0 — nothing is stale and nothing is owed (rc=$(rc_of))"
+no_reviewer; ck $? "(1) carry: NO reviewer was spawned"
+no_record; ck $? "(1) carry: no record was re-minted (the gate carries the existing one as-is)"
+out_has "NO REVIEW OWED"; ck $? "(1) carry: the answer says so, naming the recorder's own predicate"
+[ "$(cat "$TMP/check-carry-pr.txt" 2>/dev/null)" = "2284" ]; ck $? "(1) carry: it asked about THIS PR"
+
+# (2) `carry-patch` (#1377) — the rendered diff moved, every reviewed line identical: RE-RECORD at the
+# CURRENT head and buy no review. The positional sha must be the RECORDED one (a same-head call is a
+# fresh mint that refuses a blank --evidence); the fixture re-binds to the live head exactly as the
+# real recorder's carry arm does, which is what makes the "recorded at the LIVE head" assertion real.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(2) carry-patch: exit 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(2) carry-patch: NO reviewer was spawned — this is the 20-40 min the issue is about"
+case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+  "2284 $REC_HEAD_OLD "*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "(2) carry-patch: re-recorded with the RECORDED head positionally, never the live one (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+  *"--expect-head"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "(2) …and WITHOUT --expect-head, which the recorder refuses precisely when the head moved"
+grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "(2) …and the record now COVERS the live head (what the gate reads)"
+out_has "NO REVIEW OWED"; ck $? "(2) …and says the re-binding is mechanical, not a new verdict"
+
+# (3) THE FAIL-SAFE DIRECTION: if the carry cannot be SHOWN (the recorder did not land a clean record
+# at the live head), the seam must fall through to a real review. A short-circuit that trusted its own
+# token would leave the PR unreviewed AND unrecorded — a wall, not a saving.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6; FIXTURE_RECORD_RC=1; seed_stale_record
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ -f "$TMP/pi-runs.txt" ]; ck $? "(3) an UNPROVEN carry falls through and the reviewer IS spawned (no silent wall)"
+err_has "did NOT produce a clean record"; ck $? "(3) …naming the failed prerequisite instead of claiming a carry"
+
+# (4) THE MEASURED PRODUCTION CASE: on this box the store has NO record for the PR, though the BODY
+# carries a correctly-signed marker (#14746/#14774 answered `norecord` while their bodies carried
+# one). The seam must rebuild the store record (`--recover-body`) and ASK AGAIN before paying.
+reset; FIXTURE_CC_TOKEN=norecord; FIXTURE_CC_RC=4
+FIXTURE_RECOVER_RC=0; FIXTURE_CC_TOKEN_AFTER_RECOVER=carry; FIXTURE_CC_RC_AFTER_RECOVER=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(4) norecord: recovered from the signed body marker, then carried (rc=$(rc_of))"
+[ -f "$TMP/recover-pr.txt" ]; ck $? "(4) …--recover-body WAS asked (a store-less box is not evidence of changed content)"
+[ "$(wc -l < "$TMP/check-carry-pr.txt" 2>/dev/null | tr -d ' ')" = "2" ]; ck $? "(4) …and the question was asked a SECOND time after the recovery"
+no_reviewer; ck $? "(4) …and no reviewer was spawned"
+
+# (5)/(6) NOT A REVIEW, AND NOT A REFUSAL OF THE CODE: a failed READ is a RETRY, and a RED BUILD is
+# not a review finding. Both must leave the money unspent and name the right remedy.
+reset; FIXTURE_CC_TOKEN=unreadable; FIXTURE_CC_RC=3
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "12" ]; ck $? "(5) unreadable: exit 12 (RETRY), not a review (rc=$(rc_of))"
+no_reviewer; ck $? "(5) …no reviewer spawned"
+no_record; ck $? "(5) …nothing recorded"
+err_has "failed READ"; ck $? "(5) …and the remedy says the read failed, never that the diff changed"
+reset; FIXTURE_CC_TOKEN=red-surface; FIXTURE_CC_RC=7
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "13" ]; ck $? "(6) red-surface: exit 13, not a review (rc=$(rc_of))"
+no_reviewer; ck $? "(6) …no reviewer spawned for a broken build"
+no_record; ck $? "(6) …nothing recorded"
+
+# (7) `head` — a clean-family record (e.g. `clean-low`) already bound to this head: refused as the
+# unchanged-head case, NOT carried and NOT re-reviewed.
+reset; FIXTURE_CC_TOKEN=head; FIXTURE_CC_RC=0
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "5" ]; ck $? "(7) head: exit 5 — nothing to review, nothing to re-record (rc=$(rc_of))"
+no_reviewer; ck $? "(7) …no reviewer spawned"
+
+# (8) NON-VACUITY, THE OTHER DIRECTION: a genuinely CHANGED artifact still buys a review. Without this
+# the whole section could be satisfied by a seam that never reviews anything.
+reset; FIXTURE_CC_TOKEN=fresh; FIXTURE_CC_RC=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(8) fresh: the ordinary review still runs and records (rc=$(rc_of))"
+[ -f "$TMP/pi-runs.txt" ]; ck $? "(8) …the reviewer WAS spawned (a changed diff is still reviewed)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "(8) …and the record is minted"
+
+# (9) MUTATION: disable the carry arm and the §BW(1) scenario pays for a review — so §BW(1) is the
+# arm's doing and not the fixture's.
+MUT_CC="$TMP/mutant-nocarry.sh"
+# ⛔ THE REPLACEMENT MUST CONTAIN NO `|`: a `case` arm is a GLOB, so `|` is alternation, and the
+# first draft renamed only the SECOND alternative — `carry|red-base-owned-DISABLED` still MATCHED
+# `carry`, the mutant behaved like the real script, and the control silently proved nothing.
+sed 's/^  carry|red-base-owned)$/  __never_a_token__)/' "$SRC" > "$MUT_CC"; chmod +x "$MUT_CC"
+if cmp -s "$SRC" "$MUT_CC"; then
+  fail "§BW(9) the mutation did not apply — the anchored carry arm changed shape, so this control proves NOTHING"
+else
+  pass "§BW(9) mutation applied (the carry arm made unmatchable)"
+  reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_CC" 2284
+  [ -f "$TMP/pi-runs.txt" ]; ck $? "§BW(9) the MUTANT BUYS A REVIEW on an unchanged artifact — so §BW(1) is the arm's doing"
+fi
+rm -f "$MUT_CC"; reset
+# ══ end §BW ══
+
+# ⛔ THE PIN MUST NOT COUNT WHAT THE BOX DECIDES (P1, MEASURED at 0dd5e5519 on PR #4253). The floor
+# used to be an absolute total, and §AT drives six assertions per awk implementation the box happens to
+# have — so the same suite, at the same head, printed a DIFFERENT total on a four-dialect box than on a
+# three-dialect one. GitHub's ubuntu runner is a three-dialect box (awk→gawk, gawk, mawk; no nawk), so
+# an absolute floor was a red NO CHANGE COULD CLEAR on CI — the opposite of a tripwire: a
+# permanently-red assertion trains readers to ignore the pin and hides the section loss it exists for.
+# The pin therefore holds the STABLE surface (what §AT's dialect loop drove is subtracted, and that
+# loop's own size is pinned exactly above, at `6 × installed dialects`), so it means the same thing on
+# every box, and a lost section still moves it.
+# ⛔ THE ARITHMETIC, BECAUSE THE PREVIOUS VERSION OF THIS COMMENT DID NOT CLOSE IT (P3, fresh review at
+# `f3875382b204`: it quoted "1275 on a four-dialect box / 1268 on this three-dialect box" against a pin
+# of 1257 — and 1257 + 6×4 + 2 is 1283, not 1275, so at least one quoted total was not a same-head
+# measurement). What a green run prints is EXACTLY
+#
+#     total = pin_value + (6 × installed awk dialects) + 2
+#
+# (six per dialect from §AT's loop, one for the §AT delta assertion, one for this pin's own `ck`). So
+# re-measure by RUNNING the suite and reading its printed total:
+#     pin_value = total − 6 × <the dialect count the run itself reported> − 2
+# Never copy a total printed on another box into this file, and never copy a pin value from a comment.
+# MEASURED at this head (the #4255 merge, §BW included): 1316 printed on a three-dialect Linux box
+# (awk→mawk, mawk, nawk; no gawk), i.e. 1296 outside the env-dependent loop; the four-dialect twin
+# prints 1322 and wants the SAME 1296.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1296 ]; ck $? "assertion-count pin: >= 1296 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
