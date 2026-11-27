@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1795759277-p3326367-07d2ab60",
+  "_sha": "2c02f6e35baeda47d983c89e544d6cee0092fc2a",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.sdJw5W3EQJ/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/4250-named-shard-failures"
+    },
+    {
+      "kind": "sha",
+      "value": "9385b491569a5d6299bf0d80316fa314253a3bb2"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-4251"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 79,
+  "ended_at": 1795759356,
+  "exit_code": 0,
+  "heartbeat_at": 1795759356,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1795759277-p3326367-07d2ab60",
+  "lease_until": 1795759961,
+  "pid": 3326367,
+  "reason": "cap-hit:rc=0",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795759277,
+  "state": "FAILED",
+  "tag": "42",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4251"
+}
