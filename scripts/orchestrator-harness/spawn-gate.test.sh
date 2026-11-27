@@ -2419,17 +2419,8 @@ ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else th
 # arm below already does.
 # ALL THREE cost terms are pinned to 0 (the #2721 split of `DISK_LANE_SELF_MB` out of the tree term):
 # an explicit 0 is honoured, so the headroom predicate cannot refuse ahead of the LOAD gate here.
-# ⛔ `--key-gate-off` ON EVERY ONE OF THESE THREE INVOCATIONS (agent-infra#4250, measured on CI).
-# `lane.sh` asserts the MODEL CREDENTIAL before any capacity gate (`lane.sh:817` vs the load gate at
-# `:983`), so on a box with no model credential — every GitHub runner — the credential gate refused
-# 82 FIRST and these arms never reached the gate they are named for. Measured on job 140169171893:
-# seven arms read `rc=82` instead of 75/77/81 and the `gate=mem` capacity record was never written,
-# while the same suite was green on a credentialed box — i.e. the host, not the code, decided. The
-# escape is argv-only BY DESIGN (#3331: an environment variable would be a fleet-wide off switch) and
-# these fixtures already stub `pi`, which is exactly what the declared escape is for — the same call
-# `capacity-transfer.test.sh` / `lane-outcome.test.sh` / `wt-lifecycle.test.sh` already make.
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
 grep -q 'load gate refused' "$RO/logs/lane-9999.log"; rc=$?
@@ -2440,7 +2431,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
 [ "$lrc2" -eq 77 ]; rc=$?
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
@@ -2456,7 +2447,7 @@ ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 # arm asserted a gate it never reached). `$RREPO`'s HEAD is `main`; lane.sh is told `work`.
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
 [ "$lrc3" -eq 81 ]; rc=$?
 ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
 grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
