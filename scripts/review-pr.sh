@@ -125,9 +125,17 @@
 #   * the notes or the verdict COMMENT could not be posted — no comment id exists to name as
 #     `--evidence`, so re-running the recorder cannot help either; the review exists only in
 #     the transcript;
-#   * the `carry-patch` re-record LANDED in the record store but the BODY marker check (c) reads
-#     is absent or unsigned (the store is only half the attestation, and nothing was reviewed
-#     either way) — the remedy is to re-run the merge. Its sibling, a `carry-patch` BODY READ
+#   * the `carry-patch` re-record LANDED in the record store but the marker the BODY carries is
+#     absent or unsigned (one channel, and nothing was reviewed either way). ⛔ THE BODY IS NOT THE
+#     ONLY CHANNEL check (c) ADMITS (P2, fresh review of PR #4257 round 3): it also accepts the same
+#     signed line as an OWNER/MEMBER/COLLABORATOR PR COMMENT, and the recorder posts exactly that
+#     copy — and exits 0 — when its body READ fails while the comment post succeeds. So the remedy is
+#     NOT "re-run the merge": it is to LAND the body copy the recorder kept
+#     (`--flush-pending $PR $REPO`, which mints nothing) and then re-run the merge, or — if that
+#     answers 'nothing pending' — to re-mint at the RECORDED head. ⛔ A live-head re-record with
+#     `--evidence`/`--expect-head` is REFUSED and can never work here: in a carry the review comment
+#     PREDATES this head by construction, and the recorder refuses any artifact older than the head it
+#     would attest (its postdate arm). Its sibling, a `carry-patch` BODY READ
 #     that FAILED, is ⛔ NOT this exit: a read that failed is neither a missing marker nor a
 #     changed artifact, so it exits 12 (RETRY) and must never buy a review.
 # A review COMMENT may already be posted when 7 or 9 exit — that comment IS the artifact
@@ -159,8 +167,8 @@
 #      artifact check (c) reading a record bound to this head with a SIGNED marker in the PR
 #      body (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies, so
 #      "recorded" without it is a green report over a red check), and the `carry-patch`
-#      re-record landing in the record STORE while the BODY marker check (c) reads is absent
-#      or unsigned (the store is only half the attestation; nothing was reviewed either way).
+#      re-record landing in the record STORE while the marker the BODY carries is absent
+#      or unsigned (one of the two channels check (c) admits; nothing was reviewed either way).
 #      ⛔ SEVEN, and the count IS the point: this line has now been wrong in BOTH directions
 #      (four-vs-six, then eight items under the word "six"), so it enumerates exactly what it
 #      counts — the long-form paragraph above counts the pin's two forms separately, and the
@@ -707,9 +715,9 @@ case "$CC_TOKEN" in
       [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
       case "$CR_BODY_RC:$CR_MARKER" in
         0:unsigned)
-          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the marker it appended to the PR body is UNSIGNED — no signature could be minted (AI_REVIEW_GATE_KEY is not configured), so check (c) stays RED and nothing can merge on this record. NOTHING was reviewed and nothing more should be bought: re-post the marker signed (its same-head append is idempotent) — \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<the review's comment id> --expect-head $HEAD\` — after fixing the key." ;;
+          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the marker it appended to the PR body is UNSIGNED — no signature could be minted (AI_REVIEW_GATE_KEY is not configured), so NEITHER channel check (c) admits (the body, or the admitted PR COMMENT) carries a marker it can accept, and the merge is refused on this record. NOTHING was reviewed and nothing more should be bought. ⛔ THE REMEDY IS THE RECORDED HEAD, NOT THIS ONE: fix the key, then re-mint — \`$RECORDER $PR $RH $RV $REPO\`, a carry re-mint against the prior signed marker. ⛔ The live-head form with \`--evidence\`/\`--expect-head\` is REFUSED here and can never work: in a carry the review comment PREDATES this head by construction, so the recorder's postdate arm refuses it as an artifact that cannot attest a revision which did not exist yet. \`--flush-pending\` does not help either — it would re-deliver these same UNSIGNED bytes." ;;
         0:absent)
-          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the PR BODY carries no marker bound to $REPO#$PR at that head — check (c) reads the BODY, not the store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). NOTHING was reviewed. Re-run the recorder to retry the post — \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<the review's comment id> --expect-head $HEAD\` (its append is idempotent) — then re-run the merge." ;;
+          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the PR BODY carries no marker bound to $REPO#$PR at that head. ⛔ THE BODY IS NOT THE ONLY CHANNEL check (c) ADMITS: it also accepts this marker LINE as an OWNER/MEMBER/COLLABORATOR PR COMMENT, and the recorder posts exactly that copy — a SUCCESS it reports and exits 0 on — when its body READ fails while the comment post succeeds. (A failed body PATCH is a DIFFERENT arm: it exits 5, body-marker-unposted, which leaves the store half marked failed, so this seam falls through to a full review and never reaches here.) So if that COMMENT copy landed, check (c) is already satisfied and what is owed is the BODY copy and the \`edited\` re-trigger it fires, NOT a verdict. NOTHING was reviewed. Land the copy the recorder kept — \`$RECORDER --flush-pending $PR $REPO\` (it delivers the marker a previous run minted, WITHOUT re-recording and WITHOUT a new review) — then re-run the merge; if it answers 'nothing pending', re-mint at the RECORDED head: \`$RECORDER $PR $RH $RV $REPO\`. ⛔ The live-head form with \`--evidence\`/\`--expect-head\` is REFUSED here and can never work: the review comment predates this head by construction in a carry, so the recorder's postdate arm will not accept it." ;;
         0:*) : ;;   # the store half itself failed → the ordinary review, exactly as before
         *)
           die "$E_RETRY" "the carry re-record landed in the record STORE at ${HEAD:0:12}…, but the PR BODY could not be READ (gh rc=$CR_BODY_RC) so the marker check (c) consumes could not be confirmed — a failed READ is not a missing marker and is not a changed artifact, so NOTHING was reviewed and nothing more should be bought. RETRY once the API recovers; do not re-review for a read failure." ;;

@@ -3233,6 +3233,9 @@ reset
 # stable surface from 1307 to 1312. ⛔ THE PIN AND THE MEASURED COMMENT WERE NOT MOVED WITH THEM
 # (P3, fresh review of #4257 round 2): a pin five under the true surface is a tripwire that five
 # deleted assertions walk straight through, on the file whose own rule is re-measure by running.
+# §BW(10)'s round-3 rows then added five assertions (P2, fresh review of #4257 round 3 — the refusal
+# printed a remedy the recorder REFUSES, and claimed check (c) reads the body as if that were the only
+# channel it admits): 5 assertions, taking the stable surface from 1312 to 1317 — moved WITH the change.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -5035,8 +5038,12 @@ run "$SRC" 2284
 # (10) ⛔ THE RECORD STORE IS ONLY HALF THE ATTESTATION (P2, fresh review of #4256 at
 # `a3ee7be7dfda`). The `carry-patch` arm re-records and exits 0 on `record_at_head_family`, which reads
 # `$HOME/.pi/agent/reviews` — while check (c) and `ai-review-gate` read the SIGNED MARKER IN THE PR BODY.
-# The recorder's evidence post is BEST-EFFORT and exits 0 when the body read or PATCH fails, so this
-# scenario — record file present at the live head, NO marker appended — used to print "NO REVIEW OWED …
+# The recorder's evidence post is NOT uniformly best-effort (P2, fresh review of PR #4257 round 3): a
+# failed body READ exits 0 when the #1224 evidence COMMENT landed — the copy check (c) also admits — while
+# a failed body PATCH exits 5 (`body-marker-unposted`), which leaves the store half marked failed and
+# falls through to a review. So this scenario's store-OK / no-body-marker state is a recorder SUCCESS, and
+# the seam must name the missing CHANNEL without claiming the body is the only one. The
+# scenario this builds — record file present at the live head, NO marker appended — used to print "NO REVIEW OWED …
 # the record was RE-RECORDED" and exit 0 while the gate stayed RED and no review existed. It is also
 # self-locking: the next `--check-carry` reads the store, answers `head`, and the seam exits 5, so
 # nothing ever re-posts the marker. The seam must instead name the missing half.
@@ -5050,13 +5057,23 @@ out_not_has "NO REVIEW OWED"; ck $? "(10) …and the success line is NOT printed
 err_has "PR BODY carries no marker"; ck $? "(10) …the refusal names the half that is missing (check (c) reads the body)"
 grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
 ck $? "(10) …and the STORE really was re-recorded at the live head — so the arm cannot be satisfied by the re-record failing"
+# ⛔ THE REMEDY MUST BE ONE THE RECORDER ACCEPTS (P2, fresh review of PR #4257 round 3). This message used
+# to print `$RECORDER $PR $HEAD $RV $REPO --evidence comment:<id> --expect-head $HEAD` — naming the LIVE
+# head, where the recorder runs no carry arm, reaches its evidence guard, and then REFUSES the artifact on
+# its postdate arm (`record-review.sh`: a carry's review comment predates the head BY CONSTRUCTION, so it
+# "cannot attest a revision that did not exist yet" — rc=3). The only printed remedy for the harm this PR
+# fixes walked the operator into a refusal. Verified against the recorder, so these rows are the guard.
+err_has "--flush-pending"; ck $? "(10) …and the remedy LANDS the body copy the recorder kept (--flush-pending), not a re-record against the live head"
+err_not_has "--evidence comment:"; ck $? "(10) …and it does NOT print the live-head comment-evidence re-record the recorder REFUSES on its postdate arm (P2, round 3)"
+err_has "PR COMMENT"; ck $? "(10) …and it names the COMMENT channel check (c) also admits, instead of claiming the body is the only one (P2, round 3)"
 # …the second half of the same harm: rc=0 with an UNSIGNED marker (no key on the box) is a record the
 # gate fails closed on, and this file already refuses that shape by name after a fresh record (:4009).
-# ⛔ WHICH ROW ANSWERS WHICH MUTANT, because this one does not answer deleting its own arm (P3 note,
-# fresh review of PR #4257 round 2): drop `0:unsigned)` and the `rc=9` row still passes — the fall-
-# through re-reviews and then hits the same unsigned refusal after a fresh record. The arm IS covered,
-# by the two rows below it (no reviewer spawned / the signature named): they redden on exactly the
-# behaviour that deletion breaks, so a reader must not read the first row as the arm's guard.
+# ⛔ WHICH ROW ANSWERS WHICH MUTANT, because this one does not answer deleting its own arm (P3 notes,
+# fresh reviews of PR #4257 rounds 2 AND 3): drop `0:unsigned)` and BOTH the `rc=9` row AND the
+# `err_has "UNSIGNED"` row below still pass — the fall-through re-reviews and then hits the identical
+# refusal after a fresh record (`review-pr.sh:4065`: "an UNSIGNED marker is in the PR body"), i.e. the
+# same word on the same exit code. The arm IS covered, but by ONE row, not two: `no_reviewer` reddens on
+# the review that the deletion buys. A reader must not read the first two rows as the arm's guard.
 reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
 FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_NO_KEY=1
 printf 'CLEAN\n' > "$TMP/reviewer-out"
@@ -5064,6 +5081,8 @@ run "$SRC" 2284
 [ "$(rc_of)" = "9" ]; ck $? "(10) carry-patch with an UNSIGNED body marker: exit 9 too (rc=$(rc_of))"
 no_reviewer; ck $? "(10) …no reviewer spawned for an unsigned re-record either"
 err_has "UNSIGNED"; ck $? "(10) …and the refusal names the missing signature rather than a missing marker"
+err_has "RECORDED HEAD"; ck $? "(10) …and its remedy re-mints at the RECORDED head — the only form the recorder accepts in a carry"
+err_not_has "--evidence comment:"; ck $? "(10) …and it does NOT print the live-head comment-evidence re-record its postdate arm refuses"
 
 # (10b) ⛔ A FAILED BODY READ AFTER THE RE-RECORD IS ITS OWN REFUSAL (P3, fresh review of PR #4257 at
 # `c2e80bac1db7`). The carry arm's `gh pr view --json body` read has TWO failure modes and they need
@@ -5140,12 +5159,11 @@ rm -f "$MUT_CC"; reset
 # re-measure by RUNNING the suite and reading its printed total:
 #     pin_value = total − 6 × <the dialect count the run itself reported> − 2
 # Never copy a total printed on another box into this file, and never copy a pin value from a comment.
-# MEASURED at this head (the #4255 merge, §BW + its §BW(10)/(11) store-vs-body arm AND the
-# §BW(10b) body-read refusal — P3, fresh review of PR #4257 round 2: the pin and this comment were
-# left five short when §BW(10b) landed, and a pin that low is a tripwire that five deleted
-# assertions walk through): 1332 printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no
-# gawk), i.e. 1312 outside the env-dependent loop; the four-dialect twin prints 1338 and wants the
-# SAME 1312.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1312 ]; ck $? "assertion-count pin: >= 1312 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# MEASURED at this head (the #4255 merge, §BW + its §BW(10)/(11) store-vs-body arm, the §BW(10b)
+# body-read refusal, AND the round-3 remedy/channel rows — P3, fresh review of PR #4257 round 2 left
+# the pin five short when §BW(10b) landed, and round 3's five remedy rows would have walked through a
+# pin that low again): 1337 printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk), i.e.
+# 1317 outside the env-dependent loop; the four-dialect twin prints 1343 and wants the SAME 1317.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1317 ]; ck $? "assertion-count pin: >= 1317 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
