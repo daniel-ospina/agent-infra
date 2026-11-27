@@ -3142,6 +3142,9 @@ reset
 # silently.
 # Re-set to 762 when §BJ added the clause-scoped exemption, the word-numeral mirror, the indented-line
 # arm, the functional awk probe and the signed-marker arm (seventh fresh review). It was 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
+# Re-set to 891 when §BU added the marker-supplies-ISSUES arm (#4233 round 1) and again to 1274 when
+# §BV added the quotation/attribution arm (#4233 reopened, the #4251 shape) — measured 1275 printed,
+# one less per the rule above.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -4612,6 +4615,117 @@ ck $? "  ...verdict=clean, bound to the reviewed head"
 rm -f "$BU"; reset
 # ══ end §BU ══
 
-[ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
+# ── §BV A QUOTED ASSERTION IS NOT A FINDING THE REVIEWER REPORTED (agent-infra#4233, reopened) ────
+# ⛔ WHY THIS SECTION EXISTS. #4234 fixed ONE verdict shape (the marker-only `REVIEW_VERDICT: ISSUES`
+# block, §BU). #4251 then hit a SECOND shape on the SAME deployed parser, and `review-pr.sh` answered
+# `a self-contradicting CLEAN verdict (clean + a reported count) is never recorded`. The measured
+# input (preserved verbatim in /tmp/aiv99-4251.log; the transcript it names,
+# /tmp/review-pr-4251.Qo3hv5/reviewer.log, has since been swept — which is exactly why the line lives
+# in this suite as a fixture now):
+#
+#   | `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error"
+#     | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | … |
+#
+#   …and the fragment the classifier printed for it, byte for byte: ` an unmapped declaration error`.
+#   That is a mutation-table row — a REQUIRED section of the reviewer's own artifact — quoting the TEST
+#   ASSERTION it names. The article arm read the quoted noun phrase as a count of one live finding.
+# ⛔ WHAT IS AND IS NOT CLAIMED HERE. The original #4251 transcript is gone, so this section does NOT
+# claim to have re-fed it; it feeds the MEASURED LINE, verbatim, and asserts the classifier no longer
+# invents a finding from a quotation. Whether that transcript's true verdict was CLEAN or ISSUES is
+# settled DOWNSTREAM, not here: if it really carried [P1]/[P2] lines the severity scanner refuses it
+# whatever this arm does — so this fix cannot convert a refusal into a passed review.
+# ⛔ AND THE SECOND HALF OF THE ISSUE: the reader must not BLAME the reviewer for its own unparseable
+# input. `self-contradicting` now requires a verdict-shaped offending line (a line really cannot be
+# both); a count on an ORDINARY line is reported as unreconciled, with both lines printed.
+echo; echo "§BV a quoted assertion is not a reported finding (agent-infra#4233, reopened — the #4251 shape)"
+
+# (1) THE ISSUE'S ACCEPTANCE CASE: the measured #4251 row, in the mutable section, still records CLEAN.
+reset; FIXTURE_NO_MUTATION=1
+cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "the measured #4251 mutation row no longer invents a finding: the review RECORDS (rc=$(rc_of), want 0)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  ...a record was written, so a paid review is not discarded over a quotation"
+err_not_has "self-contradicting"; ck $? "  ...and nothing in the run asserts the reviewer contradicted itself"
+
+# (2) MUTATION CONTROL: the blanking is what makes (1) pass. Force BOTH passes unblanked and the SAME
+# transcript is the pre-fix refusal again, naming the pre-fix fragment byte for byte.
+BV="$TMP/mutant-no-unquote.sh"
+sed 's/^    _quote_ok=1$/    _quote_ok=0/' "$SRC" > "$BV"
+if cmp -s "$SRC" "$BV"; then
+  fail "the unquote mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MUTATION=1
+  cat > "$TMP/reviewer-out" <<'BVMEASURED'
+## MUTATION ATTRIBUTION
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | author-measured pre-fix output carries `DECLARATION ERROR … must UNKNOWN`; UNVERIFIED here — `bash scripts/activate-harness.test.sh` |
+
+CLEAN
+BVMEASURED
+  run "$BV" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "the MUTANT without the blanking refuses the same row again (rc=$(rc_of), want 7) - so the blanking is load-bearing"
+  err_has "an unmapped declaration error"; ck $? "  ...naming the SAME fragment the pre-fix seam printed (the fixture reproduces the reported defect, not a lookalike)"
+  no_record; ck $? "  ...nothing recorded either way"
+fi
+
+# (3) ⛔ THE CARVE-OUT THAT KEEPS THIS FROM BEING A FAIL-OPEN: a VERDICT-SHAPED line is scanned a
+# SECOND time unblanked (from $VERDICT_LINES_FILE), because a line cannot be both clean and counted.
+# Without that second pass, blanking quotations would un-refuse `CLEAN — "3 blocking defects …"`.
+reset; printf '**Verdict:** CLEAN — "3 blocking defects in the parser".\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a verdict-shaped line QUOTING a count is still refused (rc=$(rc_of), want 7) - blanking cannot un-refuse the verdict channel"
+no_record; ck $? "  ...nothing recorded"
+err_has "self-contradicting"; ck $? "  ...and THIS one really is self-contradicting, so it keeps that name"
+err_has "The count sits ON the verdict-shaped line above"; ck $? "  ...and the message says the count is ON that one line, which is what makes it contradictory"
+
+# (4) ⛔ AND A QUOTATION THAT ITSELF SAYS THE FINDING IS LIVE IS NOT BLANKED. A reviewer that smuggles
+# its blocker into quotes still gets refused by the quotation's own words — the blanking is gated on
+# the liveness cue precisely so this direction cannot open.
+reset; printf 'The mutation row says "2 blocking defects remain in the parser".\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted phrase saying the defects REMAIN is still a finding (rc=$(rc_of), want 7)"
+no_record; ck $? "  ...nothing recorded"
+
+# (5) ⛔ THE DIAGNOSIS: the refusal must NAME BOTH LINES it reconciled and must not claim a shape it
+# never saw. `a verdict-shaped line ALSO reports a non-zero count` was asserted over EVERY
+# counted-clean refusal, including the measured #4251 one where the count sat on a mutation-table row
+# with no verdict word at all. This is the reopened issue's demand — `the parser could not reconcile a
+# count with a verdict, which is the parser's problem to name, not the reviewer's fault to blame for`.
+reset; printf 'Summary: I found two blocking defects:\n- one in the parser\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a live count on an ordinary line still refuses (rc=$(rc_of), want 7) - the direction is unchanged"
+err_not_has "a verdict-shaped line ALSO reports"; ck $? "  ...and it no longer claims the count sat on a verdict-shaped line (that line carried no verdict word)"
+err_has "The count sits on a DIFFERENT line"; ck $? "  ...it says the two are on different lines — the reconciliation it could not perform"
+err_has "could not tell which field was authoritative"; ck $? "  ...naming its OWN limit instead of blaming the reviewer"
+err_has 'verdict line it compared : CLEAN'; ck $? "  ...and printing the verdict line it compared against"
+err_has 'line the count matched   : Summary: I found two blocking defects:'; ck $? "  ...and the exact line it matched, so both halves of the reconciliation are visible"
+err_has 'phrase it read           : " two blocking defects"'; ck $? "  ...and the exact phrase (leading separator included, as the pre-fix log printed it)"
+
+# (6) THE TWO LIVENESS VOCABULARIES CANNOT DRIFT. `unquote` decides what survives blanking, and the
+# `_cue` test decides what survives the articles arm; if one gains a word the other lacks, a quotation
+# is blanked on one pass and live on another — the drift MEMORY.md records for VD_ISSUES, one grammar
+# over. Both are derived from the SUT, so an edit to either alone is red.
+_BV_UNQ_LINE="$(grep -n 'live = (span ~' "$SRC" | head -1 | cut -d: -f1)"
+[ -n "$_BV_UNQ_LINE" ]; ck $? "the quotation reader's liveness line was located (line ${_BV_UNQ_LINE:-<none>})"
+_BV_UNQ_VOC="$(awk 'index($0,"live = (span ~ /("){ p="live = (span ~ /("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
+_BV_CUE_VOC="$(awk 'index($0,"_cue !~ /^[^.;:,!?()]*("){ p="_cue !~ /^[^.;:,!?()]*("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
+[ -n "$_BV_UNQ_VOC" ] && [ -n "$_BV_CUE_VOC" ]; ck $? "both liveness vocabularies were extracted live from the script (quotation='${_BV_UNQ_VOC:-<none>}')"
+[ "$_BV_UNQ_VOC" = "$_BV_CUE_VOC" ]; ck $? "  ...and they are IDENTICAL, so no word can be live to one reader and dead to the other (cue='${_BV_CUE_VOC:-<none>}')"
+case "$_BV_UNQ_VOC" in remain\|*\|left) rc=0;; *) rc=1;; esac
+ck $rc "  ...and the extracted set is the cue set itself (remain…left), not two empty strings that agree"
+rm -f "$BV"; reset
+# ══ end §BV ══
+
+[ "$PASS" -ge 1274 ]; ck $? "assertion-count pin: >= 1274 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

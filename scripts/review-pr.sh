@@ -2178,6 +2178,44 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
+function unquote(s,   out, rest, span, live) {
+  # ⛔ AN INLINE QUOTATION IS NOT THE REVIEWER OWN COUNT — UNLESS THE QUOTATION ITSELF SAYS THE
+  # FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). Every quoted span that carries NO
+  # liveness cue is replaced by one space before the three arms run, so a phrase the reviewer is
+  # QUOTING cannot be counted as a finding it is REPORTING.
+  #   The measured line (preserved verbatim in the operator log, /tmp/aiv99-4251.log, from transcript
+  #   /tmp/review-pr-4251.Qo3hv5/reviewer.log — since swept, which is why the line is embedded in the
+  #   suite as a fixture):
+  #     | `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration
+  #       error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | … |
+  #   The article arm read `an unmapped declaration error` out of that QUOTED TEST ASSERTION as a
+  #   count of one live finding, and `review-pr.sh` answered `a self-contradicting CLEAN verdict
+  #   (clean + a reported count) is never recorded` about a review that had contradicted nothing.
+  # ⛔ WHY THIS IS GATED ON THE LIVENESS CUE RATHER THAN ON THE QUOTES ALONE. CommonMark 0.31.2 §6
+  # lists the inline constructs — code spans, emphasis, links, images, autolinks, raw HTML, breaks,
+  # textual content — and there is NO inline quotation construct: a double-quoted string is Textual
+  # content (§6.9), i.e. plain text. So a double quote pair is a HEURISTIC for "the reviewer is
+  # quoting", never a spec rule, and it must be the NARROWEST heuristic that fixes the measured case.
+  # A quotation that itself says the findings `remain`/are `still`/`open`/`unresolved` is a report of a
+  # LIVE blocker whoever wrote it, and is left intact — so the fail-open direction (a reviewer
+  # smuggling its own blocker into quotes) stays refused by its own words.
+  # ⚠️ DECLARED RESIDUAL (fail-open, pinned-adjacent and deliberately not chased): a reviewer that
+  # reports its own live blocker inside quotes on a line with NO liveness word and NO verdict word —
+  # `The parser has "3 blocking defects in it".` — is read as describing work. That is the same
+  # direction the map already accepts for a fenced, HTML or 4-column-indented quotation, and the
+  # verdict-shaped channel is untouched (see the QUOTE_OK call site), which is where a real blocker
+  # is written.
+  out = ""
+  rest = s
+  while (match(rest, /"[^"]*"/)) {
+    span = substr(rest, RSTART, RLENGTH)
+    # ⛔ THIS VOCABULARY MUST STAY THE `_cue` VOCABULARY BELOW — §BV fails the suite if the two drift.
+    live = (span ~ /(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/)
+    out = out substr(rest, 1, RSTART - 1) (live ? span : " ")
+    rest = substr(rest, RSTART + RLENGTH)
+  }
+  return out rest
+}
 function repair_led(cl,   n, w, i, low) {
   # ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — MEASURED
   # REGRESSION this branch introduced: `repair_re` holds ordinary NOUNS (`fix`, `close`, `remove`), so
@@ -2265,6 +2303,7 @@ BEGIN {
   # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
   # in a refusal message.
   line = tolower($0)
+  if (QUOTE_OK) line = unquote(line)
   for (arm = 1; arm <= 3; arm++) {
     re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
     off = 0; rest = line
@@ -2333,7 +2372,7 @@ BEGIN {
 '
 
 refuse_counted_clean() {
-  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src
+  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src _quote_ok
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -2441,17 +2480,53 @@ refuse_counted_clean() {
         || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
       COUNT_SCAN_CANARY_OK=1
     fi
-    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
+    # ⛔ WHO BLANKED THE QUOTATIONS, AND WHY BLANKING HERE CANNOT WEAKEN THE VERDICT-SHAPED CHANNEL
+    # (issue #4233, REOPENED — the #4251 shape). Quotations are blanked ONLY on the survivors pass.
+    # Every verdict-shaped line is scanned a SECOND time, unblanked, from $VERDICT_LINES_FILE below —
+    # and that is exactly the channel the design already calls self-contradictory by construction
+    # (`a count always refuses` there, see the arm's own rule). So `CLEAN — "3 blocking defects in the
+    # parser".` still refuses, while a quotation on an ordinary line does not become a finding. The
+    # two passes are not redundant: they carry DIFFERENT blanking, and §BV pins both directions.
+    _quote_ok=1
+    if [ "$_src" = "$VERDICT_LINES_FILE" ]; then _quote_ok=0; fi
+    _hit="$(printf '%s' "$_scan" | awk -v QUOTE_OK="$_quote_ok" "$COUNT_SCAN_AWK")" \
       || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
     CLEAN_COUNT_WORDS="$(printf '%s' "$_hit" | head -1)"; CLEAN_COUNT_LINE="$_vl"; break
   done < "$_src"
   done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
-    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
-    err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
+    # ⛔ THE REFUSAL MUST NAME THE LINES IT RECONCILED — AND MUST NOT CLAIM A SHAPE IT NEVER SAW
+    # (issue #4233, REOPENED — the #4251 shape). The old wording asserted `a verdict-shaped line ALSO
+    # reports a non-zero count` about EVERY counted-clean refusal. Measured on PR #4251 the count sat
+    # on a mutation-table row carrying no verdict word at all, so the sentence described an input the
+    # reader had not read — the reopen's exact objection: `a guard that says self-contradicting when
+    # what it means is I could not tell which field is authoritative`. Both lanes now print the SAME
+    # two lines (the verdict it compared and the line it matched), so a reader can see which field is
+    # which; only the sentence explaining them differs, because only one case is a single line that
+    # really cannot be both.
+    # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864): under `pipefail` the quiet grep exits at
+    # its first match, the writer takes SIGPIPE and the pipeline reports 141 — which would silently
+    # report a verdict-shaped line as unshaped and take the wrong arm.
+    CLEAN_COUNT_SHAPED=0
+    if grep -aqE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_SHAPED=1
+    fi
+    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and this transcript reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a review cannot be both, so this is a verdict of convenience, not a clean review."
+    err "  verdict line it compared : ${LAST:-<none>}"
+    err "  line the count matched   : ${CLEAN_COUNT_LINE:-$LAST}"
+    err "  phrase it read           : \"$CLEAN_COUNT_WORDS\""
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      err "  The count sits ON the verdict-shaped line above, so that ONE line contradicts itself."
+    else
+      err "  The count sits on a DIFFERENT line, which carries no verdict word — the reader could not tell which field was authoritative, and says so instead of blaming a contradiction it cannot point at."
+    fi
     err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
     err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    if [ -r "${TRANSCRIPT:-}" ]; then
+      err "  last lines of that transcript:"
+      tail -n 5 "$TRANSCRIPT" 2>/dev/null | while IFS= read -r _tl; do err "    $_tl"; done
+    fi
     die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
   fi
 }
