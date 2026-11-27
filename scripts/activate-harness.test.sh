@@ -570,6 +570,36 @@ assert_contains "$OUT" 'ACTIVATION COMPLETE' "T1 summary names a complete activa
 assert_contains "$OUT" 'eldato-conflict-rebase' "T1 the newly armed capability is a derived row (a shipped template cannot be forgotten)"
 assert_contains "$OUT" 'eldato-worker-supply.service' "T1 the supply half is a row on a healthy cell (it ships no .timer, so nothing derives it)"
 assert_contains "$OUT" 'OK' "T1 rows carry a verdict"
+# ⛔ A SHIPPED TEMPLATE WITH NO INSTALLER MAPPING MUST NOT RED A HEALTHY BOX (agent-infra#4250).
+# #4169 shipped `eldato-disk-reaper-cache.{service,timer}` without an `installer_for()` entry, so this
+# fully-armed fixture answered `DECLARATION ERROR … must UNKNOWN` and the run exited 2 — 12 arms in
+# this file fell over from one unmapped template, and main's `script-validate` shard was red. T4 pins
+# the DECLARATION ERROR arm itself (an orphan template must fail); THIS arm pins the other direction,
+# which is the one that actually broke: every template the repo really ships must be MAPPED, so a
+# future template cannot repeat it. Pre-fix this arm is non-vacuous — the output carried the
+# DECLARATION ERROR row and the cache row read UNKNOWN.
+assert_absent "$OUT" 'DECLARATION ERROR' "T1 no shipped template is an unmapped declaration error (every .timer derives a graded row)"
+# ⛔ READ THE ROW BY FIELD ON THE TSV CONTRACT, AND ASSERT AN OBSERVABLE THAT DIFFERS BETWEEN THE
+# STATES (fresh-context review, F1/F2/F3). Two assertions stood here and NEITHER could fail:
+#   * `assert_contains "$OUT" 'eldato-disk-reaper-cache'` ("a graded row, not an orphan template") —
+#     pre-fix the row IS emitted, as UNKNOWN, and the DECLARATION ERROR detail names the base, so the
+#     string was present in both states. The row's PRESENCE is pinned below instead: `row_field`
+#     yields the empty string for an absent row, so the `OK` comparison fails if the row vanishes.
+#   * `assert_eq "$(row_field … 2)" 'must'` ("its class is must") — field 2 is `must` in BOTH states
+#     it named: the pre-fix DECLARATION ERROR emit HARDCODES `must` (activate-harness.sh:1014), and
+#     reverting the new `row_meta` arm falls back to the `*) printf 'must|3600'` default (:890). The
+#     class's real consequence — a `must` row is ARMED — is pinned behaviourally by T5's installer
+#     count, which is where a class regression would actually surface.
+# What is NOT covered by anything else is the CADENCE BOUND the fix declares (:870, `must|2400`),
+# so that is what is asserted: every other arm in this file stamps a FRESH trigger (:240-253) or the
+# 6-day-old one (:712), both far outside the 2400-vs-3600 window, so reverting the declaration to the
+# 3600 s default kept the whole suite green. The bound is rendered on the row itself, on the default
+# (non-beacon) dispatch (:1066 → :362), so field 4 is where it is observable.
+RUN --check --tsv
+assert_eq "$(row_field "$OUT" 'eldato-disk-reaper-cache' 3)" 'OK' \
+    "T1 the cache row is graded on its own timer, not skipped"
+assert_contains "$(row_field "$OUT" 'eldato-disk-reaper-cache' 4)" 'cadence allows 2400s' \
+    "T1 and it is graded on ITS OWN 2400s cadence (row_meta), never the 3600s default fallback (#4250)"
 
 # ── T2: NON-VACUITY — remove one unit and --check must name it and exit non-zero ──────────────
 rm -f "$FX/units/system/eldato-harness-apply.timer" "$FX/units/system/eldato-harness-apply.service"
@@ -608,6 +638,12 @@ INSTALLS="$(cat "$FX/install.log" 2>/dev/null || true)"
 # installer_for(), so adding a template (or renaming an installer) cannot leave one list behind.
 assert_contains "$INSTALLS" 'install-harness-apply-timer.sh' "T5 the harness-apply installer ran"
 assert_contains "$INSTALLS" 'install-disk-reaper-timer.sh' "T5 the disk-reaper installer ran"
+# ⛔ ONE SCRIPT, TWO MUST ROWS (#4250): the cache unit ships inside `install-disk-reaper-timer.sh`, so
+# BOTH disk-reaper bases must reach it. Two invocations, because `do_install` walks one row per
+# template — a count of 2 is the assertion that the cache row did not fall through to the "no runnable
+# installer" arm (which warns and sets `failed=1`: `--install` then reports an armed box as unarmed).
+assert_eq "$(grep -c 'install-disk-reaper-timer.sh' "$FX/install.log" 2>/dev/null)" '2' \
+    "T5 both disk-reaper bases are armed by the one installer (hourly + 10-minute cache)"
 assert_contains "$INSTALLS" 'install-conflict-rebase-timer.sh' "T5 the conflict-rebase installer ran (the capability this arm audit was opened for)"
 assert_contains "$INSTALLS" 'install-cell-timers.sh' "T5 the cell-timers installer ran (watchdog + reminder)"
 assert_contains "$INSTALLS" 'install-drainer-timer.sh' "T5 the ai-drainer installer ran"
