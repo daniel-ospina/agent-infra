@@ -148,13 +148,19 @@
 #   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
 #      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
 #      retarget is the same refusal) — NOT recorded
-#   9  the record/artifact arm — five cases, see above: recording failed, the recorder was
-#      never reached, a comment post failed, rc=0 arrived WITHOUT the artifact check (c)
+#   9  the record/artifact arm — six cases, see above: recording failed, the recorder was
+#      never reached, a comment post failed, the `--expect-head` pin's TWO opposite-remedy
+#      refusals (the head MOVED vs the pin could not be CHECKED), rc=0 arrived WITHOUT the
+#      artifact check (c)
 #      reads: no record bound to this head, or no marker in the PR body / a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
 #      so "recorded" without it is a green report over a red check) — OR the `carry-patch`
 #      re-record landed in the record STORE while the BODY marker check (c) reads is absent
-#      or unsigned (the store is only half the attestation; nothing was reviewed either way)
+#      or unsigned (the store is only half the attestation; nothing was reviewed either way),
+#      OR that same re-record's BODY read FAILED (a read failure is not a missing marker and
+#      not a changed artifact — re-run the merge, never buy a review). ⛔ SIX, not five: the
+#      long-form paragraph above counts the pin's two forms separately and this line did not
+#      (pre-existing drift, reconciled here — P3, fresh review of PR #4257)
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
 #      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
 #      nothing was recorded. A failed read is not a changed artifact and must never buy a review
