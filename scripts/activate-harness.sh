@@ -863,10 +863,14 @@ row_meta() { # <base> -> "<class>|<max_age_s>"
     case "$1" in
         eldato-harness-apply)     printf 'must|1200' ;;    # 10 min + RandomizedDelaySec=60 + slack
         eldato-disk-reaper)       printf 'must|5400' ;;    # hourly + pass runtime
-        # 10 min (`OnCalendar=*:0/10`) + AccuracySec=60 + RandomizedDelaySec=30 + a pass's runtime.
-        # The slack is the hourly row's 1800 s, so a pass that legitimately runs long is not its own
-        # red; the pass is bounded by its own per-pass cap (`DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB`) and
-        # `TimeoutStartSec`, and it does nothing at all while the box is above the free-space trigger.
+        # 10 min (`OnCalendar=*:0/10`) + AccuracySec=60 + RandomizedDelaySec=30 = 690 s of scheduler
+        # slack, so this bound leaves 2400 - 690 = 1710 s for a pass's own runtime — a pass that
+        # legitimately runs long is not its own red. ⛔ NOT a `TimeoutStartSec` bound: the unit is
+        # `Type=oneshot` (`eldato-disk-reaper-cache.service`), for which systemd DISABLES the start
+        # timeout by default, and the unit sets none — the real limits are the per-pass cap
+        # (`DISK_REAPER_RUNNER_CACHE_PASS_CAP_MB`), the bounded-execution helper's per-probe wall clock,
+        # and the lock (a concurrent pass defers, exit 6). It also does nothing at all while the box is
+        # above the free-space trigger.
         eldato-disk-reaper-cache) printf 'must|2400' ;;
         eldato-ai-drainer)        printf 'must|2400' ;;    # 20 min
         eldato-controller-watchdog) printf 'must|1200' ;;  # 5 min
