@@ -148,11 +148,13 @@
 #   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
 #      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
 #      retarget is the same refusal) — NOT recorded
-#   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
-#      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
-#      reads: no record bound to this head, no marker in the PR body, or a marker posted
+#   9  the record/artifact arm — five cases, see above: recording failed, the recorder was
+#      never reached, a comment post failed, rc=0 arrived WITHOUT the artifact check (c)
+#      reads: no record bound to this head, or no marker in the PR body / a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check)
+#      so "recorded" without it is a green report over a red check) — OR the `carry-patch`
+#      re-record landed in the record STORE while the BODY marker check (c) reads is absent
+#      or unsigned (the store is only half the attestation; nothing was reviewed either way)
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
 #      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
 #      nothing was recorded. A failed read is not a changed artifact and must never buy a review
@@ -557,6 +559,42 @@ record_at_head_family() { # <sha> -> 0 iff a clean(-micro|-low) record bound to 
   done
   return 1
 }
+# ── THE MARKER THE GATE READS (check (c)), AS ONE PREDICATE ─────────────────────────────────────
+# The marker shape is check-pipeline-compliance.sh's REVIEW_RECORD_MARKER_RE (the
+# consumer's own definition, mirrored here — the producer's `MARKER=` line is its source).
+# ANY signed match wins over an earlier unsigned one at the same head: a body can carry
+# both (an unsigned marker from a key-less run, then a signed one from a re-run), and a
+# first-match scan would refuse the run that actually fixed it (P3, third fresh review).
+# ⛔ SHAPE, NOT HMAC — A DECLARED RESIDUAL (raised as P3 in rounds 9, 12 and 14). The PR body is
+# author-writable, so a pre-seeded `sig=<64 hex>` line can mask the unsigned marker this run just
+# posted; verifying the HMAC locally was implemented and REVERTED, because it makes the seam refuse
+# whenever no key is readable in the calling environment — including from a cell whose key is only
+# in the recorder's own environment — which would turn a whole class of legitimate records into
+# "unverifiable" at exactly the moment the reviewer was paid for. What is guaranteed here, and what
+# the success line says, is narrower and true: a marker BOUND TO THIS PR/HEAD/REPO carries a
+# signature field; the HMAC is the ai-review-gate's to verify (it is the only consumer that must,
+# and it does). An UNSIGNED marker — the case where the recorder itself could not mint one — is
+# still its own named failure, because record-review.sh says so loudly on stderr and the marker it
+# appends then has no `sig=`.
+# ⛔ IT IS DEFINED HERE, ABOVE ITS FIRST CALLER, AND THAT IS LOAD-BEARING (P2, fresh review of PR
+# #4256 at `a3ee7be7dfda`): the `carry-patch` arm in §2b asks this predicate too, because the record
+# STORE is only HALF the attestation — check (c) reads the PR BODY — and bash resolves a function at
+# CALL time, so a definition 3,400 lines further down is simply not callable from §2b.
+marker_state() { # <body> -> signed | unsigned | absent
+  local body="$1" line pr_re head_re repo_lc saw_unsigned=0
+  pr_re="$PR"; head_re="$HEAD"
+  repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
+    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
+    [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
+    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
+    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; return 0; fi
+    saw_unsigned=1
+  done <<<"$body"
+  [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
+  printf 'absent'
+}
 # record_head_verdict — the RECORDED head and its verdict, for the carry re-record. The
 # positional SHA handed to the recorder must be the REVIEWED one, never the live head: the
 # recorder enters its carry arms only when the two differ (record-review.sh's
@@ -621,15 +659,44 @@ case "$CC_TOKEN" in
       else
         "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >/dev/null 2>&1; CR_RC=$?
       fi
-      if [ "$CR_RC" -eq 0 ] && record_at_head_family "$HEAD"; then
+      CR_STORE_OK=0
+      [ "$CR_RC" -eq 0 ] && record_at_head_family "$HEAD" && CR_STORE_OK=1
+      # ⛔ THE RECORD STORE IS ONLY HALF THE ATTESTATION (P2, fresh review of PR #4256 at
+      # `a3ee7be7dfda`). This arm used to exit 0 on `record_at_head_family` alone, which reads
+      # `$HOME/.pi/agent/reviews` — while check (c) and `ai-review-gate` read the SIGNED MARKER IN THE
+      # PR BODY, and the recorder's evidence post is BEST-EFFORT and exits 0 when the body read or the
+      # PATCH fails (`record-review.sh`: "Idempotent; best-effort — NEVER fails the record"). So a
+      # throttled body read bought a printed "NO REVIEW OWED … the record was RE-RECORDED" and exit 0
+      # while the gate stayed RED and no review existed — and the state SELF-LOCKS: the next
+      # `--check-carry` reads the store, now holding a record at the live head, answers `head`, and this
+      # seam exits 5 ("nothing to re-record"), so nothing ever re-posts the marker. The SAME two
+      # refusals this file already makes after a fresh record (:4009 unsigned, :4011 absent) are owed
+      # here, for the same reason: rc=0 from the recorder is not proof its artifact landed.
+      CR_BODY_RC=0; CR_BODY=""; CR_MARKER=""
+      if [ "$CR_STORE_OK" = 1 ]; then
+        CR_BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || CR_BODY_RC=$?
+        [ "$CR_BODY_RC" -eq 0 ] && CR_MARKER="$(marker_state "$CR_BODY")"
+      fi
+      CR_MARKER_OK=0
+      [ "$CR_MARKER" = signed ] && CR_MARKER_OK=1
+      if [ "$CR_STORE_OK" = 1 ] && [ "$CR_MARKER_OK" = 1 ]; then
         log_line "$PROG: NO REVIEW OWED — the reviewed PATCH is byte-identical at ${RH:0:12}… and ${HEAD:0:12}… (check-carry rc=$CC_RC, token=carry-patch)."
-        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The reviewer was not spawned."
+        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The SIGNED body marker for this head was read back (the artifact check (c) consumes). The reviewer was not spawned."
         [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /'
         [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
         exit 0
       fi
       [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /' >&2
       [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
+      case "$CR_BODY_RC:$CR_MARKER" in
+        0:unsigned)
+          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the marker it appended to the PR body is UNSIGNED — no signature could be minted (AI_REVIEW_GATE_KEY is not configured), so check (c) stays RED and nothing can merge on this record. NOTHING was reviewed and nothing more should be bought: re-post the marker signed (its same-head append is idempotent) — \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<the review's comment id> --expect-head $HEAD\` — after fixing the key." ;;
+        0:absent)
+          die "$E_RECORD" "the carry re-record wrote a clean record at the CURRENT head (${HEAD:0:12}…) in the record STORE, but the PR BODY carries no marker bound to $REPO#$PR at that head — check (c) reads the BODY, not the store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). NOTHING was reviewed. Re-run the recorder to retry the post — \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<the review's comment id> --expect-head $HEAD\` (its append is idempotent) — then re-run the merge." ;;
+        0:*) : ;;   # the store half itself failed → the ordinary review, exactly as before
+        *)
+          die "$E_RETRY" "the carry re-record landed in the record STORE at ${HEAD:0:12}…, but the PR BODY could not be READ (gh rc=$CR_BODY_RC) so the marker check (c) consumes could not be confirmed — a failed READ is not a missing marker and is not a changed artifact, so NOTHING was reviewed and nothing more should be bought. RETRY once the API recovers; do not re-review for a read failure." ;;
+      esac
       err "$PROG: the carry re-record did NOT produce a clean record at ${HEAD:0:12}… (recorder rc=$CR_RC) — falling through to a full review rather than claiming a carry I cannot show."
     else
       err "$PROG: check-carry answered carry-patch but no clean-family record for $REPO#$PR is readable on this box — falling through to a full review (a carry re-record needs the reviewed head and verdict)."
@@ -3930,37 +3997,9 @@ fi
 if ! record_at_head "$HEAD"; then
   die "$E_RECORD" "record-review.sh returned rc=0 but NO clean record bound to head ${HEAD:0:12}… is in $STORE — refusing to report success (transcript: $TRANSCRIPT)"
 fi
-# The marker shape is check-pipeline-compliance.sh's REVIEW_RECORD_MARKER_RE (the
-# consumer's own definition, mirrored here — the producer's `MARKER=` line is its source).
-# ANY signed match wins over an earlier unsigned one at the same head: a body can carry
-# both (an unsigned marker from a key-less run, then a signed one from a re-run), and a
-# first-match scan would refuse the run that actually fixed it (P3, third fresh review).
-# ⛔ SHAPE, NOT HMAC — A DECLARED RESIDUAL (raised as P3 in rounds 9, 12 and 14). The PR body is
-# author-writable, so a pre-seeded `sig=<64 hex>` line can mask the unsigned marker this run just
-# posted; verifying the HMAC locally was implemented and REVERTED, because it makes the seam refuse
-# whenever no key is readable in the calling environment — including from a cell whose key is only
-# in the recorder's own environment — which would turn a whole class of legitimate records into
-# "unverifiable" at exactly the moment the reviewer was paid for. What is guaranteed here, and what
-# the success line says, is narrower and true: a marker BOUND TO THIS PR/HEAD/REPO carries a
-# signature field; the HMAC is the ai-review-gate's to verify (it is the only consumer that must,
-# and it does). An UNSIGNED marker — the case where the recorder itself could not mint one — is
-# still its own named failure, because record-review.sh says so loudly on stderr and the marker it
-# appends then has no `sig=`.
-marker_state() { # <body> -> signed | unsigned | absent
-  local body="$1" line pr_re head_re repo_lc saw_unsigned=0
-  pr_re="$PR"; head_re="$HEAD"
-  repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
-  while IFS= read -r line; do
-    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
-    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
-    [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
-    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
-    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; return 0; fi
-    saw_unsigned=1
-  done <<<"$body"
-  [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
-  printf 'absent'
-}
+# ⛔ `marker_state` IS DEFINED ABOVE (§2b), NOT HERE (P2, fresh review of #4256): the carry-patch arm
+# asks it before this point, because the record STORE is only half the attestation — check (c) reads the
+# PR BODY. One definition, two callers; the rationale lives with the definition.
 # ⛔ A FUNCTION CALLED IN A COMMAND SUBSTITUTION CANNOT PUBLISH A GLOBAL (P3, this lane — found by the
 # new arm going red for the WRONG reason): `MARKER_STATE="$(marker_state ...)"` runs in a subshell, so
 # the diff group it parsed died with it and the seam fell back to a live read that could itself fail.
