@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-4255-review-1795791822-p3949774-efc651a9",
+  "_sha": "f41e9117af0bbd6a725ff4b5b7143059012e1fa7",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795810171,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-4255-review-1795791822-p3949774-efc651a9",
+  "lease_until": 1795846771,
+  "pid": 3949774,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1795791822,
+  "state": "RUNNING",
+  "tag": "4255-review",
+  "worktree": "/home/cmux/agent-infra/.worktrees/4255-review-survives"
+}
