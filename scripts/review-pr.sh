@@ -490,8 +490,10 @@ fi
 # THE WALL THIS CLOSES (agent-infra#4255, measured 2026-11-26). Every other tool that
 # decides "is this record still valid?" asks ONE predicate — `record-review.sh
 # --check-carry`, the merge gate's own question answered by the merge gate's own code
-# (`extensions/review-enforcer`, `merge-one.sh`, `check-pipeline-compliance.sh`,
-# `atomic-lane` all consult it). THIS command did not. Its only pre-review guard was
+# (`extensions/review-enforcer/index.ts`, `scripts/orchestrator-harness/merge-one.sh`,
+# `scripts/check-pipeline-compliance.sh`, `scripts/orchestrator-harness/auto-rail.sh`,
+# `scripts/orchestrator-harness/fix-one.sh`, `tools/fleet/pr_state.py` all consult it).
+# THIS command did not. Its only pre-review guard was
 # `record_at_head`, which asks "is a clean record bound to this exact sha?" — so a PR
 # whose head moved for the ONE reason that never changes what was reviewed (the base
 # advanced and the branch was refreshed onto it: `gh pr update-branch`, `git merge
