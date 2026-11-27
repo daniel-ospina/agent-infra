@@ -3228,6 +3228,11 @@ reset
 # §BW(10)/(11) then added the store-vs-BODY arm and its mutation control (P2, fresh review of #4256):
 # the `carry-patch` seam used to exit 0 on the record STORE alone while check (c) reads the PR BODY —
 # 11 assertions, taking the stable surface from 1296 to 1307.
+# §BW(10b) then added the FAILED-body-read refusal's five assertions (P3, fresh review of #4257 round
+# 1 — the arm at `review-pr.sh`'s carry seam had no scenario reaching it): 5 assertions, taking the
+# stable surface from 1307 to 1312. ⛔ THE PIN AND THE MEASURED COMMENT WERE NOT MOVED WITH THEM
+# (P3, fresh review of #4257 round 2): a pin five under the true surface is a tripwire that five
+# deleted assertions walk straight through, on the file whose own rule is re-measure by running.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -5130,9 +5135,12 @@ rm -f "$MUT_CC"; reset
 # re-measure by RUNNING the suite and reading its printed total:
 #     pin_value = total − 6 × <the dialect count the run itself reported> − 2
 # Never copy a total printed on another box into this file, and never copy a pin value from a comment.
-# MEASURED at this head (the #4255 merge, §BW + the §BW(10)/(11) store-vs-body arm included): 1327
-# printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk), i.e. 1307 outside the
-# env-dependent loop; the four-dialect twin prints 1333 and wants the SAME 1307.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1307 ]; ck $? "assertion-count pin: >= 1307 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# MEASURED at this head (the #4255 merge, §BW + its §BW(10)/(11) store-vs-body arm AND the
+# §BW(10b) body-read refusal — P3, fresh review of PR #4257 round 2: the pin and this comment were
+# left five short when §BW(10b) landed, and a pin that low is a tripwire that five deleted
+# assertions walk through): 1332 printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no
+# gawk), i.e. 1312 outside the env-dependent loop; the four-dialect twin prints 1338 and wants the
+# SAME 1312.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1312 ]; ck $? "assertion-count pin: >= 1312 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

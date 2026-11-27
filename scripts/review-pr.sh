@@ -101,10 +101,10 @@
 #      marker — agent-infra#1224).
 #
 # EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8 and 10. Exit 9
-# is the record/artifact arm, and it covers SIX cases that need DIFFERENT remedies (a table
+# is the record/artifact arm, and it covers SEVEN cases that need DIFFERENT remedies (a table
 # that described it as "the one that can leave a record behind" pointed two of them at a
-# remedy that cannot work — P3, fresh review of #2288; the pin's two refusals were the fifth and
-# sixth, and merging them — P2, fresh review of PR #2988 — ordered a fresh PAID review where the
+# remedy that cannot work — P3, fresh review of #2288; the pin's two refusals were once ONE
+# entry, and merging them — P2, fresh review of PR #2988 — ordered a fresh PAID review where the
 # remedy was to re-run the recorder):
 #   * the recorder RAN and FAILED (non-zero) — nothing was recorded, and re-running the recorder is
 #     the remedy (the review comment already exists and is nameable);
@@ -124,7 +124,12 @@
 #     was paid for) — nothing was consumed and there is nothing to re-run against;
 #   * the notes or the verdict COMMENT could not be posted — no comment id exists to name as
 #     `--evidence`, so re-running the recorder cannot help either; the review exists only in
-#     the transcript.
+#     the transcript;
+#   * the `carry-patch` re-record LANDED in the record store but the BODY marker check (c) reads
+#     is absent or unsigned (the store is only half the attestation, and nothing was reviewed
+#     either way) — the remedy is to re-run the merge. Its sibling, a `carry-patch` BODY READ
+#     that FAILED, is ⛔ NOT this exit: a read that failed is neither a missing marker nor a
+#     changed artifact, so it exits 12 (RETRY) and must never buy a review.
 # A review COMMENT may already be posted when 7 or 9 exit — that comment IS the artifact
 # (it says what the reviewer found, and `Outcome: not-clean` when it was not clean); it is
 # not a verdict, and it is never composed when the verdict contradicts its own findings.
@@ -148,22 +153,28 @@
 #   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
 #      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
 #      retarget is the same refusal) — NOT recorded
-#   9  the record/artifact arm — six cases, see above: recording failed, the recorder was
+#   9  the record/artifact arm — SEVEN cases, see above: recording failed, the recorder was
 #      never reached, a comment post failed, the `--expect-head` pin's TWO opposite-remedy
 #      refusals (the head MOVED vs the pin could not be CHECKED), rc=0 arrived WITHOUT the
-#      artifact check (c)
-#      reads: no record bound to this head, or no marker in the PR body / a marker posted
-#      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check) — OR the `carry-patch`
-#      re-record landed in the record STORE while the BODY marker check (c) reads is absent
-#      or unsigned (the store is only half the attestation; nothing was reviewed either way),
-#      OR that same re-record's BODY read FAILED (a read failure is not a missing marker and
-#      not a changed artifact — re-run the merge, never buy a review). ⛔ SIX, not five: the
-#      long-form paragraph above counts the pin's two forms separately and this line did not
-#      (pre-existing drift, reconciled here — P3, fresh review of PR #4257)
+#      artifact check (c) reading a record bound to this head with a SIGNED marker in the PR
+#      body (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies, so
+#      "recorded" without it is a green report over a red check), and the `carry-patch`
+#      re-record landing in the record STORE while the BODY marker check (c) reads is absent
+#      or unsigned (the store is only half the attestation; nothing was reviewed either way).
+#      ⛔ SEVEN, and the count IS the point: this line has now been wrong in BOTH directions
+#      (four-vs-six, then eight items under the word "six"), so it enumerates exactly what it
+#      counts — the long-form paragraph above counts the pin's two forms separately, and the
+#      `carry-patch` body-read FAILURE is NOT one of these: it is exit 12, because a read that
+#      failed is neither a missing marker nor a changed artifact (P3, fresh review of PR #4257,
+#      round 2: the header filed that failure under 9 while :704 emits 12 — the code class an
+#      operator reads first must not point at the PAID retry budget for a refusal that bought
+#      nothing)
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
 #      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
-#      nothing was recorded. A failed read is not a changed artifact and must never buy a review
+#      nothing was recorded. A failed read is not a changed artifact and must never buy a review.
+#      Its SECOND cause is the `carry-patch` re-record that LANDED in the store but whose BODY
+#      read FAILED (gh rc≠0): the marker check (c) consumes could not be confirmed, which is
+#      also a failed read — RETRY once the API recovers, never re-review for a read failure
 #   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
 #      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
