@@ -2365,10 +2365,24 @@ SCANNER="$(sed -n "/^BLOCK_SPAN_AWK='/,/^'\$/p" "$SRC" | sed '1d;$d')"
 [ -n "$SCANNER" ]; ck $? "the scanner program was extracted from the SUT"
 printf '%s\n' "$SCANNER" > "$TMP/scanner.awk"
 AWKS_TRIED=""
+# ⛔ §AT IS THE ONE ENV-DEPENDENT SECTION, SO IT DECLARES ITS OWN SIZE (P1, MEASURED at 0dd5e5519 on
+# PR #4253). The loop below drives SIX assertions per awk implementation THIS box happens to have, and
+# the implementations differ by machine: this Linux box has three (awk→mawk, mawk, nawk) and no gawk;
+# GitHub's ubuntu runner has three the other way round (awk→gawk, gawk, mawk, no nawk); the box the
+# tail pin was calibrated on had four. Six assertions are therefore NOT a measure of what ran, and the
+# tail pin must never carry them in an absolute floor — they are SUBTRACTED there instead. The count
+# is taken here and asserted EXACTLY after the loop, so a dialect's arm dropping out is red ON ITS OWN
+# LINE.
+# The TAP rule for this case (testanything.org/tap-specification; node-tap "Planned assertion counts")
+# is that an implementation a platform does not have is DECLARED, never silently omitted, because an
+# omitted one silently moves every count that includes it. Declaring the number here — rather than
+# emitting a fake ✅ for a dialect nobody ran — is how this suite applies it without minting a false
+# PASS.
+_at_loop_base="$PASS"; _at_dialects=0
 for _a in awk gawk mawk nawk; do
   command -v "$_a" >/dev/null 2>&1 || continue
   "$_a" -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
-  AWKS_TRIED="$AWKS_TRIED $_a"
+  AWKS_TRIED="$AWKS_TRIED $_a"; _at_dialects=$((_at_dialects + 1))
   [ "$sp" = "0" ]; ck $? "…and COMPILES under $_a (rc=$sp)"
   # ⛔ COMPILING IS NOT WORKING (P0, seventh fresh review of #2288 — MEASURED: a `{0,3}` bridge compiles
   # everywhere but mawk does not SUPPORT interval expressions, so the count classifier matched NOTHING
@@ -2383,6 +2397,16 @@ for _a in awk gawk mawk nawk; do
     if [ "$_want" = "refuse" ]; then [ -n "$_got" ]; ck $? "…and the count classifier WORKS under $_a ($_line)"; else [ -z "$_got" ]; ck $? "…and stays quiet under $_a ($_line)"; fi
   done
 done
+# ⛔ THE DIALECT LOOP'S SIZE, PINNED EXACTLY (P1, MEASURED: the tail floor alone could not see this).
+# Six assertions per installed dialect is the contract; a dialect whose classifier arm lost its five
+# `_case` probes, or whose compile arm was deleted, would otherwise just make the total smaller — the
+# exact same symptom as a lost section, at a scale the tail floor cannot separate from "this box has
+# one fewer awk". `_at_loop_delta` is PASSES inside the loop, so a genuinely FAILING dialect arm also
+# shows here (it is already red on its own line) — never silently absorbed into a smaller total.
+_at_loop_delta=$((PASS - _at_loop_base))
+[ "$_at_loop_delta" -eq $((6 * _at_dialects)) ]; ck $? "§AT drove 6 assertions for each of the $_at_dialects installed dialect(s) ($_at_loop_delta assertions) — a dialect arm that drops out is named here instead of only shrinking the tail count"
+# What the tail pin subtracts: the dialect loop plus this assertion itself.
+_AT_ENV_ASSERTIONS=$((_at_loop_delta + 1))
 # ⛔ ONE DIALECT IS NOT "THE DIALECTS" (P2, third fresh review of #2288): the defect this arm exists
 # for was gawk refusing a program mawk accepted, so compiling under whichever `awk` PATH happens to
 # resolve to proves that box's dialect and nothing else. Every discoverable implementation is compiled
@@ -4726,6 +4750,16 @@ ck $rc "  ...and the extracted set is the cue set itself (remain…left), not tw
 rm -f "$BV"; reset
 # ══ end §BV ══
 
-[ "$PASS" -ge 1274 ]; ck $? "assertion-count pin: >= 1274 assertions executed (section loss tripwire)"
+# ⛔ THE PIN MUST NOT COUNT WHAT THE BOX DECIDES (P1, MEASURED at 0dd5e5519 on PR #4253). The floor
+# used to be an absolute total, and §AT drives six assertions per awk implementation the box happens to
+# have — so the same suite, at the same head, measured 1275 passes on a four-dialect box (the box the
+# 1274 was calibrated on, reproduced here by putting a `gawk` on PATH) and 1268 passes on this
+# three-dialect Linux box (awk→mawk, mawk, nawk; no gawk). GitHub's ubuntu runner is the three-dialect
+# case too (awk→gawk, gawk, mawk; no nawk), so 1274 was a red NO CHANGE COULD CLEAR on CI and here —
+# which is the opposite of a tripwire: a permanently-red assertion trains readers to ignore the pin and
+# hides the section loss it exists for. The pin therefore holds the STABLE surface (what §AT's dialect
+# loop drove is subtracted, and that loop's own size is pinned exactly above), so 1250 means the same
+# thing on every box, and a lost section still moves it.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1250 ]; ck $? "assertion-count pin: >= 1250 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
