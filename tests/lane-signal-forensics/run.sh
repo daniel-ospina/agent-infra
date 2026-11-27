@@ -238,6 +238,75 @@ else
   bad "the tracked extension source was MODIFIED BY THIS RUN — the mutants escaped the copy"
 fi
 
+# ── the TRUNCATED guard is TESTED, not merely measured (#4250, review F4) ──
+# `run_suite_verified` above is this driver's own confidence limit: a run that prints no
+# `tests:` summary is re-run ONCE and then graded UNKNOWN/(truncated) — never "the mutation did
+# not take". NOTHING here could fail if that guard were reverted to the old single-`run_suite`
+# form, and the suite would go green again on the exact CI shape that produced two contradictory
+# verdicts (job 140169171893). So this arm re-runs THIS driver with a `TSX_RUNNER` stub that
+# reproduces that shape — an arm failure PRINTED, the process cut off before any summary, exit 0 —
+# and asserts the composed verdict from the OUTSIDE: TRUNCATED is stated, the retry is taken
+# exactly once per label, and the two false verdicts are absent (a summary-less baseline read as
+# GREEN, a summary-less mutant read as "the assertions are vacuous"). The stub needs no tsx, so
+# this arm costs a few file copies.
+if [ "${LSF_TRUNCATION_GUARD:-}" = "child" ]; then
+  # The child's three labels ARE the stub's runs; re-entering this arm would fork forever.
+  echo
+  echo "── truncation-guard arm skipped: this run IS the truncated child"
+else
+  echo
+  echo "── guard: a summary-less run is TRUNCATED, not a green mutant (#4250)"
+  TRUNC_STUB="$FIX/truncating-runner.sh"
+  cat >"$TRUNC_STUB" <<'STUB'
+#!/usr/bin/env bash
+# CI's measured shape (job 140169171893): arms print, arm 1's failure is PRINTED, and the process
+# is cut off before the suite's own `tests: N passed, M failed` summary. Exit 0 is what made the
+# old code read this as "the mutant did not redden the suite".
+printf '  ✅ arm 1: the lane records its parent\n'
+printf '  ❌ arm 1: the signal log has exactly one record\n'
+exit 0
+STUB
+  chmod +x "$TRUNC_STUB"
+  GUARD_OUT="$FIX/truncation-guard.out"
+  LSF_TRUNCATION_GUARD=child TSX_RUNNER="$TRUNC_STUB" \
+      bash "$ROOT/tests/lane-signal-forensics/run.sh" >"$GUARD_OUT" 2>&1
+  GUARD_RC=$?
+  if [ "$GUARD_RC" -ne 0 ]; then
+    ok "the driver does not PASS a summary-less run (exit $GUARD_RC)"
+  else
+    bad "the driver reported PASS on a summary-less run (exit 0) — a truncated run is UNPROVEN, never green"
+    sed -n '1,40p' "$GUARD_OUT"
+  fi
+  if grep -q 'TRUNCATED' "$GUARD_OUT"; then
+    ok "the summary-less run is graded TRUNCATED/UNKNOWN, in its own words"
+  else
+    bad "the summary-less run was never called TRUNCATED — the guard is gone"
+    grep -E '^\s+(✅|❌)' "$GUARD_OUT" | head -20
+  fi
+  # The pre-fix verdict IS this string: "baseline is GREEN" was printed from a run that never
+  # emitted a summary — the false PASS the guard exists to refuse.
+  if grep -q 'baseline is GREEN' "$GUARD_OUT"; then
+    bad "a summary-less BASELINE was reported GREEN — a pass verdict from a run that never finished"
+  else
+    ok "a summary-less baseline is NOT reported green"
+  fi
+  # …and this one is the CONTRADICTION: "did NOT redden the suite" is a claim about the MUTANT,
+  # derived from a run that never finished, printed beside the arm-1 failure it denies.
+  if grep -q 'did NOT redden the suite' "$GUARD_OUT"; then
+    bad "a summary-less MUTANT was called 'did NOT redden the suite' — a claim about a mutant from an unfinished run"
+  else
+    ok "a summary-less mutant is never called 'did NOT redden' (no claim about an unfinished run)"
+  fi
+  # The retry notice is the `⟳` line run_suite_verified prints ONLY when it re-runs (its wording,
+  # "re-running it once", is not shared with the `bad` verdict lines, which name the attempt count).
+  TRUNC_RETRIES="$(grep -c 're-running it once' "$GUARD_OUT" 2>/dev/null || true)"
+  if [ "$TRUNC_RETRIES" = "3" ]; then
+    ok "each of the three labels was re-run exactly ONCE before its verdict (3 retry notices)"
+  else
+    bad "expected exactly one retry per label (3 notices), observed '$TRUNC_RETRIES'"
+  fi
+fi
+
 echo
 echo "assertions: baseline ${BASE_PASS} groups green; 2 mutants required red"
 if [ "$fails" -gt 0 ]; then
