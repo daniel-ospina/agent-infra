@@ -579,12 +579,27 @@ assert_contains "$OUT" 'OK' "T1 rows carry a verdict"
 # future template cannot repeat it. Pre-fix this arm is non-vacuous — the output carried the
 # DECLARATION ERROR row and the cache row read UNKNOWN.
 assert_absent "$OUT" 'DECLARATION ERROR' "T1 no shipped template is an unmapped declaration error (every .timer derives a graded row)"
-assert_contains "$OUT" 'eldato-disk-reaper-cache' "T1 the 10-minute size-triggered cache pass is a graded row, not an orphan template (#4169/#4250)"
+# ⛔ READ THE ROW BY FIELD ON THE TSV CONTRACT, AND ASSERT AN OBSERVABLE THAT DIFFERS BETWEEN THE
+# STATES (fresh-context review, F1/F2/F3). Two assertions stood here and NEITHER could fail:
+#   * `assert_contains "$OUT" 'eldato-disk-reaper-cache'` ("a graded row, not an orphan template") —
+#     pre-fix the row IS emitted, as UNKNOWN, and the DECLARATION ERROR detail names the base, so the
+#     string was present in both states. The row's PRESENCE is pinned below instead: `row_field`
+#     yields the empty string for an absent row, so the `OK` comparison fails if the row vanishes.
+#   * `assert_eq "$(row_field … 2)" 'must'` ("its class is must") — field 2 is `must` in BOTH states
+#     it named: the pre-fix DECLARATION ERROR emit HARDCODES `must` (activate-harness.sh:1014), and
+#     reverting the new `row_meta` arm falls back to the `*) printf 'must|3600'` default (:890). The
+#     class's real consequence — a `must` row is ARMED — is pinned behaviourally by T5's installer
+#     count, which is where a class regression would actually surface.
+# What is NOT covered by anything else is the CADENCE BOUND the fix declares (:870, `must|2400`),
+# so that is what is asserted: every other arm in this file stamps a FRESH trigger (:240-253) or the
+# 6-day-old one (:712), both far outside the 2400-vs-3600 window, so reverting the declaration to the
+# 3600 s default kept the whole suite green. The bound is rendered on the row itself, on the default
+# (non-beacon) dispatch (:1066 → :362), so field 4 is where it is observable.
 RUN --check --tsv
 assert_eq "$(row_field "$OUT" 'eldato-disk-reaper-cache' 3)" 'OK' \
     "T1 the cache row is graded on its own timer, not skipped"
-assert_eq "$(row_field "$OUT" 'eldato-disk-reaper-cache' 2)" 'must' \
-    "T1 and its class is `must` — the capability is required, not a dated option"
+assert_contains "$(row_field "$OUT" 'eldato-disk-reaper-cache' 4)" 'cadence allows 2400s' \
+    "T1 and it is graded on ITS OWN 2400s cadence (row_meta), never the 3600s default fallback (#4250)"
 
 # ── T2: NON-VACUITY — remove one unit and --check must name it and exit non-zero ──────────────
 rm -f "$FX/units/system/eldato-harness-apply.timer" "$FX/units/system/eldato-harness-apply.service"
