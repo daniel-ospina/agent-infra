@@ -245,10 +245,13 @@ fi
 # form, and the suite would go green again on the exact CI shape that produced two contradictory
 # verdicts (job 140169171893). So this arm re-runs THIS driver with a `TSX_RUNNER` stub that
 # reproduces that shape — an arm failure PRINTED, the process cut off before any summary, exit 0 —
-# and asserts the composed verdict from the OUTSIDE: TRUNCATED is stated, the retry is taken
-# exactly once per label, and the two false verdicts are absent (a summary-less baseline read as
-# GREEN, a summary-less mutant read as "the assertions are vacuous"). The stub needs no tsx, so
-# this arm costs a few file copies.
+# and asserts the composed verdict from the OUTSIDE — FIVE things, every one of them now
+# attributable (it reds under the revert of the code it is written about): (1) every one of the
+# three labels is graded "no summary line in 2 attempts" AND the run is refused (exit != 0) — the
+# finding this arm used to miss, because `rc != 0` alone is already true of the PRE-fix driver,
+# (2) TRUNCATED is stated, (3) a summary-less baseline is not read as GREEN, (4) a summary-less
+# mutant is not read as "the assertions are vacuous", (5) the retry is taken exactly once per label.
+# The stub needs no tsx, so this arm costs a few file copies.
 if [ "${LSF_TRUNCATION_GUARD:-}" = "child" ]; then
   # The child's three labels ARE the stub's runs; re-entering this arm would fork forever.
   echo
@@ -271,10 +274,26 @@ STUB
   LSF_TRUNCATION_GUARD=child TSX_RUNNER="$TRUNC_STUB" \
       bash "$ROOT/tests/lane-signal-forensics/run.sh" >"$GUARD_OUT" 2>&1
   GUARD_RC=$?
-  if [ "$GUARD_RC" -ne 0 ]; then
-    ok "the driver does not PASS a summary-less run (exit $GUARD_RC)"
+  # ⛔ THE EXIT STATUS ALONE COULD NOT FAIL THIS ARM (#4251 review, finding 1). The PRE-fix driver
+  # already exited non-zero on this shape: with no summary it calls `bad` from the parse guard
+  # (`:142`, "baseline printed no parsable assertion count") and from BOTH "did NOT redden the
+  # suite" arms — so `rc != 0` was already the pre-fix verdict, and an rc-only arm is green on
+  # exactly the code this guard replaces. It is green under any UNRELATED child failure too (a
+  # missing `node`, a broken `mutate`, an unwritable `$FIX`): it attributes nothing.
+  # So bind it to what ONLY the fixed driver emits — the per-label TRUNCATED verdict, in its own
+  # words, once per label — and keep the refusal as the other half of the same assertion. The retry
+  # notice (`⟳ … printed NO summary line (rc=N)`) does not contain "in 2 attempts", so this counts
+  # final verdicts only; reverting `run_suite_verified` to the old single-`run_suite` form prints
+  # none of them and reds here.
+  TRUNC_VERDICTS="$(grep -c 'printed NO summary line in 2 attempts' "$GUARD_OUT" 2>/dev/null || true)"
+  if [ "$GUARD_RC" -ne 0 ] && [ "$TRUNC_VERDICTS" = "3" ]; then
+    ok "all three labels are graded 'NO summary line in 2 attempts' — TRUNCATED, not a verdict (exit $GUARD_RC)"
   else
-    bad "the driver reported PASS on a summary-less run (exit 0) — a truncated run is UNPROVEN, never green"
+    if [ "$GUARD_RC" -eq 0 ]; then
+      bad "the driver reported PASS on a summary-less run (exit 0) — a truncated run is UNPROVEN, never green"
+    else
+      bad "expected the truncated verdict on all three labels (3), observed '$TRUNC_VERDICTS' (exit $GUARD_RC) — a summary-less run was graded as something other than TRUNCATED"
+    fi
     sed -n '1,40p' "$GUARD_OUT"
   fi
   if grep -q 'TRUNCATED' "$GUARD_OUT"; then
