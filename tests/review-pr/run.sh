@@ -3225,6 +3225,9 @@ reset
 # stable surface from 1265 to 1296. §BW landed by MERGE, so it was renumbered from the §BV the branch
 # had chosen while `main` was still on §BU — `main` took §BV for #4233-reopened first, and a duplicate
 # section name would make every `§BV(n)` cross-reference in this file ambiguous.
+# §BW(10)/(11) then added the store-vs-BODY arm and its mutation control (P2, fresh review of #4256):
+# the `carry-patch` seam used to exit 0 on the record STORE alone while check (c) reads the PR BODY —
+# 11 assertions, taking the stable surface from 1296 to 1307.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -5024,6 +5027,51 @@ run "$SRC" 2284
 [ -f "$TMP/pi-runs.txt" ]; ck $? "(8) …the reviewer WAS spawned (a changed diff is still reviewed)"
 [ -f "$TMP/record-argv.txt" ]; ck $? "(8) …and the record is minted"
 
+# (10) ⛔ THE RECORD STORE IS ONLY HALF THE ATTESTATION (P2, fresh review of #4256 at
+# `a3ee7be7dfda`). The `carry-patch` arm re-records and exits 0 on `record_at_head_family`, which reads
+# `$HOME/.pi/agent/reviews` — while check (c) and `ai-review-gate` read the SIGNED MARKER IN THE PR BODY.
+# The recorder's evidence post is BEST-EFFORT and exits 0 when the body read or PATCH fails, so this
+# scenario — record file present at the live head, NO marker appended — used to print "NO REVIEW OWED …
+# the record was RE-RECORDED" and exit 0 while the gate stayed RED and no review existed. It is also
+# self-locking: the next `--check-carry` reads the store, answers `head`, and the seam exits 5, so
+# nothing ever re-posts the marker. The seam must instead name the missing half.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_MARKER_MISSING=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(10) carry-patch with NO body marker: exit 9, never the 'NO REVIEW OWED' claim (rc=$(rc_of))"
+no_reviewer; ck $? "(10) …no reviewer spawned (the record IS current — the BODY marker is the missing half, not the review)"
+out_not_has "NO REVIEW OWED"; ck $? "(10) …and the success line is NOT printed over a store-only attestation"
+err_has "PR BODY carries no marker"; ck $? "(10) …the refusal names the half that is missing (check (c) reads the body)"
+grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "(10) …and the STORE really was re-recorded at the live head — so the arm cannot be satisfied by the re-record failing"
+# …the second half of the same harm: rc=0 with an UNSIGNED marker (no key on the box) is a record the
+# gate fails closed on, and this file already refuses that shape by name after a fresh record (:4009).
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_NO_KEY=1
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(10) carry-patch with an UNSIGNED body marker: exit 9 too (rc=$(rc_of))"
+no_reviewer; ck $? "(10) …no reviewer spawned for an unsigned re-record either"
+err_has "UNSIGNED"; ck $? "(10) …and the refusal names the missing signature rather than a missing marker"
+
+# (11) MUTATION CONTROL for (10): weaken the marker gate to "the store landed" and the marker-less
+# scenario exits 0 — so §BW(10) is the gate's doing, not the fixture's.
+MUT_MARK="$TMP/mutant-nomarkergate.sh"
+sed 's/^      . "\$CR_MARKER" = signed . && CR_MARKER_OK=1$/      CR_MARKER_OK=1/' "$SRC" > "$MUT_MARK"; chmod +x "$MUT_MARK"
+if cmp -s "$SRC" "$MUT_MARK"; then
+  fail "§BW(11) the mutation did not apply — the marker gate changed shape, so this control proves NOTHING"
+else
+  pass "§BW(11) mutation applied (the signed-marker gate made unconditional)"
+  reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+  FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_MARKER_MISSING=1
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_MARK" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "§BW(11) the MUTANT ACCEPTS a store-only attestation (rc=$(rc_of), want 0) — so §BW(10)'s refusal is the gate's doing"
+  out_has "NO REVIEW OWED"; ck $? "§BW(11) …and prints the false success line the gate exists to stop"
+fi
+rm -f "$MUT_MARK"; reset
+
 # (9) MUTATION: disable the carry arm and the §BW(1) scenario pays for a review — so §BW(1) is the
 # arm's doing and not the fixture's.
 MUT_CC="$TMP/mutant-nocarry.sh"
@@ -5063,9 +5111,9 @@ rm -f "$MUT_CC"; reset
 # re-measure by RUNNING the suite and reading its printed total:
 #     pin_value = total − 6 × <the dialect count the run itself reported> − 2
 # Never copy a total printed on another box into this file, and never copy a pin value from a comment.
-# MEASURED at this head (the #4255 merge, §BW included): 1316 printed on a three-dialect Linux box
-# (awk→mawk, mawk, nawk; no gawk), i.e. 1296 outside the env-dependent loop; the four-dialect twin
-# prints 1322 and wants the SAME 1296.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1296 ]; ck $? "assertion-count pin: >= 1296 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# MEASURED at this head (the #4255 merge, §BW + the §BW(10)/(11) store-vs-body arm included): 1327
+# printed on a three-dialect Linux box (awk→mawk, mawk, nawk; no gawk), i.e. 1307 outside the
+# env-dependent loop; the four-dialect twin prints 1333 and wants the SAME 1307.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1307 ]; ck $? "assertion-count pin: >= 1307 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

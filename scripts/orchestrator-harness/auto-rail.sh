@@ -972,7 +972,10 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
 #     7  the reviewer FOUND ISSUES — not recorded, findings posted as the comment
 #     8  the head moved during the review        9  the record/artifact arm failed
 #     4  no `pi`                                 75 a spawn-point load refusal
-#     → 0/5 clean, 7 issues, 4/75 REFUSED (nothing was consumed: see `refused` in review_action),
+#    12  a carry-before-review answer that was NOT a review (`unreadable`/`surface-unknown`: the
+#        recorder could not READ the diff/head), or a carry re-record whose BODY marker could not be
+#        read — nothing was bought either way      13 the head's CHECK SURFACE is RED (`red-surface`)
+#     → 0/5 clean, 7 issues, 4/12/13/75 REFUSED (nothing was consumed: see `refused` in review_action),
 #       everything else retry (the review may have been paid for, so the attempt budget applies).
 # ⛔ A STALE RECORD IS TREATED AS "NO ATTESTATION FOR THE HEAD THAT WOULD MERGE", WHICH IS A DELIBERATE
 # COST, STATED RATHER THAN HIDDEN. `record-review.sh --check-carry` would sometimes answer that the
@@ -1004,7 +1007,16 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
     # refusals would otherwise mark a head nobody ever read as EXHAUSTED, permanently, and the comment
     # published for it would claim the review had been paid for. Their own state retries on TIME alone.
     # rc=3 is deliberately NOT here: `review-pr.sh` exits 3 on several paths AFTER the reviewer ran.
-    4|75) printf 'refused\n';;
+    # ⛔ 12 AND 13 ARE REFUSALS TOO (P2, fresh review of PR #4256 at `a3ee7be7dfda`). `review-pr.sh`
+    # documents both as "no review was bought and nothing was recorded": 12 is a failed READ of the live
+    # diff/head (or of the PR body when confirming a carry's marker), 13 is a RED CHECK SURFACE (a
+    # broken build is not a review finding). They landed in `*)` → `retry`, the class that SPENDS the
+    # paid budget — so a head whose check surface was transiently red or unreadable was refused in
+    # seconds three times, reached REVIEW_MAX_ATTEMPTS, and was held EXHAUSTED for
+    # REVIEW_ATTEMPT_WINDOW_S (21600 s = 6 h) including AFTER the checks went green. Same defect the
+    # round-2 note above fixed for 4/75, in the same direction: a review that was never bought must not
+    # be charged as one.
+    4|75|12|13) printf 'refused\n';;
     *)   printf 'retry\n';;
   esac
 }

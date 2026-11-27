@@ -1707,6 +1707,23 @@ _r4b="$_rdir/r4b.out"; run_review "$rev_4" 42 acme/widget "$_r4b"
 [ "$(review_state "$_r4b")" = refused ] \
   || bad "rc=4 (pi unavailable, before any review is paid for) must read as 'refused' (got '$(review_state "$_r4b")')"
 rm -f "$rev_4"
+# ⛔ 12 AND 13 ARE REFUSALS TOO (P2, fresh review of agent-infra#4256 at `a3ee7be7dfda`). `review-pr.sh`
+# grew both codes with the carry-before-review seam and documents each as "no review was bought and
+# nothing was recorded": 12 is a failed READ of the live diff/head (or of the PR body when confirming a
+# carry's marker), 13 is a RED CHECK SURFACE. Neither was in the refused arm, so both fell to `*` →
+# `retry` — the class that SPENDS the paid budget — and a head whose check surface was transiently red or
+# unreadable was refused in seconds three times, reached REVIEW_MAX_ATTEMPTS, and was held EXHAUSTED for
+# REVIEW_ATTEMPT_WINDOW_S (21600 s = 6 h), including AFTER the checks went green. This is the same defect
+# the round-2 note fixed for 4/75, in the same direction.
+for _rc in 12 13; do
+  _rvf=$(mktemp); printf '#!/bin/bash\nexit %s\n' "$_rc" > "$_rvf"; chmod +x "$_rvf"
+  _rxf="$_rdir/rf-refused-$_rc.out"; run_review "$_rvf" 42 acme/widget "$_rxf"
+  [ "$(review_state "$_rxf")" = refused ] \
+    || bad "rc=$_rc (a failed READ / a RED check surface: nothing was bought) must read as 'refused' (got '$(review_state "$_rxf")') — folded into 'retry' it spends the PAID attempt budget, and three refusals mark a head nobody ever read as EXHAUSTED for the whole window"
+  review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 1 ] \
+    || bad "rc=$_rc with the dispatch budget already spent must STILL dispatch (rc 1, got $?) — a transiently red or unreadable surface must not block a head permanently"
+  rm -f "$_rvf"
+done
 review_action refused 0 "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 0 ] \
   || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
 review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) 0; [ $? -eq 1 ] \
