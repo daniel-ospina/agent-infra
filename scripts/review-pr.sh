@@ -83,6 +83,18 @@
 #      exists but its PR-body marker is missing is the documented one: re-run
 #      `record-review.sh` — its same-head write is idempotent (#1709 rec 7) and its
 #      marker post is idempotent.)
+#   2b. It never BUYS A REVIEW for an artifact that did not change (agent-infra#4255).
+#      Before the reviewer is spawned it asks the recorder's OWN predicate
+#      (`--check-carry`, the merge gate's own question — and `--recover-body` first
+#      when this box holds no record though the PR body carries a signed marker).
+#      `carry` = the gate already carries the record: nothing is re-recorded and
+#      nothing is reviewed. `carry-patch` = the rendered diff moved but every
+#      reviewed line is identical (#1377): the record is RE-RECORDED at the current
+#      head, mechanically, and no reviewer is spawned. `fresh` — or any answer this
+#      script cannot act on — falls through to the ordinary review, so a broken
+#      predicate can cost money but can never produce a false clean. `unreadable`
+#      and `surface-unknown` exit 12 (RETRY: a failed READ is not a changed
+#      artifact) and `red-surface` exits 13 (a red build is not a review finding).
 #   3. It never edits a PR body. Findings go in a COMMENT. `record-review.sh`
 #      appends its own signed marker at record time; nothing here PATCHes a body,
 #      before or after a record (a body edit after recording is what wipes the
@@ -141,6 +153,11 @@
 #      reads: no record bound to this head, no marker in the PR body, or a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
 #      so "recorded" without it is a green report over a red check)
+#   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
+#      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
+#      nothing was recorded. A failed read is not a changed artifact and must never buy a review
+#   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
+#      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
 #      143 — NOTHING was posted and NO record was written (the child is not orphaned)
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
@@ -201,7 +218,7 @@ set -uo pipefail
 
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
-E_VACUOUS=11
+E_VACUOUS=11 E_RETRY=12 E_RED=13
 
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -468,6 +485,165 @@ if record_at_head "$HEAD"; then
   err "    $RECORDER $PR $HEAD clean $REPO --evidence comment:<id> --expect-head $HEAD"
   exit "$E_ALREADY"
 fi
+
+# ── 2b) A STALE HEAD IS NOT A STALE REVIEW — ASK THE RECORDER BEFORE PAYING ──
+# THE WALL THIS CLOSES (agent-infra#4255, measured 2026-11-26). Every other tool that
+# decides "is this record still valid?" asks ONE predicate — `record-review.sh
+# --check-carry`, the merge gate's own question answered by the merge gate's own code
+# (`extensions/review-enforcer`, `merge-one.sh`, `check-pipeline-compliance.sh`,
+# `atomic-lane` all consult it). THIS command did not. Its only pre-review guard was
+# `record_at_head`, which asks "is a clean record bound to this exact sha?" — so a PR
+# whose head moved for the ONE reason that never changes what was reviewed (the base
+# advanced and the branch was refreshed onto it: `gh pr update-branch`, `git merge
+# origin/main`, a rebase) answered NO and bought a full 20–40 minute review.
+#
+# WHY THE HEAD MOVING DOES NOT MEAN THE REVIEW IS STALE. The gate's binding digest keeps
+# hunk CONTEXT (#1362 D1), so when `main` lands work in a file this PR also touches the
+# rendered three-dot diff moves while every AUTHORED line is byte-identical. MEASURED
+# locally 2026-11-26 with the shared normalizer (one PR adding a line, `main` inserting a
+# line inside the hunk's context window, then `git merge main` into the branch):
+#   at review time      binding=dfebaa86… patch=f7f1d204…
+#   after base advance  binding=4d4d1118… patch=f7f1d204…   ← binding MOVED, patch IDENTICAL
+# The recorder already answers that case: `carry` (the rendered diff is byte-identical, the
+# gate carries the record as-is — nothing to do at all) and `carry-patch` (#1377: the
+# rendered diff moved, the reviewed patch did not — re-record mechanically, "do NOT run a
+# review cycle"). Reading either of those as "buy a review" is the defect.
+#
+# IT IS READ-ONLY AND IT CANNOT MINT A VERDICT. `--check-carry` writes nothing; the only
+# write this block can cause is a re-record at the CURRENT head through the recorder's own
+# carry arms, which re-prove content identity themselves and REFUSE when the lane's
+# commits moved. When this block cannot establish that the reviewed artifact is unchanged
+# it does NOT refuse — it falls through to the ordinary review below, i.e. the pre-change
+# behaviour, so a broken predicate can only cost money, never a false clean.
+CC_TOKEN=""; CC_RC=0; CC_OUT=""; CC_ERR=""
+# cc_ask — ONE `--check-carry`, keeping BOTH the exit code and the answer. The answer is
+# field 1 of stdout (head|carry|carry-patch|fresh|unreadable|red-surface|surface-unknown|
+# red-base-owned|norecord|nodigest); the exit code is a SECOND, independent statement, and
+# the two are never collapsed into one (a caller that reads only `rc` gets the pre-#3440
+# bug back). stdout and stderr are captured SEPARATELY because the recorder writes its
+# human-readable remedy to stderr.
+cc_ask() {
+  local f
+  f="$(mktemp 2>/dev/null)" || { CC_RC=1; CC_TOKEN=""; CC_OUT=""; CC_ERR=""; return 0; }
+  CC_OUT="$("$RECORDER" --check-carry "$PR" "$REPO" 2>"$f")"; CC_RC=$?
+  CC_ERR="$(cat "$f" 2>/dev/null || true)"
+  rm -f "$f"
+  CC_TOKEN="${CC_OUT%%$'\t'*}"
+  case "$CC_TOKEN" in
+    head|carry|carry-patch|fresh|unreadable|red-surface|surface-unknown|red-base-owned|norecord|nodigest) ;;
+    *) CC_TOKEN="" ;;
+  esac
+}
+# record_at_head_family — like `record_at_head`, but accepts the TIERED clean verdicts the
+# GitHub gate accepts too (`clean-micro`, `clean-low`, #4755). Used only to CONFIRM a carry
+# re-record landed; the unchanged-head refusal above deliberately stays on full `clean`
+# (re-recording `clean-micro` as `clean` would be a stronger claim than the reviewer made).
+record_at_head_family() { # <sha> -> 0 iff a clean(-micro|-low) record bound to <sha> for THIS repo exists
+  local f txt r
+  for f in "$QUAL" "$LEGACY"; do
+    [ -f "$f" ] || continue
+    txt="$(cat "$f" 2>/dev/null || true)"
+    [[ "$txt" == *"\"head_sha\":\"$1\""* ]] || continue
+    case "$txt" in
+      *'"repo":'*)
+        r="$(printf '%s' "$txt" | sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' | command head -1)"
+        if [ -n "$r" ] && [ "$r" != "$REPO" ]; then continue; fi ;;
+    esac
+    case "$txt" in
+      *'"verdict":"clean"'*|*'"verdict":"clean-micro"'*|*'"verdict":"clean-low"'*) return 0 ;;
+    esac
+  done
+  return 1
+}
+# record_head_verdict — the RECORDED head and its verdict, for the carry re-record. The
+# positional SHA handed to the recorder must be the REVIEWED one, never the live head: the
+# recorder enters its carry arms only when the two differ (record-review.sh's
+# `[ "$CURRENT_HEAD" != "$SHA" ]`), and a same-head call is a FRESH mint that then refuses a
+# `clean` for a missing `--evidence` (tortoise#7391) — i.e. a guaranteed no-op that buys the
+# very review this block exists to prevent. `--expect-head` cannot be used here either: the
+# recorder refuses a pin whenever the PR head is not the pin, which is precisely this case.
+record_head_verdict() {
+  local f txt r h v
+  for f in "$QUAL" "$LEGACY"; do
+    [ -f "$f" ] || continue
+    txt="$(cat "$f" 2>/dev/null || true)"
+    case "$txt" in
+      *'"repo":'*)
+        r="$(printf '%s' "$txt" | sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' | command head -1)"
+        if [ -n "$r" ] && [ "$r" != "$REPO" ]; then continue; fi ;;
+    esac
+    h="$(printf '%s' "$txt" | sed -n 's/.*"head_sha":"\([0-9a-f]\{40\}\)".*/\1/p' | command head -1)"
+    v="$(printf '%s' "$txt" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' | command head -1)"
+    case "$v" in clean|clean-micro|clean-low) ;; *) continue ;; esac
+    [ "${#h}" -eq 40 ] || continue
+    printf '%s\t%s\n' "$h" "$v"
+    return 0
+  done
+  return 1
+}
+cc_ask
+# A `norecord`/`nodigest` answer on a box that never recorded this PR is NOT evidence of
+# changed content: the signed marker may live in the PR BODY (#2872). Rebuild the store
+# record from it — the recorder verifies the HMAC itself, so a body edit cannot mint one —
+# and ask again. MEASURED 2026-11-26 on the four PRs #4255 names: `--check-carry` answered
+# `norecord` for #14746 and #14774 although BOTH bodies carry a correctly-signed marker, so
+# without this arm every one of them looked unreviewed and bought a review.
+case "$CC_TOKEN" in
+  norecord|nodigest)
+    if "$RECORDER" --recover-body "$PR" "$REPO" >/dev/null 2>&1; then cc_ask; fi ;;
+esac
+case "$CC_TOKEN" in
+  head)
+    err "$PROG: the recorder says a clean record is ALREADY bound to head ${HEAD:0:12}… for $REPO#$PR (check-carry rc=$CC_RC) — nothing is stale and no review is owed, so none was bought."
+    err "  Re-record only if the marker is missing from the PR body: $RECORDER $PR $HEAD <same verdict> $REPO --evidence comment:<id> --expect-head $HEAD"
+    exit "$E_ALREADY" ;;
+  carry|red-base-owned)
+    # THE BEST CASE: the rendered diff is byte-identical, so the merge gate ALREADY carries
+    # this record across the head move. There is nothing to re-record and nothing to review.
+    log_line "$PROG: NO REVIEW OWED — the recorder's own predicate says the reviewed DIFF is unchanged at the current head (check-carry rc=$CC_RC, token=$CC_TOKEN)."
+    log_line "  The head moved for a base-only reason; the merge gate carries this record as-is. Nothing was re-recorded and no reviewer was spawned."
+    [ -n "$CC_ERR" ] && printf '%s\n' "$CC_ERR" >&2
+    exit 0 ;;
+  carry-patch)
+    # #1377: the rendered diff moved (hunk context/line numbers), the reviewed PATCH did not.
+    # Re-record at the CURRENT head — the recorder re-proves it — and buy no review.
+    RV_PAIR="$(record_head_verdict || true)"
+    RH=""; RV=""
+    case "$RV_PAIR" in
+      *$'\t'*) RH="${RV_PAIR%%$'\t'*}"; RV="${RV_PAIR#*$'\t'}" ;;
+    esac
+    if [ -n "$RH" ] && [ -n "$RV" ]; then
+      CR_LOG="$(mktemp 2>/dev/null || true)"
+      if [ -n "$CR_LOG" ]; then
+        "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >"$CR_LOG" 2>&1; CR_RC=$?
+      else
+        "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >/dev/null 2>&1; CR_RC=$?
+      fi
+      if [ "$CR_RC" -eq 0 ] && record_at_head_family "$HEAD"; then
+        log_line "$PROG: NO REVIEW OWED — the reviewed PATCH is byte-identical at ${RH:0:12}… and ${HEAD:0:12}… (check-carry rc=$CC_RC, token=carry-patch)."
+        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The reviewer was not spawned."
+        [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /'
+        [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
+        exit 0
+      fi
+      [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /' >&2
+      [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
+      err "$PROG: the carry re-record did NOT produce a clean record at ${HEAD:0:12}… (recorder rc=$CR_RC) — falling through to a full review rather than claiming a carry I cannot show."
+    else
+      err "$PROG: check-carry answered carry-patch but no clean-family record for $REPO#$PR is readable on this box — falling through to a full review (a carry re-record needs the reviewed head and verdict)."
+    fi ;;
+  unreadable|surface-unknown)
+    die "$E_RETRY" "the recorder could NOT READ the artifacts it decides on (check-carry rc=$CC_RC, token=$CC_TOKEN) — that is a failed READ, never a changed artifact, so no review was bought and nothing was recorded.
+$CC_ERR
+  RETRY once the API/transport recovers; do not re-review for a read failure." ;;
+  red-surface)
+    die "$E_RED" "the head's CHECK SURFACE IS RED and the red belongs to this PR (check-carry rc=$CC_RC) — a broken build is not a review finding, so no review was bought and nothing was recorded.
+$CC_ERR
+  Fix or re-run the failing checks, then re-run this command." ;;
+  *) : ;;   # fresh / norecord / nodigest / no answer at all → a review is genuinely owed
+            # (or the predicate could not be consulted), which is the pre-change behaviour
+
+esac
 
 # ── 3) the self-contained prompt: diff + claimed behaviour + linked issues ───
 # Nothing here is inferred from the caller's checkout: this runs for a lander who
