@@ -4622,8 +4622,13 @@ excluded, by `BRANCH_CLAIM_EXCLUDE_PATTERN` (default `main master`). The measure
 is gone: 6 of 10 open PRs were on `feat/*`/`pr-go/*` branches the old default
 (`integration/* fix/* rescue/*`) never inspected, and no merge landed for 5.2 h. The acquire was always
 pattern-independent, so the only thing narrower than the key was the guard. `branch-claim.sh check-hook`
-verifies that the hook is actually armed in a checkout (and `cloud-cell-doctor.sh hygiene` runs it on a
-clock, naming the box and the fault), because the hook was measured present on 1 cell of 5.
+verifies that the hook is actually armed in a checkout, and `cloud-cell-doctor.sh hygiene` asks it on a
+clock **about the checkout the box pushes from (`$REPO`)** — recording `HOOK-OK` / `HOOK-FAIL <host>
+<fault>` in the pass record, so an unarmed box is named instead of silent. That row is REPORTED, never
+fatal: it never touches the disk-reclaim role's own rc, because a fresh clone, a CI runner and a new
+worktree all legitimately have no hook yet and an alarm that can never clear gets trained away (the same
+reason `status` reads the reaper's `rc=4` as INERT rather than FAILED). The hook was measured present on 1
+cell of 5.
 The measured reason: on tortoise PR #11385 two lanes wrote ONE PR for ~6 h — 11 superseded heads, five
 clean reviews on five different heads, **0 landings** — because the per-head key (`<PR>-<head12>`) cannot
 express this. The losing writer *creates a new head*, so it mints a fresh key and wins its own CAS every

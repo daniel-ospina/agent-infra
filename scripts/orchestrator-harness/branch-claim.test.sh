@@ -17,7 +17,8 @@
 #   4 FENCING              a token that is no longer the claim ref's tip cannot push (the property
 #                          is inherited from claims.sh, not re-derived here).
 #   5 FENCED RELEASE       a peer cannot release the holder's claim.
-#   6 SCOPE                an ordinary feature branch is never gated — and its subject is CLAIMED first,
+#   6 SCOPE                the TRUNK is out of scope by KIND (a CLAIMED `main` still pushes), while an
+#                          ordinary lane branch stays IN scope — and the trunk subject is CLAIMED first,
 #                          so the arm can fail (cycle-3 review F2: unclaimed, rc was 0 either way).
 #   7 RECOVERY             after the holder releases, it can re-acquire AND push — the gate is not
 #                          a dead end.
