@@ -82,11 +82,28 @@ It drops exactly three fields, all of which a REBASE rewrites even when the
 reviewed change is untouched — and keeps everything else verbatim:
 
   * `index <old>..<new>` lines (blob ids are rewritten by every rebase);
-  * `@@ … @@` hunk headers (line numbers move);
+  * the hunk header's LINE NUMBERS AND COUNTS — `@@ -N,C +N,C @@` becomes
+    `@@<SECTION>`: the `@@` frame is kept with its enclosing-scope heading
+    (`@@ def alpha():`), and only the numbers are dropped;
   * hunk CONTEXT lines (a leading single space) — the lines AROUND the change,
     which move whenever the base lands work in the same file. This is the field
     the default mode deliberately keeps, and the one that made a rebase onto a
     moved base look like a changed artifact (agent-infra #1377).
+
+WHY THE SECTION HEADING IS KEPT (agent-infra #4256, fresh review). Dropping the
+hunk frame ENTIRELY made the projection POSITION-BLIND: the same `+`/`-` lines
+relocated into a different enclosing scope — the `+GATE_BYPASS` reviewed inside
+`def alpha()` and shipped inside `def zulu()` — projected IDENTICALLY, so a
+force-push that only MOVES the reviewed lines carried the verdict with no base
+advance and no re-review. Keeping the scope heading costs nothing on a rebase
+(the heading is derived from the enclosing definition, which the base
+advance did not touch) and refuses that relocation. It is not a complete
+position binding: a relocation between two hunks under the SAME heading (or in
+a heading-less file) still projects the same. That residual is DECLARED, and it
+is bounded by the acceptance rule that consumes this projection: a patch match
+is only consulted after the marker's own `diff=` has been reproduced from its
+signed `@ sha` against the current base (`patch_arm_ok` in tortoise's
+gate; `patch_dimension_carry` in record-review.sh).
 
 KEPT, verbatim and in order: the `diff --git` / `---` / `+++` lines (so the PATCH
 IDENTITY includes the PATH, which `git patch-id` does not commit to), every
@@ -144,8 +161,14 @@ def _patch_only_entry(entry: list[str]) -> list[str]:
     for line in entry:
         if _INDEX_RE.match(line):
             continue              # blob ids are rewritten by every rebase
-        if _HUNK_RE.match(line):
-            continue              # line numbers move; the counts derive from content
+        hunk = _HUNK_RE.match(line)
+        if hunk is not None:
+            # Line numbers and counts move on every rebase/base advance; the
+            # enclosing-scope heading does NOT, and it is the only position
+            # signal available that survives a base advance. Emit the frame with
+            # the heading and no numbers (see the module docstring).
+            out.append("@@" + hunk.group(7))
+            continue
         if line.startswith(" "):
             # CONTEXT. The only field here that a BASE MOVE rewrites without the
             # reviewed change moving — dropped for the patch identity alone.
