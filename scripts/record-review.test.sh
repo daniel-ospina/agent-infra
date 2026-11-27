@@ -1476,7 +1476,7 @@ assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 401 
 # identical: on a healthy run it certifies head/base/count exactly as the
 # temp-file arm does, so announcing "the surface cap is UNVERIFIED" there told the
 # operator the cap was unverified on a run where it was fully verified — the
-# signal-that-stops-distinguishing-anything problem `record-review.sh:861-868`
+# signal-that-stops-distinguishing-anything problem `record-review.sh:874-881`
 # describes, inverted, and it fired for both callers including the
 # machine-consumed `--print-tier` seam. Nothing else pinned the move: NO vector
 # entered the `mktemp`-unavailable branch, so reverting the announcement to fire
@@ -1587,6 +1587,54 @@ STUB_FILES="scripts/admin-merge.sh" STUB_BODY="Fixes #424364" STUB_LABELS="compl
 [ "$RECORD_RC" = "4" ] && ok "8.16 rail: a rail path in a micro diff still refuses (exit 4)" || bad "8.16 rail: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424364.json" ] && ok "8.16 rail: no record written" || bad "8.16 rail: wrote a clean-micro record for a rail edit"
 assert_contains "$RECORD_ERR" "touches an ALWAYS-FULL surface" "8.16 rail: the refusal names the ALWAYS-FULL surface"
+
+# THE CARRY PREDICATE IS ITSELF A GATE SURFACE (#4259 review at 8cdcf0432, P2).
+# `scripts/lib/code-identity.py` decides whether a clean verdict may be CARRIED
+# across a head move, so a defect in it carries a verdict onto code nobody
+# reviewed — the same "correctness IS a gate" argument that puts its sibling
+# `scripts/lib/diff-normalize.py` in the class. The name was added to
+# `review_full_surface_path` by that fix round; MEASURED before it, the same
+# one-file shape answered `ok/micro` and the recorder WROTE a clean-micro record
+# (the tier that dispatches no reviewers). This row is the pin the review asked
+# for: it is the ONE assertion that reddens when the name is dropped again
+# (mutant: delete `|scripts/lib/code-identity.py` from the exact-name arm —
+# `review_tier_cap` then answers `micro`, the cap does not fire, and this vector
+# goes rc 0 WITH a record; `tests/record-review/run.sh` (30xvi) is the second,
+# independent witness through the `--print-tier` seam).
+STUB_FILES="scripts/lib/code-identity.py" STUB_BODY="Fixes #424378" STUB_LABELS="complexity:micro" run_micro_verdict 424378
+[ "$RECORD_RC" = "4" ] && ok "8.16 carry-predicate: scripts/lib/code-identity.py in a micro diff refuses (exit 4)" || bad "8.16 carry-predicate: must refuse — this file decides whether a verdict may be carried onto unreviewed code (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424378.json" ] && ok "8.16 carry-predicate: no record written" || bad "8.16 carry-predicate: wrote a clean-micro record for the predicate that decides carry eligibility"
+assert_contains "$RECORD_ERR" "touches an ALWAYS-FULL surface" "8.16 carry-predicate: the refusal names the ALWAYS-FULL surface (the cap refused it, not the tier guard)"
+assert_not_contains "$RECORD_ERR" "is REFUSED for a non-micro linked issue" "8.16 carry-predicate: the TIER guard did not refuse it — the label is complexity:micro"
+
+# …and the MUTATION PIN that makes the row above load-bearing: the SAME one-file
+# shape, run against a copy of the recorder with the name DELETED from the
+# exact-name arm, must RECORD (rc 0). Without this leg the row above could pass
+# for a reason other than the new list entry (e.g. a later cap arm firing), and
+# deleting the entry would leave it green — the un-pinned-guard shape the review
+# rejected. The copy needs `lib/` beside it, exactly as `record-review.sh`
+# resolves its two siblings (the same reason §21 builds `$S21_MUTDIR/lib`).
+CI_CP_MUT="$T/mut-4259-carry-predicate"
+mkdir -p "$CI_CP_MUT"
+cp -r "$SCRIPT_DIR/lib" "$CI_CP_MUT/lib"
+python3 - "$RECORD" "$CI_CP_MUT/record-review.sh" <<'CIEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = "|scripts/lib/diff-normalize.py|scripts/lib/code-identity.py) return 0 ;;"
+new = "|scripts/lib/diff-normalize.py) return 0 ;;"
+assert old in text, "carry-predicate arm anchor not found"
+open(dst, "w").write(text.replace(old, new, 1))
+CIEOF
+if bash -n "$CI_CP_MUT/record-review.sh" 2>/dev/null && ! cmp -s "$CI_CP_MUT/record-review.sh" "$RECORD"; then
+    ok "8.16 carry-predicate mutation: the name-deleted copy parses and differs from the recorder"
+else
+    bad "8.16 carry-predicate mutation: the name-deleted copy is unusable — re-anchor the pin"
+fi
+STUB_FILES="scripts/lib/code-identity.py" STUB_BODY="Fixes #424379" STUB_LABELS="complexity:micro" RECORD="$CI_CP_MUT/record-review.sh" run_micro_verdict 424379
+[ "$RECORD_RC" = "0" ] && ok "8.16 carry-predicate MUTATION PIN: with the name deleted the same micro diff RECORDS (rc 0) — the list entry is what refuses" || bad "8.16 carry-predicate mutation NOT caught (rc=$RECORD_RC, want 0) — the row above passes without the new entry"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424379.json" ] && ok "8.16 carry-predicate MUTATION PIN: …and the unguarded copy WROTE the clean-micro record" || bad "8.16 carry-predicate mutation: no record — the mutant did not reach the cap, so the pin proves nothing"
+RECORD="$SCRIPT_DIR/record-review.sh"
 
 # PARITY/TRUNCATION — the payload delivers a DIFFERENT number of distinct paths
 # than GitHub's own `changed_files` says the PR has (the compare endpoint caps at
@@ -7691,13 +7739,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4994 :6846 :9312 :9486, plus a comment mention at :4863; `14.1c-CITE` below
+#     CITE-CHECK: :5007 :6859 :9325 :9499, plus a comment mention at :4876; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4972) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4994) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :5007) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9312). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :9325). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7723,7 +7771,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:9312` / `:9486` — CITE-CHECK: :9312 :9486 — re-derived by the
+#     this head the predicates are `:9325` / `:9499` — CITE-CHECK: :9325 :9499 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8627,12 +8675,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4972) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4994) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :5007) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6846 :9312 :9486 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6859 :9325 :9499 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

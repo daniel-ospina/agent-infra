@@ -1895,7 +1895,7 @@ T30_EMPTY="$(tier_for 0)"
 # The diff-identity producer and the CI/pre-commit gate bodies (cycle-2 F1): the
 # recorder's own argument ("leaving it out would be a one-line bypass") applies
 # verbatim to the ONE implementation of the diff digest.
-for f in scripts/lib/diff-normalize.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit scripts/ci_exemption.py scripts/ci-workflow-pr-evaluable.sh; do
+for f in scripts/lib/diff-normalize.py scripts/lib/code-identity.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit scripts/ci_exemption.py scripts/ci-workflow-pr-evaluable.sh; do
   [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
     && pass "(30xvi) $f is ALWAYS-FULL" \
     || fail "(30xvi) $f did NOT select full — a gate body is outside the class"

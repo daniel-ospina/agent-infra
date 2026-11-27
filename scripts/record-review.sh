@@ -693,6 +693,19 @@ clean_low_shape_ok() {
 #     nothing yields `DIFF_HASH = sha256("")`, a constant that collides for
 #     every diff and lets the carry arm mint head-bound evidence for an
 #     unreviewed revision — a FALSE ACCEPT, which is what this class is for;
+#   * `scripts/lib/code-identity.py` — the SAME argument as its sibling, and the
+#     omission would have been a longer-fuse version of the same bypass (#4259
+#     review, P2). It is the predicate the #4105 carry arm consults to decide
+#     whether a clean verdict may be CARRIED across a head move, so a defect
+#     here carries a verdict onto CODE NOBODY REVIEWED — exactly what the
+#     module's own docstring records as the forbidden outcome (a wrong
+#     `identical`). Left out, a follow-up PR whose only change is e.g. "also
+#     normalise `.ts` with this regex" would cap at `micro`, and with a
+#     `complexity:micro` linked issue would land a `clean-micro` record at the
+#     last gate before main (measured at the review: `--print-tier` answered
+#     `ok/micro` for this path, `ok/full` for `diff-normalize.py`). A
+#     gate-critical file named NOWHERE in this list is the drift the first
+#     paragraph of this comment forbids;
 #   * `scripts/check-*`, `.husky/**` — CI and pre-commit gate bodies: the same
 #     "correctness IS a gate" argument as the rails above. NOTE the BOUNDARY
 #     here, stated so the list does not grow without one: the class is the
@@ -731,7 +744,7 @@ review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = un
     *"//"*|*"/./"*|*"/../"*) return 2 ;;
   esac
   case "$p" in
-    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py) return 0 ;;
+    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py|scripts/lib/code-identity.py) return 0 ;;
     # Rail-exec'd decision modules: `admin-merge.sh` execs BOTH of these to decide
     # whether a red check blocks — `ci_exemption.py` makes the exemption call and
     # `ci-workflow-pr-evaluable.sh` decides that such a red must stay BLOCKING.

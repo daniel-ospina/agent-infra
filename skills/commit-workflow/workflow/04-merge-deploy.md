@@ -66,7 +66,10 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    `scripts/check-pipeline-compliance.sh`, the recorder `scripts/record-review.sh`,
    `.github/workflows/**`, `.github/actions/**`, `.husky/**`, `extensions/**`,
    `skills/**`, `templates/**`, `enforcement/**`, `scripts/check-*`,
-   `scripts/lib/diff-normalize.py`, and the rail-exec'd decision modules
+   `scripts/lib/diff-normalize.py`, `scripts/lib/code-identity.py` (the #4105
+   carry predicate — a defect there carries a clean verdict onto code nobody
+   reviewed, so it is gate-critical for the same reason as its sibling), and the
+   rail-exec'd decision modules
    (`scripts/ci_exemption.py`, `scripts/ci-workflow-pr-evaluable.sh`,
    `scripts/checkout_guard.sh`, `scripts/ci_runner_gate.sh`) — the last five
    because they are agent-executable instructions or gate bodies), `record-review.sh` REFUSES
