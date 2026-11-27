@@ -83,6 +83,18 @@
 #      exists but its PR-body marker is missing is the documented one: re-run
 #      `record-review.sh` — its same-head write is idempotent (#1709 rec 7) and its
 #      marker post is idempotent.)
+#   2b. It never BUYS A REVIEW for an artifact that did not change (agent-infra#4255).
+#      Before the reviewer is spawned it asks the recorder's OWN predicate
+#      (`--check-carry`, the merge gate's own question — and `--recover-body` first
+#      when this box holds no record though the PR body carries a signed marker).
+#      `carry` = the gate already carries the record: nothing is re-recorded and
+#      nothing is reviewed. `carry-patch` = the rendered diff moved but every
+#      reviewed line is identical (#1377): the record is RE-RECORDED at the current
+#      head, mechanically, and no reviewer is spawned. `fresh` — or any answer this
+#      script cannot act on — falls through to the ordinary review, so a broken
+#      predicate can cost money but can never produce a false clean. `unreadable`
+#      and `surface-unknown` exit 12 (RETRY: a failed READ is not a changed
+#      artifact) and `red-surface` exits 13 (a red build is not a review finding).
 #   3. It never edits a PR body. Findings go in a COMMENT. `record-review.sh`
 #      appends its own signed marker at record time; nothing here PATCHes a body,
 #      before or after a record (a body edit after recording is what wipes the
@@ -141,6 +153,11 @@
 #      reads: no record bound to this head, no marker in the PR body, or a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
 #      so "recorded" without it is a green report over a red check)
+#   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
+#      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
+#      nothing was recorded. A failed read is not a changed artifact and must never buy a review
+#   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
+#      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
 #      143 — NOTHING was posted and NO record was written (the child is not orphaned)
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
@@ -201,7 +218,7 @@ set -uo pipefail
 
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
-E_VACUOUS=11
+E_VACUOUS=11 E_RETRY=12 E_RED=13
 
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -468,6 +485,167 @@ if record_at_head "$HEAD"; then
   err "    $RECORDER $PR $HEAD clean $REPO --evidence comment:<id> --expect-head $HEAD"
   exit "$E_ALREADY"
 fi
+
+# ── 2b) A STALE HEAD IS NOT A STALE REVIEW — ASK THE RECORDER BEFORE PAYING ──
+# THE WALL THIS CLOSES (agent-infra#4255, measured 2026-11-26). Every other tool that
+# decides "is this record still valid?" asks ONE predicate — `record-review.sh
+# --check-carry`, the merge gate's own question answered by the merge gate's own code
+# (`extensions/review-enforcer/index.ts`, `scripts/orchestrator-harness/merge-one.sh`,
+# `scripts/check-pipeline-compliance.sh`, `scripts/orchestrator-harness/auto-rail.sh`,
+# `scripts/orchestrator-harness/fix-one.sh`, `tools/fleet/pr_state.py` all consult it).
+# THIS command did not. Its only pre-review guard was
+# `record_at_head`, which asks "is a clean record bound to this exact sha?" — so a PR
+# whose head moved for the ONE reason that never changes what was reviewed (the base
+# advanced and the branch was refreshed onto it: `gh pr update-branch`, `git merge
+# origin/main`, a rebase) answered NO and bought a full 20–40 minute review.
+#
+# WHY THE HEAD MOVING DOES NOT MEAN THE REVIEW IS STALE. The gate's binding digest keeps
+# hunk CONTEXT (#1362 D1), so when `main` lands work in a file this PR also touches the
+# rendered three-dot diff moves while every AUTHORED line is byte-identical. MEASURED
+# locally 2026-11-26 with the shared normalizer (one PR adding a line, `main` inserting a
+# line inside the hunk's context window, then `git merge main` into the branch):
+#   at review time      binding=dfebaa86… patch=f7f1d204…
+#   after base advance  binding=4d4d1118… patch=f7f1d204…   ← binding MOVED, patch IDENTICAL
+# The recorder already answers that case: `carry` (the rendered diff is byte-identical, the
+# gate carries the record as-is — nothing to do at all) and `carry-patch` (#1377: the
+# rendered diff moved, the reviewed patch did not — re-record mechanically, "do NOT run a
+# review cycle"). Reading either of those as "buy a review" is the defect.
+#
+# IT IS READ-ONLY AND IT CANNOT MINT A VERDICT. `--check-carry` writes nothing; the only
+# write this block can cause is a re-record at the CURRENT head through the recorder's own
+# carry arms, which re-prove content identity themselves and REFUSE when the lane's
+# commits moved. When this block cannot establish that the reviewed artifact is unchanged
+# it does NOT refuse — it falls through to the ordinary review below, i.e. the pre-change
+# behaviour, so a broken predicate can only cost money, never a false clean.
+CC_TOKEN=""; CC_RC=0; CC_OUT=""; CC_ERR=""
+# cc_ask — ONE `--check-carry`, keeping BOTH the exit code and the answer. The answer is
+# field 1 of stdout (head|carry|carry-patch|fresh|unreadable|red-surface|surface-unknown|
+# red-base-owned|norecord|nodigest); the exit code is a SECOND, independent statement, and
+# the two are never collapsed into one (a caller that reads only `rc` gets the pre-#3440
+# bug back). stdout and stderr are captured SEPARATELY because the recorder writes its
+# human-readable remedy to stderr.
+cc_ask() {
+  local f
+  f="$(mktemp 2>/dev/null)" || { CC_RC=1; CC_TOKEN=""; CC_OUT=""; CC_ERR=""; return 0; }
+  CC_OUT="$("$RECORDER" --check-carry "$PR" "$REPO" 2>"$f")"; CC_RC=$?
+  CC_ERR="$(cat "$f" 2>/dev/null || true)"
+  rm -f "$f"
+  CC_TOKEN="${CC_OUT%%$'\t'*}"
+  case "$CC_TOKEN" in
+    head|carry|carry-patch|fresh|unreadable|red-surface|surface-unknown|red-base-owned|norecord|nodigest) ;;
+    *) CC_TOKEN="" ;;
+  esac
+}
+# record_at_head_family — like `record_at_head`, but accepts the TIERED clean verdicts the
+# GitHub gate accepts too (`clean-micro`, `clean-low`, #4755). Used only to CONFIRM a carry
+# re-record landed; the unchanged-head refusal above deliberately stays on full `clean`
+# (re-recording `clean-micro` as `clean` would be a stronger claim than the reviewer made).
+record_at_head_family() { # <sha> -> 0 iff a clean(-micro|-low) record bound to <sha> for THIS repo exists
+  local f txt r
+  for f in "$QUAL" "$LEGACY"; do
+    [ -f "$f" ] || continue
+    txt="$(cat "$f" 2>/dev/null || true)"
+    [[ "$txt" == *"\"head_sha\":\"$1\""* ]] || continue
+    case "$txt" in
+      *'"repo":'*)
+        r="$(printf '%s' "$txt" | sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' | command head -1)"
+        if [ -n "$r" ] && [ "$r" != "$REPO" ]; then continue; fi ;;
+    esac
+    case "$txt" in
+      *'"verdict":"clean"'*|*'"verdict":"clean-micro"'*|*'"verdict":"clean-low"'*) return 0 ;;
+    esac
+  done
+  return 1
+}
+# record_head_verdict — the RECORDED head and its verdict, for the carry re-record. The
+# positional SHA handed to the recorder must be the REVIEWED one, never the live head: the
+# recorder enters its carry arms only when the two differ (record-review.sh's
+# `[ "$CURRENT_HEAD" != "$SHA" ]`), and a same-head call is a FRESH mint that then refuses a
+# `clean` for a missing `--evidence` (tortoise#7391) — i.e. a guaranteed no-op that buys the
+# very review this block exists to prevent. `--expect-head` cannot be used here either: the
+# recorder refuses a pin whenever the PR head is not the pin, which is precisely this case.
+record_head_verdict() {
+  local f txt r h v
+  for f in "$QUAL" "$LEGACY"; do
+    [ -f "$f" ] || continue
+    txt="$(cat "$f" 2>/dev/null || true)"
+    case "$txt" in
+      *'"repo":'*)
+        r="$(printf '%s' "$txt" | sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' | command head -1)"
+        if [ -n "$r" ] && [ "$r" != "$REPO" ]; then continue; fi ;;
+    esac
+    h="$(printf '%s' "$txt" | sed -n 's/.*"head_sha":"\([0-9a-f]\{40\}\)".*/\1/p' | command head -1)"
+    v="$(printf '%s' "$txt" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' | command head -1)"
+    case "$v" in clean|clean-micro|clean-low) ;; *) continue ;; esac
+    [ "${#h}" -eq 40 ] || continue
+    printf '%s\t%s\n' "$h" "$v"
+    return 0
+  done
+  return 1
+}
+cc_ask
+# A `norecord`/`nodigest` answer on a box that never recorded this PR is NOT evidence of
+# changed content: the signed marker may live in the PR BODY (#2872). Rebuild the store
+# record from it — the recorder verifies the HMAC itself, so a body edit cannot mint one —
+# and ask again. MEASURED 2026-11-26 on the four PRs #4255 names: `--check-carry` answered
+# `norecord` for #14746 and #14774 although BOTH bodies carry a correctly-signed marker, so
+# without this arm every one of them looked unreviewed and bought a review.
+case "$CC_TOKEN" in
+  norecord|nodigest)
+    if "$RECORDER" --recover-body "$PR" "$REPO" >/dev/null 2>&1; then cc_ask; fi ;;
+esac
+case "$CC_TOKEN" in
+  head)
+    err "$PROG: the recorder says a clean record is ALREADY bound to head ${HEAD:0:12}… for $REPO#$PR (check-carry rc=$CC_RC) — nothing is stale and no review is owed, so none was bought."
+    err "  Re-record only if the marker is missing from the PR body: $RECORDER $PR $HEAD <same verdict> $REPO --evidence comment:<id> --expect-head $HEAD"
+    exit "$E_ALREADY" ;;
+  carry|red-base-owned)
+    # THE BEST CASE: the rendered diff is byte-identical, so the merge gate ALREADY carries
+    # this record across the head move. There is nothing to re-record and nothing to review.
+    log_line "$PROG: NO REVIEW OWED — the recorder's own predicate says the reviewed DIFF is unchanged at the current head (check-carry rc=$CC_RC, token=$CC_TOKEN)."
+    log_line "  The head moved for a base-only reason; the merge gate carries this record as-is. Nothing was re-recorded and no reviewer was spawned."
+    [ -n "$CC_ERR" ] && printf '%s\n' "$CC_ERR" >&2
+    exit 0 ;;
+  carry-patch)
+    # #1377: the rendered diff moved (hunk context/line numbers), the reviewed PATCH did not.
+    # Re-record at the CURRENT head — the recorder re-proves it — and buy no review.
+    RV_PAIR="$(record_head_verdict || true)"
+    RH=""; RV=""
+    case "$RV_PAIR" in
+      *$'\t'*) RH="${RV_PAIR%%$'\t'*}"; RV="${RV_PAIR#*$'\t'}" ;;
+    esac
+    if [ -n "$RH" ] && [ -n "$RV" ]; then
+      CR_LOG="$(mktemp 2>/dev/null || true)"
+      if [ -n "$CR_LOG" ]; then
+        "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >"$CR_LOG" 2>&1; CR_RC=$?
+      else
+        "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >/dev/null 2>&1; CR_RC=$?
+      fi
+      if [ "$CR_RC" -eq 0 ] && record_at_head_family "$HEAD"; then
+        log_line "$PROG: NO REVIEW OWED — the reviewed PATCH is byte-identical at ${RH:0:12}… and ${HEAD:0:12}… (check-carry rc=$CC_RC, token=carry-patch)."
+        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The reviewer was not spawned."
+        [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /'
+        [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
+        exit 0
+      fi
+      [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /' >&2
+      [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
+      err "$PROG: the carry re-record did NOT produce a clean record at ${HEAD:0:12}… (recorder rc=$CR_RC) — falling through to a full review rather than claiming a carry I cannot show."
+    else
+      err "$PROG: check-carry answered carry-patch but no clean-family record for $REPO#$PR is readable on this box — falling through to a full review (a carry re-record needs the reviewed head and verdict)."
+    fi ;;
+  unreadable|surface-unknown)
+    die "$E_RETRY" "the recorder could NOT READ the artifacts it decides on (check-carry rc=$CC_RC, token=$CC_TOKEN) — that is a failed READ, never a changed artifact, so no review was bought and nothing was recorded.
+$CC_ERR
+  RETRY once the API/transport recovers; do not re-review for a read failure." ;;
+  red-surface)
+    die "$E_RED" "the head's CHECK SURFACE IS RED and the red belongs to this PR (check-carry rc=$CC_RC) — a broken build is not a review finding, so no review was bought and nothing was recorded.
+$CC_ERR
+  Fix or re-run the failing checks, then re-run this command." ;;
+  *) : ;;   # fresh / norecord / nodigest / no answer at all → a review is genuinely owed
+            # (or the predicate could not be consulted), which is the pre-change behaviour
+
+esac
 
 # ── 3) the self-contained prompt: diff + claimed behaviour + linked issues ───
 # Nothing here is inferred from the caller's checkout: this runs for a lander who
@@ -2178,6 +2356,79 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
+function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl, _t) {
+  # ⛔ AN INLINE QUOTATION IN A MUTATION-TABLE ROW IS NOT THE REVIEWER OWN COUNT — UNLESS THE
+  # QUOTATION ITSELF SAYS THE FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). On such a
+  # row, a quoted span that carries NO liveness cue is replaced by one space before the three arms run,
+  # so a phrase the reviewer is QUOTING cannot be counted as a finding it is REPORTING.
+  #   The measured line (preserved verbatim in the operator log, /tmp/aiv99-4251.log, from transcript
+  #   /tmp/review-pr-4251.Qo3hv5/reviewer.log — since swept, which is why the line is embedded in the
+  #   suite as a fixture):
+  #     | `scripts/activate-harness.test.sh:581` — "no shipped template is an unmapped declaration
+  #       error" | drop `\|eldato-disk-reaper-cache` from `installer_for()` | T1 `:581` | … |
+  #   The article arm read `an unmapped declaration error` out of that QUOTED TEST ASSERTION as a
+  #   count of one live finding, and `review-pr.sh` answered `a self-contradicting CLEAN verdict
+  #   (clean + a reported count) is never recorded` about a review that had contradicted nothing.
+  # ⛔ WHY THIS IS GATED ON THE LIVENESS CUE RATHER THAN ON THE QUOTES ALONE. CommonMark 0.31.2 §6
+  # lists the inline constructs — code spans, emphasis, links, images, autolinks, raw HTML, breaks,
+  # textual content — and there is NO inline quotation construct: a double-quoted string is Textual
+  # content (§6.9), i.e. plain text. So a double quote pair is a HEURISTIC for "the reviewer is
+  # quoting", never a spec rule, and it must be the NARROWEST heuristic that fixes the measured case.
+  # A quotation that itself says the findings `remain`/are `still`/`open`/`unresolved` is a report of a
+  # LIVE blocker whoever wrote it, and is left intact — so the fail-open direction (a reviewer
+  # smuggling its own blocker into quotes) stays refused by its own words.
+  # ⛔ AND THE BLANKING IS CONFINED TO A TABLE ROW — THAT IS THE GATE (P1, fresh review at
+  # `f3875382b204` — MEASURED fail-OPEN at that head). Blanking on the QUOTATION ALONE meant
+  #   `I found "3 blocking defects" in the parser.`  ->  NO fragment (it RECORDED),
+  # while its unquoted twin still refused, so a review that had stated three blocking defects minted a
+  # SIGNED clean record — the one thing this seam exists to make impossible (the second, unblanked pass
+  # covers only VERDICT-SHAPED lines, so nothing rescued it). The only case this blanking was ever
+  # needed for (#4251, above) is a MUTATION-ATTRIBUTION TABLE ROW quoting the test assertion it names,
+  # and a table row IS a citation by construction while prose is the reviewer SPEAKING. So the citation
+  # context is the table row and nothing else; every ordinary line is read exactly as the pre-#4253
+  # seam read it, which is the fail-closed direction.
+  # ⛔ THE TEST IS THE LINE, NOT THE QUOTES: a markdown table row is a line whose first non-space
+  # character is a cell separator. A `\001`-marked (4-column-indented) table row is NOT blanked — it
+  # fails closed, deliberately, because indented content is the class the map already treats as a
+  # quotation and this arm only ever needed to narrow.
+  # ⚠️ DECLARED RESIDUAL, NOW TABLE-ROW ONLY: a live blocker quoted in a table row whose own cell
+  # carries no liveness word — `| x | "3 blocking defects" | y |` — is read as describing work. §BV pins
+  # BOTH directions of that limit: an ordinary-line quotation REFUSES (§BV(7)), a table-row quotation
+  # with a cue in its span or clause REFUSES (§BV(4)/(4b)), and the cue-less measured row RECORDS (§BV(1)).
+  _t = s
+  sub(/^[[:space:]]+/, "", _t)
+  if (substr(_t, 1, 1) != "|") return s
+  out = ""
+  rest = s
+  while (match(rest, /"[^"]*"/)) {
+    span = substr(rest, RSTART, RLENGTH)
+    # ⛔ THE CUE IS READ FROM THE CLAUSE THAT CARRIES THE QUOTATION, NOT FROM THE SPAN ALONE (P2, fresh
+    # review at `0dd5e5519` — MEASURED at `896b4a96`, the head this replaces):
+    #   `The suite reports "2 blocking defects" still open.`  ->  NO fragment at QUOTE_OK=1
+    #   the same line                                          ->  `"2 blocking defects` at QUOTE_OK=0
+    # so a reviewer that QUOTED a count and then said — outside the quotes — that it is still open had
+    # its report BLANKED, and the second, unblanked pass cannot rescue it (that pass re-scans only
+    # verdict-shaped lines). A signed clean was minted over a report of a live count, which is the one
+    # direction this seam exists to refuse, while the cue saying the finding is live sat in plain sight
+    # on the predicate. Windows `pre`/`post` are the clause OF THE SPAN — back to the last sentence
+    # terminator or table-cell separator, and forward to the next one — because THAT is where English
+    # puts the predicate (`"2 blocking defects" still open`). ⛔ Bounded that narrowly, the §BV(4c)
+    # DECLARED residual (`The parser has "3 blocking defects in it".`, no cue anywhere near it) still
+    # records, and the measured #4251 mutation-table row still records: its cell separators close the
+    # window before any other column of the table can contribute a word.
+    # ⛔ RSTART/RLENGTH ARE SAVED FIRST: `sub()` below overwrites both, and the emission at the bottom of
+    # this loop slices `rest` with them.
+    _rs = RSTART; _rl = RLENGTH
+    pre = substr(rest, 1, _rs - 1); sub(/^.*[.!?|]/, "", pre)
+    post = substr(rest, _rs + _rl); sub(/[.;:!?|].*$/, "", post)
+    win = span " " pre " " post
+    # ⛔ THIS VOCABULARY MUST STAY THE `_cue` VOCABULARY BELOW — §BV fails the suite if the two drift.
+    live = (win ~ /(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/)
+    out = out substr(rest, 1, _rs - 1) (live ? span : " ")
+    rest = substr(rest, _rs + _rl)
+  }
+  return out rest
+}
 function repair_led(cl,   n, w, i, low) {
   # ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — MEASURED
   # REGRESSION this branch introduced: `repair_re` holds ordinary NOUNS (`fix`, `close`, `remove`), so
@@ -2265,6 +2516,12 @@ BEGIN {
   # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
   # in a refusal message.
   line = tolower($0)
+  # ⛔ ONE BLANKING RULE FOR EVERY LINE (P1, fresh review at `f3875382b204`): the gate lives INSIDE
+  # `unquote` (table row only), so there is no per-pass blanking regime left to disagree about — and
+  # the former `QUOTE_OK` carve-out is provably unnecessary, because a table row can never be
+  # verdict-shaped: every VD_* pattern is anchored at `^[[:space:]]*` on a CLEAN/ISSUES/`Verdict:`
+  # token, and the first non-space character of a table row is `|`.
+  line = unquote(line)
   for (arm = 1; arm <= 3; arm++) {
     re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
     off = 0; rest = line
@@ -2441,6 +2698,13 @@ refuse_counted_clean() {
         || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
       COUNT_SCAN_CANARY_OK=1
     fi
+    # ⛔ ONE BLANKING RULE, AND THE VERDICT-SHAPED CHANNEL IS UNTOUCHED BY IT (issue #4233, REOPENED —
+    # the #4251 shape; P1, fresh review at `f3875382b204`). The blanking now applies to MUTATION-TABLE
+    # ROWS ONLY (see `unquote`), so the survivors pass and this second pass over $VERDICT_LINES_FILE
+    # scan identically and a verdict line can never be blanked (`CLEAN — "3 blocking defects in the
+    # parser".` still refuses). The second pass is therefore not a second blanking regime: it exists for
+    # the EARLIER-VERDICT-SHAPED-ISSUES arm at the top of this loop, and re-reading the counts on the
+    # verdict subset is idempotent (`_hit` breaks out of both loops at the first fragment).
     _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
       || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
@@ -2448,11 +2712,67 @@ refuse_counted_clean() {
   done < "$_src"
   done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
-    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
-    err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
+    # ⛔ THE REFUSAL MUST NAME THE LINES IT RECONCILED — AND MUST NOT CLAIM A SHAPE IT NEVER SAW
+    # (issue #4233, REOPENED — the #4251 shape). The old wording asserted `a verdict-shaped line ALSO
+    # reports a non-zero count` about EVERY counted-clean refusal. Measured on PR #4251 the count sat
+    # on a mutation-table row carrying no verdict word at all, so the sentence described an input the
+    # reader had not read — the reopen's exact objection: `a guard that says self-contradicting when
+    # what it means is I could not tell which field is authoritative`. Both lanes now print the SAME
+    # two lines (the verdict it compared and the line it matched), so a reader can see which field is
+    # which; only the sentence explaining them differs, because only one case is a single line that
+    # really cannot be both.
+    # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841/#864): under `pipefail` the quiet grep exits at
+    # its first match, the writer takes SIGPIPE and the pipeline reports 141 — which would silently
+    # report a verdict-shaped line as unshaped and take the wrong arm.
+    CLEAN_COUNT_SHAPED=0
+    if grep -aqE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_SHAPED=1
+    fi
+    # ⛔ A THIRD SHAPE, AND WHY IT IS NOT THE MILD SENTENCE (MEASURED at `896b4a96` on this change):
+    # with only the SHAPED/not split, §L (`[P1] scripts/x.sh:42 — a real blocking bug` + `CLEAN`) lost
+    # `self-contradicting` too, because its count sits on a DIFFERENT line. But that line DECLARES a
+    # blocking finding at P<n>: the reader can tell exactly which field is authoritative, and the two
+    # fields disagree — which is a contradiction, not an unreconcilable read. `SEV_RE` is the existing
+    # severity classifier (line-anchored P0-P3 token), reused rather than re-spelled, so a finding LINE
+    # is what it already means everywhere else in this script.
+    CLEAN_COUNT_FINDING=0
+    if [ "$CLEAN_COUNT_SHAPED" = "0" ] && grep -aqE "$SEV_RE" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_FINDING=1
+    fi
+    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and this transcript reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a review cannot be both, so this is a verdict of convenience, not a clean review."
+    err "  verdict line it compared : ${LAST:-<none>}"
+    err "  line the count matched   : ${CLEAN_COUNT_LINE:-$LAST}"
+    err "  phrase it read           : \"$CLEAN_COUNT_WORDS\""
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      err "  The count sits ON the verdict-shaped line above, so that ONE line contradicts itself."
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      err "  The count sits on a DIFFERENT line, and that line DECLARES a blocking finding — so the verdict and the line above contradict each other, and the reader can see both fields."
+    else
+      err "  The count sits on a DIFFERENT line, which carries no verdict word — the reader could not tell which field was authoritative, and says so instead of blaming a contradiction it cannot point at."
+    fi
     err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
     err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-    die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
+    if [ -r "${TRANSCRIPT:-}" ]; then
+      err "  last lines of that transcript:"
+      tail -n 5 "$TRANSCRIPT" 2>/dev/null | while IFS= read -r _tl; do err "    $_tl"; done
+    fi
+    # ⛔ THE LAST LINE MUST NOT CONTRADICT THE SENTENCE TWO LINES ABOVE IT (P2, fresh review at
+    # `0dd5e5519`). This `die` was UNCONDITIONAL: BOTH arms ended with `a self-contradicting CLEAN
+    # verdict (clean + a reported count)`, including the DIFFERENT-line arm whose own `err` line says
+    # the reader `could not tell which field was authoritative` — so the most visible line of exactly
+    # the case the reopen is about still called the reviewer self-contradicting and still asserted a
+    # count ON a clean. That is the reopen's own objection verbatim: `a guard that says
+    # self-contradicting when what it means is I could not tell which field is authoritative`.
+    # §BV(3)'s `err_has "self-contradicting"` could not see it either, because this shared `die`
+    # satisfied it in BOTH arms. The exit code and the direction (nothing posted, nothing recorded) are
+    # unchanged; only the CLAIM is now the one the arm can support.
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count on the SAME line) is never recorded — re-run the review"
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a blocking finding on a DIFFERENT line) is never recorded — re-run the review"
+    else
+      die "$E_ISSUES" "an unreconciled CLEAN verdict (a clean verdict and a count on DIFFERENT lines, with no way to tell which field is authoritative) is never recorded — re-run the review"
+    fi
   fi
 }
 
