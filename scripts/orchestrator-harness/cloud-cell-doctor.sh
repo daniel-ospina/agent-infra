@@ -2503,7 +2503,44 @@ run_hygiene() {
     result="${result}${result:+; }CANNOT-VERIFY: worktree reaper (pi-reap-worktrees.sh) not found"
     h_rc=3
   fi
-  # 6) the CROSS-BOX REVIEW-RECORD REGISTRY (#2577). ⛔ This sub-step is BEST-EFFORT: it never touches
+  # 6) THE BRANCH-CLAIM PUSH GUARD, ARMED ON *THIS* BOX (agent-infra#4260 §4.2).
+  # ⛔ WHY THE CLOCK ASKS THIS. The guard is a pre-push hook in a git dir, so it is per-CHECKOUT and
+  # the question "is the gate armed?" has a different answer on every box. #4260 measured it present and
+  # resolvable on ONE cell of five, while 6 of 10 open PRs were on branches whose prefix the guard did
+  # not even inspect — and nothing in the fleet could say so. "We installed it" is not a checkable
+  # claim; `branch-claim.sh check-hook` is, and this sub-step is what runs it on a clock and puts the
+  # verdict in the pass record, naming the HOST and the FAULT (`HOOK-FAIL <host> MISSING (...)`) rather
+  # than a number nobody can act on.
+  # ⛔ rc VOCABULARY: 1 = a fault this box can name (the hook is missing / not executable / foreign /
+  # unparseable / its baked gate path is gone) — a REAL defect, so it is a fail, not an abstention;
+  # 3 = cannot-verify (the gate script itself is not on this box, or this is not a work tree). Both are
+  # non-zero on purpose: the whole finding is that this state was silent.
+  if cell_stopped_midpass; then
+    result="${result}${result:+; }STOP arrived mid-pass — branch-claim hook check skipped"
+  elif [ "$dry" = "--dry-run" ]; then
+    result="${result}${result:+; }would verify the branch-claim push hook"
+  else
+    _hc_gate=""
+    for _hc_g in "$SELF_DIR/branch-claim.sh" "$O/branch-claim.sh" "$REPO/scripts/orchestrator-harness/branch-claim.sh"; do
+      [ -n "$_hc_g" ] && [ -f "$_hc_g" ] && { _hc_gate="$_hc_g"; break; }
+    done
+    if [ -z "$_hc_gate" ]; then
+      log "[hygiene] CANNOT-VERIFY: branch-claim.sh not found on this box — the push gate cannot be asked whether it is armed"
+      result="${result}${result:+; }CANNOT-VERIFY: branch-claim.sh absent (push gate unverifiable)"
+      h_rc=3
+    else
+      _hc_out="$(bash "$_hc_gate" check-hook 2>>"$O/logs/doctor.log")"; _hc_rc=$?
+      log "[hygiene] branch-claim hook: rc=$_hc_rc ${_hc_out:-<no output>}"
+      case "$_hc_rc" in
+        0) result="${result}${result:+; }branch-claim hook armed" ;;
+        1) result="${result}${result:+; }branch-claim hook NOT ARMED — ${_hc_out:-no verdict line}"
+           h_rc=1 ;;
+        *) result="${result}${result:+; }CANNOT-VERIFY: branch-claim check-hook answered rc=$_hc_rc ${_hc_out:-<no output>}"
+           h_rc=3 ;;
+      esac
+    fi
+  fi
+  # 7) the CROSS-BOX REVIEW-RECORD REGISTRY (#2577). ⛔ This sub-step is BEST-EFFORT: it never touches
   #    `$h_rc`, so no sync outcome — a dark store, a rate limit, a divergence, a missing script — can
   #    fail the pass or reach a merge decision. Its failure is a LOGGED line naming the box + the
   #    store + the verb's own first complaint, and a short entry in `last_result` so `status` shows it.
@@ -2530,7 +2567,7 @@ run_hygiene() {
     sync_registry
     result="${result}${result:+; }${REGISTRY_RESULT}"
   fi
-  # 7) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
+  # 8) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
   df_after="$(hyg_df_mb "$CELL_HOME")"
   if [ -n "$df_before" ] && [ -n "$df_after" ]; then
     log "[hygiene] df ($CELL_HOME): $(hyg_df_delta "$df_before" "$df_after")"

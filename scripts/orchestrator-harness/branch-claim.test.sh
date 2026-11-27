@@ -183,35 +183,43 @@ release_from stray "$BR"; eq "peer release refused" "$?" "1"
 ( cd "$T/origin.git" && git rev-parse --verify -q refs/claims/branch-integration-land-batch-2 >/dev/null ) \
   && ok "the claim ref survives the peer's release attempt" || bad "the peer's release deleted the claim"
 
-echo "== 6. scope: an ordinary branch is never gated"
-# ⛔ THE SUBJECT OF THIS CASE CHANGED WITH agent-infra#3696, AND THE OLD SUBJECT WAS A LATENT FALSE
-# PASS. It used `refs/heads/fix/whatever` as its "ordinary branch" — which the scope NOW covers, so the
-# case would have gone on passing while testing the opposite of what it says (an UNCLAIMED branch of an
-# IN-SCOPE name is allowed, case 1's polarity) and would have silently stopped being able to detect a
-# scope that had swallowed everything. The out-of-scope subject is now a prefix the guard does not
-# claim, and the in-scope half is pinned by case 11 rather than assumed here.
+echo "== 6. scope is by KIND: the trunk is skipped even when it IS claimed, and nothing else is"
+# ⛔ THE SUBJECT OF THIS CASE CHANGED TWICE, AND BOTH CHANGES ARE THE POINT.
+#   #3696 replaced `refs/heads/fix/whatever` (which the prefix list then covered) with a prefix outside
+#   the list. #4260 removed the prefix list itself: the gate now covers EVERY branch a lane can write
+#   (#4260 §3a measured 6 of 10 open PRs on prefixes the list never inspected), so there is no longer
+#   any LANE prefix that is out of scope. The only out-of-scope KIND left is the shared trunk — which is
+#   exactly the boundary the new default must NOT swallow, and the one an over-broad gate would break
+#   first: a claim on `main` would be a fleet-wide push block, not single-ownership.
+# ⛔ AND THE FALSE-PASS TRAP THIS CASE HAS FALLEN INTO BEFORE IS CLOSED THE SAME WAY: a `hook-ref` that
+# answers 0 proves nothing unless the same subject WOULD be refused by `guard`, so the control line
+# below is part of the case rather than decoration.
 commit_in stray "feature"
 if push_in stray "refs/heads/chore/whatever" "$T/p6.err"; then
-  ok "a branch outside the declared scope pushes freely"
+  ok "an ordinary unclaimed branch pushes freely (no over-block from the wider scope)"
 else
-  bad "scope too broad: $(cat "$T/p6.err")"
+  bad "an unclaimed ordinary branch was refused: $(cat "$T/p6.err")"
 fi
-# ⛔ THE SUBJECT IS CLAIMED BEFORE THIS ARM READS IT (cycle-3 review F2, MEASURED INERT). Against an
-# UNCLAIMED subject the arm could not fail for the reason its own `bad` sentence names: `hook-ref` skips
-# an out-of-scope branch (rc 0) and ALSO allows an in-scope UNCLAIMED one (case 1's polarity), so a scope
-# that had swallowed everything was indistinguishable from a correct one — MEASURED: with the default
-# widened to `*` this case stayed 100% green. Claiming it first makes the two outcomes differ: a claimed
-# IN-SCOPE branch IS refused (cases 11/12), so rc 0 below can only mean the scope SKIPPED it. The
-# `guard` line is the control proving that refusal was armed.
-acquire_from owner "chore/whatever"
-eq "fixture: the out-of-scope subject is CLAIMED before the scope reads it" "$?" "0"
-guard_from stray "chore/whatever"
-eq "the guard DOES refuse that branch — so rc 0 below is the scope's doing, not an unarmed claim" "$?" "1"
-( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 ); _rc6=$?
+acquire_from owner main
+ eq "fixture: the TRUNK is CLAIMED before the scope reads it" "$?" "0"
+guard_from stray main
+eq "the guard DOES refuse the trunk — so rc 0 below is the scope's doing, not an unarmed claim" "$?" "1"
+( cd "$T/stray" && "$BC" hook-ref refs/heads/main >/dev/null 2>&1 ); _rc6=$?
 case "$_rc6" in
-  0) ok "hook-ref SKIPS a CLAIMED out-of-scope branch before any registry read" ;;
-  *) bad "hook-ref gated an out-of-scope branch (rc=$_rc6) — the scope has swallowed everything" ;;
+  0) ok "hook-ref SKIPS the CLAIMED trunk (the exclusion is by kind, before any registry read)" ;;
+  *) bad "hook-ref gated the trunk (rc=$_rc6) — a claim on main would block every push in the fleet" ;;
 esac
+release_from owner main >/dev/null 2>&1
+# ⛔ AND THE IN-SCOPE HALF AT A NAME THE OLD LIST DID NOT CARRY: with `*` as the default, a lane prefix
+# that has never been seen before must be gated, and an unclaimed branch of it must still push. Case 14
+# runs this for six prefixes; this arm is the one that fails if the default is ever narrowed again.
+commit_in stray "new-prefix push"
+( cd "$T/stray" && git push -q origin "HEAD:refs/heads/chore/whatever" ) || bad "fixture: cannot push chore/whatever unclaimed"
+acquire_from owner "chore/whatever"
+eq "a NEW prefix is IN scope (acquire succeeds)" "$?" "0"
+guard_from stray "chore/whatever"
+eq "...and a peer is refused on it — by KIND, not because it was on a list" "$?" "1"
+release_from owner "chore/whatever" >/dev/null 2>&1
 
 echo "== 7. recovery: the holder releases, re-acquires and pushes again"
 ( cd "$T/owner" && git fetch -q origin "$REMOTE_BR:$REMOTE_BR" 2>/dev/null || git fetch -q origin )
@@ -631,6 +639,131 @@ else
     eq "13) a function that never CAPTURES clears a caller's -f — so the capture is measured too" \
        "$(run_bmp "$T/bmp-alwaysclear.sh" 1 integration/x)" "0:0"
   fi
+fi
+
+echo "== 14. EVERY in-scope prefix, BOTH directions — the scope is by KIND, not by a list of names"
+# ⛔ WHY THIS CASE EXISTS (agent-infra#4260). Case 11 pins `fix/*` and `rescue/*`; the measured
+# population had 6 of 10 open PRs on `feat/*` and `pr-go/*`, which the old allOWLIST
+# (`integration/* fix/* rescue/*`) never inspected. Widening the list to those two names would
+# reproduce the defect at the next new prefix, so the default is now INCLUDE-EVERYTHING and only the
+# trunk names are excluded — and that is what these arms measure: for EVERY prefix a lane writes, an
+# UNCLAIMED branch pushes freely and a PEER-CLAIMED branch is refused.
+# ⛔ THE SECOND HOLDER IS REAL, NOT SIMULATED. `stray` is a separate clone with its own installed hook
+# and no fencing token — the same shape as a second cell pushing a branch it does not own. A test that
+# "simulated" the peer (by skipping the hook, or by hand-editing the token) would prove nothing about
+# the boundary, which is precisely the failure #4260's acceptance criteria call out.
+# ⛔ AND THE TRUNK IS THE CONTROL. `main` is excluded BY KIND, so even a CLAIMED `main` is not refused
+# here: a claim on the trunk would be a fleet-wide push block, not single-ownership. Without this arm a
+# scope that had swallowed the trunk would read as "thorough" instead of "an outage".
+for _pfx in integration fix feat pr-go design scope; do
+  BR="$_pfx/4260-scope-arm"; REF="refs/heads/$BR"
+  # Seed from stray's head so every arm below is a fast-forward (a non-ff rejection looks exactly
+  # like a guard refusal — the artefact case 11 records).
+  ( cd "$T/stray" && git push -q origin "HEAD:$REF" ) || { bad "14) fixture: cannot seed $REF"; continue; }
+  commit_in stray "unclaimed push on $BR"
+  if push_in stray "$REF" "$T/p14a.err"; then
+    ok "14) $BR — an UNCLAIMED branch pushes freely (no over-block)"
+  else
+    bad "14) $BR — an unclaimed branch was REFUSED: $(cat "$T/p14a.err")"
+    continue
+  fi
+  acquire_from owner "$BR"; eq "14) $BR — owner acquires" "$?" "0"
+  OWNED_HEAD="$(cd "$T/origin.git" && git rev-parse "$BR")"
+  commit_in stray "STRAY push onto owned $BR"
+  if push_in stray "$REF" "$T/p14b.err"; then
+    bad "14) $BR — a PEER-CLAIMED branch was NOT refused (the guard does not cover this prefix)"
+  else
+    ok "14) $BR — a peer-claimed branch is REFUSED"
+  fi
+  grep -q 'branch-claim: REFUSED' "$T/p14b.err" 2>/dev/null \
+    && ok "14) $BR — the refusal names itself" \
+    || bad "14) $BR — no branch-claim refusal line: $(cat "$T/p14b.err" 2>/dev/null)"
+  eq "14) $BR — the branch did NOT move (no head superseded)" \
+     "$(cd "$T/origin.git" && git rev-parse "$BR")" "$OWNED_HEAD"
+  release_from owner "$BR" >/dev/null 2>&1
+  ( cd "$T/origin.git" && git update-ref -d "$REF" ) 2>/dev/null || true
+done
+# the control: the trunk is OUT of scope even when claimed.
+acquire_from owner main; eq "14) fixture: the trunk is CLAIMED" "$?" "0"
+commit_in stray "trunk commit"
+if push_in stray "refs/heads/main" "$T/p14c.err"; then
+  ok "14) a CLAIMED trunk still pushes — the exclusion is by KIND, and a claim cannot block the fleet's main"
+else
+  bad "14) the scope swallowed main: $(cat "$T/p14c.err")"
+fi
+release_from owner main >/dev/null 2>&1
+
+# ⛔ AND THE SAME KIND RULE MUST BE WHAT `check-hook` REPORTS, or the verifier can pass while the gate
+# is narrower than the verifier believes (a false PASS of exactly the class #4260 exists for).
+check_in() { ( cd "$T/$1" && "$BC" check-hook 2>/dev/null ); }
+_c14="$(check_in owner)"; eq "14) check-hook PASSES in an installed checkout" "$?" "0"
+case "$_c14" in HOOK-OK*) ok "14) ...and prints HOOK-OK with the gate path" ;; *) bad "14) check-hook verdict: $_c14" ;; esac
+
+# ── 15. check-hook NAMES THE BOX AND THE FAULT (#4260 §4.2: prove a FAILING box, not only a passing one)
+# ⛔ "INSTALLED ONCE AND HOPING" IS THE MEASURED DEFECT: the hook was present, executable, resolvable
+# and syntax-clean on ONE cell of five, and nothing could say so. So the verifier is exercised against a
+# box that FAILS, in each of the three shapes that matter, and the verdict must NAME the host and the
+# fault — a bare non-zero rc is the abstention this instrument exists to replace.
+git clone -q "$T/origin.git" "$T/nohook" 2>/dev/null || bad "15) fixture: cannot clone nohook"
+_n15="$(check_in nohook)"; _r15=$?
+case "$_r15" in 1) ok "15) a box with NO hook FAILS check-hook (rc 1, not an abstention)" ;; *) bad "15) no-hook rc=$_r15 (want 1): $_n15" ;; esac
+case "$_n15" in HOOK-FAIL*MISSING*) ok "15) ...and the verdict NAMES the fault (MISSING)" ;; *) bad "15) verdict does not name MISSING: $_n15" ;; esac
+case "$_n15" in *"$(hostname 2>/dev/null || uname -n)"*) ok "15) ...and NAMES THE BOX (so a fleet run can say which cell is unarmed)" ;; *) bad "15) verdict names no host: $_n15" ;; esac
+# the shape a present-and-executable check calls GREEN and which refuses every push on the box:
+( cd "$T/nohook" && "$BC" install-hook >/dev/null 2>&1 ) || bad "15) fixture: install-hook in nohook"
+_n15b="$(check_in nohook)"; eq "15) ...and the same box PASSES once the hook is installed" "$?" "0"
+case "$_n15b" in HOOK-OK*) ok "15) ...printing HOOK-OK" ;; *) bad "15) after install: $_n15b" ;; esac
+sed 's|^bc="${BRANCH_CLAIM_BIN:-.*}"$|bc="${BRANCH_CLAIM_BIN:-/nonexistent/4260/branch-claim.sh}"|' "$T/nohook/.git/hooks/pre-push" > "$T/nohook/.git/hooks/pre-push.new" \
+  && cat "$T/nohook/.git/hooks/pre-push.new" > "$T/nohook/.git/hooks/pre-push" \
+  && rm -f "$T/nohook/.git/hooks/pre-push.new"
+_n15c="$(check_in nohook)"; _r15c=$?
+case "$_r15c" in 1) ok "15) a hook whose BAKED GATE PATH is gone FAILS (rc 1)" ;; *) bad "15) gone-gate rc=$_r15c (want 1): $_n15c" ;; esac
+case "$_n15c" in *GATE-ABSENT*) ok "15) ...naming GATE-ABSENT (the shape that would refuse EVERY push on that box)" ;; *) bad "15) verdict: $_n15c" ;; esac
+chmod -x "$T/nohook/.git/hooks/pre-push"
+_n15d="$( ( cd "$T/nohook" && "$BC" check-hook 2>/dev/null ) )"; _r15d=$?
+case "$_r15d" in 1) ok "15) a NON-EXECUTABLE hook FAILS (git runs no non-executable hook: inert while looking installed)" ;; *) bad "15) non-exec rc=$_r15d: $_n15d" ;; esac
+case "$_n15d" in *NOT-EXECUTABLE*) ok "15) ...naming NOT-EXECUTABLE" ;; *) bad "15) verdict: $_n15d" ;; esac
+# cannot-verify is its own answer, and it is NOT a pass.
+_n15e="$( cd "$T" && "$BC" check-hook 2>/dev/null )"; _r15e=$?
+case "$_r15e" in 2) ok "15) outside any work tree the answer is CANNOT-VERIFY (rc 2), never a pass" ;; *) bad "15) not-a-tree rc=$_r15e: $_n15e" ;; esac
+
+# ⛔ AND THE INSTALLER MUST NOT REPORT SUCCESS IT CANNOT VERIFY. `install-hook` calls the same
+# verifier and DIES when the artifact does not answer. The fixture is a real one: a copy of the script
+# beside a template whose `@BC@` placeholder is missing, so the hook it installs names a gate path that
+# cannot resolve — the exact shape of a box whose harness moved. The SHIPPED script must refuse that
+# install; a MUTANT with the verification line replaced by `true` installs it and exits 0. The
+# difference between the two runs is the only thing that proves the line load-bearing.
+BM2="$T/branch-claim-verify-mutant.sh"
+sed 's|^  check_hook_report |  true |' "$BC" > "$BM2"
+if cmp -s "$BC" "$BM2"; then
+  bad "15) the install-verification mutant is IDENTICAL — the call was not found, so the shipped line is unpinned"
+else
+  bash -n "$BM2" && ok "15) the install-verification mutant still parses" || bad "15) the mutant does not parse"
+  mkdir -p "$T/notmpl"
+  cp "$BC" "$T/notmpl/branch-claim.sh" && chmod +x "$T/notmpl/branch-claim.sh"
+  cp "$SELFDIR/claims.sh" "$T/notmpl/claims.sh"
+  # ⛔ THE MUTANT MUST SHARE THE FIXTURE'S DIRECTORY, not sit beside the real script: it sources
+  # `$SELF_DIR/claims.sh` and reads `$SELF_DIR/branch-claim-hook.sh`, so a mutant anywhere else dies on
+  # `cannot load claims.sh` (rc 2) and the case would read that as "the mutant also refused" — a
+  # fixture artefact masquerading as a measurement.
+  cp "$BM2" "$T/notmpl/branch-claim-verify-mutant.sh" && chmod +x "$T/notmpl/branch-claim-verify-mutant.sh"
+  BM2="$T/notmpl/branch-claim-verify-mutant.sh"
+  # the template WITHOUT its @BC@ placeholder: install substitutes nothing, the hook's gate path stays
+  # the literal `@BC@`, and a hook that cannot resolve its gate is the one that refuses every push.
+  sed 's|@BC@||g' "$SELFDIR/branch-claim-hook.sh" > "$T/notmpl/branch-claim-hook.sh" \
+    || bad "15) fixture: cannot build the template without its placeholder"
+  git clone -q "$T/origin.git" "$T/verify-a" 2>/dev/null; git clone -q "$T/origin.git" "$T/verify-b" 2>/dev/null
+  ( cd "$T/verify-a" && bash "$T/notmpl/branch-claim.sh" install-hook >"$T/va.out" 2>&1 ); _ra=$?
+  ( cd "$T/verify-b" && bash "$BM2" install-hook >"$T/vb.out" 2>&1 ); _rb=$?
+  case "$_ra" in
+    0) bad "15) install-hook reported SUCCESS for a hook whose gate path cannot resolve: $(cat "$T/va.out")" ;;
+    *) ok "15) install-hook REFUSES an install that does not VERIFY (rc=$_ra)" ;;
+  esac
+  case "$_ra:$_rb" in
+    0:0|0:*) bad "15) BOTH runs failed/succeeded alike (shipped=$_ra mutant=$_rb) — the mutant does not differ, so the verification line is unpinned" ;;
+    *:0) ok "15) the MUTANT accepts it (rc=0) — so the refusal above IS the verification, not the fixture" ;;
+    *) bad "15) the mutant also refused (rc=$_rb): $(cat "$T/vb.out") — the fixture, not the verification, produced the refusal" ;;
+  esac
 fi
 
 echo
