@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-10360-1795770534-p2122556-73b98564",
+  "_sha": "bcf52f1261b969fdaccd0a20f5e1e96e15adb3e8",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-10360.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/10360-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "3f134560b6cbb3836aa6f47c6ba61d10c7efb1f1"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/tm-10360"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 35994,
+  "ended_at": 1795806528,
+  "exit_code": 0,
+  "heartbeat_at": 1795806528,
+  "host": "cmux",
+  "issue": 10360,
+  "kind": "lane",
+  "lane_id": "cmux.klane-10360-1795770534-p2122556-73b98564",
+  "lease_until": 1795843128,
+  "pid": 2122556,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795770534,
+  "state": "DONE",
+  "tag": "10360",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-10360"
+}
