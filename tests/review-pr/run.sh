@@ -5052,6 +5052,11 @@ grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-osp
 ck $? "(10) …and the STORE really was re-recorded at the live head — so the arm cannot be satisfied by the re-record failing"
 # …the second half of the same harm: rc=0 with an UNSIGNED marker (no key on the box) is a record the
 # gate fails closed on, and this file already refuses that shape by name after a fresh record (:4009).
+# ⛔ WHICH ROW ANSWERS WHICH MUTANT, because this one does not answer deleting its own arm (P3 note,
+# fresh review of PR #4257 round 2): drop `0:unsigned)` and the `rc=9` row still passes — the fall-
+# through re-reviews and then hits the same unsigned refusal after a fresh record. The arm IS covered,
+# by the two rows below it (no reviewer spawned / the signature named): they redden on exactly the
+# behaviour that deletion breaks, so a reader must not read the first row as the arm's guard.
 reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
 FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_NO_KEY=1
 printf 'CLEAN\n' > "$TMP/reviewer-out"
