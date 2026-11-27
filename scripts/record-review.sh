@@ -6262,7 +6262,15 @@ code_identity_carry() { # <reviewed-sha> <current-head> -> 0 = code identical, 1
         # 2 = the helper could not normalise it confidently. Collapsing both to a
         # refusal here is the whole fail-closed contract, so this line must never
         # grow a `|| true` or a status inversion.
-        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null 2>&1; then
+        # ⛔ ITS STDERR IS NOT SWALLOWED. The helper names WHY it refused ("no
+        # confident normaliser for tool.ts", "… does not parse as Python", "… looks
+        # binary"), and the recorder's own refusal — the stale-sha guard — says
+        # nothing about which file cost the re-review. Suppressing this turned a
+        # diagnosable refusal into "the head moved, review again", which is the
+        # exact cost #4105 exists to remove; a lane that is told WHICH file, and
+        # why, can tell "my stripper is too narrow" from "I really did change code".
+        # stdout stays discarded: the verdict is the exit status, never the wording.
+        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null; then
           command rm -rf "$tmp"; return 1
         fi
         ;;
