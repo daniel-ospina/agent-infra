@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "exit_code": null,
+  "heartbeat_at": 1795802568,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-bgok-1795802568-p223452-b70494d9",
+  "lease_until": 1795803188,
+  "pid": 223452,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1795802568,
+  "state": "RUNNING",
+  "tag": "bgok",
+  "worktree": "/tmp/tmp.259fIef9Th/wt"
+}
