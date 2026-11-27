@@ -3236,6 +3236,12 @@ reset
 # §BW(10)'s round-3 rows then added five assertions (P2, fresh review of #4257 round 3 — the refusal
 # printed a remedy the recorder REFUSES, and claimed check (c) reads the body as if that were the only
 # channel it admits): 5 assertions, taking the stable surface from 1312 to 1317 — moved WITH the change.
+# §BW(10)'s round-4 fix then RE-CLASSIFIED two of those rows (P3, fresh review of #4257 at
+# `b454f9f1c2a8` — the two `carry-patch` marker refusals exited 9, the code a recorder that ran and
+# FAILED after a PAID review also reaches, so `auto-rail.sh`'s `review_state` charged them the budget
+# their own text says they did not spend): both now expect 14. The stable surface is UNCHANGED at 1317 —
+# no assertion was added or removed — so a re-measure after this commit must still read 1317 outside the
+# §AT dialect loop, and a move here means something else changed.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -5051,7 +5057,7 @@ reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
 FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_MARKER_MISSING=1
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "9" ]; ck $? "(10) carry-patch with NO body marker: exit 9, never the 'NO REVIEW OWED' claim (rc=$(rc_of))"
+[ "$(rc_of)" = "14" ]; ck $? "(10) carry-patch with NO body marker: exit 14 — the code that buys NOTHING (rc=$(rc_of))"
 no_reviewer; ck $? "(10) …no reviewer spawned (the record IS current — the BODY marker is the missing half, not the review)"
 out_not_has "NO REVIEW OWED"; ck $? "(10) …and the success line is NOT printed over a store-only attestation"
 err_has "PR BODY carries no marker"; ck $? "(10) …the refusal names the half that is missing (check (c) reads the body)"
@@ -5067,18 +5073,22 @@ err_has "--flush-pending"; ck $? "(10) …and the remedy LANDS the body copy the
 err_not_has "--evidence comment:"; ck $? "(10) …and it does NOT print the live-head comment-evidence re-record the recorder REFUSES on its postdate arm (P2, round 3)"
 err_has "PR COMMENT"; ck $? "(10) …and it names the COMMENT channel check (c) also admits, instead of claiming the body is the only one (P2, round 3)"
 # …the second half of the same harm: rc=0 with an UNSIGNED marker (no key on the box) is a record the
-# gate fails closed on, and this file already refuses that shape by name after a fresh record (:4009).
-# ⛔ WHICH ROW ANSWERS WHICH MUTANT, because this one does not answer deleting its own arm (P3 notes,
-# fresh reviews of PR #4257 rounds 2 AND 3): drop `0:unsigned)` and BOTH the `rc=9` row AND the
-# `err_has "UNSIGNED"` row below still pass — the fall-through re-reviews and then hits the identical
-# refusal after a fresh record (`review-pr.sh:4065`: "an UNSIGNED marker is in the PR body"), i.e. the
-# same word on the same exit code. The arm IS covered, but by ONE row, not two: `no_reviewer` reddens on
-# the review that the deletion buys. A reader must not read the first two rows as the arm's guard.
+# gate fails closed on, and this file already refuses that shape by name after a fresh record (:4065).
+# ⛔ WHY THIS ARM CARRIES ITS OWN CODE (P3, fresh review of PR #4257 at `b454f9f1c2a8`): both of the arm's
+# refusals first exited 9, the code a recorder that RAN AND FAILED after a PAID review also reaches, so
+# `auto-rail.sh`'s `review_state` — which classifies on the code alone — charged them the paid attempt
+# budget the messages say they did not spend. They are 14 now, and `auto-rail.sh`'s `review_state` reads 14
+# as `refused` (a named arm, not a line number — the arm moves). The rc row below is therefore a CLASSIFICATION assertion as well as an existence one: on 9
+# it asserted the refusal exists, on 14 it also asserts nothing was charged.
+# ⛔ AND DELETING THE ARM NOW REDDENS TWO ROWS, NOT ONE (the round-2/3 note this replaces is no longer
+# true): the fall-through re-reviews and then hits the fresh-record refusal at `review-pr.sh:4065` — the
+# same WORD on a DIFFERENT code, because that one follows a paid review and must keep 9. So the rc row
+# reddens (14 ≠ 9) as well as `no_reviewer`, and `err_has "UNSIGNED"` still does not (the words survive).
 reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
 FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_NO_KEY=1
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "9" ]; ck $? "(10) carry-patch with an UNSIGNED body marker: exit 9 too (rc=$(rc_of))"
+[ "$(rc_of)" = "14" ]; ck $? "(10) carry-patch with an UNSIGNED body marker: exit 14 too — nothing was bought, so nothing may be charged (rc=$(rc_of))"
 no_reviewer; ck $? "(10) …no reviewer spawned for an unsigned re-record either"
 err_has "UNSIGNED"; ck $? "(10) …and the refusal names the missing signature rather than a missing marker"
 err_has "RECORDED HEAD"; ck $? "(10) …and its remedy re-mints at the RECORDED head — the only form the recorder accepts in a carry"
