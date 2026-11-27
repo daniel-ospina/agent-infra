@@ -2178,7 +2178,7 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
-function unquote(s,   out, rest, span, live) {
+function unquote(s,   out, rest, span, live, pre, post, win, _rs, _rl) {
   # ⛔ AN INLINE QUOTATION IS NOT THE REVIEWER OWN COUNT — UNLESS THE QUOTATION ITSELF SAYS THE
   # FINDING IS LIVE (issue #4233, REOPENED; MEASURED on PR #4251). Every quoted span that carries NO
   # liveness cue is replaced by one space before the three arms run, so a phrase the reviewer is
@@ -2209,10 +2209,30 @@ function unquote(s,   out, rest, span, live) {
   rest = s
   while (match(rest, /"[^"]*"/)) {
     span = substr(rest, RSTART, RLENGTH)
+    # ⛔ THE CUE IS READ FROM THE CLAUSE THAT CARRIES THE QUOTATION, NOT FROM THE SPAN ALONE (P2, fresh
+    # review at `0dd5e5519` — MEASURED at `896b4a96`, the head this replaces):
+    #   `The suite reports "2 blocking defects" still open.`  ->  NO fragment at QUOTE_OK=1
+    #   the same line                                          ->  `"2 blocking defects` at QUOTE_OK=0
+    # so a reviewer that QUOTED a count and then said — outside the quotes — that it is still open had
+    # its report BLANKED, and the second, unblanked pass cannot rescue it (that pass re-scans only
+    # verdict-shaped lines). A signed clean was minted over a report of a live count, which is the one
+    # direction this seam exists to refuse, while the cue saying the finding is live sat in plain sight
+    # on the predicate. Windows `pre`/`post` are the clause OF THE SPAN — back to the last sentence
+    # terminator or table-cell separator, and forward to the next one — because THAT is where English
+    # puts the predicate (`"2 blocking defects" still open`). ⛔ Bounded that narrowly, the §BV(4c)
+    # DECLARED residual (`The parser has "3 blocking defects in it".`, no cue anywhere near it) still
+    # records, and the measured #4251 mutation-table row still records: its cell separators close the
+    # window before any other column of the table can contribute a word.
+    # ⛔ RSTART/RLENGTH ARE SAVED FIRST: `sub()` below overwrites both, and the emission at the bottom of
+    # this loop slices `rest` with them.
+    _rs = RSTART; _rl = RLENGTH
+    pre = substr(rest, 1, _rs - 1); sub(/^.*[.!?|]/, "", pre)
+    post = substr(rest, _rs + _rl); sub(/[.;:!?|].*$/, "", post)
+    win = span " " pre " " post
     # ⛔ THIS VOCABULARY MUST STAY THE `_cue` VOCABULARY BELOW — §BV fails the suite if the two drift.
-    live = (span ~ /(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/)
-    out = out substr(rest, 1, RSTART - 1) (live ? span : " ")
-    rest = substr(rest, RSTART + RLENGTH)
+    live = (win ~ /(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/)
+    out = out substr(rest, 1, _rs - 1) (live ? span : " ")
+    rest = substr(rest, _rs + _rl)
   }
   return out rest
 }
@@ -2512,12 +2532,25 @@ refuse_counted_clean() {
     if grep -aqE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" <<<"${CLEAN_COUNT_LINE:-}"; then
       CLEAN_COUNT_SHAPED=1
     fi
+    # ⛔ A THIRD SHAPE, AND WHY IT IS NOT THE MILD SENTENCE (MEASURED at `896b4a96` on this change):
+    # with only the SHAPED/not split, §L (`[P1] scripts/x.sh:42 — a real blocking bug` + `CLEAN`) lost
+    # `self-contradicting` too, because its count sits on a DIFFERENT line. But that line DECLARES a
+    # blocking finding at P<n>: the reader can tell exactly which field is authoritative, and the two
+    # fields disagree — which is a contradiction, not an unreconcilable read. `SEV_RE` is the existing
+    # severity classifier (line-anchored P0-P3 token), reused rather than re-spelled, so a finding LINE
+    # is what it already means everywhere else in this script.
+    CLEAN_COUNT_FINDING=0
+    if [ "$CLEAN_COUNT_SHAPED" = "0" ] && grep -aqE "$SEV_RE" <<<"${CLEAN_COUNT_LINE:-}"; then
+      CLEAN_COUNT_FINDING=1
+    fi
     err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and this transcript reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a review cannot be both, so this is a verdict of convenience, not a clean review."
     err "  verdict line it compared : ${LAST:-<none>}"
     err "  line the count matched   : ${CLEAN_COUNT_LINE:-$LAST}"
     err "  phrase it read           : \"$CLEAN_COUNT_WORDS\""
     if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
       err "  The count sits ON the verdict-shaped line above, so that ONE line contradicts itself."
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      err "  The count sits on a DIFFERENT line, and that line DECLARES a blocking finding — so the verdict and the line above contradict each other, and the reader can see both fields."
     else
       err "  The count sits on a DIFFERENT line, which carries no verdict word — the reader could not tell which field was authoritative, and says so instead of blaming a contradiction it cannot point at."
     fi
@@ -2527,7 +2560,23 @@ refuse_counted_clean() {
       err "  last lines of that transcript:"
       tail -n 5 "$TRANSCRIPT" 2>/dev/null | while IFS= read -r _tl; do err "    $_tl"; done
     fi
-    die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
+    # ⛔ THE LAST LINE MUST NOT CONTRADICT THE SENTENCE TWO LINES ABOVE IT (P2, fresh review at
+    # `0dd5e5519`). This `die` was UNCONDITIONAL: BOTH arms ended with `a self-contradicting CLEAN
+    # verdict (clean + a reported count)`, including the DIFFERENT-line arm whose own `err` line says
+    # the reader `could not tell which field was authoritative` — so the most visible line of exactly
+    # the case the reopen is about still called the reviewer self-contradicting and still asserted a
+    # count ON a clean. That is the reopen's own objection verbatim: `a guard that says
+    # self-contradicting when what it means is I could not tell which field is authoritative`.
+    # §BV(3)'s `err_has "self-contradicting"` could not see it either, because this shared `die`
+    # satisfied it in BOTH arms. The exit code and the direction (nothing posted, nothing recorded) are
+    # unchanged; only the CLAIM is now the one the arm can support.
+    if [ "$CLEAN_COUNT_SHAPED" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count on the SAME line) is never recorded — re-run the review"
+    elif [ "$CLEAN_COUNT_FINDING" = "1" ]; then
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a blocking finding on a DIFFERENT line) is never recorded — re-run the review"
+    else
+      die "$E_ISSUES" "an unreconciled CLEAN verdict (a clean verdict and a count on DIFFERENT lines, with no way to tell which field is authoritative) is never recorded — re-run the review"
+    fi
   fi
 }
 

@@ -1150,6 +1150,7 @@ run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "exit 7 when the verdict says CLEAN but a [P1] line is present (rc=$(rc_of))"
 no_comment; ck $? "NO comment posted — the refusal runs BEFORE the artifact exists (a fail-closed check placed after the side effect fails open)"
 err_has "self-contradicting"; ck $? "…naming the contradiction"
+err_has "a blocking finding on a DIFFERENT line"; ck $? "…and naming WHICH contradiction: a blocking finding on a different line, not an unreconcilable read (§BV(5)'s arm keeps the mild sentence)"
 err_has "[P1] scripts/x.sh:42"; ck $? "…and printing the finding it refused to record over"
 no_record; ck $? "NO record written"
 no_record && [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…and no record file exists"
@@ -3166,9 +3167,16 @@ reset
 # silently.
 # Re-set to 762 when §BJ added the clause-scoped exemption, the word-numeral mirror, the indented-line
 # arm, the functional awk probe and the signed-marker arm (seventh fresh review). It was 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
-# Re-set to 891 when §BU added the marker-supplies-ISSUES arm (#4233 round 1) and again to 1274 when
-# §BV added the quotation/attribution arm (#4233 reopened, the #4251 shape) — measured 1275 printed,
-# one less per the rule above.
+# Re-set to 891 when §BU added the marker-supplies-ISSUES arm (#4233 round 1). §BV then added the
+# quotation/attribution arm (#4233 reopened, the #4251 shape) — 23 assertions — and §BV's second round
+# (the clause-scoped liveness window, the split terminal sentences, the exact-vocabulary row) added 6
+# more, with 1 in §L pinning the sentence of its own arm: 30 in total across those two rounds.
+# ⛔ THESE ARE NO LONGER ABSOLUTE TOTALS (P3, fresh review at `0dd5e5519` — the `was 1252/0; §BV adds
+# 21 → 1275` sentence did not close, because the PREVIOUS pin's own `ck` was already counted in the
+# 1252). The pin reads `PASS - _AT_ENV_ASSERTIONS`, i.e. assertions OUTSIDE §AT's dialect loop, so its
+# value is (that stable surface) - 1 and does NOT move with the box's awk-dialect count — the loop's
+# own size is pinned exactly above, in `6 × installed dialects`. Re-measure by running the suite and
+# subtracting; never copy the printed total here.
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -4720,6 +4728,34 @@ run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a quoted phrase saying the defects REMAIN is still a finding (rc=$(rc_of), want 7)"
 no_record; ck $? "  ...nothing recorded"
 
+# (4b) ⛔ THE CUE THAT GOVERNS A QUOTATION OFTEN SITS OUTSIDE IT (P2, fresh review at `0dd5e5519` —
+# MEASURED at the pre-fix blanking, on the head this row was added for): `unquote()` tested the
+# LIVENESS CUE inside the span only, so
+#
+#   The suite reports "2 blocking defects" still open.
+#
+# produced NO fragment at `QUOTE_OK=1` while it printed `"2 blocking defects` at `QUOTE_OK=0` — i.e.
+# the survivors pass RECORDED A SIGNED CLEAN over a review that had reported a live count with its own
+# cue sitting on the predicate outside the quotes. That is the one direction this seam exists to
+# refuse, and the wave-2 unblanked verdict pass does not rescue it (that pass covers only
+# VD_CLEAN|VD_CLEAN_URL|VD_ISSUES|VD_LABEL lines, and this is an ordinary line). The window is the
+# quotation AND the clause that carries it, bounded by a sentence terminator or a table-cell separator.
+# ⚠️ NON-VACUITY: this row is RED at `896b4a96` (the head that carries the defect) and GREEN after the
+# window fix — it discriminates against the regression, not against the pre-#4253 seam, which refused
+# this line too (nothing was blanked there).
+reset; printf 'The suite reports "2 blocking defects" still open.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a quoted count whose LIVENESS CUE is outside the quotation still refuses (rc=$(rc_of), want 7)"
+no_record; ck $? "  ...nothing recorded, so no signed clean is minted over it"
+err_has '2 blocking defects'; ck $? "  ...and the count it refused over is printed, not swallowed by the blanking"
+
+# (4c) ⛔ AND THE WINDOW IS A CLAUSE, NOT THE LINE — the DECLARED residual must stay quiet, or the fix
+# for (4b) would swallow the heuristic that #4233's own measured case depends on.
+reset; printf 'The parser has "3 blocking defects in it".\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "the DECLARED residual (no cue near the quotation) still RECORDS (rc=$(rc_of), want 0) - the window did not widen to the whole line"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  ...a record was written, so the narrowing is still a narrowing"
+
 # (5) ⛔ THE DIAGNOSIS: the refusal must NAME BOTH LINES it reconciled and must not claim a shape it
 # never saw. `a verdict-shaped line ALSO reports a non-zero count` was asserted over EVERY
 # counted-clean refusal, including the measured #4251 one where the count sat on a mutation-table row
@@ -4734,19 +4770,30 @@ err_has "could not tell which field was authoritative"; ck $? "  ...naming its O
 err_has 'verdict line it compared : CLEAN'; ck $? "  ...and printing the verdict line it compared against"
 err_has 'line the count matched   : Summary: I found two blocking defects:'; ck $? "  ...and the exact line it matched, so both halves of the reconciliation are visible"
 err_has 'phrase it read           : " two blocking defects"'; ck $? "  ...and the exact phrase (leading separator included, as the pre-fix log printed it)"
+# ⛔ AND THE LAST LINE OF THE REFUSAL MUST NOT CONTRADICT THE SENTENCE TWO LINES ABOVE IT (P2, fresh
+# review at `0dd5e5519`): `die` was UNCONDITIONAL and said `a self-contradicting CLEAN verdict` on
+# BOTH arms, including this one, whose own `err` line says the reader `could not tell which field was
+# authoritative` — so the most visible line of the case the reopen is about still blamed the reviewer
+# for a contradiction it had just said it could not point at. §BV(3) cannot see this: its
+# `err_has "self-contradicting"` is satisfied by the same shared `die`, so it passes in EITHER arm.
+err_not_has "self-contradicting"; ck $? "  ...and the terminal refusal does NOT call this arm self-contradicting (it is unreconciled, not contradictory)"
 
 # (6) THE TWO LIVENESS VOCABULARIES CANNOT DRIFT. `unquote` decides what survives blanking, and the
 # `_cue` test decides what survives the articles arm; if one gains a word the other lacks, a quotation
 # is blanked on one pass and live on another — the drift MEMORY.md records for VD_ISSUES, one grammar
 # over. Both are derived from the SUT, so an edit to either alone is red.
-_BV_UNQ_LINE="$(grep -n 'live = (span ~' "$SRC" | head -1 | cut -d: -f1)"
+_BV_UNQ_LINE="$(grep -n 'live = (win ~' "$SRC" | head -1 | cut -d: -f1)"
 [ -n "$_BV_UNQ_LINE" ]; ck $? "the quotation reader's liveness line was located (line ${_BV_UNQ_LINE:-<none>})"
-_BV_UNQ_VOC="$(awk 'index($0,"live = (span ~ /("){ p="live = (span ~ /("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
+_BV_UNQ_VOC="$(awk 'index($0,"live = (win ~ /("){ p="live = (win ~ /("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
 _BV_CUE_VOC="$(awk 'index($0,"_cue !~ /^[^.;:,!?()]*("){ p="_cue !~ /^[^.;:,!?()]*("; s=substr($0,index($0,p)+length(p)); print substr(s,1,index(s,")")-1) }' "$SRC" | head -1)"
 [ -n "$_BV_UNQ_VOC" ] && [ -n "$_BV_CUE_VOC" ]; ck $? "both liveness vocabularies were extracted live from the script (quotation='${_BV_UNQ_VOC:-<none>}')"
 [ "$_BV_UNQ_VOC" = "$_BV_CUE_VOC" ]; ck $? "  ...and they are IDENTICAL, so no word can be live to one reader and dead to the other (cue='${_BV_CUE_VOC:-<none>}')"
-case "$_BV_UNQ_VOC" in remain\|*\|left) rc=0;; *) rc=1;; esac
-ck $rc "  ...and the extracted set is the cue set itself (remain…left), not two empty strings that agree"
+# ⛔ THE EXACT SET, NOT ITS TWO ENDS (P3, fresh review at `0dd5e5519`): the previous row was
+# `case "$_BV_UNQ_VOC" in remain\|*\|left)`, whose `\|` are LITERAL — it only required the string to
+# BEGIN `remain|` and END `|left`, so deleting `still|open|unresolved|unfixed|outstanding|reopened`
+# from BOTH readers kept it green (measured: `remainXleft` → 0; the shortened set → 0). The vocabulary
+# decides which quotations survive blanking, so a silent shrink re-grades reviews unseen.
+[ "$_BV_UNQ_VOC" = 'remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left' ]; ck $? "  ...and it is EXACTLY the expected cue set, so no word can be dropped from both readers at once (got '${_BV_UNQ_VOC}')"
 rm -f "$BV"; reset
 # ══ end §BV ══
 
@@ -4760,6 +4807,6 @@ rm -f "$BV"; reset
 # hides the section loss it exists for. The pin therefore holds the STABLE surface (what §AT's dialect
 # loop drove is subtracted, and that loop's own size is pinned exactly above), so 1250 means the same
 # thing on every box, and a lost section still moves it.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1250 ]; ck $? "assertion-count pin: >= 1250 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1257 ]; ck $? "assertion-count pin: >= 1257 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
