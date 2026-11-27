@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "exit_code": null,
+  "heartbeat_at": 1795758716,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-bgdelivery4-1795758716-p2987373-087173e3",
+  "lease_until": 1795759336,
+  "pid": 2987373,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1795758716,
+  "state": "RUNNING",
+  "tag": "bgdelivery4",
+  "worktree": "/tmp/tmp.uUoYqNKrJo/wt"
+}
