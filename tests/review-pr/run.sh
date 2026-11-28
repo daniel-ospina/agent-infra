@@ -4926,6 +4926,13 @@ rm -f "$BV" "$BV2" "$BV3"; reset
 # assert the OBSERVABLES that matter: was a reviewer paid for, was a record minted, at which head.
 echo; echo "§BW the recorder's carry predicate is asked BEFORE a review is bought"
 REC_HEAD_OLD="2222222222222222222222222222222222222222"
+# The two digests a carry answer NAMES (`--check-carry` prints `<token>\t<recorded diff>\t<live diff>`,
+# record-review.sh:6871/6886), so the fixture can model the REAL recorder, which always writes a
+# `diff=` group into its marker (record-review.sh:8970-8973) and always answers with the pair its
+# decision is about. Derived, never hardcoded: a 64-hex literal typed by hand is a typo away from
+# a row that passes for the wrong reason.
+CARRY_DIFF="$(printf 'recorded diff for the carry scenarios' | fixture_sha256)"
+CARRY_LIVE="$(printf 'live diff after the base advance' | fixture_sha256)"
 # The PRECONDITION of every carry answer is a record that exists and names an EARLIER head, so the
 # carry-patch scenarios seed the store with exactly that (a fresh `reset` empties it). Verdict `clean`
 # and a real `evidence` field: `--check-carry` treats a `carried` record with no provenance as
@@ -4939,10 +4946,19 @@ seed_stale_record() {
 # A carried record's SIGNED MARKER is what check (c) reads, and it is bound to the RECORDED head —
 # so a carry scenario without one models a store-only attestation, which is a DIFFERENT (refused)
 # state. Every carry scenario below therefore seeds the marker the real recorder would have posted.
-seed_body_marker() { # <sha> [verdict] [sig]
-  local m
-  m="review recorded: reviews/2284.json verdict=${2:-clean} @ $1 (daniel-ospina/agent-infra)"
-  printf '%s sig=%s\n' "$m" "${3:-$(printf '%s' "$m" | openssl dgst -sha256 -hmac fixture-signing-key | awk '{print $NF}')}" >> "$TMP/body.md"
+# ⛔ AND THE MARKER NAMES ITS DIFF (P1, fresh review at `085a6e65c118`). `record-review.sh` writes
+# `@ <sha> diff=<64hex> (<repo>)` whenever it has a digest, and check (c)'s carry path REFUSES a
+# candidate whose marker carries none (`c_carry_resolve`: `nodhead` → rc 2) — so a fixture that
+# seeded digest-less markers modelled a state the gate refuses and let the seam's exit-0 arm look
+# correct over it. The `diff=` group is therefore a first-class parameter, and §BW(15)/(16) drive
+# its two absence states.
+seed_body_marker() { # <sha> [verdict] [sig] [diff]
+  local head="$1" verdict="${2:-clean}" sig="${3:-}" diff="${4:-}" m
+  m="review recorded: reviews/2284.json verdict=$verdict @ $head"
+  [ -n "$diff" ] && m="$m diff=$diff"
+  m="$m (daniel-ospina/agent-infra)"
+  [ -z "$sig" ] && sig="$(printf '%s' "$m" | openssl dgst -sha256 -hmac fixture-signing-key | awk '{print $NF}')"
+  printf '%s sig=%s\n' "$m" "$sig" >> "$TMP/body.md"
 }
 # The RECORDER'S negative line (#3400) — the only thing that tells a carry arm the carried record is
 # `not-clean`; the token and rc stay identity-based, which is why the token alone was not enough.
@@ -4952,13 +4968,15 @@ seen_not_clean_hint() {
 }
 
 # (1) `carry` — the reviewed DIFF is byte-identical, so the gate already carries the record.
-reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_body_marker "$REC_HEAD_OLD"
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+seed_body_marker "$REC_HEAD_OLD" clean "" "$CARRY_DIFF"
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "(1) carry: exit 0 — nothing is stale and nothing is owed (rc=$(rc_of))"
 no_reviewer; ck $? "(1) carry: NO reviewer was spawned"
 no_record; ck $? "(1) carry: no record was re-minted (the gate carries the existing one as-is)"
 out_has "NO REVIEW OWED"; ck $? "(1) carry: the answer says so, naming the recorder's own predicate"
+out_has "${CARRY_DIFF:0:12}"; ck $? "(1) carry: the success line names the digest it certified, not just 'a marker exists'"
 [ "$(cat "$TMP/check-carry-pr.txt" 2>/dev/null)" = "2284" ]; ck $? "(1) carry: it asked about THIS PR"
 
 # (2) `carry-patch` (#1377) — the rendered diff moved, every reviewed line identical: RE-RECORD at the
@@ -4966,6 +4984,12 @@ out_has "NO REVIEW OWED"; ck $? "(1) carry: the answer says so, naming the recor
 # fresh mint that refuses a blank --evidence); the fixture re-binds to the live head exactly as the
 # real recorder's carry arm does, which is what makes the "recorded at the LIVE head" assertion real.
 reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6
+# ⛔ THE RECORDER'S OWN MARKER IS THE ARTIFACT (P1, fresh review at `085a6e65c118`). A successful
+# carry-patch RE-RECORDS at the live head, so the recorder it calls posts a marker there — and the
+# real one always carries `diff=<the live diff>`. The fake writes `diff=` only when it is told the
+# digest, so both are set: without them this scenario models a post that never landed, which is
+# exactly the state §BW(17) must refuse rather than certify.
+FIXTURE_CC_LIVE="$CARRY_LIVE"; FIXTURE_MARKER_DIFF="$CARRY_LIVE"
 FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
@@ -4999,7 +5023,8 @@ err_has "did NOT produce a clean record"; ck $? "(3) …naming the failed prereq
 # one). The seam must rebuild the store record (`--recover-body`) and ASK AGAIN before paying.
 reset; FIXTURE_CC_TOKEN=norecord; FIXTURE_CC_RC=4
 FIXTURE_RECOVER_RC=0; FIXTURE_CC_TOKEN_AFTER_RECOVER=carry; FIXTURE_CC_RC_AFTER_RECOVER=0
-seed_body_marker "$REC_HEAD_OLD"   # the whole premise: the SIGNED marker lives in the body
+FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+seed_body_marker "$REC_HEAD_OLD" clean "" "$CARRY_DIFF"   # the whole premise: the SIGNED marker lives in the body
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "(4) norecord: recovered from the signed body marker, then carried (rc=$(rc_of))"
@@ -5072,7 +5097,14 @@ run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "(12) head + a NOT-CLEAN record: exit 7 (issues), never 5/'nothing owed' (rc=$(rc_of))"
 no_reviewer; ck $? "(12) …no reviewer spawned (an unchanged artifact is not an approval)"
 err_has "OPEN FINDINGS"; ck $? "(12) …and the refusal says the findings are open, not that a clean record exists"
-reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record; seen_not_clean_hint; seed_body_marker "$REC_HEAD_OLD" not-clean
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record; seen_not_clean_hint
+FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+# ⛔ A CLEAN-FAMILY MARKER, NOT `not-clean` (P3, fresh review at `085a6e65c118`). `marker_state`'s regex
+# accepts only `clean|clean-micro|clean-low`, so the old `not-clean` seed could NEVER match: the row
+# still caught the defect (the mutant reddened, at 0 rather than at 7) but it proved the `cc_negative`
+# line alone and read as coverage of the marker axis it did not have. With a clean-family seed the
+# ONLY thing that can refuse here is the verdict discriminator, which is what the row names.
+seed_body_marker "$REC_HEAD_OLD" clean "" "$CARRY_DIFF"
 printf 'CLEAN
 ' > "$TMP/reviewer-out"
 run "$SRC" 2284
@@ -5085,12 +5117,110 @@ err_not_has "NO REVIEW OWED"; ck $? "(13) …and the success line is NOT printed
 # that wipes the marker, a dropped post, a store synced from another box). Nothing must be bought, and
 # nothing may be claimed.
 reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record
+FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
 printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "9" ]; ck $? "(14) carry with NO body marker: exit 9 (record arm), not 0 (rc=$(rc_of))"
 no_reviewer; ck $? "(14) …no reviewer spawned (the record is current; the marker is the missing half)"
 err_not_has "NO REVIEW OWED"; ck $? "(14) …and no success line over a body the gate cannot read"
 err_has "NO signed marker"; ck $? "(14) …naming the half that is missing"
+
+# (15)/(16) ⛔ A SIGNED MARKER IS NOT ENOUGH — IT MUST NAME THE CARRIED DIFF (P1, fresh review at
+# `085a6e65c118`). The seam's marker scan was `any-head` AND nothing else: it certified "a signed
+# marker for this PR/repo exists at SOME head", while check (c)'s carry path certifies the
+# `(recorded head, recorded diff)` PAIR — it skips a digest-less candidate (`c_carry_resolve` → rc 2)
+# and answers `fresh` for a digest that does not match (rc 3). Both states below are reachable INSIDE
+# the population the carry arm exists for, and both exited 0 (`auto-rail: clean`) over a RED check
+# before this fix. Nothing must be bought for either: the artifact exists and is current; the ATTACK
+# is on the attestation.
+# (15) a PRE-#2982 marker: signed, at the recorded head, no `diff=` group at all.
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record
+FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+seed_body_marker "$REC_HEAD_OLD"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(15) carry + a SIGNED marker with NO diff=: exit 9, never 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(15) …no reviewer spawned (a re-record is the remedy, not a re-review)"
+err_not_has "NO REVIEW OWED"; ck $? "(15) …and no 'nothing is owed' line over a marker check (c) skips"
+err_has "NO \`diff=\` group"; ck $? "(15) …naming the pre-#2982 shape, not a missing marker"
+# (16) THE BODY-EDIT CASE THE PR NAMES: the carried record's marker was wiped, an OLDER signed marker
+# for another diff survives. `any-head` + presence certified it; check (c) asks the producer about the
+# carried pair and gets `fresh`.
+reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record
+FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+CARRY_OTHER="$(printf 'an older record, a different artifact' | fixture_sha256)"
+seed_body_marker "$REC_HEAD_OLD" clean "" "$CARRY_OTHER"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(16) carry + a marker for a DIFFERENT diff: exit 9, never 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(16) …no reviewer spawned"
+err_not_has "NO REVIEW OWED"; ck $? "(16) …and no success line over a marker that names another record"
+err_has "DIFFERENT diff"; ck $? "(16) …naming the surviving-marker half of the body edit"
+
+# (17) ⛔ THE `carry-patch` ARM ASKS FOR THE MARKER TOO (P1, fresh review at `085a6e65c118`). The
+# comment on `marker_state`'s hoisted definition claims this arm asks it; it did not — it exited 0 on
+# the STORE check alone, certifying a required check it never read. A successful re-record whose
+# best-effort body post did not land leaves a clean record at the live head and check (c) RED.
+reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6; FIXTURE_CC_LIVE="$CARRY_LIVE"
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record
+FIXTURE_MARKER_MISSING=1   # the re-record lands; the marker post did not
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "(17) carry-patch with NO body marker after the re-record: exit 9, never 0 (rc=$(rc_of))"
+no_reviewer; ck $? "(17) …no reviewer spawned (the record is fine; the attestation is not)"
+err_not_has "NO REVIEW OWED"; ck $? "(17) …and no success line over the half that is missing"
+# (18) MUTATION CONTROL for (17): make the arm skip the body read and (17) records rc=0 — so (17) is
+# the arm's doing. NON-VACUITY AT THE PRE-FIX HEAD: the pre-fix code IS this mutant (the arm had no
+# marker check at all), so (17) was a false clean at 0 before this change.
+MUT_CP="$TMP/mutant-nopatchmarker.sh"
+sed 's|^        \[ "\$CP_BODY_RC" -eq 0 \] && CP_MARKER=.*$|        CP_BODY_RC=0; CP_MARKER="signed"|' "$SRC" > "$MUT_CP"; chmod +x "$MUT_CP"
+if cmp -s "$SRC" "$MUT_CP"; then
+  fail "§BW(18) the mutation did not apply — the carry-patch marker call changed shape, so this control proves NOTHING"
+else
+  pass "§BW(18) mutation applied (the carry-patch marker read forced to 'signed')"
+  reset; FIXTURE_CC_TOKEN=carry-patch; FIXTURE_CC_RC=6; FIXTURE_CC_LIVE="$CARRY_LIVE"
+  FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD_FIXTURE"; seed_stale_record; FIXTURE_MARKER_MISSING=1
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_CP" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "§BW(18) the MUTANT exits 0 on a body with no marker — so (17) is the arm's doing (rc=$(rc_of))"
+fi
+rm -f "$MUT_CP"; reset
+
+# (19) MUTATION CONTROL for (15)/(16): a `marker_state` that ignores its expected digest is the PRE-FIX
+# predicate, and (15) records rc=0 under it. That is the non-vacuity proof for both rows.
+MUT_MD="$TMP/mutant-nodigestgate.sh"
+sed 's/^    if \[ -n "\$want_diff" \]; then$/    if [ 0 = 1 ]; then/' "$SRC" > "$MUT_MD"; chmod +x "$MUT_MD"
+if cmp -s "$SRC" "$MUT_MD"; then
+  fail "§BW(19) the mutation did not apply — the digest gate changed shape, so this control proves NOTHING"
+else
+  pass "§BW(19) mutation applied (the expected-digest gate disabled — the pre-fix predicate)"
+  reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record
+  FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+  seed_body_marker "$REC_HEAD_OLD"
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_MD" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "§BW(19) the MUTANT exits 0 over a digest-less marker — so (15) is the digest gate's doing (rc=$(rc_of))"
+fi
+rm -f "$MUT_MD"; reset
+
+# (20) MUTATION CONTROL for (12)/(13), WHICH THE CLEAN-FAMILY SEED MAKES SELF-EXPLANATORY (the review
+# owed this attribution: with the old `not-clean` seed the mutant reddened at 9 — the marker never
+# matched — so the row proved the `cc_negative` line only by accident). Disable the verdict
+# discriminator and (13) records rc=0 over a review that left 2 open blocking findings.
+MUT_CN="$TMP/mutant-noverdictgate.sh"
+sed 's/^    if cc_negative; then$/    if false; then/' "$SRC" > "$MUT_CN"; chmod +x "$MUT_CN"
+if cmp -s "$SRC" "$MUT_CN"; then
+  fail "§BW(20) the mutation did not apply — the verdict gate changed shape, so this control proves NOTHING"
+else
+  pass "§BW(20) mutation applied (the recorder's NOT-CLEAN line ignored)"
+  reset; FIXTURE_CC_TOKEN=carry; FIXTURE_CC_RC=0; seed_stale_record; seen_not_clean_hint
+  FIXTURE_CC_RECORDED="$CARRY_DIFF"; FIXTURE_CC_LIVE="$CARRY_LIVE"
+  seed_body_marker "$REC_HEAD_OLD" clean "" "$CARRY_DIFF"
+  printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_CN" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "§BW(20) the MUTANT exits 0 over a not-clean record — so (13) is the verdict discriminator's doing (rc=$(rc_of))"
+fi
+rm -f "$MUT_CN"; reset
 
 # ══ end §BW ══
 
@@ -5151,7 +5281,11 @@ fi
 # patch-projection vectors were moved ABOVE the pin (they had landed below it, which hid them from the
 # pin's own count): 1336 printed on the four-dialect box, i.e. 1310 outside the loop. Measured by
 # RUNNING, never by adding assertion counts — that is the mistake this note exists for.
-[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1309 ]; ck $? "assertion-count pin: >= 1309 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
+# RE-MEASURED AGAIN for the §BW(15)-(20) rows (the carried-DIFF gate, the carry-patch marker read and
+# their mutation controls): 1347 printed on the three-dialect box above, i.e. 1347 − (6×3 + 2) = 1327
+# outside the loop. The pin moved 1310 → 1327 with it, so DELETING any of those rows still reds this
+# tripwire — a new row that is not counted by the pin is coverage that can vanish silently.
+[ "$(( PASS - _AT_ENV_ASSERTIONS ))" -ge 1327 ]; ck $? "assertion-count pin: >= 1327 assertions outside the env-dependent §AT dialect loop (section loss tripwire)"
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
