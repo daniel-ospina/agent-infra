@@ -104,7 +104,7 @@ BUDGET_SECONDS="${REAP_LW_BUDGET_SECONDS:-300}"
 case "$BUDGET_SECONDS" in ''|*[!0-9]*) BUDGET_SECONDS=300 ;; esac
 
 die()  { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
-say()  { printf '%s\n' "$*"; }
+emit() { printf '%s\n' "$*"; }
 note() { printf '%s\n' "$*" >&2; }
 
 usage() { sed -n '3,90p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0; }
@@ -150,7 +150,7 @@ if [ -z "$LP_LIB" ]; then
     else
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — lib/live-paths.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts/lib); nothing was reaped (exit 3)"
     fi
-    say "SKIP reason=census-library-missing"
+    emit "SKIP reason=census-library-missing"
     exit 3
 fi
 # shellcheck source=lib/live-paths.sh
@@ -239,28 +239,28 @@ sweep_repo() { # <repo-path>
     local self_pwd now_sha now_dirty why
 
     canon="$(cd "$repo" 2>/dev/null && pwd -P)" || { note "$SCRIPT_NAME: repo '$repo' is not a directory — skipped"; RC=3; return 1; }
-    [ -d "$canon/.worktrees" ] || { say "reading repo=$canon worktrees=none (no .worktrees directory)"; return 0; }
+    [ -d "$canon/.worktrees" ] || { emit "reading repo=$canon worktrees=none (no .worktrees directory)"; return 0; }
 
     # ⛔ THE MAIN REF IS THE PROOF. If it cannot be resolved, NOTHING in this repo can be shown to have
     # landed, so the pass refuses the repo instead of degrading to a per-row guess.
     main_sha="$(git_at "$canon" rev-parse --verify --quiet "$MAIN_REF^{commit}")" || main_sha=""
     if [ -z "$main_sha" ]; then
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — main ref '$MAIN_REF' does not resolve in $canon; nothing in this repo was reaped (exit 3)"
-        say "SKIP reason=main-unresolved repo=$canon main=$MAIN_REF"
+        emit "SKIP reason=main-unresolved repo=$canon main=$MAIN_REF"
         RC=3; return 1
     fi
 
     # Indicator 3 (#4194): each pass prints the reading it used.
-    say "reading repo=$canon main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
+    emit "reading repo=$canon main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12) mode=$MODE_TEXT"
 
     censusdir="$(mktemp -d "${TMPDIR:-/tmp}/reap-landed.XXXXXX")" || {
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no scratch dir under ${TMPDIR:-/tmp}; nothing was reaped (exit 3)"
-        say "SKIP reason=scratch-unwritable repo=$canon"; RC=3; return 1; }
+        emit "SKIP reason=scratch-unwritable repo=$canon"; RC=3; return 1; }
     census="$censusdir/live-paths.tsv"
     if ! lp_census "$censusdir" >/dev/null 2>&1; then
         rm -rf "$censusdir" 2>/dev/null
         note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — the process census is unreadable (mechanism=${LP_CENSUS_MECH:-none}); no tree can be proven holder-free, so nothing was reaped (exit 3)"
-        say "SKIP reason=census-unreadable repo=$canon"
+        emit "SKIP reason=census-unreadable repo=$canon"
         RC=3; return 1
     fi
     CENSUS_TOTAL=$((CENSUS_TOTAL + ${LP_CENSUS_ROWS:-0}))
@@ -290,7 +290,7 @@ sweep_repo() { # <repo-path>
         case "$off" in ''|*[!0-9]*) off=0 ;; esac
     fi
     [ "$n_cands" -gt 0 ] && off=$(( off % n_cands )) || off=0
-    [ "$n_cands" -gt 0 ] && say "ROTATE on=1 offset=$off total=$n_cands offset-file=${OFFSET_FILE:-none}"
+    [ "$n_cands" -gt 0 ] && emit "ROTATE on=1 offset=$off total=$n_cands offset-file=${OFFSET_FILE:-none}"
 
     i=0
     while [ "$i" -lt "$n_cands" ]; do
@@ -300,28 +300,28 @@ sweep_repo() { # <repo-path>
         # ⛔ THE BUDGET IS CHECKED BEFORE ANY PROBE, so a spent pass costs O(1) per remaining entry.
         now=$(date +%s)
         if [ "$now" -ge "$deadline" ]; then
-            deferred=$((deferred + 1)); say "DEFERRED path=$c reason=budget (the pass spent its ${BUDGET_SECONDS}s)"; continue
+            deferred=$((deferred + 1)); emit "DEFERRED path=$c reason=budget (the pass spent its ${BUDGET_SECONDS}s)"; continue
         fi
-        path="$(cd "$c" 2>/dev/null && pwd -P)" || { kept_unprovable=$((kept_unprovable + 1)); say "KEPT reason=unprovable path=$c detail=no-canonical-path"; continue; }
+        path="$(cd "$c" 2>/dev/null && pwd -P)" || { kept_unprovable=$((kept_unprovable + 1)); emit "KEPT reason=unprovable path=$c detail=no-canonical-path"; continue; }
 
         # Self-protection: never this pass's own tree.
         case "$self_pwd/" in
-            "$path/"*) say "KEPT reason=self path=$path"; continue ;;
+            "$path/"*) emit "KEPT reason=self path=$path"; continue ;;
         esac
 
         if guard_held "$census" "$path"; then
-            kept_held=$((kept_held + 1)); say "KEPT reason=$GUARD_REASON path=$path"; continue
+            kept_held=$((kept_held + 1)); emit "KEPT reason=$GUARD_REASON path=$path"; continue
         fi
 
         br="$(git_at "$path" rev-parse --abbrev-ref HEAD)" || br=""
         head12="$(git_at "$path" rev-parse --verify --quiet 'HEAD^{commit}')" || head12=""
         if [ -z "$head12" ]; then
-            kept_unprovable=$((kept_unprovable + 1)); say "KEPT reason=unprovable path=$path detail=no-head"; continue
+            kept_unprovable=$((kept_unprovable + 1)); emit "KEPT reason=unprovable path=$path detail=no-head"; continue
         fi
         head12="$(printf '%s' "$head12" | cut -c1-12)"
 
         if guard_detached "$br"; then
-            kept_detached=$((kept_detached + 1)); say "KEPT reason=detached path=$path head=$head12"; continue
+            kept_detached=$((kept_detached + 1)); emit "KEPT reason=detached path=$path head=$head12"; continue
         fi
 
         dirty_n=""   # assigned by the expensive guard below
@@ -339,19 +339,19 @@ sweep_repo() { # <repo-path>
         anc="no"
         if git_at "$path" merge-base --is-ancestor "$head12" "$MAIN_REF" >/dev/null 2>&1; then anc="yes"; fi
         if guard_ahead "$ahead" "$anc" "$br"; then
-            kept_ahead=$((kept_ahead + 1)); say "KEPT reason=$GUARD_REASON path=$path"
+            kept_ahead=$((kept_ahead + 1)); emit "KEPT reason=$GUARD_REASON path=$path"
             continue
         fi
 
         dirty_n="$(git_at "$path" status --porcelain | head -100 | wc -l | tr -d ' ')" || dirty_n=""
         if guard_dirty "$dirty_n"; then
-            kept_dirty=$((kept_dirty + 1)); say "KEPT reason=$GUARD_REASON path=$path"
+            kept_dirty=$((kept_dirty + 1)); emit "KEPT reason=$GUARD_REASON path=$path"
             continue
         fi
 
         eligible=$((eligible + 1))
         if [ "$DRY_RUN" = 1 ]; then
-            say "WOULD-REMOVE path=$path branch=$br head=$head12 ahead=0 ancestor=yes"
+            emit "WOULD-REMOVE path=$path branch=$br head=$head12 ahead=0 ancestor=yes"
             continue
         fi
 
@@ -378,16 +378,16 @@ sweep_repo() { # <repo-path>
             esac
         fi
         if [ -n "$why" ]; then
-            kept_dirty=$((kept_dirty + 1)); say "KEPT reason=re-probe path=$path detail=$why"; continue
+            kept_dirty=$((kept_dirty + 1)); emit "KEPT reason=re-probe path=$path detail=$why"; continue
         fi
 
         # `git worktree remove` — NEVER `--force`. It refuses a dirty tree a second time (belt and
         # braces: the guard above already answered), and it removes the admin record with the
         # directory, so no `git worktree prune` is ever owed. The BRANCH REF IS KEPT.
         if git_at "$canon" worktree remove "$path" >/dev/null 2>&1; then
-            removed=$((removed + 1)); say "REMOVED path=$path branch=$br head=$head12 ahead=0"
+            removed=$((removed + 1)); emit "REMOVED path=$path branch=$br head=$head12 ahead=0"
         else
-            failed=$((failed + 1)); say "FAILED path=$path branch=$br detail=worktree-remove-refused"; RC=1
+            failed=$((failed + 1)); emit "FAILED path=$path branch=$br detail=worktree-remove-refused"; RC=1
         fi
     done
     # The next pass starts where this one stopped: the entries that were PROBED, not the deferred tail.
@@ -404,14 +404,14 @@ sweep_repo() { # <repo-path>
     TOTAL_REMOVED=$((TOTAL_REMOVED + removed)); TOTAL_FAILED=$((TOTAL_FAILED + failed))
     TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped)); REPO_N=$((REPO_N + 1)); TOTAL_DEFERRED=$((TOTAL_DEFERRED + deferred))
 
-    say "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - removed - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12)"
+    emit "SUMMARY class=landed-worktree repo=$canon mode=$MODE_TEXT examined=$examined eligible=$eligible removed=$removed kept=$((examined - removed - failed - deferred)) kept-ahead=$kept_ahead kept-dirty=$kept_dirty kept-held=$kept_held kept-detached=$kept_detached kept-unprovable=$kept_unprovable skipped=$skipped deferred=$deferred failed=$failed budget=${BUDGET_SECONDS}s main=$MAIN_REF@$(printf '%s' "$main_sha" | cut -c1-12)"
     [ "$failed" -gt 0 ] && RC=1
     return 0
 }
 
 if [ -z "$REPOS" ]; then
     note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — no repo to scan (pass --repo PATH, or set REAP_LW_REPOS); nothing was reaped (exit 3)"
-    say "SKIP reason=no-repo"
+    emit "SKIP reason=no-repo"
     exit 3
 fi
 
@@ -424,11 +424,11 @@ IFS="$OLDIFS"
 
 if [ "$REPO_N" = 0 ]; then
     note "$SCRIPT_NAME: ⛔ FAIL-CLOSED — none of the configured repos could be swept; nothing was reaped (exit 3)"
-    say "SKIP reason=no-sweepable-repo"
+    emit "SKIP reason=no-sweepable-repo"
     exit 3
 fi
 
 # The caller's attribution datum (disk-reaper reads `REMOVED=<n>` beside its df reading), and the
 # per-condition counters #4194 asks for, on one line a log reader can grep.
-say "reap-landed-worktrees: pass complete mode=$MODE_TEXT REMOVED=$TOTAL_REMOVED eligible=$TOTAL_ELIGIBLE examined=$TOTAL_EXAMINED failed=$TOTAL_FAILED skipped=$TOTAL_SKIPPED deferred=$TOTAL_DEFERRED census_rows=$CENSUS_TOTAL budget=${BUDGET_SECONDS}s"
+emit "reap-landed-worktrees: pass complete mode=$MODE_TEXT REMOVED=$TOTAL_REMOVED eligible=$TOTAL_ELIGIBLE examined=$TOTAL_EXAMINED failed=$TOTAL_FAILED skipped=$TOTAL_SKIPPED deferred=$TOTAL_DEFERRED census_rows=$CENSUS_TOTAL budget=${BUDGET_SECONDS}s"
 exit "$RC"
