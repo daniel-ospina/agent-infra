@@ -40,6 +40,11 @@
 #                          reverting the default to the PR claim's 1800s left every suite green, so
 #                          the single-owner guarantee's entire term — the thing whose expiry lets a
 #                          peer take a LIVE batch branch — was unpinned.
+#  16 INSTALL SUBJECT      `install-hook` verifies the checkout it WROTE TO, not the caller's cwd, so a
+#                          controller outside any work tree (the documented `CLAIM_REPO` fallback) gets
+#                          INSTALLED **and** rc 0. The pre-fix code printed INSTALLED and then exited 2
+#                          claiming "the push is NOT gated by this install" over a hook that was armed and
+#                          correct — the operator told the opposite of the state on disk (review F3).
 #
 # ⛔ NO `git checkout` ANYWHERE: every push names its destination ref (`HEAD:refs/heads/...`).
 #
@@ -764,6 +769,45 @@ else
     0:0|0:*) bad "15) BOTH runs failed/succeeded alike (shipped=$_ra mutant=$_rb) — the mutant does not differ, so the verification line is unpinned" ;;
     *:0) ok "15) the MUTANT accepts it (rc=0) — so the refusal above IS the verification, not the fixture" ;;
     *) bad "15) the mutant also refused (rc=$_rb): $(cat "$T/vb.out") — the fixture, not the verification, produced the refusal" ;;
+  esac
+fi
+
+# ── 16. INSTALL-HOOK VERIFIES THE CHECKOUT IT WROTE TO (#4260 review F3)
+# ⛔ EVERY OTHER install-hook ARM IN THIS SUITE AND IN THE TREE `cd`s INTO THE REPO FIRST, so none of
+# them can see the disagreement this case pins: `cmd_install_hook` resolves its subject through
+# `claim_repo_init` (cwd, ELSE the documented `CLAIM_REPO` fallback for "a controller that has already
+# cd'd home, or a systemd timer"), while `check_hook_report` used to resolve its own subject from the
+# PROCESS CWD. For that caller the two are DIFFERENT checkouts: the install wrote a correct hook, printed
+# INSTALLED, and then exited 2 with "the push is NOT gated by this install" — a false FAIL on the one
+# path the fallback exists for, and a bootstrap aborted over a hook that is armed.
+echo "== 16. install-hook verifies the checkout it WROTE TO, not the caller's cwd"
+git clone -q "$T/origin.git" "$T/f3repo" 2>/dev/null || bad "16) fixture: cannot clone f3repo"
+mkdir -p "$T/outside" && rm -f "$T/f3repo/.git/hooks/pre-push"
+( cd "$T/outside" && CLAIM_REPO="$T/f3repo" bash "$BC" install-hook >"$T/f3.out" 2>&1 ); _f3=$?
+eq "16) install-hook from OUTSIDE any work tree, via the documented CLAIM_REPO fallback, exits 0" "$_f3" "0"
+grep -qF "INSTALLED $T/f3repo/.git/hooks/pre-push" "$T/f3.out" 2>/dev/null \
+  && ok "16) ...and names the hook it wrote (so the arm measured an install, not an early exit)" \
+  || bad "16) no INSTALLED line naming the CLAIM_REPO hook: $(cat "$T/f3.out" 2>/dev/null)"
+if [ -x "$T/f3repo/.git/hooks/pre-push" ]; then ok "16) ...and the hook is on disk, executable"
+else bad "16) the hook is not executable at the CLAIM_REPO path"; fi
+_f3v="$(check_in f3repo)"; _f3r=$?
+case "$_f3r" in 0) ok "16) ...and the installed checkout verifies HOOK-OK (the install told the truth)" ;; *) bad "16) check-hook in f3repo rc=$_f3r: $_f3v" ;; esac
+# ⛔ NON-VACUITY: revert exactly the fix (drop the subject argument, so the verifier resolves from the
+# caller's cwd again) and the SAME arm must fail. Without this pair the green above could be produced by
+# the fixture rather than by the argument.
+mkdir -p "$T/f3mut"
+sed 's|^  check_hook_report "$CLAIM_REPO" |  check_hook_report |' "$BC" > "$T/f3mut/branch-claim.sh"
+if cmp -s "$BC" "$T/f3mut/branch-claim.sh"; then
+  bad "16) the cwd-verifier mutant is IDENTICAL — the call was not found, so the fix is unpinned"
+else
+  cp "$SELFDIR/claims.sh" "$T/f3mut/claims.sh"
+  cp "$SELFDIR/branch-claim-hook.sh" "$T/f3mut/branch-claim-hook.sh"
+  chmod +x "$T/f3mut/branch-claim.sh"
+  rm -f "$T/f3repo/.git/hooks/pre-push"
+  ( cd "$T/outside" && CLAIM_REPO="$T/f3repo" bash "$T/f3mut/branch-claim.sh" install-hook >"$T/f3m.out" 2>&1 ); _f3m=$?
+  case "$_f3m" in
+    0) bad "16) the cwd-verifier MUTANT also succeeded — the fixture, not the fix, produced the green (and the F3 regression would be invisible)" ;;
+    *) ok "16) the cwd-verifier MUTANT fails the same install (rc=$_f3m) — so the arm measures the subject argument" ;;
   esac
 fi
 

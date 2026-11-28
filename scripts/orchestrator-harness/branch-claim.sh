@@ -45,9 +45,23 @@
 # ⛔ SO THE DEFAULT IS NOW INCLUDE-EVERYTHING, AND ONLY AN EXPLICIT EXCLUSION CAN EVADE IT. A prefix
 # added after today (a new `…/` shape, a repo-specific convention) is in scope by construction; the
 # only way a branch escapes is a line in BRANCH_CLAIM_EXCLUDE_PATTERN, which is reviewable, tiny, and
-# holds TRUNK NAMES (a kind), never a lane's prefixes. Widening the gate is not free of risk, but the
-# cost is bounded by the fact that **an unclaimed branch is never refused** (claims.sh
-# `claim_branch_guard`), so covering a prefix costs a lane that does not claim nothing at all.
+# holds TRUNK NAMES (a kind), never a lane's prefixes.
+# ⛔ AND THE COST IS BOUNDED FOR THE **UNCLAIMED** ARM ONLY — NOT FOR THE FAIL-CLOSED ONES (review F2,
+# MEASURED against `claims.sh`). This comment used to say covering a prefix "costs a lane that does not
+# claim nothing at all", which its own called function refutes: `claim_branch_guard` refuses on FIVE
+# arms that fire BEFORE ownership is ever decided — `registry-unreadable` (rc 2, `ls-remote` failed),
+# `claim-unreadable` (rc 2), `clock-unreadable` (rc 2), `lease-unreadable` (rc 1) and
+# `claim-expired-unreclaimed` (rc 1) — and the hook refuses on ANY non-zero (`branch-claim-hook.sh`).
+# So the honest statement of the blast radius is: **a box whose claim registry is momentarily
+# unreadable (a DNS/network blip, a git/`gh` outage, a checkout whose remote is not literally named
+# `origin`) refuses EVERY push to EVERY non-trunk branch on that box until it clears** — where the old
+# three-prefix default refused three prefixes. Fail-closed is the intended polarity and stays; the cost
+# is stated here, in `docs/ops/dispatch-inventory.md` §3 and in the README, because a change shipped on
+# a sentence its own callee contradicts is the false-PASS class this repo keeps paying for.
+# ⛔ HOOKS ARE PER REPOSITORY, NOT PER WORKTREE (measured: `git rev-parse --git-path hooks` in a linked
+# worktree resolves the COMMON hooks dir; `git-worktree(1)` — "sharing everything except per-worktree
+# files such as HEAD, index"). So one `install-hook` arms every worktree of that repo on that box,
+# which is why the blast radius above is a BOX-wide statement and not a checkout-local one.
 # `BRANCH_CLAIM_PATTERN` is kept as the include seam (default `*`), so a consumer repo that genuinely
 # needs a narrower surface can still say so — it just cannot do it by accident.
 #
@@ -280,7 +294,15 @@ cmd_install_hook() {
   # ⛔ THE INSTALL IS NOT THE PROOF (agent-infra#4260 §3b: the hook was present, executable and
   # resolvable on one cell of five, and NOBODY KNEW about the other four). Verify what was just
   # written, in the same breath, and fail the install if the artifact does not answer.
-  check_hook_report || die2 "the hook was written to $hook but does not VERIFY — the push is NOT gated by this install; fix the fault above (the refusal names it) and re-run"
+  # ⛔ AND THE VERIFIER'S SUBJECT IS THE INSTALLER'S SUBJECT (review F3, MEASURED). `claim_repo_init`
+  # above resolves `$CLAIM_REPO` — cwd, else the documented fallback — but `check_hook_report` resolved
+  # its own subject from the PROCESS CWD. For a caller outside any work tree (a controller that has
+  # cd'd home, a systemd timer) those are different checkouts: the install wrote a CORRECT hook into
+  # `$CLAIM_REPO/.git/hooks/pre-push`, printed INSTALLED, and then died rc 2 claiming "the push is NOT
+  # gated by this install" — telling the operator the opposite of the state on disk, and aborting a
+  # bootstrap that had actually succeeded. The subject is passed in, so the two can never disagree.
+  check_hook_report "$CLAIM_REPO" \
+    || die2 "the hook was written to $hook but does not VERIFY — the push is NOT gated by this install; fix the fault above (the refusal names it) and re-run"
 }
 
 # ── check-hook: IS THE GATE ARMED IN THIS CHECKOUT? (agent-infra#4260 §4.2) ────────────────────
@@ -296,9 +318,20 @@ cmd_install_hook() {
 # worktree was reaped, then holds a hook that names a path nothing lives at — and the hook's own
 # fail-closed branch (`bc` unresolved -> exit 1) would refuse EVERY push on that box. That is not a
 # gate, it is an outage, and it is the one shape a present-and-executable check would call green.
-check_hook_report() { # -> 0 OK / 1 FAULT / 2 CANNOT-VERIFY; one line on stdout, one on stderr
+check_hook_report() { # [<repo>] -> 0 OK / 1 FAULT / 2 CANNOT-VERIFY; one line on stdout, one on stderr
+  # ⛔ THE SUBJECT IS AN ARGUMENT, DEFAULTING TO THE CWD (review F3). The hook question is about a
+  # CHECKOUT, and the two callers resolve a checkout differently on purpose: `check-hook` is asked by
+  # whoever is standing in it (so cwd is right), while `install-hook` has already resolved one through
+  # `claim_repo_init` — which falls back to `CLAIM_REPO` precisely when the cwd is NOT a work tree.
+  # Resolving from cwd here made the verifier answer about a different checkout than the one the
+  # installer just wrote to. The argument form also keeps the ONE source of the not-a-work-tree verdict
+  # (rc 2 below) for both callers, which is why the caller does not pre-check it.
   local repo dir hook gate fault="" rc=0
-  repo="$(git rev-parse --show-toplevel 2>/dev/null)" || repo=""
+  if [ -n "${1:-}" ]; then
+    repo="$( cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )" || repo=""
+  else
+    repo="$(git rev-parse --show-toplevel 2>/dev/null)" || repo=""
+  fi
   if [ -z "$repo" ]; then
     printf 'HOOK-UNVERIFIED not a git work tree — cannot say whether the push gate is armed here\n'
     return 2
