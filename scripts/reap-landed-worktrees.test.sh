@@ -196,7 +196,25 @@ mutant() {
 
 mutrun() { # <base> <mutant-script> [args...]
     local base="$1" m="$2"; shift 2
-    OUT="$(env -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT REAP_LW_PROC_ROOT="$base/proc" \
+    # ⛔ THE MUTANT LIVES IN $T, NOT BESIDE lib/ — so it can only find the census library through the
+    # documented seam. Without this line the H arms read the AMBIENT `$HOME/.pi/agent/scripts/lib`
+    # copy: green on a box that carries the vendored install, and `FAIL-CLOSED — lib/live-paths.sh not
+    # found … (exit 3)` on a clean CI runner, where the H1-H4 assertions then fail for a reason that
+    # has nothing to do with the guard being deleted (#3131's class — an ambient-ref reader).
+    # Measured on main b526f3c79: 48 passed, 8 failed on the runner; the same suite is green on a
+    # developer box purely because that directory exists there. Pin it to the tree UNDER TEST.
+    # ⛔ AND `-u HOME`, OR THE PIN IS A NO-OP ON THE HOSTS IT EXISTS FOR. `REAP_LW_LIVE_PATHS` is the
+    # LAST candidate the script tries (SELF_DIR/lib, then `$HOME/.pi/agent/scripts/lib`, then the
+    # seam), so on a box WITH the vendored install the ambient copy still wins and `$LIB` is never
+    # read — the H arms would exercise a STALE library on exactly the machine whose local green the
+    # pin is supposed to make trustworthy (measured: pointing the seam at a marker library produced
+    # no marker while `$HOME/.pi/agent/scripts/lib` was readable, i.e. the ambient copy was sourced).
+    # Unsetting HOME inside `env` makes `$LIB` unambiguously the source. Verified safe for the suite:
+    # the state dir is supplied explicitly below and the fixture repos carry their own git config
+    # (`env -u HOME bash scripts/reap-landed-worktrees.test.sh` → 56 passed, 0 failed).
+    OUT="$(env -u HOME -u REPO -u REAP_LW_REPOS -u LP_PROC_ROOT \
+                REAP_LW_LIVE_PATHS="$LIB" \
+                REAP_LW_PROC_ROOT="$base/proc" \
                 REAP_LW_STATE_DIR="$base/state" bash "$m" "$@" 2>&1)"
     SUT_RC=$?
 }
