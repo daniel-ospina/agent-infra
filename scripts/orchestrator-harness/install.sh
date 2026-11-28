@@ -1722,7 +1722,15 @@ DRIFTED=""
 # lane_registry.py (#3382) is the registry the harness's own lane-surface tools import to answer "did
 # this lane finish?"; a $O deployed without it makes every such caller import-fail, so it joins the
 # same union as the names above — this one from the #3382 branch, not from main.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh lane-report-gate.sh controller-state.sh gh-auth.sh park-human.sh; do
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh lane-report-gate.sh controller-state.sh gh-auth.sh park-human.sh branch-claim.sh branch-claim-hook.sh; do
+# branch-claim.sh + branch-claim-hook.sh (agent-infra#4260) are the ONE-WRITER PUSH GUARD and its hook
+# template. They were in NEITHER this list nor the supervisor's — so a cell never received them, which
+# is the mechanism behind the measured "hook installed on 1 of 5 cells": the installer that would have
+# seeded it did not know the file existed, and `cloud-cell-doctor.sh hygiene` now ASKS each box whether
+# the hook is armed. `branch-claim-hook.sh` is here because `install-hook` reads it from $SELF_DIR at
+# install time: a $O with the gate and not the template installs a hook from whichever tree it was
+# copied out of, or dies on "cannot read the hook template". Presence + byte comparison is all this
+# list does, so each is one word — the same union rule as every name above.
 # park-human.sh (#4126 review, P2/P3) is the operator surface that WRITES a human park: it is what the
 # README and the `parkorigin` ledger row tell an operator to run to freeze a PR, so a $O without it silently
 # loses the only producer of `parkorigin` = `human` and the guard's human arm becomes unreachable again.

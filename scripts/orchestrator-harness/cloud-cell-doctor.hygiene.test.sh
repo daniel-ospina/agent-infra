@@ -198,6 +198,15 @@ export DOCTOR_WORKTREE_REAPER="$REAPER"
 export DOCTOR_TEST_UV="$T/uv"
 export HYGIENE_TMP_DIR="$T/tmp"
 export STALE_WORKTREE_DAYS=7
+# ⛔ AND THE SECOND REPO THE SWEEP ENUMERATES IS CLEARED AT SETUP, NOT ONLY AT ITS OWN CASE (measured on
+# the fleet box, #4262 review). The doctor enumerates `$REPO` **and** `$HARNESS_REPO`, and the harness
+# exports `HARNESS_REPO` for the controller — so on an operator's box this suite inherited the REAL
+# checkout, enumerated its 117 worktrees, and the "every root held ⇒ nothing is swept" arm saw a real
+# `prune --caches` call against roots the fixture never created. It is INERT only because the executor is
+# the stub (`$T/bin/sup`), but the arm asserted against the operator's machine, not the fixture, which is
+# the exact hermeticity rule this file's header states. On a CI runner the variable is unset, so the shard
+# never measured this hole. `HARNESS_REPO` is re-armed deliberately, and unset again, by its own case.
+export HARNESS_REPO=""
 # ⛔ `apply`, not the shipped default `auto`: `auto` arms the reaper only under disk pressure, so on a
 # runner with free space the worktree arms would assert against a DRY-RUN and prove nothing about
 # delivery. The pressure-driven arming is pinned by `cloud-cell-doctor.test.sh` (both directions).
@@ -730,6 +739,90 @@ case "$PASS2" in
   *"prune --caches"*) ok "the SECOND pass passes NO exclusion: the set is per-PASS, reset at the top of the sweep" ;;
   *) bad "the SECOND pass never invoked the sweep, so this arm proved nothing — calls=[$(printf '%s' "$PASS_CALLS" | tr '\n' '|')]" ;;
 esac
+
+# ════════════════ the branch-claim hook row (#4260 §4.2 · #4262 review F1/F2) ══════════════════
+say_case "branch-claim hook: the row NAMES the fault, asks about \$REPO, and never reddens the disk role"
+# ⛔ WHAT THIS CASE IS FOR, AND WHY IT HAS TO EXIST AT ALL (review F1). The #4262 change added a
+# pass-level sub-step and no assertion of its own, so the only signal it produced in CI was TWELVE reds on
+# arms encoding OTHER behaviours (docker polarity, cache-sweep abstention) — unattributable, and proof of
+# nothing. Worse, the sub-step asked `check-hook` in whatever directory the doctor happened to be in
+# (review F2): in CI that IS a work tree, so it answered about the wrong checkout, while on a cell the
+# doctor's cwd is deliberately NOT the repo (`launchd-controller.sh:47-53`) — so the instrument was
+# permanently `CANNOT-VERIFY` exactly where it was supposed to speak, and permanently red elsewhere.
+#
+# The four arms below pin the contract in BOTH directions and are non-vacuous as a set: deleting the
+# sub-step reddens (h1)/(h3) (`result_has` finds no row at all); asking the doctor's cwd instead of
+# `$REPO` reddens (h2) — the case where the two checkouts DISAGREE; coupling the row to `$h_rc` reddens
+# every `DOC_RC -eq 0` arm, which is the `rc=4 → INERT` anti-pattern this file already documents.
+doc_from() { local d="$1"; shift; DOC_OUT="$( cd "$d" && bash "$DOCTOR" "$@" 2>&1 )"; DOC_RC=$?; }
+HC="$HERE/branch-claim.sh"
+[ -f "$HC" ] || { echo "FATAL: missing $HC" >&2; exit 2; }
+# A checkout the box does NOT push from, with the gate ARMED in it: the fixture that makes "which
+# directory was asked?" observable at all.
+rm -rf "$T/elsewhere"; mkdir -p "$T/elsewhere"
+"$REAL_GIT" init -q -b main "$T/elsewhere" \
+  && ( cd "$T/elsewhere" && CLAIM_REPO="$T/elsewhere" bash "$HC" install-hook >/dev/null 2>&1 ) \
+  || { echo "FATAL: cannot arm a hook in the else-where fixture" >&2; exit 2; }
+_hc_elsewhere="$( ( cd "$T/elsewhere" && bash "$HC" check-hook 2>/dev/null ) )"; _hc_elsewhere_rc=$?
+[ "$_hc_elsewhere_rc" -eq 0 ] \
+  && ok "fixture: \$T/elsewhere HAS an armed hook (asked from there, check-hook says HOOK-OK)" \
+  || bad "fixture: the else-where checkout is not armed (rc=$_hc_elsewhere_rc) — the F2 arm below would prove nothing: $_hc_elsewhere"
+[ ! -e "$T/repo/.git/hooks/pre-push" ] \
+  && ok "fixture: \$REPO (\$T/repo) has NO hook — the two checkouts disagree, which is what F2 is about" \
+  || bad "fixture: \$REPO already carries a hook; the unarmed arm cannot be measured"
+
+# ── (h1) UNARMED $REPO, asked from a directory that is not a work tree at all ───────────────────
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+doc_from "$T" hygiene
+result_has "branch-claim hook NOT ARMED in $T/repo" \
+  && ok "h1: an unarmed \$REPO is NAMED in the pass record, against the checkout it is about" \
+  || bad "h1: the record does not name the unarmed checkout — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+result_has "HOOK-FAIL" \
+  && ok "h1: …and the row carries the gate's own verdict, so the HOST and FAULT reach the record" \
+  || bad "h1: the record carries a bare failure with no HOOK-FAIL <host> <fault> — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+log_has "[hygiene] branch-claim hook in $T/repo: rc=1" \
+  && ok "h1: the log names the CHECKOUT it asked, its rc and the verdict (an operator can act on it)" \
+  || bad "h1: the log does not name the checkout + rc — $(grep -F 'branch-claim' "$T/o/logs/doctor.log" 2>/dev/null | head -2)"
+[ "$DOC_RC" -eq 0 ] \
+  && ok "h1: …and the DISK-RECLAIM role is still rc=0: the row is REPORTED, never fatal (an alarm that can never clear is trained-to-be-ignored — the rc=4/INERT lesson)" \
+  || bad "h1: rc=$DOC_RC (want 0) — a missing git hook reddened the disk-reclaim role: $(printf '%s' "$DOC_OUT" | tail -2)"
+
+# ── (h2) the DECIDING arm for F2: the doctor's cwd has a hook, $REPO does not ─────────────────
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+doc_from "$T/elsewhere" hygiene
+result_has "branch-claim hook NOT ARMED in $T/repo" \
+  && ok "h2: asked FROM an armed checkout, the verdict still describes \$REPO — the question follows the checkout the box pushes from, not the doctor's cwd" \
+  || bad "h2: the row described the process's cwd instead of \$REPO (F2) — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+result_has "hook armed" \
+  && bad "h2: the cwd's armed hook was claimed as \$REPO's — exactly the F2 inversion" \
+  || ok "h2: …and it did NOT borrow the cwd checkout's green"
+[ "$DOC_RC" -eq 0 ] && ok "h2: …and the role stays rc=0" || bad "h2: rc=$DOC_RC (want 0) — $(printf '%s' "$DOC_OUT" | tail -2)"
+
+# ── (h3) ARMED $REPO, asked from a directory with no hook — the other direction ──────────────
+( cd "$T/repo" && CLAIM_REPO="$T/repo" bash "$HC" install-hook >/dev/null 2>&1 ) \
+  || bad "h3 fixture: install-hook failed in \$REPO"
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+doc_from "$T" hygiene
+result_has "branch-claim hook armed in $T/repo" \
+  && ok "h3: an ARMING is reported as armed, so (h1) measured the fault and not a row that always says NOT ARMED" \
+  || bad "h3: an armed \$REPO was not reported armed — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+result_has "NOT ARMED" \
+  && bad "h3: an ARMED \$REPO still produced a NOT ARMED row" \
+  || ok "h3: …and no NOT ARMED row contradicts it"
+log_has "[hygiene] branch-claim hook in $T/repo: rc=0" \
+  && ok "h3: …and the log carries rc=0 from the gate itself (the verdict is the gate's, not the doctor's guess)" \
+  || bad "h3: the log has no rc=0 line for the armed checkout"
+[ "$DOC_RC" -eq 0 ] && ok "h3: …and the role stays rc=0 with the gate armed too" || bad "h3: rc=$DOC_RC (want 0) — $(printf '%s' "$DOC_OUT" | tail -2)"
+
+# ── (h4) a REHEARSAL performs no action, so it may not claim a verdict ─────────────────────────
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+doc_from "$T" hygiene --dry-run
+result_has "would verify the branch-claim push hook in $T/repo" \
+  && ok "h4: --dry-run records WOULD verify, naming the checkout" \
+  || bad "h4: the rehearsal record does not name the check — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+result_has "branch-claim hook armed" \
+  && bad "h4: a rehearsal claimed a VERDICT it did not take" \
+  || ok "h4: …and claims no verdict it did not take"
 
 # ════════════════ summary ═══════════════════════════════════════════════════════════════════════
 echo

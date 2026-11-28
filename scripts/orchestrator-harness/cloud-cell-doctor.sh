@@ -2390,8 +2390,11 @@ run_hygiene() {
   # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
   # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
   # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
-  local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0
+  # ⛔ ONE `local` LINE, NOT TWO: this was a duplicated declaration whose second copy re-initialised
+  # `result` and `h_rc` — harmless only because nothing ran between them (collapsed in the #4262 review,
+  # F1's neighbourhood), and a trap for the next sub-step added above them.
   local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0 reason
+  local _hc_gate _hc_g _hc_out _hc_rc
   require_repo "hygiene" || return $?
   # ⛔ THE PASS-LEVEL `df` READ COMES FIRST, and the delta printed at the END is the ONLY savings this
   # role may claim. Not a `du` sum (see the section header), and not docker's own "Total reclaimed"
@@ -2503,7 +2506,58 @@ run_hygiene() {
     result="${result}${result:+; }CANNOT-VERIFY: worktree reaper (pi-reap-worktrees.sh) not found"
     h_rc=3
   fi
-  # 6) the CROSS-BOX REVIEW-RECORD REGISTRY (#2577). ⛔ This sub-step is BEST-EFFORT: it never touches
+  # 6) THE BRANCH-CLAIM PUSH GUARD, ARMED IN THE CHECKOUT THIS BOX PUSHES FROM (agent-infra#4260 §4.2).
+  # ⛔ WHY THE CLOCK ASKS THIS. The guard is a pre-push hook in a git dir, so it is per-CHECKOUT and
+  # the question "is the gate armed?" has a different answer on every box. #4260 measured it present and
+  # resolvable on ONE cell of five, while 6 of 10 open PRs were on branches whose prefix the guard did
+  # not even inspect — and nothing in the fleet could say so. "We installed it" is not a checkable
+  # claim; `branch-claim.sh check-hook` is, and this sub-step is what runs it on a clock and puts the
+  # verdict in the pass record, naming the HOST and the FAULT (`HOOK-FAIL <host> MISSING (...)`) rather
+  # than a number nobody can act on.
+  # ⛔ IT ASKS ABOUT `$REPO`, NEVER ABOUT THE DOCTOR'S OWN CWD (review F2, MEASURED). `check_hook_report`
+  # resolves the checkout with `git rev-parse --show-toplevel` — the process's cwd — and on a cell that
+  # is deliberately NOT the repo: `launchd-controller.sh:47-53` states "THE JOB'S `WorkingDirectory` MUST
+  # NOT BE THE REPO … must be `$O`". Asked from there the answer was `HOOK-UNVERIFIED not a git work
+  # tree` on EVERY scheduled pass, so the verification advertised here could never say HOOK-OK or
+  # HOOK-FAIL where it mattered, while in CI (cwd IS a work tree) it produced a verdict about the wrong
+  # checkout. `$REPO` is the checkout this box's lanes push from, which is the only one the question is
+  # about; `cd` into it runs in a SUBSHELL so the pass's own cwd is untouched.
+  # ⛔ AND IT IS A DECIDED, NON-FATAL ROW: it NEVER touches `$h_rc` (review F1). The reason is the one
+  # this file already documents for rc=4 (`role_row`'s INERT arm) — an alarm that can never clear is
+  # trained-to-be-ignored, and a sub-step bolted onto the DISK-RECLAIM role whose failure condition is
+  # "this checkout has no git hook" (true of every fresh clone, every CI runner and every brand-new
+  # worktree until `install-hook` runs) would make the role permanently red on boxes whose actual job —
+  # reclaiming disk — is completing fine. The finding being closed here is that the state was SILENT,
+  # and the naming mechanism is the pass record: `last_result` carries `branch-claim hook NOT ARMED in
+  # <repo> — HOOK-FAIL <host> MISSING (...)`, which `doctor status` prints, and `doctor.log` carries the
+  # same line with the gate's own rc. Non-fatal ≠ silent; it is REPORTED without being able to redden
+  # another role's verdict.
+  if cell_stopped_midpass; then
+    result="${result}${result:+; }STOP arrived mid-pass — branch-claim hook check skipped"
+  elif [ "$dry" = "--dry-run" ]; then
+    result="${result}${result:+; }would verify the branch-claim push hook in $REPO"
+  else
+    _hc_gate=""
+    for _hc_g in "$SELF_DIR/branch-claim.sh" "$O/branch-claim.sh" "$REPO/scripts/orchestrator-harness/branch-claim.sh"; do
+      [ -n "$_hc_g" ] && [ -f "$_hc_g" ] && { _hc_gate="$_hc_g"; break; }
+    done
+    if [ -z "$_hc_gate" ]; then
+      log "[hygiene] CANNOT-VERIFY: branch-claim.sh not found on this box — the push gate cannot be asked whether it is armed"
+      result="${result}${result:+; }CANNOT-VERIFY: branch-claim.sh absent (push gate unverifiable)"
+    else
+      # The gate answers about ITS cwd, so the question is asked from the checkout it is about. A
+      # `$REPO` that is not a work tree is not special-cased here: `check-hook` answers rc=2
+      # `HOOK-UNVERIFIED not a git work tree` itself, and there must be ONE source for that verdict.
+      _hc_out="$( cd "$REPO" && bash "$_hc_gate" check-hook 2>>"$O/logs/doctor.log" )"; _hc_rc=$?
+      log "[hygiene] branch-claim hook in $REPO: rc=$_hc_rc ${_hc_out:-<no output>}"
+      case "$_hc_rc" in
+        0) result="${result}${result:+; }branch-claim hook armed in $REPO" ;;
+        1) result="${result}${result:+; }branch-claim hook NOT ARMED in $REPO — ${_hc_out:-no verdict line}" ;;
+        *) result="${result}${result:+; }CANNOT-VERIFY: branch-claim check-hook answered rc=$_hc_rc in $REPO ${_hc_out:-<no output>}" ;;
+      esac
+    fi
+  fi
+  # 7) the CROSS-BOX REVIEW-RECORD REGISTRY (#2577). ⛔ This sub-step is BEST-EFFORT: it never touches
   #    `$h_rc`, so no sync outcome — a dark store, a rate limit, a divergence, a missing script — can
   #    fail the pass or reach a merge decision. Its failure is a LOGGED line naming the box + the
   #    store + the verb's own first complaint, and a short entry in `last_result` so `status` shows it.
@@ -2530,7 +2584,7 @@ run_hygiene() {
     sync_registry
     result="${result}${result:+; }${REGISTRY_RESULT}"
   fi
-  # 7) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
+  # 8) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
   df_after="$(hyg_df_mb "$CELL_HOME")"
   if [ -n "$df_before" ] && [ -n "$df_after" ]; then
     log "[hygiene] df ($CELL_HOME): $(hyg_df_delta "$df_before" "$df_after")"
