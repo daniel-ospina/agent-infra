@@ -181,11 +181,12 @@ bash "$TMP/broken/check-portability-traps-changed.sh" --root "$FIX" --base HEAD~
 # ⛔ WHY THESE EXIST: AN EARLIER REVIEW CYCLE ON THIS PR (that cycle's `F2`, not an arm of the F-section —
 # the F arms live in `check-portability-traps.test.sh` and are unrelated to these) replaced A6's original
 # stub (which refused EVERY invocation) rather than duplicating it, so the site that stub happened to
-# reach — the `--print-targets` guard —# lost its only invocation, and the EMPTY-set guard and the failed-`git diff` guard never had one. The
-# three guards mask each other pairwise today, so a single deleted handler still refuses via its
-# neighbour: exactly the shape that makes a deletion of two of them silently read as CLEAN, which is
-# the one direction this file exists to refuse. Each arm below drives ONE site and asserts the
-# refusal BY NAME, so a handler that stops naming its reason cannot pass on some other site's rc.
+# reach — the `--print-targets` guard — lost its only invocation, and the EMPTY-set guard and the
+# failed-`git diff` guard never had one. The three guards mask each other pairwise today, so a single
+# deleted handler still refuses via its neighbour: exactly the shape that makes a deletion of two of
+# them silently read as CLEAN, which is the one direction this file exists to refuse. Each arm below
+# drives ONE site and asserts the refusal BY NAME, so a handler that stops naming its reason cannot
+# pass on some other site's rc.
 
 # A6a — THE DETECTOR CANNOT PUBLISH ITS SCAN SET (an empty set would read as 'nothing to scan').
 mkdir -p "$TMP/nopublish"
