@@ -145,6 +145,11 @@ Nothing in this inventory proposes to re-derive any of the four.
 
   **Where the arming step belongs** (not done here — it changes a box-bootstrap path, not the guard): the
   provisioning that seeds `$O` — `install.sh` for the macOS orchestrator, `cloud-cell-supervisor.sh apply/start`
-  for the cells — is what would run `install-hook` against `$REPO` and let `check-hook` gate the result. Until
-  then the doctor row is an OBSERVATION with a printed remedy, and an unarmed cell is a known-absent state, not
-  a fixed one.
+  for the cells — is what would run `install-hook` against `$REPO` and let `check-hook` gate the result.
+  ⛔ **AND IT MUST RUN THE DEPLOYED `$O/branch-claim.sh`, NOT A PIN'S COPY.** `install-hook` bakes
+  `$SELF_DIR/branch-claim.sh` into the hook, and `cloud-cell-supervisor.sh prune` deletes old harness pins —
+  so an arming step run out of a pin directory would leave a hook naming a path that is later removed, which
+  is the `GATE-ABSENT` shape the verifier exists to catch and which **refuses every push on that box**. The
+  stable gate path is the seeded `$O` copy; that is the one to install from.
+  Until then the doctor row is an OBSERVATION with a printed remedy, and an unarmed cell is a known-absent
+  state, not a fixed one.
