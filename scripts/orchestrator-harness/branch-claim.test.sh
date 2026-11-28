@@ -222,9 +222,26 @@ release_from owner main >/dev/null 2>&1
 commit_in stray "new-prefix push"
 ( cd "$T/stray" && git push -q origin "HEAD:refs/heads/chore/whatever" ) || bad "fixture: cannot push chore/whatever unclaimed"
 acquire_from owner "chore/whatever"
-eq "a NEW prefix is IN scope (acquire succeeds)" "$?" "0"
-guard_from stray "chore/whatever"
-eq "...and a peer is refused on it — by KIND, not because it was on a list" "$?" "1"
+eq "6) fixture: the claim on a never-before-seen prefix is HELD (acquire is pattern-independent)" "$?" "0"
+# ⛔ THE SCOPE ARM MUST RUN THE COMMAND THAT CONSULTS THE SCOPE (review P2, rule 3 — this REPLACED an
+# arm that could not vary). `acquire`/`guard` never read `BRANCH_CLAIM_PATTERN` or
+# `BRANCH_CLAIM_EXCLUDE_PATTERN`: `cmd_hook_ref` is the only caller of `branch_in_scope`, so an arm
+# phrased through `acquire`/`guard` stayed GREEN under the pre-#4260 three-prefix default AND with
+# `branch_in_scope` deleted outright — it measured `claim_branch_guard` refusing a peer, which was true
+# under every scope, under a label that claimed "by KIND, not because it was on a list". These two go
+# through `hook-ref` (the path the installed hook takes), and the SECOND one is the mutant that makes
+# the first attributable: the same subject under the old default must NOT be refused — which is exactly
+# the ungated `feat/*` push #4260 measured.
+( cd "$T/stray" && "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 ); _rc6p=$?
+case "$_rc6p" in
+  1) ok "6) hook-ref REFUSES a peer on a NEW prefix — in scope by KIND, not because it was on a list" ;;
+  *) bad "6) hook-ref on a peer-claimed chore/whatever said rc=$_rc6p (want 1) — the default scope was narrowed, so the gate does not cover every branch a lane writes" ;;
+esac
+( cd "$T/stray" && BRANCH_CLAIM_PATTERN='integration/* fix/* rescue/*' "$BC" hook-ref refs/heads/chore/whatever >/dev/null 2>&1 ); _rc6q=$?
+case "$_rc6q" in
+  0) ok "6) …and under the PRE-#4260 three-prefix default the same peer push is ALLOWED — so the arm above measures the scope, not the guard" ;;
+  *) bad "6) the pre-#4260 pattern also refused chore/whatever (rc=$_rc6q), so the arm above cannot be attributed to the scope" ;;
+esac
 release_from owner "chore/whatever" >/dev/null 2>&1
 
 echo "== 7. recovery: the holder releases, re-acquires and pushes again"
@@ -627,6 +644,22 @@ eq "...and -f the CALLER already had is PRESERVED, not cleared over it" \
    "$(run_bmp "$BM" 1 integration/x)" "0:1"
 eq "...on the non-match exit too" \
    "$(run_bmp "$BM" 1 chore/x)" "1:1"
+# ⛔ AN EXPLICITLY EMPTY LIST MUST MEAN EMPTY, NOT "FALL BACK TO THE INCLUDE LIST" (review P2, same
+# source, unreachable today only because the exclude default above uses `:-`). With `${2:-…}` an empty
+# argument resolved to `$BRANCH_CLAIM_PATTERN` — `*` — which matches every branch, so `branch_in_scope`
+# answered "out of scope" for the whole TREE and the gate refused nothing, silently, from one exported
+# variable. Both directions are measured: the shipped function must NOT match, and the pre-fix default
+# must. (`empty_list_rc` prints the rc from a same-shell subshell, as `run_bmp` does.)
+empty_list_rc() { ( set +f; BRANCH_CLAIM_PATTERN='*'; . "$1"; branch_matches_pattern "$2" "" >/dev/null 2>&1; printf '%s' "$?" ); }
+eq "13) an EXPLICIT EMPTY list matches NOTHING (empty means empty, never the include list)" \
+   "$(empty_list_rc "$BM" chore/x)" "1"
+sed 's|list="${2-\$BRANCH_CLAIM_PATTERN}"|list="${2:-\$BRANCH_CLAIM_PATTERN}"|' "$BM" > "$T/bmp-emptylist.sh"
+if cmp -s "$BM" "$T/bmp-emptylist.sh"; then
+  bad "13) the empty-list mutant is IDENTICAL — the default was not found to change, so the arm above is unpinned"
+else
+  eq "13) …and under the PRE-FIX colon-dash default the same empty list matches EVERYTHING — so the arm measures it" \
+     "$(empty_list_rc "$T/bmp-emptylist.sh" chore/x)" "0"
+fi
 # the mutant: delete BOTH restores. The function then leaks `set -f` into its caller, and row 1 reddens.
 sed 's|\[ "$_had_f" -eq 0 \] && set +f|:|' "$BM" > "$T/bmp-norestore.sh"
 if cmp -s "$BM" "$T/bmp-norestore.sh"; then
@@ -732,6 +765,82 @@ case "$_n15d" in *NOT-EXECUTABLE*) ok "15) ...naming NOT-EXECUTABLE" ;; *) bad "
 # cannot-verify is its own answer, and it is NOT a pass.
 _n15e="$( cd "$T" && "$BC" check-hook 2>/dev/null )"; _r15e=$?
 case "$_r15e" in 2) ok "15) outside any work tree the answer is CANNOT-VERIFY (rc 2), never a pass" ;; *) bad "15) not-a-tree rc=$_r15e: $_n15e" ;; esac
+# ⛔ NO `bash` ON PATH IS AN ABSTENTION, NOT A SYNTAX FAULT (review round 1, finding 8; the rc
+# vocabulary documented above already reserved rc 2 for this and the code did not have the arm). The
+# fixture is the decisive one: a PATH carrying every program the verifier needs EXCEPT the interpreter.
+# Without the arm `bash -n` is "command not found", the `!` inverts that into a pass, and a PERFECTLY
+# GOOD hook is reported `SYNTAX` at rc 1 (measured) — the verifier asserting a fault in an artifact it
+# never read. `$T/nohook` is the subject because it HAS an installed hook (its `-x` bit is restored
+# first), so a pre-fix run cannot stop at MISSING or NOT-EXECUTABLE instead.
+chmod +x "$T/nohook/.git/hooks/pre-push" 2>/dev/null
+BASH_ABS="$(command -v bash)"
+mkdir -p "$T/minbin"
+for _t in git dirname grep sed cmp mktemp head hostname uname cat rm chmod awk; do
+  _p="$(command -v "$_t" 2>/dev/null)" && [ -n "$_p" ] && ln -sf "$_p" "$T/minbin/$_t"
+done
+[ -e "$T/minbin/bash" ] && bad "15) fixture: minbin carries bash, so the arm below would prove nothing"
+_n15f="$( ( cd "$T/nohook" && env PATH="$T/minbin" "$BASH_ABS" "$BC" check-hook 2>/dev/null ) )"; _r15f=$?
+case "$_r15f" in
+  2) ok "15) with no bash on PATH the answer is CANNOT-VERIFY (rc 2), never a fault it cannot measure" ;;
+  *) bad "15) no-bash rc=$_r15f (want 2): $_n15f" ;;
+esac
+case "$_n15f" in
+  *"no bash"*) ok "15) …and it NAMES the missing interpreter (so nobody is sent to reinstall a correct hook)" ;;
+  *) bad "15) the no-bash verdict names no interpreter: $_n15f" ;;
+esac
+# ⛔ AND PRESENT + RESOLVABLE IS NOT "THE CURRENT GENERATION" (review P1). Every arm above passes on a
+# hook whose baked gate is an OLDER `branch-claim.sh` — the pre-#4260 `integration/* fix/* rescue/*`
+# scope — which is the shape the doctor's row would have reported as `armed`, about a box whose `feat/*`
+# pushes are still ungated. Four fixtures: (a) a REAL install from a byte-identical copy at another
+# path, which is CURRENT and must stay green (a pin, a consumer repo's vendored tree); (b) the same
+# copy one generation stale in its CONTENT at the SAME path as the copy, which must be named
+# GATE-STALE; (c) an install from a pre-#3329 TEMPLATE, present, executable, ours, parseable and with a
+# resolvable current gate, which must be named HOOK-STALE; (d) reinstall from this tree, green again, so
+# none of the three reds came from the fixture.
+git clone -q "$T/origin.git" "$T/gen" 2>/dev/null || bad "15) fixture: cannot clone gen"
+GEN_HOOK="$T/gen/.git/hooks/pre-push"
+gen_verdict() { ( cd "$T/gen" && "$BC" check-hook 2>/dev/null ); }
+# (a) a REAL install from a byte-identical tree at a different path — the pin/consumer shape.
+mkdir -p "$T/gen/copy"
+cp "$BC" "$SELFDIR/claims.sh" "$SELFDIR/branch-claim-hook.sh" "$T/gen/copy/"
+( cd "$T/gen" && CLAIM_REPO="$T/gen" bash "$T/gen/copy/branch-claim.sh" install-hook >/dev/null 2>&1 ) \
+  || bad "15) fixture: install-hook from the copied tree failed"
+_g15a="$(gen_verdict)"; _r15a=$?
+case "$_r15a" in 0) ok "15) a hook installed from a BYTE-IDENTICAL copy at another path still verifies (a pin is not stale by PATH)" ;; *) bad "15) identical-copy rc=$_r15a (want 0) — a path compare leaked into the verdict: $_g15a" ;; esac
+case "$_g15a" in *"gate=$T/gen/copy/branch-claim.sh"*) ok "15) …and the verdict names the gate that is actually installed" ;; *) bad "15) verdict does not name the installed gate: $_g15a" ;; esac
+# (b) the same path, one generation older in its CONTENT: the pre-#4260 narrow scope.
+sed 's|BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-\*}"|BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/* fix/* rescue/*}"|' \
+  "$BC" > "$T/gen/copy/branch-claim.sh.old"
+if cmp -s "$BC" "$T/gen/copy/branch-claim.sh.old"; then
+  bad "15) the stale-gate mutant is IDENTICAL — the default was not found, so the arm below is unpinned"
+else
+  cat "$T/gen/copy/branch-claim.sh.old" > "$T/gen/copy/branch-claim.sh"
+  rm -f "$T/gen/copy/branch-claim.sh.old" "$GEN_HOOK"
+  ( cd "$T/gen" && CLAIM_REPO="$T/gen" bash "$T/gen/copy/branch-claim.sh" install-hook >/dev/null 2>&1 ) \
+    || bad "15) fixture: install-hook from the stale copy failed"
+  _g15b="$(gen_verdict)"; _r15b=$?
+  case "$_r15b" in 1) ok "15) an armed hook whose GATE is an older generation FAILS (rc 1) — present+resolvable+executable is not CURRENT" ;; *) bad "15) stale-gate rc=$_r15b (want 1): $_g15b" ;; esac
+  case "$_g15b" in *GATE-STALE*) ok "15) …naming GATE-STALE (the box the old verifier reported as HOOK-OK and the fleet read as fixed)" ;; *) bad "15) verdict: $_g15b" ;; esac
+fi
+# (c) the pre-#3329 hook: present, executable, ours, parses, gate CURRENT — and validates no ref at all.
+mkdir -p "$T/gen/oldtmpl"
+cp "$BC" "$SELFDIR/claims.sh" "$T/gen/oldtmpl/"
+awk '!done && $0=="set -u" { print; print "cat >/dev/null   # pre-#3329: consume the ref lines, replay none"; done=1; next } { print }' \
+  "$SELFDIR/branch-claim-hook.sh" > "$T/gen/oldtmpl/branch-claim-hook.sh"
+if cmp -s "$SELFDIR/branch-claim-hook.sh" "$T/gen/oldtmpl/branch-claim-hook.sh"; then
+  bad "15) the stale-template mutant is IDENTICAL — the template was not found, so the arm below is unpinned"
+else
+  rm -f "$GEN_HOOK"
+  ( cd "$T/gen" && CLAIM_REPO="$T/gen" bash "$T/gen/oldtmpl/branch-claim.sh" install-hook >/dev/null 2>&1 ) \
+    || bad "15) fixture: install-hook from the old template failed"
+  _g15c="$(gen_verdict)"; _r15c2=$?
+  case "$_r15c2" in 1) ok "15) a hook from an OLDER TEMPLATE FAILS (rc 1) — the inert-while-looking-installed class, caught by content" ;; *) bad "15) stale-template rc=$_r15c2 (want 1): $_g15c" ;; esac
+  case "$_g15c" in *HOOK-STALE*) ok "15) …naming HOOK-STALE" ;; *) bad "15) verdict: $_g15c" ;; esac
+fi
+# (d) control: reinstall from THIS tree and the same checkout verifies, so (b)/(c) measured the hooks.
+rm -f "$GEN_HOOK"
+( cd "$T/gen" && CLAIM_REPO="$T/gen" "$BC" install-hook >/dev/null 2>&1 ) || bad "15) fixture: reinstall in gen"
+_g15d="$(gen_verdict)"; eq "15) …and the SAME checkout verifies again after a reinstall from this tree (so the two reds above are the hooks, not the fixture)" "$?" "0"
 
 # ⛔ AND THE INSTALLER MUST NOT REPORT SUCCESS IT CANNOT VERIFY. `install-hook` calls the same
 # verifier and DIES when the artifact does not answer. The fixture is a real one: a copy of the script

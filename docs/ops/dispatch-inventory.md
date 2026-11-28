@@ -151,5 +151,12 @@ Nothing in this inventory proposes to re-derive any of the four.
   so an arming step run out of a pin directory would leave a hook naming a path that is later removed, which
   is the `GATE-ABSENT` shape the verifier exists to catch and which **refuses every push on that box**. The
   stable gate path is the seeded `$O` copy; that is the one to install from.
+  ⛔ **AND THE VERIFIER NO LONGER WAITS FOR `prune` TO NOTICE (review P1).** `check-hook` byte-compares the
+  gate the hook names against the `branch-claim.sh` beside it (`GATE-STALE`) and the hook itself against
+  `branch-claim-hook.sh` (`HOOK-STALE`). Before that, the window between installing from a pin and `prune`
+  deleting it was a FALSE PASS: the hook was present, executable, ours, parseable and resolvable while the
+  gate it baked carried the pre-#4260 three-prefix scope — `HOOK-OK` about a box that was still ungated,
+  which is the fleet reading the measured defect as fixed. It is a CONTENT compare, not a path compare, so a
+  byte-identical copy at a pin's or a consumer repo's path stays green.
   Until then the doctor row is an OBSERVATION with a printed remedy, and an unarmed cell is a known-absent
   state, not a fixed one.

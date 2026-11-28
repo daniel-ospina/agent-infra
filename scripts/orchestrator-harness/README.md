@@ -4632,7 +4632,15 @@ three-prefix default refused three prefixes. Hooks are per REPOSITORY, not per w
 (`git rev-parse --git-path hooks` in a linked worktree resolves the COMMON hooks dir), so one install arms
 every worktree on the box. Fail-closed is the intended polarity and is unchanged.
 `branch-claim.sh check-hook`
-verifies that the hook is actually armed in a checkout, and `cloud-cell-doctor.sh hygiene` asks it on a
+verifies that the hook is actually armed in a checkout **and that it is THIS tree's generation of it**
+(review P1): the installed hook is byte-compared against the template beside the script (`HOOK-STALE`)
+and the gate it names is byte-compared against this `branch-claim.sh` (`GATE-STALE`). Presence alone was
+a false PASS on the exact state #4260 measured — a hook installed from a pin, a consumer repo's vendored
+tree or any pre-#4260 checkout is present, executable, ours, parseable and resolvable while enforcing the
+OLD `integration/* fix/* rescue/*` scope, so a box whose `feat/*` pushes are still ungated read
+`HOOK-OK`; the same door admitted a pre-#3329 template that buffered no stdin and validated no ref. Both
+arms compare CONTENT, never a path, so a byte-identical copy at another path stays green and the doctor's
+clock keeps no network dependency. `cloud-cell-doctor.sh hygiene` asks it on a
 clock **about the checkout the box pushes from (`$REPO`)** — recording `HOOK-OK` / `HOOK-FAIL <host>
 <fault>` in the pass record, so an unarmed box is named instead of silent. That row is REPORTED, never
 fatal: it never touches the disk-reclaim role's own rc, because a fresh clone, a CI runner and a new
