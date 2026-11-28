@@ -134,7 +134,14 @@ claim_repo_init_local() {
 # branch class the gate exists to refuse. `set -f` is the one-token fix; it is scoped to this function
 # so nothing else in the script inherits it.
 branch_matches_pattern() {
-  local br="${1:-}" list="${2:-$BRANCH_CLAIM_PATTERN}" pat _had_f=0
+  # ⛔ AN EXPLICITLY EMPTY LIST MUST MEAN EMPTY, NOT "FALL BACK TO THE INCLUDE LIST" (review P2,
+  # verified from the source and unreachable only by accident). With `${2:-…}` a caller passing `""`
+  # — an empty `BRANCH_CLAIM_EXCLUDE_PATTERN` someone exported to turn exclusions OFF — fell back to
+  # `$BRANCH_CLAIM_PATTERN`, i.e. `*`, which matches EVERY branch: `branch_in_scope` then answered "out
+  # of scope" for the whole tree and the gate refused nothing, silently. Today only `:92`'s `:-` default
+  # keeps an empty value from reaching here, so the function must not depend on a caller's defaulting to
+  # stay fail-closed: `${2-…}` (`-`, not `:-`) makes an empty argument an empty list.
+  local br="${1:-}" list="${2-$BRANCH_CLAIM_PATTERN}" pat _had_f=0
   case "$-" in *f*) _had_f=1 ;; esac
   set -f
   for pat in $list; do
@@ -168,7 +175,9 @@ usage: branch-claim.sh <command> [args]
   install-hook [--force]   install the pre-push hook that calls `guard` into this repo's hooks dir, then
                            VERIFY it (the write is not the proof)
   check-hook               verify the hook installed in THIS checkout: present, executable, ours, its
-                           gate path resolves, and it parses. rc 0 = OK, 1 = a named fault, 2 = cannot
+                           gate path resolves, it parses, AND both the hook and its baked gate are THIS
+                           tree's bytes (a present hook from an older generation is a named fault, not
+                           a pass). rc 0 = OK, 1 = a named fault, 2 = cannot
                            verify. Prints one verdict line (`HOOK-OK ...` / `HOOK-FAIL ...`), so a clock
                            can run it on every box and a reader can tell WHICH box fails and why
   hook-ref <ref>           (hook helper) guard the branch named by a full refs/heads/... ref
@@ -318,6 +327,23 @@ cmd_install_hook() {
 # worktree was reaped, then holds a hook that names a path nothing lives at — and the hook's own
 # fail-closed branch (`bc` unresolved -> exit 1) would refuse EVERY push on that box. That is not a
 # gate, it is an outage, and it is the one shape a present-and-executable check would call green.
+# ⛔ AND PRESENT + EXECUTABLE + RESOLVABLE IS STILL NOT "THE CURRENT GENERATION" (review P1, MEASURED
+# FROM THE SOURCE). Those four arms all pass on a hook installed from a PIN directory, from a consumer
+# repo's vendored copy, or from any tree older than #4260 — and such a copy carries
+# `BRANCH_CLAIM_PATTERN="${BRANCH_CLAIM_PATTERN:-integration/* fix/* rescue/*}"`, i.e. exactly the
+# narrow scope #4260 exists to remove. So the verifier answered `HOOK-OK ... gate=/<old>/branch-claim.sh`
+# and the fleet read "this box is fixed" about a box whose `feat/*` pushes are still ungated: the
+# measured defect's second half, reported GREEN by the instrument that is this PR's own acceptance
+# evidence. The same door admits a pre-#3329 TEMPLATE, which buffered no stdin and therefore validated
+# NO ref while being present, executable, ours-by-marker and syntax-clean — the "inert while LOOKING
+# installed" class this block already names for NOT-EXECUTABLE, reached a different way.
+# So the last two arms are BYTE COMPARISONS against this tree, which is what "current" actually means:
+#   GATE-STALE  the gate the hook names is not the `branch-claim.sh` beside this verifier
+#   HOOK-STALE  the hook itself is not what this tree's template installs
+# A byte compare, not a path compare: a byte-identical copy at another path (a consumer repo's
+# vendored tree, a synced `$O` reached by a different root) IS current and must not be flagged, and
+# a same-path file whose CONTENT is an older scope is not. It is also local and offline, so the
+# doctor's clock can run it on a cell with no network.
 check_hook_report() { # [<repo>] -> 0 OK / 1 FAULT / 2 CANNOT-VERIFY; one line on stdout, one on stderr
   # ⛔ THE SUBJECT IS AN ARGUMENT, DEFAULTING TO THE CWD (review F3). The hook question is about a
   # CHECKOUT, and the two callers resolve a checkout differently on purpose: `check-hook` is asked by
@@ -326,7 +352,18 @@ check_hook_report() { # [<repo>] -> 0 OK / 1 FAULT / 2 CANNOT-VERIFY; one line o
   # Resolving from cwd here made the verifier answer about a different checkout than the one the
   # installer just wrote to. The argument form also keeps the ONE source of the not-a-work-tree verdict
   # (rc 2 below) for both callers, which is why the caller does not pre-check it.
-  local repo dir hook gate fault="" rc=0
+  local repo dir hook gate fault="" rc=0 tmpl _stale_gate _stale_a
+  # ⛔ NO `bash` ON PATH IS CANNOT-VERIFY, NOT A SYNTAX FAULT (review round 1, finding 8 — the
+  # documented rc vocabulary above already claimed this arm and the code did not have it). Without it
+  # the `bash -n` arm below is "command not found", the `!` inverts that into a pass, and the box is
+  # reported `SYNTAX` at rc 1: an instrument asserting a fact about an artifact it never read. It is
+  # asked FIRST because every arm below runs a program; when there is no interpreter, there is no
+  # answer, and rc 2 is the vocabulary's word for that.
+  if ! command -v bash >/dev/null 2>&1; then
+    printf 'HOOK-UNVERIFIED %s: no bash on PATH — cannot read or parse the hook, so this is no answer\n' \
+      "${HOSTNAME:-$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'this-box')}"
+    return 2
+  fi
   if [ -n "${1:-}" ]; then
     repo="$( cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )" || repo=""
   else
@@ -359,6 +396,31 @@ check_hook_report() { # [<repo>] -> 0 OK / 1 FAULT / 2 CANNOT-VERIFY; one line o
       fault="GATE-ABSENT ($hook names $gate, which does not exist — the hook will refuse EVERY push on this box)"
     elif [ ! -x "$gate" ]; then
       fault="GATE-NOT-EXECUTABLE ($gate)"
+    elif [ -f "$SELF_DIR/branch-claim.sh" ] && ! cmp -s "$gate" "$SELF_DIR/branch-claim.sh"; then
+      fault="GATE-STALE ($gate is not the gate this verifier ships ($SELF_DIR/branch-claim.sh) — the hook enforces whatever scope THAT copy carries, which can be the pre-#4260 three-prefix default, so this box is NOT gated the way this verdict implies; reinstall: bash $SELF_DIR/branch-claim.sh install-hook)"
+    fi
+  fi
+  # ⛔ AND THE HOOK ITSELF MUST BE THIS TREE'S TEMPLATE, not merely present and parseable (review P1).
+  # The installer runs ONE transform — `sed "s|@BC@|<gate>|g"` over the template — so the generation test
+  # is that same transform applied to this tree's template with the gate path the hook actually carries,
+  # compared byte for byte. A pre-#3329 template (which consumed its ref lines and replayed none, so a
+  # chained hook validated nothing) is byte-different and gets named. The transform is NOT limited to the
+  # `bc=` line: `@BC@` also appears in the template's own comment, and the installer rewrites that too
+  # (measured — comparing only the `bc=` line flags every CORRECT install). `|`, `&` and `\` are escaped
+  # into the replacement so a path containing one cannot make a correct hook read as stale. If the
+  # comparison cannot be run (no template beside this script, no mktemp, an unreadable file) the arm is
+  # SKIPPED rather than failed: a check that cannot answer must not manufacture a fault, which would
+  # refuse a correct install.
+  if [ -z "$fault" ] && [ -r "$SELF_DIR/branch-claim-hook.sh" ]; then
+    tmpl="$SELF_DIR/branch-claim-hook.sh"
+    _stale_gate="$(printf '%s' "$gate" | sed 's/[\\|&]/\\&/g' 2>/dev/null)"
+    _stale_a="$(mktemp "${TMPDIR:-/tmp}/branch-claim-stale.XXXXXX" 2>/dev/null)" || _stale_a=""
+    if [ -n "$_stale_a" ]; then
+      if sed "s|@BC@|$_stale_gate|g" "$tmpl" > "$_stale_a" 2>/dev/null \
+         && ! cmp -s "$hook" "$_stale_a"; then
+        fault="HOOK-STALE ($hook is not what $tmpl installs — an older generation of the hook, whose stdin replay may be missing entirely, so it can validate NO ref while it looks installed; reinstall: bash $SELF_DIR/branch-claim.sh install-hook)"
+      fi
+      rm -f "$_stale_a"
     fi
   fi
   if [ -z "$fault" ]; then
