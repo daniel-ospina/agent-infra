@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-3953-1795851950-p553719-7b81bf17",
+  "_sha": "366d833f7e796255a09cfb53341eff7481a6bd0c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-3953.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/3953-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "31a320e392a7b7bed06d6a33d16b5cc34e7d76e9"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/tm-3953"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 768,
+  "ended_at": 1795852718,
+  "exit_code": 0,
+  "heartbeat_at": 1795852718,
+  "host": "cmux",
+  "issue": 3953,
+  "kind": "lane",
+  "lane_id": "cmux.klane-3953-1795851950-p553719-7b81bf17",
+  "lease_until": 1795889318,
+  "pid": 553719,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795851950,
+  "state": "DONE",
+  "tag": "3953",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-3953"
+}
