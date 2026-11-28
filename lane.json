@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795851078,
+  "host": "cmux",
+  "issue": 14691,
+  "kind": "lane",
+  "lane_id": "cmux.klane-14691-1795851078-p4191968-fe8e77a7",
+  "lease_until": 1795887678,
+  "pid": 4191968,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795851078,
+  "state": "RUNNING",
+  "tag": "14691",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-14691"
+}
