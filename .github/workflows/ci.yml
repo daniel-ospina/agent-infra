@@ -1919,6 +1919,13 @@ jobs:
           # than the step it describes).
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
           BASH_SHARD_STEP_BUDGET_SECS: 4200
+          # ⛔ THE WHOLE-TREE PORTABILITY ARM IS OFF THIS LANE (agent-infra#4210, owner decision
+          # 2026-11-25). `check-portability-traps.test.sh`'s F4 runs `--root` over the whole tree; its
+          # cost tracks REPOSITORY SIZE, not the diff, so it grows on every merge — measured 2356 s of
+          # a 2400 s step — and it is why this lane could not finish. F4/F5 print an explicit SKIP
+          # naming the lane that owns them (`.github/workflows/portability-tree-scan.yml`, scheduled),
+          # so nothing is silently dropped; the DIFF half runs in `bash-suites-gate` below, every PR.
+          PORTABILITY_TREE_SCAN: "0"
         # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
         # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
         # `cancelled`: the service cancels the job, the job-cancellation callback sets
@@ -1970,9 +1977,20 @@ jobs:
     # is not a fail-fast — it is the #2055 stall with a label on it.
     #
     # ⛔ SAME ARITHMETIC AS `bash-suites`: the job bound sits ABOVE the sum of the step bounds below
-    # (10 + 10 + 5 + 15 = 40 < 60), so a running step always trips its OWN bound first — which is
-    # `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
-    timeout-minutes: 60
+    # (10 + 10 + 5 + 10 + 5 + 5 + 15 = 60 < 80), so a running step always trips its OWN bound first —
+    # which is `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
+    # ⛔ THE 60 → 80 RISE IS THE #4210 STEPS, NOT SLACK: the two portability steps (10 + 5) and the
+    # origin/main materialization they need (5) are new work this gate did not do before, and a job
+    # bound left at 60 would have equalled the sum — the guard refuses that, correctly, because a job
+    # bound at its own sum can win the race and report `cancelled`.
+    timeout-minutes: 80
+    # ⛔ `actions: read` IS REQUIRED BY THE FRESHNESS STEP BELOW (#4210 acceptance 4): it reads this
+    # workflow's own successful-run history through the Actions API, which is the publication of the
+    # whole-tree scan's last success. Unlisted scopes are NONE once `permissions` is declared, so a
+    # missing key would 403 the step — and a 403 is a REFUSAL there, i.e. red, never a silent pass.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
@@ -1980,6 +1998,40 @@ jobs:
         with:
           node-version: '22'
         timeout-minutes: 10
+      - name: Materialize origin/main so the changed-files portability gate can answer (#4210)
+        # `check-portability-traps-changed.sh` diffs against a base ref. An actions/checkout of a PR
+        # head carries ONE ref, so `origin/main` does not exist and the gate would refuse (correctly —
+        # but for a reason unrelated to the diff). A fetch that cannot produce the ref must fail
+        # loudly — no `|| true`. (ci-main.yml does NOT share this shape: it checks out with
+        # `fetch-depth: 2` and diffs `--base HEAD^`. The freshness guard below reads this same ref, so
+        # the base the diff is measured against is also the base that bounds its 404 bootstrap window.)
+        timeout-minutes: 5
+        run: |
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+            git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          fi
+      - name: Portability — THIS change's shell files only (#4210 — the diff, not the tree)
+        # The required half of the scope split. It intersects the diff with the detector's OWN
+        # published scan set (`--print-targets`), so a changed file cannot be invisible to it, and it
+        # fails a change that INTRODUCES a trap. An unresolvable base refuses (rc 2) rather than
+        # reading as an empty diff, and "nothing in scope" is printed as a conclusion, never silence.
+        timeout-minutes: 10
+        env:
+          # Two-dot on purpose (see the script header): three-dot needs a merge base a depth-1 fetch
+          # of the base does not have, and the extra over-inclusion is the SAFE direction.
+          PORTABILITY_BASE_REF: origin/main
+        run: bash scripts/check-portability-traps-changed.sh
+      - name: Portability — is the whole-tree scan still ALIVE? (#4210 acceptance 4)
+        # The arm that moved off this lane is asserted to exist, from the lane that still runs. A
+        # scheduled job that stops is an ABSENCE, and an absence is not a pass: this reds on a
+        # last-success older than 72 h, and on a workflow that has never succeeded once its
+        # registration predates that bound (a just-landed workflow gets ONE named bootstrap window).
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `--base` is REQUIRED for the 404 branch: it is what tells a workflow that is LANDING from one
+        # that landed and never registered (#4210 review P2). It is the same ref the diff gate above uses.
+        run: bash scripts/check-portability-tree-scan-alive.sh --base origin/main
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
         # Step bounds, not just the job bound, for the reason recorded on `bash-suites` above: a
         # step timeout is `failed` (red), a job timeout is `cancelled` (non-red to the rail).

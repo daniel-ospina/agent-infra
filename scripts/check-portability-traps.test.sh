@@ -24,8 +24,20 @@
 # `scripts/run-bash-shards.sh` to prove the suite is discovered. The consequence a reader must know: a
 # lane that adds a real trap reds THIS shard, by design.
 #
+# ⛔ F4/F5 CARRY A SCOPE SWITCH SINCE #4210, AND IT IS NOT A COVERAGE TRADE (owner decision, 2026-11-25,
+# option A — the re-scope comment on agent-infra#4210). F4 is a `--root` scan: its runtime is a
+# function of REPOSITORY SIZE, not of the diff, so it grows on every merge and eventually outlived the
+# bounded lane's own step bound (measured: 2356 s of a 2400 s step, 98.2 %). A PR cannot change a
+# tree-wide result except through the files it touches — so the BOUNDED lane runs
+# `PORTABILITY_TREE_SCAN=0` (F4/F5 print an explicit SKIP naming the batch lane that owns them, never a
+# silent pass) and `.github/workflows/portability-tree-scan.yml` runs the same assertion against the
+# accumulated tree on a schedule, where a slow run buys information that has changed.
+# The DEFAULT here is 1: a developer, and any run that can afford it, still gets the full assertion.
+#
 #   bash scripts/check-portability-traps.test.sh
 #   bash scripts/check-portability-traps.test.sh --verbose
+#   PORTABILITY_TREE_SCAN=0 bash scripts/check-portability-traps.test.sh   # bounded lane (#4210)
+#   bash scripts/check-portability-traps.test.sh --scope-self-test        # print the F4/F5 SCOPE decision
 #
 # ⛔ IF THE LOCAL CHECKOUT GUARD REFUSES THIS SUITE (fails closed: "script-indirection — the discard's
 # effect could not be verified", #709), do NOT work around it by weakening the arms: run the SAME bytes
@@ -41,8 +53,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || { echo "❌ unresolvable
 CHECK="$HERE/check-portability-traps.sh"
 BASELINE="$HERE/portability-baseline.tsv"
 BOX="$HERE/lib/box.sh"
-VERBOSE=0
-[ "${1:-}" = "--verbose" ] && VERBOSE=1
+VERBOSE=0; SCOPE_SELF_TEST=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --verbose) VERBOSE=1 ;;
+    # ⛔ THE SCOPE DECISION IS PUBLISHED SO IT CAN BE ASSERTED WITHOUT NESTING A SUITE (#4210).
+    # The earlier suites in this tree record that a nested suite run is refused wholesale by the
+    # checkout guard (`script-indirection`), so an arm that re-ran this file to observe the switch
+    # would make the gate unrunnable; this mode prints the SAME decision the F section branches on.
+    --scope-self-test) SCOPE_SELF_TEST=1 ;;
+    *) echo "unknown argument: $_arg" >&2; exit 2 ;;
+  esac
+done
 
 [ -f "$CHECK" ] || { echo "❌ detector missing: $CHECK"; exit 1; }
 
@@ -58,6 +80,20 @@ unproven() { UNPROVEN=$((UNPROVEN+1)); printf 'UNPROVEN-ON(%s, %s)\n' "$(uname -
 # The platform EVERY arm below ran on. Stated once, printed in the summary, and never implied.
 OS="$(uname -s 2>/dev/null || echo unknown)"
 BASHV="${BASH_VERSION%%(*}"
+
+# ── THE SCOPE GATE (agent-infra#4210) ───────────────────────────────────────────────────────────
+# ONE predicate, read by ONE branch in the F section — a second copy of this decision is how the arm
+# keeps running in the bounded lane while the comment claims it moved.
+tree_scan_enabled() { [ "${PORTABILITY_TREE_SCAN:-1}" != "0" ]; }
+
+if [ "$SCOPE_SELF_TEST" = 1 ]; then
+  if tree_scan_enabled; then
+    printf 'SCOPE F4/F5=RUN (whole-tree scan enabled; PORTABILITY_TREE_SCAN=%s)\n' "${PORTABILITY_TREE_SCAN:-1}"
+  else
+    printf 'SCOPE F4/F5=SKIP (PORTABILITY_TREE_SCAN=0 — the batch lane owns the whole-tree scan)\n'
+  fi
+  exit 0
+fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ctrap-XXXXXX")" || { echo "❌ mktemp"; exit 1; }
 cleanup() { rm -rf "$TMP"; }
@@ -1491,6 +1527,71 @@ run_check "$E" --baseline "$TMP/base-nojust.tsv"
   || bad "E4: a justification-less baseline entry was accepted"
 
 
+# ── E20..E22: A SCOPED SCAN IS NOT EVIDENCE ABOUT A FILE IT NEVER OPENED (#4210) ─────────────
+# ⛔ THE DEFECT THESE PIN, AND IT IS A MISREADING GENERATOR. `--targets` restricts the scan to named
+# files, but the ratchet compared against the WHOLE baseline — so every row belonging to an unscanned
+# file fell to 0 and printed as `SHRANK … CONFIRM each was FIXED and not merely UNSCANNED`. On the
+# changed-files lane that is EVERY unscanned row, on EVERY run (measured: 85 rows on the first run of
+# `check-portability-traps-changed.sh`), i.e. a notice whose whole purpose is to detect a real scan
+# loss arriving buried in rows that were merely never read — which teaches a reader to skip it.
+# E20 scoped: only the SCANNED file may be reported. E21 control: with the file in scope the notice IS
+# reported, so E20 cannot pass by suppressing the notice altogether. E22: the verdict SAYS it is
+# scoped, because "0 new traps" over four changed files and over the whole tree are different claims.
+mkdir -p "$TMP/tree/scope"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/scope/in.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/scope/out.sh"
+printf 'scope/in.sh\tcpu-count-single-mechanism\t3\t#4210 arm: both files hold ONE live trap, the baseline claims THREE\n' >"$TMP/base-scope.tsv"
+printf 'scope/out.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this row is OUT of scope for the scoped run below\n' >>"$TMP/base-scope.tsv"
+printf 'scope/in.sh\n' >"$TMP/scope-in-only"
+printf 'scope/in.sh\nscope/out.sh\n' >"$TMP/scope-both"
+run_check "$TMP/scope-in-only" --baseline "$TMP/base-scope.tsv"
+if [ "$?" = 0 ] && grep -q 'scope/in.sh' "$ERR" && ! grep -q 'scope/out.sh' "$ERR"; then
+  ok "E20: a SCOPED scan reports the scanned file fall and says NOTHING about an unscanned file (the notice keeps its meaning)"
+else
+  bad "E20: a scoped scan reported an unscanned baseline row as SHRANK (or reported nothing at all) — every scoped run would arrive buried in rows it never read"
+fi
+run_check "$TMP/scope-both" --baseline "$TMP/base-scope.tsv"
+if [ "$?" = 0 ] && grep -q 'scope/in.sh' "$ERR" && grep -q 'scope/out.sh' "$ERR"; then
+  ok "E21: the SAME two rows ARE both reported when both files are scanned — the scope filter is not a blanket suppression"
+else
+  bad "E21: with both files in scope a fall was NOT reported — the scope filter suppresses real notices"
+fi
+grep -q 'SCOPED to the target list' "$ERR" \
+  && ok "E22: a scoped verdict SAYS it is scoped — 'no new traps' over a diff and over the tree are different claims" \
+  || bad "E22: the scoped verdict is indistinguishable from a whole-tree one"
+
+# ⛔ E23: THE FILTER IS SCOPED BY THE `--targets` FLAG, NEVER BY THE TARGET LIST (#4210 review P1,
+# measured). `targets()` IS the whole tree in `--root` mode, so gating `inscope` on `TARGET_LIST` also
+# silenced the `--root` run — the scheduled batch lane and F4, the only surfaces that still read the
+# WHOLE baseline — for a baseline row whose file left the scan set entirely (deleted, renamed, or
+# shebang removed). That row then keeps its old, higher count as STANDING HEADROOM, and `NOJUST` is
+# skipped for it too, so a justification-less row that used to exit 1 passes. E20..E22 cannot see any
+# of this: their fixtures keep the out-of-scope file INSIDE the tree's scan set, so only `--targets`
+# ever excludes it — the `--root` direction had no arm at all.
+mkdir -p "$TMP/roottree/keep"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/roottree/keep/a.sh"
+rgit() { git -C "$TMP/roottree" "$@" >/dev/null 2>&1; }
+rgit init -q -b main
+rgit config user.email scope@example.invalid
+rgit config user.name scope-arm
+rgit add -A
+rgit commit -q -m fixture
+printf 'keep/a.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this file holds ONE live trap while the baseline claims THREE\n' >"$TMP/base-root-vanished.tsv"
+printf 'gone/gone.sh\tcpu-count-single-mechanism\t3\t#4210 arm: this file is NOT in the scan set, so a --root run must still speak about its row\n' >>"$TMP/base-root-vanished.tsv"
+bash "$CHECK" --root "$TMP/roottree" --baseline "$TMP/base-root-vanished.tsv" >"$OUT" 2>"$ERR"; rc=$?
+if [ "$rc" = 0 ] && grep -q 'gone/gone.sh' "$ERR" && grep -q 'SHRANK' "$ERR"; then
+  ok "E23: a WHOLE-TREE run still reports the baseline row of a file no longer in the scan set (the scope filter is the FLAG, not the target list)"
+else
+  bad "E23: a --root run went SILENT about a vanished baseline row (rc=$rc) — deleting or renaming a baselined file erases its re-emit notice and keeps its headroom"
+fi
+printf 'keep/a.sh\n' >"$TMP/root-keep-only"
+bash "$CHECK" --root "$TMP/roottree" --targets "$TMP/root-keep-only" --baseline "$TMP/base-root-vanished.tsv" >"$OUT" 2>"$ERR"; rc=$?
+if [ "$rc" = 0 ] && grep -q 'keep/a.sh' "$ERR" && ! grep -q 'gone/gone.sh' "$ERR"; then
+  ok "E23b: the SAME baseline SCOPED to keep/a.sh says NOTHING about the vanished row — E23 cannot pass by reporting everything"
+else
+  bad "E23b: the scoped control diverged (rc=$rc) — E23 would then pass on a filter that never applies"
+fi
+
 # ── E8..E10: `--emit-baseline` IS A DOCUMENTED REGENERATION PATH, SO IT IS A GATE SURFACE ────────
 # ⛔ THE DEFECT THESE PIN (review cycle-18 P1). The rule table reached awk as `-v rules="$RULES"` with
 # LITERAL NEWLINES in it; one-true-awk — macOS, the host this class exists for — refuses that, the
@@ -1721,19 +1822,33 @@ esac
 # over the tree is a test of a detector, not a gate — and the wiring is asserted rather than assumed,
 # because the brief calls out the exact failure a previous lane made (a reviewer filing "this test
 # never runs" by searching for a FILENAME instead of reading the derived list).
-real_out="$(bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" 2>&1)"; real_rc=$?
-if [ "$real_rc" != 0 ]; then printf '%s\n' "$real_out" | sed 's/^/    /' >&2; fi
-[ "$real_rc" = 0 ] && ok "F4: the repo's own tree is clean under the shipped baseline (what CI enforces)" \
-  || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
+#
+# ⛔ F4/F5 ARE THE SCOPE-SWITCHED ARMS (#4210 re-scope). The predicate is `tree_scan_enabled` and the
+# SKIP names the lane that owns the assertion — a `skip` that says WHERE the coverage went, because a
+# silent removal is the fail-open class this repo refuses.
+real_out=""
+if tree_scan_enabled; then
+  real_out="$(bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" 2>&1)"; real_rc=$?
+  if [ "$real_rc" != 0 ]; then printf '%s\n' "$real_out" | sed 's/^/    /' >&2; fi
+  [ "$real_rc" = 0 ] && ok "F4: the repo's own tree is clean under the shipped baseline (what CI enforces)" \
+    || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
+else
+  skip "F4: the whole-tree scan is owned by .github/workflows/portability-tree-scan.yml (--root over the accumulated tree, on a schedule) — #4210 moved it off the bounded lane because its cost tracks REPOSITORY SIZE, not the diff"
+  skip "F5: the verdict-line arm rides on F4's run and moves with it — the batch workflow's REPORT step now asserts it on its own scan-out/verdict.txt (a clean rc=0 without the clean verdict line FAILS the run there), and scripts/check-portability-scope.test.sh C8 runs that shipped step to prove the assertion is live"
+fi
 
 # ⛔ NO PIPELINE INTO `grep -q` — THE SIGPIPE FALSE-NEGATIVE (#841/#861). Under `pipefail` a `grep -q`
 # that finds its match exits early, the writer takes SIGPIPE, and the PIPELINE reports failure — so a
 # PRESENT verdict line read as "not found". Here that would be a guard asserting a guard. A here-string
 # has no writer process to break, which is why this site and the three in C8/C11 use one.
-grep -q 'no NEW cross-platform traps' <<<"$real_out"
-ok_or_bad=$?
-[ "$ok_or_bad" = 0 ] && ok "F5: the verdict line is printed (silence is never a pass)" \
-  || bad "F5: the real-tree run printed no verdict line"
+# (Only meaningful when F4 ran: with the scan switched off there is no run whose verdict line could be
+# missing, and asserting on an empty string would report a red for a moved arm.)
+if tree_scan_enabled; then
+  grep -q 'no NEW cross-platform traps' <<<"$real_out"
+  ok_or_bad=$?
+  [ "$ok_or_bad" = 0 ] && ok "F5: the verdict line is printed (silence is never a pass)" \
+    || bad "F5: the real-tree run printed no verdict line"
+fi
 
 # ⛔ WIRING BY DERIVATION, NOT BY A SECOND LIST: both CI lanes execute scripts/run-bash-shards.sh,
 # and that runner DISCOVERS its suites by glob (`SUITE_GLOBS`) — nothing is registered by hand. So the
