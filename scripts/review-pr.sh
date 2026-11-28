@@ -148,14 +148,28 @@
 #   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
 #      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
 #      retarget is the same refusal) — NOT recorded
-#   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
-#      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
-#      reads: no record bound to this head, no marker in the PR body, or a marker posted
-#      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check)
+#   9  the record/artifact arm — the cases are enumerated above; this PR adds three SHAPES inside
+#      them. The artifact check (c) reads can be a marker whose `diff=` is ABSENT (`nodigest`, a
+#      pre-#2982 marker) or names a DIFFERENT artifact (`mismatch`, the surviving-marker half of
+#      the body-edit case), and the recorder's answer for the pair a carry certifies can carry no
+#      readable 64-hex digest at all (`cc_need_digest`, whose field number says which one). The
+#      `carry` arm scans the marker at ANY head — a carried marker is bound to the RECORDED head —
+#      and must name the digest that carry is over; `carry-patch` re-records at the LIVE head, so
+#      it reads the marker HEAD-SCOPED. On `carry` the digest test is the one check (c)'s CARRY
+#      path already applies — that path skips a digest-less candidate and asks the producer about
+#      the marker's own (head, diff) pair — so PRESENCE ALONE is not the artifact it reads. On
+#      `carry-patch` it is STRICTER than check (c)'s HEAD-BOUND matcher (`has_review_record`),
+#      which reads no `diff=` at all: strictness there can only REFUSE a carry (exit 9 names the
+#      re-record), never certify one check (c) would reject
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
-#      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
-#      nothing was recorded. A failed read is not a changed artifact and must never buy a review
+#      READ the live diff/head (`unreadable` / `surface-unknown`), OR the PR BODY could not be
+#      READ while certifying the marker a carry depends on. A failed read is not a missing marker
+#      and not a changed artifact, and must never buy a review — RETRY, and nothing was paid for.
+#      ⛔ It is NOT "nothing happened": `carry` writes nothing, but `carry-patch` RE-RECORDS at the
+#      live head BEFORE it reads the body (`record_at_head_family` gates the arm, and its own
+#      refusal text says the re-record LANDED), so a record may already exist at the current head
+#      when this exits — the retry re-sends the marker, it does not undo the record. That is why
+#      the "NO RECORD" promise at the top of this block stops at exit 10
 #   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
 #      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
@@ -518,6 +532,13 @@ fi
 # it does NOT refuse — it falls through to the ordinary review below, i.e. the pre-change
 # behaviour, so a broken predicate can only cost money, never a false clean.
 CC_TOKEN=""; CC_RC=0; CC_OUT=""; CC_ERR=""
+# # cc_negative — did the RECORDER say the record it is answering about is `not-clean`? One predicate
+# over the recorder's own stderr (#3400's diagnosis), so no arm has to re-derive a verdict from a
+# store it may not hold, and no arm can invent one.
+cc_negative() {
+  case "${CC_ERR:-}" in *"reviewed NOT CLEAN"*) return 0 ;; esac
+  return 1
+}
 # cc_ask — ONE `--check-carry`, keeping BOTH the exit code and the answer. The answer is
 # field 1 of stdout (head|carry|carry-patch|fresh|unreadable|red-surface|surface-unknown|
 # red-base-owned|norecord|nodigest); the exit code is a SECOND, independent statement, and
@@ -556,6 +577,82 @@ record_at_head_family() { # <sha> -> 0 iff a clean(-micro|-low) record bound to 
     esac
   done
   return 1
+}
+# ── THE MARKER THE GATE READS (check (c)), AS ONE PREDICATE ─────────────────────────────────────
+# The marker shape is check-pipeline-compliance.sh's REVIEW_RECORD_MARKER_RE (the
+# consumer's own definition, mirrored here — the producer's `MARKER=` line is its source).
+# ANY signed match wins over an earlier unsigned one at the same head: a body can carry
+# both (an unsigned marker from a key-less run, then a signed one from a re-run), and a
+# first-match scan would refuse the run that actually fixed it (P3, third fresh review).
+# ⛔ SHAPE, NOT HMAC — A DECLARED RESIDUAL (raised as P3 in rounds 9, 12 and 14). The PR body is
+# author-writable, so a pre-seeded `sig=<64 hex>` line can mask the unsigned marker this run just
+# posted; verifying the HMAC locally was implemented and REVERTED, because it makes the seam refuse
+# whenever no key is readable in the calling environment — including from a cell whose key is only
+# in the recorder's own environment — which would turn a whole class of legitimate records into
+# "unverifiable" at exactly the moment the reviewer was paid for. What is guaranteed here, and what
+# the success line says, is narrower and true: a marker BOUND TO THIS PR/HEAD/REPO carries a
+# signature field; the HMAC is the ai-review-gate's to verify (it is the only consumer that must,
+# and it does). An UNSIGNED marker — the case where the recorder itself could not mint one — is
+# still its own named failure, because record-review.sh says so loudly on stderr and the marker it
+# appends then has no `sig=`.
+# ⛔ IT IS DEFINED HERE, ABOVE ITS FIRST CALLER, AND THAT IS LOAD-BEARING (P2, fresh review of PR
+# #4256 at `a3ee7be7dfda`): the `carry-patch` arm in §2b asks this predicate too, because the record
+# STORE is only HALF the attestation — check (c) reads the PR BODY — and bash resolves a function at
+# CALL time, so a definition 3,400 lines further down is simply not callable from §2b.
+marker_state() { # <body> [any-head] [expected-diff] -> signed | unsigned | nodigest | mismatch | absent
+  # `any-head` is for the CARRY arms: a carried record's marker is bound to the RECORDED
+  # head, never to the live one, so a head-scoped scan would call a carried attestation
+  # "absent" and refusal would be wrong. Everything else about the scan is identical.
+  # ⛔ `<expected-diff>` IS WHAT MAKES `any-head` AS STRONG AS CHECK (c), AND ITS ABSENCE WAS THE
+  # DEFECT (P1, fresh review at `085a6e65c118`). Dropping the head comparison is the ONE relaxation a
+  # carry needs; stopping there left the predicate at "a signed marker for this PR/repo exists at SOME
+  # head", which is strictly WEAKER than check (c)'s carry path: `c_carry_resolve` SKIPS a candidate
+  # whose marker carries no digest (a pre-#2982 marker, `nodhead` → "candidates exist but none carries a
+  # digest", rc 2) and hands every surviving candidate to the producer, which answers `carry` only for
+  # the (recorded head, recorded diff) pair. So with `any-head` alone, a digest-less marker and an OLDER
+  # marker left behind by a body edit both read `signed` → exit 0 (`auto-rail: clean`) over a RED check.
+  # Passing the digest the carry was actually established over makes the two predicates agree: the
+  # marker must claim the SAME artifact, and its verdict must be clean-family (both facts check (c)
+  # requires of a carried record), so a marker for another record can no longer stand in.
+  local body="$1" scope="${2:-}" want_diff="${3:-}" line pr_re head_re repo_lc saw_unsigned=0 saw_nodigest=0 saw_mismatch=0
+  pr_re="$PR"; head_re="$HEAD"
+  repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
+    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
+    [ "$scope" = any-head ] || [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
+    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
+    if [ -n "$want_diff" ]; then
+      # An ABSENT digest and a DIFFERENT digest are distinct states with distinct remedies, so they are
+      # counted separately rather than collapsed into `absent` (which says "no marker at all" and would
+      # send the operator to the wrong fix).
+      if [ -z "${BASH_REMATCH[4]}" ]; then saw_nodigest=1; continue; fi
+      [ "${BASH_REMATCH[4]}" = " diff=$want_diff" ] || { saw_mismatch=1; continue; }
+    fi
+    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; return 0; fi
+    saw_unsigned=1
+  done <<<"$body"
+  [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
+  [ "$saw_nodigest" = 1 ] && { printf 'nodigest'; return 0; }
+  [ "$saw_mismatch" = 1 ] && { printf 'mismatch'; return 0; }
+  printf 'absent'
+}
+# cc_answer_field — field <n> of the recorder's `--check-carry` answer, when it is a 64-hex DIGEST, else
+# empty. One reader for both carry arms, so they cannot disagree about the shape: the answer is
+# `<token>\t<recorded diff>\t<live diff>` (record-review.sh's own printf), and the digest is the thing
+# the carry decision is ABOUT — never a decoration on it.
+cc_answer_field() { # <n> -> the field's digest, or nothing
+  local v
+  v="$(printf '%s' "${CC_OUT:-}" | cut -f"$1")"
+  case "$v" in '' | *[!0-9a-f]*) return 0 ;; esac
+  [ "${#v}" -eq 64 ] || return 0
+  printf '%s' "$v"
+}
+# cc_need_digest — a certification whose digest cannot be READ is not a pass. Both carry arms claim
+# "check (c) is satisfied"; neither may do so without naming the artifact it certified.
+cc_need_digest() { # <digest> <field number>
+  [ -n "$1" ] && return 0
+  die "$E_RECORD" "the recorder answered '$CC_TOKEN' but field $2 of its answer is not a readable 64-hex digest ('$(printf '%s' "${CC_OUT:-}" | cut -f"$2" | tr -d '\r' | command cut -c1-80)'). The digest is the artifact that answer is about, so a marker cannot be certified against it: NOTHING was reviewed and nothing should be bought. RETRY; if it repeats, the recorder's answer shape has changed and BOTH sides need fixing."
 }
 # record_head_verdict — the RECORDED head and its verdict, for the carry re-record. The
 # positional SHA handed to the recorder must be the REVIEWED one, never the live head: the
@@ -596,14 +693,81 @@ case "$CC_TOKEN" in
 esac
 case "$CC_TOKEN" in
   head)
-    err "$PROG: the recorder says a clean record is ALREADY bound to head ${HEAD:0:12}… for $REPO#$PR (check-carry rc=$CC_RC) — nothing is stale and no review is owed, so none was bought."
+    # ⛔ `head` IS AN IDENTITY ANSWER, NOT A VERDICT — AND THE DIFFERENCE WAS A FALSE CLEAN (P0, fresh
+    # review of PR #4256). `--check-carry` reports that a record is BOUND to this head; whether that
+    # record's verdict is `clean` is a DIFFERENT question, and `--check-carry` prints "reviewed NOT
+    # CLEAN" on stderr while still answering `head` with rc 0. The guard ABOVE (`record_at_head`, which
+    # requires `"verdict":"clean"`) already failed by the time this arm is reachable, so a record bound
+    # here that does not answer `record_at_head_family` is a NON-CLEAN one. Claiming "a clean record is
+    # already bound — no review is owed" over it, and discarding the recorder's own negative in
+    # `$CC_ERR`, is the one direction this command must never take.
+    # ⛔ THE NEGATIVE VERDICT IS THE RECORDER'S OWN DIAGNOSIS, NOT MY INFERENCE. When the record is
+    # `not-clean`, `--check-carry` says so on stderr and the token stays identity-based — so the
+    # discriminator is that line, never "I could not read the record here" (a box can hold no store
+    # for this repo at all: `registry-sync.sh pull` is named in the recorder's own hint, and inventing
+    # "open findings" over a store I cannot read would be a different false report).
+    if cc_negative; then
+      die "$E_ISSUES" "a record IS bound to head ${HEAD:0:12}… for $REPO#$PR, but it is NOT a clean verdict (check-carry rc=$CC_RC) — the last review on this PR left OPEN FINDINGS. An unchanged artifact is not an approval: no review was bought and none is owed until they are fixed.
+$CC_ERR
+  If you believe those findings are resolved, re-run the review explicitly rather than waiting for a carry."
+    fi
+    if record_at_head_family "$HEAD"; then
+      err "$PROG: a clean record is ALREADY bound to head ${HEAD:0:12}… for $REPO#$PR (check-carry rc=$CC_RC) — nothing is stale and no review is owed, so none was bought."
+    else
+      err "$PROG: the recorder says a record is ALREADY bound to head ${HEAD:0:12}… for $REPO#$PR (check-carry rc=$CC_RC) — nothing is stale and no review is owed, so none was bought."
+      err "  Its verdict is not readable on this box (no store record here), so it is reported as an identity claim, not as a clean one."
+    fi
     err "  Re-record only if the marker is missing from the PR body: $RECORDER $PR $HEAD <same verdict> $REPO --evidence comment:<id> --expect-head $HEAD"
     exit "$E_ALREADY" ;;
   carry|red-base-owned)
     # THE BEST CASE: the rendered diff is byte-identical, so the merge gate ALREADY carries
-    # this record across the head move. There is nothing to re-record and nothing to review.
+    # this record across the head move. There is nothing to re-record and nothing to review —
+    # PROVIDED the carried record is a CLEAN one and its marker is really where check (c) reads.
+    # ⛔ VERDICT FIRST (P0, fresh review of PR #4256). `--check-carry` answers "is the reviewed
+    # ARTIFACT the same", never "was it approved": it prints "reviewed NOT CLEAN — N open finding(s)"
+    # on stderr and still answers `carry` with rc 0. This arm used to exit 0 on the token alone, so a
+    # PR whose only review said `verdict=not-clean` with open blocking findings was reported as
+    # "NO REVIEW OWED" and rc=0 — which `auto-rail.sh` maps to `clean`. Pre-fix the same PR bought a
+    # review and exited 7 (issues). The discriminator is the recorder's OWN negative line, so a box
+    # that merely holds no store record is not turned into a finding nobody made.
+    if cc_negative; then
+      die "$E_ISSUES" "the recorder says the reviewed artifact is UNCHANGED at ${HEAD:0:12}… (check-carry rc=$CC_RC, token=$CC_TOKEN), but the record it would carry is NOT a clean verdict — the last review on this PR left OPEN FINDINGS. An unchanged artifact is not an approval: no review was bought, and none is owed until they are fixed.
+$CC_ERR"
+    fi
+    # ⛔ AND THE MARKER IS THE OTHER HALF (P1). Exit 0 here tells the caller and every downstream
+    # reader (auto-rail: `0|5 -> clean`) that the required check is satisfied. Check (c) reads the
+    # SIGNED MARKER IN THE PR BODY, and the store record is not it: a body edit that wipes the marker
+    # (this file's own #1224 doctrine), a dropped marker post, or a store synced from another box all
+    # leave a valid store record and a RED check. So the body is read, and a signature-bound marker for
+    # this PR/repo that CARRIES THE DIGEST THE CARRY IS ABOUT is required — the carried record's marker
+    # is bound to the RECORDED head, which is exactly the point of rule (b)/(c).
+    # ⛔ THE DIGEST, NOT MERE PRESENCE (P1, fresh review at `085a6e65c118`). `--check-carry` reports the
+    # pair its answer is about as fields 2 and 3 of stdout (`carry\t<recorded diff>\t<live diff>`), and
+    # check (c)'s carry path certifies exactly that pair: it SKIPS a digest-less candidate
+    # (`c_carry_resolve`: `nodhead` → "candidates exist but none carries a digest", rc 2) and answers
+    # `fresh` for a digest that does not match. A marker scan that stopped at "a signed marker exists
+    # at some head" therefore exited 0 over a RED check in two reachable states — a pre-#2982
+    # digest-less marker, and an OLDER marker left behind by the very body edit this arm is about.
+    CB_WANT="$(cc_answer_field 2)"
+    cc_need_digest "$CB_WANT" 2
+    CB_BODY_RC=0; CB_BODY=""; CB_MARKER=""
+    CB_BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || CB_BODY_RC=$?
+    [ "$CB_BODY_RC" -eq 0 ] && CB_MARKER="$(marker_state "$CB_BODY" any-head "$CB_WANT")"
+    case "$CB_BODY_RC:$CB_MARKER" in
+      0:signed) : ;;
+      0:unsigned)
+        die "$E_RECORD" "the carried record is clean and the artifact is unchanged, but the marker in the PR BODY at that record's head is UNSIGNED (no signature could be minted: AI_REVIEW_GATE_KEY is not configured), so check (c) stays RED and nothing merges on it. NOTHING was reviewed and nothing should be bought: re-post the marker signed after fixing the key — \`$RECORDER $PR <the recorded head> clean $REPO --evidence comment:<id>\`." ;;
+      0:nodigest)
+        die "$E_RECORD" "the carried record is clean and the artifact is unchanged, but the signed marker in the PR BODY carries NO \`diff=\` group (a pre-#2982 marker), while the carry is over diff ${CB_WANT:0:12}… — check (c)'s carry path SKIPS a digest-less candidate (it answers 'candidates exist but none carries a digest'), so it stays RED and nothing merges. NOTHING was reviewed. Re-run the recorder at the recorded head so it re-posts the marker WITH the digest: \`$RECORDER $PR <the recorded head> clean $REPO --evidence comment:<id>\` (the append is idempotent)." ;;
+      0:mismatch)
+        die "$E_RECORD" "the carried record is clean and the artifact is unchanged, but the signed marker in the PR BODY names a DIFFERENT diff than the one being carried (${CB_WANT:0:12}…) — it attests a record that is not this carry (the surviving-marker half of the body-edit case). check (c) asks the producer about the carried pair and is answered \`fresh\`, so it stays RED and nothing merges. NOTHING was reviewed. Re-run the recorder at the recorded head to append a marker for the diff on disk now: \`$RECORDER $PR <the recorded head> clean $REPO --evidence comment:<id>\`." ;;
+      0:*)
+        die "$E_RECORD" "the carried record is clean and the artifact is unchanged, but the PR BODY carries NO signed marker for $REPO#$PR at diff ${CB_WANT:0:12}… — check (c) reads the BODY, not the record store, so it would stay red (the recorder's evidence post is best-effort). NOTHING was reviewed. Re-run the recorder at the recorded head to retry the post: \`$RECORDER $PR <the recorded head> clean $REPO --evidence comment:<id>\` (its append is idempotent), then re-run the merge." ;;
+      *)
+        die "$E_RETRY" "the carried record is clean and the artifact is unchanged, but the PR BODY could not be READ (gh rc=$CB_BODY_RC), so the marker check (c) consumes could not be confirmed — a failed READ is not a missing marker and not a changed artifact. NOTHING was reviewed; RETRY once the API recovers." ;;
+    esac
     log_line "$PROG: NO REVIEW OWED — the recorder's own predicate says the reviewed DIFF is unchanged at the current head (check-carry rc=$CC_RC, token=$CC_TOKEN)."
-    log_line "  The head moved for a base-only reason; the merge gate carries this record as-is. Nothing was re-recorded and no reviewer was spawned."
+    log_line "  The head moved for a base-only reason; the merge gate carries this record as-is. The carried record's verdict is clean-family and its SIGNED body marker — carrying diff ${CB_WANT:0:12}…, the artifact check (c) certifies — was read back. Nothing was re-recorded and no reviewer was spawned."
     [ -n "$CC_ERR" ] && printf '%s\n' "$CC_ERR" >&2
     exit 0 ;;
   carry-patch)
@@ -622,8 +786,35 @@ case "$CC_TOKEN" in
         "$RECORDER" "$PR" "$RH" "$RV" "$REPO" >/dev/null 2>&1; CR_RC=$?
       fi
       if [ "$CR_RC" -eq 0 ] && record_at_head_family "$HEAD"; then
+        # ⛔ THE MARKER IS THE OTHER HALF HERE TOO, AND THIS ARM DID NOT ASK (P1, fresh review at
+        # `085a6e65c118`). The comment on `marker_state`'s hoisted definition states that "the
+        # `carry-patch` arm in §2b asks this predicate too"; it did not — it exited 0 on the STORE
+        # check alone. So the one exit-0 arm whose re-record is a mechanical re-binding was certified
+        # without the artifact check (c) actually reads: a successful re-record whose best-effort body
+        # post did not land (gh PATCH failed, the marker went to the pending file) leaves a clean
+        # record at the live head and check (c) RED, and auto-rail maps this 0 to `clean`.
+        # The digest here is field 3 — the LIVE diff — because the re-record landed at the LIVE head,
+        # and check (c)'s head-bound arm is the one that must match, not the carry path.
+        CP_WANT="$(cc_answer_field 3)"
+        cc_need_digest "$CP_WANT" 3
+        CP_BODY_RC=0; CP_BODY=""; CP_MARKER=""
+        CP_BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || CP_BODY_RC=$?
+        [ "$CP_BODY_RC" -eq 0 ] && CP_MARKER="$(marker_state "$CP_BODY" "" "$CP_WANT")"
+        case "$CP_BODY_RC:$CP_MARKER" in
+          0:signed) : ;;
+          0:unsigned)
+            die "$E_RECORD" "the patch re-record LANDED at ${HEAD:0:12}… ($RV), but the marker in the PR BODY at this head is UNSIGNED (no signature could be minted: AI_REVIEW_GATE_KEY is not configured), so check (c) stays RED and nothing merges on it. Re-post it signed after fixing the key — \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<id> --expect-head $HEAD\` (idempotent at the same head)." ;;
+          0:nodigest)
+            die "$E_RECORD" "the patch re-record LANDED at ${HEAD:0:12}… ($RV), but the signed marker for this head carries NO \`diff=\` group (a pre-#2982 marker), while check (c)'s head-bound arm reads that digest — so it stays RED and nothing merges. Re-run the recorder at this head so it re-posts the marker WITH the digest: \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<id> --expect-head $HEAD\`." ;;
+          0:mismatch)
+            die "$E_RECORD" "the patch re-record LANDED at ${HEAD:0:12}… ($RV), but the signed marker in the PR BODY names a DIFFERENT diff than this head's (${CP_WANT:0:12}…) — it attests another record, so check (c) reads the wrong artifact and stays RED. Re-run the recorder at this head to append a marker for the diff on disk now: \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<id> --expect-head $HEAD\`." ;;
+          0:*)
+            die "$E_RECORD" "the patch re-record LANDED at ${HEAD:0:12}… ($RV), but the PR BODY carries NO signed marker bound to this head for $REPO#$PR — check (c) reads the BODY, not the record store, so it would stay red (the recorder's evidence post is best-effort). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD $RV $REPO --evidence comment:<id> --expect-head $HEAD\` (its append is idempotent), then re-run the merge." ;;
+          *)
+            die "$E_RETRY" "the patch re-record LANDED at ${HEAD:0:12}… ($RV), but the PR BODY could not be READ (gh rc=$CP_BODY_RC), so the marker check (c) consumes could not be confirmed — a failed READ is not a missing marker. RETRY once the API recovers." ;;
+        esac
         log_line "$PROG: NO REVIEW OWED — the reviewed PATCH is byte-identical at ${RH:0:12}… and ${HEAD:0:12}… (check-carry rc=$CC_RC, token=carry-patch)."
-        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The reviewer was not spawned."
+        log_line "  The record was RE-RECORDED at the current head ($RV), which is a mechanical re-binding, not a new verdict. The reviewer was not spawned. The SIGNED body marker for this head (diff ${CP_WANT:0:12}…) — the artifact check (c) consumes — was read back."
         [ -n "$CR_LOG" ] && sed -n '1,40p' "$CR_LOG" | sed 's/^/  /'
         [ -n "$CR_LOG" ] && rm -f "$CR_LOG"
         exit 0
@@ -3946,21 +4137,11 @@ fi
 # and it does). An UNSIGNED marker — the case where the recorder itself could not mint one — is
 # still its own named failure, because record-review.sh says so loudly on stderr and the marker it
 # appends then has no `sig=`.
-marker_state() { # <body> -> signed | unsigned | absent
-  local body="$1" line pr_re head_re repo_lc saw_unsigned=0
-  pr_re="$PR"; head_re="$HEAD"
-  repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
-  while IFS= read -r line; do
-    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
-    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
-    [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
-    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
-    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; return 0; fi
-    saw_unsigned=1
-  done <<<"$body"
-  [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
-  printf 'absent'
-}
+# ⛔ THE DEFINITION ABOVE IS THE ONLY ONE (P2, cherry-pick onto the squashed #4256): this file
+# carried a SECOND, head-scoped `marker_state` 3,400 lines below, and in bash the LAST definition
+# wins — so the `any-head` scope the carry arms rely on was silently replaced by a head-scoped one,
+# and a carried marker (bound to the RECORDED head) read as `absent`. Callers here pass one argument
+# and get the head-scoped behaviour; the carry arms pass `any-head`.
 # ⛔ A FUNCTION CALLED IN A COMMAND SUBSTITUTION CANNOT PUBLISH A GLOBAL (P3, this lane — found by the
 # new arm going red for the WRONG reason): `MARKER_STATE="$(marker_state ...)"` runs in a subshell, so
 # the diff group it parsed died with it and the seam fell back to a live read that could itself fail.

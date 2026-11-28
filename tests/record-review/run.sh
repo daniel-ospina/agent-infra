@@ -2200,15 +2200,30 @@ PA="$(pair_of "$Q/a.diff")"; PB="$(pair_of "$Q/b.diff")"
   && pass "(31) PATCH: the same base move leaves the patch digest IDENTICAL — this is what the carry accepts" \
   || fail "(31) the patch digest moved on an unchanged change — the arm would refuse a legitimate carry"
 
-# One changed LINE is not carried.
+# One change that is NOT the reviewed one is not carried.
+# ⛔ AND THIS FIXTURE'S c.diff IS TWO CHANGE PAIRS, NOT ONE — MEASURED, RECORDED HERE, NOT FIXED
+# (fresh review at `22282f4d5`, note 2). Writing f.txt over the MERGED tip leaves main's own
+# `l4` -> `l4` pair in the diff beside `l6` -> `l6-PR-CHANGED`, and it moves the hunk to line 1,
+# so c's frame is EMPTY while b's is `l2`. Both facts are LOAD-BEARING, not drift:
+#   · the frame axis is the ONLY place in this section where b and c differ on the enclosing
+#     scope, and that is what the (P1)/(P2) mutant pair below measures about the projection this
+#     PR ADDS (`@@ l2` vs `@@`);
+#   · the obvious repair was MEASURED, not assumed: resetting the file to the MERGED tip first
+#     (`git checkout -q "$CURRENT31" -- f.txt`, the review's own suggestion) makes c one change
+#     against main, and it projects to `@@ -3,7 +3,7 @@ l2` — the SAME frame as b. b/c then read
+#     `dd8624ce…`/`e03f93b6…`, P1 `f662541f…`/`622a860f…`, P2 COLLAPSES to `ec259dba…`: every row
+#     stays green and the frame coverage is GONE, because no assertion on this pair can any
+#     longer tell "frame emitted" from "frame dropped". The label was the false part; it is
+#     corrected here, the fixture is left alone deliberately, and the messages below no longer
+#     claim a shape this diff does not have.
 printf 'l1\nl2\nl3\nl4\nl5\nl6-PR-CHANGED\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
 git add -A; git commit -qm "an edit"
 EDIT31="$(git rev-parse HEAD)"
 git diff --no-color --full-index "main...$EDIT31" > "$Q/c.diff"
 PC="$(pair_of "$Q/c.diff")"
 [ "${PB##* }" != "${PC##* }" ] \
-  && pass "(31) a ONE-LINE change moves the patch digest — it must refuse (the refusal direction)" \
-  || fail "(31) a one-line change kept the same patch digest — FAIL-OPEN"
+  && pass "(31) a change that is NOT the reviewed one moves the patch digest — it must refuse (the refusal direction)" \
+  || fail "(31) a change that is not the reviewed one kept the same patch digest — FAIL-OPEN"
 
 # Whitespace only: the exact hole `git patch-id --stable` has.
 printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\t\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
@@ -2725,24 +2740,49 @@ if [ -s "$TMP/pmut-ctx/diff-normalize.py" ]; then
 else
   fail "(31) could not build the context-keeping mutant"
 fi
-# A mutant that DROPS the +/- lines must make the refusal assertion redden.
-mkdir -p "$TMP/pmut-none"
-python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-none/diff-normalize.py" <<'INNERPY' || true
+# The REFUSAL assertion (`PB` != `PC`: a change that is not the reviewed one moves the patch
+# digest) must be attributable
+# to the CHANGED LINES — and the projection now separates b from c on TWO axes: the changed line AND
+# the enclosing-scope frame (`@@ l2` vs `@@`, the position-bearing projection the consumer relies on,
+# agent-infra#4255). A single "drop the +/- lines" mutant therefore proves nothing: it cannot collapse
+# the pair while the frame still differs, so the arm reads as a refusal failure rather than as the
+# attribution it is (measured: CI `bash-suites (4)` on #4261, this very assertion). Attribute ONE
+# axis at a time instead, or the control silently stops measuring the field it names.
+#   (P1) frame DROPPED, changed lines KEPT — the pre-position-blind projection. The pair must STILL
+#        differ, so the refusal does not hinge on the new position signal.
+#   (P2) frame AND changed lines DROPPED — the residual projection is ONE line, `diff --git <path>`:
+#        context and `index` are already dropped by the shipped projection, and `---`/`+++` begin with
+#        `-`/`+` so the ±-drop needle takes them. The pair MUST collapse, so the changed lines are the
+#        only field the refusal can be measuring.
+mkdir -p "$TMP/pmut-frame" "$TMP/pmut-none"
+python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-frame/diff-normalize.py" "$TMP/pmut-none/diff-normalize.py" <<'INNERPY' || true
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
+frame = '            out.append("@@" + hunk.group(7))\n'
+assert frame in src, "frame-emission needle not found"
+p1 = src.replace(frame, '            continue\n', 1)
+assert p1 != src, "frame mutant is a no-op"
+open(sys.argv[2], "w", encoding="utf-8").write(p1)
 needle = '        out.append(line)\n    return out\n\n\ndef _normalize_entry'
-assert needle in src, "changed-lines needle not found"
-open(sys.argv[2], "w", encoding="utf-8").write(src.replace(
-    needle, '        if line[:1] in ("+", "-"):\n            continue\n        out.append(line)\n    return out\n\n\ndef _normalize_entry', 1))
+assert needle in p1, "changed-lines needle not found"
+p2 = p1.replace(
+    needle, '        if line[:1] in ("+", "-"):\n            continue\n        out.append(line)\n    return out\n\n\ndef _normalize_entry', 1)
+assert p2 != p1, "changed-lines mutant is a no-op"
+open(sys.argv[3], "w", encoding="utf-8").write(p2)
 INNERPY
-if [ -s "$TMP/pmut-none/diff-normalize.py" ]; then
+if [ -s "$TMP/pmut-frame/diff-normalize.py" ] && [ -s "$TMP/pmut-none/diff-normalize.py" ]; then
+  MFB="$(pair_of "$Q/b.diff" "$TMP/pmut-frame/diff-normalize.py")"
+  MFC="$(pair_of "$Q/c.diff" "$TMP/pmut-frame/diff-normalize.py")"
   MB2="$(pair_of "$Q/b.diff" "$TMP/pmut-none/diff-normalize.py")"
   MC2="$(pair_of "$Q/c.diff" "$TMP/pmut-none/diff-normalize.py")"
-  [ -n "$MB2" ] && [ "${MB2##* }" = "${MC2##* }" ] \
-    && pass "(31) MUTATION: with the changed lines DROPPED the one-line edit matches — the refusal assertion is load-bearing" \
-    || fail "(31) mutation did not collapse the pair, so the refusal may pass vacuously"
+  [ -n "$MFB" ] && [ -n "$MFC" ] && [ "${MFB##* }" != "${MFC##* }" ] \
+    && pass "(31) MUTATION (P1): with the position frame DROPPED the refused change still moves the patch digest — the refusal does not hinge on the new frame" \
+    || fail "(31) MUTATION SURVIVED (P1): a projection that stopped carrying the CHANGED LINES collapsed the edit onto the base move"
+  [ -n "$MB2" ] && [ -n "$MC2" ] && [ "${MB2##* }" = "${MC2##* }" ] \
+    && pass "(31) MUTATION (P2): with the position frame AND the changed lines DROPPED the refused change matches — the changed lines are the refusal's own field" \
+    || fail "(31) MUTATION DID NOT COLLAPSE (P2): a projection carrying neither the changed lines nor the frame still told the refused change apart, so the refusal may pass vacuously"
 else
-  fail "(31) could not build the changed-lines-dropped mutant"
+  fail "(31) could not build the two attribution mutants (frame-dropped, changed-lines-dropped)"
 fi
 cd "$TMP" || true
 # ── (32) THE MARKER-PRESENT EARLY RETURN IS LOAD-BEARING (#841/#864, agent-infra#2741) ─────────
@@ -2917,7 +2957,7 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=223
+MIN_ASSERTIONS=224
 # #2628: 214 -> 219. The ``pulls`` read stopped discarding its HTTP status, so
 # the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
 # is now `unclassified` (the API REFUSED this PR → positive evidence) and a
@@ -2932,6 +2972,10 @@ MIN_ASSERTIONS=223
 # the only assertions here that require the shim to have taken effect). Without
 # them the pre-fix shape (the warning emitted before the fallback read, so it fires
 # on healthy runs too) leaves both suites green. MEASURED 223 on this tree.
+# #4255 (the position-bearing patch projection, #4261): 223 -> 224 — the (31) refusal attribution
+# became a PAIR of axis-isolated mutants (P1 frame-dropped, P2 frame-and-changed-lines-dropped)
+# because the single changed-lines mutant could no longer collapse the pair once the projection
+# carried the enclosing-scope frame. MEASURED 224 on this tree.
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
