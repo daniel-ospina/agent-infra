@@ -2734,10 +2734,10 @@ fi
 # axis at a time instead, or the control silently stops measuring the field it names.
 #   (P1) frame DROPPED, changed lines KEPT — the pre-position-blind projection. The pair must STILL
 #        differ, so the refusal does not hinge on the new position signal.
-#   (P2) frame AND changed lines DROPPED — the residual projection is ONE line, `diff --git <path>`
-#        (context is already dropped by the shipped projection, and `index`/`---`/`+++` go with the
-#        ±-drop needle), so the pair MUST collapse and the changed lines are the only field the
-#        refusal can be measuring.
+#   (P2) frame AND changed lines DROPPED — the residual projection is ONE line, `diff --git <path>`:
+#        context and `index` are already dropped by the shipped projection, and `---`/`+++` begin with
+#        `-`/`+` so the ±-drop needle takes them. The pair MUST collapse, so the changed lines are the
+#        only field the refusal can be measuring.
 mkdir -p "$TMP/pmut-frame" "$TMP/pmut-none"
 python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-frame/diff-normalize.py" "$TMP/pmut-none/diff-normalize.py" <<'INNERPY' || true
 import sys

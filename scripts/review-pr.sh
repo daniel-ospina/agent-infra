@@ -148,21 +148,25 @@
 #   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
 #      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
 #      retarget is the same refusal) — NOT recorded
-#   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
-#      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
-#      reads: no record bound to this head, no marker in the PR body, a marker posted
-#      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check), or — on a CARRY, where the
-#      marker is bound to the RECORDED head and is therefore read at any head — a marker whose
-#      `diff=` is ABSENT (`nodigest`, a pre-#2982 marker) or names a DIFFERENT artifact
-#      (`mismatch`, the surviving-marker half of the body-edit case). Check (c)'s carry path
-#      skips a digest-less candidate and asks the producer about the marker's own (head, diff)
-#      pair, so PRESENCE ALONE is not the artifact it reads
+#   9  the record/artifact arm — the cases are enumerated above; this PR adds three SHAPES inside
+#      them. The artifact check (c) reads can be a marker whose `diff=` is ABSENT (`nodigest`, a
+#      pre-#2982 marker) or names a DIFFERENT artifact (`mismatch`, the surviving-marker half of
+#      the body-edit case), and the recorder's answer for the pair a carry certifies can carry no
+#      readable 64-hex digest at all (`cc_need_digest`, whose field number says which one). The
+#      `carry` arm scans the marker at ANY head — a carried marker is bound to the RECORDED head —
+#      and must name the digest that carry is over; `carry-patch` re-records at the LIVE head, so
+#      it reads the marker HEAD-SCOPED. Check (c) skips a digest-less candidate and asks the
+#      producer about the marker's own (head, diff) pair, so PRESENCE ALONE is not the artifact
+#      it reads
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
 #      READ the live diff/head (`unreadable` / `surface-unknown`), OR the PR BODY could not be
-#      READ while certifying the marker the carry depends on — RETRY, nothing was paid for and
-#      nothing was recorded. A failed read is not a missing marker and not a changed artifact,
-#      and must never buy a review
+#      READ while certifying the marker a carry depends on. A failed read is not a missing marker
+#      and not a changed artifact, and must never buy a review — RETRY, and nothing was paid for.
+#      ⛔ It is NOT "nothing happened": `carry` writes nothing, but `carry-patch` RE-RECORDS at the
+#      live head BEFORE it reads the body (`record_at_head_family` gates the arm, and its own
+#      refusal text says the re-record LANDED), so a record may already exist at the current head
+#      when this exits — the retry re-sends the marker, it does not undo the record. That is why
+#      the "NO RECORD" promise at the top of this block stops at exit 10
 #   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
 #      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
