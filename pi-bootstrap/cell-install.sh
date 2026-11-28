@@ -2751,6 +2751,15 @@ verify_layer() {
   if [ ! -s "$DEST/scripts/lib/diff-normalize.py" ]; then
     fail "lib/diff-normalize.py is missing or empty — record-review.sh resolves it as its own sibling and degrades to the raw pre-#1362 digest"
   fi
+  # #4105 — the code-identity carry arm's sibling. Unlike the normalizer above (whose absence degrades
+  # to a DIGEST), an absent helper makes the arm INERT: `code_identity_carry` returns 1 at its
+  # `[ -f "$CODE_IDENTITY_PY" ]` guard for every head move, so every docstring-only head move is
+  # re-reviewed and the fleet pays the three-fresh-reviews-in-40-minutes cost #4105 was filed to remove.
+  # The repo copy passes the `21.x` vectors either way, which is why this check exists here: a delivery
+  # gap is invisible from the tests that run `$SCRIPT_DIR`.
+  if [ ! -s "$DEST/scripts/lib/code-identity.py" ]; then
+    fail "lib/code-identity.py is missing or empty — record-review.sh resolves it as its own sibling, and without it the #4105 code-identity carry arm is inert on this box (every head move is re-reviewed)"
+  fi
 
   # ── the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md, row 1) ────────────
   # The shim (`scripts/gh-shim/gh`) is the only layer a shell TOKEN SPLICE cannot defeat (`--ad""min`,

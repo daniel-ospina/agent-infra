@@ -960,7 +960,16 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # legacy volatile home) or `/home/cmux` as a default, so a farm that omitted this file would leave
 # every consumer on its named `$HOME` fallback — and, worse, would leave the RESOLVER absent while the
 # consumers that source it look healthy. Farm it with them.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh systemd-unit-parse.sh)
+# ⛔ agent-infra#4105 — `code-identity.py` IS A SIBLING OF THE RECORDER, AND THE RECORDER IS THE MERGE
+# GATE. `merge_gate_srcs` delivers `record-review.sh` FLAT into `$DEST/scripts/`, and that recorder
+# resolves this file as `$(dirname "${BASH_SOURCE[0]}")/lib/code-identity.py` — so `lib_srcs` is the
+# ONLY array that can carry it. Not carrying it does not degrade gracefully: the arm returns 1 at its
+# `[ -f "$CODE_IDENTITY_PY" ]` guard on EVERY head move, so the delivered copy behaves exactly as it did
+# before #4105 (3 fresh reviews discarded in 40 minutes, the issue's own measurement) while the repo
+# copy the `21.x` vectors drive stays green. That is a false PASS over a deployment, not a missing
+# nicety. `test-setup-no-nesting.sh` derives the lane-producer population from the CODE and reds
+# `ADDED: lib:code-identity.py` unless `LANE_PRODUCERS_CANONICAL` is re-cut with `--cut` in this change.
+lib_srcs=(pid-identity.sh diff-normalize.py code-identity.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh systemd-unit-parse.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0

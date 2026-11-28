@@ -693,6 +693,19 @@ clean_low_shape_ok() {
 #     nothing yields `DIFF_HASH = sha256("")`, a constant that collides for
 #     every diff and lets the carry arm mint head-bound evidence for an
 #     unreviewed revision — a FALSE ACCEPT, which is what this class is for;
+#   * `scripts/lib/code-identity.py` — the SAME argument as its sibling, and the
+#     omission would have been a longer-fuse version of the same bypass (#4259
+#     review, P2). It is the predicate the #4105 carry arm consults to decide
+#     whether a clean verdict may be CARRIED across a head move, so a defect
+#     here carries a verdict onto CODE NOBODY REVIEWED — exactly what the
+#     module's own docstring records as the forbidden outcome (a wrong
+#     `identical`). Left out, a follow-up PR whose only change is e.g. "also
+#     normalise `.ts` with this regex" would cap at `micro`, and with a
+#     `complexity:micro` linked issue would land a `clean-micro` record at the
+#     last gate before main (measured at the review: `--print-tier` answered
+#     `ok/micro` for this path, `ok/full` for `diff-normalize.py`). A
+#     gate-critical file named NOWHERE in this list is the drift the first
+#     paragraph of this comment forbids;
 #   * `scripts/check-*`, `.husky/**` — CI and pre-commit gate bodies: the same
 #     "correctness IS a gate" argument as the rails above. NOTE the BOUNDARY
 #     here, stated so the list does not grow without one: the class is the
@@ -731,7 +744,7 @@ review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = un
     *"//"*|*"/./"*|*"/../"*) return 2 ;;
   esac
   case "$p" in
-    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py) return 0 ;;
+    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py|scripts/lib/code-identity.py) return 0 ;;
     # Rail-exec'd decision modules: `admin-merge.sh` execs BOTH of these to decide
     # whether a red check blocks — `ci_exemption.py` makes the exemption call and
     # `ci-workflow-pr-evaluable.sh` decides that such a red must stay BLOCKING.
@@ -5687,6 +5700,10 @@ fi
 # digest → the marker falls back to the legacy sha-only shape, and the gate's
 # sha-match path still governs.
 DIFF_NORMALIZER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/diff-normalize.py"
+# agent-infra#4105 — the normaliser behind the code-identity carry arm. It answers
+# "do these two revisions of this file differ ONLY in docstrings/comments?", and
+# it answers `cannot normalise` (exit 2) rather than guessing — see its docstring.
+CODE_IDENTITY_PY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/code-identity.py"
 DIFF_HASH=""
 # #1362 D1 — the sha256 over the RAW diff (the pre-normalization binding). Kept
 # ONLY so the carry-forward arm can accept a marker minted before this change;
@@ -6164,6 +6181,128 @@ carry_delta_digest() { # <from-sha> <to-sha> -> binding digest of the tree delta
   fi
   command rm -f "$tmp"
   return 1
+}
+
+# ── agent-infra#4105 — CARRY A VERDICT ACROSS A DOCSTRING-ONLY HEAD MOVE ───────
+# THE DEFECT THIS ARM ANSWERS. Every arm above proves the LANE's rendered artifact
+# unchanged. None of them can prove anything about a head move that rewrites PROSE:
+# a docstring, a comment block, or a comment line changes the diff text without
+# touching a single executable line, so diff/patch/lane all refuse — and the
+# recorder answers "stale-sha guard" for a delta a reviewer never needed to see.
+# MEASURED on tortoise#13104 (this issue's own evidence): 12 commits on one PR, 4
+# of them docstring-only, **3 fresh-context reviews discarded**, each refused by
+# that guard, and the delta between the last reviewed code head and the final head
+# was one file, docstring-only, `AST_IDENTICAL_AFTER_DOCSTRING_STRIP: True`.
+#
+# WHAT IT PROVES, STATED NARROWLY. For each path that differs between the two
+# revisions, the file is normalised with comments/docstrings stripped (see
+# `lib/code-identity.py`) and the two normalised forms must be byte-equal. That is
+# a statement about the CODE, which is what a review verdict attests — it is NOT a
+# statement about the rendered diff, so it must never be read as one (a docstring
+# IS visible in `git diff`, and #2982's byte-identity arm is right to refuse it).
+#
+# ⛔ THE FAILURE MODE STAYS `REFUSE`. Every path below returns non-zero — and the
+# caller refuses exactly as it does today — on: a commit absent from the local
+# clone, a wrong-origin checkout, an added/deleted file, a mode change, more than
+# ${CODE_IDENTITY_MAX_FILES} changed paths, an unknown language, a parse failure, a
+# binary/NUL blob, an over-size blob, and ANY unexpected error (the helper's own
+# exit 2). A normaliser that cannot be confident returns "changed", never
+# "identical", so the widening this arm adds is bounded by what it can PROVE.
+#
+# NO `git fetch`, deliberately — same reasoning as `lane_dimension_carry` clause
+# (A): this predicate sits in the merge gate's trust boundary, and pulling objects
+# from the remote inside it is a worse failure than a missed carry. An absent
+# commit is a refusal.
+CODE_IDENTITY_MAX_FILES=100
+CODE_IDENTITY_FILES=0
+code_identity_carry() { # <reviewed-sha> <current-head> -> 0 = code identical, 1 = not provable
+  local reviewed="$1" current="$2" dir="${LOCAL_DIFF_REPO:-.}" root="" url="" norm_url=""
+  local tmp="" tok="" path="" osha="" nsha="" omode="" nmode="" _st="" pairs=0
+  local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+  CODE_IDENTITY_FILES=0
+  [ -n "$reviewed" ] && [ -n "$current" ] || return 1
+  [ "$reviewed" != "$current" ] || return 1
+  case "$reviewed$current" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#reviewed}" -eq 40 ] && [ "${#current}" -eq 40 ] || return 1
+  command -v git >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  # ⛔ `-s`, NOT `-f` (review of #4105, consequence A of the farm finding). A ZERO-BYTE helper is not a
+  # missing one: `python3 empty.py a b` exits 0 with no output, and this arm reads a zero status as
+  # "the two files normalise to the SAME code" — so a truncated or half-copied sibling would carry
+  # EVERY head move, including ones that changed code. The farm already guards `[ -s ]` on
+  # `lib/diff-normalize.py` for the same reason (an empty normalizer hashes the empty string into a
+  # constant digest, a false accept); the gate must not be weaker than the farm that feeds it.
+  [ -s "$CODE_IDENTITY_PY" ] || return 1
+  # THE CHECKOUT MUST BE THIS PR'S REPO. Without this, an unrelated clone holding
+  # two commits with the same abbreviated-looking shas could answer for a repo it
+  # is not — the same identity guard the #1398 local-diff fallback applies.
+  root="$(command git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$root" ] || return 1
+  url="$(command git -C "$root" config --get remote.origin.url 2>/dev/null || true)"
+  norm_url="$(printf '%s' "$url" \
+    | command sed -e 's#^git@github\.com:##' -e 's#^ssh://git@github\.com/##' \
+          -e 's#^https\{0,1\}://github\.com/##' -e 's#\.git$##')"
+  [ "$norm_url" = "$REPO" ] || return 1
+  command git -C "$root" cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
+  command git -C "$root" cat-file -e "$current^{commit}" 2>/dev/null || return 1
+  tmp="$(command mktemp -d 2>/dev/null)" || return 1
+  # `--raw -z` rather than parsing `--name-only`: it carries the BLOB ids and the
+  # MODEs, so a mode-only or binary change is visible here rather than inferred;
+  # `-z` because a path may contain spaces. `--no-renames` turns a rename into an
+  # add+delete, which the added/deleted arm refuses — a rename is a real change.
+  # The pin set matches the #1398 local fallback: no external diff driver, no
+  # textconv, and replace/graft refs neutralised (via `local -x` above).
+  if ! command git -C "$root" diff --raw -z --no-renames --no-ext-diff --no-textconv \
+         --abbrev=40 "$reviewed" "$current" > "$tmp/raw" 2>/dev/null; then
+    command rm -rf "$tmp"; return 1
+  fi
+  while IFS= read -r -d '' tok; do
+    case "$tok" in
+      :*)
+        IFS=' ' read -r omode nmode osha nsha _st <<< "${tok#:}"
+        # The path is the NEXT NUL-terminated field (`--raw -z` framing).
+        if ! IFS= read -r -d '' path; then command rm -rf "$tmp"; return 1; fi
+        # ADDED (all-zero old id) or DELETED (all-zero new id) is a real change:
+        # a new file that is entirely comments is still a file nobody reviewed.
+        case "$osha$nsha" in *0000000000000000000000000000000000000000*) command rm -rf "$tmp"; return 1 ;; esac
+        # A MODE change (e.g. chmod +x) is executable-line material: refuse rather
+        # than call it prose. (`git diff --raw` reports the same blob ids for it.)
+        [ "$omode" = "$nmode" ] || { command rm -rf "$tmp"; return 1; }
+        [ "$osha" = "$nsha" ] && continue
+        pairs=$((pairs + 1))
+        if [ "$pairs" -gt "$CODE_IDENTITY_MAX_FILES" ]; then command rm -rf "$tmp"; return 1; fi
+        if ! command git -C "$root" cat-file blob "$osha" > "$tmp/a" 2>/dev/null; then
+          command rm -rf "$tmp"; return 1
+        fi
+        if ! command git -C "$root" cat-file blob "$nsha" > "$tmp/b" 2>/dev/null; then
+          command rm -rf "$tmp"; return 1
+        fi
+        # ANY non-zero status is "not provably identical" — 1 = the code differs,
+        # 2 = the helper could not normalise it confidently. Collapsing both to a
+        # refusal here is the whole fail-closed contract, so this line must never
+        # grow a `|| true` or a status inversion.
+        # ⛔ ITS STDERR IS NOT SWALLOWED. The helper names WHY it refused ("no
+        # confident normaliser for tool.ts", "… does not parse as Python", "… looks
+        # binary"), and the recorder's own refusal — the stale-sha guard — says
+        # nothing about which file cost the re-review. Suppressing this turned a
+        # diagnosable refusal into "the head moved, review again", which is the
+        # exact cost #4105 exists to remove; a lane that is told WHICH file, and
+        # why, can tell "my stripper is too narrow" from "I really did change code".
+        # stdout stays discarded: the verdict is the exit status, never the wording.
+        if ! command python3 "$CODE_IDENTITY_PY" "$path" "$tmp/a" "$tmp/b" >/dev/null; then
+          command rm -rf "$tmp"; return 1
+        fi
+        ;;
+      *)
+        # `--raw -z` emits header/path PAIRS; a stray token means the framing is
+        # not what this parser assumes. Refuse rather than guess.
+        command rm -rf "$tmp"; return 1
+        ;;
+    esac
+  done < "$tmp/raw"
+  command rm -rf "$tmp"
+  CODE_IDENTITY_FILES="$pairs"
+  return 0
 }
 
 # #1377 — carry across a head move whose PATCH is unchanged even though the
@@ -8110,6 +8249,17 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       CARRY_ARM="patch"
     elif [ "$FORCE_STALE" -ne 1 ] && lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
       CARRY_ARM="lane"
+    elif [ "$FORCE_STALE" -ne 1 ] && [ "$DELTA" -ne 1 ] && code_identity_carry "$SHA" "$CURRENT_HEAD"; then
+      # agent-infra#4105 — LAST, deliberately: diff/patch/lane each prove the
+      # rendered artifact unchanged, which is the stronger and cheaper statement
+      # whenever it is available. This arm is the only one that can answer for a
+      # head move whose diff text genuinely moved while no executable line did.
+      # ⛔ EXCLUDED UNDER `--delta`: a delta attests an AUTHORED-CHANGE claim
+      # (`authored_unchanged` / `conflicts`), and "the code is the same after
+      # stripping prose" is not one of those dimensions. Letting it carry a delta
+      # would mint `proved:"none"` — a claim about nothing — so the delta path
+      # keeps refusing exactly as it does today.
+      CARRY_ARM="code"
     fi
     if [ -n "$CARRY_ARM" ]; then
       # (E) (#1575) — the veto. Refuse BEFORE printing either arm's success line and
@@ -8158,13 +8308,18 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         # MECHANICAL re-record is owed. The binding is upgraded to the CURRENT
         # head's own digest by the marker minted below — never inherited.
         echo "#1377 patch carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff CHANGED (diff=${DIFF_HASH}) but the REVIEWED PATCH is byte-identical at both heads (verified against the prior signed marker's own diff=${PRIOR_PATCH_NORM:0:12}…; the reviewed side was ${PRIOR_PATCH_SHA:0:12}…) — a rebase/base-move, not an edit. Recording against the CURRENT head; NO new review cycle is owed" >&2
-      else
+      elif [ "$CARRY_ARM" = "lane" ]; then
         # The rendered patch moved (a base merge), but the LANE's artifact is
         # provably unchanged: the head only moved forward, no lane commit is in
         # between, and a clean re-merge of (reviewed, its base parent) reproduces
         # the head's tree exactly. Re-record against the CURRENT head, exactly as
         # the arm above does — the binding is to the head that will merge.
         echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base NON-MERGE commit in between — an intervening merge is permitted, which is why the tree check below is load-bearing; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
+      else
+        # agent-infra#4105. The wording states what was MEASURED and what was NOT:
+        # the code is identical after stripping docstrings/comments; the diff text
+        # is not asserted to be identical; the verdict is about the code.
+        echo "#4105 code-identity carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the CODE is IDENTICAL at both heads with docstrings/comments stripped (${CODE_IDENTITY_FILES} changed path(s), each normalised and compared; a parse failure, an unknown language, a binary, or an added/deleted path would have refused) — recording against the CURRENT head. The verdict attests the same executable substance; the record still names the head it was minted at." >&2
       fi
       # ── RECORD WHAT THIS CARRY CARRIED (#10177) ──────────────────────
       # `diff_sha256` alone cannot tell a reader which artifact a verdict covers,
@@ -8176,10 +8331,11 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       case "$CARRY_ARM" in
         diff)  CARRY_REVIEWED_DIFF="$DIFF_HASH"; CARRY_REVIEWED_SOURCE="marker" ;;
         patch) CARRY_REVIEWED_DIFF="$PRIOR_PATCH_NORM"; CARRY_REVIEWED_SOURCE="marker" ;;
-        lane)
-          # The LANE arm needs no signed marker, so the reviewed artifact's
-          # identity is re-derived from the COMMITS (both present locally — the
-          # arm's own clause (A)) rather than inherited from anything trustworthy.
+        lane|code)
+          # These arms need no signed marker, so the reviewed artifact's identity is
+          # re-derived from the COMMITS (both present locally) rather than inherited
+          # from anything trustworthy. `code` is treated identically for the same reason:
+          # it proves itself from local objects, never from the PR body.
           CARRY_BASE_FOR_REVIEWED="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
           if CARRY_REVIEWED_DIFF="$(carry_local_artifact_digest "$CARRY_BASE_FOR_REVIEWED" "$ORIG_SHA")"; then
             CARRY_REVIEWED_SOURCE="local"
@@ -8213,6 +8369,38 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       echo "⚠️ --force-stale passed: recording stale sha $SHA anyway, with NO diff binding (#784 — a stale sha's diff cannot be shown unchanged) — the ai-review-gate will keep rejecting until re-recorded at the current head" >&2
     fi
   fi
+fi
+
+# ── agent-infra#4105 — A CODE-IDENTICAL CARRY MUST NOT SWALLOW THE CALLER'S EVIDENCE ──
+# The `code` arm is reached from the stale-sha chain, where the caller named the
+# REVIEWED head (`$ORIG_SHA`) and the PR head has since moved to `$CURRENT_HEAD`.
+# Two things would go wrong if this block did not exist:
+#   1. Every other carry arm sets `CARRY_ARM`, which SKIPS the tortoise#7391
+#      evidence gate — so a caller-supplied `--evidence` would be silently
+#      DROPPED (never verified, never recorded) and the record would carry some
+#      inherited ref instead. Silently discarding the artifact the reviewer just
+#      named is the same class of defect as minting without one.
+#   2. Verified against the WRONG head. The artifact was produced for the reviewed
+#      head, so verifying it against `$CURRENT_HEAD` fails the "postdates the
+#      recorded revision" arm (`created_at` < the new head's commit date) — which
+#      is exactly the false refusal #4105 exists to remove. The revision this
+#      verdict would attest is the ONE the code-identity arm proved EQUIVALENT to
+#      the head, so that is the revision the artifact must postdate.
+# A `delta:` ref is deliberately NOT handled here: the carry-versus-delta guard
+# below refuses a delta on ANY carry arm with its own message, and verifying one
+# here first would replace that diagnosis with a less accurate one.
+if [ "$CARRY_ARM" = "code" ] && [ -n "$EVIDENCE" ]; then
+  case "$EVIDENCE" in
+    delta:*) : ;;
+    *)
+      if ! verify_review_evidence "$EVIDENCE" "$ORIG_SHA" "$VERDICT" >/dev/null; then
+        echo "⛔ #4105: refusing to carry a '${VERDICT}' verdict from ${ORIG_SHA:0:12}… onto ${CURRENT_HEAD:0:12}… — the code-identity arm proved the CODE identical, but the review evidence '${EVIDENCE}' could not be verified against the REVIEWED head ${ORIG_SHA:0:12}… (reason above). An unverifiable artifact is not evidence, and the carry is not a licence to skip checking it. (no record written, no marker posted)" >&2
+        exit 3
+      fi
+      EVIDENCE_VERIFIED="$EVIDENCE"
+      echo "✅ #4105 code-identity carry: review evidence verified against the REVIEWED head ${ORIG_SHA:0:12}… (the head this verdict was minted at), because the carry proved the same code is at ${CURRENT_HEAD:0:12}…" >&2
+      ;;
+  esac
 fi
 # tortoise#9492 — FAIL CLOSED when the pin could not be CHECKED. The guard above
 # only runs with a resolvable $REPO and a gh on PATH; without them the caller's
@@ -8589,7 +8777,28 @@ TMP="$FILE.tmp"
 #      combination tortoise#10677 produced, and no reader could have caught it.
 if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
   CARRY_EVIDENCE=""
-  if [ -f "$FILE" ]; then
+  # ── #4105 — THE CODE ARM EXTENDS THE SAME RULE THE `diff` ARM APPLIES TO MARKERS ──
+  # The `diff`/`patch` arms only accept a marker whose head/verdict they can VERIFY
+  # against bytes they re-derive, so a predecessor record belonging to a DIFFERENT
+  # revision can never authorise the carry. The `code` arm inherits the predecessor
+  # record's `evidence` instead, so it must apply the equivalent predicate itself:
+  # the record being superseded must name the REVIEWED head (`$ORIG_SHA`, the sha
+  # the caller says was reviewed and the arm proved code-equivalent) and the SAME
+  # verdict. Otherwise a record minted at some unrelated head — or a `clean-micro`
+  # record behind a `clean` carry — would be inherited as if it covered this tree.
+  # Absent file or mismatch is NOT fatal here: the refusal below (a `clean` carry
+  # with no provable artifact) is the correct answer for `clean`, and a non-`clean`
+  # tier takes its normal `carry:` pointer. What this arm must never do is inherit
+  # silently from a record it cannot place at the reviewed revision.
+  if [ "$CARRY_ARM" = "code" ] && [ -f "$FILE" ]; then
+    CODE_CARRY_PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+    CODE_CARRY_PRIOR_VERDICT="$(sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+    if [ "$CODE_CARRY_PRIOR_HEAD" != "$ORIG_SHA" ] || [ "$CODE_CARRY_PRIOR_VERDICT" != "$VERDICT" ]; then
+      echo "⚠️ #4105: the record being superseded for ${REPO:-<no-repo>}#$PR is at head '${CODE_CARRY_PRIOR_HEAD:-<none>}' verdict '${CODE_CARRY_PRIOR_VERDICT:-<none>}' — NOT the reviewed head ${ORIG_SHA:0:12}…/verdict '$VERDICT'. Its evidence is not inherited: a carry may only re-bind the verdict the CALLER reviewed at that revision." >&2
+    else
+      CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+    fi
+  elif [ -f "$FILE" ]; then
     CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
   fi
   # ⛔ THE ARM SELECTS THE PAIR (fresh-review cycle 3): a marker may only be named
@@ -8610,11 +8819,33 @@ if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
     if [ "$VERDICT" = "clean" ]; then
       echo "⛔ carry-provenance: refusing to CARRY a 'clean' verdict from ${ORIG_SHA:0:12}… onto ${CURRENT_HEAD:0:12}… — the carry proved the ARTIFACT is unchanged, but nothing here names the REVIEW ARTIFACT that verdict was minted against (the superseded record carries no evidence, and no verified signed marker anchors it). A carried 'clean' with no evidence is the shape tortoise#10677 produced: a verdict re-bound to a tree with nothing in it a reader could check, so it is refused rather than minted (no record written, no marker posted)." >&2
       echo "   Remedy: review the current head and record it fresh with --evidence <comment:<id>|review:<id>|…>; a carry cannot manufacture the artifact it is supposed to inherit." >&2
+      if [ "$CARRY_ARM" = "code" ]; then
+        echo "   (#4105: if a review DID happen at ${ORIG_SHA:0:12}…, name its artifact — an artifact produced for the REVIEWED head is accepted for a code-identical carry: record-review.sh $PR $ORIG_SHA $VERDICT ${REPO:-owner/repo} --evidence <its URL or comment:<id>>)" >&2
+      fi
       exit 3
     fi
     CARRY_EVIDENCE="carry:${CARRY_ARM}:${ORIG_SHA:0:12}"
   fi
   echo "carry provenance: evidence=${CARRY_EVIDENCE} (inherited — a carry re-binds a verdict, it does not mint one), arm=${CARRY_ARM}, reviewed_diff=${CARRY_REVIEWED_DIFF:-unavailable} (${CARRY_REVIEWED_SOURCE:-unavailable}), delta=${CARRY_DELTA_DIFF:-unavailable}" >&2
+fi
+# ── #4105 — THE RECORD MUST SAY WHAT THE CARRY PROVED ABOUT THE SUBSTANCE ──────
+# `carry_arm:"code"` alone is a word a reader has to trust. The evidence field is
+# where this file records "what artifact this verdict rests on", and for this arm
+# the answer is: the review of `<reviewed sha>`, whose CODE this head reproduces
+# exactly with docstrings/comments stripped. Appending that to the ref is
+# deliberate — a maintainer reading the record must be able to see that the
+# attestation covers a DIFFERENT sha without fetching a second file, and the
+# sentence names the sha it came from. It runs AFTER the provenance block so it
+# applies to an inherited ref and to a caller-verified one alike; the `(${"$…"})`
+# shape is a plain string append, not a re-interpretation of the ref.
+if [ "$CARRY_ARM" = "code" ]; then
+  CODE_CARRY_NOTE="code identical to ${ORIG_SHA}, docstring/comment-only delta"
+  if [ -n "$EVIDENCE_VERIFIED" ]; then
+    EVIDENCE_VERIFIED="$EVIDENCE_VERIFIED ($CODE_CARRY_NOTE)"
+  elif [ -n "$CARRY_EVIDENCE" ]; then
+    CARRY_EVIDENCE="$CARRY_EVIDENCE ($CODE_CARRY_NOTE)"
+  fi
+  echo "#4105 record evidence: ($CODE_CARRY_NOTE) — the attestation is bound to ${CURRENT_HEAD:0:12}… and states the reviewed head it was carried from" >&2
 fi
 # #1348 — pin the MERGE BASE the clean-low guard certified. The attestation is
 # a function of the three-dot diff `compare/<base>...<head>`, whose CONTENT is
