@@ -4621,7 +4621,17 @@ never wrong.)*
 excluded, by `BRANCH_CLAIM_EXCLUDE_PATTERN` (default `main master`). The measured reason the prefix list
 is gone: 6 of 10 open PRs were on `feat/*`/`pr-go/*` branches the old default
 (`integration/* fix/* rescue/*`) never inspected, and no merge landed for 5.2 h. The acquire was always
-pattern-independent, so the only thing narrower than the key was the guard. `branch-claim.sh check-hook`
+pattern-independent, so the only thing narrower than the key was the guard.
+**What the widening COSTS, stated** (review F2): the "an unclaimed branch is never refused" bound holds for
+the UNCLAIMED arm only. `claim_branch_guard` has five arms that REFUSE before ownership is decided
+(`registry-unreadable`, `claim-unreadable`, `clock-unreadable`, `lease-unreadable`,
+`claim-expired-unreclaimed`) and the hook refuses on any non-zero, so a box whose claim registry is
+momentarily unreadable — a network/DNS blip, a git/`gh` outage, a checkout whose remote is not literally
+named `origin` — refuses **every push to every non-trunk branch on that box** until it clears, where the old
+three-prefix default refused three prefixes. Hooks are per REPOSITORY, not per worktree
+(`git rev-parse --git-path hooks` in a linked worktree resolves the COMMON hooks dir), so one install arms
+every worktree on the box. Fail-closed is the intended polarity and is unchanged.
+`branch-claim.sh check-hook`
 verifies that the hook is actually armed in a checkout, and `cloud-cell-doctor.sh hygiene` asks it on a
 clock **about the checkout the box pushes from (`$REPO`)** — recording `HOOK-OK` / `HOOK-FAIL <host>
 <fault>` in the pass record, so an unarmed box is named instead of silent. That row is REPORTED, never
@@ -4629,6 +4639,14 @@ fatal: it never touches the disk-reclaim role's own rc, because a fresh clone, a
 worktree all legitimately have no hook yet and an alarm that can never clear gets trained away (the same
 reason `status` reads the reaper's `rc=4` as INERT rather than FAILED). The hook was measured present on 1
 cell of 5.
+**THE ARMING STEP DOES NOT EXIST YET, and that is stated rather than implied** (review F1, #4260 §4.2's
+first half): nothing in this tree runs `install-hook`. `install.sh` seeds `branch-claim.sh` and
+`branch-claim-hook.sh` into `$O` — the SCRIPT, not the HOOK — so a box that never ran
+`bash <tree>/scripts/orchestrator-harness/branch-claim.sh install-hook` in its `$REPO` has no `pre-push` and
+every push from it is ungated. What this change buys is that the state is now NAMED (with the remedy command
+inside the `MISSING (...)` text) on every scheduled pass, instead of being unobservable; the arming belongs
+in box provisioning (`install.sh` on the orchestrator, `cloud-cell-supervisor.sh apply/start` on a cell) and
+is tracked separately.
 The measured reason: on tortoise PR #11385 two lanes wrote ONE PR for ~6 h — 11 superseded heads, five
 clean reviews on five different heads, **0 landings** — because the per-head key (`<PR>-<head12>`) cannot
 express this. The losing writer *creates a new head*, so it mints a fresh key and wins its own CAS every

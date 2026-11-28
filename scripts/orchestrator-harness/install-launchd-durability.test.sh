@@ -439,6 +439,25 @@ for _m in live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.
   if drift_names "$DRIFT_LIST" | grep -qxF "$_m"; then ok "the drift list covers the loop module $_m"
   else bad "the drift list omits $_m — orch-loop.sh reads it from \$O, so a stale copy is silent"; fi
 done
+# ⛔ THE ONE-WRITER PUSH GUARD AND ITS HOOK TEMPLATE (agent-infra#4260 review, mutation table: this was
+# the diff's ONE changed line no assertion protected — reverting both names left every suite green).
+# The guard is a PRE-PUSH HOOK: a box must carry the gate AND the template, because `install-hook`
+# SUBSTITUTES `@BC@` into `branch-claim-hook.sh` read from `$SELF_DIR`, so a `$O` with the gate and not
+# the template dies on "cannot read the hook template" — and a `$O` with neither has no hook at all,
+# which is the measured "installed on 1 of 5 cells" state this change exists to end.
+# ⛔ NON-VACUITY: the same membership predicate, run against the list with those names removed, must
+# read as NOT covered — otherwise the arm below is decorative and a merge could drop them again.
+_GUARD_NAMES="branch-claim.sh branch-claim-hook.sh"
+for _m in $_GUARD_NAMES; do
+  if drift_names "$DRIFT_LIST" | grep -qxF "$_m"; then ok "the drift list covers the push guard's $_m"
+  else bad "the drift list omits $_m — a \$O without it has no push gate (or no hook template to install one from)"; fi
+done
+_GUARD_OMITTED="$(for _n in $(drift_names "$DRIFT_LIST"); do case " $_GUARD_NAMES " in *" $_n "*) ;; *) printf '%s ' "$_n" ;; esac; done)"
+_GUARD_STILL=0
+for _m in $_GUARD_NAMES; do drift_names "$_GUARD_OMITTED" | grep -qxF "$_m" && _GUARD_STILL=1; done
+if [ -n "$DRIFT_LIST" ] && [ "$_GUARD_STILL" -eq 0 ]; then
+  ok "the guard-name membership check DISCRIMINATES (a list without them reads as NOT covered)"
+else bad "the guard-name membership check does not discriminate — an omitted branch-claim name still read as covered"; fi
 # Every listed name must EXIST in the harness dir. A renamed/typo'd name would otherwise report
 # "<name>(missing)" on every install forever — noise an operator learns to skip.
 MISSING_IN_LIST=""

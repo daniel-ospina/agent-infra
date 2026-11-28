@@ -31,7 +31,7 @@ not a capacity reading.
 | 10 | **CI re-run actuator.** `orch-loop.sh:8110`–`8118` (`gh run rerun --failed`), gated on `python-ci-gate` in the check set and on `state/rerun-<PR>-<RID>` | (no worker) | **`state/rerun-<PR>-<RID>`**, touched only on success (`:8119`) | **KEYED ON THE RUN — deliberately finer than the head, and it shows.** It answers "this RUN was already re-run" exactly, which is what the actuator consumes; it does NOT bound "this HEAD's CI has been re-run N times", so a second run on an unchanged head is a fresh key. Whether that matters depends on `rerun-*` pruning, which is **UNVERIFIED** in the reapers (`state/rerun-*` is not in the `MERGED\|CLOSED` sweep's list at `:6789`). |
 | 10b | **Background backlog refresh.** `orch-loop.sh:10642` runs `refresh-candidates.sh` when the backlog is below 6 or the latch is stale (`:10374`) | (no worker) | **`$O/.refresh.lock`** (`mkdir` at `:10387`, stale-cleared at `:10648`) | **YES — the refresh job itself**, and it is a lock, not a claim (same box only). `refresh-candidates.sh` dispatches nothing; it also *reads* `refs/claims/issue-<N>` per candidate and queues only on an explicit `rc 0` (`:5770`–`5798`). |
 | 11 | **Drain stall → diagnostician.** `orch-loop.sh:9459`–`9478`, firing only on `_stalled=1` | stall-fix worker | **`state/drain-stall`** pass counter (`DRAIN_STALL_FIX_EVERY`, default one pass in three) | **No identity key, and stated as such.** The resource is *this box's drain*, which no peer can consume, and the dispatch is read-only by contract (`stall-fix.sh` never touches a PR a lane holds). The bound is the pass counter, not a claim. |
-| 12 | **Adoption of a sick/unowned PR** (`adopt-fix.sh`; the controller's pr-sickness role spawns `fix-<PR>` from `orch-loop.sh:8313` when `PRSICK=1`) | `fix-<PR>` | **`state/mergeclaim-<PR>.lock`** + `ps_held`'s `pr-<N>`/lease read (`pr-sickness.sh:434`–`438`) + **`state/psick-<PR>-<head12>`** (head-keyed budget, cap `PS_MAX_TRIES`) | **YES — the PR.** The lock's holder is provable-dead or the takeover refuses (`adopt-fix.sh:218`); the budget is per head because the work is a diff, and the pass-level `PS_MAXSPAWN` is a capacity ceiling beside it, not a substitute. |
+| 12 | **Adoption of a sick/unowned PR** (`adopt-fix.sh`; the controller's pr-sickness role runs `ps_select` from `orch-loop.sh:8289`–`8323` (`[prsick-pass:begin]`) when `PRSICK=1`, and the spawn itself is `pr-sickness.sh:574`–`583` `ps_spawn_fixer`) | `fix-<PR>` | **`state/mergeclaim-<PR>.lock`** + `ps_held`'s `pr-<N>`/lease read (`pr-sickness.sh:434`–`438`) + **`state/psick-<PR>-<head12>`** (head-keyed budget, cap `PS_MAX_TRIES`) | **YES — the PR.** The lock's holder is provable-dead or the takeover refuses (`adopt-fix.sh:218`); the budget is per head because the work is a diff, and the pass-level `PS_MAXSPAWN` is a capacity ceiling beside it, not a substitute. |
 | 13 | **Candidate refresh** (`refresh-candidates.sh`) | — | — | **It dispatches NOTHING.** It writes/refreshes `candidates.txt` and certifies an issue CLEAN by reading the registry; the code states that a certification is not a lock and the claim is (`orch-loop.sh:9828` comment). Listed here so the inventory is closed, not because it is a dispatch path. |
 
 **Control structure, stated accurately.** The PR sweep is **one pipeline subshell** — `printf … | while IFS=$'\t' read -r PR BR DRAFT OWN` (`orch-loop.sh:6745`) to `done` (`:8234`) — and inside one row the arms are a **precedence ladder of row-owning guards, each of which writes a `disp` row and `continue`s**, not an `elif` chain. Order per row: draft (`6762`) → `MERGED|CLOSED` marker sweep (`6788`) → **the cross-box claim gate `claim_selection_verdict` (`6844`), which applies to every arm below** → `[redfix]` (`6913`–`7226`, owns the row via one gated `continue`) → parked guard (`7292`) → `AUTHORITY_UNKNOWN` (`7339`) → classifier (`7349`, empty ⇒ `NOCHECKS` at `7380`) → `CONFLICTING` router (`7480`) → `case "$V"` (`7563`: `GREEN`/`PENDING`/`FAILED`, and inside `FAILED` the review-gate chain `7704`–`8014` then the CI-red arm `8015`–`8075`) → **the rerun actuator after the chain (`8085`–`8129`), so two actuators can fire on one PR in one cycle** → tail arms (`8131`–`8212`).
@@ -76,6 +76,35 @@ branch and then a **second** worker that pushes onto it without acquiring (a hum
 older deployment). That backstop must be in front of every branch a lane can write — and, per #4260 §3(b),
 installed on every box that can write one.
 
+### 3.1 What widening the scope costs — the fail-closed arms, stated
+
+Widening the guard from three prefixes to **every** non-trunk branch is not free, and the bound is narrower
+than "an unclaimed branch is never refused". That sentence is true **only for the `unclaimed` arm**. Before
+ownership is decided at all, `claim_branch_guard` (`claims.sh`) has five REFUSAL arms that fire on their own:
+
+```
+registry-unreadable         `git ls-remote origin "$ref"` non-zero            -> rc 2
+claim-unreadable            the claim ref exists, its lease is unreadable     -> rc 2
+clock-unreadable            the local clock cannot judge the lease             -> rc 2
+lease-unreadable            the lease term does not parse                      -> rc 1
+claim-expired-unreclaimed   expired but not reclaimed                         -> rc 1
+```
+
+and `branch-claim-hook.sh` refuses on **any** non-zero.
+
+⇒ **The cost of the widening, in one sentence: a box whose claim registry is momentarily unreadable — a
+network/DNS blip (a cell can be unreachable for hours), a git/`gh` outage, or a checkout whose remote is not
+literally named `origin` (the ref is hardcoded `origin`, and the hook forwards only `$remote_ref`) — refuses
+every push to every non-trunk branch on that box until it clears, where the old three-prefix default refused
+three prefixes.** Hooks are **per repository, not per worktree** (`git rev-parse --git-path hooks` in a linked
+worktree resolves the COMMON hooks dir; `git-worktree(1)`: "sharing everything except per-worktree files such as
+HEAD, index"), so one `install-hook` arms every worktree of that repo on that box — which is why the blast
+radius is a box-wide statement, not a checkout-local one.
+
+Fail-closed is the intended polarity and is **not** changed here: an abstention is not permission, and the
+alternative — a momentary outage silently permitting a stray push — is the exact loss this guard exists to stop.
+What is being closed in this paragraph is that the change shipped on a sentence its own callee refutes.
+
 ## 4. What already ships (checked, not assumed — #4260 §2)
 
 | Mechanism | State in the tree at `b526f3c79` | Evidence |
@@ -93,4 +122,29 @@ Nothing in this inventory proposes to re-derive any of the four.
   abstention doctrine, not a bug, and it is not in #4260's scope.
 - **Row 11** has no identity key. It is read-only by contract; if `stall-fix.sh` ever gains write actions,
   this row is where the key must be added.
-- **The guard's install coverage** is the second half of #4260 and is tracked there, not here.
+- **The guard's INSTALL COVERAGE — the FIRST half of #4260 §4.2 — is not closed by this change, and the residual
+  is stated rather than implied.** §4.2 asks two things: how does every checkout on every cell get the hook, and
+  how is that proven. This change delivers the second half. Measured at this head:
+
+  ```
+  $ git grep -n 'install-hook' -- ':!*.test.sh' ':!*.md' ':!branch-claim.sh' ':!branch-claim-hook.sh'
+  cloud-cell-doctor.sh:2529   # a comment ABOUT it
+  install.sh:1730             # a comment ABOUT it
+  ```
+
+  **Zero callers.** `install.sh` seeds `branch-claim.sh` and `branch-claim-hook.sh` into `$O` — that is the
+  *script*, not the *hook*: a seeded `$O/branch-claim.sh` leaves `$REPO/.git/hooks/pre-push` absent. So the
+  cells that were unarmed **stay unarmed** until a provisioning step or an operator runs
+  `bash <tree>/scripts/orchestrator-harness/branch-claim.sh install-hook` in the checkout the box pushes from.
+  What changed is that the absence is now **named**: `cloud-cell-doctor.sh hygiene` records
+  `branch-claim hook NOT ARMED in <repo> — HOOK-FAIL <host> MISSING (...)`, whose parenthesised text carries the
+  remedy command, on every scheduled pass — instead of nobody being able to say which cell was unarmed. Every
+  comparable splits the same way: `pre-commit`/`lefthook` expose an explicit `install` verb for a provisioning
+  step to call, and CI invokes the check directly rather than reading a fresh clone's missing hook as a fault of
+  the machine.
+
+  **Where the arming step belongs** (not done here — it changes a box-bootstrap path, not the guard): the
+  provisioning that seeds `$O` — `install.sh` for the macOS orchestrator, `cloud-cell-supervisor.sh apply/start`
+  for the cells — is what would run `install-hook` against `$REPO` and let `check-hook` gate the result. Until
+  then the doctor row is an OBSERVATION with a printed remedy, and an unarmed cell is a known-absent state, not
+  a fixed one.
