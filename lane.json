@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795851453,
+  "host": "cmux",
+  "issue": 3055,
+  "kind": "lane",
+  "lane_id": "cmux.klane-3055-1795851453-p197563-abd71b4a",
+  "lease_until": 1795888053,
+  "pid": 197563,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795851453,
+  "state": "RUNNING",
+  "tag": "3055",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-3055"
+}
