@@ -11,6 +11,16 @@ O="${O:-$HOME/orchestrator}"
 # sibling was converted. `$O/logs` above and below is CORRECT as it stands — logs are state.
 _AF_WORK="${O_WORK:-$O}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O_WORK/gh-rest` (Mac REST adapter) / `$O_WORK/gh-limit` (cell
+# serialiser) for this launcher AND every gh its adopted fix chain inherits — a shim that is never
+# resolved is an INERT layer: it reports protection and provides none. Re-assert both here, adapter
+# last so `gh-rest` (which itself calls the same helper) wins where it exists.
+# ⛔ THE WORK ROOT, NOT `$O` (#2095/#3846): on a state-dir instance `$O/gh-limit` is a directory that
+# can exist without the adapters, so the shims would be dropped SILENTLY — the INERT layer this block
+# exists to prevent. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "${_AF_WORK:-$O}/gh-limit" ]; then PATH="${_AF_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${_AF_WORK:-$O}/gh-rest" ]; then PATH="${_AF_WORK:-$O}/gh-rest:$PATH"; fi
 mkdir -p "$O/logs"
 cd "$REPO" || exit 1
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
