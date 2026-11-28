@@ -2917,7 +2917,7 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=223
+MIN_ASSERTIONS=224
 # #2628: 214 -> 219. The ``pulls`` read stopped discarding its HTTP status, so
 # the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
 # is now `unclassified` (the API REFUSED this PR → positive evidence) and a
@@ -2932,6 +2932,13 @@ MIN_ASSERTIONS=223
 # the only assertions here that require the shim to have taken effect). Without
 # them the pre-fix shape (the warning emitted before the fallback read, so it fires
 # on healthy runs too) leaves both suites green. MEASURED 223 on this tree.
+# #4259 (the 8cdcf0432 review's Finding 1): 223 -> 224 for (30xvi)'s new
+# `scripts/lib/code-identity.py` entry — the #4105 carry predicate is in the
+# ALWAYS-FULL class beside its `diff-normalize.py` sibling, because a defect
+# there carries a clean verdict onto code nobody reviewed. MEASURED 224 here;
+# the refusal witness is `scripts/record-review.test.sh` §8.16's
+# "carry-predicate" row plus its name-deleted MUTATION PIN (this seam cannot
+# record, so it pins the CLASSIFICATION and that row pins the RECORD PATH).
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
