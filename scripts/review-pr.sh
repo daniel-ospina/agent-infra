@@ -150,12 +150,19 @@
 #      retarget is the same refusal) — NOT recorded
 #   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
 #      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
-#      reads: no record bound to this head, no marker in the PR body, or a marker posted
+#      reads: no record bound to this head, no marker in the PR body, a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check)
+#      so "recorded" without it is a green report over a red check), or — on a CARRY, where the
+#      marker is bound to the RECORDED head and is therefore read at any head — a marker whose
+#      `diff=` is ABSENT (`nodigest`, a pre-#2982 marker) or names a DIFFERENT artifact
+#      (`mismatch`, the surviving-marker half of the body-edit case). Check (c)'s carry path
+#      skips a digest-less candidate and asks the producer about the marker's own (head, diff)
+#      pair, so PRESENCE ALONE is not the artifact it reads
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
-#      READ the live diff/head (`unreadable` / `surface-unknown`) — RETRY, nothing was paid for and
-#      nothing was recorded. A failed read is not a changed artifact and must never buy a review
+#      READ the live diff/head (`unreadable` / `surface-unknown`), OR the PR BODY could not be
+#      READ while certifying the marker the carry depends on — RETRY, nothing was paid for and
+#      nothing was recorded. A failed read is not a missing marker and not a changed artifact,
+#      and must never buy a review
 #   13 the head's CHECK SURFACE is RED and the red is this PR's own (`red-surface`): a broken build
 #      is not a review finding — fix or re-run the failing checks, then re-run this command
 #   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
@@ -709,11 +716,6 @@ $CC_ERR
     # THE BEST CASE: the rendered diff is byte-identical, so the merge gate ALREADY carries
     # this record across the head move. There is nothing to re-record and nothing to review —
     # PROVIDED the carried record is a CLEAN one and its marker is really where check (c) reads.
-    # ⛔ VERDICT FIRST (P0, fresh review of PR #4256). `--check-carry` answers "is the reviewed
-    # ARTIFACT the same", never "was it approved": it prints "reviewed NOT CLEAN" on stderr and still
-    # answers `carry` rc 0. This arm used to exit 0 on the token alone, so a PR whose only review said
-    # `verdict=not-clean` with open blocking findings was reported as "NO REVIEW OWED" and rc=0 —
-    # which auto-rail maps to `clean`. Pre-fix, the same PR bought a review and exited 7 (issues).
     # ⛔ VERDICT FIRST (P0, fresh review of PR #4256). `--check-carry` answers "is the reviewed
     # ARTIFACT the same", never "was it approved": it prints "reviewed NOT CLEAN — N open finding(s)"
     # on stderr and still answers `carry` with rc 0. This arm used to exit 0 on the token alone, so a
