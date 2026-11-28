@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795851588,
+  "host": "cmux",
+  "issue": 3484,
+  "kind": "lane",
+  "lane_id": "cmux.klane-3484-1795851588-p250466-e4fc2f58",
+  "lease_until": 1795888188,
+  "pid": 250466,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795851588,
+  "state": "RUNNING",
+  "tag": "3484",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-3484"
+}
