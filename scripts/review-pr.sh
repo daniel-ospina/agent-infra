@@ -152,12 +152,16 @@
 #      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
 #      reads: no record bound to this head, no marker in the PR body, a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
-#      so "recorded" without it is a green report over a red check), or — on a CARRY, where the
-#      marker is bound to the RECORDED head and is therefore read at any head — a marker whose
-#      `diff=` is ABSENT (`nodigest`, a pre-#2982 marker) or names a DIFFERENT artifact
-#      (`mismatch`, the surviving-marker half of the body-edit case). Check (c)'s carry path
-#      skips a digest-less candidate and asks the producer about the marker's own (head, diff)
-#      pair, so PRESENCE ALONE is not the artifact it reads
+#      so "recorded" without it is a green report over a red check), or — in BOTH carry arms,
+#      `carry` (marker bound to the RECORDED head, hence read at any head) and `carry-patch`
+#      (re-recorded at the LIVE head, hence read head-scoped) — a marker whose `diff=` is ABSENT
+#      (`nodigest`, a pre-#2982 marker) or names a DIFFERENT artifact (`mismatch`, the
+#      surviving-marker half of the body-edit case). On `carry` this is the SAME digest test
+#      check (c)'s carry path already applies — that path skips a digest-less candidate and asks
+#      the producer about the marker's own (head, diff) pair; on `carry-patch` it is STRICTER than
+#      check (c)'s head-bound matcher (`has_review_record`), which reads no digest at all — and
+#      strictness can only REFUSE a carry (exit 9 names the re-record), never certify one check
+#      (c) would reject. Either way PRESENCE ALONE is not the artifact it reads
 #   12 a CARRY-BEFORE-REVIEW answer that is NOT a review: the recorder's own predicate could not
 #      READ the live diff/head (`unreadable` / `surface-unknown`), OR the PR BODY could not be
 #      READ while certifying the marker the carry depends on — RETRY, nothing was paid for and

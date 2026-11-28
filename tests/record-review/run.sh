@@ -2200,15 +2200,30 @@ PA="$(pair_of "$Q/a.diff")"; PB="$(pair_of "$Q/b.diff")"
   && pass "(31) PATCH: the same base move leaves the patch digest IDENTICAL — this is what the carry accepts" \
   || fail "(31) the patch digest moved on an unchanged change — the arm would refuse a legitimate carry"
 
-# One changed LINE is not carried.
+# One change that is NOT the reviewed one is not carried.
+# ⛔ AND THIS FIXTURE'S c.diff IS TWO CHANGE PAIRS, NOT ONE — MEASURED, RECORDED HERE, NOT FIXED
+# (fresh review at `22282f4d5`, note 2). Writing f.txt over the MERGED tip leaves main's own
+# `l4` -> `l4` pair in the diff beside `l6` -> `l6-PR-CHANGED`, and it moves the hunk to line 1,
+# so c's frame is EMPTY while b's is `l2`. Both facts are LOAD-BEARING, not drift:
+#   · the frame axis is the ONLY place in this section where b and c differ on the enclosing
+#     scope, and that is what the (P1)/(P2) mutant pair below measures about the projection this
+#     PR ADDS (`@@ l2` vs `@@`);
+#   · the obvious repair was MEASURED, not assumed: resetting the file to the MERGED tip first
+#     (`git checkout -q "$CURRENT31" -- f.txt`, the review's own suggestion) makes c one change
+#     against main, and it projects to `@@ -3,7 +3,7 @@ l2` — the SAME frame as b. b/c then read
+#     `dd8624ce…`/`e03f93b6…`, P1 `f662541f…`/`622a860f…`, P2 COLLAPSES to `ec259dba…`: every row
+#     stays green and the frame coverage is GONE, because no assertion on this pair can any
+#     longer tell "frame emitted" from "frame dropped". The label was the false part; it is
+#     corrected here, the fixture is left alone deliberately, and the messages below no longer
+#     claim a shape this diff does not have.
 printf 'l1\nl2\nl3\nl4\nl5\nl6-PR-CHANGED\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
 git add -A; git commit -qm "an edit"
 EDIT31="$(git rev-parse HEAD)"
 git diff --no-color --full-index "main...$EDIT31" > "$Q/c.diff"
 PC="$(pair_of "$Q/c.diff")"
 [ "${PB##* }" != "${PC##* }" ] \
-  && pass "(31) a ONE-LINE change moves the patch digest — it must refuse (the refusal direction)" \
-  || fail "(31) a one-line change kept the same patch digest — FAIL-OPEN"
+  && pass "(31) a change that is NOT the reviewed one moves the patch digest — it must refuse (the refusal direction)" \
+  || fail "(31) a change that is not the reviewed one kept the same patch digest — FAIL-OPEN"
 
 # Whitespace only: the exact hole `git patch-id --stable` has.
 printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\t\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
@@ -2725,7 +2740,8 @@ if [ -s "$TMP/pmut-ctx/diff-normalize.py" ]; then
 else
   fail "(31) could not build the context-keeping mutant"
 fi
-# The REFUSAL assertion (`PB` != `PC`: a ONE-LINE edit moves the patch digest) must be attributable
+# The REFUSAL assertion (`PB` != `PC`: a change that is not the reviewed one moves the patch
+# digest) must be attributable
 # to the CHANGED LINES — and the projection now separates b from c on TWO axes: the changed line AND
 # the enclosing-scope frame (`@@ l2` vs `@@`, the position-bearing projection the consumer relies on,
 # agent-infra#4255). A single "drop the +/- lines" mutant therefore proves nothing: it cannot collapse
@@ -2760,10 +2776,10 @@ if [ -s "$TMP/pmut-frame/diff-normalize.py" ] && [ -s "$TMP/pmut-none/diff-norma
   MB2="$(pair_of "$Q/b.diff" "$TMP/pmut-none/diff-normalize.py")"
   MC2="$(pair_of "$Q/c.diff" "$TMP/pmut-none/diff-normalize.py")"
   [ -n "$MFB" ] && [ -n "$MFC" ] && [ "${MFB##* }" != "${MFC##* }" ] \
-    && pass "(31) MUTATION (P1): with the position frame DROPPED the one-line edit still moves the patch digest — the refusal does not hinge on the new frame" \
+    && pass "(31) MUTATION (P1): with the position frame DROPPED the refused change still moves the patch digest — the refusal does not hinge on the new frame" \
     || fail "(31) MUTATION SURVIVED (P1): a projection that stopped carrying the CHANGED LINES collapsed the edit onto the base move"
   [ -n "$MB2" ] && [ -n "$MC2" ] && [ "${MB2##* }" = "${MC2##* }" ] \
-    && pass "(31) MUTATION (P2): with the position frame AND the changed lines DROPPED the one-line edit matches — the changed lines are the refusal's own field" \
+    && pass "(31) MUTATION (P2): with the position frame AND the changed lines DROPPED the refused change matches — the changed lines are the refusal's own field" \
     || fail "(31) MUTATION DID NOT COLLAPSE (P2): a projection carrying neither the changed lines nor the frame still told the one-line edit apart, so the refusal may pass vacuously"
 else
   fail "(31) could not build the two attribution mutants (frame-dropped, changed-lines-dropped)"
