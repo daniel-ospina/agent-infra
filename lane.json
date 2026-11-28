@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "exit_code": null,
+  "heartbeat_at": 1795851092,
+  "host": "cmux",
+  "issue": 12943,
+  "kind": "lane",
+  "lane_id": "cmux.klane-12943-1795851092-p14450-7446de13",
+  "lease_until": 1795887692,
+  "pid": 14450,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1795851092,
+  "state": "RUNNING",
+  "tag": "12943",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-12943"
+}
